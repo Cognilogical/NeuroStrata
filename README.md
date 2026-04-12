@@ -2,8 +2,6 @@
   <img src="docs/assets/strata-logo.svg" alt="Strata: Cognitive Architecture for AI Agents" width="850">
 </div>
 
-# 🧠 Strata: Cognitive Memory Architecture for AI Agents
-
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://golang.org/)
 [![MCP](https://img.shields.io/badge/Protocol-MCP-blue?style=flat-square)](https://modelcontextprotocol.io/)
 [![Qdrant](https://img.shields.io/badge/Vector%20DB-Qdrant-red?style=flat-square)](https://qdrant.tech/)
