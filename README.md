@@ -163,7 +163,7 @@ Strata represents a synthesis of cognitive science theories and foundational ope
 
 * **[Graphify](https://graphify.net/):** The knowledge graph engine that turns flat code bases and documentation into clustered, edge-mapped conceptual communities.
 * **[Qdrant](https://qdrant.tech/):** The incredibly fast and reliable Rust-based vector search engine that powers the underlying memory mesh.
-* **[LLM-WIKI Concept]:** The architectural pattern of storing narrative knowledge in hyper-linked Markdown while giving the AI specific "Pointer-Wiki" search capabilities to prevent context bloat.
+* **[LLM-WIKI Concept](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f):** The architectural pattern of storing narrative knowledge in hyper-linked Markdown while giving the AI specific "Pointer-Wiki" search capabilities to prevent context bloat.
 
 ### Scientific Literature
 * Brooks, R. (1983). *Towards a theory of the comprehension of computer programs*. International Journal of Man-Machine Studies.
