@@ -161,7 +161,6 @@ Once installed, your AI agent automatically gains access to the following tools:
 
 Strata represents a synthesis of cognitive science theories and foundational open-source engineering. This project would not exist without the pioneering work of the following researchers and projects:
 
-* **[Strata](https://github.com/the legacy Strata python package/Strata):** The original inspiration for persistent, tier-based vector storage for AI agents. Strata's payload schema pays homage to their foundational open-source work.
 * **[Qdrant](https://qdrant.tech/):** The incredibly fast and reliable Rust-based vector search engine that powers the underlying memory mesh.
 * **[LLM-WIKI Concept]:** The architectural pattern of storing narrative knowledge in hyper-linked Markdown while giving the AI specific "Pointer-Wiki" search capabilities to prevent context bloat.
 * **[Graphify]:** The knowledge graph engine that turns flat code bases and documentation into clustered, edge-mapped conceptual communities.
