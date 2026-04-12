@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/assets/strata-logo.svg" alt="Strata: Cognitive Architecture for AI Agents" width="800">
+  <img src="docs/assets/strata-logo.svg" alt="Strata: Cognitive Architecture for AI Agents" width="850">
 </div>
 
 # 🧠 Strata: Cognitive Memory Architecture for AI Agents
