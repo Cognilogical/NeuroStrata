@@ -1,0 +1,4 @@
+*.canvas
+/bin/
+/dist/
+*.exe

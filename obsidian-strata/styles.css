@@ -1,0 +1,60 @@
+.strata-memory-card {
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    padding: 10px;
+    margin-bottom: 10px;
+    background-color: var(--background-secondary);
+}
+
+.strata-memory-text {
+    margin-bottom: 8px;
+    font-size: var(--font-ui-small);
+    line-height: 1.4;
+    white-space: pre-wrap;
+}
+
+.strata-memory-edit-area {
+    width: 100%;
+    min-height: 60px;
+    margin-bottom: 8px;
+    background-color: var(--background-primary);
+    color: var(--text-normal);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    padding: 5px;
+    font-family: inherit;
+    resize: vertical;
+}
+
+.strata-button-group {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.strata-btn {
+    padding: 4px 12px;
+    font-size: var(--font-ui-smaller);
+    cursor: pointer;
+}
+
+.strata-btn-delete {
+    background-color: var(--background-modifier-error);
+    color: var(--text-on-accent);
+}
+
+.strata-header-controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+    align-items: center;
+}
+
+.strata-select {
+    flex-grow: 1;
+    padding: 5px;
+    background-color: var(--background-primary);
+    color: var(--text-normal);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+}

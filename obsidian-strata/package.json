@@ -1,0 +1,22 @@
+{
+  "name": "obsidian-strata",
+  "version": "1.0.0",
+  "description": "Strata vector database curation plugin for Obsidian",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "author": "Strata",
+  "license": "MIT",
+  "dependencies": {
+    "obsidian": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^16.11.29",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "0.17.3",
+    "tslib": "2.4.0",
+    "typescript": "4.9.5"
+  }
+}
