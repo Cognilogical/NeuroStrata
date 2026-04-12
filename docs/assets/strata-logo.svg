@@ -47,7 +47,7 @@
   <rect width="100%" height="100%" fill="url(#bg)" rx="20" />
 
   <!-- Logo Mark (Left Side) -->
-  <g transform="translate(240, 220)">
+  <g transform="translate(180, 220)">
     <!-- Base Layer (Tier 1: Global Semantic) -->
     <path d="M 0,90 L 120,40 L 0,-10 L -120,40 Z" fill="url(#tier1)" stroke="#00ADD8" stroke-width="2" />
     <circle cx="-50" cy="40" r="4" fill="#00ADD8" filter="url(#glow)"/>
@@ -81,7 +81,7 @@
   </g>
 
   <!-- Typography (Right Side) -->
-  <g transform="translate(460, 200)">
+  <g transform="translate(400, 200)">
     <text x="0" y="0" font-family="'Inter', -apple-system, sans-serif" font-weight="900" font-size="80" fill="#ffffff" letter-spacing="4">STRATA</text>
     <text x="5" y="45" font-family="'Inter', -apple-system, monospace" font-weight="400" font-size="20" fill="#8b949e" letter-spacing="8">COGNITIVE ARCHITECTURE</text>
     
