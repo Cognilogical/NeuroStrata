@@ -2,3 +2,8 @@
 /bin/
 /dist/
 *.exe
+
+# AI Chat Sessions
+.sessions/
+# Graphify Cache/Artifacts
+.graphify_*
