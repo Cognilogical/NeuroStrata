@@ -81,7 +81,7 @@
   </g>
 
   <!-- Typography (Right Side) -->
-  <g transform="translate(400, 200)">
+  <g transform="translate(360, 200)">
     <text x="0" y="0" font-family="'Inter', -apple-system, sans-serif" font-weight="900" font-size="80" fill="#ffffff" letter-spacing="4">STRATA</text>
     <text x="5" y="45" font-family="'Inter', -apple-system, monospace" font-weight="400" font-size="20" fill="#8b949e" letter-spacing="8">COGNITIVE ARCHITECTURE</text>
     
