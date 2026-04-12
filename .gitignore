@@ -7,3 +7,4 @@
 .sessions/
 # Graphify Cache/Artifacts
 .graphify_*
+mcp/strata-mcp

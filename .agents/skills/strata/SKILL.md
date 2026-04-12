@@ -76,10 +76,18 @@ Ad-hoc architectural discussions generate vital context that evaporates when the
 2. **Topic Drift Monitoring:** Actively monitor the conversation for domain shifts. If detected, pause and ask: "I notice we are shifting topics. Would you like to summarize and save the current Strata session and start a new one?"
 3. **Visualization Updates:** Whenever a Strata session concludes, or massive architectural changes are made, run `strata_generate_canvas` to ensure the user's Obsidian graph is up to date.
 
-## Structured Pointers & Compact Reading
-To prevent context window bloat, Tier 2 Domain pointers must be hyper-specific.
-1. **Payload Structure:** Memories now use structured JSON `refs` arrays containing `file`, `anchor`, and `lines` (e.g., `{"refs": [{"file": "docs/architecture/domains/ml_training.md", "lines": "42-49"}]}`).
-2. **Compact Reading Constraint:** When retrieving a memory with `lines` metadata, the agent MUST use the `Read` tool's `offset` and `limit` parameters to fetch ONLY that specific paragraph/chunk first.
+## Bi-Directional Anchors & Compact Reading
+To prevent context window bloat and perfectly map semantic rules to the codebase, Tier 2 Domain pointers use a dual-anchor metadata schema.
+1. **Payload Structure:** Memories use structured JSON metadata to anchor to both documentation and (optionally) code symbols:
+   ```json
+   {
+     "doc_refs": [{"file": "docs/architecture/domains/sync.md", "lines": "42-49"}],
+     "code_refs": [{"file": "src/sync/engine.ts", "symbol": "startSync()"}]
+   }
+   ```
+   *Note: `code_refs` is strictly an optional augmentation. Not all projects have source code. Only use it when an architectural rule directly governs a specific function, class, or method.*
+2. **Compact Reading Constraint:** When retrieving a memory with `doc_refs` containing `lines`, the agent MUST use the `Read` tool's `offset` and `limit` parameters to fetch ONLY that specific chunk first.
+3. **Symbol Traversal:** If `code_refs` are present, use the Glob or Grep tools to locate the exact `symbol` to understand its current implementation.
 
 ## Agent Directives
 *   **NEVER** use `bd remember`.

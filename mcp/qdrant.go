@@ -94,7 +94,7 @@ func UpsertPoint(ctx context.Context, id, content, userID string, metadataRaw in
 	qBody, _ := json.Marshal(qdrantReq)
 	url := fmt.Sprintf("%s/collections/%s/points?wait=true", cfg.QdrantURL, cfg.QdrantCollection)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(qBody))
+	req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewBuffer(qBody))
 	if err != nil {
 		return "", err
 	}

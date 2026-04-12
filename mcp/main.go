@@ -25,7 +25,7 @@ func main() {
 		mcp.WithDescription("Store an architectural rule, project pattern, or task insight."),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The text of the memory to save.")),
 		mcp.WithString("user_id", mcp.DefaultString("system_architecture"), mcp.Description("The namespace.")),
-		mcp.WithObject("metadata", mcp.Description("Optional dictionary with source references.")),
+		mcp.WithObject("metadata", mcp.Description("Optional dictionary with Bi-Directional Anchors: {\"doc_refs\":[{\"file\":\"...\"}], \"code_refs\":[{\"file\":\"...\", \"symbol\":\"...\"}]}")),
 	), addMemoryHandler)
 
 	s.AddTool(mcp.NewTool("strata_search_memory",
@@ -40,7 +40,7 @@ func main() {
 		mcp.WithString("id", mcp.Required(), mcp.Description("The ID of the memory to update.")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The new text of the memory.")),
 		mcp.WithString("user_id", mcp.DefaultString("system_architecture"), mcp.Description("The namespace.")),
-		mcp.WithObject("metadata", mcp.Description("Optional dictionary with source references.")),
+		mcp.WithObject("metadata", mcp.Description("Optional dictionary with Bi-Directional Anchors: {\"doc_refs\":[{\"file\":\"...\"}], \"code_refs\":[{\"file\":\"...\", \"symbol\":\"...\"}]}")),
 	), updateMemoryHandler)
 
 	s.AddTool(mcp.NewTool("strata_delete_memory",
