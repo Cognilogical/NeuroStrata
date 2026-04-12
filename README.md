@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="docs/assets/strata-logo.svg" alt="Strata: Cognitive Architecture for AI Agents" width="800">
+</div>
+
 # 🧠 Strata: Cognitive Memory Architecture for AI Agents
 
 [![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go)](https://golang.org/)
