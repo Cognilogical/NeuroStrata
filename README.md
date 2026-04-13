@@ -145,6 +145,20 @@ The installer creates a default configuration at `~/.config/strata/config.json`.
 }
 ```
 
+### OpenCode Agent Configuration
+
+The Strata installation includes the `strata-task-agent`. To ensure this agent runs optimally, you should configure it to use a fast, low-cost, code-oriented model in your `~/.config/opencode/opencode.json` file. 
+
+Add the `agent` block below to map `strata-task-agent` to a provider model of your choice (e.g., `github-copilot/gpt-4o`, `anthropic/claude-3-haiku-20240307`, or `openai/gpt-4o-mini`):
+
+```json
+  "agent": {
+    "strata-task-agent": {
+      "model": "github-copilot/gpt-4o"
+    }
+  }
+```
+
 ---
 
 ## 🛠️ MCP Tool Reference
