@@ -72,10 +72,10 @@ else
 fi
 
 # Symlink agent
-mkdir -p "$HOME/.agents/agents"
+mkdir -p "$HOME/.config/opencode/agents"
 if [ -d "$SCRIPT_DIR/../.agents/agents" ]; then
-    ln -sfn "$SCRIPT_DIR/../.agents/agents" "$HOME/.agents/agents/strata"
-    echo "  -> Linked local agents to ~/.agents/agents/strata"
+    ln -sfn "$SCRIPT_DIR/../.agents/agents/strata-task-agent.md" "$HOME/.config/opencode/agents/strata-task-agent.md"
+    echo "  -> Linked strata-task-agent.md to ~/.config/opencode/agents/"
 fi
 CONFIG_DIR="$HOME/.config/strata"
 CONFIG_FILE="$CONFIG_DIR/config.json"
