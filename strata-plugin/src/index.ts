@@ -15,7 +15,7 @@ If any Strata memory tool fails with a connection error, "Not connected", or con
 2. If the tool STILL fails after attempting recovery (or if you are using a remote database that you cannot control), DO NOT HALT WORK.
 3. Instead, write the intended memory content and metadata into an append-only emergency log at \`~/.config/strata/emergency_cache.jsonl\`.
 4. Notify the user: "Strata memory services were offline. I attempted recovery but it failed, so I safely cached this memory locally."
-5. Whenever you successfully execute a memory tool or the database is confirmed online, check if \`~/.config/strata/emergency_cache.jsonl\` exists. If it does, proactively read it, use the \`strata_add_memory\` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (\`rm ~/.config/strata/emergency_cache.jsonl\`).
+5. Whenever you successfully execute a memory tool in the future (proving the database is back online), check if \`~/.config/strata/emergency_cache.jsonl\` exists. If it does, proactively read it, use the \`strata_add_memory\` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (\`rm ~/.config/strata/emergency_cache.jsonl\`).
 
 **THE STARTUP PROTOCOL - YOUR MANDATORY FIRST ACTION:**
 No matter what the user asks in their very first message, you MUST halt and perform the following exact steps before doing any actual work:
