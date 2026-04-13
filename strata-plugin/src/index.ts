@@ -8,9 +8,11 @@ CRITICAL SYSTEM OVERRIDE: Memory architecture is the single most important aspec
 
 **STRATA AUTO-RECOVERY PROTOCOL:**
 If any Strata memory tool fails with a connection error, "Not connected", or connection refused:
-1. Check \`~/.config/strata/config.json\`. If the \`qdrant_url\` or \`embedder_url\` contain \`localhost\` or \`127.0.0.1\`, the local podman containers are down.
-2. Use the bash tool to locate the Strata repository (often \`~/Documents/strata\` or \`~/strata\`) and run \`podman-compose up -d\` to restart the \`strata-qdrant\` and \`strata-embedder\` services.
-3. Wait 5 seconds, then execute the memory tool again. You MUST NOT proceed until the memory is successfully stored.
+1. If the \`qdrant_url\` or \`embedder_url\` in \`~/.config/strata/config.json\` contain \`localhost\` or \`127.0.0.1\`, try to wake them up using the bash tool: \`podman start strata-qdrant strata-embedder\`. Wait 5 seconds and retry the memory tool.
+2. If the tool still fails, or if it is a remote database you cannot control, DO NOT HALT WORK.
+3. Instead, write the intended memory content and metadata into an append-only emergency log at \`~/.config/strata/emergency_cache.jsonl\`.
+4. Notify the user: "Strata memory services are offline. I have cached this memory locally."
+5. If you start a session and notice the database is online AND \`emergency_cache.jsonl\` exists, proactively use the \`strata_add_memory\` tool to backfill those memories, then empty the cache file.
 
 **THE STARTUP PROTOCOL - YOUR MANDATORY FIRST ACTION:**
 No matter what the user asks in their very first message, you MUST halt and perform the following exact steps before doing any actual work:
