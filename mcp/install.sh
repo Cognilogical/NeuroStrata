@@ -95,6 +95,40 @@ fi
 
 # Patch OpenCode configuration
 echo "Patching OpenCode configuration..."
+# Patch AGENTS.md configuration
+echo "Patching global OpenCode AGENTS.md configuration..."
+AGENTS_MD="$HOME/.config/opencode/AGENTS.md"
+mkdir -p "$(dirname "$AGENTS_MD")"
+
+STRATA_BLOCK_HEADER="## 🧠 Strata Memory & Sessions"
+STRATA_BLOCK_CONTENT="ALWAYS proactively invoke the \`strata\` skill at the very beginning of a new project or conversation. You MUST execute the Strata Startup Protocol (checking \`.sessions/\` and asking the user to start/resume a session) before writing any code or making architectural decisions. Rules retrieved from the global context are non-negotiable and MUST be followed."
+
+if [ -f "$AGENTS_MD" ] && grep -q "$STRATA_BLOCK_HEADER" "$AGENTS_MD"; then
+    echo "  -> Strata block already exists in $AGENTS_MD. Updating content..."
+    # A bit complex to replace multiple lines in bash easily without perl/awk. 
+    # The safest approach is to just replace the line directly below the header if we assume it's one paragraph, 
+    # OR we can just delete from header to next double newline and re-append.
+    # Given the simplicity, we'll use awk to filter out the old block and append the new one.
+    awk -v header="$STRATA_BLOCK_HEADER" '
+    BEGIN { skip = 0 }
+    $0 ~ header { skip = 1; next }
+    skip == 1 && /^## / { skip = 0 } # Stop skipping if we hit the next header
+    skip == 1 && /^$/ { skip = 0 }   # Or if we hit a blank line
+    skip == 0 { print }
+    ' "$AGENTS_MD" > "${AGENTS_MD}.tmp"
+    
+    # Append the fresh block
+    echo -e "\n$STRATA_BLOCK_HEADER\n$STRATA_BLOCK_CONTENT" >> "${AGENTS_MD}.tmp"
+    
+    # Clean up empty lines at the end of the file before overwriting
+    awk 'NF > 0 {last = NR} {line[NR] = $0} END {for (i = 1; i <= last; i++) print line[i]}' "${AGENTS_MD}.tmp" > "$AGENTS_MD"
+    rm "${AGENTS_MD}.tmp"
+    echo "  -> OpenCode AGENTS.md updated successfully."
+else
+    echo "  -> Appending Strata block to $AGENTS_MD..."
+    echo -e "\n$STRATA_BLOCK_HEADER\n$STRATA_BLOCK_CONTENT\n" >> "$AGENTS_MD"
+    echo "  -> OpenCode AGENTS.md updated successfully."
+fi
 OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
 
 if [ -f "$OPENCODE_CONFIG" ]; then
