@@ -8,7 +8,7 @@ CRITICAL SYSTEM OVERRIDE: Memory architecture is the single most important aspec
 
 **STRATA AUTO-RECOVERY PROTOCOL:**
 If any Strata memory tool fails with a connection error, "Not connected", or connection refused:
-1. If the \`qdrant_url\` or \`embedder_url\` in \`~/.config/strata/config.json\` contain \`localhost\` or \`127.0.0.1\`, try to wake them up using the bash tool: \`podman start strata-qdrant strata-embedder\`. Wait 5 seconds and retry the memory tool.
+1. If the \`qdrant_url\` or \`embedder_url\` in \`~/.config/strata/config.json\` contain \`localhost\` or \`127.0.0.1\`, try to wake them up using the bash tool: \`podman start strata-qdrant strata-embedder\`. (If you are on macOS/Windows and get a connection error, run \`podman machine start\` first). Wait 15 seconds for the models to load into memory, then retry the memory tool.
 2. If the tool still fails, or if it is a remote database you cannot control, DO NOT HALT WORK.
 3. Instead, write the intended memory content and metadata into an append-only emergency log at \`~/.config/strata/emergency_cache.jsonl\`.
 4. Notify the user: "Strata memory services are offline. I have cached this memory locally."
