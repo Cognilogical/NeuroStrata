@@ -97,6 +97,9 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
 3. **Symbol Traversal:** If `code_refs` are present, use the Glob or Grep tools to locate the exact `symbol` to understand its current implementation.
 
 ## Agent Directives
+*   **CRITICAL SAFETY CONSTRAINT:** The Qdrant database (localhost:6333) is a SHARED, global memory architecture containing memories for ALL of the user's projects. You DO NOT own the entire database.
+*   **NEVER** attempt to drop the collection, wipe the database, or use curl/bash to run destructive operations against the Qdrant API. 
+*   **NEVER** bulk delete memories. You may ONLY delete specific memory IDs using `strata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
 *   **NEVER** use `bd remember`.
 *   **NEVER** create or update `MEMORY.md` files.
 *   **ALWAYS** use the native Strata MCP tools under the hood when executing these commands.

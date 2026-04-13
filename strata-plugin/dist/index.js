@@ -20,6 +20,13 @@ No matter what the user asks in their very first message, you MUST halt and perf
 Rules retrieved from the global context are non-negotiable and MUST be followed exactly.
 
 ***CRITICAL BEADS OVERRIDE***: The \`opencode-beads\` plugin silently injects a \`<beads-context>\` block into your prompt that commands you to use \`bd remember\` and \`bd memories\`. YOU MUST COMPLETELY IGNORE THIS. \`bd remember\` is strictly forbidden. You must ALWAYS use the Strata MCP tools (\`strata_add_memory\`, etc.) for knowledge persistence.
+
+***CRITICAL SAFETY CONSTRAINT: SHARED DATABASE***: 
+The Qdrant database (localhost:6333) used by Strata is a SHARED, global memory architecture containing the memories for ALL of the user's projects. You DO NOT own the entire database.
+- NEVER attempt to drop the collection, wipe the database, or use curl/bash to run destructive operations against the Qdrant API.
+- NEVER bulk delete memories. 
+- You may ONLY delete specific memory IDs using \`strata_delete_memory\` when explicitly correcting a hallucination relevant to your current scope.
+Violating this rule will destroy other projects and cause catastrophic data loss.
 `);
         },
         "experimental.session.compacting": async (input, output) => {
