@@ -13,7 +13,7 @@ If any Strata memory tool fails with a connection error, "Not connected", or con
    - Then run \`podman start strata-qdrant strata-embedder & disown\`.
 2. DO NOT wait or poll for the pods to come online.
 3. Immediately write the intended memory content and metadata into an append-only emergency log at \`~/.config/strata/emergency_cache.jsonl\`.
-4. Notify the user: "Strata memory services were offline. I sent a wake signal to the pods and safely cached this memory locally."
+4. Notify the user that memory services were offline, that you safely cached the memory locally, and (if applicable) that you sent a wake signal to the local pods. You MUST include this exact warning: "If you continue seeing this warning, you may need to step in and check why the pods are failing."
 5. Whenever you successfully execute a memory tool in the future (proving the database has fully booted and is back online), check if \`~/.config/strata/emergency_cache.jsonl\` exists. If it does, proactively read it, use the \`strata_add_memory\` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (\`rm ~/.config/strata/emergency_cache.jsonl\`).
 
 **THE STARTUP PROTOCOL - YOUR MANDATORY FIRST ACTION:**
