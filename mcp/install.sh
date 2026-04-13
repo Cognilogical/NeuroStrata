@@ -98,16 +98,28 @@ OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
 # Build and link the OpenCode TypeScript plugin
 echo "Setting up the Strata OpenCode plugin..."
 PLUGIN_DIR="$SCRIPT_DIR/../strata-plugin"
-if command -v npm &>/dev/null; then
-    if [ -d "$PLUGIN_DIR" ]; then
-        echo "  -> Found strata-plugin. Building and linking..."
-        (cd "$PLUGIN_DIR" && npm install && npm run build && npm link)
-        echo "  -> Plugin built and linked globally."
-    else
-        echo "  -> Notice: strata-plugin directory not found. Skipping plugin build."
-    fi
+INSTALL_PLUGIN_DIR="$HOME/.local/share/strata/plugin"
+
+if [ -d "$PLUGIN_DIR/dist" ] && [ -f "$PLUGIN_DIR/package.json" ]; then
+    echo "  -> Found local strata-plugin source. Copying to $INSTALL_PLUGIN_DIR..."
+    mkdir -p "$INSTALL_PLUGIN_DIR"
+    cp -r "$PLUGIN_DIR/dist" "$INSTALL_PLUGIN_DIR/"
+    cp "$PLUGIN_DIR/package.json" "$INSTALL_PLUGIN_DIR/"
 else
-    echo "  -> Warning: npm not found. Skipping OpenCode plugin installation."
+    # 3. Production Mode: Download pre-compiled plugin tarball from GitHub Releases
+    PLUGIN_URL="https://github.com/$GITHUB_REPO/releases/latest/download/opencode-strata.tgz"
+    echo "  -> Downloading pre-compiled plugin from $PLUGIN_URL..."
+    
+    mkdir -p "$INSTALL_PLUGIN_DIR"
+    if curl -f -L "$PLUGIN_URL" -o "$INSTALL_PLUGIN_DIR/plugin.tgz"; then
+        tar -xzf "$INSTALL_PLUGIN_DIR/plugin.tgz" -C "$INSTALL_PLUGIN_DIR" --strip-components=1
+        rm "$INSTALL_PLUGIN_DIR/plugin.tgz"
+        echo "  -> Plugin downloaded and extracted successfully."
+    else
+        echo "  -> Error: Failed to download pre-compiled plugin tarball."
+        echo "     If you are compiling from source, please run ./build.sh first."
+        exit 1
+    fi
 fi
 
 # Patch OpenCode configuration
@@ -115,7 +127,7 @@ echo "Patching OpenCode configuration..."
 if [ -f "$OPENCODE_CONFIG" ]; then
     if command -v jq &>/dev/null; then
         # Safely update JSON using jq
-        jq '.mcp |= (. // {}) | .mcp.strata = {"type": "local", "command": ["'"$HOME"'/.local/bin/strata-mcp"]} | .plugin |= (. // []) | if (.plugin | index("opencode-strata") | not) then .plugin += ["opencode-strata"] else . end' "$OPENCODE_CONFIG" > "${OPENCODE_CONFIG}.tmp" && mv "${OPENCODE_CONFIG}.tmp" "$OPENCODE_CONFIG"
+        jq '.mcp |= (. // {}) | .mcp.strata = {"type": "local", "command": ["'"$HOME"'/.local/bin/strata-mcp"]} | .plugin |= (. // []) | if (.plugin | index("'"$INSTALL_PLUGIN_DIR"'") | not) then .plugin = (.plugin | map(select(. != "opencode-strata"))) + ["'"$INSTALL_PLUGIN_DIR"'"] else . end' "$OPENCODE_CONFIG" > "${OPENCODE_CONFIG}.tmp" && mv "${OPENCODE_CONFIG}.tmp" "$OPENCODE_CONFIG"
         echo "  -> OpenCode configuration updated successfully using jq."
     elif command -v node &>/dev/null; then
         # Fallback to Node.js
@@ -123,15 +135,18 @@ if [ -f "$OPENCODE_CONFIG" ]; then
 const fs = require('fs');
 const path = require('path');
 const filepath = process.argv[1];
+const pluginPath = process.argv[2];
 let data = JSON.parse(fs.readFileSync(filepath, 'utf8'));
 data.mcp = data.mcp || {};
 data.mcp.strata = { type: 'local', command: [path.join(process.env.HOME, '.local/bin/strata-mcp')] };
 data.plugin = data.plugin || [];
-if (!data.plugin.includes('opencode-strata')) {
-    data.plugin.push('opencode-strata');
+// Remove legacy global npm link name if it exists
+data.plugin = data.plugin.filter(p => p !== 'opencode-strata');
+if (!data.plugin.includes(pluginPath)) {
+    data.plugin.push(pluginPath);
 }
 fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
-" "$OPENCODE_CONFIG"
+" "$OPENCODE_CONFIG" "$INSTALL_PLUGIN_DIR"
         echo "  -> OpenCode configuration updated successfully using Node.js fallback."
     else
         echo "  -> Notice: Neither 'jq' nor 'node' were found."
