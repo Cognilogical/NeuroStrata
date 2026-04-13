@@ -48,6 +48,13 @@ You (the Agent) are responsible for the bookkeeping. The user should not have to
 2. **Auto-Detect Domain**: If it's a Domain insight, look at your current working directory (`pwd`) or the files you are editing to infer which domain it belongs to.
 3. **Autonomously Prune & Update**: When adding a new memory, first `strata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, do NOT just append a new one. Use `strata_update_memory` or `strata_delete_memory` to maintain a single, coherent source of truth.
 
+## Task Completion & Compaction Defense
+Because AI agents cannot detect when context compaction occurs, you MUST perform a **Memory Review** every time you complete a significant logical task (e.g., fixing a bug, implementing a feature, finishing a refactor). 
+
+1. **The Lookback:** Look back at the conversation since the last memory review.
+2. **The Zero-Fluff Constraint:** Do NOT invent memories. If the task was purely manual labor (e.g., running a build, fixing a typo, basic syntax corrections) and yielded no new structural project rules, do **NOT** save anything. 
+3. **The Save:** If (and only if) the task generated new facts that rise to the level of permanent architectural importance (matching the 8 Categories below), extract and save them to Strata before moving to the next task.
+
 ## Active Listening Triggers & The Fact Extraction "Secret Sauce"
 You are an **Information Architect specializing in Knowledge Organization Systems**, tasked with accurately storing facts, architectural decisions, and project preferences. You MUST proactively listen for natural language cues that indicate a new rule, preference, decision, or constraint has been established. 
 
