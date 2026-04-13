@@ -35,7 +35,7 @@ const STRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="currentC
 
 class StrataView extends ItemView {
     plugin: StrataPlugin;
-    currentNamespace: string = 'fish';
+    currentNamespace: string = 'global';
     memoriesContainer: HTMLElement;
     allCurrentPoints: any[] = [];
     searchInput: HTMLInputElement;
@@ -44,6 +44,7 @@ class StrataView extends ItemView {
     addTextarea: HTMLTextAreaElement;
     refInput: HTMLInputElement;
     linesInput: HTMLInputElement;
+    namespaceSelect: HTMLSelectElement;
 
     constructor(leaf: WorkspaceLeaf, plugin: StrataPlugin) {
         super(leaf);
@@ -79,14 +80,9 @@ class StrataView extends ItemView {
         const controls = container.createDiv({ cls: "strata-header-controls" });
         controls.style.flexWrap = "wrap";
         
-        const select = controls.createEl("select", { cls: "strata-select" });
-        const namespaces = ['fish', 'global', 'system_architecture'];
-        namespaces.forEach(ns => {
-            const option = select.createEl("option", { text: ns, value: ns });
-            if (ns === this.currentNamespace) option.selected = true;
-        });
-
-        select.onchange = (e) => {
+        this.namespaceSelect = controls.createEl("select", { cls: "strata-select" });
+        
+        this.namespaceSelect.onchange = (e) => {
             this.currentNamespace = (e.target as HTMLSelectElement).value;
             this.loadMemories();
         };
@@ -234,12 +230,14 @@ class StrataView extends ItemView {
             saveNewBtn.disabled = false;
         };
 
-        refreshBtn.onclick = () => {
+        refreshBtn.onclick = async () => {
             this.searchInput.value = '';
+            await this.loadNamespaces();
             this.loadMemories();
         };
 
         this.memoriesContainer = container.createDiv();
+        await this.loadNamespaces();
         await this.loadMemories();
     }
 
@@ -251,6 +249,54 @@ class StrataView extends ItemView {
         this.refInput.value = referencePath;
         this.linesInput.value = linesStr;
         this.addTextarea.focus();
+    }
+
+    async loadNamespaces() {
+        try {
+            const res = await fetch(`${this.qdrantPointsUrl}/scroll`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    limit: 10000,
+                    with_payload: true
+                })
+            });
+            
+            if (!res.ok) throw new Error("Failed to fetch points");
+            const data = await res.json();
+            
+            const uniqueNamespaces = new Set<string>();
+            uniqueNamespaces.add('global'); // Always ensure 'global' exists
+            
+            if (data.result && data.result.points) {
+                data.result.points.forEach((p: any) => {
+                    if (p.payload && p.payload.user_id) {
+                        uniqueNamespaces.add(p.payload.user_id);
+                    }
+                });
+            }
+            
+            const namespaces = Array.from(uniqueNamespaces).sort();
+            
+            this.namespaceSelect.empty();
+            namespaces.forEach(ns => {
+                const option = this.namespaceSelect.createEl("option", { text: ns, value: ns });
+                if (ns === this.currentNamespace) {
+                    option.selected = true;
+                }
+            });
+            
+            if (!namespaces.includes(this.currentNamespace)) {
+                this.currentNamespace = 'global';
+                this.namespaceSelect.value = 'global';
+            }
+            
+        } catch (e) {
+            console.error("Strata: Failed to load namespaces from Qdrant", e);
+            this.namespaceSelect.empty();
+            this.namespaceSelect.createEl("option", { text: "global", value: "global" });
+            this.currentNamespace = 'global';
+        }
     }
 
     async loadMemories() {
