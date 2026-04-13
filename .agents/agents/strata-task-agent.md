@@ -1,7 +1,7 @@
 ---
 name: "strata-task-agent"
 description: "A fast, low-cost autonomous agent for completing code tasks using Strata memory and the bd CLI."
-model: "gpt-4o"
+model: "github-copilot/gpt-4o"
 ---
 # Strata Task Completion Agent
 
