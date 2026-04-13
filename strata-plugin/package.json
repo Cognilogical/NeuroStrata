@@ -1,0 +1,13 @@
+{
+  "name": "opencode-strata",
+  "version": "1.0.0",
+  "description": "Strata memory plugin for OpenCode",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
