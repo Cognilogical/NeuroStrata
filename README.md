@@ -117,13 +117,19 @@ Strata is completely tool-agnostic. It integrates with the standard `~/.agents/`
 
 ### Installation
 
-Clone the repository and run the automated installer. The installer uses a pre-compiled native binary, sets up global symlinks, and patches OpenCode's configuration automatically—**no Go toolchain required**. If you need to build from source for a different architecture, simply run `./build.sh` before `./install.sh`.
+Clone the repository and run the automated installer. The installer uses a pre-compiled native binary, sets up global symlinks, builds the native OpenCode TypeScript plugin, and patches OpenCode's configuration automatically—**no Go toolchain required**. If you need to build from source for a different architecture, simply run `./build.sh` before `./install.sh`.
 
 ```bash
 git clone https://github.com/your-username/strata.git ~/Documents/strata
 cd ~/Documents/strata/mcp
 ./install.sh
 ```
+
+**What the installer does:**
+1. Installs the Go `strata-mcp` binary to `~/.local/bin/strata-mcp`.
+2. Links the universal `SKILL.md` to `~/.agents/skills/strata`.
+3. Builds and globally links the `opencode-strata` TypeScript plugin.
+4. Registers both the MCP server and the plugin in `~/.config/opencode/opencode.json`.
 
 ### Configuration
 The installer creates a default configuration at `~/.config/strata/config.json`. Modify this to point to your specific local LLM and database ports:

@@ -15,7 +15,7 @@ This is the turnkey infrastructure package that deploys the "Pointer-Wiki Hybrid
 - **Containers:** Strictly uses `podman-compose` (Docker is banned by global rule).
 - **Vector Database:** Uses Qdrant for fast, local embedding retrieval (via `strata`).
 - **Local Models:** Uses Ollama with `nomic-embed-text` for embeddings and a lightweight model (like `llama3.2:1b`) for local inference to ensure complete privacy and offline capability.
-- **Tooling:** Installs `strataai` (Python), `graphify-cli` (Python) for codebase spatial mapping, and `beads` (Go) for issue tracking.
+- **Tooling:** Installs `strata-mcp` (Go) for memory persistence, the `strata-plugin` (TypeScript) to enforce Strata rules against OpenCode context compaction, `graphify-cli` (Python) for codebase spatial mapping, and `beads` (Go) for issue tracking.
 
 ## Philosophy
 To prevent "Context Bloat" (legacy markdown files) and "Fragmented Amnesia" (pure RAG), the installer provisions a system where AI agents store compact pointers in the Vector DB (Tier 1/3) that point to synthesized narrative markdown files in the repository (Tier 2).
