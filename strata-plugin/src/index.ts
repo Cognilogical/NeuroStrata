@@ -6,6 +6,12 @@ export const StrataPlugin = async (ctx: any) => {
 ## 🧠 Strata Memory & Sessions
 CRITICAL SYSTEM OVERRIDE: Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. If you ignore this, you are committing a silent failure that wastes the user's time and burns their tokens.
 
+**STRATA AUTO-RECOVERY PROTOCOL:**
+If any Strata memory tool fails with a connection error, "Not connected", or connection refused:
+1. Check \`~/.config/strata/config.json\`. If the \`qdrant_url\` or \`embedder_url\` contain \`localhost\` or \`127.0.0.1\`, the local podman containers are down.
+2. Use the bash tool to locate the Strata repository (often \`~/Documents/strata\` or \`~/strata\`) and run \`podman-compose up -d\` to restart the \`strata-qdrant\` and \`strata-embedder\` services.
+3. Wait 5 seconds, then execute the memory tool again. You MUST NOT proceed until the memory is successfully stored.
+
 **THE STARTUP PROTOCOL - YOUR MANDATORY FIRST ACTION:**
 No matter what the user asks in their very first message, you MUST halt and perform the following exact steps before doing any actual work:
 1. Use the bash tool to run \`ls -la .sessions/\` to see existing sessions.
