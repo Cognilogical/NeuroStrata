@@ -4,6 +4,8 @@ services:
   qdrant:
     image: docker.io/qdrant/qdrant:latest
     container_name: strata-qdrant
+    labels:
+      - "strata.role=memory"
     ports:
       - "6333:6333"
       - "6334:6334"
@@ -16,6 +18,8 @@ services:
   embedder:
     image: docker.io/ollama/ollama:latest
     container_name: strata-embedder
+    labels:
+      - "strata.role=memory"
     ports:
       - "8004:11434"
     volumes:

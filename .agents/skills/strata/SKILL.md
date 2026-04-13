@@ -79,7 +79,7 @@ Do not wait for the user to explicitly say "remember". Trigger the bookkeeping r
 
 ## Interactive Sessions & Topic Drift
 Ad-hoc architectural discussions generate vital context that evaporates when the chat closes.
-1. **Startup Protocol:** When a new tool session begins, YOUR MANDATORY FIRST ACTION is to check the `.sessions/` directory and ask the user: "Would you like to resume an existing Strata session or start a new one? Please provide a name." Do not answer their initial query until a session name is established.
+1. **Startup Protocol:** When a new tool session begins, YOUR MANDATORY FIRST ACTION is to check the `.sessions/` directory and use the \`question\` tool to present a picker interface listing recent sessions, asking: "Which session would you like to resume, or would you like to create a new one?". Do not answer their initial query until a session is established.
 2. **Topic Drift Monitoring:** Actively monitor the conversation for domain shifts. If detected, pause and ask: "I notice we are shifting topics. Would you like to summarize and save the current Strata session and start a new one?"
 3. **Visualization Updates:** Whenever a Strata session concludes, or massive architectural changes are made, run `strata_generate_canvas` to ensure the user's Obsidian graph is up to date.
 
