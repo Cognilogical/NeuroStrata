@@ -10,12 +10,11 @@ CRITICAL SYSTEM OVERRIDE: Memory architecture is the single most important aspec
 If any Strata memory tool fails with a connection error, "Not connected", or connection refused:
 1. Check \`~/.config/strata/config.json\`. If the \`qdrant_url\` or \`embedder_url\` contain \`localhost\` or \`127.0.0.1\`, the local podman containers are down. Attempt to wake them using the bash tool:
    - Run \`podman machine start\` (only needed on macOS/Windows, ignore if it fails on Linux).
-   - Then run \`podman start strata-qdrant strata-embedder\`.
-   - Wait 15 seconds for the models to load into memory, then retry the memory tool.
-2. If the tool STILL fails after attempting recovery (or if you are using a remote database that you cannot control), DO NOT HALT WORK.
-3. Instead, write the intended memory content and metadata into an append-only emergency log at \`~/.config/strata/emergency_cache.jsonl\`.
-4. Notify the user: "Strata memory services were offline. I attempted recovery but it failed, so I safely cached this memory locally."
-5. Whenever you successfully execute a memory tool in the future (proving the database is back online), check if \`~/.config/strata/emergency_cache.jsonl\` exists. If it does, proactively read it, use the \`strata_add_memory\` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (\`rm ~/.config/strata/emergency_cache.jsonl\`).
+   - Then run \`podman start strata-qdrant strata-embedder & disown\`.
+2. DO NOT wait or poll for the pods to come online.
+3. Immediately write the intended memory content and metadata into an append-only emergency log at \`~/.config/strata/emergency_cache.jsonl\`.
+4. Notify the user: "Strata memory services were offline. I sent a wake signal to the pods and safely cached this memory locally."
+5. Whenever you successfully execute a memory tool in the future (proving the database has fully booted and is back online), check if \`~/.config/strata/emergency_cache.jsonl\` exists. If it does, proactively read it, use the \`strata_add_memory\` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (\`rm ~/.config/strata/emergency_cache.jsonl\`).
 
 **THE STARTUP PROTOCOL - YOUR MANDATORY FIRST ACTION:**
 No matter what the user asks in their very first message, you MUST halt and perform the following exact steps before doing any actual work:
