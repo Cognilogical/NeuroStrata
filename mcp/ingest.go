@@ -40,7 +40,7 @@ func IngestDirectory(ctx context.Context, dirPath, userID string) (int, error) {
 
 			_, err := UpsertPoint(ctx, "", chunk, userID, metadata)
 			if err != nil {
-				fmt.Printf("Warning: failed to ingest chunk from %s: %v\n", path, err)
+				fmt.Fprintf(os.Stderr, "Warning: failed to ingest chunk from %s: %v\n", path, err)
 				continue
 			}
 			count++

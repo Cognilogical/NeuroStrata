@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"net/http"
 )
 
@@ -97,8 +98,8 @@ func startHTTPServer() {
 		json.NewEncoder(w).Encode(map[string]interface{}{"results": results})
 	})
 
-	fmt.Printf("Strata REST API listening on :%s\n", cfg.HTTPPort)
+	fmt.Fprintf(os.Stderr, "Strata REST API listening on :%s\n", cfg.HTTPPort)
 	if err := http.ListenAndServe(":"+cfg.HTTPPort, mux); err != nil {
-		fmt.Printf("HTTP Server error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "HTTP Server error: %v\n", err)
 	}
 }
