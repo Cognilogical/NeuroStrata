@@ -1,0 +1,54 @@
+name: "Deploy v1.0.0 (Nightly)"
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Strata MCP & Plugin
+        run: |
+          chmod +x ./mcp/build.sh
+          
+          # Install dependencies for the typescript plugin
+          cd strata-plugin && npm ci && cd ..
+          
+          # Execute the build script
+          ./mcp/build.sh
+          
+          # Ensure consistent asset names
+          if [ -f dist/opencode-strata-1.0.0.tgz ]; then
+            mv dist/opencode-strata-1.0.0.tgz dist/opencode-strata.tgz
+          fi
+
+      - name: Clobber v1.0.0 Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.0.0 \
+            bin/strata-mcp-linux-amd64 \
+            bin/strata-mcp-linux-arm64 \
+            bin/strata-mcp-darwin-amd64 \
+            bin/strata-mcp-darwin-arm64 \
+            bin/strata-mcp-windows-amd64.exe \
+            dist/opencode-strata.tgz \
+            --clobber
