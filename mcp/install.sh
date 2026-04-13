@@ -71,7 +71,12 @@ else
     echo "  -> Downloaded SKILL.md directly from GitHub to ~/.agents/skills/strata"
 fi
 
-# Config setup
+# Symlink agent
+mkdir -p "$HOME/.agents/agents"
+if [ -d "$SCRIPT_DIR/../.agents/agents" ]; then
+    ln -sfn "$SCRIPT_DIR/../.agents/agents" "$HOME/.agents/agents/strata"
+    echo "  -> Linked local agents to ~/.agents/agents/strata"
+fi
 CONFIG_DIR="$HOME/.config/strata"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 echo "Setting up configuration at $CONFIG_FILE..."
