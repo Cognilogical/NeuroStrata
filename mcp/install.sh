@@ -93,15 +93,32 @@ else
   echo "Configuration already exists."
 fi
 
+OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
+
+# Build and link the OpenCode TypeScript plugin
+echo "Setting up the Strata OpenCode plugin..."
+PLUGIN_DIR="$SCRIPT_DIR/../strata-plugin"
+if command -v npm &>/dev/null; then
+    if [ -d "$PLUGIN_DIR" ]; then
+        echo "  -> Found strata-plugin. Building and linking..."
+        (cd "$PLUGIN_DIR" && npm install && npm run build && npm link)
+        echo "  -> Plugin built and linked globally."
+    else
+        echo "  -> Notice: strata-plugin directory not found. Skipping plugin build."
+    fi
+else
+    echo "  -> Warning: npm not found. Skipping OpenCode plugin installation."
+fi
+
 # Patch OpenCode configuration
 echo "Patching OpenCode configuration..."
 if [ -f "$OPENCODE_CONFIG" ]; then
     if command -v jq &>/dev/null; then
-        # Safely update JSON using jq (standard bash tool)
-        jq '.mcp |= (. // {}) | .mcp.strata = {"type": "local", "command": ["'"$HOME"'/.local/bin/strata-mcp"]}' "$OPENCODE_CONFIG" > "${OPENCODE_CONFIG}.tmp" && mv "${OPENCODE_CONFIG}.tmp" "$OPENCODE_CONFIG"
+        # Safely update JSON using jq
+        jq '.mcp |= (. // {}) | .mcp.strata = {"type": "local", "command": ["'"$HOME"'/.local/bin/strata-mcp"]} | .plugin |= (. // []) | if (.plugin | index("opencode-strata") | not) then .plugin += ["opencode-strata"] else . end' "$OPENCODE_CONFIG" > "${OPENCODE_CONFIG}.tmp" && mv "${OPENCODE_CONFIG}.tmp" "$OPENCODE_CONFIG"
         echo "  -> OpenCode configuration updated successfully using jq."
     elif command -v node &>/dev/null; then
-        # Fallback to Node.js (highly likely to be installed since AI agents use npx for tools like context7)
+        # Fallback to Node.js
         node -e "
 const fs = require('fs');
 const path = require('path');
@@ -109,13 +126,16 @@ const filepath = process.argv[1];
 let data = JSON.parse(fs.readFileSync(filepath, 'utf8'));
 data.mcp = data.mcp || {};
 data.mcp.strata = { type: 'local', command: [path.join(process.env.HOME, '.local/bin/strata-mcp')] };
+data.plugin = data.plugin || [];
+if (!data.plugin.includes('opencode-strata')) {
+    data.plugin.push('opencode-strata');
+}
 fs.writeFileSync(filepath, JSON.stringify(data, null, 2));
 " "$OPENCODE_CONFIG"
         echo "  -> OpenCode configuration updated successfully using Node.js fallback."
     else
         echo "  -> Notice: Neither 'jq' nor 'node' were found."
-        echo "     Please manually add the following to your $OPENCODE_CONFIG under 'mcp':"
-        echo "     \"strata\": { \"type\": \"local\", \"command\": [\"$HOME/.local/bin/strata-mcp\"] }"
+        echo "     Please manually add the MCP configuration to $OPENCODE_CONFIG."
     fi
 else
     echo "  -> Warning: $OPENCODE_CONFIG not found."
