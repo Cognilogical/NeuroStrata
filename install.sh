@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -e
-
 echo "==============================================="
 echo "  Strata: 3-Tier Memory Installer        "
 echo "==============================================="
+
+
 
 # 1. Check for Podman
 if ! command -v podman &> /dev/null; then
@@ -19,7 +20,7 @@ fi
 
 # 3. Install graphify (Codebase Spatial Mapping)
 echo "Installing graphify..."
-pip3 install graphify-cli --user || echo "Note: graphify-cli package may need specific repo access."
+pip install pipx && pipx install graphify-cli || echo "Note: graphify-cli package may need specific repo access."
 
 # 4. Install beads (Issue Tracker)
 echo "Installing beads issue tracker..."
@@ -32,7 +33,7 @@ fi
 
 # 5. Pull Ollama models (Embedder & Lightweight LLM)
 echo "Starting local infrastructure to pull models..."
-podman-compose up -d
+podman rm -f strata-qdrant strata-embedder || true && podman-compose up -d
 
 echo "Waiting for Ollama to start..."
 sleep 10
@@ -42,6 +43,27 @@ podman exec -it ollama ollama pull nomic-embed-text
 
 echo "Pulling lightweight local LLM (llama3.2:1b)..."
 podman exec -it ollama ollama pull llama3.2:1b
+
+# 6. Install Go MCP Server
+echo "Installing Core MCP Server..."
+if [ -f "./mcp/install.sh" ]; then
+    bash ./mcp/install.sh
+else
+    echo "Warning: ./mcp/install.sh not found."
+fi
+
+# 7. Client Discovery and Plugin Setup
+echo "Detecting available client environments..."
+if command -v opencode &> /dev/null || [ -d "$HOME/.config/opencode" ]; then
+    echo "OpenCode detected. Running OpenCode plugin setup..."
+    if [ -f "./plugins/opencode/install.sh" ]; then
+        bash ./plugins/opencode/install.sh
+    fi
+fi
+
+if command -v claude &> /dev/null || [ -d "$HOME/.claude" ]; then
+    echo "Claude Code detected. No specific setup needed currently."
+fi
 
 echo "==============================================="
 echo "  Installation Complete!                       "

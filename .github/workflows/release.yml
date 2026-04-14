@@ -25,12 +25,12 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Build Strata MCP & Plugin
+      - name: Build Strata Unified Core + Shims
         run: |
           chmod +x ./mcp/build.sh
           
           # Install dependencies for the typescript plugin
-          cd strata-plugin && npm ci && cd ..
+          cd plugins/opencode/strata-plugin && npm ci && cd ../..
           
           # Execute the build script
           ./mcp/build.sh
