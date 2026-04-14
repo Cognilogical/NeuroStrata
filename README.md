@@ -124,8 +124,8 @@ Strata is completely tool-agnostic. It integrates with the standard `~/.agents/`
 1. **Embedder:** An OpenAI-compatible embedding endpoint (e.g., local Llama.cpp/Ollama on `localhost:8004`, or a hosted provider like OpenAI).
 2. **Vector Database:** A Qdrant instance (running locally on `localhost:6333` or via Qdrant Cloud).
 
-#### 💡 Optional (But Recommended) Agent Tooling
-While Strata functions perfectly as a standalone memory drive, the automated installers will attempt to provision the following CLI tools to give your AI agents the best possible environment:
+#### 💡 Bundled Agent Tooling
+To ensure your AI agents have the best possible environment out of the box, the automated installers will automatically provision the following CLI tools alongside Strata:
 * **[Graphify](https://github.com/graphify/graphify-cli):** Used by agents for codebase spatial mapping.
 * **[Beads (bd)](https://github.com/beads/bd):** A local, git-backed issue tracker used by agents for task coordination. 
 
