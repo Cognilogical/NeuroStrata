@@ -66,9 +66,22 @@ if ((Get-Command opencode -ErrorAction SilentlyContinue) -or (Test-Path $opencod
     }
 }
 
+$openclawConfigDir = Join-Path $env:USERPROFILE ".config\openclaw"
+if ((Get-Command openclaw -ErrorAction SilentlyContinue) -or (Test-Path $openclawConfigDir)) {
+    Write-Host "OpenClaw detected. Running OpenClaw plugin setup..."
+    $pluginInstallScript = Join-Path $PSScriptRoot "plugins\openclaw\install.ps1"
+    if (Test-Path $pluginInstallScript) {
+        & $pluginInstallScript
+    }
+}
+
 $claudeConfigDir = Join-Path $env:USERPROFILE ".claude"
 if ((Get-Command claude -ErrorAction SilentlyContinue) -or (Test-Path $claudeConfigDir)) {
-    Write-Host "Claude Code detected. No specific setup needed currently."
+    Write-Host "Claude Code detected. Running Claude plugin setup..."
+    $pluginInstallScript = Join-Path $PSScriptRoot "plugins\claude\install.ps1"
+    if (Test-Path $pluginInstallScript) {
+        & $pluginInstallScript
+    }
 }
 
 Write-Host "==============================================="

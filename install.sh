@@ -61,8 +61,18 @@ if command -v opencode &> /dev/null || [ -d "$HOME/.config/opencode" ]; then
     fi
 fi
 
+if command -v openclaw &> /dev/null || [ -d "$HOME/.config/openclaw" ]; then
+    echo "OpenClaw detected. Running OpenClaw plugin setup..."
+    if [ -f "./plugins/openclaw/install.sh" ]; then
+        bash ./plugins/openclaw/install.sh
+    fi
+fi
+
 if command -v claude &> /dev/null || [ -d "$HOME/.claude" ]; then
-    echo "Claude Code detected. No specific setup needed currently."
+    echo "Claude Code detected. Running Claude plugin setup..."
+    if [ -f "./plugins/claude/install.sh" ]; then
+        bash ./plugins/claude/install.sh
+    fi
 fi
 
 echo "==============================================="
