@@ -21,6 +21,10 @@ func addMemoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	if err := validateMemoryPaths(userID, args["metadata"]); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	id, err := UpsertPoint(opCtx, "", content, userID, args["metadata"])
 	if err != nil {
 		return nil, err
@@ -54,7 +58,12 @@ func searchMemoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 		id, _ := p["id"].(string)
 		payload, _ := p["payload"].(map[string]interface{})
 		data, _ := payload["data"].(string)
-		out += fmt.Sprintf("- [ID: %s] %s\n", id, data)
+
+		if userID == "global" {
+			out += fmt.Sprintf("- [🌍 GLOBAL DIRECTIVE] [ID: %s] %s\n", id, data)
+		} else {
+			out += fmt.Sprintf("- [🛑 CRITICAL PROJECT RULE] [ID: %s] %s\n", id, data)
+		}
 	}
 	return mcp.NewToolResultText(out), nil
 }
@@ -77,6 +86,10 @@ func updateMemoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 
 	opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+
+	if err := validateMemoryPaths(userID, args["metadata"]); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	_, err = UpsertPoint(opCtx, id, content, userID, args["metadata"])
 	if err != nil {

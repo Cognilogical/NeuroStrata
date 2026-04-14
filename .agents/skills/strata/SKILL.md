@@ -15,7 +15,7 @@ Strata is the standard operating protocol for persisting and retrieving knowledg
 
 ## Available MCP Tools
 Strata provides the following native MCP tools that you MUST use to manage the system's memory:
-* `strata_add_memory`: Add a new architectural rule or constraint.
+* `strata_add_memory`: Add a new architectural rule or constraint. If scoped `user_id=global`, file paths in metadata must point to `~/.config/strata/global/`.
 * `strata_search_memory`: Search for existing rules before writing code or making architectural decisions.
 * `strata_update_memory`: Update an existing memory by ID. Use this when a rule has evolved or was initially saved with hallucinations.
 * `strata_delete_memory`: Delete a memory by ID. Use this to prune obsolete, duplicated, or incorrect rules.
@@ -106,6 +106,7 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
 3. **Symbol Traversal:** If `code_refs` are present, use the Glob or Grep tools to locate the exact `symbol` to understand its current implementation.
 
 ## Agent Directives
+*   **CRITICAL RULE ENFORCEMENT:** When you retrieve memories using `strata_search_memory`, you will see them prefixed with `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`. These are **absolute, non-negotiable constraints**. You MUST follow them perfectly. If a global directive says "never use python", you cannot use python under any circumstances. Do not ignore these prefixes.
 *   **CRITICAL SAFETY CONSTRAINT:** The Qdrant database (localhost:6333) is a SHARED, global memory architecture containing memories for ALL of the user's projects. You DO NOT own the entire database.
 *   **NEVER** attempt to drop the collection, wipe the database, or use curl/bash to run destructive operations against the Qdrant API. 
 *   **NEVER** bulk delete memories. You may ONLY delete specific memory IDs using `strata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
