@@ -90,6 +90,15 @@ graph TD
 
 ---
 
+## 📝 Strata Session Logs: The Safety Net
+
+To prevent the loss of critical architectural decisions made during ad-hoc conversations, Strata mandates the use of **Strata Session Logs**. 
+
+Instead of treating chat sessions as ephemeral, the system forces the AI to create and append to text files in the `.sessions/` directory. 
+* **The Nuance:** We keep periodic logs of the session text so that if an agent misses extracting a crucial rule into the Qdrant database during real-time interaction, the conversation history is not lost. The human (or the Strata system itself later) can go back, read the session log, and harvest those missed rules for permanent vector memory.
+
+---
+
 ## ✨ Features: Transparent & Autonomous Memory
 
 > 💡 **Want to see Strata in action?** Check out the [Strata UI User Guide](docs/UI_GUIDE.md) for screenshots of the Obsidian Sidebar Inspector, Right-Click Context Tools, and the auto-generated Visual MemorySpace Canvas.
