@@ -126,7 +126,7 @@ Strata is completely tool-agnostic. It integrates with the standard `~/.agents/`
 
 ### Installation
 
-Clone the repository and run the automated installer. The installer uses a pre-compiled native binary, sets up global symlinks, builds the native OpenCode TypeScript plugin, and patches OpenCode's configuration automatically—**no Go toolchain required**. If you need to build from source for a different architecture, simply run `./build.sh` before `./install.sh`.
+Clone the repository and run the automated installer. The installer uses a pre-compiled native binary, sets up global symlinks, builds the native TypeScript plugin for compatible clients (like OpenCode), and patches the client's configuration automatically—**no Go toolchain required**. If you need to build from source for a different architecture, simply run `./build.sh` before `./install.sh`.
 
 ```bash
 git clone https://github.com/your-username/strata.git ~/Documents/strata
@@ -138,7 +138,7 @@ cd ~/Documents/strata/mcp
 1. Installs the Go `strata-mcp` binary to `~/.local/bin/strata-mcp`.
 2. Links the universal `SKILL.md` to `~/.agents/skills/strata`.
 3. Builds and globally links the `opencode-strata` TypeScript plugin.
-4. Registers both the MCP server and the plugin in `~/.config/opencode/opencode.json`.
+4. Registers both the MCP server and the plugin in your client's local configuration (e.g. `~/.config/opencode/opencode.json`).
 
 ### Configuration
 The installer creates a default configuration at `~/.config/strata/config.json`. Modify this to point to your specific local LLM and database ports:
@@ -154,11 +154,11 @@ The installer creates a default configuration at `~/.config/strata/config.json`.
 }
 ```
 
-### OpenCode Agent Configuration
+### Sub-Agent Configuration
 
-The Strata installation includes the `strata-task-agent`. To ensure this agent runs optimally, you should configure it to use a fast, low-cost, code-oriented model in your `~/.config/opencode/opencode.json` file. 
+The Strata installation includes the `strata-task-agent`. To ensure this agent runs optimally, you should configure your AI client to map this sub-agent to a fast, low-cost, code-oriented model.
 
-Add the `agent` block below to map `strata-task-agent` to a provider model of your choice (e.g., `github-copilot/gpt-4o`, `anthropic/claude-3-haiku-20240307`, or `openai/gpt-4o-mini`):
+For example, if you are using OpenCode, add the `agent` block below to `~/.config/opencode/opencode.json`:
 
 ```json
   "agent": {
