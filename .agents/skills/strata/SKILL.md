@@ -107,6 +107,7 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
 
 ## Agent Directives
 *   **CRITICAL RULE ENFORCEMENT:** When you retrieve memories using `strata_search_memory`, you will see them prefixed with `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`. These are **absolute, non-negotiable constraints**. You MUST follow them perfectly. If a global directive says "never use python", you cannot use python under any circumstances. Do not ignore these prefixes.
+*   **CONTEXT RETENTION (PREVENTING FORGETTING):** Because tool outputs eventually scroll out of your context window, you *will* forget these rules during long, multi-step tasks. When you retrieve a `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`, you MUST anchor it in your working memory. Restate the core constraints in your internal thought process, add them as constraints to your active `todowrite` task list, or proactively re-query `strata_search_memory` if the conversation gets long.
 *   **CRITICAL SAFETY CONSTRAINT:** The Qdrant database (localhost:6333) is a SHARED, global memory architecture containing memories for ALL of the user's projects. You DO NOT own the entire database.
 *   **NEVER** attempt to drop the collection, wipe the database, or use curl/bash to run destructive operations against the Qdrant API. 
 *   **NEVER** bulk delete memories. You may ONLY delete specific memory IDs using `strata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
