@@ -129,7 +129,7 @@ To ensure your AI agents have the best possible environment out of the box, the 
 * **[Graphify](https://github.com/graphify/graphify-cli):** Used by agents for codebase spatial mapping.
 * **[Beads (bd)](https://github.com/beads/bd):** A local, git-backed issue tracker used by agents for task coordination. 
 
-If you wish to visually monitor what the agents are doing with the `bd` CLI, you can optionally install the human-facing **[BeadBoard Dashboard](https://github.com/beads/beadboard)** alongside it.
+If you wish to visually monitor what the agents are doing with the `bd` CLI, you can optionally install the **[BeadBoard Dashboard](https://github.com/beads/beadboard)** alongside it.
 
 ### Installation
 
