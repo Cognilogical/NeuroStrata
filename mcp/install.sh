@@ -31,7 +31,7 @@ echo "Installing Strata Go MCP Server ($BINARY_NAME)..."
 
 # 1. Detect if we are installing from source (development mode)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_BIN="$SCRIPT_DIR/../bin/strata-mcp"
+LOCAL_BIN="$SCRIPT_DIR/../bin/$BINARY_NAME"
 LOCAL_SKILL_DIR="$SCRIPT_DIR/../.agents/skills/strata"
 
 if [ -f "$LOCAL_BIN" ]; then

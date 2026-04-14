@@ -15,9 +15,9 @@ Strata is the standard operating protocol for persisting and retrieving knowledg
 
 ## Available MCP Tools
 Strata provides the following native MCP tools that you MUST use to manage the system's memory:
-* `strata_add_memory`: Add a new architectural rule or constraint. If scoped `user_id=global`, file paths in metadata must point to `~/.config/strata/global/`.
+* `strata_add_memory`: Add a new architectural rule, project pattern, or task insight. **FORMATTING:** If the memory is a strict, non-negotiable constraint that must NEVER be ignored, prefix it with "RULE: " (e.g., "RULE: Never use Python"). If it is general context, domain logic, or a pointer to documentation, just save it as normal text without the prefix. If scoped `user_id=global`, file paths in metadata must point to `~/.config/strata/global/`.
 * `strata_search_memory`: Search for existing rules before writing code or making architectural decisions.
-* `strata_update_memory`: Update an existing memory by ID. Use this when a rule has evolved or was initially saved with hallucinations.
+* `strata_update_memory`: Update an existing memory by ID. **FORMATTING:** Maintain the "RULE: " prefix only if the updated memory remains a strict constraint. Use this when a rule has evolved or was initially saved with hallucinations.
 * `strata_delete_memory`: Delete a memory by ID. Use this to prune obsolete, duplicated, or incorrect rules.
 * `strata_generate_canvas`: Automatically regenerate the `Strata MemorySpace.canvas` Obsidian visualization file. Use this after making significant changes to the project's memory or architecture.
 * `strata_ingest_directory`: Batch ingest an entire directory of markdown files (e.g., `docs/architecture/`) into Strata. The server will automatically chunk and embed the files.

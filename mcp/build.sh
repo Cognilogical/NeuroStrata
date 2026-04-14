@@ -29,7 +29,7 @@ for PLATFORM in "${PLATFORMS[@]}"; do
 done
 
 echo "Building Strata OpenCode Plugin..."
-cd "$ROOT_DIR/strata-plugin"
+cd "$ROOT_DIR/plugins/opencode/strata-plugin"
 
 if ! command -v npm &> /dev/null; then
     echo "Warning: npm is required to build the release plugin package, but it is not installed. Skipping plugin package."

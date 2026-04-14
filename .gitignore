@@ -1,6 +1,8 @@
 *.canvas
 /bin/
 /dist/
+mcp/bin/
+mcp/dist/
 *.exe
 
 # AI Chat Sessions
