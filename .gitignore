@@ -8,3 +8,8 @@
 # Graphify Cache/Artifacts
 .graphify_*
 mcp/strata-mcp
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
