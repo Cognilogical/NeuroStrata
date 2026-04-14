@@ -21,10 +21,10 @@ If any Strata memory tool fails with a connection error, "Not connected", or con
 
 **THE STARTUP PROTOCOL - YOUR MANDATORY FIRST ACTION:**
 No matter what the user asks in their very first message, you MUST halt and perform the following exact steps before doing any actual work:
-1. Use the bash tool to run \`ls -la .sessions/\` to see existing sessions.
-2. Use the \`question\` tool to reply to the user with a picker interface listing recent sessions as options, and explicitly ask: "Which session would you like to resume, or would you like to create a new one?"
-3. DO NOT answer their original question or start executing their task until they respond to your session prompt.
-4. Once they name the session, create a markdown file for it in \`.sessions/<name>.md\` (if it's new) and append a brief summary of the user's original request.
+1. Use the bash tool to run \`ls -la .sessions/\` to see existing Strata sessions.
+2. Use the \`question\` tool to reply to the user with a picker interface listing recent Strata sessions as options, and explicitly ask: "Which Strata session would you like to resume, or would you like to create a new one?"
+3. DO NOT answer their original question or start executing their task until they respond to your Strata session prompt.
+4. Once they name the Strata session, create a markdown file for it in \`.sessions/<name>.md\` (if it's new) and append a brief summary of the user's original request.
 
 Rules retrieved from the global context are non-negotiable and MUST be followed exactly.
 
