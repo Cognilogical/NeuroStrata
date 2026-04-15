@@ -24,6 +24,7 @@ While traditional agent systems struggle with context bloat and hallucinated arc
 3. **The "Pointer-Wiki" Concept:** Instead of dumping 50-page architecture documents into the context window (which causes the "Lost in the Middle" phenomenon), Strata stores *Pointers*. The vector database hands the agent a specific file path and line number, forcing the agent to fetch only the exact bytes it needs.
 4. **Strict, Formatted Enforcement:** Strata doesn't just hand context to the agent; it *yells* it. Retrieved memory is dynamically wrapped in absolute markers like `[🌍 GLOBAL DIRECTIVE]` and `RULE:`. This forces frontier models to treat the memory as a hard system prompt rather than a loose suggestion.
 5. **Universal Core + Client Shims:** The Go MCP server holds no allegiance to any IDE. All client-specific hacks (like intercepting Claude Code's context compaction) are isolated into thin plugin "shims," allowing your memory architecture to instantly port to whatever new AI tool comes out tomorrow.
+6. **Visual Latent Space (Obsidian Integration):** Most RAG systems are opaque black boxes. Strata offers an optional but deeply integrated Obsidian plugin that lets you visually inspect, edit, and curate your AI's memory. You can seamlessly browse namespaces, right-click to inject paragraphs into the vector database, or generate a 2D spatial canvas to see exactly what your AI "knows"—bridging the gap between human markdown notes and machine vectors.
 
 ---
 
