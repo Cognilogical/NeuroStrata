@@ -161,6 +161,17 @@ cd ~/Documents/strata/mcp
 3. Builds and globally links the `opencode-strata` TypeScript plugin.
 4. Registers both the MCP server and the plugin in your client's local configuration (e.g. `~/.config/opencode/opencode.json`).
 
+### Optional: Obsidian Plugin Installation
+Because the Strata Obsidian plugin is not yet published to the official Community Plugins store, you must install it manually into your vault:
+
+1. Open your Obsidian vault directory in your terminal.
+2. Create a new plugin folder: `mkdir -p .obsidian/plugins/strata-plugin`
+3. Copy the pre-compiled plugin files from the Strata repository into your vault:
+   ```bash
+   cp -r ~/Documents/strata/plugins/obsidian/obsidian-strata/* .obsidian/plugins/strata-plugin/
+   ```
+4. In Obsidian, go to **Settings > Community Plugins**, disable **Safe Mode**, and toggle the **Strata** plugin to enable it.
+
 ### Configuration
 The installer creates a default configuration at `~/.config/strata/config.json`. Modify this to point to your specific local LLM and database ports:
 
