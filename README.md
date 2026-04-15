@@ -209,7 +209,9 @@ Once installed, your AI agent automatically gains access to the following tools:
 
 Strata represents a synthesis of cognitive science theories and foundational open-source engineering. This project would not exist without the pioneering work of the following researchers and projects:
 
-* **[Graphify](https://graphify.net/):** The knowledge graph engine that turns flat code bases and documentation into clustered, edge-mapped conceptual communities.
+* **[Graphify](https://github.com/graphify/graphify-cli):** The knowledge graph engine that turns flat code bases and documentation into clustered, edge-mapped conceptual communities. Strata's *Graph Edge Fusion* works by directly parsing the lightweight `graphify-out/edges.json` artifacts they generate, giving agents "free" relational traversal without expensive LLM API calls.
+* **[LightRAG](https://github.com/HKUDS/LightRAG):** The revolutionary architecture from HKUDS that pioneered Dual-Level Retrieval (Global + Local RAG) and Graph-Vector Fusion. Strata adopted these core concepts and translated them into a lightning-fast, native Go MCP pipeline to eliminate Python overhead and LLM ingestion costs.
+* **[Paperclip](https://github.com/paperclipai/paperclip):** Open-source orchestration for zero-human companies. Paperclip manages the *execution state* (who is doing what, when, and for how much money), while Strata complements it perfectly by managing the *knowledge state* (what the rules are and what was learned).
 * **[Qdrant](https://qdrant.tech/):** The incredibly fast and reliable Rust-based vector search engine that powers the underlying memory mesh.
 * **[LLM-WIKI Concept](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f):** The architectural pattern of storing narrative knowledge in hyper-linked Markdown while giving the AI specific "Pointer-Wiki" search capabilities to prevent context bloat.
 
