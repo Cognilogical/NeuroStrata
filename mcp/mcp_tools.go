@@ -45,26 +45,36 @@ func searchMemoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	points, err := SearchPoints(opCtx, query, userID, 5)
-	if err != nil {
-		return nil, err
+	out := ""
+
+	// 1. Search Global Tier First
+	globalPoints, err := SearchPoints(opCtx, query, "global", 3)
+	if err == nil && len(globalPoints) > 0 {
+		for _, p := range globalPoints {
+			id, _ := p["id"].(string)
+			payload, _ := p["payload"].(map[string]interface{})
+			data, _ := payload["data"].(string)
+			out += fmt.Sprintf("- [🌍 GLOBAL DIRECTIVE] [ID: %s] %s\n", id, data)
+		}
 	}
-	if len(points) == 0 {
+
+	// 2. Search Local Project Tier
+	if userID != "global" {
+		localPoints, err := SearchPoints(opCtx, query, userID, 5)
+		if err == nil && len(localPoints) > 0 {
+			for _, p := range localPoints {
+				id, _ := p["id"].(string)
+				payload, _ := p["payload"].(map[string]interface{})
+				data, _ := payload["data"].(string)
+				out += fmt.Sprintf("- [🛑 CRITICAL PROJECT RULE] [ID: %s] %s\n", id, data)
+			}
+		}
+	}
+
+	if out == "" {
 		return mcp.NewToolResultText("No relevant memories found."), nil
 	}
 
-	out := ""
-	for _, p := range points {
-		id, _ := p["id"].(string)
-		payload, _ := p["payload"].(map[string]interface{})
-		data, _ := payload["data"].(string)
-
-		if userID == "global" {
-			out += fmt.Sprintf("- [🌍 GLOBAL DIRECTIVE] [ID: %s] %s\n", id, data)
-		} else {
-			out += fmt.Sprintf("- [🛑 CRITICAL PROJECT RULE] [ID: %s] %s\n", id, data)
-		}
-	}
 	return mcp.NewToolResultText(out), nil
 }
 
