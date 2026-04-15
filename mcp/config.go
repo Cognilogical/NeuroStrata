@@ -11,6 +11,8 @@ type Config struct {
 	EmbedderURL      string `json:"embedder_url"`
 	EmbedderModel    string `json:"embedder_model"`
 	EmbedderAPIKey   string `json:"embedder_api_key"`
+	RerankerURL      string `json:"reranker_url"`
+	RerankerModel    string `json:"reranker_model"`
 	QdrantURL        string `json:"qdrant_url"`
 	QdrantCollection string `json:"qdrant_collection"`
 	HTTPPort         string `json:"http_port"`

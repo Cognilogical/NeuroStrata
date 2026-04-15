@@ -50,6 +50,7 @@ func searchMemoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	// 1. Search Global Tier First
 	globalPoints, err := SearchPoints(opCtx, query, "global", 3)
 	if err == nil && len(globalPoints) > 0 {
+		globalPoints, _ = RerankPoints(opCtx, query, globalPoints)
 		for _, p := range globalPoints {
 			id, _ := p["id"].(string)
 			payload, _ := p["payload"].(map[string]interface{})
@@ -62,12 +63,16 @@ func searchMemoryHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	if userID != "global" {
 		localPoints, err := SearchPoints(opCtx, query, userID, 5)
 		if err == nil && len(localPoints) > 0 {
+			localPoints, _ = RerankPoints(opCtx, query, localPoints)
 			for _, p := range localPoints {
 				id, _ := p["id"].(string)
 				payload, _ := p["payload"].(map[string]interface{})
 				data, _ := payload["data"].(string)
 				out += fmt.Sprintf("- [🛑 CRITICAL PROJECT RULE] [ID: %s] %s\n", id, data)
 			}
+
+			// 3. Optional: Fuse Local Graphify Edges
+			out += FuseGraphEdges(opCtx, localPoints)
 		}
 	}
 
