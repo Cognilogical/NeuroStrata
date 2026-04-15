@@ -103,12 +103,15 @@ graph TD
 
 ---
 
-## 📝 Strata Session Logs: The Safety Net
+## 📝 The Continuous Backup Protocol
 
-To prevent the loss of critical architectural decisions made during ad-hoc conversations, Strata mandates the use of **Strata Session Logs**. 
+To prevent the loss of critical architectural decisions made during ad-hoc conversations, Strata enforces a **Continuous Backup Protocol**. 
 
-Instead of treating chat sessions as ephemeral, the system forces the AI to create and append to text files in the `.sessions/` directory. 
-* **The Nuance:** We keep periodic logs of the session text so that if an agent misses extracting a crucial rule into the Qdrant database during real-time interaction, the conversation history is not lost. The human (or the Strata system itself later) can go back, read the session log, and harvest those missed rules for permanent vector memory.
+Instead of treating chat sessions as ephemeral or forcing annoying "Startup Protocols", the system maintains an invisible, rolling log in the `.strata/sessions/` directory. 
+
+* **The Mechanism:** Agents are instructed to silently use the `strata_append_log` tool in the background as they work. The Go server automatically manages file size, rolling logs over 500KB into timestamped archives.
+* **Grep-able Waypoints:** When a user changes topics (e.g., from "database refactor" to "UI design"), the agent tags the log entry. The Go server injects highly structured `### 🔄 Topic Switch` markers.
+* **Recovery:** If an agent ever loses context due to compaction, it is instructed to run a two-pass recovery: `grep` for the Topic Switch waypoints to find the general discussion area, and then use the `read` tool with exact line offsets to instantly recover the forgotten context without reading massive files.
 
 ---
 
