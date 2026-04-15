@@ -143,6 +143,7 @@ To ensure your AI agents have the best possible environment out of the box, the 
 * **[Beads (bd)](https://github.com/beads/bd):** A local, git-backed issue tracker used by agents for task coordination. 
 
 If you wish to visually monitor what the agents are doing with the `bd` CLI, you can optionally install the **[BeadBoard Dashboard](https://github.com/beads/beadboard)** alongside it.
+Similarly, if you want to visually manage and curate the AI's memory vectors and spatial graph, we highly recommend installing **[Obsidian](https://obsidian.md/)** and enabling the Strata Community Plugin.
 
 ### Installation
 
