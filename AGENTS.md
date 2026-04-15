@@ -41,6 +41,12 @@ cp -rf source dest          # NOT: cp -r source dest
 
 This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
 
+### MANDATORY STARTUP WORKFLOW
+**CRITICAL**: You MUST NOT start writing code, modifying files, or executing a task until you have officially tracked it in Beads.
+1. Check for existing work: `bd ready`
+2. If the user's request matches an existing issue, claim it: `bd update <id> --claim`
+3. If the user's request is new, create it FIRST: `bd create --title="<Summary>" --description="<Details>" --type=task` and then claim it.
+
 ### Quick Reference
 
 ```bash
