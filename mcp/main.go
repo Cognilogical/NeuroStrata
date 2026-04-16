@@ -68,6 +68,7 @@ func main() {
 	s.AddTool(mcp.NewTool("strata_append_log",
 		mcp.WithDescription("Silently append a summary of tasks or architectural decisions to the continuous backup log."),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The summary to append.")),
+		mcp.WithString("project_root", mcp.Required(), mcp.Description("Absolute path to the current local project workspace.")),
 		mcp.WithString("tags", mcp.Description("Optional comma-separated list of tags ONLY if you are switching subjects (e.g. 'auth, database'). Do NOT provide tags for minor updates.")),
 	), appendLogHandler)
 

@@ -23,6 +23,11 @@ func appendLogHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	projectRoot, err := request.RequireString("project_root")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	args := request.GetArguments()
 	var tags []string
 	if rawTags, ok := args["tags"].(string); ok && strings.TrimSpace(rawTags) != "" {
@@ -35,7 +40,7 @@ func appendLogHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		}
 	}
 
-	logDir := filepath.Join(".strata", "sessions")
+	logDir := filepath.Join(projectRoot, ".strata", "sessions")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to create log directory: %v", err)), nil
 	}
