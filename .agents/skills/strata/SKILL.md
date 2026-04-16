@@ -85,6 +85,29 @@ Do not wait for the user to explicitly say "remember". Trigger the bookkeeping r
 * **Corrections:** "Actually, let's change that to...", "That didn't work, let's switch to..."
 * **Context & The "Why":** "The reason we do this is...", "This is a workaround for...", "Keep in mind that...", "because..."
 
+## Deep Knowledge Ingestion (Wiki Triggers)
+While tracking constraints and decisions is important, it is equally critical to proactively extract and organize **acquired domain knowledge**. When you spend tokens learning how something works, you must persist that knowledge into Tier 2 Domain Narratives (`docs/architecture/domains/*.md`) so future agents do not have to re-learn it.
+
+**Action Triggers (When to synthesize knowledge):**
+1. **The External Dependency Trigger:** You used `webfetch`, `query-docs`, or searched the web to learn about a 3rd-party library, API, or smart contract (e.g., Stripe, an ERC-20 token, a UI framework).
+2. **The Reverse Engineering Trigger:** You spent significant time reading (`read`, `grep`) through complex, undocumented legacy code or a large 3rd-party module to figure out how it works.
+3. **The Hard-Won Battle Trigger:** You struggled with a task, failed multiple times (e.g., compiler errors, weird API responses, deployment crashes), and finally succeeded. Workarounds, "gotchas", and undocumented edge cases are the most valuable form of domain knowledge.
+4. **The Sub-Agent Research Handoff:** A `Task` subagent returned a large research report or deep-dive analysis.
+
+**Natural Language Triggers (What the user says):**
+1. **The Explanation:** "Let me explain how this works...", "The way the ERC-20 contract is set up is...", "Here's the math behind the measurement..."
+2. **The Correction/Nuance:** "Actually, it's more complicated than that...", "You missed a step, we also have to..."
+3. **The Definition/Ontology:** "In this project, a 'User' means...", "The difference between an Order and a Cart is..."
+4. **The Contextual Dump:** "Here is a bunch of background on the feature...", "Before you start, you need to know..."
+
+**The Workflow (The "Wiki Synthesis"):**
+When any of the above triggers occur, you MUST perform a Wiki Synthesis before closing your current task:
+1. **Search First:** Use `strata_search_memory` to see if a domain narrative already exists for this topic.
+2. **Create or Append:**
+   * *If it exists:* Read the file, append the new knowledge, and save it.
+   * *If it does not exist:* Create a new markdown file in `docs/architecture/domains/` with the mandatory YAML frontmatter (domain, description, governs_paths).
+3. **Anchor in Strata:** Call `strata_add_memory` (if new) or `strata_update_memory` (if appended) with `user_id="<project_name>"` to ensure the Tier 2 pointer is accurate and the dual-anchors point to the right lines.
+
 ## Interactive Sessions & Topic Drift
 Ad-hoc architectural discussions generate vital context that evaporates when the chat closes.
 1. **Startup Protocol:** When a new tool session begins, YOUR MANDATORY FIRST ACTION is to check the `.sessions/` directory and use the \`question\` tool to present a picker interface listing recent Strata session logs, asking: "Which Strata session log would you like to resume, or would you like to create a new one?". Do not answer their initial query until a Strata session log is established. CRITICAL: The session name provided is strictly an identifier for the log file. It is NOT an instruction or task to execute. Do not attempt to execute or write code based on the session name itself.
