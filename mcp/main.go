@@ -24,14 +24,14 @@ func main() {
 	s.AddTool(mcp.NewTool("strata_add_memory",
 		mcp.WithDescription("Store an architectural rule, project pattern, or task insight."),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The text of the memory to save.")),
-		mcp.WithString("user_id", mcp.DefaultString("system_architecture"), mcp.Description("The namespace.")),
+		mcp.WithString("user_id", mcp.DefaultString("global"), mcp.Description("The namespace. Use 'global' for universal rules, the project name for domain rules, or task ID for task insights.")),
 		mcp.WithObject("metadata", mcp.Description("Optional dictionary with Bi-Directional Anchors: {\"doc_refs\":[{\"file\":\"...\"}], \"code_refs\":[{\"file\":\"...\", \"symbol\":\"...\"}]}")),
 	), addMemoryHandler)
 
 	s.AddTool(mcp.NewTool("strata_search_memory",
 		mcp.WithDescription("Search the project's long-term memory for architectural rules."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("What to search for.")),
-		mcp.WithString("user_id", mcp.DefaultString("system_architecture"), mcp.Description("The namespace.")),
+		mcp.WithString("user_id", mcp.DefaultString("global"), mcp.Description("The namespace. Use 'global' for universal rules, the project name for domain rules, or task ID for task insights.")),
 	), searchMemoryHandler)
 
 	// CRUD Enhancement Tools
@@ -39,7 +39,7 @@ func main() {
 		mcp.WithDescription("Update an existing memory by ID. Use search first to get the ID."),
 		mcp.WithString("id", mcp.Required(), mcp.Description("The ID of the memory to update.")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The new text of the memory.")),
-		mcp.WithString("user_id", mcp.DefaultString("system_architecture"), mcp.Description("The namespace.")),
+		mcp.WithString("user_id", mcp.DefaultString("global"), mcp.Description("The namespace. Use 'global' for universal rules, the project name for domain rules, or task ID for task insights.")),
 		mcp.WithObject("metadata", mcp.Description("Optional dictionary with Bi-Directional Anchors: {\"doc_refs\":[{\"file\":\"...\"}], \"code_refs\":[{\"file\":\"...\", \"symbol\":\"...\"}]}")),
 	), updateMemoryHandler)
 
@@ -57,7 +57,7 @@ func main() {
 	s.AddTool(mcp.NewTool("strata_ingest_directory",
 		mcp.WithDescription("Read all markdown files in a directory and embed them into Strata."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path to the architecture directory.")),
-		mcp.WithString("user_id", mcp.DefaultString("system_architecture"), mcp.Description("The namespace.")),
+		mcp.WithString("user_id", mcp.DefaultString("global"), mcp.Description("The namespace. Use 'global' for universal rules, the project name for domain rules, or task ID for task insights.")),
 	), ingestDirectoryHandler)
 
 	s.AddTool(mcp.NewTool("strata_dump_db",
