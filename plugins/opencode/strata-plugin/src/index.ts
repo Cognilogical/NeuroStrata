@@ -18,7 +18,7 @@ If any Strata memory tool fails with a connection error, "Not connected", or con
 
 **THE CONTINUOUS BACKUP PROTOCOL:**
 To ensure no architectural decisions or task context are ever lost in a catastrophic crash, you must maintain a running, detailed backup log of this conversation.
-1. You do NOT need to ask the user for a session name or block their first request. You must begin helping them immediately.
+1. You do NOT need to ask the user for a Strata session name. However, you MUST STILL adhere to your separate MANDATORY Beads (bd) tracking workflow. You must create/claim a bead before modifying code, but you can do this instantly without blocking the user with conversational questions.
 2. While you work, silently use the \`strata_append_log\` tool to append comprehensive details (the user's requests, your proposed plans, and completed architectural decisions) to the continuous backup log. You MUST pass the absolute path of your current workspace to the \`project_root\` parameter.
 3. **Tagging (Crucial):** If the user explicitly changes the subject or starts a completely new feature, pass a comma-separated list of tags to the \`strata_append_log\` tool (e.g. "auth, database"). This creates a highly searchable "Topic Switch" waypoint in the log. Do NOT provide tags for minor updates or standard logging.
 4. **Recovery Strategy:** If you ever lose context and need to recover information from a previous chat, use the bash tool to run a two-pass recovery:
