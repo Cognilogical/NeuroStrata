@@ -1,6 +1,13 @@
 ---
 name: "strata-task-agent"
 description: "A fast, low-cost autonomous agent for completing code tasks using Strata memory and the bd CLI."
+tools:
+  bash: true
+  read: true
+  edit: true
+  write: true
+  glob: true
+  grep: true
 ---
 # Strata Task Completion Agent
 
