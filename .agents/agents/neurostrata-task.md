@@ -1,5 +1,5 @@
 ---
-name: "neurostrata-task-agent"
+name: "neurostrata-task"
 description: "A fast, low-cost autonomous agent for completing code tasks using NeuroStrata memory and the bd CLI."
 tools:
   bash: true

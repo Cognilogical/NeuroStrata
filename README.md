@@ -191,13 +191,13 @@ The installer creates a default configuration at `~/.config/neurostrata/config.j
 
 ### Sub-Agent Configuration
 
-The NeuroStrata installation includes the `neurostrata-task-agent`. To ensure this agent runs optimally, you should configure your AI client to map this sub-agent to a fast, low-cost, code-oriented model.
+The NeuroStrata installation includes the `neurostrata-task`. To ensure this agent runs optimally, you should configure your AI client to map this sub-agent to a fast, low-cost, code-oriented model.
 
 For example, if you are using OpenCode, add the `agent` block below to `~/.config/opencode/opencode.json`:
 
 ```json
   "agent": {
-    "neurostrata-task-agent": {
+    "neurostrata-task": {
       "model": "github-copilot/gpt-4o"
     }
   }
