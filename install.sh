@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 echo "==============================================="
-echo "  Strata: 3-Tier Memory Installer        "
+echo "  NeuroStrata: 3-Tier Memory Installer        "
 echo "==============================================="
 
 
@@ -33,7 +33,7 @@ fi
 
 # 5. Pull Ollama models (Embedder & Lightweight LLM)
 echo "Starting local infrastructure to pull models..."
-podman rm -f strata-qdrant strata-embedder || true && podman-compose up -d
+podman rm -f neurostrata-qdrant neurostrata-embedder || true && podman-compose up -d
 
 echo "Waiting for Ollama to start..."
 sleep 10

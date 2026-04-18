@@ -2,27 +2,27 @@ $ErrorActionPreference = "Stop"
 
 # ==============================================================================
 # Configuration
-$githubRepo = "your-username/strata"
+$githubRepo = "your-username/neurostrata"
 # ==============================================================================
 
 $os = "windows"
 $arch = "amd64" # Simplified for typical Windows installations
 
-$binaryName = "strata-mcp-${os}-${arch}.exe"
+$binaryName = "neurostrata-mcp-${os}-${arch}.exe"
 
-$installDir = Join-Path $env:USERPROFILE ".local\share\strata\bin"
+$installDir = Join-Path $env:USERPROFILE ".local\share\neurostrata\bin"
 if (-not (Test-Path $installDir)) {
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 }
 
-$destBin = Join-Path $installDir "strata-mcp.exe"
+$destBin = Join-Path $installDir "neurostrata-mcp.exe"
 
-Write-Host "Installing Strata Go MCP Server ($binaryName)..."
+Write-Host "Installing NeuroStrata Go MCP Server ($binaryName)..."
 
 # 1. Detect if we are installing from source
 $scriptDir = $PSScriptRoot
-$localBin = Join-Path $scriptDir "..\bin\strata-mcp.exe"
-$localSkillDir = Join-Path $scriptDir "..\.agents\skills\strata"
+$localBin = Join-Path $scriptDir "..\bin\neurostrata-mcp.exe"
+$localSkillDir = Join-Path $scriptDir "..\.agents\skills\neurostrata"
 
 if (Test-Path $localBin) {
     Write-Host "Found local compiled binary, copying to $destBin..."
@@ -48,13 +48,13 @@ if (-not (Test-Path $localBinDir)) {
     New-Item -ItemType Directory -Force -Path $localBinDir | Out-Null
 }
 
-$symlinkBin = Join-Path $localBinDir "strata-mcp.exe"
+$symlinkBin = Join-Path $localBinDir "neurostrata-mcp.exe"
 Write-Host "Setting up executable link at $symlinkBin..."
 Copy-Item -Path $destBin -Destination $symlinkBin -Force
 Write-Host "  -> Copied $destBin to $symlinkBin"
 
 # Set up SKILL.md
-$skillDir = Join-Path $env:USERPROFILE ".agents\skills\strata"
+$skillDir = Join-Path $env:USERPROFILE ".agents\skills\neurostrata"
 if (-not (Test-Path $skillDir)) {
     New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
 }
@@ -64,7 +64,7 @@ if (Test-Path $localSkillDir) {
     Copy-Item -Path "$localSkillDir\*" -Destination $skillDir -Recurse -Force
 } else {
     Write-Host "  -> Downloaded SKILL.md directly from GitHub to $skillDir"
-    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$githubRepo/main/.agents/skills/strata/SKILL.md" -OutFile "$skillDir\SKILL.md"
+    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$githubRepo/main/.agents/skills/neurostrata/SKILL.md" -OutFile "$skillDir\SKILL.md"
 }
 
 # Symlink/copy agent
@@ -73,15 +73,15 @@ if (-not (Test-Path $opencodeAgentsDir)) {
     New-Item -ItemType Directory -Force -Path $opencodeAgentsDir | Out-Null
 }
 
-$localAgent = Join-Path $scriptDir "..\.agents\agents\strata-task-agent.md"
+$localAgent = Join-Path $scriptDir "..\.agents\agents\neurostrata-task-agent.md"
 if (Test-Path $localAgent) {
-    $destAgent = Join-Path $opencodeAgentsDir "strata-task-agent.md"
+    $destAgent = Join-Path $opencodeAgentsDir "neurostrata-task-agent.md"
     Copy-Item -Path $localAgent -Destination $destAgent -Force
-    Write-Host "  -> Copied strata-task-agent.md to $opencodeAgentsDir\"
+    Write-Host "  -> Copied neurostrata-task-agent.md to $opencodeAgentsDir\"
 }
 
 # Config
-$configDir = Join-Path $env:USERPROFILE ".config\strata"
+$configDir = Join-Path $env:USERPROFILE ".config\neurostrata"
 $configFile = Join-Path $configDir "config.json"
 Write-Host "Setting up configuration at $configFile..."
 
@@ -96,7 +96,7 @@ if (-not (Test-Path $configFile)) {
   "embedder_model": "nomic-embed-text-v1.5.f16.gguf",
   "embedder_api_key": "sk-local",
   "qdrant_url": "http://localhost:6333",
-  "qdrant_collection": "strata",
+  "qdrant_collection": "neurostrata",
   "http_port": "8005"
 }
 "@

@@ -18,24 +18,24 @@ func main() {
 	go startHTTPServer()
 
 	// 2. Start MCP Server
-	s := server.NewMCPServer("Strata Native Agent Memory", "2.0.0")
+	s := server.NewMCPServer("NeuroStrata Native Agent Memory", "2.0.0")
 
 	// Base Tools
-	s.AddTool(mcp.NewTool("strata_add_memory",
+	s.AddTool(mcp.NewTool("neurostrata_add_memory",
 		mcp.WithDescription("Store an architectural rule, project pattern, or task insight."),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The text of the memory to save.")),
 		mcp.WithString("user_id", mcp.DefaultString("global"), mcp.Description("The namespace. Use 'global' for universal rules, the project name for domain rules, or task ID for task insights.")),
 		mcp.WithObject("metadata", mcp.Description("Optional dictionary with Bi-Directional Anchors: {\"doc_refs\":[{\"file\":\"...\"}], \"code_refs\":[{\"file\":\"...\", \"symbol\":\"...\"}]}")),
 	), addMemoryHandler)
 
-	s.AddTool(mcp.NewTool("strata_search_memory",
+	s.AddTool(mcp.NewTool("neurostrata_search_memory",
 		mcp.WithDescription("Search the project's long-term memory for architectural rules."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("What to search for.")),
 		mcp.WithString("user_id", mcp.DefaultString("global"), mcp.Description("The namespace. Use 'global' for universal rules, the project name for domain rules, or task ID for task insights.")),
 	), searchMemoryHandler)
 
 	// CRUD Enhancement Tools
-	s.AddTool(mcp.NewTool("strata_update_memory",
+	s.AddTool(mcp.NewTool("neurostrata_update_memory",
 		mcp.WithDescription("Update an existing memory by ID. Use search first to get the ID."),
 		mcp.WithString("id", mcp.Required(), mcp.Description("The ID of the memory to update.")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The new text of the memory.")),
@@ -43,29 +43,29 @@ func main() {
 		mcp.WithObject("metadata", mcp.Description("Optional dictionary with Bi-Directional Anchors: {\"doc_refs\":[{\"file\":\"...\"}], \"code_refs\":[{\"file\":\"...\", \"symbol\":\"...\"}]}")),
 	), updateMemoryHandler)
 
-	s.AddTool(mcp.NewTool("strata_delete_memory",
+	s.AddTool(mcp.NewTool("neurostrata_delete_memory",
 		mcp.WithDescription("Delete an obsolete or incorrect memory by ID."),
 		mcp.WithString("id", mcp.Required(), mcp.Description("The ID of the memory to delete.")),
 	), deleteMemoryHandler)
 
 	// Advanced Enhancement Tools
-	s.AddTool(mcp.NewTool("strata_generate_canvas",
+	s.AddTool(mcp.NewTool("neurostrata_generate_canvas",
 		mcp.WithDescription("Generate an Obsidian Canvas file visualizing the current memory space."),
 		mcp.WithString("vault_path", mcp.Required(), mcp.Description("Absolute path to the Obsidian vault.")),
 	), generateCanvasHandler)
 
-	s.AddTool(mcp.NewTool("strata_ingest_directory",
-		mcp.WithDescription("Read all markdown files in a directory and embed them into Strata."),
+	s.AddTool(mcp.NewTool("neurostrata_ingest_directory",
+		mcp.WithDescription("Read all markdown files in a directory and embed them into NeuroStrata."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path to the architecture directory.")),
 		mcp.WithString("user_id", mcp.DefaultString("global"), mcp.Description("The namespace. Use 'global' for universal rules, the project name for domain rules, or task ID for task insights.")),
 	), ingestDirectoryHandler)
 
-	s.AddTool(mcp.NewTool("strata_dump_db",
-		mcp.WithDescription("Dump the entire Strata vector database to a JSON file for backup purposes."),
+	s.AddTool(mcp.NewTool("neurostrata_dump_db",
+		mcp.WithDescription("Dump the entire NeuroStrata vector database to a JSON file for backup purposes."),
 		mcp.WithString("output_path", mcp.Required(), mcp.Description("Absolute path to save the JSON dump.")),
 	), dumpDbHandler)
 
-	s.AddTool(mcp.NewTool("strata_append_log",
+	s.AddTool(mcp.NewTool("neurostrata_append_log",
 		mcp.WithDescription("Silently append a summary of tasks or architectural decisions to the continuous backup log."),
 		mcp.WithString("content", mcp.Required(), mcp.Description("The summary to append.")),
 		mcp.WithString("project_root", mcp.Required(), mcp.Description("Absolute path to the current local project workspace.")),

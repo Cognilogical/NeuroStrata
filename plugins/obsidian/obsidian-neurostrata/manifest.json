@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-neurostrata",
+  "name": "NeuroStrata Memory Curation",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Curate the NeuroStrata Qdrant vector database directly from Obsidian.",
+  "author": "NeuroStrata",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

@@ -1,13 +1,13 @@
 {
-  "name": "obsidian-strata",
+  "name": "obsidian-neurostrata",
   "version": "1.0.0",
-  "description": "Strata vector database curation plugin for Obsidian",
+  "description": "NeuroStrata vector database curation plugin for Obsidian",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
   },
-  "author": "Strata",
+  "author": "NeuroStrata",
   "license": "MIT",
   "dependencies": {
     "obsidian": "latest"

@@ -3,8 +3,8 @@ set -e
 
 # Default settings
 QDRANT_URL=${1:-"http://localhost:6333"}
-COLLECTION_NAME=${2:-"strata"}
-BACKUP_DIR="$HOME/.config/strata/db/backups"
+COLLECTION_NAME=${2:-"neurostrata"}
+BACKUP_DIR="$HOME/.config/neurostrata/db/backups"
 
 mkdir -p "$BACKUP_DIR"
 

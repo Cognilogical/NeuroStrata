@@ -2,20 +2,20 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname \"${BASH_SOURCE[0]}\")" && pwd)"
-INSTALL_PLUGIN_DIR="$HOME/.local/share/strata/plugin"
+INSTALL_PLUGIN_DIR="$HOME/.local/share/neurostrata/plugin"
 OPENCLAW_CONFIG="$HOME/.config/openclaw/openclaw.json"
-GITHUB_REPO="your-username/strata"
+GITHUB_REPO="your-username/neurostrata"
 
-echo "Setting up the Strata OpenClaw plugin..."
-PLUGIN_DIR="$SCRIPT_DIR/strata-plugin"
+echo "Setting up the NeuroStrata OpenClaw plugin..."
+PLUGIN_DIR="$SCRIPT_DIR/neurostrata-plugin"
 
 if [ -d "$PLUGIN_DIR/dist" ] && [ -f "$PLUGIN_DIR/package.json" ]; then
-    echo "  -> Found local strata-plugin source. Copying to $INSTALL_PLUGIN_DIR..."
+    echo "  -> Found local neurostrata-plugin source. Copying to $INSTALL_PLUGIN_DIR..."
     mkdir -p "$INSTALL_PLUGIN_DIR"
     cp -r "$PLUGIN_DIR/dist" "$INSTALL_PLUGIN_DIR/"
     cp "$PLUGIN_DIR/package.json" "$INSTALL_PLUGIN_DIR/"
 else
-    PLUGIN_URL="https://github.com/$GITHUB_REPO/releases/latest/download/openclaw-strata.tgz"
+    PLUGIN_URL="https://github.com/$GITHUB_REPO/releases/latest/download/openclaw-neurostrata.tgz"
     echo "  -> Downloading pre-compiled plugin from $PLUGIN_URL..."
     mkdir -p "$INSTALL_PLUGIN_DIR"
     if curl -f -L "$PLUGIN_URL" -o "$INSTALL_PLUGIN_DIR/plugin.tgz"; then
@@ -37,7 +37,7 @@ if [ ! -f "$OPENCLAW_CONFIG" ]; then
 fi
 
 if command -v jq &>/dev/null; then
-    jq '.plugin |= (. // []) | if (.plugin | index("$INSTALL_PLUGIN_DIR") | not) then .plugin = (.plugin | map(select(. != "openclaw-strata"))) + ["$INSTALL_PLUGIN_DIR"] else . end' "$OPENCLAW_CONFIG" > "${OPENCLAW_CONFIG}.tmp" && mv "${OPENCLAW_CONFIG}.tmp" "$OPENCLAW_CONFIG"
+    jq '.plugin |= (. // []) | if (.plugin | index("$INSTALL_PLUGIN_DIR") | not) then .plugin = (.plugin | map(select(. != "openclaw-neurostrata"))) + ["$INSTALL_PLUGIN_DIR"] else . end' "$OPENCLAW_CONFIG" > "${OPENCLAW_CONFIG}.tmp" && mv "${OPENCLAW_CONFIG}.tmp" "$OPENCLAW_CONFIG"
     echo "  -> OpenClaw configuration updated successfully using jq."
 elif command -v node &>/dev/null; then
     node -e "
@@ -46,7 +46,7 @@ elif command -v node &>/dev/null; then
     const pluginPath = process.argv[2];
     let data = JSON.parse(fs.readFileSync(filepath, 'utf8'));
     data.plugin = data.plugin || [];
-    data.plugin = data.plugin.filter(p => p !== 'openclaw-strata');
+    data.plugin = data.plugin.filter(p => p !== 'openclaw-neurostrata');
     if (!data.plugin.includes(pluginPath)) {
         data.plugin.push(pluginPath);
     }

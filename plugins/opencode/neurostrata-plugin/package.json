@@ -1,7 +1,7 @@
 {
-  "name": "opencode-strata",
+  "name": "opencode-neurostrata",
   "version": "1.0.0",
-  "description": "Strata memory plugin for OpenCode",
+  "description": "NeuroStrata memory plugin for OpenCode",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

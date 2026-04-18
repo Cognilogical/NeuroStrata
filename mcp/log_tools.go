@@ -40,7 +40,7 @@ func appendLogHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		}
 	}
 
-	logDir := filepath.Join(projectRoot, ".strata", "sessions")
+	logDir := filepath.Join(projectRoot, ".neurostrata", "sessions")
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to create log directory: %v", err)), nil
 	}

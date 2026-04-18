@@ -43,7 +43,7 @@ func GenerateCanvas(ctx context.Context, vaultPath string) error {
 		payload, _ := p["payload"].(map[string]interface{})
 		data, _ := payload["data"].(string)
 
-		text := fmt.Sprintf("**Strata Memory**\nID: `%s`\n\n%s", id, data)
+		text := fmt.Sprintf("**NeuroStrata Memory**\nID: `%s`\n\n%s", id, data)
 
 		node := CanvasNode{
 			ID:     id,
@@ -64,7 +64,7 @@ func GenerateCanvas(ctx context.Context, vaultPath string) error {
 		}
 	}
 
-	outPath := filepath.Join(vaultPath, "Strata MemorySpace.canvas")
+	outPath := filepath.Join(vaultPath, "NeuroStrata MemorySpace.canvas")
 	b, err := json.MarshalIndent(canvas, "", "  ")
 	if err != nil {
 		return err

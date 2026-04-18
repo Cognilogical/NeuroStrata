@@ -16,7 +16,7 @@ func validateMemoryPaths(userID string, metadataRaw interface{}) error {
 		return errors.New("invalid metadata format")
 	}
 
-	globalDir := filepath.Join(os.Getenv("HOME"), ".config/strata/global")
+	globalDir := filepath.Join(os.Getenv("HOME"), ".config/neurostrata/global")
 
 	validatePaths := func(refsKey string) error {
 		refs, ok := metadata[refsKey].([]interface{})
@@ -33,11 +33,11 @@ func validateMemoryPaths(userID string, metadataRaw interface{}) error {
 				absPath, _ := filepath.Abs(os.ExpandEnv(filePath))
 				if userID == "global" {
 					if !filepath.HasPrefix(absPath, globalDir) {
-						return errors.New("global metadata file path must be inside ~/.config/strata/global directory")
+						return errors.New("global metadata file path must be inside ~/.config/neurostrata/global directory")
 					}
 				} else {
 					if filepath.HasPrefix(absPath, globalDir) {
-						return errors.New("domain/task metadata file path cannot point to ~/.config/strata/global directory")
+						return errors.New("domain/task metadata file path cannot point to ~/.config/neurostrata/global directory")
 					}
 				}
 			}

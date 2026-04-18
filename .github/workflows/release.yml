@@ -25,19 +25,19 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Build Strata Unified Core + Shims
+      - name: Build NeuroStrata Unified Core + Shims
         run: |
           chmod +x ./mcp/build.sh
           
           # Install dependencies for the typescript plugin
-          cd plugins/opencode/strata-plugin && npm ci && cd ../..
+          cd plugins/opencode/neurostrata-plugin && npm ci && cd ../..
           
           # Execute the build script
           ./mcp/build.sh
           
           # Ensure consistent asset names
-          if [ -f dist/opencode-strata-1.0.0.tgz ]; then
-            mv dist/opencode-strata-1.0.0.tgz dist/opencode-strata.tgz
+          if [ -f dist/opencode-neurostrata-1.0.0.tgz ]; then
+            mv dist/opencode-neurostrata-1.0.0.tgz dist/opencode-neurostrata.tgz
           fi
 
       - name: Clobber v1.0.0 Release Assets
@@ -45,10 +45,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload v1.0.0 \
-            bin/strata-mcp-linux-amd64 \
-            bin/strata-mcp-linux-arm64 \
-            bin/strata-mcp-darwin-amd64 \
-            bin/strata-mcp-darwin-arm64 \
-            bin/strata-mcp-windows-amd64.exe \
-            dist/opencode-strata.tgz \
+            bin/neurostrata-mcp-linux-amd64 \
+            bin/neurostrata-mcp-linux-arm64 \
+            bin/neurostrata-mcp-darwin-amd64 \
+            bin/neurostrata-mcp-darwin-arm64 \
+            bin/neurostrata-mcp-windows-amd64.exe \
+            dist/opencode-neurostrata.tgz \
             --clobber

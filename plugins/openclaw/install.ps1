@@ -1,25 +1,25 @@
 $ErrorActionPreference = "Stop"
 
 $scriptDir = $PSScriptRoot
-$installPluginDir = Join-Path $env:USERPROFILE ".local\share\strata\plugin"
+$installPluginDir = Join-Path $env:USERPROFILE ".local\share\neurostrata\plugin"
 $openClawConfig = Join-Path $env:USERPROFILE ".config\openclaw\openclaw.json"
-$githubRepo = "your-username/strata"
+$githubRepo = "your-username/neurostrata"
 
-Write-Host "Setting up the Strata OpenClaw plugin..."
-$pluginDir = Join-Path $scriptDir "strata-plugin"
+Write-Host "Setting up the NeuroStrata OpenClaw plugin..."
+$pluginDir = Join-Path $scriptDir "neurostrata-plugin"
 
 $distDir = Join-Path $pluginDir "dist"
 $pkgJson = Join-Path $pluginDir "package.json"
 
 if ((Test-Path $distDir) -and (Test-Path $pkgJson)) {
-    Write-Host "  -> Found local strata-plugin source. Copying to $installPluginDir..."
+    Write-Host "  -> Found local neurostrata-plugin source. Copying to $installPluginDir..."
     if (-not (Test-Path $installPluginDir)) {
         New-Item -ItemType Directory -Force -Path $installPluginDir | Out-Null
     }
     Copy-Item -Path $distDir -Destination $installPluginDir -Recurse -Force
     Copy-Item -Path $pkgJson -Destination $installPluginDir -Force
 } else {
-    $pluginUrl = "https://github.com/$githubRepo/releases/latest/download/openclaw-strata.tgz"
+    $pluginUrl = "https://github.com/$githubRepo/releases/latest/download/openclaw-neurostrata.tgz"
     Write-Host "  -> Downloading pre-compiled plugin from $pluginUrl..."
     if (-not (Test-Path $installPluginDir)) {
         New-Item -ItemType Directory -Force -Path $installPluginDir | Out-Null
@@ -53,8 +53,8 @@ try {
     if ($null -eq $configData) { $configData = @{} }
     if ($null -eq $configData.plugin) { Add-Member -InputObject $configData -MemberType NoteProperty -Name "plugin" -Value @() }
     $pluginArray = [System.Collections.ArrayList]@($configData.plugin)
-    if ($pluginArray.Contains("openclaw-strata")) {
-        $pluginArray.Remove("openclaw-strata")
+    if ($pluginArray.Contains("openclaw-neurostrata")) {
+        $pluginArray.Remove("openclaw-neurostrata")
     }
     $pluginArray.Add($installPluginDir) | Out-Null
     $configData.plugin = $pluginArray

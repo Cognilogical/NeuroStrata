@@ -2,21 +2,21 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_PLUGIN_DIR="$HOME/.local/share/strata/plugin"
+INSTALL_PLUGIN_DIR="$HOME/.local/share/neurostrata/plugin"
 OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
-GITHUB_REPO="your-username/strata"
+GITHUB_REPO="your-username/neurostrata"
 
-echo "Setting up the Strata OpenCode plugin..."
-PLUGIN_DIR="$SCRIPT_DIR/strata-plugin"
+echo "Setting up the NeuroStrata OpenCode plugin..."
+PLUGIN_DIR="$SCRIPT_DIR/neurostrata-plugin"
 
 if [ -d "$PLUGIN_DIR/dist" ] && [ -f "$PLUGIN_DIR/package.json" ]; then
-    echo "  -> Found local strata-plugin source. Copying to $INSTALL_PLUGIN_DIR..."
+    echo "  -> Found local neurostrata-plugin source. Copying to $INSTALL_PLUGIN_DIR..."
     mkdir -p "$INSTALL_PLUGIN_DIR"
     cp -r "$PLUGIN_DIR/dist" "$INSTALL_PLUGIN_DIR/"
     cp "$PLUGIN_DIR/package.json" "$INSTALL_PLUGIN_DIR/"
 else
     # Production Mode: Download pre-compiled plugin tarball from GitHub Releases
-    PLUGIN_URL="https://github.com/$GITHUB_REPO/releases/latest/download/opencode-strata.tgz"
+    PLUGIN_URL="https://github.com/$GITHUB_REPO/releases/latest/download/opencode-neurostrata.tgz"
     echo "  -> Downloading pre-compiled plugin from $PLUGIN_URL..."
     
     mkdir -p "$INSTALL_PLUGIN_DIR"
@@ -40,7 +40,7 @@ fi
 
 if command -v jq &>/dev/null; then
     # Safely update JSON using jq
-    jq '.mcp |= (. // {}) | .mcp.strata = {"type": "local", "command": ["'"$HOME"'/.local/bin/strata-mcp"]} | .plugin |= (. // []) | if (.plugin | index("'"$INSTALL_PLUGIN_DIR"'") | not) then .plugin = (.plugin | map(select(. != "opencode-strata"))) + ["'"$INSTALL_PLUGIN_DIR"'"] else . end' "$OPENCODE_CONFIG" > "${OPENCODE_CONFIG}.tmp" && mv "${OPENCODE_CONFIG}.tmp" "$OPENCODE_CONFIG"
+    jq '.mcp |= (. // {}) | .mcp.neurostrata = {"type": "local", "command": ["'"$HOME"'/.local/bin/neurostrata-mcp"]} | .plugin |= (. // []) | if (.plugin | index("'"$INSTALL_PLUGIN_DIR"'") | not) then .plugin = (.plugin | map(select(. != "opencode-neurostrata"))) + ["'"$INSTALL_PLUGIN_DIR"'"] else . end' "$OPENCODE_CONFIG" > "${OPENCODE_CONFIG}.tmp" && mv "${OPENCODE_CONFIG}.tmp" "$OPENCODE_CONFIG"
     echo "  -> OpenCode configuration updated successfully using jq."
 elif command -v node &>/dev/null; then
     # Fallback to Node.js
@@ -51,10 +51,10 @@ const filepath = process.argv[1];
 const pluginPath = process.argv[2];
 let data = JSON.parse(fs.readFileSync(filepath, 'utf8'));
 data.mcp = data.mcp || {};
-data.mcp.strata = { type: 'local', command: [path.join(process.env.HOME, '.local/bin/strata-mcp')] };
+data.mcp.neurostrata = { type: 'local', command: [path.join(process.env.HOME, '.local/bin/neurostrata-mcp')] };
 data.plugin = data.plugin || [];
 // Remove legacy global npm link name if it exists
-data.plugin = data.plugin.filter(p => p !== 'opencode-strata');
+data.plugin = data.plugin.filter(p => p !== 'opencode-neurostrata');
 if (!data.plugin.includes(pluginPath)) {
     data.plugin.push(pluginPath);
 }

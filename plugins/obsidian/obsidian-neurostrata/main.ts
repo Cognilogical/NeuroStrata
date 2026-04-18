@@ -1,23 +1,23 @@
 import { App, Plugin, PluginSettingTab, Setting, ItemView, WorkspaceLeaf, Notice, TFile, addIcon } from 'obsidian';
 
-interface StrataPluginSettings {
+interface NeuroStrataPluginSettings {
     qdrantUrl: string;
     collectionName: string;
     embedderUrl: string;
     autoUpdateCanvas: boolean;
 }
 
-const DEFAULT_SETTINGS: StrataPluginSettings = {
+const DEFAULT_SETTINGS: NeuroStrataPluginSettings = {
     qdrantUrl: 'http://127.0.0.1:6333',
-    collectionName: 'strata',
+    collectionName: 'neurostrata',
     embedderUrl: 'http://127.0.0.1:8004/v1/embeddings',
     autoUpdateCanvas: false
 }
 
-const VIEW_TYPE_STRATA = "strata-view";
-const CANVAS_FILE_NAME = "Strata MemorySpace.canvas";
+const VIEW_TYPE_NEUROSTRATA = "neurostrata-view";
+const CANVAS_FILE_NAME = "NeuroStrata MemorySpace.canvas";
 
-const STRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+const NEUROSTRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="50" cy="50" r="45" stroke-dasharray="4 4" opacity="0.3"/>
   <circle cx="30" cy="35" r="8"/>
   <circle cx="70" cy="35" r="8"/>
@@ -33,8 +33,8 @@ const STRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="currentC
   <path d="M70 43 L80 60"/>
 </svg>`;
 
-class StrataView extends ItemView {
-    plugin: StrataPlugin;
+class NeuroStrataView extends ItemView {
+    plugin: NeuroStrataPlugin;
     currentNamespace: string = 'global';
     memoriesContainer: HTMLElement;
     allCurrentPoints: any[] = [];
@@ -46,21 +46,21 @@ class StrataView extends ItemView {
     linesInput: HTMLInputElement;
     namespaceSelect: HTMLSelectElement;
 
-    constructor(leaf: WorkspaceLeaf, plugin: StrataPlugin) {
+    constructor(leaf: WorkspaceLeaf, plugin: NeuroStrataPlugin) {
         super(leaf);
         this.plugin = plugin;
     }
 
     getViewType() {
-        return VIEW_TYPE_STRATA;
+        return VIEW_TYPE_NEUROSTRATA;
     }
 
     getDisplayText() {
-        return "Strata Inspector";
+        return "NeuroStrata Inspector";
     }
 
     getIcon() {
-        return "strata-brain";
+        return "neurostrata-brain";
     }
 
     get qdrantPointsUrl() {
@@ -75,22 +75,22 @@ class StrataView extends ItemView {
     async onOpen() {
         const container = this.containerEl.children[1];
         container.empty();
-        container.createEl("h4", { text: "Strata Curation" });
+        container.createEl("h4", { text: "NeuroStrata Curation" });
 
-        const controls = container.createDiv({ cls: "strata-header-controls" });
+        const controls = container.createDiv({ cls: "neurostrata-header-controls" });
         controls.style.flexWrap = "wrap";
         
-        this.namespaceSelect = controls.createEl("select", { cls: "strata-select" });
+        this.namespaceSelect = controls.createEl("select", { cls: "neurostrata-select" });
         
         this.namespaceSelect.onchange = (e) => {
             this.currentNamespace = (e.target as HTMLSelectElement).value;
             this.loadMemories();
         };
 
-        const addBtn = controls.createEl("button", { text: "+ Add Memory", cls: "strata-btn" });
-        const refreshBtn = controls.createEl("button", { text: "Refresh", cls: "strata-btn" });
+        const addBtn = controls.createEl("button", { text: "+ Add Memory", cls: "neurostrata-btn" });
+        const refreshBtn = controls.createEl("button", { text: "Refresh", cls: "neurostrata-btn" });
         
-        const canvasBtn = controls.createEl("button", { text: "View MemorySpace", cls: "strata-btn" });
+        const canvasBtn = controls.createEl("button", { text: "View MemorySpace", cls: "neurostrata-btn" });
         canvasBtn.style.backgroundColor = "var(--interactive-accent)";
         canvasBtn.style.color = "var(--text-on-accent)";
         
@@ -105,7 +105,7 @@ class StrataView extends ItemView {
         this.searchInput = container.createEl("input", { 
             type: "text", 
             placeholder: "Filter memories...", 
-            cls: "strata-memory-edit-area" 
+            cls: "neurostrata-memory-edit-area" 
         });
         this.searchInput.style.minHeight = "auto";
         this.searchInput.style.padding = "6px";
@@ -115,12 +115,12 @@ class StrataView extends ItemView {
             this.renderFilteredMemories();
         };
 
-        this.addForm = container.createDiv({ cls: "strata-memory-card" });
+        this.addForm = container.createDiv({ cls: "neurostrata-memory-card" });
         this.addForm.style.display = 'none';
         this.addForm.style.borderColor = "var(--interactive-accent)";
 
-        this.addForm.createEl("div", { text: "New Memory Content:", cls: "strata-memory-text" });
-        this.addTextarea = this.addForm.createEl("textarea", { cls: "strata-memory-edit-area" });
+        this.addForm.createEl("div", { text: "New Memory Content:", cls: "neurostrata-memory-text" });
+        this.addTextarea = this.addForm.createEl("textarea", { cls: "neurostrata-memory-edit-area" });
 
         const metaContainer = this.addForm.createDiv();
         metaContainer.style.display = "grid";
@@ -129,23 +129,23 @@ class StrataView extends ItemView {
         metaContainer.style.marginTop = "10px";
 
         const refDiv = metaContainer.createDiv();
-        const refLabel = refDiv.createEl("div", { text: "File:", cls: "strata-memory-text" });
+        const refLabel = refDiv.createEl("div", { text: "File:", cls: "neurostrata-memory-text" });
         refLabel.style.fontSize = "var(--font-ui-smaller)";
-        this.refInput = refDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+        this.refInput = refDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
         this.refInput.style.minHeight = "auto";
         this.refInput.style.padding = "5px";
 
         const linesDiv = metaContainer.createDiv();
-        const linesLabel = linesDiv.createEl("div", { text: "Lines (e.g. 42-49):", cls: "strata-memory-text" });
+        const linesLabel = linesDiv.createEl("div", { text: "Lines (e.g. 42-49):", cls: "neurostrata-memory-text" });
         linesLabel.style.fontSize = "var(--font-ui-smaller)";
-        this.linesInput = linesDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+        this.linesInput = linesDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
         this.linesInput.style.minHeight = "auto";
         this.linesInput.style.padding = "5px";
 
-        const addBtnGroup = this.addForm.createDiv({ cls: "strata-button-group" });
+        const addBtnGroup = this.addForm.createDiv({ cls: "neurostrata-button-group" });
         addBtnGroup.style.marginTop = "10px";
-        const saveNewBtn = addBtnGroup.createEl("button", { text: "Save Memory", cls: "strata-btn" });
-        const cancelNewBtn = addBtnGroup.createEl("button", { text: "Cancel", cls: "strata-btn" });
+        const saveNewBtn = addBtnGroup.createEl("button", { text: "Save Memory", cls: "neurostrata-btn" });
+        const cancelNewBtn = addBtnGroup.createEl("button", { text: "Cancel", cls: "neurostrata-btn" });
 
         addBtn.onclick = () => {
             this.addForm.style.display = 'block';
@@ -188,7 +188,7 @@ class StrataView extends ItemView {
                     }
                 }
             } catch (e) {
-                console.warn("Strata Embedder failed. Falling back to zero-vector.", e);
+                console.warn("NeuroStrata Embedder failed. Falling back to zero-vector.", e);
             }
 
             const pointId = crypto.randomUUID();
@@ -292,7 +292,7 @@ class StrataView extends ItemView {
             }
             
         } catch (e) {
-            console.error("Strata: Failed to load namespaces from Qdrant", e);
+            console.error("NeuroStrata: Failed to load namespaces from Qdrant", e);
             this.namespaceSelect.empty();
             this.namespaceSelect.createEl("option", { text: "global", value: "global" });
             this.currentNamespace = 'global';
@@ -352,15 +352,15 @@ class StrataView extends ItemView {
     }
 
     renderMemoryCard(point: any) {
-        const card = this.memoriesContainer.createDiv({ cls: "strata-memory-card" });
+        const card = this.memoriesContainer.createDiv({ cls: "neurostrata-memory-card" });
         let textData = point.payload?.data || "";
         let refs = point.payload?.refs || [];
 
-        const textDisplay = card.createDiv({ cls: "strata-memory-text", text: textData });
+        const textDisplay = card.createDiv({ cls: "neurostrata-memory-text", text: textData });
         textDisplay.style.whiteSpace = "pre-wrap";
         textDisplay.style.marginBottom = "8px";
         
-        const badgeContainer = card.createDiv({ cls: "strata-refs-container" });
+        const badgeContainer = card.createDiv({ cls: "neurostrata-refs-container" });
         
         const renderBadges = (currentRefs: any[]) => {
             badgeContainer.empty();
@@ -393,7 +393,7 @@ class StrataView extends ItemView {
         const editContainer = card.createDiv();
         editContainer.style.display = 'none';
 
-        const editArea = editContainer.createEl("textarea", { cls: "strata-memory-edit-area" });
+        const editArea = editContainer.createEl("textarea", { cls: "neurostrata-memory-edit-area" });
         editArea.value = textData;
 
         const editMetaContainer = editContainer.createDiv();
@@ -403,13 +403,13 @@ class StrataView extends ItemView {
         editMetaContainer.style.marginTop = "10px";
 
         const editRefDiv = editMetaContainer.createDiv();
-        editRefDiv.createEl("div", { text: "File:", cls: "strata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
-        const editRefInput = editRefDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+        editRefDiv.createEl("div", { text: "File:", cls: "neurostrata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
+        const editRefInput = editRefDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
         editRefInput.style.minHeight = "auto"; editRefInput.style.padding = "5px";
         
         const editLinesDiv = editMetaContainer.createDiv();
-        editLinesDiv.createEl("div", { text: "Lines:", cls: "strata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
-        const editLinesInput = editLinesDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+        editLinesDiv.createEl("div", { text: "Lines:", cls: "neurostrata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
+        const editLinesInput = editLinesDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
         editLinesInput.style.minHeight = "auto"; editLinesInput.style.padding = "5px";
 
         if (refs.length > 0) {
@@ -417,13 +417,13 @@ class StrataView extends ItemView {
             editLinesInput.value = refs[0].lines || "";
         }
 
-        const btnGroup = card.createDiv({ cls: "strata-button-group" });
+        const btnGroup = card.createDiv({ cls: "neurostrata-button-group" });
         btnGroup.style.marginTop = "10px";
         
-        const editBtn = btnGroup.createEl("button", { text: "Edit", cls: "strata-btn" });
-        const deleteBtn = btnGroup.createEl("button", { text: "Delete", cls: "strata-btn strata-btn-delete" });
-        const saveBtn = btnGroup.createEl("button", { text: "Save", cls: "strata-btn" });
-        const cancelBtn = btnGroup.createEl("button", { text: "Cancel", cls: "strata-btn" });
+        const editBtn = btnGroup.createEl("button", { text: "Edit", cls: "neurostrata-btn" });
+        const deleteBtn = btnGroup.createEl("button", { text: "Delete", cls: "neurostrata-btn neurostrata-btn-delete" });
+        const saveBtn = btnGroup.createEl("button", { text: "Save", cls: "neurostrata-btn" });
+        const cancelBtn = btnGroup.createEl("button", { text: "Cancel", cls: "neurostrata-btn" });
 
         saveBtn.style.display = 'none';
         cancelBtn.style.display = 'none';
@@ -564,10 +564,10 @@ class StrataView extends ItemView {
     }
 }
 
-class StrataSettingTab extends PluginSettingTab {
-    plugin: StrataPlugin;
+class NeuroStrataSettingTab extends PluginSettingTab {
+    plugin: NeuroStrataPlugin;
 
-    constructor(app: App, plugin: StrataPlugin) {
+    constructor(app: App, plugin: NeuroStrataPlugin) {
         super(app, plugin);
         this.plugin = plugin;
     }
@@ -575,7 +575,7 @@ class StrataSettingTab extends PluginSettingTab {
     display(): void {
         const {containerEl} = this;
         containerEl.empty();
-        containerEl.createEl('h2', {text: 'Strata Settings'});
+        containerEl.createEl('h2', {text: 'NeuroStrata Settings'});
 
         new Setting(containerEl)
             .setName('Qdrant Base URL')
@@ -590,9 +590,9 @@ class StrataSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Collection Name')
-            .setDesc('The name of the Qdrant collection used by Strata')
+            .setDesc('The name of the Qdrant collection used by NeuroStrata')
             .addText(text => text
-                .setPlaceholder('strata')
+                .setPlaceholder('neurostrata')
                 .setValue(this.plugin.settings.collectionName)
                 .onChange(async (value) => {
                     this.plugin.settings.collectionName = value;
@@ -612,7 +612,7 @@ class StrataSettingTab extends PluginSettingTab {
                 
         new Setting(containerEl)
             .setName('Auto-Update Canvas')
-            .setDesc('Automatically regenerate the "Strata MemorySpace.canvas" file when modifying memories.')
+            .setDesc('Automatically regenerate the "NeuroStrata MemorySpace.canvas" file when modifying memories.')
             .addToggle(toggle => toggle
                 .setValue(this.plugin.settings.autoUpdateCanvas)
                 .onChange(async (value) => {
@@ -622,22 +622,22 @@ class StrataSettingTab extends PluginSettingTab {
     }
 }
 
-export default class StrataPlugin extends Plugin {
-    settings: StrataPluginSettings;
+export default class NeuroStrataPlugin extends Plugin {
+    settings: NeuroStrataPluginSettings;
 
     async onload() {
         await this.loadSettings();
         
-        addIcon('strata-brain', STRATA_ICON_SVG);
+        addIcon('neurostrata-brain', NEUROSTRATA_ICON_SVG);
 
-        this.addSettingTab(new StrataSettingTab(this.app, this));
+        this.addSettingTab(new NeuroStrataSettingTab(this.app, this));
 
         this.registerView(
-            VIEW_TYPE_STRATA,
-            (leaf) => new StrataView(leaf, this)
+            VIEW_TYPE_NEUROSTRATA,
+            (leaf) => new NeuroStrataView(leaf, this)
         );
 
-        this.addRibbonIcon('strata-brain', 'Open Strata Inspector', () => {
+        this.addRibbonIcon('neurostrata-brain', 'Open NeuroStrata Inspector', () => {
             this.activateView();
         });
 
@@ -647,8 +647,8 @@ export default class StrataPlugin extends Plugin {
                 if (selection && selection.trim().length > 0) {
                     menu.addItem((item) => {
                         item
-                            .setTitle("Create Strata Memory (Paragraph)")
-                            .setIcon("strata-brain")
+                            .setTitle("Create NeuroStrata Memory (Paragraph)")
+                            .setIcon("neurostrata-brain")
                             .onClick(async () => {
                                 const selections = editor.listSelections();
                                 let linesStr = "";
@@ -670,7 +670,7 @@ export default class StrataPlugin extends Plugin {
                                 }
                                 
                                 const viewInstance = await this.activateView();
-                                if (viewInstance && viewInstance instanceof StrataView) {
+                                if (viewInstance && viewInstance instanceof NeuroStrataView) {
                                     const filePath = view.file ? view.file.path : "";
                                     viewInstance.openAddMemoryForm(selection, filePath, linesStr);
                                 }
@@ -823,7 +823,7 @@ export default class StrataPlugin extends Plugin {
                 file = await this.app.vault.create(CANVAS_FILE_NAME, fileData);
             }
             if (!silent) {
-                new Notice("Strata MemorySpace generated successfully!");
+                new Notice("NeuroStrata MemorySpace generated successfully!");
                 this.app.workspace.getLeaf(false).openFile(file);
             }
         } catch (e) {
@@ -839,32 +839,32 @@ export default class StrataPlugin extends Plugin {
     async saveSettings() {
         await this.saveData(this.settings);
         
-        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_STRATA);
+        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_NEUROSTRATA);
         for (const leaf of leaves) {
-            if (leaf.view instanceof StrataView) {
+            if (leaf.view instanceof NeuroStrataView) {
                 leaf.view.loadMemories();
             }
         }
     }
 
-    async activateView(): Promise<StrataView | null> {
+    async activateView(): Promise<NeuroStrataView | null> {
         const { workspace } = this.app;
         
         let leaf: WorkspaceLeaf | null = null;
-        const leaves = workspace.getLeavesOfType(VIEW_TYPE_STRATA);
+        const leaves = workspace.getLeavesOfType(VIEW_TYPE_NEUROSTRATA);
         
         if (leaves.length > 0) {
             leaf = leaves[0];
         } else {
             leaf = workspace.getRightLeaf(false);
             if (leaf) {
-                await leaf.setViewState({ type: VIEW_TYPE_STRATA, active: true });
+                await leaf.setViewState({ type: VIEW_TYPE_NEUROSTRATA, active: true });
             }
         }
         
         if (leaf) {
             workspace.revealLeaf(leaf);
-            return leaf.view as StrataView;
+            return leaf.view as NeuroStrataView;
         }
         return null;
     }

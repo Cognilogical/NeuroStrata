@@ -9,7 +9,7 @@ mcp/dist/
 .sessions/
 # Graphify Cache/Artifacts
 .graphify_*
-mcp/strata-mcp
+mcp/neurostrata-mcp
 
 # Beads / Dolt files (added by bd init)
 .dolt/

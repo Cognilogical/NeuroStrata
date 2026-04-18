@@ -1,18 +1,18 @@
 $ErrorActionPreference = "Stop"
 
 $scriptDir = $PSScriptRoot
-$installPluginDir = Join-Path $env:USERPROFILE ".local\share\strata\plugin"
+$installPluginDir = Join-Path $env:USERPROFILE ".local\share\neurostrata\plugin"
 $opencodeConfig = Join-Path $env:USERPROFILE ".config\opencode\opencode.json"
-$githubRepo = "your-username/strata"
+$githubRepo = "your-username/neurostrata"
 
-Write-Host "Setting up the Strata OpenCode plugin..."
-$pluginDir = Join-Path $scriptDir "strata-plugin"
+Write-Host "Setting up the NeuroStrata OpenCode plugin..."
+$pluginDir = Join-Path $scriptDir "neurostrata-plugin"
 
 $distDir = Join-Path $pluginDir "dist"
 $pkgJson = Join-Path $pluginDir "package.json"
 
 if ((Test-Path $distDir) -and (Test-Path $pkgJson)) {
-    Write-Host "  -> Found local strata-plugin source. Copying to $installPluginDir..."
+    Write-Host "  -> Found local neurostrata-plugin source. Copying to $installPluginDir..."
     if (-not (Test-Path $installPluginDir)) {
         New-Item -ItemType Directory -Force -Path $installPluginDir | Out-Null
     }
@@ -20,7 +20,7 @@ if ((Test-Path $distDir) -and (Test-Path $pkgJson)) {
     Copy-Item -Path $pkgJson -Destination $installPluginDir -Force
 } else {
     # Production Mode
-    $pluginUrl = "https://github.com/$githubRepo/releases/latest/download/opencode-strata.tgz"
+    $pluginUrl = "https://github.com/$githubRepo/releases/latest/download/opencode-neurostrata.tgz"
     Write-Host "  -> Downloading pre-compiled plugin from $pluginUrl..."
     
     if (-not (Test-Path $installPluginDir)) {
@@ -61,20 +61,20 @@ try {
     if ($null -eq $configData.mcp) { Add-Member -InputObject $configData -MemberType NoteProperty -Name "mcp" -Value @{} }
     if ($null -eq $configData.plugin) { Add-Member -InputObject $configData -MemberType NoteProperty -Name "plugin" -Value @() }
     
-    # Setup MCP strata config
-    $strataMcpCommand = Join-Path $env:USERPROFILE ".local\bin\strata-mcp.exe"
-    $mcpStrata = @{
+    # Setup MCP neurostrata config
+    $neurostrataMcpCommand = Join-Path $env:USERPROFILE ".local\bin\neurostrata-mcp.exe"
+    $mcpNeuroStrata = @{
         "type" = "local"
-        "command" = @($strataMcpCommand)
+        "command" = @($neurostrataMcpCommand)
     }
-    $configData.mcp.strata = $mcpStrata
+    $configData.mcp.neurostrata = $mcpNeuroStrata
     
     # Setup plugin array
     $pluginArray = [System.Collections.ArrayList]@($configData.plugin)
     
     # Remove old global plugin if present
-    if ($pluginArray.Contains("opencode-strata")) {
-        $pluginArray.Remove("opencode-strata")
+    if ($pluginArray.Contains("opencode-neurostrata")) {
+        $pluginArray.Remove("opencode-neurostrata")
     }
     
     # Format the path replacing single backward slash with double

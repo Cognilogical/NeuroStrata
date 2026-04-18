@@ -1,4 +1,4 @@
-.strata-memory-card {
+.neurostrata-memory-card {
     border: 1px solid var(--background-modifier-border);
     border-radius: 6px;
     padding: 10px;
@@ -6,14 +6,14 @@
     background-color: var(--background-secondary);
 }
 
-.strata-memory-text {
+.neurostrata-memory-text {
     margin-bottom: 8px;
     font-size: var(--font-ui-small);
     line-height: 1.4;
     white-space: pre-wrap;
 }
 
-.strata-memory-edit-area {
+.neurostrata-memory-edit-area {
     width: 100%;
     min-height: 60px;
     margin-bottom: 8px;
@@ -26,31 +26,31 @@
     resize: vertical;
 }
 
-.strata-button-group {
+.neurostrata-button-group {
     display: flex;
     gap: 8px;
     justify-content: flex-end;
 }
 
-.strata-btn {
+.neurostrata-btn {
     padding: 4px 12px;
     font-size: var(--font-ui-smaller);
     cursor: pointer;
 }
 
-.strata-btn-delete {
+.neurostrata-btn-delete {
     background-color: var(--background-modifier-error);
     color: var(--text-on-accent);
 }
 
-.strata-header-controls {
+.neurostrata-header-controls {
     display: flex;
     gap: 10px;
     margin-bottom: 15px;
     align-items: center;
 }
 
-.strata-select {
+.neurostrata-select {
     flex-grow: 1;
     padding: 5px;
     background-color: var(--background-primary);

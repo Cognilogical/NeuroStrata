@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 Write-Host "==============================================="
-Write-Host "  Strata: 3-Tier Memory Installer (Windows)  "
+Write-Host "  NeuroStrata: 3-Tier Memory Installer (Windows)  "
 Write-Host "==============================================="
 
 # 1. Check for Podman
@@ -34,7 +34,7 @@ if (Get-Command go -ErrorAction SilentlyContinue) {
 
 # 5. Pull Ollama models
 Write-Host "Starting local infrastructure to pull models..."
-podman rm -f strata-qdrant strata-embedder 2>$null
+podman rm -f neurostrata-qdrant neurostrata-embedder 2>$null
 podman-compose up -d
 
 Write-Host "Waiting for Ollama to start..."

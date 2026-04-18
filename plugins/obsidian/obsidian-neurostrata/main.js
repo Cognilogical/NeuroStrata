@@ -19,19 +19,19 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // main.ts
 var main_exports = {};
 __export(main_exports, {
-  default: () => StrataPlugin
+  default: () => NeuroStrataPlugin
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var DEFAULT_SETTINGS = {
   qdrantUrl: "http://127.0.0.1:6333",
-  collectionName: "strata",
+  collectionName: "neurostrata",
   embedderUrl: "http://127.0.0.1:8004/v1/embeddings",
   autoUpdateCanvas: false
 };
-var VIEW_TYPE_STRATA = "strata-view";
-var CANVAS_FILE_NAME = "Strata MemorySpace.canvas";
-var STRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+var VIEW_TYPE_NEUROSTRATA = "neurostrata-view";
+var CANVAS_FILE_NAME = "NeuroStrata MemorySpace.canvas";
+var NEUROSTRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="50" cy="50" r="45" stroke-dasharray="4 4" opacity="0.3"/>
   <circle cx="30" cy="35" r="8"/>
   <circle cx="70" cy="35" r="8"/>
@@ -46,7 +46,7 @@ var STRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="currentCol
   <path d="M30 43 L20 60"/>
   <path d="M70 43 L80 60"/>
 </svg>`;
-var StrataView = class extends import_obsidian.ItemView {
+var NeuroStrataView = class extends import_obsidian.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.currentNamespace = "global";
@@ -54,13 +54,13 @@ var StrataView = class extends import_obsidian.ItemView {
     this.plugin = plugin;
   }
   getViewType() {
-    return VIEW_TYPE_STRATA;
+    return VIEW_TYPE_NEUROSTRATA;
   }
   getDisplayText() {
-    return "Strata Inspector";
+    return "NeuroStrata Inspector";
   }
   getIcon() {
-    return "strata-brain";
+    return "neurostrata-brain";
   }
   get qdrantPointsUrl() {
     const baseUrl = this.plugin.settings.qdrantUrl.replace(/\/$/, "");
@@ -72,17 +72,17 @@ var StrataView = class extends import_obsidian.ItemView {
   async onOpen() {
     const container = this.containerEl.children[1];
     container.empty();
-    container.createEl("h4", { text: "Strata Curation" });
-    const controls = container.createDiv({ cls: "strata-header-controls" });
+    container.createEl("h4", { text: "NeuroStrata Curation" });
+    const controls = container.createDiv({ cls: "neurostrata-header-controls" });
     controls.style.flexWrap = "wrap";
-    this.namespaceSelect = controls.createEl("select", { cls: "strata-select" });
+    this.namespaceSelect = controls.createEl("select", { cls: "neurostrata-select" });
     this.namespaceSelect.onchange = (e) => {
       this.currentNamespace = e.target.value;
       this.loadMemories();
     };
-    const addBtn = controls.createEl("button", { text: "+ Add Memory", cls: "strata-btn" });
-    const refreshBtn = controls.createEl("button", { text: "Refresh", cls: "strata-btn" });
-    const canvasBtn = controls.createEl("button", { text: "View MemorySpace", cls: "strata-btn" });
+    const addBtn = controls.createEl("button", { text: "+ Add Memory", cls: "neurostrata-btn" });
+    const refreshBtn = controls.createEl("button", { text: "Refresh", cls: "neurostrata-btn" });
+    const canvasBtn = controls.createEl("button", { text: "View MemorySpace", cls: "neurostrata-btn" });
     canvasBtn.style.backgroundColor = "var(--interactive-accent)";
     canvasBtn.style.color = "var(--text-on-accent)";
     canvasBtn.onclick = async () => {
@@ -95,7 +95,7 @@ var StrataView = class extends import_obsidian.ItemView {
     this.searchInput = container.createEl("input", {
       type: "text",
       placeholder: "Filter memories...",
-      cls: "strata-memory-edit-area"
+      cls: "neurostrata-memory-edit-area"
     });
     this.searchInput.style.minHeight = "auto";
     this.searchInput.style.padding = "6px";
@@ -103,32 +103,32 @@ var StrataView = class extends import_obsidian.ItemView {
     this.searchInput.oninput = () => {
       this.renderFilteredMemories();
     };
-    this.addForm = container.createDiv({ cls: "strata-memory-card" });
+    this.addForm = container.createDiv({ cls: "neurostrata-memory-card" });
     this.addForm.style.display = "none";
     this.addForm.style.borderColor = "var(--interactive-accent)";
-    this.addForm.createEl("div", { text: "New Memory Content:", cls: "strata-memory-text" });
-    this.addTextarea = this.addForm.createEl("textarea", { cls: "strata-memory-edit-area" });
+    this.addForm.createEl("div", { text: "New Memory Content:", cls: "neurostrata-memory-text" });
+    this.addTextarea = this.addForm.createEl("textarea", { cls: "neurostrata-memory-edit-area" });
     const metaContainer = this.addForm.createDiv();
     metaContainer.style.display = "grid";
     metaContainer.style.gridTemplateColumns = "1fr 1fr";
     metaContainer.style.gap = "8px";
     metaContainer.style.marginTop = "10px";
     const refDiv = metaContainer.createDiv();
-    const refLabel = refDiv.createEl("div", { text: "File:", cls: "strata-memory-text" });
+    const refLabel = refDiv.createEl("div", { text: "File:", cls: "neurostrata-memory-text" });
     refLabel.style.fontSize = "var(--font-ui-smaller)";
-    this.refInput = refDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+    this.refInput = refDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
     this.refInput.style.minHeight = "auto";
     this.refInput.style.padding = "5px";
     const linesDiv = metaContainer.createDiv();
-    const linesLabel = linesDiv.createEl("div", { text: "Lines (e.g. 42-49):", cls: "strata-memory-text" });
+    const linesLabel = linesDiv.createEl("div", { text: "Lines (e.g. 42-49):", cls: "neurostrata-memory-text" });
     linesLabel.style.fontSize = "var(--font-ui-smaller)";
-    this.linesInput = linesDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+    this.linesInput = linesDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
     this.linesInput.style.minHeight = "auto";
     this.linesInput.style.padding = "5px";
-    const addBtnGroup = this.addForm.createDiv({ cls: "strata-button-group" });
+    const addBtnGroup = this.addForm.createDiv({ cls: "neurostrata-button-group" });
     addBtnGroup.style.marginTop = "10px";
-    const saveNewBtn = addBtnGroup.createEl("button", { text: "Save Memory", cls: "strata-btn" });
-    const cancelNewBtn = addBtnGroup.createEl("button", { text: "Cancel", cls: "strata-btn" });
+    const saveNewBtn = addBtnGroup.createEl("button", { text: "Save Memory", cls: "neurostrata-btn" });
+    const cancelNewBtn = addBtnGroup.createEl("button", { text: "Cancel", cls: "neurostrata-btn" });
     addBtn.onclick = () => {
       this.addForm.style.display = "block";
       this.addTextarea.value = "";
@@ -163,7 +163,7 @@ var StrataView = class extends import_obsidian.ItemView {
           }
         }
       } catch (e) {
-        console.warn("Strata Embedder failed. Falling back to zero-vector.", e);
+        console.warn("NeuroStrata Embedder failed. Falling back to zero-vector.", e);
       }
       const pointId = crypto.randomUUID();
       const payload = {
@@ -251,7 +251,7 @@ var StrataView = class extends import_obsidian.ItemView {
         this.namespaceSelect.value = "global";
       }
     } catch (e) {
-      console.error("Strata: Failed to load namespaces from Qdrant", e);
+      console.error("NeuroStrata: Failed to load namespaces from Qdrant", e);
       this.namespaceSelect.empty();
       this.namespaceSelect.createEl("option", { text: "global", value: "global" });
       this.currentNamespace = "global";
@@ -302,13 +302,13 @@ var StrataView = class extends import_obsidian.ItemView {
   }
   renderMemoryCard(point) {
     var _a, _b;
-    const card = this.memoriesContainer.createDiv({ cls: "strata-memory-card" });
+    const card = this.memoriesContainer.createDiv({ cls: "neurostrata-memory-card" });
     let textData = ((_a = point.payload) == null ? void 0 : _a.data) || "";
     let refs = ((_b = point.payload) == null ? void 0 : _b.refs) || [];
-    const textDisplay = card.createDiv({ cls: "strata-memory-text", text: textData });
+    const textDisplay = card.createDiv({ cls: "neurostrata-memory-text", text: textData });
     textDisplay.style.whiteSpace = "pre-wrap";
     textDisplay.style.marginBottom = "8px";
-    const badgeContainer = card.createDiv({ cls: "strata-refs-container" });
+    const badgeContainer = card.createDiv({ cls: "neurostrata-refs-container" });
     const renderBadges = (currentRefs) => {
       badgeContainer.empty();
       if (currentRefs.length > 0) {
@@ -336,7 +336,7 @@ var StrataView = class extends import_obsidian.ItemView {
     renderBadges(refs);
     const editContainer = card.createDiv();
     editContainer.style.display = "none";
-    const editArea = editContainer.createEl("textarea", { cls: "strata-memory-edit-area" });
+    const editArea = editContainer.createEl("textarea", { cls: "neurostrata-memory-edit-area" });
     editArea.value = textData;
     const editMetaContainer = editContainer.createDiv();
     editMetaContainer.style.display = "grid";
@@ -344,25 +344,25 @@ var StrataView = class extends import_obsidian.ItemView {
     editMetaContainer.style.gap = "8px";
     editMetaContainer.style.marginTop = "10px";
     const editRefDiv = editMetaContainer.createDiv();
-    editRefDiv.createEl("div", { text: "File:", cls: "strata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
-    const editRefInput = editRefDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+    editRefDiv.createEl("div", { text: "File:", cls: "neurostrata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
+    const editRefInput = editRefDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
     editRefInput.style.minHeight = "auto";
     editRefInput.style.padding = "5px";
     const editLinesDiv = editMetaContainer.createDiv();
-    editLinesDiv.createEl("div", { text: "Lines:", cls: "strata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
-    const editLinesInput = editLinesDiv.createEl("input", { type: "text", cls: "strata-memory-edit-area" });
+    editLinesDiv.createEl("div", { text: "Lines:", cls: "neurostrata-memory-text" }).style.fontSize = "var(--font-ui-smaller)";
+    const editLinesInput = editLinesDiv.createEl("input", { type: "text", cls: "neurostrata-memory-edit-area" });
     editLinesInput.style.minHeight = "auto";
     editLinesInput.style.padding = "5px";
     if (refs.length > 0) {
       editRefInput.value = refs[0].file || "";
       editLinesInput.value = refs[0].lines || "";
     }
-    const btnGroup = card.createDiv({ cls: "strata-button-group" });
+    const btnGroup = card.createDiv({ cls: "neurostrata-button-group" });
     btnGroup.style.marginTop = "10px";
-    const editBtn = btnGroup.createEl("button", { text: "Edit", cls: "strata-btn" });
-    const deleteBtn = btnGroup.createEl("button", { text: "Delete", cls: "strata-btn strata-btn-delete" });
-    const saveBtn = btnGroup.createEl("button", { text: "Save", cls: "strata-btn" });
-    const cancelBtn = btnGroup.createEl("button", { text: "Cancel", cls: "strata-btn" });
+    const editBtn = btnGroup.createEl("button", { text: "Edit", cls: "neurostrata-btn" });
+    const deleteBtn = btnGroup.createEl("button", { text: "Delete", cls: "neurostrata-btn neurostrata-btn-delete" });
+    const saveBtn = btnGroup.createEl("button", { text: "Save", cls: "neurostrata-btn" });
+    const cancelBtn = btnGroup.createEl("button", { text: "Cancel", cls: "neurostrata-btn" });
     saveBtn.style.display = "none";
     cancelBtn.style.display = "none";
     editBtn.onclick = () => {
@@ -482,7 +482,7 @@ var StrataView = class extends import_obsidian.ItemView {
     };
   }
 };
-var StrataSettingTab = class extends import_obsidian.PluginSettingTab {
+var NeuroStrataSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -490,12 +490,12 @@ var StrataSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Strata Settings" });
+    containerEl.createEl("h2", { text: "NeuroStrata Settings" });
     new import_obsidian.Setting(containerEl).setName("Qdrant Base URL").setDesc("The base URL for your local Qdrant vector database").addText((text) => text.setPlaceholder("http://127.0.0.1:6333").setValue(this.plugin.settings.qdrantUrl).onChange(async (value) => {
       this.plugin.settings.qdrantUrl = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Collection Name").setDesc("The name of the Qdrant collection used by Strata").addText((text) => text.setPlaceholder("strata").setValue(this.plugin.settings.collectionName).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Collection Name").setDesc("The name of the Qdrant collection used by NeuroStrata").addText((text) => text.setPlaceholder("neurostrata").setValue(this.plugin.settings.collectionName).onChange(async (value) => {
       this.plugin.settings.collectionName = value;
       await this.plugin.saveSettings();
     }));
@@ -503,22 +503,22 @@ var StrataSettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.embedderUrl = value;
       await this.plugin.saveSettings();
     }));
-    new import_obsidian.Setting(containerEl).setName("Auto-Update Canvas").setDesc('Automatically regenerate the "Strata MemorySpace.canvas" file when modifying memories.').addToggle((toggle) => toggle.setValue(this.plugin.settings.autoUpdateCanvas).onChange(async (value) => {
+    new import_obsidian.Setting(containerEl).setName("Auto-Update Canvas").setDesc('Automatically regenerate the "NeuroStrata MemorySpace.canvas" file when modifying memories.').addToggle((toggle) => toggle.setValue(this.plugin.settings.autoUpdateCanvas).onChange(async (value) => {
       this.plugin.settings.autoUpdateCanvas = value;
       await this.plugin.saveSettings();
     }));
   }
 };
-var StrataPlugin = class extends import_obsidian.Plugin {
+var NeuroStrataPlugin = class extends import_obsidian.Plugin {
   async onload() {
     await this.loadSettings();
-    (0, import_obsidian.addIcon)("strata-brain", STRATA_ICON_SVG);
-    this.addSettingTab(new StrataSettingTab(this.app, this));
+    (0, import_obsidian.addIcon)("neurostrata-brain", NEUROSTRATA_ICON_SVG);
+    this.addSettingTab(new NeuroStrataSettingTab(this.app, this));
     this.registerView(
-      VIEW_TYPE_STRATA,
-      (leaf) => new StrataView(leaf, this)
+      VIEW_TYPE_NEUROSTRATA,
+      (leaf) => new NeuroStrataView(leaf, this)
     );
-    this.addRibbonIcon("strata-brain", "Open Strata Inspector", () => {
+    this.addRibbonIcon("neurostrata-brain", "Open NeuroStrata Inspector", () => {
       this.activateView();
     });
     this.registerEvent(
@@ -526,7 +526,7 @@ var StrataPlugin = class extends import_obsidian.Plugin {
         const selection = editor.getSelection();
         if (selection && selection.trim().length > 0) {
           menu.addItem((item) => {
-            item.setTitle("Create Strata Memory (Paragraph)").setIcon("strata-brain").onClick(async () => {
+            item.setTitle("Create NeuroStrata Memory (Paragraph)").setIcon("neurostrata-brain").onClick(async () => {
               const selections = editor.listSelections();
               let linesStr = "";
               if (selections.length > 0) {
@@ -542,7 +542,7 @@ var StrataPlugin = class extends import_obsidian.Plugin {
                 linesStr = `${startLine + 1}-${endLine + 1}`;
               }
               const viewInstance = await this.activateView();
-              if (viewInstance && viewInstance instanceof StrataView) {
+              if (viewInstance && viewInstance instanceof NeuroStrataView) {
                 const filePath = view.file ? view.file.path : "";
                 viewInstance.openAddMemoryForm(selection, filePath, linesStr);
               }
@@ -679,7 +679,7 @@ ${((_b = mem.payload) == null ? void 0 : _b.data) || ""}`,
         file = await this.app.vault.create(CANVAS_FILE_NAME, fileData);
       }
       if (!silent) {
-        new import_obsidian.Notice("Strata MemorySpace generated successfully!");
+        new import_obsidian.Notice("NeuroStrata MemorySpace generated successfully!");
         this.app.workspace.getLeaf(false).openFile(file);
       }
     } catch (e) {
@@ -693,9 +693,9 @@ ${((_b = mem.payload) == null ? void 0 : _b.data) || ""}`,
   }
   async saveSettings() {
     await this.saveData(this.settings);
-    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_STRATA);
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_NEUROSTRATA);
     for (const leaf of leaves) {
-      if (leaf.view instanceof StrataView) {
+      if (leaf.view instanceof NeuroStrataView) {
         leaf.view.loadMemories();
       }
     }
@@ -703,13 +703,13 @@ ${((_b = mem.payload) == null ? void 0 : _b.data) || ""}`,
   async activateView() {
     const { workspace } = this.app;
     let leaf = null;
-    const leaves = workspace.getLeavesOfType(VIEW_TYPE_STRATA);
+    const leaves = workspace.getLeavesOfType(VIEW_TYPE_NEUROSTRATA);
     if (leaves.length > 0) {
       leaf = leaves[0];
     } else {
       leaf = workspace.getRightLeaf(false);
       if (leaf) {
-        await leaf.setViewState({ type: VIEW_TYPE_STRATA, active: true });
+        await leaf.setViewState({ type: VIEW_TYPE_NEUROSTRATA, active: true });
       }
     }
     if (leaf) {

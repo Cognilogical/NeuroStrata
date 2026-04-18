@@ -4,11 +4,11 @@ set -e
 # Configuration
 BACKUP_FILE=$1
 QDRANT_URL=${2:-"http://localhost:6333"}
-COLLECTION_NAME=${3:-"strata"}
+COLLECTION_NAME=${3:-"neurostrata"}
 
 if [ -z "$BACKUP_FILE" ]; then
     echo "Usage: ./restore.sh <path_to_snapshot.snapshot> [QDRANT_URL] [COLLECTION_NAME]"
-    echo "Example: ./restore.sh ~/.config/strata/db/backups/strata-1234.snapshot"
+    echo "Example: ./restore.sh ~/.config/neurostrata/db/backups/neurostrata-1234.snapshot"
     exit 1
 fi
 

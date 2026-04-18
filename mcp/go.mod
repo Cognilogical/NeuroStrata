@@ -1,4 +1,4 @@
-module strata-mcp
+module neurostrata-mcp
 
 go 1.24.4
 

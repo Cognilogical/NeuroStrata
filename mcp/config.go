@@ -25,7 +25,7 @@ func loadConfig() error {
 	if err != nil {
 		return err
 	}
-	cfgPath := filepath.Join(home, ".config", "strata", "config.json")
+	cfgPath := filepath.Join(home, ".config", "neurostrata", "config.json")
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		return fmt.Errorf("failed to read config at %s: %w", cfgPath, err)

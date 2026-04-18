@@ -1,15 +1,15 @@
-# Strata OpenCode Plugin (`opencode-strata`)
+# NeuroStrata OpenCode Plugin (`opencode-neurostrata`)
 
-This directory contains the native OpenCode TypeScript plugin designed to protect the Strata 3-Tier memory architecture against context compaction.
+This directory contains the native OpenCode TypeScript plugin designed to protect the NeuroStrata 3-Tier memory architecture against context compaction.
 
 ## Why this exists
 
 AI conversational clients (like OpenCode) use rolling context windows. Once the context limit is reached, older messages are "compacted" or discarded, resulting in severe amnesia for the agent.
 
-**The Strata Plugin solves this by hooking directly into the OpenCode lifecycle:**
+**The NeuroStrata Plugin solves this by hooking directly into the OpenCode lifecycle:**
 
 1. **`experimental.chat.system.transform` (New Session Hook)**
-   - Enforces the **Strata Startup Protocol** on every new chat.
+   - Enforces the **NeuroStrata Startup Protocol** on every new chat.
    - Embeds aggressive safety constraints to prevent database destruction.
 
 2. **`experimental.session.compacting` (Compaction Defense Hook)**
@@ -23,7 +23,7 @@ This plugin is automatically built and linked when you run the main repository i
 If you need to build it manually:
 
 ```bash
-cd strata-plugin
+cd neurostrata-plugin
 npm install
 npm run build
 npm pack
