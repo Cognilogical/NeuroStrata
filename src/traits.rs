@@ -1,0 +1,51 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Represents a stored memory payload
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MemoryPayload {
+    pub content: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+/// Represents a search result from the vector database
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SearchResult {
+    pub id: String,
+    pub score: f32,
+    pub payload: MemoryPayload,
+}
+
+/// The core interface for generating vector embeddings from text.
+/// By making this a trait, we can swap between Local (FastEmbed/ONNX), 
+/// Remote (Ollama), or Cloud (OpenAI) implementations.
+#[async_trait]
+pub trait Embedder: Send + Sync {
+    /// Convert text into a dense vector representation.
+    async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    
+    /// Get the expected dimension of the embeddings (e.g., 768 for nomic-embed-text)
+    fn dimensions(&self) -> usize;
+}
+
+/// The core interface for vector storage and retrieval.
+/// By making this a trait, we can swap between Embedded Qdrant, 
+/// Remote Qdrant, LanceDB, or SQLite-VSS.
+#[async_trait]
+pub trait VectorStore: Send + Sync {
+    /// Ensure the necessary collections/tables exist.
+    async fn init(&self) -> Result<()>;
+    
+    /// Insert or update a memory with its associated vector and metadata.
+    async fn upsert(&self, id: &str, vector: Vec<f32>, payload: MemoryPayload) -> Result<()>;
+    
+    /// Search for the closest memories to a given vector.
+    async fn search(&self, vector: Vec<f32>, limit: usize) -> Result<Vec<SearchResult>>;
+    
+    /// Delete a specific memory by its ID.
+    async fn delete(&self, id: &str) -> Result<()>;
+}
