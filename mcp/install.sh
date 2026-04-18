@@ -4,7 +4,7 @@ set -e
 # ==============================================================================
 # Configuration
 # Change this to your actual GitHub username and repository when publishing
-GITHUB_REPO="your-username/neurostrata"
+GITHUB_REPO="Cognilogical/NeuroStrata"
 # ==============================================================================
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"

@@ -41,10 +41,10 @@ Write-Host "Waiting for Ollama to start..."
 Start-Sleep -Seconds 10
 
 Write-Host "Pulling local embedding model (nomic-embed-text)..."
-podman exec -it ollama ollama pull nomic-embed-text
+podman exec -it neurostrata-embedder ollama pull nomic-embed-text
 
 Write-Host "Pulling lightweight local LLM (llama3.2:1b)..."
-podman exec -it ollama ollama pull llama3.2:1b
+podman exec -it neurostrata-embedder ollama pull llama3.2:1b
 
 # 6. Install Go MCP Server
 Write-Host "Installing Core MCP Server..."

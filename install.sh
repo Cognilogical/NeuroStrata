@@ -39,10 +39,10 @@ echo "Waiting for Ollama to start..."
 sleep 10
 
 echo "Pulling local embedding model (nomic-embed-text)..."
-podman exec -it ollama ollama pull nomic-embed-text
+podman exec -it neurostrata-embedder ollama pull nomic-embed-text
 
 echo "Pulling lightweight local LLM (llama3.2:1b)..."
-podman exec -it ollama ollama pull llama3.2:1b
+podman exec -it neurostrata-embedder ollama pull llama3.2:1b
 
 # 6. Install Go MCP Server
 echo "Installing Core MCP Server..."

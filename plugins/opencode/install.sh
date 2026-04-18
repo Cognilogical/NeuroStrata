@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_PLUGIN_DIR="$HOME/.local/share/neurostrata/plugin"
 OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
-GITHUB_REPO="your-username/neurostrata"
+GITHUB_REPO="Cognilogical/NeuroStrata"
 
 echo "Setting up the NeuroStrata OpenCode plugin..."
 PLUGIN_DIR="$SCRIPT_DIR/neurostrata-plugin"
