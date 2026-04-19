@@ -162,3 +162,21 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
 *   **ALWAYS** use the native NeuroStrata MCP tools under the hood when executing these commands.
 *   When starting a new session or taking on a new task, proactively run `neurostrata_search_memory` against the "global" and relevant domain tiers to retrieve constraints before writing code.
 *   **Proactively fix memory!** If you spot a hallucination or an outdated architectural rule during your work, use `neurostrata_delete_memory` or `neurostrata_update_memory` to fix the database without asking for permission.
+
+## The Vector-to-Wiki Promotion Threshold (Keeping LanceDB Compact)
+Vector memory is cheap to search but should not become a dumping ground for massive text blobs that bloat the context window upon retrieval. You must actively manage the threshold between a raw Vector Memory and a Tier 2 Markdown Wiki file.
+
+**When to keep it as a raw Vector Memory (LanceDB only):**
+- Short constraints (1-4 sentences).
+- Quick "gotchas", negative knowledge, and anti-patterns (e.g., "Use `platform: browser` for esbuild").
+- Simple CLI commands or single-step fixes.
+
+**When to PROMOTE to LLM-Wiki format (.md file in `docs/architecture/domains/`):**
+1. **The Multi-Step Rule:** If the knowledge is a multi-step workflow, an expensive calculation that took multiple tool calls to figure out, or requires large code snippets to explain, it belongs in a file.
+2. **The Aggregation Rule:** If you notice multiple fragmented vector memories accumulating about the same component (e.g., 4 different memories about "MQTT" or "LanceDB schemas"), the vector space is getting cluttered.
+3. **The Promotion Action:** You MUST synthesize those fragmented memories into a single cohesive `.md` file. Then, use `neurostrata_delete_memory` to clear out the verbose vectors, and `neurostrata_add_memory` to create a single **Pointer Memory** (e.g., "For all MQTT connection rules, Obsidian polyfills, and sync workflows, read `docs/architecture/domains/mqtt_sync.md`").
+
+## Harvesting Hallucinations & Expensive Computations
+You must aggressively harvest the results of your own labor:
+- **Negative Knowledge (The Hallucination Trap):** When you or a sub-agent makes a mistake, hallucinates an API, or falls into a compiler trap, you MUST record the failed path and the correct resolution. Future agents will have similar semantic thoughts; the vector DB must intercept them before they write bad code.
+- **The Token Tax (Expensive Computations):** If you spend multiple turns using `grep`, `read`, or `bash` to trace a complex variable path, reverse-engineer a system, or map out an undocumented module, the final synthesized conclusion MUST be saved immediately. Do not force the next agent to pay the same token tax to relearn it.
