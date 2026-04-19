@@ -13155,14 +13155,12 @@ var NeuroStrataView = class extends import_obsidian.ItemView {
     try {
       if (!this.plugin.mqtt)
         return;
-      const data = await this.plugin.mqtt.request("list", {});
+      const data = await this.plugin.mqtt.request("list_namespaces", {});
       const uniqueNamespaces = /* @__PURE__ */ new Set();
       uniqueNamespaces.add("global");
       if (data && Array.isArray(data)) {
-        data.forEach((p) => {
-          if (p.payload && p.payload.user_id) {
-            uniqueNamespaces.add(p.payload.user_id);
-          }
+        data.forEach((ns) => {
+          uniqueNamespaces.add(ns);
         });
       }
       const namespaces = Array.from(uniqueNamespaces).sort();
@@ -13405,47 +13403,85 @@ var NeuroStrataPlugin = class extends import_obsidian.Plugin {
     this.mqtt = null;
   }
   async onload() {
-    await this.loadSettings();
-    this.initMqtt();
-    (0, import_obsidian.addIcon)("neurostrata-brain", NEUROSTRATA_ICON_SVG);
-    this.addSettingTab(new NeuroStrataSettingTab(this.app, this));
-    this.registerView(
-      VIEW_TYPE_NEUROSTRATA,
-      (leaf) => new NeuroStrataView(leaf, this)
-    );
-    this.addRibbonIcon("neurostrata-brain", "Open NeuroStrata Inspector", () => {
-      this.activateView();
-    });
-    this.registerEvent(
-      this.app.workspace.on("editor-menu", (menu, editor, view) => {
-        const selection = editor.getSelection();
-        if (selection && selection.trim().length > 0) {
-          menu.addItem((item) => {
-            item.setTitle("Create NeuroStrata Memory (Paragraph)").setIcon("neurostrata-brain").onClick(async () => {
-              const selections = editor.listSelections();
-              let linesStr = "";
-              if (selections.length > 0) {
-                let startLine = Math.min(selections[0].anchor.line, selections[0].head.line);
-                let endLine = Math.max(selections[0].anchor.line, selections[0].head.line);
-                while (startLine > 0 && editor.getLine(startLine - 1).trim() !== "") {
-                  startLine--;
+    try {
+      await this.loadSettings();
+      this.initMqtt();
+      (0, import_obsidian.addIcon)("neurostrata-brain", NEUROSTRATA_ICON_SVG);
+      this.addSettingTab(new NeuroStrataSettingTab(this.app, this));
+      this.registerView(
+        VIEW_TYPE_NEUROSTRATA,
+        (leaf) => new NeuroStrataView(leaf, this)
+      );
+      this.addRibbonIcon("neurostrata-brain", "Open NeuroStrata Inspector", () => {
+        this.activateView();
+      });
+      this.registerEvent(
+        this.app.workspace.on("file-menu", (menu, file) => {
+          if (file instanceof import_obsidian.TFolder) {
+            menu.addItem((item) => {
+              item.setTitle("Generate Cognitive Graph (NeuroStrata)").setIcon("neurostrata-brain").onClick(async () => {
+                const namespace = file.name;
+                new import_obsidian.Notice(`Generating MemorySpace for ${namespace}...`);
+                try {
+                  if (this.mqtt) {
+                    const res = await this.mqtt.request("generate_canvas", { namespace });
+                    if (res && res.path) {
+                      new import_obsidian.Notice("MemorySpace generated successfully!");
+                      setTimeout(async () => {
+                        const canvasFile = this.app.vault.getAbstractFileByPath(res.path);
+                        if (canvasFile && canvasFile instanceof import_obsidian.TFile) {
+                          this.app.workspace.getLeaf(false).openFile(canvasFile);
+                        } else {
+                          new import_obsidian.Notice("File created, but not yet indexed by Obsidian. Please open it manually from the file explorer.");
+                        }
+                      }, 500);
+                    }
+                  } else {
+                    new import_obsidian.Notice("MQTT client not ready.");
+                  }
+                } catch (e) {
+                  console.error("Failed to generate MemorySpace via MQTT", e);
+                  new import_obsidian.Notice(`Failed to generate MemorySpace: ${e.message}`);
                 }
-                const lineCount = editor.lineCount();
-                while (endLine < lineCount - 1 && editor.getLine(endLine + 1).trim() !== "") {
-                  endLine++;
-                }
-                linesStr = `${startLine + 1}-${endLine + 1}`;
-              }
-              const viewInstance = await this.activateView();
-              if (viewInstance && viewInstance instanceof NeuroStrataView) {
-                const filePath = view.file ? view.file.path : "";
-                viewInstance.openAddMemoryForm(selection, filePath, linesStr);
-              }
+              });
             });
-          });
-        }
-      })
-    );
+          }
+        })
+      );
+      this.registerEvent(
+        this.app.workspace.on("editor-menu", (menu, editor, view) => {
+          const selection = editor.getSelection();
+          if (selection && selection.trim().length > 0) {
+            menu.addItem((item) => {
+              item.setTitle("Create NeuroStrata Memory (Paragraph)").setIcon("neurostrata-brain").onClick(async () => {
+                const selections = editor.listSelections();
+                let linesStr = "";
+                if (selections.length > 0) {
+                  let startLine = Math.min(selections[0].anchor.line, selections[0].head.line);
+                  let endLine = Math.max(selections[0].anchor.line, selections[0].head.line);
+                  while (startLine > 0 && editor.getLine(startLine - 1).trim() !== "") {
+                    startLine--;
+                  }
+                  const lineCount = editor.lineCount();
+                  while (endLine < lineCount - 1 && editor.getLine(endLine + 1).trim() !== "") {
+                    endLine++;
+                  }
+                  linesStr = `${startLine + 1}-${endLine + 1}`;
+                }
+                const viewInstance = await this.activateView();
+                if (viewInstance && viewInstance instanceof NeuroStrataView) {
+                  const filePath = view.file ? view.file.path : "";
+                  viewInstance.openAddMemoryForm(selection, filePath, linesStr);
+                }
+              });
+            });
+          }
+        })
+      );
+    } catch (e) {
+      new import_obsidian.Notice(`NeuroStrata Plugin Load Error: ${e.message || e}`);
+      console.error("NeuroStrata Plugin Load Error:", e);
+    }
   }
   initMqtt() {
     if (this.mqtt) {
@@ -13458,7 +13494,7 @@ var NeuroStrataPlugin = class extends import_obsidian.Plugin {
       this.mqtt.client.end();
     }
   }
-  async generateCanvas(points, silent = false) {
+  async generateCanvas(points, silent = false, targetFileName) {
     const domainMap = /* @__PURE__ */ new Map();
     const orphanedMemories = [];
     points.forEach((p) => {

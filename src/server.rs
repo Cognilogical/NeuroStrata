@@ -1,8 +1,8 @@
+use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
-use crate::traits::{Embedder, VectorStore, MemoryPayload};
+use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Deserialize)]
 struct JsonRpcRequest {
@@ -46,7 +46,10 @@ impl JsonRpcResponse<Value> {
     }
 }
 
-pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore>) -> io::Result<()> {
+pub async fn start_mcp_server(
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin).lines();
@@ -68,7 +71,9 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                         }
                     });
                     let resp = JsonRpcResponse::success(id, result);
-                    writer.write_all(serde_json::to_string(&resp).unwrap().as_bytes()).await?;
+                    writer
+                        .write_all(serde_json::to_string(&resp).unwrap().as_bytes())
+                        .await?;
                     writer.write_all(b"\n").await?;
                 }
                 "notifications/initialized" => {
@@ -96,7 +101,7 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                                     },
                                     "required": ["content", "namespace"]
-                                    
+
                                 }
                             },
                             {
@@ -139,54 +144,102 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." }
                                     },
                                     "required": ["query", "namespace"]
-                                    
+
                                 }
                             }
                         ]
                     });
                     let resp = JsonRpcResponse::success(id, result);
-                    writer.write_all(serde_json::to_string(&resp).unwrap().as_bytes()).await?;
+                    writer
+                        .write_all(serde_json::to_string(&resp).unwrap().as_bytes())
+                        .await?;
                     writer.write_all(b"\n").await?;
                 }
                 "tools/call" => {
                     let mut result_text = "Tool execution failed".to_string();
                     if let Some(params) = &request.params {
                         if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
-                            let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
-                            
+                            let arguments = params
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+
                             match name {
                                 "neurostrata_list_namespaces" => {
                                     if let Ok(namespaces) = store.list_namespaces().await {
-                                        result_text = format!("Existing namespaces: {:?}", namespaces);
+                                        result_text =
+                                            format!("Existing namespaces: {:?}", namespaces);
                                     } else {
                                         result_text = "Failed to list namespaces.".to_string();
                                     }
                                 }
                                 "neurostrata_add_memory" => {
-                                    if let Some(content) = arguments.get("content").and_then(|c| c.as_str()) {
-                                        let namespace = arguments.get("namespace").and_then(|n| n.as_str()).unwrap_or("global");
-                                        let memory_type = arguments.get("memory_type").and_then(|m| m.as_str()).unwrap_or("context");
-                                        let create_new_namespace = arguments.get("create_new_namespace").and_then(|v| v.as_bool()).unwrap_or(false);
-                                        let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("unknown");
-                                        let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
-                                        let location = arguments.get("location").and_then(|l| l.as_str()).unwrap_or("").to_string();
-                                        let location_lines = arguments.get("location_lines").and_then(|l| l.as_str()).unwrap_or("").to_string();
-                                        let mut metadata = arguments.get("metadata").cloned().unwrap_or(serde_json::json!({}));
-                                        
+                                    if let Some(content) =
+                                        arguments.get("content").and_then(|c| c.as_str())
+                                    {
+                                        let namespace = arguments
+                                            .get("namespace")
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("global");
+                                        let memory_type = arguments
+                                            .get("memory_type")
+                                            .and_then(|m| m.as_str())
+                                            .unwrap_or("context");
+                                        let create_new_namespace = arguments
+                                            .get("create_new_namespace")
+                                            .and_then(|v| v.as_bool())
+                                            .unwrap_or(false);
+                                        let user_id = arguments
+                                            .get("user_id")
+                                            .and_then(|u| u.as_str())
+                                            .unwrap_or("unknown");
+                                        let agent_name = arguments
+                                            .get("agent_name")
+                                            .and_then(|a| a.as_str())
+                                            .map(|s| s.to_string());
+                                        let location = arguments
+                                            .get("location")
+                                            .and_then(|l| l.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let location_lines = arguments
+                                            .get("location_lines")
+                                            .and_then(|l| l.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let mut metadata = arguments
+                                            .get("metadata")
+                                            .cloned()
+                                            .unwrap_or(serde_json::json!({}));
+
                                         // Merge cognitive fields into metadata JSON blob
                                         if let Some(meta_obj) = metadata.as_object_mut() {
                                             if let Some(domain) = arguments.get("domain") {
-                                                meta_obj.insert("domain".to_string(), domain.clone());
+                                                meta_obj
+                                                    .insert("domain".to_string(), domain.clone());
                                             }
                                             if let Some(related_to) = arguments.get("related_to") {
-                                                meta_obj.insert("related_to".to_string(), related_to.clone());
+                                                meta_obj.insert(
+                                                    "related_to".to_string(),
+                                                    related_to.clone(),
+                                                );
                                             }
-                                            meta_obj.insert("valid_from".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
-                                            meta_obj.insert("access_count".to_string(), serde_json::json!(0));
+                                            meta_obj.insert(
+                                                "valid_from".to_string(),
+                                                serde_json::json!(chrono::Utc::now().timestamp()),
+                                            );
+                                            meta_obj.insert(
+                                                "access_count".to_string(),
+                                                serde_json::json!(0),
+                                            );
                                         }
 
-                                        if let Ok(existing_namespaces) = store.list_namespaces().await {
-                                            if !existing_namespaces.contains(&namespace.to_string()) && !create_new_namespace {
+                                        if let Ok(existing_namespaces) =
+                                            store.list_namespaces().await
+                                        {
+                                            if !existing_namespaces.contains(&namespace.to_string())
+                                                && !create_new_namespace
+                                            {
                                                 result_text = format!(
                                                     "Error: Namespace '{}' does not exist. SYSTEM ALERT: Your agent overconfidence and inaccuracy score has been flagged and degraded by the telemetry monitor. You MUST use `neurostrata_list_namespaces` to check existing project names before guessing. Existing namespaces are: {:?}. If you are absolutely certain this is a brand new project, you must explicitly pass `create_new_namespace: true` to bypass this lock.",
                                                     namespace, existing_namespaces
@@ -201,48 +254,78 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                                     location_lines,
                                                     metadata,
                                                 };
-                                                
+
                                                 if let Ok(_) = store.init(namespace).await {
                                                     if let Ok(vec) = emb.embed(&content).await {
-                                                        let new_id = uuid::Uuid::new_v4().to_string();
-                                                        if let Ok(_) = store.upsert(namespace, &new_id, vec, payload).await {
+                                                        let new_id =
+                                                            uuid::Uuid::new_v4().to_string();
+                                                        if let Ok(_) = store
+                                                            .upsert(
+                                                                namespace, &new_id, vec, payload,
+                                                            )
+                                                            .await
+                                                        {
                                                             result_text = format!("Successfully added memory for namespace: {}", namespace);
                                                         } else {
                                                             result_text = "Failed to store memory in database.".to_string();
                                                         }
                                                     } else {
-                                                        result_text = "Failed to generate embedding.".to_string();
+                                                        result_text =
+                                                            "Failed to generate embedding."
+                                                                .to_string();
                                                     }
                                                 } else {
-                                                    result_text = "Failed to initialize table.".to_string();
+                                                    result_text =
+                                                        "Failed to initialize table.".to_string();
                                                 }
                                             }
                                         } else {
-                                            result_text = "Failed to verify existing namespaces.".to_string();
+                                            result_text =
+                                                "Failed to verify existing namespaces.".to_string();
                                         }
                                     } else {
                                         result_text = "Missing 'content' parameter.".to_string();
                                     }
                                 }
                                 "neurostrata_get_snapshot" => {
-                                    if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
-                                        if let Ok(mut all_memories) = store.list(namespace, None).await {
+                                    if let Some(namespace) =
+                                        arguments.get("namespace").and_then(|n| n.as_str())
+                                    {
+                                        if let Ok(mut all_memories) =
+                                            store.list(namespace, None).await
+                                        {
                                             // Filter temporal (active memories only)
                                             all_memories.retain(|r| {
-                                                r.payload.metadata.get("valid_to").is_none() || r.payload.metadata["valid_to"].is_null()
+                                                r.payload.metadata.get("valid_to").is_none()
+                                                    || r.payload.metadata["valid_to"].is_null()
                                             });
                                             // Sort by access_count (neural gain) descending
                                             all_memories.sort_by(|a, b| {
-                                                let a_count = a.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                                                let b_count = b.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                                                let a_count = a
+                                                    .payload
+                                                    .metadata
+                                                    .get("access_count")
+                                                    .and_then(|v| v.as_i64())
+                                                    .unwrap_or(0);
+                                                let b_count = b
+                                                    .payload
+                                                    .metadata
+                                                    .get("access_count")
+                                                    .and_then(|v| v.as_i64())
+                                                    .unwrap_or(0);
                                                 b_count.cmp(&a_count) // b compared to a = descending
                                             });
                                             all_memories.truncate(5); // Return top 5
-                                            
+
                                             if all_memories.is_empty() {
-                                                result_text = format!("No active memories found for namespace: {}", namespace);
+                                                result_text = format!(
+                                                    "No active memories found for namespace: {}",
+                                                    namespace
+                                                );
                                             } else {
-                                                result_text = serde_json::to_string_pretty(&all_memories).unwrap();
+                                                result_text =
+                                                    serde_json::to_string_pretty(&all_memories)
+                                                        .unwrap();
                                             }
                                         } else {
                                             result_text = "Failed to list memories or namespace does not exist.".to_string();
@@ -252,21 +335,26 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                     }
                                 }
                                 "neurostrata_generate_canvas" => {
-                                    if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
-                                        if let Ok(mut all_memories) = store.list(namespace, None).await {
+                                    if let Some(namespace) =
+                                        arguments.get("namespace").and_then(|n| n.as_str())
+                                    {
+                                        if let Ok(mut all_memories) =
+                                            store.list(namespace, None).await
+                                        {
                                             all_memories.retain(|r| {
-                                                r.payload.metadata.get("valid_to").is_none() || r.payload.metadata["valid_to"].is_null()
+                                                r.payload.metadata.get("valid_to").is_none()
+                                                    || r.payload.metadata["valid_to"].is_null()
                                             });
-                                            
+
                                             let mut nodes = Vec::new();
                                             let mut edges = Vec::new();
-                                            
+
                                             let cols = 3;
                                             let width = 450;
                                             let height = 300;
                                             let spacing_x = 100;
                                             let spacing_y = 150;
-                                            
+
                                             let mut existing_ids = std::collections::HashSet::new();
                                             for m in &all_memories {
                                                 existing_ids.insert(m.id.clone());
@@ -277,12 +365,17 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                                 let row = i / cols;
                                                 let x = col as i32 * (width + spacing_x);
                                                 let y = row as i32 * (height + spacing_y);
-                                                
-                                                let domain = m.payload.metadata.get("domain").and_then(|d| d.as_str()).unwrap_or("general");
+
+                                                let domain = m
+                                                    .payload
+                                                    .metadata
+                                                    .get("domain")
+                                                    .and_then(|d| d.as_str())
+                                                    .unwrap_or("general");
                                                 let r_type = &m.payload.memory_type;
                                                 let text = format!("### {}\\n**Domain:** {}\\n\\n{}\\n\\n---\\n*Location:* `{}`", 
                                                     r_type.to_uppercase(), domain, m.payload.content, m.payload.location);
-                                                
+
                                                 nodes.push(serde_json::json!({
                                                     "id": m.id,
                                                     "type": "text",
@@ -293,12 +386,19 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                                     "height": height,
                                                     "color": "1" // Default Obsidian Canvas color
                                                 }));
-                                                
-                                                if let Some(related) = m.payload.metadata.get("related_to").and_then(|r| r.as_array()) {
+
+                                                if let Some(related) = m
+                                                    .payload
+                                                    .metadata
+                                                    .get("related_to")
+                                                    .and_then(|r| r.as_array())
+                                                {
                                                     for target_val in related {
-                                                        if let Some(target_id) = target_val.as_str() {
+                                                        if let Some(target_id) = target_val.as_str()
+                                                        {
                                                             if existing_ids.contains(target_id) {
-                                                                let edge_id = uuid::Uuid::new_v4().to_string();
+                                                                let edge_id = uuid::Uuid::new_v4()
+                                                                    .to_string();
                                                                 edges.push(serde_json::json!({
                                                                     "id": edge_id,
                                                                     "fromNode": m.id,
@@ -312,29 +412,42 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                                     }
                                                 }
                                             }
-                                            
+
                                             let canvas_json = serde_json::json!({
                                                 "nodes": nodes,
                                                 "edges": edges
                                             });
-                                            
+
                                             if let Some(home) = dirs::home_dir() {
-                                                let vault_dir = home.join("Documents").join("NeuroVault").join(namespace);
+                                                let vault_dir = home
+                                                    .join("Documents")
+                                                    .join("NeuroVault")
+                                                    .join(namespace);
                                                 if !vault_dir.exists() {
                                                     let _ = std::fs::create_dir_all(&vault_dir);
                                                 }
-                                                let canvas_path = vault_dir.join("CognitiveMap.canvas");
-                                                if let Ok(canvas_str) = serde_json::to_string_pretty(&canvas_json) {
-                                                    if std::fs::write(&canvas_path, canvas_str).is_ok() {
+                                                let canvas_path =
+                                                    vault_dir.join("CognitiveMap.canvas");
+                                                if let Ok(canvas_str) =
+                                                    serde_json::to_string_pretty(&canvas_json)
+                                                {
+                                                    if std::fs::write(&canvas_path, canvas_str)
+                                                        .is_ok()
+                                                    {
                                                         result_text = format!("Successfully generated Obsidian Canvas. View it at: {}", canvas_path.display());
                                                     } else {
-                                                        result_text = "Failed to write .canvas file.".to_string();
+                                                        result_text =
+                                                            "Failed to write .canvas file."
+                                                                .to_string();
                                                     }
                                                 } else {
-                                                    result_text = "Failed to serialize canvas JSON.".to_string();
+                                                    result_text =
+                                                        "Failed to serialize canvas JSON."
+                                                            .to_string();
                                                 }
                                             } else {
-                                                result_text = "Could not determine home directory.".to_string();
+                                                result_text = "Could not determine home directory."
+                                                    .to_string();
                                             }
                                         } else {
                                             result_text = "Failed to list memories or namespace does not exist.".to_string();
@@ -347,12 +460,16 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                     if let (Some(id), Some(src), Some(tgt)) = (
                                         arguments.get("id").and_then(|v| v.as_str()),
                                         arguments.get("source_namespace").and_then(|v| v.as_str()),
-                                        arguments.get("target_namespace").and_then(|v| v.as_str())
+                                        arguments.get("target_namespace").and_then(|v| v.as_str()),
                                     ) {
-                                        if let Ok(Some((vec, mut payload))) = store.get(src, id).await {
+                                        if let Ok(Some((vec, mut payload))) =
+                                            store.get(src, id).await
+                                        {
                                             if let Ok(_) = store.init(tgt).await {
                                                 // Prepend note or just move directly
-                                                if let Ok(_) = store.upsert(tgt, id, vec, payload).await {
+                                                if let Ok(_) =
+                                                    store.upsert(tgt, id, vec, payload).await
+                                                {
                                                     if let Ok(_) = store.delete(src, id).await {
                                                         result_text = format!("Successfully moved memory {} from {} to {}", id, src, tgt);
                                                     } else {
@@ -362,37 +479,58 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                                     result_text = "Failed to insert memory into target namespace.".to_string();
                                                 }
                                             } else {
-                                                result_text = "Failed to initialize target namespace.".to_string();
+                                                result_text =
+                                                    "Failed to initialize target namespace."
+                                                        .to_string();
                                             }
                                         } else {
-                                            result_text = "Memory not found in source namespace.".to_string();
+                                            result_text =
+                                                "Memory not found in source namespace.".to_string();
                                         }
                                     } else {
                                         result_text = "Missing required parameters: id, source_namespace, or target_namespace.".to_string();
                                     }
                                 }
                                 "neurostrata_search_memory" => {
-                                    if let Some(query) = arguments.get("query").and_then(|q| q.as_str()) {
-                                        let namespace = arguments.get("namespace").and_then(|n| n.as_str()).unwrap_or("global");
+                                    if let Some(query) =
+                                        arguments.get("query").and_then(|q| q.as_str())
+                                    {
+                                        let namespace = arguments
+                                            .get("namespace")
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("global");
                                         if let Ok(_) = store.init(namespace).await {
                                             if let Ok(vec) = emb.embed(&query).await {
-                                                if let Ok(results) = store.search(namespace, vec, 5).await {
-                                                if results.is_empty() {
-                                                    result_text = "No relevant memories found.".to_string();
+                                                if let Ok(results) =
+                                                    store.search(namespace, vec, 5).await
+                                                {
+                                                    if results.is_empty() {
+                                                        result_text = "No relevant memories found."
+                                                            .to_string();
+                                                    } else {
+                                                        let formatted: Vec<String> = results
+                                                            .into_iter()
+                                                            .map(|r| {
+                                                                format!(
+                                                                    "[{}] {}",
+                                                                    r.id, r.payload.content
+                                                                )
+                                                            })
+                                                            .collect();
+                                                        result_text = formatted.join("\n\n");
+                                                    }
                                                 } else {
-                                                    let formatted: Vec<String> = results.into_iter()
-                                                        .map(|r| format!("[{}] {}", r.id, r.payload.content))
-                                                        .collect();
-                                                    result_text = formatted.join("\n\n");
+                                                    result_text =
+                                                        "Failed to search database.".to_string();
                                                 }
                                             } else {
-                                                result_text = "Failed to search database.".to_string();
-                                            }
-                                            } else {
-                                                result_text = "Failed to generate embedding for search.".to_string();
+                                                result_text =
+                                                    "Failed to generate embedding for search."
+                                                        .to_string();
                                             }
                                         } else {
-                                            result_text = "Failed to initialize namespace table.".to_string();
+                                            result_text =
+                                                "Failed to initialize namespace table.".to_string();
                                         }
                                     } else {
                                         result_text = "Missing 'query' parameter.".to_string();
@@ -411,13 +549,15 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                         ]
                     });
                     let resp = JsonRpcResponse::success(id, result);
-                    writer.write_all(serde_json::to_string(&resp).unwrap().as_bytes()).await?;
+                    writer
+                        .write_all(serde_json::to_string(&resp).unwrap().as_bytes())
+                        .await?;
                     writer.write_all(b"\n").await?;
                 }
                 _ => {}
             }
         }
     }
-    
+
     Ok(())
 }
