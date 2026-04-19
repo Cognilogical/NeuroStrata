@@ -78,7 +78,7 @@ graph TD
         Tier3[("Tier 3: Task<br/>(Working Memory)")]
     end
     
-    Qdrant[(Local Qdrant<br/>Vector DB)]
+    LanceDB[(Embedded LanceDB<br/>Vector DB)]
     PointerWiki[(Project Files:<br/>docs/architecture/domains/)]
     Obsidian((Obsidian GUI))
     Graphify[[Graphify Engine]]
@@ -88,15 +88,15 @@ graph TD
     Router -->|Code Map Pointers| Tier2
     Router -->|Active Bug/Feature| Tier3
     
-    Tier1 -.-> Qdrant
-    Tier3 -.-> Qdrant
-    Tier2 -.->|Semantic Pointer| Qdrant
+    Tier1 -.-> LanceDB
+    Tier3 -.-> LanceDB
+    Tier2 -.->|Semantic Pointer| LanceDB
     Tier2 <==>|Physical File Anchor| PointerWiki
     
     Graphify -->|Analyzes Code & Updates| PointerWiki
     
     Obsidian -.->|Visualizes Graph & Notes| PointerWiki
-    Obsidian -.->|Queries Vector Data| Qdrant
+    Obsidian -.->|Queries Vector Data| LanceDB
 
     classDef core fill:#1e1e1e,stroke:#00ADD8,stroke-width:2px,color:#fff;
     classDef memory fill:#2d2d2d,stroke:#ff5555,stroke-width:1px,color:#fff;
@@ -104,7 +104,7 @@ graph TD
     classDef tool fill:#1c3d5a,stroke:#3b82f6,stroke-width:1px,color:#fff;
     
     class Agent,Router core;
-    class Tier1,Tier2,Tier3,Qdrant,PointerWiki memory;
+    class Tier1,Tier2,Tier3,LanceDB,PointerWiki memory;
     class Graphify engine;
     class Obsidian tool;
 ```
@@ -150,7 +150,7 @@ NeuroStrata is completely tool-agnostic. It integrates with the standard `~/.age
 > **Philosophy: Batteries Included, Cloud Ready.** NeuroStrata is designed as a local-first, self-contained cognitive architecture to ensure absolute privacy and zero latency. However, it does not preclude utilizing hosted or cloud-based solutions—simply update the configuration to point to your preferred remote endpoints.
 
 1. **Embedder:** An OpenAI-compatible embedding endpoint (e.g., local Llama.cpp/Ollama on `localhost:8004`, or a hosted provider like OpenAI).
-2. **Vector Database:** A Qdrant instance (running locally on `localhost:6333` or via Qdrant Cloud).
+2. **Vector Database:** None! LanceDB runs entirely embedded within the Rust binary. No external database instance is required.
 
 #### 💡 Bundled Agent Tooling
 To ensure your AI agents have the best possible environment out of the box, the automated installers will automatically provision the following CLI tools alongside NeuroStrata:
@@ -166,7 +166,7 @@ Clone the repository and run the automated installer. The installer uses a pre-c
 
 ```bash
 git clone https://github.com/your-username/NeuroStrata.git ~/Documents/neurostrata
-cd ~/Documents/neurostrata/mcp
+cd ~/Documents/neurostrata
 ./install.sh
 ```
 
@@ -192,12 +192,7 @@ The installer creates a default configuration at `~/.config/neurostrata/config.j
 
 ```json
 {
-  "embedder_url": "http://localhost:8004/v1/embeddings",
-  "embedder_model": "nomic-embed-text-v1.5.f16.gguf",
-  "embedder_api_key": "sk-local",
-  "qdrant_url": "http://localhost:6333",
-  "qdrant_collection": "neurostrata",
-  "http_port": "8005"
+  "db_path": "~/.local/share/neurostrata/db"
 }
 ```
 
@@ -240,7 +235,7 @@ NeuroStrata represents a synthesis of cognitive science theories and foundationa
 * **[Graphify](https://github.com/graphify/graphify-cli):** The knowledge graph engine that turns flat code bases and documentation into clustered, edge-mapped conceptual communities. NeuroStrata's *Graph Edge Fusion* works by directly parsing the lightweight `graphify-out/edges.json` artifacts they generate, giving agents "free" relational traversal without expensive LLM API calls.
 * **[Beads (bd)](https://github.com/beads/bd):** A local, git-backed issue tracker that serves as the primary execution and orchestration layer for agents. While NeuroStrata strictly manages the *knowledge state*, Beads manages the *execution state* (ensuring no code is written without a claimed ticket).
 * **[LightRAG](https://github.com/HKUDS/LightRAG):** The revolutionary architecture from HKUDS that pioneered Dual-Level Retrieval (Global + Local RAG) and Graph-Vector Fusion. NeuroStrata adopted these core concepts and translated them into a lightning-fast, native Rust MCP pipeline to eliminate Python overhead and LLM ingestion costs.
-* **[Qdrant](https://qdrant.tech/):** The incredibly fast and reliable Rust-based vector search engine that powers the underlying memory mesh.
+* **[LanceDB](https://lancedb.com/):** An open-source, embedded vector database designed for AI. It runs seamlessly inside the Rust binary, offering extreme performance with zero infrastructure overhead.
 * **[LLM-WIKI Concept](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f):** The architectural pattern of storing narrative knowledge in hyper-linked Markdown while giving the AI specific "Pointer-Wiki" search capabilities to prevent context bloat.
 
 ### Scientific Literature
@@ -251,12 +246,3 @@ NeuroStrata represents a synthesis of cognitive science theories and foundationa
 
 ## License
 MIT License. See the `LICENSE` file for details. I wrote it, you can use it, keep it, close source it, whatever—just don't sue me!
-
-### (Optional) 🐳 Infrastructure Setup via Podman
-If you don't already have Qdrant and an Embedder running on your machine, NeuroStrata provides a ready-to-use `podman-compose.yml` to spin up the required local infrastructure instantly:
-
-```bash
-cd ~/Documents/neurostrata
-podman-compose up -d
-```
-*Note: The example compose file uses Ollama for embeddings. Ensure your `~/.config/neurostrata/config.json` embedder URL points to `http://localhost:8004/api/embeddings` if using this setup.*
