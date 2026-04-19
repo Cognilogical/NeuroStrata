@@ -84,7 +84,7 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                     "type": "object",
                                     "properties": {
                                         "content": { "type": "string", "description": "The text of the memory to save." },
-                                        "namespace": { "type": "string", "description": "The project ID or global namespace." },
+                                        "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
                                         "user_id": { "type": "string", "description": "The user making the request." },
                                         "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
                                         "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
@@ -100,7 +100,7 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                     "type": "object",
                                     "properties": {
                                         "query": { "type": "string", "description": "What to search for." },
-                                        "namespace": { "type": "string", "description": "The project ID or global namespace." }
+                                        "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." }
                                     },
                                     "required": ["query", "namespace"]
                                     

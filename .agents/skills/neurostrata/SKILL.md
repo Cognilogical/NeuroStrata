@@ -8,14 +8,14 @@ description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task). Repl
 NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Golang Model Context Protocol (MCP) server connected directly to an embedded LanceDB vector database partitioned into three distinct tiers.
 
 ## The 3 Tiers
-1. **Global (`user_id="global"`)**: Company-wide constraints, infrastructure mandates (e.g., LanceDB only, no REST, Clojure for parsing), and universal tool usage rules.
-2. **Domain/Project (Pointer-Wiki Hybrid, `user_id="<project_name>"`)**: Hidden business rules, API contracts, and spatial code layouts specific to the project's domains.
+1. **Global (`namespace="global"`)**: Company-wide constraints, infrastructure mandates (e.g., LanceDB only, no REST, Clojure for parsing), and universal tool usage rules.
+2. **Domain/Project (Pointer-Wiki Hybrid, `namespace="<project_name>"`)**: Hidden business rules, API contracts, and spatial code layouts specific to the project's domains.
    * **The Pointer-Wiki Hybrid**: To prevent context bloat, NeuroStrata stores *pointers* (e.g., "See `docs/architecture/domains/sync.md` for full narrative") instead of dumping entire narratives into vector memory.
-3. **Task (`user_id="<task_id>"`)**: Specific insights, decisions, and context scoped to a single active task.
+3. **Task (`namespace="<task_id>"`)**: Specific insights, decisions, and context scoped to a single active task.
 
 ## Available MCP Tools
 NeuroStrata provides the following native MCP tools that you MUST use to manage the system's memory:
-* `neurostrata_add_memory`: Add a new architectural rule, project pattern, or task insight. **FORMATTING:** If the memory is a strict, non-negotiable constraint that must NEVER be ignored, prefix it with "RULE: " (e.g., "RULE: Never use Python"). If it is general context, domain logic, or a pointer to documentation, just save it as normal text without the prefix. If scoped `user_id=global`, file paths in metadata must point to `~/.config/neurostrata/global/`.
+* `neurostrata_add_memory`: Add a new architectural rule, project pattern, or task insight. **FORMATTING:** If the memory is a strict, non-negotiable constraint that must NEVER be ignored, prefix it with "RULE: " (e.g., "RULE: Never use Python"). If it is general context, domain logic, or a pointer to documentation, just save it as normal text without the prefix. If scoped `namespace=global`, file paths in metadata must point to `~/.config/neurostrata/global/`.
 * `neurostrata_search_memory`: Search for existing rules before writing code or making architectural decisions.
 * `neurostrata_update_memory`: Update an existing memory by ID. **FORMATTING:** Maintain the "RULE: " prefix only if the updated memory remains a strict constraint. Use this when a rule has evolved or was initially saved with hallucinations.
 * `neurostrata_delete_memory`: Delete a memory by ID. Use this to prune obsolete, duplicated, or incorrect rules.
@@ -50,9 +50,9 @@ You (the Agent) are responsible for the bookkeeping. The user should not have to
 **Exceptions:** You may only make direct file edits yourself for trivial, one-off changes (e.g., fixing a single typo, renaming a variable).
 
 1. **Analyze Scope**:
-   * *Global*: Is this a universal tool preference, infrastructure mandate, or language constraint that applies to ALL projects? (Route to `user_id="global"`).
+   * *Global*: Is this a universal tool preference, infrastructure mandate, or language constraint that applies to ALL projects? (Route to `namespace="global"`).
    * *Domain*: Is this a project-specific architecture rule, API contract, or data flow? (Route to Tier 2 Pointer-Wiki).
-   * *Task*: Is this only relevant to the current bug/feature? (Route to `user_id="<task_id>"`).
+   * *Task*: Is this only relevant to the current bug/feature? (Route to `namespace="<task_id>"`).
 2. **Auto-Detect Domain**: If it's a Domain insight, look at your current working directory (`pwd`) or the files you are editing to infer which domain it belongs to.
 3. **Autonomously Prune & Update**: When adding a new memory, first `neurostrata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, do NOT just append a new one. Use `neurostrata_update_memory` or `neurostrata_delete_memory` to maintain a single, coherent source of truth.
 
@@ -106,7 +106,7 @@ When any of the above triggers occur, you MUST perform a Wiki Synthesis before c
 2. **Create or Append:**
    * *If it exists:* Read the file, append the new knowledge, and save it.
    * *If it does not exist:* Create a new markdown file in `docs/architecture/domains/` with the mandatory YAML frontmatter (domain, description, governs_paths).
-3. **Anchor in NeuroStrata:** Call `neurostrata_add_memory` (if new) or `neurostrata_update_memory` (if appended) with `user_id="<project_name>"` to ensure the Tier 2 pointer is accurate and the dual-anchors point to the right lines.
+3. **Anchor in NeuroStrata:** Call `neurostrata_add_memory` (if new) or `neurostrata_update_memory` (if appended) with `namespace="<project_name>"` to ensure the Tier 2 pointer is accurate and the dual-anchors point to the right lines.
 
 ## Interactive Sessions & Topic Drift
 Ad-hoc architectural discussions generate vital context that evaporates when the chat closes.
