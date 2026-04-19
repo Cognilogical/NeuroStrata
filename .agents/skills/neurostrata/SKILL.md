@@ -180,3 +180,10 @@ Vector memory is cheap to search but should not become a dumping ground for mass
 You must aggressively harvest the results of your own labor:
 - **Negative Knowledge (The Hallucination Trap):** When you or a sub-agent makes a mistake, hallucinates an API, or falls into a compiler trap, you MUST record the failed path and the correct resolution. Future agents will have similar semantic thoughts; the vector DB must intercept them before they write bad code.
 - **The Token Tax (Expensive Computations):** If you spend multiple turns using `grep`, `read`, or `bash` to trace a complex variable path, reverse-engineer a system, or map out an undocumented module, the final synthesized conclusion MUST be saved immediately. Do not force the next agent to pay the same token tax to relearn it.
+
+## 🚨 THE HABITUAL MEMORY COMMIT (MANDATORY)
+Do not wait for the user to tell you to save a memory. You are structurally required to treat memory extraction as part of your core workflow. 
+**The Forcing Function:** Whenever you are about to complete a task, close a Bead (`bd close`), or tell the user "I fixed it", you MUST FIRST perform a "Memory Commit".
+1. Ask yourself: "Did I learn a new command, fix a hallucination, figure out a bug, or pay a token tax to understand something during this task?"
+2. If YES, you MUST run `neurostrata_add_memory` BEFORE you close the task. 
+3. Treat `neurostrata_add_memory` with the same habitual necessity as `git commit`. Work is not done until the knowledge is persisted.
