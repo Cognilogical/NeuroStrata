@@ -18,8 +18,8 @@ npm run build
 cd -
 
 echo "Setting up NeuroVault Obsidian Vault..."
-mkdir -p "$HOME/NeuroVault/.obsidian/plugins"
-ln -sfn "$(pwd)/plugins/obsidian/obsidian-neurostrata" "$HOME/NeuroVault/.obsidian/plugins/obsidian-neurostrata"
+mkdir -p "$HOME/Documents/NeuroVault/.obsidian/plugins"
+ln -sfn "$(pwd)/plugins/obsidian/obsidian-neurostrata" "$HOME/Documents/NeuroVault/.obsidian/plugins/obsidian-neurostrata"
 
 echo "==============================================="
 echo "  Installation Complete!"
