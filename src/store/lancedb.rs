@@ -136,9 +136,21 @@ impl VectorStore for LanceDBStore {
 
             for i in 0..batch.num_rows() {
                 let metadata_val: Value = serde_json::from_str(metadatas.value(i)).unwrap_or(Value::Null);
+
+                // Temporal filtering (Bi-Temporal Memory)
+                if metadata_val.get("valid_to").is_some() && !metadata_val["valid_to"].is_null() {
+                    continue; // Skip soft-deleted memories
+                }
+
+                // Neural Gain Mechanism (Access-Based Synaptic Weighting)
+                let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let base_distance = distances.value(i);
+                // LanceDB distance (L2): lower is better. We subtract a boost based on access_count.
+                let boosted_distance = base_distance - (access_count as f32 * 0.05);
+
                 results.push(SearchResult {
                     id: ids.value(i).to_string(),
-                    score: distances.value(i),
+                    score: boosted_distance,
                     payload: MemoryPayload {
                         content: contents.value(i).to_string(),
                         user_id: user_ids.value(i).to_string(),
@@ -151,6 +163,10 @@ impl VectorStore for LanceDBStore {
                 });
             }
         }
+
+        // Sort by boosted score and truncate to limit
+        results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
 
         Ok(results)
     }

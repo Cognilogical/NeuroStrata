@@ -91,10 +91,23 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
                                         "location": { "type": "string", "description": "The file path, URL, or general location this memory refers to." },
                                         "location_lines": { "type": "string", "description": "The line numbers (e.g. '42-49') this memory refers to." },
+                                        "domain": { "type": "string", "description": "Optional category or domain this rule belongs to (e.g., 'frontend', 'database', 'devops', 'api')." },
+                                        "related_to": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory IDs this rule connects to, forming a knowledge graph edge." },
                                         "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                                     },
                                     "required": ["content", "namespace"]
                                     
+                                }
+                            },
+                            {
+                                "name": "neurostrata_get_snapshot",
+                                "description": "Get a pre-computed cognitive snapshot of the most important active architectural rules for a project. Use this immediately upon starting a new task to ground yourself in the project's core architecture before searching.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'." }
+                                    },
+                                    "required": ["namespace"]
                                 }
                             },
                             {
@@ -147,8 +160,20 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
                                         let location = arguments.get("location").and_then(|l| l.as_str()).unwrap_or("").to_string();
                                         let location_lines = arguments.get("location_lines").and_then(|l| l.as_str()).unwrap_or("").to_string();
-                                        let metadata = arguments.get("metadata").cloned().unwrap_or(serde_json::json!({}));
+                                        let mut metadata = arguments.get("metadata").cloned().unwrap_or(serde_json::json!({}));
                                         
+                                        // Merge cognitive fields into metadata JSON blob
+                                        if let Some(meta_obj) = metadata.as_object_mut() {
+                                            if let Some(domain) = arguments.get("domain") {
+                                                meta_obj.insert("domain".to_string(), domain.clone());
+                                            }
+                                            if let Some(related_to) = arguments.get("related_to") {
+                                                meta_obj.insert("related_to".to_string(), related_to.clone());
+                                            }
+                                            meta_obj.insert("valid_from".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
+                                            meta_obj.insert("access_count".to_string(), serde_json::json!(0));
+                                        }
+
                                         if let Ok(existing_namespaces) = store.list_namespaces().await {
                                             if !existing_namespaces.contains(&namespace.to_string()) && !create_new_namespace {
                                                 result_text = format!(
@@ -186,6 +211,33 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         }
                                     } else {
                                         result_text = "Missing 'content' parameter.".to_string();
+                                    }
+                                }
+                                "neurostrata_get_snapshot" => {
+                                    if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
+                                        if let Ok(mut all_memories) = store.list(namespace, None).await {
+                                            // Filter temporal (active memories only)
+                                            all_memories.retain(|r| {
+                                                r.payload.metadata.get("valid_to").is_none() || r.payload.metadata["valid_to"].is_null()
+                                            });
+                                            // Sort by access_count (neural gain) descending
+                                            all_memories.sort_by(|a, b| {
+                                                let a_count = a.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                                                let b_count = b.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                                                b_count.cmp(&a_count) // b compared to a = descending
+                                            });
+                                            all_memories.truncate(5); // Return top 5
+                                            
+                                            if all_memories.is_empty() {
+                                                result_text = format!("No active memories found for namespace: {}", namespace);
+                                            } else {
+                                                result_text = serde_json::to_string_pretty(&all_memories).unwrap();
+                                            }
+                                        } else {
+                                            result_text = "Failed to list memories or namespace does not exist.".to_string();
+                                        }
+                                    } else {
+                                        result_text = "Missing 'namespace' parameter.".to_string();
                                     }
                                 }
                                 "neurostrata_move_memory" => {

@@ -4333,6 +4333,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "async-trait",
+ "chrono",
  "dirs",
  "fastembed",
  "futures",
