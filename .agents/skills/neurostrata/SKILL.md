@@ -69,10 +69,12 @@ If an agent skips the verification step (e.g., claiming a fix is complete withou
 Every active project MUST have a foundational "Bootstrap" memory (a LanceDB node with `memory_type="bootstrap"`). This acts as the supreme context anchor for the entire repository.
 
 1. **The Initial Check:** When starting work on an unfamiliar project, use `neurostrata_get_snapshot` or search the namespace to verify a bootstrap memory exists.
-2. **The Autonomous Rummage:** If no bootstrap memory exists, you MUST build one immediately. Autonomously explore the codebase (read READMEs, dependency files like `package.json` or `Cargo.toml`, and core structural folders). 
+2. **The Autonomous Rummage:** If no bootstrap memory exists, you MUST build one immediately. Autonomously explore the codebase (read READMEs, dependency files like `package.json` or `Cargo.toml`, and core structural folders).
+   * **Crucial Dependency:** Before building the bootstrap memory, check if the `.neurostrata/docs` directory exists. If it does not, you MUST use the `bash` tool to run `./scripts/bootstrap.sh <pwd>` (which invokes `deepwiki-rs`) to generate the foundational C4 project knowledge graph and architecture markdown. You cannot accurately bootstrap a project without its graph.
 3. **The User Interrogation:** If the repository is entirely empty, completely opaque, or you cannot deduce its goal, you MUST stop and explicitly ask the user: "What is the core purpose and intended architecture of this project?"
 4. **The Ingestion:** Once synthesized, use `neurostrata_add_memory` with `memory_type="bootstrap"` to save a dense, high-level summary of the project's purpose, tech stack, and primary domain logic.
 5. **The Evolution (Refinement):** The codebase lives and breathes. Every few major tasks or feature epics, proactively review the existing bootstrap memory. If the project has expanded or pivoted, update the bootstrap memory to reflect the new reality (by creating a new, more refined bootstrap memory and deprecating the old one).
+   * **Deepwiki Freshness:** When you significantly update the bootstrap memory or complete a major architectural refactor, you MUST remind the user to re-run the `./scripts/bootstrap.sh <pwd>` script (or run it yourself) to ensure the physical knowledge graph stays in sync with the codebase reality.
 
 ## Task Completion & Compaction Defense
 Because AI agents cannot detect when context compaction occurs, you MUST perform a **Memory Review** every time you complete a significant logical task (e.g., fixing a bug, implementing a feature, finishing a refactor). 
