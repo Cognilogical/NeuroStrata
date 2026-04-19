@@ -111,6 +111,17 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                 }
                             },
                             {
+                                "name": "neurostrata_generate_canvas",
+                                "description": "Generate an Obsidian Canvas (.canvas) file visually mapping the architectural rules and their relationships for a project. Opens directly in NeuroVault.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." }
+                                    },
+                                    "required": ["namespace"]
+                                }
+                            },
+                            {
                                 "name": "neurostrata_list_namespaces",
                                 "description": "List all existing project namespaces in the database. Use this to prevent hallucinating namespace names.",
                                 "inputSchema": {
@@ -232,6 +243,98 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                                 result_text = format!("No active memories found for namespace: {}", namespace);
                                             } else {
                                                 result_text = serde_json::to_string_pretty(&all_memories).unwrap();
+                                            }
+                                        } else {
+                                            result_text = "Failed to list memories or namespace does not exist.".to_string();
+                                        }
+                                    } else {
+                                        result_text = "Missing 'namespace' parameter.".to_string();
+                                    }
+                                }
+                                "neurostrata_generate_canvas" => {
+                                    if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
+                                        if let Ok(mut all_memories) = store.list(namespace, None).await {
+                                            all_memories.retain(|r| {
+                                                r.payload.metadata.get("valid_to").is_none() || r.payload.metadata["valid_to"].is_null()
+                                            });
+                                            
+                                            let mut nodes = Vec::new();
+                                            let mut edges = Vec::new();
+                                            
+                                            let cols = 3;
+                                            let width = 450;
+                                            let height = 300;
+                                            let spacing_x = 100;
+                                            let spacing_y = 150;
+                                            
+                                            let mut existing_ids = std::collections::HashSet::new();
+                                            for m in &all_memories {
+                                                existing_ids.insert(m.id.clone());
+                                            }
+
+                                            for (i, m) in all_memories.iter().enumerate() {
+                                                let col = i % cols;
+                                                let row = i / cols;
+                                                let x = col as i32 * (width + spacing_x);
+                                                let y = row as i32 * (height + spacing_y);
+                                                
+                                                let domain = m.payload.metadata.get("domain").and_then(|d| d.as_str()).unwrap_or("general");
+                                                let r_type = &m.payload.memory_type;
+                                                let text = format!("### {}\\n**Domain:** {}\\n\\n{}\\n\\n---\\n*Location:* `{}`", 
+                                                    r_type.to_uppercase(), domain, m.payload.content, m.payload.location);
+                                                
+                                                nodes.push(serde_json::json!({
+                                                    "id": m.id,
+                                                    "type": "text",
+                                                    "text": text,
+                                                    "x": x,
+                                                    "y": y,
+                                                    "width": width,
+                                                    "height": height,
+                                                    "color": "1" // Default Obsidian Canvas color
+                                                }));
+                                                
+                                                if let Some(related) = m.payload.metadata.get("related_to").and_then(|r| r.as_array()) {
+                                                    for target_val in related {
+                                                        if let Some(target_id) = target_val.as_str() {
+                                                            if existing_ids.contains(target_id) {
+                                                                let edge_id = uuid::Uuid::new_v4().to_string();
+                                                                edges.push(serde_json::json!({
+                                                                    "id": edge_id,
+                                                                    "fromNode": m.id,
+                                                                    "fromSide": "right",
+                                                                    "toNode": target_id,
+                                                                    "toSide": "left",
+                                                                    "color": "4"
+                                                                }));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            let canvas_json = serde_json::json!({
+                                                "nodes": nodes,
+                                                "edges": edges
+                                            });
+                                            
+                                            if let Some(home) = dirs::home_dir() {
+                                                let vault_dir = home.join("Documents").join("NeuroVault").join(namespace);
+                                                if !vault_dir.exists() {
+                                                    let _ = std::fs::create_dir_all(&vault_dir);
+                                                }
+                                                let canvas_path = vault_dir.join("CognitiveMap.canvas");
+                                                if let Ok(canvas_str) = serde_json::to_string_pretty(&canvas_json) {
+                                                    if std::fs::write(&canvas_path, canvas_str).is_ok() {
+                                                        result_text = format!("Successfully generated Obsidian Canvas. View it at: {}", canvas_path.display());
+                                                    } else {
+                                                        result_text = "Failed to write .canvas file.".to_string();
+                                                    }
+                                                } else {
+                                                    result_text = "Failed to serialize canvas JSON.".to_string();
+                                                }
+                                            } else {
+                                                result_text = "Could not determine home directory.".to_string();
                                             }
                                         } else {
                                             result_text = "Failed to list memories or namespace does not exist.".to_string();
