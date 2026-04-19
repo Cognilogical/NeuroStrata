@@ -1,5 +1,5 @@
 import { App, Plugin, PluginSettingTab, Setting, ItemView, WorkspaceLeaf, Notice, TFile, TFolder, addIcon } from 'obsidian';
-import * as mqtt from 'mqtt';
+import mqtt from 'mqtt/dist/mqtt.esm';
 
 interface NeuroStrataPluginSettings {
     mqttUrl: string;
@@ -31,7 +31,7 @@ const NEUROSTRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="cur
 </svg>`;
 
 class MqttClientWrapper {
-    client: mqtt.MqttClient;
+    client: any;
     pendingRequests: Map<string, {resolve: Function, reject: Function, timeout: any}> = new Map();
 
     constructor(url: string) {
@@ -42,7 +42,7 @@ class MqttClientWrapper {
             this.client.subscribe('neurostrata/response', { qos: 0 });
         });
 
-        this.client.on('message', (topic, message) => {
+        this.client.on('message', (topic: string, message: any) => {
             if (topic === 'neurostrata/response') {
                 try {
                     const res = JSON.parse(message.toString());

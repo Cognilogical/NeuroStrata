@@ -26,31 +26,42 @@ pub struct SearchResult {
 }
 
 /// The core interface for generating vector embeddings from text.
-/// By making this a trait, we can swap between Local (FastEmbed/ONNX), 
+/// By making this a trait, we can swap between Local (FastEmbed/ONNX),
 /// Remote (Ollama), or Cloud (OpenAI) implementations.
 #[async_trait]
 pub trait Embedder: Send + Sync {
     /// Convert text into a dense vector representation.
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
-    
+
     /// Get the expected dimension of the embeddings (e.g., 768 for nomic-embed-text)
     fn dimensions(&self) -> usize;
 }
 
 /// The core interface for vector storage and retrieval.
-/// By making this a trait, we can swap between Embedded Qdrant, 
+/// By making this a trait, we can swap between Embedded Qdrant,
 /// Remote Qdrant, LanceDB, or SQLite-VSS.
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     /// Ensure the necessary collections/tables exist.
     async fn init(&self, namespace: &str) -> Result<()>;
-    
+
     /// Insert or update a memory with its associated vector and metadata.
-    async fn upsert(&self, namespace: &str, id: &str, vector: Vec<f32>, payload: MemoryPayload) -> Result<()>;
-    
+    async fn upsert(
+        &self,
+        namespace: &str,
+        id: &str,
+        vector: Vec<f32>,
+        payload: MemoryPayload,
+    ) -> Result<()>;
+
     /// Search for the closest memories to a given vector.
-    async fn search(&self, namespace: &str, vector: Vec<f32>, limit: usize) -> Result<Vec<SearchResult>>;
-    
+    async fn search(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>>;
+
     /// Delete a specific memory by its ID.
     async fn delete(&self, namespace: &str, id: &str) -> Result<()>;
 

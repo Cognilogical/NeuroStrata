@@ -1,7 +1,7 @@
+use crate::traits::Embedder;
 use anyhow::Result;
 use async_trait::async_trait;
-use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
-use crate::traits::Embedder;
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 pub struct FastEmbedder {
     model: TextEmbedding,
@@ -9,7 +9,9 @@ pub struct FastEmbedder {
 
 impl FastEmbedder {
     pub fn new() -> Result<Self> {
-        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::NomicEmbedTextV15).with_show_download_progress(true))?;
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::NomicEmbedTextV15).with_show_download_progress(true),
+        )?;
         Ok(Self { model })
     }
 }

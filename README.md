@@ -239,7 +239,6 @@ NeuroStrata represents a synthesis of cognitive science theories and foundationa
 * **[Litho / deepwiki-rs](https://github.com/sopaco/deepwiki-rs):** The AI-driven intelligent document generator we utilize as the primary Knowledge Bootstrapper.
 * **[Beads (bd)](https://github.com/beads/bd):** A local, git-backed issue tracker that serves as the primary execution and orchestration layer for agents. While NeuroStrata strictly manages the *knowledge state*, Beads manages the *execution state* (ensuring no code is written without a claimed ticket).
 * **[LightRAG](https://github.com/HKUDS/LightRAG):** The revolutionary architecture from HKUDS that pioneered Dual-Level Retrieval (Global + Local RAG) and Graph-Vector Fusion. NeuroStrata adopted these core concepts and translated them into a lightning-fast, native Rust MCP pipeline to eliminate Python overhead and LLM ingestion costs.
-* **[MindBank](https://github.com/spfcraze/MindBank) & [Cognitive Memory](https://github.com/petertilsen/cognitive-memory):** Our inspirations for adopting bi-temporal graph architectures, cognitive decay filters, and exponential access reinforcement.
 * **[LanceDB](https://lancedb.com/):** An open-source, embedded vector database designed for AI. It runs seamlessly inside the Rust binary, offering extreme performance with zero infrastructure overhead.
 
 ### Scientific Literature

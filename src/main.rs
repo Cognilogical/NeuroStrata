@@ -1,16 +1,16 @@
-mod mqtt_worker;
-mod traits;
 mod config;
 mod embed;
-mod store;
-mod server;
 mod mqtt;
+mod mqtt_worker;
+mod server;
+mod store;
+mod traits;
 
-use traits::{Embedder, VectorStore};
 use config::Config;
 use embed::FastEmbedder;
-use store::LanceDBStore;
 use std::sync::Arc;
+use store::LanceDBStore;
+use traits::{Embedder, VectorStore};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     // Start Embedded MQTT Broker (handles WebSockets and TCP)
     println!("Starting Embedded MQTT Broker on ports 1883 and 8080 (WS)...");
     mqtt::start_broker();
-    
+
     // Give broker a split second to boot before client connects
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
@@ -31,13 +31,16 @@ async fn main() -> anyhow::Result<()> {
     let embedder = Arc::new(FastEmbedder::new()?);
     println!("Embedder initialized.");
 
-    // Initialize Embedded LanceDB VectorStore 
-    println!("Initializing Embedded LanceDB Store at {:?}", config.db_path);
+    // Initialize Embedded LanceDB VectorStore
+    println!(
+        "Initializing Embedded LanceDB Store at {:?}",
+        config.db_path
+    );
     let vector_store: Arc<dyn VectorStore> = Arc::new(LanceDBStore::new(
-        config.db_path.to_str().unwrap().to_string(), 
-        embedder.dimensions()
+        config.db_path.to_str().unwrap().to_string(),
+        embedder.dimensions(),
     )?);
-    
+
     vector_store.init("global").await?;
     println!("Vector store tables ensured.");
 
@@ -48,6 +51,6 @@ async fn main() -> anyhow::Result<()> {
     // Boot actual MCP server loop
     println!("Starting in MCP JSON-RPC mode");
     server::start_mcp_server(embedder, vector_store).await?;
-    
+
     Ok(())
 }

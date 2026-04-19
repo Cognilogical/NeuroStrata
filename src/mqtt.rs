@@ -35,7 +35,7 @@ pub fn start_broker() {
                     max_inflight_count = 100
                     max_inflight_size = 1024
         "#;
-        
+
         let config: Config = toml::from_str(config_str).unwrap();
         let mut broker = Broker::new(config);
         broker.start().unwrap();
@@ -82,7 +82,7 @@ fn test_broker_start() {
                     max_inflight_count = 100
                     max_inflight_size = 1024
         "#;
-        
+
     let config: rumqttd::Config = toml::from_str(config_str).unwrap();
     println!("Config parsed successfully.");
     let mut broker = rumqttd::Broker::new(config);

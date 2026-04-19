@@ -12948,7 +12948,7 @@ var NEUROSTRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="curre
 var MqttClientWrapper = class {
   constructor(url) {
     this.pendingRequests = /* @__PURE__ */ new Map();
-    this.client = (void 0)(url);
+    this.client = mqtt_esm_default.connect(url);
     this.client.on("connect", () => {
       console.log("NeuroStrata: Connected to MQTT broker");
       this.client.subscribe("neurostrata/response", { qos: 0 });
