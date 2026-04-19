@@ -40,6 +40,8 @@ impl LanceDBStore {
             Field::new("user_id", DataType::Utf8, false),
             Field::new("memory_type", DataType::Utf8, false),
             Field::new("agent_name", DataType::Utf8, false),
+            Field::new("location", DataType::Utf8, false),
+            Field::new("location_lines", DataType::Utf8, false),
             Field::new("metadata", DataType::Utf8, false),
         ]))
     }
@@ -81,6 +83,8 @@ impl VectorStore for LanceDBStore {
         let memory_type_array = Arc::new(StringArray::from(vec![payload.memory_type.as_str()]));
         let agent_name_str = payload.agent_name.unwrap_or_else(|| "unknown".to_string());
         let agent_name_array = Arc::new(StringArray::from(vec![agent_name_str.as_str()]));
+        let location_array = Arc::new(StringArray::from(vec![payload.location.as_str()]));
+        let location_lines_array = Arc::new(StringArray::from(vec![payload.location_lines.as_str()]));
         let metadata_str = serde_json::to_string(&payload.metadata)?;
         let metadata_array = Arc::new(StringArray::from(vec![metadata_str.as_str()]));
 
@@ -93,6 +97,8 @@ impl VectorStore for LanceDBStore {
                 user_id_array,
                 memory_type_array,
                 agent_name_array,
+                location_array,
+                location_lines_array,
                 metadata_array,
             ],
         )?;
@@ -124,6 +130,8 @@ impl VectorStore for LanceDBStore {
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let memory_types = batch.column_by_name("memory_type").ok_or_else(|| anyhow!("Missing memory_type column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let locations = batch.column_by_name("location").ok_or_else(|| anyhow!("Missing location column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let location_lines = batch.column_by_name("location_lines").ok_or_else(|| anyhow!("Missing location_lines column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
 
             for i in 0..batch.num_rows() {
@@ -136,6 +144,8 @@ impl VectorStore for LanceDBStore {
                         user_id: user_ids.value(i).to_string(),
                         memory_type: memory_types.value(i).to_string(),
                         agent_name: Some(agent_names.value(i).to_string()),
+                        location: locations.value(i).to_string(),
+                        location_lines: location_lines.value(i).to_string(),
                         metadata: metadata_val,
                     }
                 });
@@ -171,6 +181,8 @@ impl VectorStore for LanceDBStore {
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let memory_types = batch.column_by_name("memory_type").ok_or_else(|| anyhow!("Missing memory_type column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let locations = batch.column_by_name("location").ok_or_else(|| anyhow!("Missing location column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let location_lines = batch.column_by_name("location_lines").ok_or_else(|| anyhow!("Missing location_lines column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
 
             for i in 0..batch.num_rows() {
@@ -183,6 +195,8 @@ impl VectorStore for LanceDBStore {
                         user_id: user_ids.value(i).to_string(),
                         memory_type: memory_types.value(i).to_string(),
                         agent_name: Some(agent_names.value(i).to_string()),
+                        location: locations.value(i).to_string(),
+                        location_lines: location_lines.value(i).to_string(),
                         metadata: metadata_val,
                     }
                 });
@@ -214,6 +228,8 @@ impl VectorStore for LanceDBStore {
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let memory_types = batch.column_by_name("memory_type").ok_or_else(|| anyhow!("Missing memory_type column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let locations = batch.column_by_name("location").ok_or_else(|| anyhow!("Missing location column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let location_lines = batch.column_by_name("location_lines").ok_or_else(|| anyhow!("Missing location_lines column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let vectors = batch.column_by_name("vector").ok_or_else(|| anyhow!("Missing vector column"))?.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
             
@@ -227,6 +243,8 @@ impl VectorStore for LanceDBStore {
                 user_id: user_ids.value(0).to_string(),
                 memory_type: memory_types.value(0).to_string(),
                 agent_name: Some(agent_names.value(0).to_string()),
+                location: locations.value(0).to_string(),
+                location_lines: location_lines.value(0).to_string(),
                 metadata: metadata_val,
             };
             return Ok(Some((vec, payload)));

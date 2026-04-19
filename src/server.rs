@@ -89,6 +89,8 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY if you are absolutely certain this is a brand new project namespace that doesn't exist yet." },
                                         "user_id": { "type": "string", "description": "The user making the request." },
                                         "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
+                                        "location": { "type": "string", "description": "The file path, URL, or general location this memory refers to." },
+                                        "location_lines": { "type": "string", "description": "The line numbers (e.g. '42-49') this memory refers to." },
                                         "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                                     },
                                     "required": ["content", "namespace"]
@@ -143,6 +145,8 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         let create_new_namespace = arguments.get("create_new_namespace").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("unknown");
                                         let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
+                                        let location = arguments.get("location").and_then(|l| l.as_str()).unwrap_or("").to_string();
+                                        let location_lines = arguments.get("location_lines").and_then(|l| l.as_str()).unwrap_or("").to_string();
                                         let metadata = arguments.get("metadata").cloned().unwrap_or(serde_json::json!({}));
                                         
                                         if let Ok(existing_namespaces) = store.list_namespaces().await {
@@ -157,6 +161,8 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                                     user_id: user_id.to_string(),
                                                     memory_type: memory_type.to_string(),
                                                     agent_name,
+                                                    location,
+                                                    location_lines,
                                                     metadata,
                                                 };
                                                 

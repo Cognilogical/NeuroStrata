@@ -11,6 +11,8 @@ pub struct MemoryPayload {
     pub memory_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
+    pub location: String,
+    pub location_lines: String,
     #[serde(default)]
     pub metadata: Value,
 }
