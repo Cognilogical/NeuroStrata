@@ -53,4 +53,7 @@ pub trait VectorStore: Send + Sync {
 
     /// List all memories
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
+
+    /// Get a specific memory by its ID, returning its vector and payload
+    async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
 }

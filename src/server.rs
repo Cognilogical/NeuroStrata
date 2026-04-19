@@ -150,6 +150,34 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                         result_text = "Missing 'content' parameter.".to_string();
                                     }
                                 }
+                                "neurostrata_move_memory" => {
+                                    if let (Some(id), Some(src), Some(tgt)) = (
+                                        arguments.get("id").and_then(|v| v.as_str()),
+                                        arguments.get("source_namespace").and_then(|v| v.as_str()),
+                                        arguments.get("target_namespace").and_then(|v| v.as_str())
+                                    ) {
+                                        if let Ok(Some((vec, mut payload))) = store.get(src, id).await {
+                                            if let Ok(_) = store.init(tgt).await {
+                                                // Prepend note or just move directly
+                                                if let Ok(_) = store.upsert(tgt, id, vec, payload).await {
+                                                    if let Ok(_) = store.delete(src, id).await {
+                                                        result_text = format!("Successfully moved memory {} from {} to {}", id, src, tgt);
+                                                    } else {
+                                                        result_text = "Memory copied to target but failed to delete from source.".to_string();
+                                                    }
+                                                } else {
+                                                    result_text = "Failed to insert memory into target namespace.".to_string();
+                                                }
+                                            } else {
+                                                result_text = "Failed to initialize target namespace.".to_string();
+                                            }
+                                        } else {
+                                            result_text = "Memory not found in source namespace.".to_string();
+                                        }
+                                    } else {
+                                        result_text = "Missing required parameters: id, source_namespace, or target_namespace.".to_string();
+                                    }
+                                }
                                 "neurostrata_search_memory" => {
                                     if let Some(query) = arguments.get("query").and_then(|q| q.as_str()) {
                                         let namespace = arguments.get("namespace").and_then(|n| n.as_str()).unwrap_or("global");
