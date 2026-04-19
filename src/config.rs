@@ -1,35 +1,37 @@
 use serde::Deserialize;
+use std::fs;
 use std::path::PathBuf;
-use anyhow::Result;
+use anyhow::{Result, Context};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, serde::Serialize)]
 pub struct Config {
-    pub api_key: String,
-    pub model_path: PathBuf,
-    
-    #[serde(default = "default_backend")]
-    pub backend: String,
-    
-    #[serde(default = "default_qdrant_url")]
-    pub qdrant_url: String,
-}
-
-fn default_backend() -> String {
-    "lancedb".to_string()
-}
-
-fn default_qdrant_url() -> String {
-    "http://localhost:6334".to_string()
+    #[serde(default)]
+    pub db_path: PathBuf,
 }
 
 impl Config {
     pub fn from_default_path() -> Result<Self> {
-        // Return dummy config for now, will implement dirs::config_dir
-        Ok(Self {
-            api_key: "default".to_string(),
-            model_path: PathBuf::from("~/.local/share/neurostrata/db"),
-            backend: default_backend(),
-            qdrant_url: default_qdrant_url(),
-        })
+        let home_dir = dirs::home_dir().context("Could not find home directory")?;
+        let config_path = home_dir.join(".config").join("neurostrata").join("config.json");
+        
+        // If config doesn't exist, create default
+        if !config_path.exists() {
+            let default_config = Config {
+                db_path: home_dir.join(".local").join("share").join("neurostrata").join("db"),
+            };
+            
+            if let Some(parent) = config_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            
+            let json = serde_json::to_string_pretty(&default_config)?;
+            fs::write(&config_path, json)?;
+            
+            return Ok(default_config);
+        }
+
+        let content = fs::read_to_string(&config_path)?;
+        let config: Config = serde_json::from_str(&content)?;
+        Ok(config)
     }
 }

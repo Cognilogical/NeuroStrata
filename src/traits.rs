@@ -48,4 +48,7 @@ pub trait VectorStore: Send + Sync {
     
     /// Delete a specific memory by its ID.
     async fn delete(&self, id: &str) -> Result<()>;
+
+    /// List all memories (optionally filtered by user_id)
+    async fn list(&self, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
 }

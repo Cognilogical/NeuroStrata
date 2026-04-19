@@ -140,6 +140,40 @@ impl VectorStore for LanceDBStore {
         table.delete(format!("id = '{}'", id).as_str()).await?;
         Ok(())
     }
+
+    async fn list(&self, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
+        let conn = lancedb::connect(self.local_path.to_str().unwrap()).execute().await?;
+        let table = conn.open_table("memories").execute().await?;
+
+        let mut query = table.query();
+        if let Some(uid) = user_id {
+            query = query.only_if(format!("user_id = '{}'", uid));
+        }
+
+        let mut stream = query.execute().await?;
+        let mut results = Vec::new();
+        
+        while let Some(batch) = stream.next().await {
+            let batch: RecordBatch = batch?;
+            let ids = batch.column_by_name("id").ok_or_else(|| anyhow!("Missing id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let contents = batch.column_by_name("content").ok_or_else(|| anyhow!("Missing content column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+
+            for i in 0..batch.num_rows() {
+                let metadata_val: Value = serde_json::from_str(metadatas.value(i)).unwrap_or(Value::Null);
+                results.push(SearchResult {
+                    id: ids.value(i).to_string(),
+                    score: 0.0, // Score not applicable for list
+                    payload: MemoryPayload {
+                        content: contents.value(i).to_string(),
+                        user_id: user_ids.value(i).to_string(),
+                        metadata: metadata_val,
+                    }
+                });
+            }
+        }
+
+        Ok(results)
+    }
 }
-
-

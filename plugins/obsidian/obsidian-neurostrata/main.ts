@@ -1,16 +1,13 @@
 import { App, Plugin, PluginSettingTab, Setting, ItemView, WorkspaceLeaf, Notice, TFile, addIcon } from 'obsidian';
+import * as mqtt from 'mqtt';
 
 interface NeuroStrataPluginSettings {
-    qdrantUrl: string;
-    collectionName: string;
-    embedderUrl: string;
+    mqttUrl: string;
     autoUpdateCanvas: boolean;
 }
 
 const DEFAULT_SETTINGS: NeuroStrataPluginSettings = {
-    qdrantUrl: 'http://127.0.0.1:6333',
-    collectionName: 'neurostrata',
-    embedderUrl: 'http://127.0.0.1:8004/v1/embeddings',
+    mqttUrl: 'ws://127.0.0.1:8081',
     autoUpdateCanvas: false
 }
 
@@ -32,6 +29,66 @@ const NEUROSTRATA_ICON_SVG = `<svg viewBox="0 0 100 100" fill="none" stroke="cur
   <path d="M30 43 L20 60"/>
   <path d="M70 43 L80 60"/>
 </svg>`;
+
+class MqttClientWrapper {
+    client: mqtt.MqttClient;
+    pendingRequests: Map<string, {resolve: Function, reject: Function, timeout: any}> = new Map();
+
+    constructor(url: string) {
+        this.client = mqtt.connect(url);
+        
+        this.client.on('connect', () => {
+            console.log('NeuroStrata: Connected to MQTT broker');
+            this.client.subscribe('neurostrata/response', { qos: 0 });
+        });
+
+        this.client.on('message', (topic, message) => {
+            if (topic === 'neurostrata/response') {
+                try {
+                    const res = JSON.parse(message.toString());
+                    const reqId = res.request_id;
+                    if (reqId && this.pendingRequests.has(reqId)) {
+                        const { resolve, reject, timeout } = this.pendingRequests.get(reqId)!;
+                        clearTimeout(timeout);
+                        this.pendingRequests.delete(reqId);
+                        
+                        if (res.success) {
+                            resolve(res.data);
+                        } else {
+                            reject(new Error(res.error || 'Unknown error'));
+                        }
+                    }
+                } catch (e) {
+                    console.error('NeuroStrata: Failed to parse MQTT response', e);
+                }
+            }
+        });
+    }
+
+    async request(action: string, payload: any = {}): Promise<any> {
+        return new Promise((resolve, reject) => {
+            if (!this.client.connected) {
+                return reject(new Error("Not connected to NeuroStrata MQTT broker"));
+            }
+
+            const reqId = crypto.randomUUID();
+            const timeout = setTimeout(() => {
+                this.pendingRequests.delete(reqId);
+                reject(new Error(`MQTT Request timeout for action: ${action}`));
+            }, 10000);
+
+            this.pendingRequests.set(reqId, { resolve, reject, timeout });
+
+            const req = {
+                request_id: reqId,
+                action: action,
+                payload: payload
+            };
+
+            this.client.publish('neurostrata/request', JSON.stringify(req), { qos: 0 });
+        });
+    }
+}
 
 class NeuroStrataView extends ItemView {
     plugin: NeuroStrataPlugin;
@@ -61,15 +118,6 @@ class NeuroStrataView extends ItemView {
 
     getIcon() {
         return "neurostrata-brain";
-    }
-
-    get qdrantPointsUrl() {
-        const baseUrl = this.plugin.settings.qdrantUrl.replace(/\/$/, '');
-        return `${baseUrl}/collections/${this.plugin.settings.collectionName}/points`;
-    }
-
-    get embedderUrl() {
-        return this.plugin.settings.embedderUrl;
     }
 
     async onOpen() {
@@ -176,52 +224,43 @@ class NeuroStrataView extends ItemView {
             let vector = Array(768).fill(0); 
             
             try {
-                const embRes = await fetch(this.embedderUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ input: content })
-                });
-                if (embRes.ok) {
-                    const embData = await embRes.json();
-                    if (embData.data && embData.data[0] && embData.data[0].embedding) {
-                        vector = embData.data[0].embedding;
+                if (this.plugin.mqtt) {
+                    const embRes = await this.plugin.mqtt.request('embed', { input: content });
+                    if (embRes && embRes.embedding) {
+                        vector = embRes.embedding;
                     }
                 }
             } catch (e) {
-                console.warn("NeuroStrata Embedder failed. Falling back to zero-vector.", e);
+                console.warn("NeuroStrata Embedder failed via MQTT. Falling back to zero-vector.", e);
             }
 
             const pointId = crypto.randomUUID();
             
-            const payload: any = {
-                data: content,
-                user_id: this.currentNamespace
+            const payloadData: any = {
+                content: content,
+                user_id: this.currentNamespace,
+                metadata: {}
             };
             
             if (refFile) {
-                payload.refs = [{ file: refFile }];
-                if (refLines) payload.refs[0].lines = refLines;
+                payloadData.metadata.refs = [{ file: refFile }];
+                if (refLines) payloadData.metadata.refs[0].lines = refLines;
             }
 
             try {
-                await fetch(`${this.qdrantPointsUrl}?wait=true`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        points: [{
-                            id: pointId,
-                            payload: payload,
-                            vector: vector
-                        }]
-                    })
-                });
-                new Notice(`Memory added to ${this.currentNamespace}`);
-                this.addForm.style.display = 'none';
-                
-                setTimeout(() => {
-                    this.loadMemories();
-                }, 250);
-
+                if (this.plugin.mqtt) {
+                    await this.plugin.mqtt.request('add', {
+                        id: pointId,
+                        vector: vector,
+                        payload: payloadData
+                    });
+                    new Notice(`Memory added to ${this.currentNamespace}`);
+                    this.addForm.style.display = 'none';
+                    
+                    setTimeout(() => {
+                        this.loadMemories();
+                    }, 250);
+                }
             } catch (e) {
                 new Notice(`Failed to save memory: ${e}`);
             }
@@ -237,8 +276,11 @@ class NeuroStrataView extends ItemView {
         };
 
         this.memoriesContainer = container.createDiv();
-        await this.loadNamespaces();
-        await this.loadMemories();
+        
+        setTimeout(async () => {
+            await this.loadNamespaces();
+            await this.loadMemories();
+        }, 500); // Give MQTT time to connect
     }
 
     public openAddMemoryForm(initialText: string, referencePath: string, linesStr: string) {
@@ -253,23 +295,14 @@ class NeuroStrataView extends ItemView {
 
     async loadNamespaces() {
         try {
-            const res = await fetch(`${this.qdrantPointsUrl}/scroll`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    limit: 10000,
-                    with_payload: true
-                })
-            });
-            
-            if (!res.ok) throw new Error("Failed to fetch points");
-            const data = await res.json();
+            if (!this.plugin.mqtt) return;
+            const data = await this.plugin.mqtt.request('list', {});
             
             const uniqueNamespaces = new Set<string>();
             uniqueNamespaces.add('global'); // Always ensure 'global' exists
             
-            if (data.result && data.result.points) {
-                data.result.points.forEach((p: any) => {
+            if (data && Array.isArray(data)) {
+                data.forEach((p: any) => {
                     if (p.payload && p.payload.user_id) {
                         uniqueNamespaces.add(p.payload.user_id);
                     }
@@ -292,7 +325,7 @@ class NeuroStrataView extends ItemView {
             }
             
         } catch (e) {
-            console.error("NeuroStrata: Failed to load namespaces from Qdrant", e);
+            console.error("NeuroStrata: Failed to load namespaces from MQTT", e);
             this.namespaceSelect.empty();
             this.namespaceSelect.createEl("option", { text: "global", value: "global" });
             this.currentNamespace = 'global';
@@ -304,17 +337,9 @@ class NeuroStrataView extends ItemView {
         this.memoriesContainer.createEl("p", { text: "Loading..." });
 
         try {
-            const res = await fetch(`${this.qdrantPointsUrl}/scroll`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    filter: { must: [{ key: "user_id", match: { value: this.currentNamespace } }] },
-                    limit: 100,
-                    with_payload: true
-                })
-            });
-            const data = await res.json();
-            this.allCurrentPoints = data.result?.points || [];
+            if (!this.plugin.mqtt) throw new Error("MQTT client not ready");
+            const data = await this.plugin.mqtt.request('list', { namespace: this.currentNamespace });
+            this.allCurrentPoints = Array.isArray(data) ? data : [];
 
             this.renderFilteredMemories();
             
@@ -339,7 +364,7 @@ class NeuroStrataView extends ItemView {
         const filterText = this.searchInput.value.toLowerCase();
         
         const filteredPoints = this.allCurrentPoints.filter(point => {
-            const textData = point.payload?.data || "";
+            const textData = point.payload?.content || "";
             return textData.toLowerCase().includes(filterText);
         });
 
@@ -353,8 +378,8 @@ class NeuroStrataView extends ItemView {
 
     renderMemoryCard(point: any) {
         const card = this.memoriesContainer.createDiv({ cls: "neurostrata-memory-card" });
-        let textData = point.payload?.data || "";
-        let refs = point.payload?.refs || [];
+        let textData = point.payload?.content || "";
+        let refs = point.payload?.metadata?.refs || [];
 
         const textDisplay = card.createDiv({ cls: "neurostrata-memory-text", text: textData });
         textDisplay.style.whiteSpace = "pre-wrap";
@@ -456,60 +481,40 @@ class NeuroStrataView extends ItemView {
             saveBtn.disabled = true;
             cancelBtn.disabled = true;
             
-            const newPayload: any = { data: newText, user_id: this.currentNamespace };
+            const newPayload: any = { content: newText, user_id: this.currentNamespace, metadata: {} };
             
             if (editRefInput.value.trim()) {
-                newPayload.refs = [{ file: editRefInput.value.trim() }];
+                newPayload.metadata.refs = [{ file: editRefInput.value.trim() }];
                 if (editLinesInput.value.trim()) {
-                    newPayload.refs[0].lines = editLinesInput.value.trim();
+                    newPayload.metadata.refs[0].lines = editLinesInput.value.trim();
                 }
             }
 
-            let newVector = null;
+            let newVector = Array(768).fill(0);
             try {
-                const embRes = await fetch(this.embedderUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ input: newText })
-                });
-                if (embRes.ok) {
-                    const embData = await embRes.json();
-                    if (embData.data && embData.data[0] && embData.data[0].embedding) {
-                        newVector = embData.data[0].embedding;
+                if (this.plugin.mqtt) {
+                    const embRes = await this.plugin.mqtt.request('embed', { input: newText });
+                    if (embRes && embRes.embedding) {
+                        newVector = embRes.embedding;
                     }
                 }
             } catch (e) {
-                console.warn("Re-embedding failed. Fallback to updating payload only.", e);
+                console.warn("Re-embedding failed via MQTT. Fallback to zero-vector.", e);
             }
 
             try {
-                if (newVector) {
-                    await fetch(`${this.qdrantPointsUrl}?wait=true`, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            points: [{
-                                id: point.id,
-                                payload: newPayload,
-                                vector: newVector
-                            }]
-                        })
-                    });
-                } else {
-                    await fetch(`${this.qdrantPointsUrl}/payload?wait=true`, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            payload: newPayload,
-                            points: [point.id]
-                        })
+                if (this.plugin.mqtt) {
+                    await this.plugin.mqtt.request('update', {
+                        id: point.id,
+                        vector: newVector,
+                        payload: newPayload
                     });
                 }
                 
                 new Notice("Memory updated successfully.");
                 
                 textData = newText;
-                refs = newPayload.refs || [];
+                refs = newPayload.metadata.refs || [];
                 point.payload = newPayload; 
                 
                 textDisplay.innerText = textData;
@@ -542,11 +547,9 @@ class NeuroStrataView extends ItemView {
                 deleteBtn.innerText = "Deleting...";
                 deleteBtn.disabled = true;
                 try {
-                    await fetch(`${this.qdrantPointsUrl}/delete?wait=true`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ points: [point.id] })
-                    });
+                    if (this.plugin.mqtt) {
+                        await this.plugin.mqtt.request('delete', { id: point.id });
+                    }
                     card.remove();
                     this.allCurrentPoints = this.allCurrentPoints.filter(p => p.id !== point.id);
                     new Notice("Memory deleted.");
@@ -578,36 +581,15 @@ class NeuroStrataSettingTab extends PluginSettingTab {
         containerEl.createEl('h2', {text: 'NeuroStrata Settings'});
 
         new Setting(containerEl)
-            .setName('Qdrant Base URL')
-            .setDesc('The base URL for your local Qdrant vector database')
+            .setName('MQTT Broker URL (WebSocket)')
+            .setDesc('The WebSocket URL for the embedded NeuroStrata MQTT broker')
             .addText(text => text
-                .setPlaceholder('http://127.0.0.1:6333')
-                .setValue(this.plugin.settings.qdrantUrl)
+                .setPlaceholder('ws://127.0.0.1:8081')
+                .setValue(this.plugin.settings.mqttUrl)
                 .onChange(async (value) => {
-                    this.plugin.settings.qdrantUrl = value;
+                    this.plugin.settings.mqttUrl = value;
                     await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Collection Name')
-            .setDesc('The name of the Qdrant collection used by NeuroStrata')
-            .addText(text => text
-                .setPlaceholder('neurostrata')
-                .setValue(this.plugin.settings.collectionName)
-                .onChange(async (value) => {
-                    this.plugin.settings.collectionName = value;
-                    await this.plugin.saveSettings();
-                }));
-
-        new Setting(containerEl)
-            .setName('Embedder URL')
-            .setDesc('The endpoint for your local embedding model')
-            .addText(text => text
-                .setPlaceholder('http://127.0.0.1:8004/v1/embeddings')
-                .setValue(this.plugin.settings.embedderUrl)
-                .onChange(async (value) => {
-                    this.plugin.settings.embedderUrl = value;
-                    await this.plugin.saveSettings();
+                    this.plugin.initMqtt();
                 }));
                 
         new Setting(containerEl)
@@ -624,9 +606,11 @@ class NeuroStrataSettingTab extends PluginSettingTab {
 
 export default class NeuroStrataPlugin extends Plugin {
     settings: NeuroStrataPluginSettings;
+    mqtt: MqttClientWrapper | null = null;
 
     async onload() {
         await this.loadSettings();
+        this.initMqtt();
         
         addIcon('neurostrata-brain', NEUROSTRATA_ICON_SVG);
 
@@ -681,12 +665,25 @@ export default class NeuroStrataPlugin extends Plugin {
         );
     }
 
+    initMqtt() {
+        if (this.mqtt) {
+            this.mqtt.client.end();
+        }
+        this.mqtt = new MqttClientWrapper(this.settings.mqttUrl);
+    }
+
+    onunload() {
+        if (this.mqtt) {
+            this.mqtt.client.end();
+        }
+    }
+
     async generateCanvas(points: any[], silent: boolean = false) {
         const domainMap = new Map<string, any[]>();
         const orphanedMemories: any[] = [];
 
         points.forEach(p => {
-            const refs = p.payload?.refs || [];
+            const refs = p.payload?.metadata?.refs || [];
             let foundDoc = false;
             
             if (refs.length > 0) {
@@ -742,7 +739,7 @@ export default class NeuroStrataPlugin extends Plugin {
                 const memX = x + DOC_WIDTH + 100;
                 const memY = y + (rowIndex * (MEM_HEIGHT + 50));
                 
-                const rawText = mem.payload?.data || "";
+                const rawText = mem.payload?.content || "";
 
                 nodes.push({
                     id: memNodeId,
@@ -797,7 +794,7 @@ export default class NeuroStrataPlugin extends Plugin {
                 nodes.push({
                     id: `mem-${mem.id}`,
                     type: "text",
-                    text: `**Orphaned [${mem.payload?.user_id || 'unknown'}]**\n\n${mem.payload?.data || ""}`,
+                    text: `**Orphaned [${mem.payload?.user_id || 'unknown'}]**\n\n${mem.payload?.content || ""}`,
                     x: startX + (col * (MEM_WIDTH + 50)),
                     y: orphStartY + (row * (MEM_HEIGHT + 50)),
                     width: MEM_WIDTH,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Arc;
+use std::sync::Arc;
 use crate::traits::{Embedder, VectorStore};
 
 #[derive(Deserialize)]
@@ -19,6 +19,7 @@ struct JsonRpcResponse<T> {
     result: T,
     error: Option<Value>,
 }
+
 impl<T> JsonRpcResponse<T> {
     fn success(id: Option<Value>, result: T) -> Self {
         Self {
@@ -28,7 +29,9 @@ impl<T> JsonRpcResponse<T> {
             error: None,
         }
     }
+}
 
+impl JsonRpcResponse<Value> {
     fn error(id: Option<Value>, error: Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -43,7 +46,7 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin).lines();
-    let mut writer = stdout; // Use unbuffered writer for stdout JSON-RPC
+    let mut writer = stdout;
 
     while let Some(line) = reader.next_line().await? {
         if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line) {
@@ -52,4 +55,13 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                 "initialize" => {
                     let result = serde_json::json!({ "status": "initialized" });
                     let resp = JsonRpcResponse::success(id, result);
-                    writer.write_all(resp.json().as_bytes());// assistance
+                    writer.write_all(serde_json::to_string(&resp).unwrap().as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    Ok(())
+}
