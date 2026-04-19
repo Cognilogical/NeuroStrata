@@ -4,31 +4,24 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_PLUGIN_DIR="$HOME/.local/share/neurostrata/plugin"
 OPENCODE_CONFIG="$HOME/.config/opencode/opencode.json"
-GITHUB_REPO="Cognilogical/NeuroStrata"
 
 echo "Setting up the NeuroStrata OpenCode plugin..."
 PLUGIN_DIR="$SCRIPT_DIR/neurostrata-plugin"
 
-if [ -d "$PLUGIN_DIR/dist" ] && [ -f "$PLUGIN_DIR/package.json" ]; then
-    echo "  -> Found local neurostrata-plugin source. Copying to $INSTALL_PLUGIN_DIR..."
+if [ -f "$PLUGIN_DIR/package.json" ]; then
+    echo "  -> Building local neurostrata-plugin source..."
+    cd "$PLUGIN_DIR"
+    npm install
+    npm run build
+    cd -
+    
+    echo "  -> Copying to $INSTALL_PLUGIN_DIR..."
     mkdir -p "$INSTALL_PLUGIN_DIR"
     cp -r "$PLUGIN_DIR/dist" "$INSTALL_PLUGIN_DIR/"
     cp "$PLUGIN_DIR/package.json" "$INSTALL_PLUGIN_DIR/"
 else
-    # Production Mode: Download pre-compiled plugin tarball from GitHub Releases
-    PLUGIN_URL="https://github.com/$GITHUB_REPO/releases/latest/download/opencode-neurostrata.tgz"
-    echo "  -> Downloading pre-compiled plugin from $PLUGIN_URL..."
-    
-    mkdir -p "$INSTALL_PLUGIN_DIR"
-    if curl -f -L "$PLUGIN_URL" -o "$INSTALL_PLUGIN_DIR/plugin.tgz"; then
-        tar -xzf "$INSTALL_PLUGIN_DIR/plugin.tgz" -C "$INSTALL_PLUGIN_DIR" --strip-components=1
-        rm "$INSTALL_PLUGIN_DIR/plugin.tgz"
-        echo "  -> Plugin downloaded and extracted successfully."
-    else
-        echo "  -> Error: Failed to download pre-compiled plugin tarball."
-        echo "     If you are compiling from source, please run ./mcp/build.sh first."
-        exit 1
-    fi
+    echo "  -> Error: Local neurostrata-plugin not found at $PLUGIN_DIR"
+    exit 1
 fi
 
 # Patch OpenCode configuration

@@ -17,3 +17,7 @@ mcp/neurostrata-mcp
 .beads-credential-key
 
 target/
+.fastembed_cache/
+.neurostrata/
+*.log
+*.pid
