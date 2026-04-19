@@ -76,8 +76,8 @@ async fn handle_request(req: MqttRequest, embedder: Arc<dyn Embedder>, store: Ar
             }
         }
         "list" => {
-            let namespace = req.payload.get("namespace").and_then(|v| v.as_str());
-            match store.list(namespace).await {
+            let namespace = req.payload.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
+            match store.list(namespace, None).await {
                 Ok(results) => {
                     success = true;
                     data = Some(serde_json::to_value(results).unwrap());
@@ -87,7 +87,8 @@ async fn handle_request(req: MqttRequest, embedder: Arc<dyn Embedder>, store: Ar
         }
         "add" | "update" => {
             if let Ok(memory_req) = serde_json::from_value::<AddMemoryReq>(req.payload.clone()) {
-                match store.upsert(&memory_req.id, memory_req.vector, memory_req.payload).await {
+                let namespace = req.payload.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
+                match store.upsert(namespace, &memory_req.id, memory_req.vector, memory_req.payload).await {
                     Ok(_) => success = true,
                     Err(e) => error = Some(e.to_string()),
                 }
@@ -97,7 +98,8 @@ async fn handle_request(req: MqttRequest, embedder: Arc<dyn Embedder>, store: Ar
         }
         "delete" => {
             if let Some(id) = req.payload.get("id").and_then(|v| v.as_str()) {
-                match store.delete(id).await {
+                let namespace = req.payload.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
+                match store.delete(namespace, id).await {
                     Ok(_) => success = true,
                     Err(e) => error = Some(e.to_string()),
                 }

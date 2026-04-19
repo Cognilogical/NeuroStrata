@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         embedder.dimensions()
     )?);
     
-    vector_store.init().await?;
+    vector_store.init("global").await?;
     println!("Vector store tables ensured.");
 
     // Start internal MQTT worker to process requests from Obsidian

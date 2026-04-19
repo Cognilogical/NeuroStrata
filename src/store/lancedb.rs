@@ -38,6 +38,7 @@ impl LanceDBStore {
             ), false),
             Field::new("content", DataType::Utf8, false),
             Field::new("user_id", DataType::Utf8, false),
+            Field::new("agent_name", DataType::Utf8, false),
             Field::new("metadata", DataType::Utf8, false),
         ]))
     }
@@ -45,24 +46,24 @@ impl LanceDBStore {
 
 #[async_trait]
 impl VectorStore for LanceDBStore {
-    async fn init(&self) -> Result<()> {
+    async fn init(&self, namespace: &str) -> Result<()> {
         let conn = lancedb::connect(self.local_path.to_str().unwrap()).execute().await?;
         
         // Check if table exists, if not create empty table
         let table_names = conn.table_names().execute().await?;
-        if !table_names.contains(&"memories".to_string()) {
+        if !table_names.contains(&namespace.to_string()) {
             let schema = self.schema();
             let empty_batch = RecordBatch::new_empty(schema.clone());
             let batches = vec![empty_batch];
             let batches_iter = Box::new(RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone())) as Box<dyn RecordBatchReader + Send>;
-            conn.create_table("memories", batches_iter).execute().await?;
+            conn.create_table(namespace, batches_iter).execute().await?;
         }
         Ok(())
     }
     
-    async fn upsert(&self, id: &str, vector: Vec<f32>, payload: MemoryPayload) -> Result<()> {
+    async fn upsert(&self, namespace: &str, id: &str, vector: Vec<f32>, payload: MemoryPayload) -> Result<()> {
         let conn = lancedb::connect(self.local_path.to_str().unwrap()).execute().await?;
-        let table = conn.open_table("memories").execute().await?;
+        let table = conn.open_table(namespace).execute().await?;
 
         let schema = self.schema();
         let id_array = Arc::new(StringArray::from(vec![id]));
@@ -76,6 +77,8 @@ impl VectorStore for LanceDBStore {
         
         let content_array = Arc::new(StringArray::from(vec![payload.content.as_str()]));
         let user_id_array = Arc::new(StringArray::from(vec![payload.user_id.as_str()]));
+        let agent_name_str = payload.agent_name.unwrap_or_else(|| "unknown".to_string());
+        let agent_name_array = Arc::new(StringArray::from(vec![agent_name_str.as_str()]));
         let metadata_str = serde_json::to_string(&payload.metadata)?;
         let metadata_array = Arc::new(StringArray::from(vec![metadata_str.as_str()]));
 
@@ -86,6 +89,7 @@ impl VectorStore for LanceDBStore {
                 vector_list,
                 content_array,
                 user_id_array,
+                agent_name_array,
                 metadata_array,
             ],
         )?;
@@ -98,9 +102,9 @@ impl VectorStore for LanceDBStore {
         Ok(())
     }
     
-    async fn search(&self, vector: Vec<f32>, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, namespace: &str, vector: Vec<f32>, limit: usize) -> Result<Vec<SearchResult>> {
         let conn = lancedb::connect(self.local_path.to_str().unwrap()).execute().await?;
-        let table = conn.open_table("memories").execute().await?;
+        let table = conn.open_table(namespace).execute().await?;
 
         let mut stream = table.vector_search(vector)?
             .limit(limit)
@@ -115,6 +119,7 @@ impl VectorStore for LanceDBStore {
             let distances = batch.column_by_name("_distance").ok_or_else(|| anyhow!("Missing _distance column"))?.as_any().downcast_ref::<Float32Array>().unwrap();
             let contents = batch.column_by_name("content").ok_or_else(|| anyhow!("Missing content column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
 
             for i in 0..batch.num_rows() {
@@ -125,6 +130,7 @@ impl VectorStore for LanceDBStore {
                     payload: MemoryPayload {
                         content: contents.value(i).to_string(),
                         user_id: user_ids.value(i).to_string(),
+                        agent_name: Some(agent_names.value(i).to_string()),
                         metadata: metadata_val,
                     }
                 });
@@ -134,16 +140,16 @@ impl VectorStore for LanceDBStore {
         Ok(results)
     }
     
-    async fn delete(&self, id: &str) -> Result<()> {
+    async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
         let conn = lancedb::connect(self.local_path.to_str().unwrap()).execute().await?;
-        let table = conn.open_table("memories").execute().await?;
+        let table = conn.open_table(namespace).execute().await?;
         table.delete(format!("id = '{}'", id).as_str()).await?;
         Ok(())
     }
 
-    async fn list(&self, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
+    async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
         let conn = lancedb::connect(self.local_path.to_str().unwrap()).execute().await?;
-        let table = conn.open_table("memories").execute().await?;
+        let table = conn.open_table(namespace).execute().await?;
 
         let mut query = table.query();
         if let Some(uid) = user_id {
@@ -158,6 +164,7 @@ impl VectorStore for LanceDBStore {
             let ids = batch.column_by_name("id").ok_or_else(|| anyhow!("Missing id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let contents = batch.column_by_name("content").ok_or_else(|| anyhow!("Missing content column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
 
             for i in 0..batch.num_rows() {
@@ -168,6 +175,7 @@ impl VectorStore for LanceDBStore {
                     payload: MemoryPayload {
                         content: contents.value(i).to_string(),
                         user_id: user_ids.value(i).to_string(),
+                        agent_name: Some(agent_names.value(i).to_string()),
                         metadata: metadata_val,
                     }
                 });

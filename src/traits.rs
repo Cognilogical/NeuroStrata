@@ -8,6 +8,8 @@ use serde_json::Value;
 pub struct MemoryPayload {
     pub content: String,
     pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     #[serde(default)]
     pub metadata: Value,
 }
@@ -38,17 +40,17 @@ pub trait Embedder: Send + Sync {
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     /// Ensure the necessary collections/tables exist.
-    async fn init(&self) -> Result<()>;
+    async fn init(&self, namespace: &str) -> Result<()>;
     
     /// Insert or update a memory with its associated vector and metadata.
-    async fn upsert(&self, id: &str, vector: Vec<f32>, payload: MemoryPayload) -> Result<()>;
+    async fn upsert(&self, namespace: &str, id: &str, vector: Vec<f32>, payload: MemoryPayload) -> Result<()>;
     
     /// Search for the closest memories to a given vector.
-    async fn search(&self, vector: Vec<f32>, limit: usize) -> Result<Vec<SearchResult>>;
+    async fn search(&self, namespace: &str, vector: Vec<f32>, limit: usize) -> Result<Vec<SearchResult>>;
     
     /// Delete a specific memory by its ID.
-    async fn delete(&self, id: &str) -> Result<()>;
+    async fn delete(&self, namespace: &str, id: &str) -> Result<()>;
 
-    /// List all memories (optionally filtered by user_id)
-    async fn list(&self, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
+    /// List all memories
+    async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
 }

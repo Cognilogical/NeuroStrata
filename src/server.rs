@@ -84,10 +84,13 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                     "type": "object",
                                     "properties": {
                                         "content": { "type": "string", "description": "The text of the memory to save." },
-                                        "user_id": { "type": "string", "description": "The namespace." },
+                                        "namespace": { "type": "string", "description": "The project ID or global namespace." },
+                                        "user_id": { "type": "string", "description": "The user making the request." },
+                                        "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
                                         "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                                     },
-                                    "required": ["content"]
+                                    "required": ["content", "namespace"]
+                                    
                                 }
                             },
                             {
@@ -97,9 +100,10 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                     "type": "object",
                                     "properties": {
                                         "query": { "type": "string", "description": "What to search for." },
-                                        "user_id": { "type": "string", "description": "The namespace." }
+                                        "namespace": { "type": "string", "description": "The project ID or global namespace." }
                                     },
-                                    "required": ["query"]
+                                    "required": ["query", "namespace"]
+                                    
                                 }
                             }
                         ]
@@ -117,21 +121,27 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                             match name {
                                 "neurostrata_add_memory" => {
                                     if let Some(content) = arguments.get("content").and_then(|c| c.as_str()) {
-                                        let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("global");
+                                        let namespace = arguments.get("namespace").and_then(|n| n.as_str()).unwrap_or("global");
+                                        let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("unknown");
+                                        let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
                                         let metadata = arguments.get("metadata").cloned().unwrap_or(serde_json::json!({}));
                                         
                                         let payload = MemoryPayload {
                                             content: content.to_string(),
                                             user_id: user_id.to_string(),
+                                            agent_name,
                                             metadata,
                                         };
                                         
-                                        if let Ok(vec) = emb.embed(&content).await {
-                                            let new_id = uuid::Uuid::new_v4().to_string();
-                                            if let Ok(_) = store.upsert(&new_id, vec, payload).await {
-                                                result_text = format!("Successfully added memory for user: {}", user_id);
+                                        if let Ok(_) = store.init(namespace).await {
+                                            if let Ok(vec) = emb.embed(&content).await {
+                                                let new_id = uuid::Uuid::new_v4().to_string();
+                                                if let Ok(_) = store.upsert(namespace, &new_id, vec, payload).await {
+                                                    result_text = format!("Successfully added memory for namespace: {}", namespace);
+                                                } else {
+                                                    result_text = "Failed to store memory in database.".to_string();
+                                                }
                                             } else {
-                                                result_text = "Failed to store memory in database.".to_string();
                                             }
                                         } else {
                                             result_text = "Failed to generate embedding.".to_string();
@@ -142,8 +152,10 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                 }
                                 "neurostrata_search_memory" => {
                                     if let Some(query) = arguments.get("query").and_then(|q| q.as_str()) {
-                                        if let Ok(vec) = emb.embed(&query).await {
-                                            if let Ok(results) = store.search(vec, 5).await {
+                                        let namespace = arguments.get("namespace").and_then(|n| n.as_str()).unwrap_or("global");
+                                        if let Ok(_) = store.init(namespace).await {
+                                            if let Ok(vec) = emb.embed(&query).await {
+                                                if let Ok(results) = store.search(namespace, vec, 5).await {
                                                 if results.is_empty() {
                                                     result_text = "No relevant memories found.".to_string();
                                                 } else {
@@ -155,8 +167,11 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                             } else {
                                                 result_text = "Failed to search database.".to_string();
                                             }
+                                            } else {
+                                                result_text = "Failed to generate embedding for search.".to_string();
+                                            }
                                         } else {
-                                            result_text = "Failed to generate embedding for search.".to_string();
+                                            result_text = "Failed to initialize namespace table.".to_string();
                                         }
                                     } else {
                                         result_text = "Missing 'query' parameter.".to_string();
