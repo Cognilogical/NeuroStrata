@@ -1,0 +1,35 @@
+# Base image with Node.js and basic tools
+FROM ubuntu:22.04
+
+# Avoid tzdata interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20.x
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g opencode
+
+# Set up a generic app user to mimic host user permissions (optional but good practice)
+RUN useradd -m -s /bin/bash agent
+
+# Switch to agent user
+USER agent
+WORKDIR /home/agent/workspace
+
+# Clone the Express.js testbed repo (if it doesn't exist already)
+# We do this in the entrypoint or setup script, but having git is enough.
+# The actual repo will be mounted from the host or cloned here during setup.
+
+# Set environment variables for the injected binary and isolated MCP
+ENV PATH="/usr/local/bin:$PATH"
+ENV NEUROSTRATA_DB_PATH="/home/agent/workspace/.neurostrata/db"
+ENV OPENSYNC_CONFIG="/home/agent/workspace/.config/opencode/opencode.json"
+
+# Keep the container alive or run the default command
+CMD ["bash"]
