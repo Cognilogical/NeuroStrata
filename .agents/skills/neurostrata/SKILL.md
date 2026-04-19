@@ -135,18 +135,24 @@ Ad-hoc architectural discussions generate vital context that evaporates when the
 3. **Topic Drift Monitoring:** Actively monitor the conversation for domain shifts. If detected, pause and ask: "I notice we are shifting topics. Would you like to summarize and save the current NeuroStrata session log and start a new one?"
 4. **Visualization Updates:** Whenever a NeuroStrata session concludes, or massive architectural changes are made, run `neurostrata_generate_canvas` to ensure the user's Obsidian graph is up to date.
 
-## Bi-Directional Anchors & Compact Reading
-To prevent context window bloat and perfectly map semantic rules to the codebase, Tier 2 Domain pointers use a dual-anchor metadata schema.
-1. **Payload Structure:** Memories use structured JSON metadata to anchor to both documentation and (optionally) code symbols:
-   ```json
-   {
-     "doc_refs": [{"file": "docs/architecture/domains/sync.md", "lines": "42-49"}],
-     "code_refs": [{"file": "src/sync/engine.ts", "symbol": "startSync()"}]
-   }
-   ```
-   *Note: `code_refs` is strictly an optional augmentation. Not all projects have source code. Only use it when an architectural rule directly governs a specific function, class, or method.*
-2. **Compact Reading Constraint:** When retrieving a memory with `doc_refs` containing `lines`, the agent MUST use the `Read` tool's `offset` and `limit` parameters to fetch ONLY that specific chunk first.
-3. **Symbol Traversal:** If `code_refs` are present, use the Glob or Grep tools to locate the exact `symbol` to understand its current implementation.
+## Bi-Directional Anchors, Canvas Linking & Compact Reading
+To prevent context window bloat and perfectly map semantic rules to the codebase, NeuroStrata memories use `location` and `refs` arrays to anchor memories to documents. This data directly powers the `neurostrata_generate_canvas` tool, dictating which file column a memory is drawn into in the Obsidian graph.
+
+1. **Payload Structure (Canvas Grouping):** 
+   - `location`: The primary file path (e.g., `src/server.rs` or `docs/architecture/sync.md`). If set, the canvas generator will create a File Node for this document and draw an edge connecting the memory to it.
+   - `metadata.refs`: If a memory applies to multiple files, use the `refs` array in the JSON metadata. The canvas generator checks `refs[].file` first before falling back to `location`.
+     ```json
+     {
+       "refs": [
+         { "file": "docs/architecture/domains/sync.md", "lines": "42-49" },
+         { "file": "src/sync/engine.ts", "symbol": "startSync()" }
+       ],
+       "related_to": ["UUID-1", "UUID-2"]
+     }
+     ```
+     *Note: `related_to` is an array of memory IDs. If present, the canvas generator draws horizontal edges connecting related memories to each other.*
+2. **Compact Reading Constraint:** When retrieving a memory with `refs` containing `lines` or `location_lines`, the agent MUST use the `Read` tool's `offset` and `limit` parameters to fetch ONLY that specific chunk first.
+3. **Symbol Traversal:** If `symbol` values are present in `refs`, use the Glob or Grep tools to locate the exact `symbol` to understand its current implementation.
 
 ## Agent Directives
 *   **ESCALATING CROSS-PROJECT GUARD:** When asked to interact with files outside your current workspace, first check if the target is another NeuroStrata-managed project (e.g., contains a `.neurostrata` or `.agents` directory, or exists in `neurostrata_search_memory`). If it is NOT, proceed normally. If it IS a NeuroStrata-managed project, apply these escalation rules:
