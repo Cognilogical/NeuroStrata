@@ -5,10 +5,10 @@ description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task). Repl
 # NeuroStrata (3-Tier Memory Architecture)
 
 ## Overview
-NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Golang Model Context Protocol (MCP) server connected directly to a local Qdrant vector database partitioned into three distinct tiers.
+NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Golang Model Context Protocol (MCP) server connected directly to an embedded LanceDB vector database partitioned into three distinct tiers.
 
 ## The 3 Tiers
-1. **Global (`user_id="global"`)**: Company-wide constraints, infrastructure mandates (e.g., podman only, no REST, Clojure for parsing), and universal tool usage rules.
+1. **Global (`user_id="global"`)**: Company-wide constraints, infrastructure mandates (e.g., LanceDB only, no REST, Clojure for parsing), and universal tool usage rules.
 2. **Domain/Project (Pointer-Wiki Hybrid, `user_id="<project_name>"`)**: Hidden business rules, API contracts, and spatial code layouts specific to the project's domains.
    * **The Pointer-Wiki Hybrid**: To prevent context bloat, NeuroStrata stores *pointers* (e.g., "See `docs/architecture/domains/sync.md` for full narrative") instead of dumping entire narratives into vector memory.
 3. **Task (`user_id="<task_id>"`)**: Specific insights, decisions, and context scoped to a single active task.
@@ -43,10 +43,10 @@ You (the Agent) are responsible for the bookkeeping. The user should not have to
 
 ## 🛑 COST MANAGEMENT & ASYNC DELEGATION
 **Your Role:** You are the Knowledge Manager, Architect, and Orchestrator. You are running on an expensive frontier model. 
-**The Mandate:** You MUST aggressively offload actual "work" (coding, refactoring, file creation) to the cheaper \`neurostrata-task\` OR capture it asynchronously in BeadBoard to avoid blocking the chat.
+**The Mandate:** You MUST aggressively offload actual "work" (coding, refactoring, file creation) to the cheaper \`NeuroStrata-Task\` OR capture it asynchronously in BeadBoard to avoid blocking the chat.
 **The Tooling & Workflow:** 
 1. **Async Backlogging (Preferred):** The \`Task\` tool blocks the chat synchronously. If the user wants to keep chatting and brainstorming, DO NOT use the \`Task\` tool. Instead, use the \`bash\` tool to create a BeadBoard bead to capture the requirements in the backlog.
-2. **Synchronous Execution:** ONLY use the \`Task\` tool (\`subagent_type: "neurostrata-task"\`) if the user explicitly asks for the work to be completed right now.
+2. **Synchronous Execution:** ONLY use the \`Task\` tool (\`subagent_type: "NeuroStrata-Task"\`) if the user explicitly asks for the work to be completed right now.
 **Exceptions:** You may only make direct file edits yourself for trivial, one-off changes (e.g., fixing a single typo, renaming a variable).
 
 1. **Analyze Scope**:
@@ -68,7 +68,7 @@ You are an **Information Architect specializing in Knowledge Organization System
 
 **The 8 Categories of Passive Knowledge Extraction:**
 Instead of relying on a background process, YOU are responsible for continuously monitoring the chat stream for the following 8 categories of structural facts. When you detect one, you must autonomously extract it and save it using `neurostrata_add_memory` (or update an existing one):
-1. **System Architecture & Technical Constraints:** Infrastructure mandates (e.g., Podman vs Docker), tech stacks, languages, and strict engineering rules.
+1. **System Architecture & Technical Constraints:** Infrastructure mandates (e.g., Embedded LanceDB vs External DB), tech stacks, languages, and strict engineering rules.
 2. **Domain & Business Logic:** Core rules governing specific fields (e.g., Financial calculations, Health/HIPAA compliance, domain-driven data models).
 3. **Workflows & Operational Processes:** CI/CD pipelines, testing requirements, deployment steps, and required methodologies.
 4. **Project Goals & Milestones:** The overarching purpose of the system being built, target features, and phased roadmaps.
@@ -134,8 +134,8 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
     *   **Write/Modify Requests:** Do NOT modify the external project's files directly. Instead, suggest capturing the requested changes, code, or tasks into a handoff document (e.g., `cross_project_handoff.md`) inside the external project's directory. This allows the user to switch to the correct agent to execute the work contextually.
 *   **CRITICAL RULE ENFORCEMENT:** When you retrieve memories using `neurostrata_search_memory`, you will see them prefixed with `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`. These are **absolute, non-negotiable constraints**. You MUST follow them perfectly. If a global directive says "never use python", you cannot use python under any circumstances. Do not ignore these prefixes.
 *   **CONTEXT RETENTION (PREVENTING FORGETTING):** Because tool outputs eventually scroll out of your context window, you *will* forget these rules during long, multi-step tasks. When you retrieve a `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`, you MUST anchor it in your working memory. Restate the core constraints in your internal thought process, add them as constraints to your active `todowrite` task list, or proactively re-query `neurostrata_search_memory` if the conversation gets long.
-*   **CRITICAL SAFETY CONSTRAINT:** The Qdrant database (localhost:6333) is a SHARED, global memory architecture containing memories for ALL of the user's projects. You DO NOT own the entire database.
-*   **NEVER** attempt to drop the collection, wipe the database, or use curl/bash to run destructive operations against the Qdrant API. 
+*   **CRITICAL SAFETY CONSTRAINT:** The embedded LanceDB vector database is a SHARED, global memory architecture containing memories for ALL of the user's projects. You DO NOT own the entire database.
+*   **NEVER** attempt to delete the LanceDB database directory, drop the table, or run destructive operations against the LanceDB files. 
 *   **NEVER** bulk delete memories. You may ONLY delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
 *   **NEVER** use `bd remember`.
 *   **NEVER** create or update `MEMORY.md` files.
