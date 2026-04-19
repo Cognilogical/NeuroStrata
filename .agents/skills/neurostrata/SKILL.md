@@ -65,6 +65,15 @@ If an agent skips the verification step (e.g., claiming a fix is complete withou
 2. **Auto-Detect Domain**: If it's a Domain insight, look at your current working directory (`pwd`) or the files you are editing to infer which domain it belongs to.
 3. **Autonomously Prune & Update**: When adding a new memory, first `neurostrata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, do NOT just append a new one. Use `neurostrata_update_memory` or `neurostrata_delete_memory` to maintain a single, coherent source of truth.
 
+## 🌱 THE BOOTSTRAPPER PROTOCOL (Project Genesis)
+Every active project MUST have a foundational "Bootstrap" memory (a LanceDB node with `memory_type="bootstrap"`). This acts as the supreme context anchor for the entire repository.
+
+1. **The Initial Check:** When starting work on an unfamiliar project, use `neurostrata_get_snapshot` or search the namespace to verify a bootstrap memory exists.
+2. **The Autonomous Rummage:** If no bootstrap memory exists, you MUST build one immediately. Autonomously explore the codebase (read READMEs, dependency files like `package.json` or `Cargo.toml`, and core structural folders). 
+3. **The User Interrogation:** If the repository is entirely empty, completely opaque, or you cannot deduce its goal, you MUST stop and explicitly ask the user: "What is the core purpose and intended architecture of this project?"
+4. **The Ingestion:** Once synthesized, use `neurostrata_add_memory` with `memory_type="bootstrap"` to save a dense, high-level summary of the project's purpose, tech stack, and primary domain logic.
+5. **The Evolution (Refinement):** The codebase lives and breathes. Every few major tasks or feature epics, proactively review the existing bootstrap memory. If the project has expanded or pivoted, update the bootstrap memory to reflect the new reality (by creating a new, more refined bootstrap memory and deprecating the old one).
+
 ## Task Completion & Compaction Defense
 Because AI agents cannot detect when context compaction occurs, you MUST perform a **Memory Review** every time you complete a significant logical task (e.g., fixing a bug, implementing a feature, finishing a refactor). 
 
