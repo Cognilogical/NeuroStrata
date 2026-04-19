@@ -581,7 +581,7 @@ pub async fn start_mcp_server(
                                         arguments.get("source_namespace").and_then(|v| v.as_str()),
                                         arguments.get("target_namespace").and_then(|v| v.as_str()),
                                     ) {
-                                        if let Ok(Some((vec, mut payload))) =
+                                        if let Ok(Some((vec, payload))) =
                                             store.get(src, id).await
                                         {
                                             if let Ok(_) = store.init(tgt).await {

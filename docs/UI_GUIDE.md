@@ -1,6 +1,6 @@
 # 🖌️ NeuroStrata UI User Guide (Obsidian Integration)
 
-The NeuroStrata Obsidian plugin provides a native, seamless interface for curating and visualizing your AI's 3-Tier cognitive memory directly within your knowledge base. It connects securely to the Dual-Mode NeuroStrata Go Server (`http://localhost:8005/api/memory`) to ensure your Obsidian notes and your AI's latent space remain perfectly synchronized.
+The NeuroStrata Obsidian plugin provides a native, seamless interface for curating and visualizing your AI's 3-Tier Dual-Temporal-Memory directly within your knowledge base. It connects securely to the Dual-Mode NeuroStrata Go Server (`http://localhost:8005/api/memory`) to ensure your Obsidian notes and your AI's latent space remain perfectly synchronized.
 
 ---
 

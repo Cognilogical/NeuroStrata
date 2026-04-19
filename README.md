@@ -23,7 +23,7 @@ If you're tired of AI agents hallucinating library choices, ignoring your archit
 *   **"Pointer-Wiki" Architecture:** Instead of dumping 50-page architecture documents into the LLM context window (which destroys performance and racks up API costs), NeuroStrata hands the agent a semantic *pointer* (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs.
 *   **Visualize AI Memory:** Most RAG systems are opaque black boxes. NeuroStrata includes a native **Obsidian Plugin** that connects via WebSockets to visually render exactly what your AI "knows" into a 2D spatial canvas in real-time. You can seamlessly curate, edit, and delete the AI's memory with a right-click.
 
-Integrated seamlessly with **Deepwiki / Litho**, NeuroStrata maps semantic business axioms directly to the structural codebase, closing the cognitive gap between *what* code does and *why* it was written.
+Integrated seamlessly with **native AST parsing**, NeuroStrata maps semantic business axioms directly to the structural codebase, closing the cognitive gap between *what* code does and *why* it was written.
 
 ---
 
@@ -50,7 +50,7 @@ Current agentic workflows suffer from severe context degradation due to a fundam
 
 ### 1. The Semantic vs. Structural Disconnect
 Traditional static analysis tools (like AST parsers) map *code dependencies* and *call graphs*, but they are completely blind to *project knowledge*, *feature requirements*, and *axiomatic constraints*. The problem domain ("Reject mutilated fish") is structurally disconnected from the programming domain (`parser.go`).
-* **The NeuroStrata + Litho Fix:** According to the theory of program comprehension (*Brooks, 1983*), understanding code requires mapping the problem domain to the structural domain. NeuroStrata uses **Litho / deepwiki-rs** to generate a knowledge graph that explicitly maps architectural documents to the code files (the implementations), bridging the gap between axioms and execution.
+* **The NeuroStrata + Litho Fix:** According to the theory of program comprehension (*Brooks, 1983*), understanding code requires mapping the problem domain to the structural domain. NeuroStrata uses **the native AST parser** to generate a knowledge graph that explicitly maps architectural documents to the code files (the implementations), bridging the gap between axioms and execution.
 
 ### 2. The "Lost in the Middle" Phenomenon
 Research demonstrates that LLMs have a U-shaped performance curve when retrieving information from long contexts. They remember the beginning and end of a prompt but catastrophically fail to retrieve information buried in the middle (*Liu et al., 2023*). 
@@ -85,7 +85,7 @@ graph TD
     LanceDB[(Embedded LanceDB<br/>Vector DB)]
     PointerWiki[(Project Files:<br/>docs/architecture/domains/)]
     Obsidian((Obsidian GUI))
-    Deepwiki[[Deepwiki/Litho]]
+    ast-parser[[ast-parser/Litho]]
     
     Agent <-->|JSON-RPC via stdio| Router
     Router -->|Universal Rules| Tier1
@@ -97,7 +97,7 @@ graph TD
     Tier2 -.->|Semantic Pointer| LanceDB
     Tier2 <==>|Physical File Anchor| PointerWiki
     
-    Deepwiki -->|Analyzes Code & Updates| PointerWiki
+    ast-parser -->|Analyzes Code & Updates| PointerWiki
     
     Obsidian -.->|Visualizes Graph & Notes| PointerWiki
     Obsidian -.->|Queries Vector Data| LanceDB
@@ -109,7 +109,7 @@ graph TD
     
     class Agent,Router core;
     class Tier1,Tier2,Tier3,LanceDB,PointerWiki memory;
-    class Deepwiki engine;
+    class ast-parser engine;
     class Obsidian tool;
 ```
 
@@ -158,7 +158,6 @@ NeuroStrata is completely tool-agnostic. It integrates with the standard `~/.age
 
 #### 💡 Bundled Agent Tooling
 To ensure your AI agents have the best possible environment out of the box, the automated installers will automatically provision the following CLI tools alongside NeuroStrata:
-* **[Litho / deepwiki-rs](https://github.com/sopaco/deepwiki-rs):** Used by agents for codebase spatial mapping and C4 architectural document bootstrapping.
 * **[Beads (bd)](https://github.com/beads/bd):** A local, git-backed issue tracker used by agents for task coordination. 
 
 If you wish to visually monitor what the agents are doing with the `bd` CLI, you can optionally install the **[BeadBoard Dashboard](https://github.com/beads/beadboard)** alongside it.
@@ -236,9 +235,7 @@ Once installed, your AI agent automatically gains access to the following tools:
 
 NeuroStrata represents a synthesis of cognitive science theories and foundational open-source engineering. This project would not exist without the pioneering work of the following researchers and projects:
 
-* **[Litho / deepwiki-rs](https://github.com/sopaco/deepwiki-rs):** The AI-driven intelligent document generator we utilize as the primary Knowledge Bootstrapper.
 * **[Beads (bd)](https://github.com/beads/bd):** A local, git-backed issue tracker that serves as the primary execution and orchestration layer for agents. While NeuroStrata strictly manages the *knowledge state*, Beads manages the *execution state* (ensuring no code is written without a claimed ticket).
-* **[LightRAG](https://github.com/HKUDS/LightRAG):** The revolutionary architecture from HKUDS that pioneered Dual-Level Retrieval (Global + Local RAG) and Graph-Vector Fusion. NeuroStrata adopted these core concepts and translated them into a lightning-fast, native Rust MCP pipeline to eliminate Python overhead and LLM ingestion costs.
 * **[LanceDB](https://lancedb.com/):** An open-source, embedded vector database designed for AI. It runs seamlessly inside the Rust binary, offering extreme performance with zero infrastructure overhead.
 
 ### Scientific Literature
