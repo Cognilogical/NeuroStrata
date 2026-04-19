@@ -38,6 +38,7 @@ impl LanceDBStore {
             ), false),
             Field::new("content", DataType::Utf8, false),
             Field::new("user_id", DataType::Utf8, false),
+            Field::new("memory_type", DataType::Utf8, false),
             Field::new("agent_name", DataType::Utf8, false),
             Field::new("metadata", DataType::Utf8, false),
         ]))
@@ -77,6 +78,7 @@ impl VectorStore for LanceDBStore {
         
         let content_array = Arc::new(StringArray::from(vec![payload.content.as_str()]));
         let user_id_array = Arc::new(StringArray::from(vec![payload.user_id.as_str()]));
+        let memory_type_array = Arc::new(StringArray::from(vec![payload.memory_type.as_str()]));
         let agent_name_str = payload.agent_name.unwrap_or_else(|| "unknown".to_string());
         let agent_name_array = Arc::new(StringArray::from(vec![agent_name_str.as_str()]));
         let metadata_str = serde_json::to_string(&payload.metadata)?;
@@ -89,6 +91,7 @@ impl VectorStore for LanceDBStore {
                 vector_list,
                 content_array,
                 user_id_array,
+                memory_type_array,
                 agent_name_array,
                 metadata_array,
             ],
@@ -119,6 +122,7 @@ impl VectorStore for LanceDBStore {
             let distances = batch.column_by_name("_distance").ok_or_else(|| anyhow!("Missing _distance column"))?.as_any().downcast_ref::<Float32Array>().unwrap();
             let contents = batch.column_by_name("content").ok_or_else(|| anyhow!("Missing content column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let memory_types = batch.column_by_name("memory_type").ok_or_else(|| anyhow!("Missing memory_type column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
 
@@ -130,6 +134,7 @@ impl VectorStore for LanceDBStore {
                     payload: MemoryPayload {
                         content: contents.value(i).to_string(),
                         user_id: user_ids.value(i).to_string(),
+                        memory_type: memory_types.value(i).to_string(),
                         agent_name: Some(agent_names.value(i).to_string()),
                         metadata: metadata_val,
                     }
@@ -164,6 +169,7 @@ impl VectorStore for LanceDBStore {
             let ids = batch.column_by_name("id").ok_or_else(|| anyhow!("Missing id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let contents = batch.column_by_name("content").ok_or_else(|| anyhow!("Missing content column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let memory_types = batch.column_by_name("memory_type").ok_or_else(|| anyhow!("Missing memory_type column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
 
@@ -175,6 +181,7 @@ impl VectorStore for LanceDBStore {
                     payload: MemoryPayload {
                         content: contents.value(i).to_string(),
                         user_id: user_ids.value(i).to_string(),
+                        memory_type: memory_types.value(i).to_string(),
                         agent_name: Some(agent_names.value(i).to_string()),
                         metadata: metadata_val,
                     }
@@ -205,6 +212,7 @@ impl VectorStore for LanceDBStore {
             }
             let contents = batch.column_by_name("content").ok_or_else(|| anyhow!("Missing content column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let user_ids = batch.column_by_name("user_id").ok_or_else(|| anyhow!("Missing user_id column"))?.as_any().downcast_ref::<StringArray>().unwrap();
+            let memory_types = batch.column_by_name("memory_type").ok_or_else(|| anyhow!("Missing memory_type column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let agent_names = batch.column_by_name("agent_name").ok_or_else(|| anyhow!("Missing agent_name column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let metadatas = batch.column_by_name("metadata").ok_or_else(|| anyhow!("Missing metadata column"))?.as_any().downcast_ref::<StringArray>().unwrap();
             let vectors = batch.column_by_name("vector").ok_or_else(|| anyhow!("Missing vector column"))?.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
@@ -217,6 +225,7 @@ impl VectorStore for LanceDBStore {
             let payload = MemoryPayload {
                 content: contents.value(0).to_string(),
                 user_id: user_ids.value(0).to_string(),
+                memory_type: memory_types.value(0).to_string(),
                 agent_name: Some(agent_names.value(0).to_string()),
                 metadata: metadata_val,
             };
@@ -224,5 +233,11 @@ impl VectorStore for LanceDBStore {
         }
         
         Ok(None)
+    }
+
+    async fn list_namespaces(&self) -> Result<Vec<String>> {
+        let conn = lancedb::connect(self.local_path.to_str().unwrap()).execute().await?;
+        let table_names = conn.table_names().execute().await?;
+        Ok(table_names)
     }
 }

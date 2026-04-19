@@ -8,6 +8,7 @@ use serde_json::Value;
 pub struct MemoryPayload {
     pub content: String,
     pub user_id: String,
+    pub memory_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     #[serde(default)]
@@ -56,4 +57,7 @@ pub trait VectorStore: Send + Sync {
 
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
+
+    /// List all existing namespaces (tables)
+    async fn list_namespaces(&self) -> Result<Vec<String>>;
 }

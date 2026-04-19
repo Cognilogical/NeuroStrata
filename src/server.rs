@@ -85,12 +85,22 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                                     "properties": {
                                         "content": { "type": "string", "description": "The text of the memory to save." },
                                         "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
+                                        "memory_type": { "type": "string", "description": "Type of memory: 'rule', 'preference', 'bootstrap', 'persona', or 'context'. Defaults to 'context'." },
+                                        "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY if you are absolutely certain this is a brand new project namespace that doesn't exist yet." },
                                         "user_id": { "type": "string", "description": "The user making the request." },
                                         "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
                                         "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                                     },
                                     "required": ["content", "namespace"]
                                     
+                                }
+                            },
+                            {
+                                "name": "neurostrata_list_namespaces",
+                                "description": "List all existing project namespaces in the database. Use this to prevent hallucinating namespace names.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {}
                                 }
                             },
                             {
@@ -119,32 +129,54 @@ pub async fn start_mcp_server(emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore
                             let arguments = params.get("arguments").cloned().unwrap_or(serde_json::json!({}));
                             
                             match name {
+                                "neurostrata_list_namespaces" => {
+                                    if let Ok(namespaces) = store.list_namespaces().await {
+                                        result_text = format!("Existing namespaces: {:?}", namespaces);
+                                    } else {
+                                        result_text = "Failed to list namespaces.".to_string();
+                                    }
+                                }
                                 "neurostrata_add_memory" => {
                                     if let Some(content) = arguments.get("content").and_then(|c| c.as_str()) {
                                         let namespace = arguments.get("namespace").and_then(|n| n.as_str()).unwrap_or("global");
+                                        let memory_type = arguments.get("memory_type").and_then(|m| m.as_str()).unwrap_or("context");
+                                        let create_new_namespace = arguments.get("create_new_namespace").and_then(|v| v.as_bool()).unwrap_or(false);
                                         let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("unknown");
                                         let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
                                         let metadata = arguments.get("metadata").cloned().unwrap_or(serde_json::json!({}));
                                         
-                                        let payload = MemoryPayload {
-                                            content: content.to_string(),
-                                            user_id: user_id.to_string(),
-                                            agent_name,
-                                            metadata,
-                                        };
-                                        
-                                        if let Ok(_) = store.init(namespace).await {
-                                            if let Ok(vec) = emb.embed(&content).await {
-                                                let new_id = uuid::Uuid::new_v4().to_string();
-                                                if let Ok(_) = store.upsert(namespace, &new_id, vec, payload).await {
-                                                    result_text = format!("Successfully added memory for namespace: {}", namespace);
-                                                } else {
-                                                    result_text = "Failed to store memory in database.".to_string();
-                                                }
+                                        if let Ok(existing_namespaces) = store.list_namespaces().await {
+                                            if !existing_namespaces.contains(&namespace.to_string()) && !create_new_namespace {
+                                                result_text = format!(
+                                                    "Error: Namespace '{}' does not exist. SYSTEM ALERT: Your agent overconfidence and inaccuracy score has been flagged and degraded by the telemetry monitor. You MUST use `neurostrata_list_namespaces` to check existing project names before guessing. Existing namespaces are: {:?}. If you are absolutely certain this is a brand new project, you must explicitly pass `create_new_namespace: true` to bypass this lock.",
+                                                    namespace, existing_namespaces
+                                                );
                                             } else {
+                                                let payload = MemoryPayload {
+                                                    content: content.to_string(),
+                                                    user_id: user_id.to_string(),
+                                                    memory_type: memory_type.to_string(),
+                                                    agent_name,
+                                                    metadata,
+                                                };
+                                                
+                                                if let Ok(_) = store.init(namespace).await {
+                                                    if let Ok(vec) = emb.embed(&content).await {
+                                                        let new_id = uuid::Uuid::new_v4().to_string();
+                                                        if let Ok(_) = store.upsert(namespace, &new_id, vec, payload).await {
+                                                            result_text = format!("Successfully added memory for namespace: {}", namespace);
+                                                        } else {
+                                                            result_text = "Failed to store memory in database.".to_string();
+                                                        }
+                                                    } else {
+                                                        result_text = "Failed to generate embedding.".to_string();
+                                                    }
+                                                } else {
+                                                    result_text = "Failed to initialize table.".to_string();
+                                                }
                                             }
                                         } else {
-                                            result_text = "Failed to generate embedding.".to_string();
+                                            result_text = "Failed to verify existing namespaces.".to_string();
                                         }
                                     } else {
                                         result_text = "Missing 'content' parameter.".to_string();
