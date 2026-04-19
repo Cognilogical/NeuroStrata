@@ -4,7 +4,7 @@ use tokio::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::traits::{Embedder, VectorStore, MemoryPayload, SearchResult};
+use crate::traits::{Embedder, VectorStore, MemoryPayload};
 
 #[derive(Deserialize)]
 struct MqttRequest {
