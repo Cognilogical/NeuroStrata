@@ -7,6 +7,9 @@ echo "==============================================="
 echo "Building Rust backend..."
 cargo build --release
 
+echo "Installing deepwiki-rs for project bootstrapping (this may take a few minutes)..."
+cargo install deepwiki-rs
+
 echo "Installing Rust binary to ~/.local/bin..."
 mkdir -p ~/.local/bin
 cp target/release/neurostrata-mcp ~/.local/bin/
