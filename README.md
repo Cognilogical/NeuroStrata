@@ -1,5 +1,3 @@
-<div align="center">
-
 # 🧠 NeuroStrata
 **The Long-Term Memory Layer for AI Coding Agents**
 
@@ -7,10 +5,6 @@
 [![MCP](https://img.shields.io/badge/Protocol-MCP-blue?style=flat-square)](https://modelcontextprotocol.io/)
 [![LanceDB](https://img.shields.io/badge/Vector%20DB-LanceDB-orange?style=flat-square)](https://lancedb.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-</div>
-
-<br/>
 
 **Stop re-explaining your stack to your AI every time you open a new chat.**
 
