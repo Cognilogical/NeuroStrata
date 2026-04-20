@@ -35,9 +35,9 @@ We don't just store flat vectors; we map how software actually evolves using 6 c
 
 1. **Semantic Graph Edges (Relational Traversal):** Memories aren't isolated. Our LanceDB schema supports directional edges (`related_to`). When an agent updates a database rule, it instantly traverses the graph to identify connected API contracts, preventing cascading regressions.
 2. **Immutable Temporal Audit Trail:** Agents never overwrite history. Using `valid_from` and `valid_to` timestamps, NeuroStrata soft-deletes outdated rules. This bi-temporal design maintains a perfect, queryable audit trail of how your architecture evolves.
-3. **Neural Gain Mechanism (Synaptic Weighting):** We apply an access-based reinforcement algorithm (inspired by the Ebbinghaus Forgetting Curve) on top of standard vector distance. Frequently used rules gain a mathematical boost and float to the top of the context window, while unused, outdated rules naturally decay.
+3. **Synaptic Pruning & Gain:** We apply an access-based reinforcement algorithm (inspired by the Ebbinghaus Forgetting Curve) on top of standard vector distance. Frequently used Engrams gain a mathematical boost and float to the top of the context window, while unused, outdated rules naturally decay.
 4. **Domain-Isolated Knowledge Shelves:** To prevent massive context hallucinations, NeuroStrata categorizes vectors into explicit declarative `domains` (e.g., `frontend`, `database`, `devops`). Agents compartmentalize their focus, shrinking the search space and ensuring high-fidelity retrieval.
-5. **Pre-computed Cognitive Snapshots:** Instead of wasting tokens blindly searching a new repository, agents use our Wake-Up Snapshot tool to instantly retrieve the top-5 highest-weighted, active cognitive nodes for any project. This perfectly grounds an agent the second a session begins.
+5. **Eidetic Recall (Cognitive Snapshots):** Instead of wasting tokens blindly searching a new repository, agents instantly retrieve the top-5 highest-weighted, active Engrams for any project. This perfectly grounds an agent the second a session begins.
 6. **Reciprocal Rank Fusion (Hybrid Retrieval):** Dense vectors are terrible at finding exact variable names. NeuroStrata's Rust backend utilizes `tantivy` to merge dense semantic search with exact Full-Text Search (BM25). Agents recall both the conceptual "gist" and the exact "verbatim" code syntax simultaneously.
 
 *For a deep dive into the 10 mechanics powering the system, read the [Cognitive Architecture Whitepaper](docs/COGNITIVE_ARCHITECTURE.md).*
@@ -58,15 +58,15 @@ Research demonstrates that LLMs have a U-shaped performance curve when retrievin
 
 ### 3. The Absence of Spatial Anchoring
 Human memory relies on the hippocampus to create "Cognitive Maps"—spatial frameworks where memories are anchored to specific physical or conceptual locations (*O'Keefe & Nadel, 1978*). AI agents typically use flat vector databases, meaning a rule about frontend rendering might accidentally pollute a backend database task because they semantically overlap.
-* **The NeuroStrata Fix:** NeuroStrata implements a **Pointer-Wiki Hybrid**. Domain rules are spatially anchored to specific directories (e.g., `docs/architecture/domains/`). The vector database stores a semantic pointer *to the physical file*. This forces the agent to traverse the project's spatial hierarchy, grounding its understanding in your codebase structure.
+* **The NeuroStrata Fix:** NeuroStrata integrates semantic rules directly into **SynapticGraph**. Domain rules are spatially anchored to specific directories (e.g., `docs/architecture/domains/`). The vector database stores a semantic pointer *to the physical file*. This forces the agent to traverse the project's spatial hierarchy, grounding its understanding in your codebase structure.
 
 ### 4. Semantic vs. Episodic Interference
 Cognitive science divides long-term memory into **Semantic** (general facts/rules) and **Episodic** (specific events/tasks) (*Tulving, 1972*). Forcing an AI to process global infrastructure rules mixed with a temporary bug-fix context creates catastrophic interference.
-* **The NeuroStrata Fix:** NeuroStrata rigidly partitions the database into Global, Domain, and Task namespaces (The 3 Tiers), ensuring the AI only retrieves the exact type of memory required for the current cognitive load.
+* **The NeuroStrata Fix:** NeuroStrata rigidly partitions the database into **The Tri-Strata Model** (Global, Domain, and Task namespaces), ensuring the AI only retrieves the exact type of memory required for the current cognitive load.
 
 ---
 
-## 🏗️ The 3-Tier Architecture
+## 🏗️ The Tri-Strata Model
 
 NeuroStrata maps directly to human cognitive models to provide agents with perfect, interference-free recall.
 
@@ -77,9 +77,9 @@ graph TD
     subgraph NeuroStrataServer [Native Rust Dual-Mode Server]
         Router{Smart Routing &<br/>Bookkeeping Lock}
         
-        Tier1[("Tier 1: Global<br/>(Semantic Memory)")]
-        Tier2[("Tier 2: Domain<br/>(Spatial Memory)")]
-        Tier3[("Tier 3: Task<br/>(Working Memory)")]
+        Tier1[("Global Stratum<br/>(Semantic Memory)")]
+        Tier2[("Domain Stratum<br/>(Spatial Memory)")]
+        Tier3[("Task Stratum<br/>(Working Memory)")]
     end
     
     LanceDB[(Embedded LanceDB<br/>Vector DB)]
@@ -113,17 +113,17 @@ graph TD
     class Obsidian tool;
 ```
 
-1. **Global (Tier 1):** Company-wide constraints and infrastructure mandates.
-2. **Domain (Tier 2):** Project-specific rules and API contracts. Utilizes the *Pointer-Wiki* constraint: memories are hyper-specific references (`{"file": "docs/...", "lines": "42-49"}`) to physical architecture files.
-3. **Task (Tier 3):** Ephemeral context for active bug fixes or feature branches.
+1. **Global Stratum (Tier 1):** Company-wide constraints and infrastructure mandates.
+2. **Domain Stratum (Tier 2):** Project-specific rules and API contracts. Utilizes the SynapticGraph pointer constraint: Engrams are hyper-specific references (`{"file": "docs/...", "lines": "42-49"}`) to physical architecture files.
+3. **Task Stratum (Tier 3):** Ephemeral context for active bug fixes or feature branches.
 
 ---
 
-## 📝 The Continuous Backup Protocol
+## 📝 The Episodic Buffer
 
-To prevent the loss of critical architectural decisions made during ad-hoc conversations, NeuroStrata enforces a **Continuous Backup Protocol**. 
+To prevent the loss of critical architectural decisions made during ad-hoc conversations, NeuroStrata enforces an **Episodic Buffer**. 
 
-Instead of treating chat sessions as ephemeral or forcing annoying "Startup Protocols", the system maintains an invisible, rolling log in the `.neurostrata/sessions/` directory. 
+Instead of treating chat sessions as ephemeral or forcing annoying "Startup Protocols", the system maintains an invisible, rolling log (the Context Stream) in the `.neurostrata/sessions/` directory. 
 
 * **The Mechanism:** Agents are instructed to silently use the `neurostrata_append_log` tool in the background as they work. The Rust server automatically manages file size, rolling logs over 500KB into timestamped archives.
 * **Grep-able Waypoints:** When a user changes topics (e.g., from "database refactor" to "UI design"), the agent tags the log entry. The Rust server injects highly structured `### 🔄 Topic Switch` markers.
@@ -137,7 +137,7 @@ Instead of treating chat sessions as ephemeral or forcing annoying "Startup Prot
 
 NeuroStrata isn't just a database; it is an active cognitive loop. 
 
-* **Human Oversight & Curation:** While agents are highly autonomous, you retain ultimate control. Because Tier 2 memory is grounded in standard physical Markdown files (`docs/architecture/domains/`), you can directly edit, review, and curate the knowledge graph using Obsidian, VSCode, or any text editor. NeuroStrata respects explicit human-written constraints as the ultimate source of truth.
+* **Human Oversight & Curation:** While agents are highly autonomous, you retain ultimate control. Because the Domain Stratum is grounded in standard physical Markdown files (`docs/architecture/domains/`), you can directly edit, review, and curate the knowledge graph using Obsidian, VSCode, or any text editor. NeuroStrata respects explicit human-written constraints as the ultimate source of truth.
 * **Autonomous Self-Healing (CRUD):** Agents using NeuroStrata are instructed to actively prune their own brains. If an agent detects a hallucinated rule or an outdated architectural decision, it autonomously calls `neurostrata_update_memory` or `neurostrata_delete_memory` to maintain a single source of truth.
 * **Live Visual Latent Space:** Because vectors are opaque, NeuroStrata makes them transparent. Agents autonomously call `neurostrata_generate_canvas(vault_path)`. NeuroStrata reads the vector database and programmatically generates an `Obsidian .canvas` file, allowing humans to physically see and organize the AI's "brain" as a spatial graph.
 * **Mass Ingestion & Graphing:** Point NeuroStrata at a folder via `neurostrata_ingest_directory`. The Rust server intelligently chunks markdown by paragraph, paces requests to your local LLM embedder, and maps your architecture into vector space instantly.
