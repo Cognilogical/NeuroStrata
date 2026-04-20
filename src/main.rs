@@ -1,7 +1,5 @@
 mod config;
 mod embed;
-mod mqtt;
-mod mqtt_worker;
 mod parser;
 mod server;
 mod store;
@@ -104,13 +102,6 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_default_path()?;
     println!("Config loaded: {:?}", config);
 
-    // Start Embedded MQTT Broker (handles WebSockets and TCP)
-    println!("Starting Embedded MQTT Broker on ports 1883 and 8080 (WS)...");
-    mqtt::start_broker();
-
-    // Give broker a split second to boot before client connects
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
     // Initialize Embedder
     let embedder = Arc::new(FastEmbedder::new()?);
     println!("Embedder initialized.");
@@ -127,10 +118,6 @@ async fn main() -> anyhow::Result<()> {
 
     vector_store.init("global").await?;
     println!("Vector store tables ensured.");
-
-    // Start internal MQTT worker to process requests from Obsidian
-    println!("Starting internal MQTT worker...");
-    mqtt_worker::start_worker(embedder.clone(), vector_store.clone()).await;
 
     // Boot actual MCP server loop
     println!("Starting in MCP JSON-RPC mode");
