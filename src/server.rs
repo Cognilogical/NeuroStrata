@@ -177,6 +177,24 @@ pub async fn start_mcp_server(
                                     if let Some(content) =
                                         arguments.get("content").and_then(|c| c.as_str())
                                     {
+                                        // Secret Scrubber Check
+                                        let content_lower = content.to_lowercase();
+                                        if content_lower.contains("sk-ant-") || 
+                                           content_lower.contains("ghp_") ||
+                                           content_lower.contains("xoxb-") ||
+                                           content_lower.contains("eyjhbg") || // JWT header
+                                           content_lower.contains("api_key=") ||
+                                           content_lower.contains("password=") ||
+                                           content_lower.contains("sk-proj-")
+                                        {
+                                            return Ok(CallToolResult {
+                                                content: vec![ToolContent::Text {
+                                                    text: "ERROR [SECURITY]: Memory rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your request and try storing the memory again.".to_string(),
+                                                }],
+                                                is_error: Some(true),
+                                            });
+                                        }
+
                                         let namespace = arguments
                                             .get("namespace")
                                             .and_then(|n| n.as_str())

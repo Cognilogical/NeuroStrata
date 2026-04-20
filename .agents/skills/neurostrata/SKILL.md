@@ -18,7 +18,7 @@ NeuroStrata provides the following native MCP tools that you MUST use to manage 
 * `neurostrata_add_memory`: Add a new architectural rule, project pattern, or task insight (an Engram). **FORMATTING:** If the Engram is a strict, non-negotiable constraint that must NEVER be ignored, prefix it with "RULE: " (e.g., "RULE: Never use Python"). If it is general context, domain logic, or a pointer to documentation, just save it as normal text without the prefix. If scoped `namespace=global`, file paths in metadata must point to `~/.config/neurostrata/global/`.
 * `neurostrata_search_memory`: Search for existing Engrams before writing code or making architectural decisions.
 * `neurostrata_update_memory`: Update an existing Engram by ID. **FORMATTING:** Maintain the "RULE: " prefix only if the updated memory remains a strict constraint. Use this when a rule has evolved or was initially saved with hallucinations.
-* `neurostrata_delete_memory`: Delete an Engram by ID. Use this to prune obsolete, duplicated, or incorrect rules.
+* `neurostrata_delete_memory`: Delete an Engram by ID. Use this to prune obsolete, duplicated, or incorrect rules. **CRITICAL SECURITY RULE:** Only the designated NeuroStrata agent is permitted to delete memories. If you are a Task agent or another specialized agent, you may only add or update memories. Do not attempt to delete.
 * `neurostrata_generate_canvas`: Automatically regenerate the `NeuroStrata MemorySpace.canvas` Obsidian visualization file using the internal SynapticGraph engine. Use this after making significant changes to the project's memory or architecture.
 * `neurostrata_ingest_directory`: Batch ingest an entire directory of markdown files (e.g., `docs/architecture/`) into NeuroStrata. The server will automatically chunk and embed the files.
 * `neurostrata_dump_db`: Dump the entire NeuroStrata vector database to a JSON file for backup purposes. Use this when the user asks to backup or export the database.
@@ -86,6 +86,7 @@ Because AI agents cannot detect when context compaction occurs (the "Happy Path"
 ### Performing an Engram Review
 When one of the Soft Locks triggers you to pause:
 1. **The Lookback:** Look back at the conversation since the last memory review.
+1. **Secret Scrubbing & Rejection (The Redaction Loop):** If `neurostrata_add_memory` or `neurostrata_update_memory` returns an error stating "Memory rejected due to sensitive information", you MUST NOT skip saving the memory. Instead, you MUST rewrite your intended context, aggressively redact any API keys, tokens, or passwords, and try storing the memory again.
 2. **The Zero-Fluff Constraint:** Do NOT invent memories. If the task was purely manual labor (e.g., running a build, fixing a typo, basic syntax corrections) and yielded no new structural project rules, do **NOT** save anything. 
 3. **The Save:** If (and only if) the task generated new facts that rise to the level of permanent project knowledge (e.g., high-level architecture like CQRS, but ALSO domain/business logic like "fish measurements are x, y, z", API contracts, or strict workflow constraints, matching the 8 Categories below), perform an **Engram Inscription** to NeuroStrata before moving to the next task.
 
