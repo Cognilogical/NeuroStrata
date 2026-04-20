@@ -23,7 +23,7 @@ If you're tired of AI agents hallucinating library choices, ignoring your archit
 *   **"Pointer-Wiki" Architecture:** Instead of dumping 50-page architecture documents into the LLM context window (which destroys performance and racks up API costs), NeuroStrata hands the agent a semantic *pointer* (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs.
 *   **Visualize AI Memory:** Most RAG systems are opaque black boxes. NeuroStrata includes a native **Obsidian Plugin** that connects via WebSockets to visually render exactly what your AI "knows" into a 2D spatial canvas in real-time. You can seamlessly curate, edit, and delete the AI's memory with a right-click.
 
-Integrated seamlessly with **native AST parsing**, NeuroStrata maps semantic business axioms directly to the structural codebase, closing the cognitive gap between *what* code does and *why* it was written.
+Integrated seamlessly with **SynapticGraph**, NeuroStrata maps semantic business axioms directly to the structural codebase, closing the cognitive gap between *what* code does and *why* it was written.
 
 ---
 
@@ -49,8 +49,8 @@ We don't just store flat vectors; we map how software actually evolves using 6 c
 Current agentic workflows suffer from severe context degradation due to a fundamental misunderstanding of how memory should be structured. Simply dumping vector search results into an LLM's context window leads to cognitive overload and hallucinations.
 
 ### 1. The Semantic vs. Structural Disconnect
-Traditional static analysis tools (like AST parsers) map *code dependencies* and *call graphs*, but they are completely blind to *project knowledge*, *feature requirements*, and *axiomatic constraints*. The problem domain ("Reject mutilated fish") is structurally disconnected from the programming domain (`parser.go`).
-* **The NeuroStrata + Litho Fix:** According to the theory of program comprehension (*Brooks, 1983*), understanding code requires mapping the problem domain to the structural domain. NeuroStrata uses **the native AST parser** to generate a knowledge graph that explicitly maps architectural documents to the code files (the implementations), bridging the gap between axioms and execution.
+Traditional static analysis tools map *code dependencies* and *call graphs*, but they are completely blind to *project knowledge*, *feature requirements*, and *axiomatic constraints*. The problem domain ("Reject mutilated fish") is structurally disconnected from the programming domain (`parser.go`).
+* **The NeuroStrata + SynapticGraph Fix:** According to the theory of program comprehension (*Brooks, 1983*), understanding code requires mapping the problem domain to the structural domain. NeuroStrata uses **the internal SynapticGraph engine** to generate a knowledge graph that explicitly maps architectural documents to the code files (the implementations), bridging the gap between axioms and execution.
 
 ### 2. The "Lost in the Middle" Phenomenon
 Research demonstrates that LLMs have a U-shaped performance curve when retrieving information from long contexts. They remember the beginning and end of a prompt but catastrophically fail to retrieve information buried in the middle (*Liu et al., 2023*). 
@@ -85,7 +85,7 @@ graph TD
     LanceDB[(Embedded LanceDB<br/>Vector DB)]
     PointerWiki[(Project Files:<br/>docs/architecture/domains/)]
     Obsidian((Obsidian GUI))
-    ast-parser[[ast-parser/Litho]]
+    SynapticGraph[[SynapticGraph]]
     
     Agent <-->|JSON-RPC via stdio| Router
     Router -->|Universal Rules| Tier1
@@ -97,7 +97,7 @@ graph TD
     Tier2 -.->|Semantic Pointer| LanceDB
     Tier2 <==>|Physical File Anchor| PointerWiki
     
-    ast-parser -->|Analyzes Code & Updates| PointerWiki
+    SynapticGraph -->|Analyzes Code & Updates| PointerWiki
     
     Obsidian -.->|Visualizes Graph & Notes| PointerWiki
     Obsidian -.->|Queries Vector Data| LanceDB
@@ -109,7 +109,7 @@ graph TD
     
     class Agent,Router core;
     class Tier1,Tier2,Tier3,LanceDB,PointerWiki memory;
-    class ast-parser engine;
+    class SynapticGraph engine;
     class Obsidian tool;
 ```
 
