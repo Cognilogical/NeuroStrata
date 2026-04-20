@@ -66,6 +66,13 @@ bd close <id>         # Complete work
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
 
+### 🛡️ The 3 Resilient Soft Locks (Standalone Memory Enforcement)
+Because NeuroStrata must function as a standalone MVP without an OS-level intercept, you MUST adhere to these three behavioral forcing functions to ensure knowledge is extracted despite context window bloat:
+
+1. **The Pre-Commit/Pre-Push Hook (Behavioral Forcing):** We tie the logging requirement directly to the definition of "Done." A `git pre-push` hook is installed via `scripts/install_hooks.sh` that will BLOCK your push if the NeuroStrata DB hasn't been updated recently. If your push is blocked, you MUST run `neurostrata_add_memory` before retrying.
+2. **The Checklist Abstraction (`bd` Integration):** When transitioning a bead from `working` to `done`, your closing summary MUST be accompanied by a call to `neurostrata_add_memory` to summarize the architectural decisions made during that ticket.
+3. **The "Breath" Prompt (Periodic Context Checks):** For long, multi-step tasks, the context window gets dense. If a task takes more than 3-5 steps, you MUST pause, summarize the current architectural state, and commit it to Tier 3 (Task Stratum) memory before proceeding to the next major phase.
+
 **MANDATORY WORKFLOW:**
 
 1. **Extract Knowledge (Habitual Memory Commit)** - You MUST run `neurostrata_add_memory` to save any new facts, fixes, constraints, or hallucinations learned during this session BEFORE doing anything else.

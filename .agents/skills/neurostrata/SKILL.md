@@ -76,9 +76,15 @@ Every active project MUST have a foundational "Bootstrap" Engram (a LanceDB node
 5. **The Evolution (Refinement):** The codebase lives and breathes. Every few major tasks or feature epics, proactively review the existing bootstrap Engram. If the project has expanded or pivoted, update the bootstrap Engram to reflect the new reality (by creating a new, more refined bootstrap Engram and deprecating the old one).
    * **SynapticGraph Freshness:** When you significantly update the bootstrap Engram or complete a major architectural refactor, you MUST remind the user to re-run the `./scripts/bootstrap.sh <pwd>` script (or run it yourself) to ensure the physical knowledge graph stays in sync with the codebase reality.
 
-## Task Completion & Compaction Defense
-Because AI agents cannot detect when context compaction occurs, you MUST perform an **Engram Review** every time you complete a significant logical task (e.g., fixing a bug, implementing a feature, finishing a refactor). 
+## Task Completion & Compaction Defense (The 3 Resilient Soft Locks)
+Because AI agents cannot detect when context compaction occurs (the "Happy Path" tunnel vision), you MUST rely on these three behavioral forcing functions to ensure knowledge extraction in a standalone MCP environment:
 
+1. **The Pre-Push Hook (Behavioral Forcing):** We tie the logging requirement directly to the definition of "Done." If you try to run `git push`, the installed hook will BLOCK your push if the NeuroStrata DB hasn't been updated since your last commit. If blocked, you MUST run `neurostrata_add_memory` before retrying.
+2. **The Checklist Abstraction (`bd` Integration):** When you transition a bead (ticket) from `working` to `done`, your closing summary MUST be accompanied by a call to `neurostrata_add_memory` to summarize the architectural decisions made.
+3. **The "Breath" Prompt (Periodic Context Checks):** For long, multi-step tasks, the context window gets incredibly dense. If a task takes more than 3-5 steps, you MUST pause, summarize the current architectural state, and commit it to Tier 3 (Task Stratum) memory before proceeding to the next major phase.
+
+### Performing an Engram Review
+When one of the Soft Locks triggers you to pause:
 1. **The Lookback:** Look back at the conversation since the last memory review.
 2. **The Zero-Fluff Constraint:** Do NOT invent memories. If the task was purely manual labor (e.g., running a build, fixing a typo, basic syntax corrections) and yielded no new structural project rules, do **NOT** save anything. 
 3. **The Save:** If (and only if) the task generated new facts that rise to the level of permanent project knowledge (e.g., high-level architecture like CQRS, but ALSO domain/business logic like "fish measurements are x, y, z", API contracts, or strict workflow constraints, matching the 8 Categories below), perform an **Engram Inscription** to NeuroStrata before moving to the next task.

@@ -22,6 +22,12 @@ mkdir -p "$HOME/Documents/NeuroVault/.obsidian/plugins"
 ln -sfn "$(pwd)/plugins/obsidian/obsidian-neurostrata" "$HOME/Documents/NeuroVault/.obsidian/plugins/obsidian-neurostrata"
 
 echo "==============================================="
+echo "  Setting up Global Git Hook..."
+echo "==============================================="
+chmod +x ./scripts/install_hooks.sh
+./scripts/install_hooks.sh --global
+
+echo "==============================================="
 echo "  Installation Complete!"
 echo "  Ensure ~/.local/bin is in your PATH."
 echo "  You can start the backend by running:"
