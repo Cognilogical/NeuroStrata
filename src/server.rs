@@ -187,19 +187,9 @@ pub async fn start_mcp_server(
                                            content_lower.contains("password=") ||
                                            content_lower.contains("sk-proj-")
                                         {
-                                            return Ok(CallToolResult {
-                                                content: vec![ToolContent::Text {
-                                                    text: "ERROR [SECURITY]: Memory rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your request and try storing the memory again.".to_string(),
-                                                }],
-                                                is_error: Some(true),
-                                            });
-                                        }
-
-                                        let namespace = arguments
-                                            .get("namespace")
-                                            .and_then(|n| n.as_str())
-                                            .unwrap_or("global");
-                                        let memory_type = arguments
+                                            result_text = "ERROR [SECURITY]: Memory rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your request and try storing the memory again.".to_string();
+                                        } else if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
+                                            let memory_type = arguments
                                             .get("memory_type")
                                             .and_then(|m| m.as_str())
                                             .unwrap_or("context");
@@ -302,10 +292,13 @@ pub async fn start_mcp_server(
                                                 "Failed to verify existing namespaces.".to_string();
                                         }
                                     } else {
-                                        result_text = "Missing 'content' parameter.".to_string();
+                                        result_text = "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace. NEVER default to 'global' unless instructed.".to_string();
                                     }
+                                } else {
+                                    result_text = "Missing 'content' parameter.".to_string();
                                 }
-                                "neurostrata_get_snapshot" => {
+                            }
+                            "neurostrata_get_snapshot" => {
                                     if let Some(namespace) =
                                         arguments.get("namespace").and_then(|n| n.as_str())
                                     {
@@ -632,11 +625,8 @@ pub async fn start_mcp_server(
                                     if let Some(query) =
                                         arguments.get("query").and_then(|q| q.as_str())
                                     {
-                                        let namespace = arguments
-                                            .get("namespace")
-                                            .and_then(|n| n.as_str())
-                                            .unwrap_or("global");
-                                        if let Ok(_) = store.init(namespace).await {
+                                        if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
+                                            if let Ok(_) = store.init(namespace).await {
                                             if let Ok(vec) = emb.embed(&query).await {
                                                 if let Ok(results) =
                                                     store.search(namespace, vec, 5).await
@@ -670,10 +660,13 @@ pub async fn start_mcp_server(
                                                 "Failed to initialize namespace table.".to_string();
                                         }
                                     } else {
-                                        result_text = "Missing 'query' parameter.".to_string();
+                                        result_text = "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string();
                                     }
+                                } else {
+                                    result_text = "Missing 'query' parameter.".to_string();
                                 }
-                                _ => {
+                            }
+                            _ => {
                                     result_text = format!("Unknown tool: {}", name);
                                 }
                             }

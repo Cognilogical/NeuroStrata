@@ -8,7 +8,7 @@ description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task). Repl
 NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Golang Model Context Protocol (MCP) server connected directly to an embedded LanceDB vector database partitioned into three distinct tiers (The Tri-Strata Model).
 
 ## The Tri-Strata Model
-1. **Global Stratum (`namespace="global"`)**: Company-wide constraints, infrastructure mandates (e.g., LanceDB only, no REST, Clojure for parsing), and universal tool usage rules.
+1. **Global Stratum (`namespace="global"`)**: Company-wide constraints, infrastructure mandates (e.g., LanceDB only, no REST, Clojure for parsing), and universal tool usage rules. **CRITICAL: NEVER use 'global' unless the user EXPLICITLY instructs you to make a company-wide machine rule. Assume all architecture rules are local to the current project and DEFAULT TO THE PROJECT NAMESPACE.**
 2. **Domain Stratum (SynapticGraph, `namespace="<project_name>"`)**: Hidden business rules, API contracts, and spatial code layouts specific to the project's domains.
    * **SynapticGraph Linking**: To prevent context bloat, NeuroStrata stores *pointers* (e.g., "See `docs/architecture/domains/sync.md` for full narrative") instead of dumping entire narratives into an Engram.
 3. **Task Stratum (`namespace="<task_id>"`)**: Specific insights, decisions, and context scoped to a single active task.
