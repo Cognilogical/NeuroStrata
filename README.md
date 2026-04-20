@@ -183,5 +183,13 @@ Once installed, your AI agent automatically gains access to the following tools 
 | `neurostrata_ingest_directory` | Batch-embed an entire architectural documentation folder. |
 | `neurostrata_dump_db` | Export the entire vector database to a JSON file for backup and portability. |
 
+## 🛡️ Security & Compliance
+
+NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications** and common AI red-teaming vectors:
+- **Zero Network Attack Surface (Mitigates LLM07):** NeuroStrata is a pure `stdio` MCP server. It listens on zero ports and has no external APIs, neutralizing remote RCE and plugin exploitation vectors.
+- **Active Secret Scrubbing (Mitigates LLM06):** The Rust backend actively scans memory payloads for high-entropy secrets (API keys, passwords, JWTs) and explicitly rejects insertions, forcing the agent into a "Redaction Loop" to prevent permanent context contamination.
+- **Role-Based Memory Access (Mitigates LLM08):** Destructive actions (`neurostrata_delete_memory`) are strictly restricted. Task sub-agents cannot delete memories or drop the database, ensuring only the manager agent can curate the vector space.
+- **Resilient Soft Locks (Mitigates LLM09):** To combat context degradation and "happy path" tunnel vision, NeuroStrata enforces memory extraction through OS-level Git hooks (Pre-Push Behavioral Forcing) rather than relying solely on fragile system prompts.
+
 ## License
 MIT License. See the `LICENSE` file for details. I wrote it, you can use it, keep it, close source it, whatever—just don't sue me!
