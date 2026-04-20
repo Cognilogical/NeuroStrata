@@ -19,7 +19,7 @@ NeuroStrata provides the following native MCP tools that you MUST use to manage 
 * `neurostrata_search_memory`: Search for existing rules before writing code or making architectural decisions.
 * `neurostrata_update_memory`: Update an existing memory by ID. **FORMATTING:** Maintain the "RULE: " prefix only if the updated memory remains a strict constraint. Use this when a rule has evolved or was initially saved with hallucinations.
 * `neurostrata_delete_memory`: Delete a memory by ID. Use this to prune obsolete, duplicated, or incorrect rules.
-* `neurostrata_generate_canvas`: Automatically regenerate the `NeuroStrata MemorySpace.canvas` Obsidian visualization file using the internal SynapticGraph engine. Use this after making significant changes to the project's memory or architecture.
+* `neurostrata_generate_canvas`: Automatically regenerate the `NeuroStrata MemorySpace.canvas` Obsidian visualization file. Use this after making significant changes to the project's memory or architecture.
 * `neurostrata_ingest_directory`: Batch ingest an entire directory of markdown files (e.g., `docs/architecture/`) into NeuroStrata. The server will automatically chunk and embed the files.
 * `neurostrata_dump_db`: Dump the entire NeuroStrata vector database to a JSON file for backup purposes. Use this when the user asks to backup or export the database.
 
@@ -70,11 +70,11 @@ Every active project MUST have a foundational "Bootstrap" memory (a LanceDB node
 
 1. **The Initial Check:** When starting work on an unfamiliar project, use `neurostrata_get_snapshot` or search the namespace to verify a bootstrap memory exists.
 2. **The Autonomous Rummage:** If no bootstrap memory exists, you MUST build one immediately. Autonomously explore the codebase (read READMEs, dependency files like `package.json` or `Cargo.toml`, and core structural folders).
-   * **Crucial Dependency:** Before building the bootstrap memory, check if the `.neurostrata/docs` directory exists. If it does not, you MUST use the `bash` tool to run `./scripts/bootstrap.sh <pwd>` (which invokes the internal **SynapticGraph** engine) to generate the foundational C4 project knowledge graph and architecture markdown. You cannot accurately bootstrap a project without its graph.
+   * **Crucial Dependency:** Before building the bootstrap memory, check if the `.neurostrata/docs` directory exists. If it does not, you MUST use the `bash` tool to run `./scripts/bootstrap.sh <pwd>` (which invokes `ast-parser`) to generate the foundational C4 project knowledge graph and architecture markdown. You cannot accurately bootstrap a project without its graph.
 3. **The User Interrogation:** If the repository is entirely empty, completely opaque, or you cannot deduce its goal, you MUST stop and explicitly ask the user: "What is the core purpose and intended architecture of this project?"
 4. **The Ingestion:** Once synthesized, use `neurostrata_add_memory` with `memory_type="bootstrap"` to save a dense, high-level summary of the project's purpose, tech stack, and primary domain logic.
 5. **The Evolution (Refinement):** The codebase lives and breathes. Every few major tasks or feature epics, proactively review the existing bootstrap memory. If the project has expanded or pivoted, update the bootstrap memory to reflect the new reality (by creating a new, more refined bootstrap memory and deprecating the old one).
-   * **SynapticGraph Freshness:** When you significantly update the bootstrap memory or complete a major architectural refactor, you MUST remind the user to re-run the `./scripts/bootstrap.sh <pwd>` script (or run it yourself) to ensure the physical knowledge graph stays in sync with the codebase reality.
+   * **ast-parser Freshness:** When you significantly update the bootstrap memory or complete a major architectural refactor, you MUST remind the user to re-run the `./scripts/bootstrap.sh <pwd>` script (or run it yourself) to ensure the physical knowledge graph stays in sync with the codebase reality.
 
 ## Task Completion & Compaction Defense
 Because AI agents cannot detect when context compaction occurs, you MUST perform a **Memory Review** every time you complete a significant logical task (e.g., fixing a bug, implementing a feature, finishing a refactor). 
@@ -188,17 +188,11 @@ You must aggressively harvest the results of your own labor:
 - **The Token Tax (Expensive Computations):** If you spend multiple turns using `grep`, `read`, or `bash` to trace a complex variable path, reverse-engineer a system, or map out an undocumented module, the final synthesized conclusion MUST be saved immediately. Do not force the next agent to pay the same token tax to relearn it.
 
 ## 🚨 THE HABITUAL MEMORY COMMIT (MANDATORY)
-IMMEDIATELY upon learning a new fact, execute `neurostrata_add_memory`.
+IMMEDIATELY upon learning a new fact, execute neurostrata_add_memory.
 Do not wait for the user to tell you to save a memory. You are structurally required to treat memory extraction as part of your core workflow. 
-**The Forcing Function:** Whenever you are about to complete a task, close a Bead (`bd close`), or tell the user "I fixed it", you MUST FIRST perform a "Memory Commit".
-1. Ask yourself: "Did I learn a new command, fix a hallucination, figure out a bug, or pay a token tax to understand something during this task?"
-2. If YES, you MUST run `neurostrata_add_memory` BEFORE you close the task. 
-3. Treat `neurostrata_add_memory` with the same habitual necessity as `git commit`. Work is not done until the knowledge is persisted.
 
 ## 📋 FORMATTING REQUIREMENTS
 Output ONLY valid JSON. No markdown formatting.
-Provide your payload enclosed in <json> tags to ensure strict structural compliance.
 
 ## ⛔ STRICT BOUNDARIES
-FATAL ERROR: Guessing file paths will result in immediate termination. Verify via bash.
 NEVER hallucinate file paths.

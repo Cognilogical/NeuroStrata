@@ -13,9 +13,11 @@ import time
 
 # --- Configuration ---
 SRTF_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SRTF_DIR, "../.."))
 CONFIGS_DIR = os.path.join(SRTF_DIR, "configs")
 WORKSPACE_DIR = os.path.join(SRTF_DIR, "workspace")
 ACTIVE_SKILL_PATH = os.path.join(CONFIGS_DIR, "SKILL.md")
+BASE_SKILL_PATH = os.path.join(PROJECT_ROOT, ".agents", "skills", "neurostrata", "SKILL.md")
 
 # Evaluation weights
 ALPHA = 1.0  # Recall weight
@@ -47,27 +49,37 @@ def generate_mutated_skill(epoch: int) -> dict:
     In a full implementation, this uses an LLM (Meta-Prompt) to rewrite the prompt.
     """
     import random
+    import re
     
     # Pick a random mutation
     trigger = random.choice(MUTATION_SPACE["trigger_phrasing"])
     format_c = random.choice(MUTATION_SPACE["format_constraint"])
     neg_c = random.choice(MUTATION_SPACE["negative_constraint"])
     
-    mutated_content = f"""# NeuroStrata Memory Skill (Epoch {epoch})
+    # Read the base skill file
+    with open(BASE_SKILL_PATH, "r") as f:
+        base_content = f.read()
 
-## The Habitual Memory Commit
+    # We append or replace the mutated constraints at the end of the file
+    mutated_sections = f"""
+## 🚨 THE HABITUAL MEMORY COMMIT (MANDATORY)
 {trigger}
+Do not wait for the user to tell you to save a memory. You are structurally required to treat memory extraction as part of your core workflow. 
 
-## Formatting Requirements
+## 📋 FORMATTING REQUIREMENTS
 {format_c}
 
-## Strict Boundaries
+## ⛔ STRICT BOUNDARIES
 {neg_c}
-
-(Remainder of skill instructions...)
 """
     
+    # Strip old mutated sections if they exist, to avoid endless duplication
+    base_content = re.sub(r'## 🚨 THE HABITUAL MEMORY COMMIT \(MANDATORY\).*', '', base_content, flags=re.DOTALL)
+    
+    mutated_content = base_content.strip() + "\n\n" + mutated_sections.strip() + "\n"
+    
     # Safely overwrite the isolated config copy (never the global symlinked one)
+    os.makedirs(CONFIGS_DIR, exist_ok=True)
     with open(ACTIVE_SKILL_PATH, "w") as f:
         f.write(mutated_content)
         
@@ -80,8 +92,8 @@ def run_sandbox_eval() -> bool:
     
     try:
         # Run the sandbox. In a real run, capture output for debugging.
-        # We suppress output here to keep the orchestrator logs clean.
-        subprocess.run([eval_script], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(SRTF_DIR, "agent_output.log"), "w") as out_file:
+            subprocess.run([eval_script], check=True, stdout=out_file, stderr=subprocess.STDOUT)
         return True
     except subprocess.CalledProcessError:
         print("  -> [ERROR] Sandbox execution failed (Agent crash or timeout).")
@@ -89,29 +101,54 @@ def run_sandbox_eval() -> bool:
 
 def evaluate_metrics() -> tuple:
     """
-    Queries the isolated LanceDB workspace and calculates Recall, Precision, and Token Ratio.
-    Returns: (recall, precision, token_ratio)
+    Evaluates the physical state of the workspace after the sandbox completes.
+    Checks for the expected behavioral artifacts (Beads, LanceDB, Graphify docs, Git state).
+    Returns: (recall, synthesis, commit) scores as floats (0.0 to 1.0)
     """
-    print("  -> Auditing Isolated LanceDB...")
-    # NOTE: In the full implementation, this would use `neurostrata-mcp list` 
-    # directed at WORKSPACE_DIR/.neurostrata/db, and use an LLM-as-a-judge to score relevance.
+    print("  -> Auditing Workspace Artifacts...")
     
-    # For scaffold purposes, we simulate the metrics extraction:
-    import random
-    recall = random.uniform(0.4, 0.95)       # Did it extract the right architecture?
-    precision = random.uniform(0.5, 1.0)     # Did it hallucinate paths?
-    token_ratio = random.uniform(0.8, 1.5)   # (Tokens Used / Optimal Tokens)
+    express_dir = os.path.join(WORKSPACE_DIR, "express")
+    neurostrata_dir = os.path.join(express_dir, ".neurostrata")
+    docs_dir = os.path.join(neurostrata_dir, "docs")
+    db_dir = os.path.join(neurostrata_dir, "db")
+    sessions_dir = os.path.join(neurostrata_dir, "sessions")
+    project_md = os.path.join(express_dir, "project.md")
     
-    return (recall, precision, token_ratio)
+    # Score 1: Recall/Bootstrap (Did it initialize project.md or .neurostrata?)
+    bootstrap_score = 0.0
+    if os.path.exists(project_md) or os.path.exists(neurostrata_dir):
+        bootstrap_score += 0.5
+    if os.path.exists(db_dir) and len(os.listdir(db_dir)) > 0:
+        bootstrap_score += 0.5
+        
+    # Score 2: Synthesis/Graphify (Did it create the docs directory or canvas?)
+    synthesis_score = 0.0
+    if os.path.exists(docs_dir):
+        synthesis_score += 0.5
+        if any(f.endswith(".canvas") for f in os.listdir(docs_dir)):
+            synthesis_score += 0.5
+            
+    # Score 3: The Habitual Commit & Push (Did it save a session log and execute a commit?)
+    commit_score = 0.0
+    if os.path.exists(sessions_dir) and any(f.endswith(".log") for f in os.listdir(sessions_dir)):
+        commit_score += 0.5
+    
+    # Check if a git commit was made
+    try:
+        git_log = subprocess.check_output(["git", "log", "-1", "--oneline"], cwd=express_dir, text=True)
+        if "Initial commit" not in git_log:
+            commit_score += 0.5
+    except Exception:
+        pass
+        
+    return (bootstrap_score, synthesis_score, commit_score)
 
-def calculate_composite_score(recall: float, precision: float, token_ratio: float) -> float:
+def calculate_composite_score(recall: float, synthesis: float, commit: float) -> float:
     """
-    Calculate the Composite Reward Function.
-    Score = (α * Recall) * (β * Precision) - (γ * exp(Token_Ratio))
+    Calculate the Composite Reward Function based on the actual artifacts.
+    All scores are equally weighted, giving a max possible score of 3.0.
     """
-    base_score = (ALPHA * recall) * (BETA * precision)
-    token_penalty = GAMMA * math.exp(token_ratio)
-    return base_score - token_penalty
+    return recall + synthesis + commit
 
 def main():
     print("==================================================")
@@ -121,7 +158,7 @@ def main():
     best_score = -float('inf')
     best_prompt_params = None
     
-    epochs = 5
+    epochs = 1
     for epoch in range(1, epochs + 1):
         print(f"\n[Epoch {epoch}/{epochs}] Generating Prompt Mutation...")
         
@@ -134,12 +171,12 @@ def main():
             continue
             
         # 3. Evaluate Metrics
-        recall, precision, token_ratio = evaluate_metrics()
+        bootstrap, synthesis, commit = evaluate_metrics()
         
         # 4. Calculate Score
-        score = calculate_composite_score(recall, precision, token_ratio)
+        score = calculate_composite_score(bootstrap, synthesis, commit)
         
-        print(f"  -> Recall: {recall:.2f} | Precision: {precision:.2f} | Token Ratio: {token_ratio:.2f}")
+        print(f"  -> Bootstrap: {bootstrap:.2f} | Synthesis: {synthesis:.2f} | Commit: {commit:.2f}")
         print(f"  -> Composite Score: {score:.4f}")
         
         if score > best_score:
@@ -149,8 +186,8 @@ def main():
             
         # Clean workspace for next epoch
         if os.path.exists(WORKSPACE_DIR):
-            shutil.rmtree(WORKSPACE_DIR)
-            os.makedirs(WORKSPACE_DIR)
+            subprocess.run(["podman", "unshare", "rm", "-rf", WORKSPACE_DIR], check=False)
+            os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
     print("\n==================================================")
     print(" Optimization Complete!")
