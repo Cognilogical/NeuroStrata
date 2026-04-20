@@ -12,7 +12,7 @@ NeuroStrata is a zero-config, local-first Model Context Protocol (MCP) server th
 
 If you are tired of spending 20 minutes context-loading every new chat, only for the agent to hallucinate library choices, ignore your architectural rules, or forget how your specific API works because it fell out of the context window—NeuroStrata is the permanent fix.
 
-It doesn’t just blindly dump Markdown into a prompt. It is a biologically-inspired **Dual-Track Bi-Temporal Graph Memory System** written entirely in Rust. It utilizes an embedded LanceDB vector store and full-text search (BM25 via Tantivy) to ensure your AI remembers exactly *what* to do, *how* to do it, and *why* you built it that way.
+It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by **SynapticGraph**, a biologically-inspired **Dual-Track Bi-Temporal Graph Memory System** written entirely in Rust. It utilizes an embedded LanceDB vector store and full-text search (BM25 via Tantivy) to ensure your AI remembers exactly *what* to do, *how* to do it, and *why* you built it that way.
 
 ---
 
@@ -20,8 +20,9 @@ It doesn’t just blindly dump Markdown into a prompt. It is a biologically-insp
 
 * **Zero Network Attack Surface:** There are no REST APIs. There are no WebSockets. There is no MQTT broker, and there are no exposed localhost ports. NeuroStrata communicates purely over standard input/output (`stdio`) using the official MCP JSON-RPC spec. It is a secure, offline, single compiled Rust binary.
 * **Embedded LanceDB & Tantivy:** No Docker containers to manage and no remote databases to pay for. The entire vector database and full-text search index runs embedded inside the Rust binary. It just works.
-* **The "Pointer-Wiki" Architecture:** Standard RAG systems dump 50-page architecture documents into the LLM context window, which destroys reasoning performance and racks up API costs. NeuroStrata hands the agent a semantic *pointer* (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs to solve the problem.
-* **Visualize AI Memory Locally:** Because NeuroStrata simply writes to a local `.neurostrata/db` directory, our native **Obsidian Plugin** can read the database directly from disk. You can visually render exactly what your AI "knows" into a 2D spatial canvas in real-time, and seamlessly curate, edit, or delete the AI's memory with a right-click—all without a network connection.
+* **The "Pointer-Wiki" Architecture:** Standard RAG systems dump 50-page architecture documents into the LLM context window, which destroys reasoning performance and racks up API costs. NeuroStrata's **SynapticGraph** hands the agent a semantic *pointer*—a hyper-specific **Engram** (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs to solve the problem.
+* **Eidetic Recall & Instant Grounding:** Instead of wasting tokens blindly searching a new repository, agents instantly retrieve the top-5 highest-weighted, active Engrams for any project. This **Eidetic Recall** perfectly grounds an agent the exact second a chat session begins.
+* **Visualize AI Memory Locally:** Because NeuroStrata simply writes to a local `.neurostrata/db` directory, our native **Obsidian Plugin** can read the database directly from disk. You can visually render exactly what your AI "knows" into a 2D spatial canvas in real-time, and seamlessly curate, edit, or **Synaptically Prune** the AI's memory with a right-click—all without a network connection.
 
 ---
 
@@ -31,6 +32,7 @@ NeuroStrata uses cognitive metaphors to map how software actually evolves. Here 
 
 | Biological Term | Engineering Primitive | Description |
 | :--- | :--- | :--- |
+| **SynapticGraph** | **Knowledge Engine** | The core inference engine mapping semantic business axioms directly to your structural codebase, traversing edges to identify connected architecture. |
 | **Engram** | **Vector Row** | A single memory record in LanceDB containing text, embeddings, metadata, domain tags, and optional graph edges linking it to other Engrams. |
 | **Synaptic Pruning** | **Score Decay** | An access-based reinforcement algorithm (inspired by the Ebbinghaus Forgetting Curve). Unused rules naturally decay in retrieval rank over time. *They are never autonomously deleted.* |
 | **Eidetic Recall** | **Boot-time Snapshot** | Instant retrieval of the top 5 highest-weighted, active Engrams for a project the exact second a new chat session begins, instantly grounding the agent. |
