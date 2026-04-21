@@ -1,8 +1,10 @@
+import { useRef, useEffect } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
 
 interface Props {
   data: GraphData;
+  selectedNode: MemoryNode | null;
   onNodeClick: (node: MemoryNode) => void;
   onLinkClick: (link: MemoryLink) => void;
 }
@@ -27,26 +29,40 @@ if (typeof Path2D !== 'undefined') {
   });
 }
 
-export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkClick }) => {
+export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeClick, onLinkClick }) => {
+  const fgRef = useRef<any>(null);
+
+  useEffect(() => {
+    if (selectedNode && fgRef.current) {
+      const graphNode = fgRef.current.graphData().nodes.find((n: any) => n.id === selectedNode.id);
+      if (graphNode && graphNode.x !== undefined && graphNode.y !== undefined) {
+        fgRef.current.centerAt(graphNode.x, graphNode.y, 1000);
+        fgRef.current.zoom(2, 1000);
+      }
+    }
+  }, [selectedNode, data]);
+
   return (
     <div className="absolute inset-0 bg-[#0a192f] z-0" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px)', backgroundSize: '20px 20px' }}>
       <ForceGraph2D
+        ref={fgRef}
         graphData={data}
         backgroundColor="transparent"
         nodeCanvasObject={(node, ctx, globalScale) => {
           const mNode = node as MemoryNode;
           if (mNode.x === undefined || mNode.y === undefined) return;
           
+          const isSelected = selectedNode && selectedNode.id === mNode.id;
           const label = mNode.name;
-          const fontSize = 12 / globalScale;
-          const baseSize = Math.max(12, (mNode.degree || 1) * 2); 
-          const color = mNode.memory_type === 'markdown' ? '#ffffff' : mNode.memory_type === 'directory' ? '#888888' : mNode.namespace === 'global' ? '#64ffda' : '#e6f1ff';
+          const fontSize = (isSelected ? 16 : 12) / globalScale;
+          const baseSize = Math.max(12, (mNode.degree || 1) * 2) * (isSelected ? 1.5 : 1); 
+          const color = isSelected ? '#ffffff' : mNode.memory_type === 'markdown' ? '#dddddd' : mNode.memory_type === 'directory' ? '#888888' : mNode.namespace === 'global' ? '#64ffda' : '#e6f1ff';
           
           ctx.save();
           ctx.translate(mNode.x, mNode.y);
 
           // Neon/Blueprint Glow effect
-          ctx.shadowBlur = 12;
+          ctx.shadowBlur = isSelected ? 24 : 12;
           ctx.shadowColor = color;
           ctx.fillStyle = color;
 
@@ -65,24 +81,26 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
           ctx.font = `${fontSize}px Sans-Serif`;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'top';
-          ctx.fillStyle = '#a8b2d1';
+          ctx.fillStyle = isSelected ? '#ffffff' : '#a8b2d1';
           ctx.fillText(label, mNode.x, mNode.y + baseSize + 4);
         }}
-        linkDirectionalParticles={2}
-        linkDirectionalParticleWidth={2} // Extremely faint, small blur on 2D
-        linkDirectionalParticleColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.25)';
-          return 'rgba(100, 255, 218, 0.15)';
-        }}
-        linkDirectionalParticleSpeed={0.003}
         linkColor={(link: any) => {
-          // Physical lines between nodes
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
-          return 'rgba(100, 255, 218, 0.1)';
+          const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
+          const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
+          const highlight = isSourceSelected || isTargetSelected;
+          
+          if (highlight) return 'rgba(255, 255, 255, 0.9)';
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
+          return 'rgba(100, 255, 218, 0.2)';
         }}
-        linkWidth={(link: any) => link.type === 'links_to' ? 3 : 1.5} // Fatter physical lines
+        linkWidth={(link: any) => {
+          const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
+          const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
+          if (isSourceSelected || isTargetSelected) return 4;
+
+          return link.type === 'links_to' ? 3 : 1.5;
+        }}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
       />

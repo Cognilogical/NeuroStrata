@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from 'react';
 import { GalaxyGraph3D } from './components/GalaxyGraph3D';
 import { BlueprintGraph2D } from './components/BlueprintGraph2D';
 import { UIPanel } from './components/UIPanel';
+import { FileExplorer } from './components/FileExplorer';
 import type { GraphData, MemoryNode, MemoryLink } from './types';
 
 function App() {
@@ -71,13 +72,25 @@ function App() {
   };
 
   return (
-    <div className="relative w-full h-screen overflow-hidden">
-      {viewMode === '3d' ? (
-        <GalaxyGraph3D data={filteredData} onNodeClick={handleNodeClick} onLinkClick={handleLinkClick} />
-      ) : (
-        <BlueprintGraph2D data={filteredData} onNodeClick={handleNodeClick} onLinkClick={handleLinkClick} />
-      )}
-      
+    <div className="relative w-full h-screen overflow-hidden flex">
+      <div className="absolute inset-0 z-0">
+        {viewMode === '3d' ? (
+          <GalaxyGraph3D data={filteredData} selectedNode={selectedNode} onNodeClick={handleNodeClick} onLinkClick={handleLinkClick} />
+        ) : (
+          <BlueprintGraph2D data={filteredData} selectedNode={selectedNode} onNodeClick={handleNodeClick} onLinkClick={handleLinkClick} />
+        )}
+      </div>
+
+      {/* Left Pane: File Explorer */}
+      <div className="z-10 p-6 pointer-events-none h-full">
+        <FileExplorer 
+          nodes={filteredData.nodes} 
+          selectedNode={selectedNode} 
+          onNodeSelect={handleNodeClick} 
+        />
+      </div>
+
+      {/* Right Pane: Filters and Details */}
       <UIPanel 
         viewMode={viewMode}
         setViewMode={setViewMode}
