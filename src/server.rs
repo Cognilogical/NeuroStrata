@@ -726,10 +726,31 @@ pub async fn start_mcp_server(
                                                         let formatted: Vec<String> = results
                                                             .into_iter()
                                                             .map(|r| {
-                                                                format!(
-                                                                    "[{}] {}",
-                                                                    r.id, r.payload.content
-                                                                )
+                                                                let mut out = format!(
+                                                                    "--- Memory ID: {} ---\nType: {}\nContent: {}",
+                                                                    r.id, r.payload.memory_type, r.payload.content
+                                                                );
+                                                                if !r.payload.location.is_empty() {
+                                                                    out.push_str(&format!("\nFile Location: {}", r.payload.location));
+                                                                    if !r.payload.location_lines.is_empty() {
+                                                                        out.push_str(&format!(" (Lines: {})", r.payload.location_lines));
+                                                                    }
+                                                                }
+                                                                if let Some(locations) = r.payload.metadata.get("locations") {
+                                                                    if let Some(arr) = locations.as_array() {
+                                                                        if !arr.is_empty() {
+                                                                            out.push_str(&format!("\nCode Graph Locations: {}", locations));
+                                                                        }
+                                                                    }
+                                                                }
+                                                                if let Some(related) = r.payload.metadata.get("related_to") {
+                                                                    if let Some(arr) = related.as_array() {
+                                                                        if !arr.is_empty() {
+                                                                            out.push_str(&format!("\nRelated Nodes: {}", related));
+                                                                        }
+                                                                    }
+                                                                }
+                                                                out
                                                             })
                                                             .collect();
                                                         result_text = formatted.join("\n\n");
