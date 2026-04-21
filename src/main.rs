@@ -115,6 +115,85 @@ async fn main() -> anyhow::Result<()> {
                 println!("Ingestion complete.");
                 return Ok(());
             }
+            "export-graph" => {
+                let default_out_path = ".NeuroStrata/graph/graph.json";
+                let out_path = args.get(2).map(|s| s.as_str()).unwrap_or(default_out_path);
+                println!("Exporting Memory Graph to {}", out_path);
+                
+                // Ensure output directory exists
+                if let Some(parent) = std::path::Path::new(out_path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let mut nodes = Vec::new();
+                let mut links = Vec::new();
+                let namespaces = vector_store.list_namespaces().await?;
+                
+                for ns in namespaces {
+                    let memories = vector_store.list(&ns, None).await?;
+                    for res in memories {
+                        let payload = res.payload;
+                        let mut degree = 0;
+                        
+                        // Extract related_to links
+                        if let Some(related) = payload.metadata.get("related_to").and_then(|r| r.as_array()) {
+                            degree += related.len();
+                            for link in related {
+                                if let Some(target_id) = link.as_str() {
+                                    links.push(serde_json::json!({
+                                        "source": res.id.clone(),
+                                        "target": target_id.to_string(),
+                                        "type": "related_to"
+                                    }));
+                                }
+                            }
+                        }
+                        
+                        // Extract locations as links (to link semantic memories to code_ast memories)
+                        if let Some(locations) = payload.metadata.get("locations").and_then(|l| l.as_array()) {
+                            degree += locations.len();
+                            for loc in locations {
+                                if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
+                                    // create a synthetic edge to the path string (or we could resolve it later)
+                                    links.push(serde_json::json!({
+                                        "source": res.id.clone(),
+                                        "target": format!("path:{}", path),
+                                        "type": "references_file"
+                                    }));
+                                }
+                            }
+                        }
+
+                        // Determine a display name (short snippet)
+                        let mut name = payload.content.chars().take(60).collect::<String>();
+                        if payload.content.len() > 60 {
+                            name.push_str("...");
+                        }
+
+                        nodes.push(serde_json::json!({
+                            "id": res.id,
+                            "name": name,
+                            "content": payload.content,
+                            "memory_type": payload.memory_type,
+                            "namespace": ns,
+                            "agent_name": payload.agent_name.unwrap_or_else(|| "unknown".to_string()),
+                            "location": payload.location,
+                            "location_lines": payload.location_lines,
+                            "degree": degree,
+                            "metadata": payload.metadata
+                        }));
+                    }
+                }
+                
+                let graph = serde_json::json!({
+                    "nodes": nodes,
+                    "links": links
+                });
+                
+                std::fs::write(out_path, serde_json::to_string_pretty(&graph)?)?;
+                println!("Export complete.");
+                return Ok(());
+            }
             _ => {
                 // If it's something else, fall through or print usage? Let's just start the server.
                 // Or maybe they passed a random arg. Let's start the server but we can ignore it.

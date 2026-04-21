@@ -33,7 +33,7 @@ WORKDIR /home/agent/workspace
 # Install graphifyy for the agent user
 RUN pipx install graphifyy
 ENV PATH="/home/agent/.local/bin:/usr/local/bin:$PATH"
-ENV NEUROSTRATA_DB_PATH="/home/agent/workspace/.neurostrata/db"
+ENV NEUROSTRATA_DB_PATH="/home/agent/workspace/.NeuroStrata/db"
 ENV OPENCODE_CONFIG="/home/agent/.config/opencode/opencode.json"
 
 # Keep the container alive or run the default command

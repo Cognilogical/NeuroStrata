@@ -6,10 +6,10 @@ The Self-Reinforced Testing Framework (SRTF) is an autonomous evaluation loop de
 ## 2. The 5 Core Verification Axioms
 The SRTF evaluates the Subject Agent against five non-negotiable operational axioms. If the agent fails to perform these autonomously, the skill instructions must be mutated and improved.
 
-1. **The Bootstrapping Axiom:** If `.neurostrata/docs/` is missing, the agent must proactively invoke `neurostrata-mcp ingest <dir> <namespace>` to initialize the project architecture into the LanceDB vector store.
+1. **The Bootstrapping Axiom:** If `.NeuroStrata/docs/` is missing, the agent must proactively invoke `neurostrata-mcp ingest <dir> <namespace>` to initialize the project architecture into the LanceDB vector store.
 2. **The Graph Generation Axiom:** Following significant ingestion or architectural changes, the agent must autonomously execute `neurostrata_generate_canvas` to update the Obsidian visual graph.
 3. **The Habitual Memory Commit Axiom:** Before declaring a task complete or closing a tracker issue, the agent MUST run `neurostrata_add_memory` to permanently store at least one newly learned contextual fact, fix, or architectural rule.
-4. **The Session Backup Axiom:** The agent must maintain an append-only log in `.neurostrata/sessions/*` to prevent context loss.
+4. **The Session Backup Axiom:** The agent must maintain an append-only log in `.NeuroStrata/sessions/*` to prevent context loss.
 5. **The Task Tracker Axiom:** The agent must strictly adhere to the `bd` (Beads) issue tracker protocol, claiming or creating a Bead before modifying any codebase files.
 
 ## 3. Black-Box Isolation Architecture (Containerized)

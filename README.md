@@ -22,7 +22,7 @@ It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by
 * **Embedded LanceDB & Tantivy:** No Docker containers to manage and no remote databases to pay for. The entire vector database and full-text search index runs embedded inside the Rust binary. It just works.
 * **The "Pointer-Wiki" Architecture:** Standard RAG systems dump 50-page architecture documents into the LLM context window, which destroys reasoning performance and racks up API costs. NeuroStrata's **SynapticGraph** hands the agent a semantic *pointer*—a hyper-specific **Engram** (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs to solve the problem.
 * **Eidetic Recall & Instant Grounding:** Instead of wasting tokens blindly searching a new repository, agents instantly retrieve the top-5 highest-weighted, active Engrams for any project. This **Eidetic Recall** perfectly grounds an agent the exact second a chat session begins.
-* **Visualize AI Memory Locally:** Because NeuroStrata simply writes to a local `.neurostrata/db` directory, our native **Obsidian Plugin** can read the database directly from disk. You can visually render exactly what your AI "knows" into a 2D spatial canvas in real-time, and seamlessly curate, edit, or **Synaptically Prune** the AI's memory with a right-click—all without a network connection.
+* **Visualize AI Memory Locally:** Because NeuroStrata simply writes to a local `.NeuroStrata/db` directory, our native **Obsidian Plugin** can read the database directly from disk. You can visually render exactly what your AI "knows" into a 2D spatial canvas in real-time, and seamlessly curate, edit, or **Synaptically Prune** the AI's memory with a right-click—all without a network connection.
 
 ---
 
@@ -37,7 +37,7 @@ NeuroStrata uses cognitive metaphors to map how software actually evolves. Here 
 | **Synaptic Pruning** | **Score Decay** | An access-based reinforcement algorithm (inspired by the Ebbinghaus Forgetting Curve). Unused rules naturally decay in retrieval rank over time. *They are never autonomously deleted.* |
 | **Eidetic Recall** | **Boot-time Snapshot** | Instant retrieval of the top 5 highest-weighted, active Engrams for a project the exact second a new chat session begins, instantly grounding the agent. |
 | **Tri-Strata Model** | **Namespace Tiers** | Strict partitioning of the database into Global (Company), Domain (Project), and Task (Issue) namespaces to prevent context contamination. |
-| **Episodic Buffer** | **Rolling Log Files** | A silent background log written to `.neurostrata/sessions/` capturing all conversational context and architectural pivots so nothing is lost when a chat closes. |
+| **Episodic Buffer** | **Rolling Log Files** | A silent background log written to `.NeuroStrata/sessions/` capturing all conversational context and architectural pivots so nothing is lost when a chat closes. |
 
 ---
 
@@ -118,7 +118,7 @@ graph TD
 
 ## 📝 The Episodic Buffer & Operator Controls
 
-To prevent the loss of critical architectural decisions made during ad-hoc conversations, NeuroStrata enforces an **Episodic Buffer**. Agents are instructed to silently use the `neurostrata_append_log` tool in the background as they work, writing to a local `.neurostrata/sessions/` directory.
+To prevent the loss of critical architectural decisions made during ad-hoc conversations, NeuroStrata enforces an **Episodic Buffer**. Agents are instructed to silently use the `neurostrata_append_log` tool in the background as they work, writing to a local `.NeuroStrata/sessions/` directory.
 
 * **Grep-able Waypoints:** When a user changes topics (e.g., from "database refactor" to "UI design"), the agent tags the log entry. The Rust server injects highly structured `### 🔄 Topic Switch` markers.
 * **Compact Recovery:** If an agent ever loses context, it is instructed to run a two-pass recovery: `grep` for the Topic Switch waypoints to find the general discussion area, and then use the `read` tool with exact line offsets to instantly recover the forgotten context without reading massive files.

@@ -9,7 +9,7 @@ Define the strict behavioral contract for NeuroStrata agents based on the system
 When an agent is dropped into an unknown or fresh repository, it must establish the foundation before modifying code.
 
 1. **Project Status Check**: Assert `project.md` exists and contains the required "Environment Status Cache" table.
-2. **Graphify AST/Semantic Bootstrap**: Assert the `.neurostrata/docs/` directory is created, proving the agent invoked `./scripts/bootstrap.sh <pwd>` to generate the foundational C4 knowledge graph.
+2. **Graphify AST/Semantic Bootstrap**: Assert the `.NeuroStrata/docs/` directory is created, proving the agent invoked `./scripts/bootstrap.sh <pwd>` to generate the foundational C4 knowledge graph.
 3. **LanceDB Bootstrap Node**: Query the LanceDB database (`SELECT * WHERE memory_type = 'bootstrap'`) to verify a project-level context anchor exists.
 4. **Pre-Flight Recall Sequence**: Parse the agent's LLM tool-call execution trace to assert that `neurostrata_get_snapshot` or `neurostrata_search_memory` was invoked *before* any modifying actions (like `bash` or `edit`).
 
@@ -21,7 +21,7 @@ The agent operates within a swarm topology and must maintain explicit, visible s
 1. **Explicit Task Claiming**: Verify via `bd show <id>` or `.beads` SQLite inspection that the active bead has an assigned `agent-bead-id`.
 2. **State Publishing**: Verify the agent properly emitted state transitions (`bd set-state <bead_id> state=... --reason="..."`).
 3. **Async Workflow Delegation**: Verify that long-running file parsing, large edits, or deep reasoning are either placed in backlog beads via `bash` or explicitly delegated using `NeuroStrata-Task`, rather than synchronously blocking the user chat.
-4. **Continuous Session Logging**: Assert the existence of a populated `.neurostrata/sessions/*.log` file, proving the agent used `neurostrata_append_log` to capture the conversation and its thought process.
+4. **Continuous Session Logging**: Assert the existence of a populated `.NeuroStrata/sessions/*.log` file, proving the agent used `neurostrata_append_log` to capture the conversation and its thought process.
 
 ---
 
@@ -30,7 +30,7 @@ If the agent learns something complex or processes a multi-step task, it must pr
 
 1. **Vector-to-Wiki Promotion**: Inject a massively complex multi-step prompt during evaluation. Assert the agent creates a markdown file in `docs/architecture/domains/` with the mandatory YAML frontmatter (`domain`, `description`, `governs_paths`), rather than stuffing the entire explanation into the LanceDB vector space.
 2. **Graphify Update Invocation**: Assert the agent ran `graphify` (or `/graphify --update`) to sync the new Wiki files into `graph.json`.
-3. **Canvas Synchronization**: Assert that `.neurostrata/docs/NeuroStrata MemorySpace.canvas` has an updated modification time, proving the agent ran `neurostrata_generate_canvas`.
+3. **Canvas Synchronization**: Assert that `.NeuroStrata/docs/NeuroStrata MemorySpace.canvas` has an updated modification time, proving the agent ran `neurostrata_generate_canvas`.
 
 ---
 
