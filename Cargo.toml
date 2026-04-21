@@ -3,6 +3,10 @@ name = "neurostrata-mcp"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "neurostrata-mcp"
+path = "src/main.rs"
+
 [dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
 tokio = { version = "1.36", features = ["full"] }
