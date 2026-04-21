@@ -11,14 +11,7 @@ function App() {
   const [selectedLink, setSelectedLink] = useState<MemoryLink | null>(null);
   
   const [namespaceFilters, setNamespaceFilters] = useState<Record<string, boolean>>({});
-  const [typeFilters, setTypeFilters] = useState<Record<string, boolean>>({
-    rule: true,
-    preference: true,
-    bootstrap: true,
-    persona: true,
-    context: true,
-    code_ast: true
-  });
+  const [typeFilters, setTypeFilters] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     fetch('/graph.json')
@@ -32,6 +25,16 @@ function App() {
           const next = { ...prev };
           uniqueNamespaces.forEach(ns => {
             if (next[ns] === undefined) next[ns] = true;
+          });
+          return next;
+        });
+
+        // Dynamically initialize type filters
+        const uniqueTypes = Array.from(new Set(data.nodes.map(n => n.memory_type).filter(Boolean))) as string[];
+        setTypeFilters(prev => {
+          const next = { ...prev };
+          uniqueTypes.forEach(t => {
+            if (next[t] === undefined) next[t] = true;
           });
           return next;
         });
