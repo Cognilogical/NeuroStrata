@@ -1,3 +1,4 @@
+import React, { useState } from 'react';
 import type { MemoryNode, MemoryLink } from '../types';
 
 interface Props {
@@ -21,6 +22,28 @@ export const UIPanel: React.FC<Props> = ({
   namespaceFilters,
   setNamespaceFilters,
 }) => {
+  const [editor, setEditor] = useState<'vscode' | 'cursor' | 'obsidian'>(
+    (localStorage.getItem('neurostrata_editor') as any) || 'vscode'
+  );
+
+  const handleEditorChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const val = e.target.value as 'vscode' | 'cursor' | 'obsidian';
+    setEditor(val);
+    localStorage.setItem('neurostrata_editor', val);
+  };
+
+  const handleOpenInEditor = () => {
+    if (!selectedNode || !selectedNode.absolute_path) return;
+    const path = selectedNode.absolute_path;
+    let url = '';
+    switch (editor) {
+      case 'vscode': url = `vscode://file/${encodeURIComponent(path)}`; break;
+      case 'cursor': url = `cursor://file/${encodeURIComponent(path)}`; break;
+      case 'obsidian': url = `obsidian://open?path=${encodeURIComponent(path)}`; break;
+    }
+    window.open(url, '_blank');
+  };
+
   // Candy glassmorphism bevel effect class
   const panelGlassClass = "p-5 rounded-2xl bg-white/10 backdrop-blur-xl border border-white/20 shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_1px_1px_rgba(255,255,255,0.4),inset_0_-1px_1px_rgba(255,255,255,0.1)]";
 
@@ -72,6 +95,30 @@ export const UIPanel: React.FC<Props> = ({
                 <div className="flex flex-col gap-2">
                   <div className="text-sm text-gray-300">Type: <span className="font-mono text-purple-300 drop-shadow-sm">{selectedNode.memory_type}</span></div>
                   {selectedNode.namespace && <div className="text-sm text-gray-300">Namespace: <span className="font-mono text-blue-300 drop-shadow-sm">{selectedNode.namespace}</span></div>}
+                  
+                  {selectedNode.absolute_path && (
+                    <div className="mt-2 flex flex-col gap-2 p-3 bg-white/5 rounded-lg border border-white/10">
+                      <div className="text-xs text-gray-400">Location: <span className="truncate max-w-[200px] inline-block align-bottom">{selectedNode.location}</span></div>
+                      <div className="flex items-center justify-between gap-2">
+                        <select 
+                          className="bg-black/50 text-xs text-white border border-white/20 rounded p-1"
+                          value={editor}
+                          onChange={handleEditorChange}
+                        >
+                          <option value="vscode">VS Code</option>
+                          <option value="cursor">Cursor</option>
+                          <option value="obsidian">Obsidian</option>
+                        </select>
+                        <button 
+                          onClick={handleOpenInEditor}
+                          className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold py-1 px-2 rounded transition-colors shadow-sm border border-blue-400/50"
+                        >
+                          Open File
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   {/* File / Memory Viewer Content */}
                   <div className="mt-2 text-sm leading-relaxed whitespace-pre-wrap bg-black/30 p-4 rounded-lg shadow-[inset_0_2px_4px_rgba(0,0,0,0.6)] border border-white/5 break-words">
                     {selectedNode.name}

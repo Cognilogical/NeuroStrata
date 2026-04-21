@@ -150,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
                         else if path.ends_with(".rs") || path.ends_with(".ts") || path.ends_with(".tsx") { mem_type = "code_ast"; }
                         else { continue; } // Only index relevant files
                     }
+                    
+                    let abs_path = std::env::current_dir().unwrap().join(&path).canonicalize().unwrap_or_default().to_string_lossy().to_string();
 
                     // If markdown, parse links
                     if mem_type == "markdown" {
@@ -200,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                         "namespace": "filesystem",
                         "agent_name": "system",
                         "location": path.clone(),
+                        "absolute_path": abs_path,
                         "location_lines": "",
                         "degree": if is_file { 1 } else { 3 },
                         "metadata": {}
@@ -260,6 +263,18 @@ async fn main() -> anyhow::Result<()> {
                             name.push_str("...");
                         }
 
+                        let mut abs_path = "".to_string();
+                        if !payload.location.is_empty() {
+                            let p = std::path::Path::new(&payload.location);
+                            if p.is_absolute() {
+                                abs_path = payload.location.clone();
+                            } else {
+                                if let Ok(cwd) = std::env::current_dir() {
+                                    abs_path = cwd.join(p).canonicalize().unwrap_or_default().to_string_lossy().to_string();
+                                }
+                            }
+                        }
+
                         nodes.push(serde_json::json!({
                             "id": res.id,
                             "name": name,
@@ -268,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
                             "namespace": ns,
                             "agent_name": payload.agent_name.unwrap_or_else(|| "unknown".to_string()),
                             "location": payload.location,
+                            "absolute_path": abs_path,
                             "location_lines": payload.location_lines,
                             "degree": degree,
                             "metadata": payload.metadata

@@ -47,6 +47,23 @@ Vectors are notoriously difficult for humans to understand. NeuroStrata solves t
 
 ---
 
+## 4. Local OS Editor Integration (Web UI)
+
+If you are using the standalone browser-based **NeuroStrata Web UI** (via `/graph.json`), it includes a native file explorer to browse the physical codebase and the memory graph side-by-side. 
+
+Because the web UI runs in a browser sandbox, we rely on custom OS URL protocols to launch your local editor.
+
+**How it works:**
+1. When the `neurostrata-mcp export-graph` command runs, it computes the absolute path for every file and memory node and injects it into the graph as `absolute_path`.
+2. When you click a file in the Web UI's **File Explorer** (or click a memory node linked to a file), its details appear in the right-hand **Details & Viewer** panel.
+3. You can select your preferred editor from the dropdown (VS Code, Cursor, or Obsidian) which is saved locally to your browser's `localStorage`.
+4. Clicking **"Open File"** triggers the respective custom protocol:
+   - **VS Code:** `vscode://file/{absolute_path}`
+   - **Cursor:** `cursor://file/{absolute_path}`
+   - **Obsidian:** `obsidian://open?path={encoded_absolute_path}`
+
+---
+
 ## Getting Started
 
 1. Ensure the **NeuroStrata Native Go Server** is running in the background (it automatically starts when your AI client launches via MCP).
