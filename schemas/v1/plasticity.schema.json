@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Cognilogical/NeuroStrata/main/schemas/v1/plasticity.schema.json",
+  "title": "NeuroPlasticity Prompt Testing Suite",
+  "description": "Schema for defining prompt testing suites, variables, and assertions in the NeuroPlasticity framework.",
+  "type": "object",
+  "required": ["version", "suite", "tests"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "enum": ["1.0"],
+      "description": "The schema version."
+    },
+    "suite": {
+      "type": "string",
+      "description": "The name of the prompt testing suite."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional description of what this suite tests."
+    },
+    "defaults": {
+      "type": "object",
+      "description": "Default configuration for all tests in this suite.",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "The default AI model to use (e.g., 'gpt-4o', 'claude-3-5-sonnet')."
+        },
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2,
+          "description": "The default temperature setting."
+        }
+      }
+    },
+    "tests": {
+      "type": "array",
+      "description": "List of individual prompt test cases.",
+      "items": {
+        "type": "object",
+        "required": ["name", "prompt", "assertions"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the test case."
+          },
+          "system_prompt": {
+            "type": "string",
+            "description": "The system prompt to prepend."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "The user prompt to execute."
+          },
+          "variables": {
+            "type": "object",
+            "description": "Variables to interpolate into the prompt.",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "assertions": {
+            "type": "array",
+            "description": "List of assertions to validate the model's response.",
+            "items": {
+              "type": "object",
+              "required": ["type"],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "contains",
+                    "not_contains",
+                    "matches_regex",
+                    "is_json",
+                    "is_valid_schema",
+                    "exact_match",
+                    "llm_eval"
+                  ],
+                  "description": "The type of assertion to perform."
+                },
+                "value": {
+                  "type": ["string", "object", "array", "boolean", "number"],
+                  "description": "The value or schema to test against."
+                },
+                "eval_prompt": {
+                  "type": "string",
+                  "description": "If type is 'llm_eval', the prompt used by the evaluator model to grade the response."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
