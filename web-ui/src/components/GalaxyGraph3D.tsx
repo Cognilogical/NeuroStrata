@@ -20,44 +20,43 @@ const colorMap: Record<string, string> = {
   code_ast: '#ffcc00',
 };
 
-const getGlowTexture = () => {
+const getGlowTexture = (isParticle = false) => {
   const canvas = document.createElement('canvas');
   canvas.width = 64;
   canvas.height = 64;
   const ctx = canvas.getContext('2d');
   if (ctx) {
     const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
-    // Extra diffuse, softer glow profile
-    gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
-    gradient.addColorStop(0.1, 'rgba(255, 255, 255, 0.8)');
-    gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.2)');
-    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    if (isParticle) {
+      // Extremely diffuse and faint glow for the plasma blobs
+      gradient.addColorStop(0, 'rgba(255, 255, 255, 0.6)');
+      gradient.addColorStop(0.2, 'rgba(255, 255, 255, 0.2)');
+      gradient.addColorStop(0.6, 'rgba(255, 255, 255, 0.02)');
+      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    } else {
+      // Core bright glow for the document nodes
+      gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+      gradient.addColorStop(0.1, 'rgba(255, 255, 255, 0.8)');
+      gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.2)');
+      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    }
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, 64, 64);
   }
   return new THREE.CanvasTexture(canvas);
 };
 
-// GLOBALLY CACHED PARTICLE RESOURCES
-// Prevents WebGL Context Loss by never recreating geometry/materials during the animation loop
-// 16 segments makes it a smooth sphere, preventing the "solid polygon" look
-const particleGeom = new THREE.SphereGeometry(1, 16, 16); 
-const particleMats: Record<string, THREE.MeshBasicMaterial> = {
-  contains: new THREE.MeshBasicMaterial({ color: '#6496ff', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false }),
-  links_to: new THREE.MeshBasicMaterial({ color: '#ff64ff', transparent: true, opacity: 0.25, blending: THREE.AdditiveBlending, depthWrite: false }),
-  default: new THREE.MeshBasicMaterial({ color: '#64ffda', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false })
-};
-
 export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   
-  const { nodeMaterials, defaultNodeMaterial } = useMemo(() => {
-    const tex = getGlowTexture();
+  const { nodeMaterials, defaultNodeMaterial, particleMats } = useMemo(() => {
+    const nodeTex = getGlowTexture(false);
+    const particleTex = getGlowTexture(true);
     
     const nMats: Record<string, THREE.SpriteMaterial> = {};
     for (const [key, color] of Object.entries(colorMap)) {
       nMats[key] = new THREE.SpriteMaterial({
-        map: tex,
+        map: nodeTex,
         color: color,
         transparent: true,
         blending: THREE.AdditiveBlending,
@@ -66,14 +65,20 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
     }
     
     const defNodeMat = new THREE.SpriteMaterial({
-      map: tex,
+      map: nodeTex,
       color: '#888888',
       transparent: true,
       blending: THREE.AdditiveBlending,
       depthWrite: false
     });
 
-    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat };
+    const pMats: Record<string, THREE.SpriteMaterial> = {
+      contains: new THREE.SpriteMaterial({ map: particleTex, color: '#6496ff', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
+      links_to: new THREE.SpriteMaterial({ map: particleTex, color: '#ff64ff', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
+      default: new THREE.SpriteMaterial({ map: particleTex, color: '#64ffda', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false })
+    };
+
+    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat, particleMats: pMats };
   }, []);
 
   return (
@@ -92,12 +97,12 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         }}
         linkDirectionalParticles={3}
         linkDirectionalParticleSpeed={0.003}
-        linkDirectionalParticleWidth={1.2} // Drastically smaller so they don't look like giant nodes
         linkDirectionalParticleThreeObject={(link: any) => {
-          // Uses the globally cached geometry and material
-          // AdditiveBlending makes them look like faint glowing energy rather than solid objects
+          // Use globally cached SpriteMaterial with heavy blur texture
           const mat = particleMats[link.type] || particleMats.default;
-          return new THREE.Mesh(particleGeom, mat);
+          const sprite = new THREE.Sprite(mat);
+          sprite.scale.set(10, 10, 1); // Large but extremely diffuse and faint
+          return sprite;
         }}
         linkColor={(link: any) => {
           if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
