@@ -155,23 +155,37 @@ async fn main() -> anyhow::Result<()> {
                     if mem_type == "markdown" {
                         if let Ok(content) = std::fs::read_to_string(&path) {
                             for cap in re_md.captures_iter(&content) {
-                                let target = cap[1].to_string();
-                                links.push(serde_json::json!({
-                                    "source": path.clone(),
-                                    "target": target.clone(),
-                                    "type": "links_to"
-                                }));
+                                let mut target = cap[1].to_string();
+                                // Only link if it looks like a local relative file path
+                                if !target.starts_with("http") && !target.contains("://") {
+                                    // Clean up basic relative path dots
+                                    if target.starts_with("./") {
+                                        target = target[2..].to_string();
+                                    }
+                                    links.push(serde_json::json!({
+                                        "source": path.clone(),
+                                        "target": format!("./{}", target),
+                                        "type": "links_to"
+                                    }));
+                                }
                             }
                             for cap in re_wiki.captures_iter(&content) {
                                 let mut target = cap[1].to_string();
+                                
+                                // Strip off anchor tags (e.g., #Header)
+                                if let Some(idx) = target.find('#') {
+                                    target = target[..idx].to_string();
+                                }
+                                
                                 // Optional: append .md if wiki link doesn't have it
                                 if !target.ends_with(".md") {
                                     target.push_str(".md");
                                 }
+                                
                                 // Simple loose linking strategy for now
                                 links.push(serde_json::json!({
                                     "source": path.clone(),
-                                    "target": target,
+                                    "target": format!("./{}", target),
                                     "type": "links_to"
                                 }));
                             }
