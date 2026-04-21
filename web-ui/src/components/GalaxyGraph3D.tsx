@@ -27,9 +27,10 @@ const getGlowTexture = () => {
   const ctx = canvas.getContext('2d');
   if (ctx) {
     const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    // Extra diffuse, softer glow profile
     gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
-    gradient.addColorStop(0.2, 'rgba(255, 255, 255, 0.8)');
-    gradient.addColorStop(0.5, 'rgba(255, 255, 255, 0.2)');
+    gradient.addColorStop(0.1, 'rgba(255, 255, 255, 0.8)');
+    gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.2)');
     gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, 64, 64);
@@ -40,7 +41,7 @@ const getGlowTexture = () => {
 export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   
-  const { nodeMaterials, defaultNodeMaterial } = useMemo(() => {
+  const { nodeMaterials, defaultNodeMaterial, plasmaMaterials } = useMemo(() => {
     const tex = getGlowTexture();
     
     const nMats: Record<string, THREE.SpriteMaterial> = {};
@@ -62,7 +63,20 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
       depthWrite: false
     });
 
-    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat };
+    // Plasma materials pre-cached to prevent WebGL Context Loss
+    const pMats: Record<string, THREE.SpriteMaterial> = {
+      contains: new THREE.SpriteMaterial({
+        map: tex, color: '#6496ff', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false
+      }),
+      links_to: new THREE.SpriteMaterial({
+        map: tex, color: '#ff64ff', transparent: true, opacity: 0.25, blending: THREE.AdditiveBlending, depthWrite: false
+      }),
+      default: new THREE.SpriteMaterial({
+        map: tex, color: '#64ffda', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false
+      })
+    };
+
+    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat, plasmaMaterials: pMats };
   }, []);
 
   return (
@@ -80,19 +94,22 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
           return sprite;
         }}
         linkDirectionalParticles={3}
-        linkDirectionalParticleSpeed={0.004}
-        linkDirectionalParticleWidth={4} // High width for the plasma effect
-        linkDirectionalParticleColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.6)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.8)';
-          return 'rgba(100, 255, 218, 0.6)';
+        linkDirectionalParticleSpeed={0.003}
+        linkDirectionalParticleThreeObject={(link: any) => {
+          // Re-use pre-cached materials to avoid memory leak
+          const material = plasmaMaterials[link.type] || plasmaMaterials.default;
+          const sprite = new THREE.Sprite(material);
+          // Scale down to make them smaller, but diffuse
+          sprite.scale.set(6, 6, 1); 
+          return sprite;
         }}
         linkColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.25)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.5)';
-          return 'rgba(255, 255, 255, 0.15)';
+          // Faint lines, but fatter physical presence
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
+          return 'rgba(255, 255, 255, 0.08)';
         }}
-        linkWidth={(link: any) => link.type === 'links_to' ? 2 : 1}
+        linkWidth={(link: any) => link.type === 'links_to' ? 3 : 1.5}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
       />
