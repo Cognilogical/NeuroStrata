@@ -4,7 +4,7 @@
       "type": "local",
       "command": ["/usr/local/bin/neurostrata-mcp"],
       "environment": {
-        "NEUROSTRATA_DB_PATH": "/home/agent/workspace/.neurostrata/db",
+        "NEUROSTRATA_DB_PATH": "/home/agent/workspace/.NeuroStrata/db",
         "NEUROSTRATA_MQTT_PORT": "11883",
         "NEUROSTRATA_WS_PORT": "18080"
       }

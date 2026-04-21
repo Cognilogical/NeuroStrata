@@ -18,6 +18,6 @@ mcp/neurostrata-mcp
 
 target/
 .fastembed_cache/
-.neurostrata/
+.NeuroStrata/
 *.log
 *.pid

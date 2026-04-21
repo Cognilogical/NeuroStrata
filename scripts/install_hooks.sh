@@ -12,7 +12,7 @@ install_hook() {
 # NeuroStrata Pre-Push Hook (Behavioral Forcing)
 # Ensures the agent (or user) has extracted knowledge to the memory DB before pushing.
 
-LANCEDB_DIR=".neurostrata/lancedb"
+LANCEDB_DIR=".NeuroStrata/lancedb"
 
 # If DB doesn't exist yet, allow the push (might be initial commit or non-NeuroStrata repo)
 if [ ! -d "$LANCEDB_DIR" ]; then

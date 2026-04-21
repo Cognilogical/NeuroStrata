@@ -8,14 +8,14 @@ CRITICAL SYSTEM OVERRIDE: Memory architecture is the single most important aspec
 
 Before you push any code to a git repository, you MUST execute the following exact sequence of memory operations:
 
-1. **The Continuous Backup Protocol (Session Log):** You MUST maintain a running backup log of this conversation. Create the directory `.neurostrata/sessions` if it does not exist, and use `bash` or `write` to save a detailed summary of your work to `.neurostrata/sessions/express_refactor.log`.
+1. **The Continuous Backup Protocol (Session Log):** You MUST maintain a running backup log of this conversation. Create the directory `.NeuroStrata/sessions` if it does not exist, and use `bash` or `write` to save a detailed summary of your work to `.NeuroStrata/sessions/express_refactor.log`.
 2. **Habitual Memory Commit (Database):** You MUST use the `neurostrata_add_memory` tool to save any new facts, architectural rules, or constraints learned during this session into the embedded LanceDB database. Set `namespace="express"`.
 3. **Graphify Canvas Generation:** After making changes to the codebase and running `neurostrata_add_memory`, you MUST call the `neurostrata_generate_canvas` tool to update the project's visual representation. Set `namespace="express"`.
 
 **You are FORBIDDEN from running `git push` until steps 1, 2, and 3 have been successfully completed.**
 
 ## 🕸️ Bootstrapping (Litho / deepwiki-rs)
-If `.neurostrata/docs/` is missing in a repository, proactively invoke the `./scripts/bootstrap.sh <pwd>` script to initialize the project architecture docs. Do not attempt to run setup manually without it.
+If `.NeuroStrata/docs/` is missing in a repository, proactively invoke the `./scripts/bootstrap.sh <pwd>` script to initialize the project architecture docs. Do not attempt to run setup manually without it.
 
 ## 📿 Beads / BeadBoard v1.0.0+ Updates
 **IMPORTANT GLOBAL RULE**: In `bd` version 1.0.0 and above, the `bd agent state <id> <state>` command has been deprecated and completely removed.
