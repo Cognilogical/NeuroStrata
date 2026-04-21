@@ -127,6 +127,82 @@ async fn main() -> anyhow::Result<()> {
 
                 let mut nodes = Vec::new();
                 let mut links = Vec::new();
+
+                // Regex to find standard Markdown links and Obsidian WikiLinks
+                let re_md = regex::Regex::new(r"\]\((.*?\.md)\)").unwrap();
+                let re_wiki = regex::Regex::new(r"\[\[(.*?)\]\]").unwrap();
+
+                // Build the physical Software Graph (AST + Files)
+                for entry in walkdir::WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
+                    let path = entry.path().to_string_lossy().to_string();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    
+                    // Skip node_modules, target, etc.
+                    if path.contains("node_modules") || path.contains("target") || path.contains(".git") || path.contains("dist") || path.contains(".dolt") {
+                        continue;
+                    }
+
+                    let mut is_file = false;
+                    let mut mem_type = "directory";
+                    if entry.file_type().is_file() {
+                        is_file = true;
+                        if path.ends_with(".md") { mem_type = "markdown"; }
+                        else if path.ends_with(".rs") || path.ends_with(".ts") || path.ends_with(".tsx") { mem_type = "code_ast"; }
+                        else { continue; } // Only index relevant files
+                    }
+
+                    // If markdown, parse links
+                    if mem_type == "markdown" {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            for cap in re_md.captures_iter(&content) {
+                                let target = cap[1].to_string();
+                                links.push(serde_json::json!({
+                                    "source": path.clone(),
+                                    "target": target.clone(),
+                                    "type": "links_to"
+                                }));
+                            }
+                            for cap in re_wiki.captures_iter(&content) {
+                                let mut target = cap[1].to_string();
+                                // Optional: append .md if wiki link doesn't have it
+                                if !target.ends_with(".md") {
+                                    target.push_str(".md");
+                                }
+                                // Simple loose linking strategy for now
+                                links.push(serde_json::json!({
+                                    "source": path.clone(),
+                                    "target": target,
+                                    "type": "links_to"
+                                }));
+                            }
+                        }
+                    }
+
+                    nodes.push(serde_json::json!({
+                        "id": path.clone(),
+                        "name": name,
+                        "content": format!("Path: {}", path),
+                        "memory_type": mem_type,
+                        "namespace": "filesystem",
+                        "agent_name": "system",
+                        "location": path.clone(),
+                        "location_lines": "",
+                        "degree": if is_file { 1 } else { 3 },
+                        "metadata": {}
+                    }));
+
+                    if let Some(parent) = entry.path().parent() {
+                        let parent_path = parent.to_string_lossy().to_string();
+                        if parent_path != "." && parent_path != "" {
+                            links.push(serde_json::json!({
+                                "source": path,
+                                "target": parent_path,
+                                "type": "contains"
+                            }));
+                        }
+                    }
+                }
+
                 let namespaces = vector_store.list_namespaces().await?;
                 
                 for ns in namespaces {
