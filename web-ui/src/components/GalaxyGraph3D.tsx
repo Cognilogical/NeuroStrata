@@ -15,6 +15,9 @@ const colorMap: Record<string, string> = {
   bootstrap: '#ffaa00',
   persona: '#cc00ff',
   context: '#4b9dff',
+  directory: '#555555',
+  markdown: '#ffffff',
+  code_ast: '#ffcc00',
 };
 
 const getGlowTexture = () => {
@@ -47,7 +50,7 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         nodeThreeObject={(node: any) => {
           const mNode = node as MemoryNode;
           const size = Math.max(16, mNode.degree * 3);
-          const color = colorMap[mNode.memory_type] || '#ffffff';
+          const color = colorMap[mNode.memory_type] || '#888888';
           
           const material = new THREE.SpriteMaterial({
             map: glowTexture,
