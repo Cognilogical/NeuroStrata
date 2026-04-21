@@ -64,12 +64,30 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
           return sprite;
         }}
         linkDirectionalParticles={3}
-        linkDirectionalParticleWidth={2}
-        linkDirectionalParticleSpeed={0.005}
+        linkDirectionalParticleSpeed={0.004}
+        linkDirectionalParticleThreeObject={(link: any) => {
+          let color = '#ffffff';
+          if (link.type === 'contains') color = '#6496ff';
+          else if (link.type === 'links_to') color = '#ff64ff';
+          else if (link.type === 'related_to') color = '#64ffda';
+
+          const material = new THREE.SpriteMaterial({
+            map: glowTexture,
+            color: color,
+            transparent: true,
+            opacity: 0.4, // Dropped opacity for the plasma feel
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+          });
+          const sprite = new THREE.Sprite(material);
+          sprite.scale.set(10, 10, 1); // Large heavy blur/glow
+          return sprite;
+        }}
         linkColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.4)';
-          return 'rgba(255, 255, 255, 0.3)';
+          // Physical lines between nodes
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.25)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.5)';
+          return 'rgba(255, 255, 255, 0.15)';
         }}
         linkWidth={(link: any) => link.type === 'links_to' ? 2 : 1}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}

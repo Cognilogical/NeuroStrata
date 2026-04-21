@@ -22,11 +22,18 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
           ctx.beginPath();
           ctx.arc(mNode.x || 0, mNode.y || 0, size, 0, 2 * Math.PI, false);
           ctx.fillStyle = mNode.memory_type === 'markdown' ? '#ffffff' : mNode.memory_type === 'directory' ? '#555555' : mNode.namespace === 'global' ? '#64ffda' : '#e6f1ff';
+          
+          // Add soft glow to nodes in 2D
+          ctx.shadowBlur = 10;
+          ctx.shadowColor = ctx.fillStyle;
           ctx.fill();
+          
           ctx.lineWidth = 1;
           ctx.strokeStyle = '#0a192f';
           ctx.stroke();
-
+          
+          // Reset shadow for text
+          ctx.shadowBlur = 0;
           ctx.font = `${fontSize}px Sans-Serif`;
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
@@ -34,12 +41,18 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
           ctx.fillText(label, mNode.x || 0, (mNode.y || 0) + size + fontSize);
         }}
         linkDirectionalParticles={2}
-        linkDirectionalParticleWidth={1.5}
+        linkDirectionalParticleWidth={4} // Larger for blurred plasma look
+        linkDirectionalParticleColor={(link: any) => {
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.4)';
+          return 'rgba(100, 255, 218, 0.4)';
+        }}
         linkDirectionalParticleSpeed={0.005}
         linkColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 200, 255, 0.2)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.5)';
-          return 'rgba(100, 255, 218, 0.4)';
+          // Physical lines between nodes
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.2)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
+          return 'rgba(100, 255, 218, 0.3)';
         }}
         linkWidth={(link: any) => link.type === 'links_to' ? 2 : 1}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
