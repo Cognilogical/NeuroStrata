@@ -20,26 +20,18 @@ const colorMap: Record<string, string> = {
   code_ast: '#ffcc00',
 };
 
-const getGlowTexture = (isParticle = false) => {
+const getGlowTexture = () => {
   const canvas = document.createElement('canvas');
   canvas.width = 64;
   canvas.height = 64;
   const ctx = canvas.getContext('2d');
   if (ctx) {
     const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
-    if (isParticle) {
-      // Extremely diffuse and faint glow for the plasma blobs
-      gradient.addColorStop(0, 'rgba(255, 255, 255, 0.6)');
-      gradient.addColorStop(0.2, 'rgba(255, 255, 255, 0.2)');
-      gradient.addColorStop(0.6, 'rgba(255, 255, 255, 0.02)');
-      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-    } else {
-      // Core bright glow for the document nodes
-      gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
-      gradient.addColorStop(0.1, 'rgba(255, 255, 255, 0.8)');
-      gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.2)');
-      gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-    }
+    // Core bright glow for the document nodes
+    gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    gradient.addColorStop(0.1, 'rgba(255, 255, 255, 0.8)');
+    gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.2)');
+    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, 64, 64);
   }
@@ -49,9 +41,8 @@ const getGlowTexture = (isParticle = false) => {
 export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   
-  const { nodeMaterials, defaultNodeMaterial, particleMats } = useMemo(() => {
-    const nodeTex = getGlowTexture(false);
-    const particleTex = getGlowTexture(true);
+  const { nodeMaterials, defaultNodeMaterial } = useMemo(() => {
+    const nodeTex = getGlowTexture();
     
     const nMats: Record<string, THREE.SpriteMaterial> = {};
     for (const [key, color] of Object.entries(colorMap)) {
@@ -72,13 +63,7 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
       depthWrite: false
     });
 
-    const pMats: Record<string, THREE.SpriteMaterial> = {
-      contains: new THREE.SpriteMaterial({ map: particleTex, color: '#6496ff', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
-      links_to: new THREE.SpriteMaterial({ map: particleTex, color: '#ff64ff', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
-      default: new THREE.SpriteMaterial({ map: particleTex, color: '#64ffda', transparent: true, blending: THREE.AdditiveBlending, depthWrite: false })
-    };
-
-    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat, particleMats: pMats };
+    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat };
   }, []);
 
   return (
@@ -88,8 +73,9 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         graphData={data}
         backgroundColor="#000000"
         nodeThreeObject={(node: any) => {
+          if (!node) return new THREE.Object3D();
           const mNode = node as MemoryNode;
-          const size = Math.max(16, mNode.degree * 3);
+          const size = Math.max(16, (mNode.degree || 1) * 3);
           const material = nodeMaterials[mNode.memory_type] || defaultNodeMaterial;
           const sprite = new THREE.Sprite(material);
           sprite.scale.set(size, size, 1);
@@ -97,12 +83,12 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         }}
         linkDirectionalParticles={3}
         linkDirectionalParticleSpeed={0.003}
-        linkDirectionalParticleThreeObject={(link: any) => {
-          // Use globally cached SpriteMaterial with heavy blur texture
-          const mat = particleMats[link.type] || particleMats.default;
-          const sprite = new THREE.Sprite(mat);
-          sprite.scale.set(10, 10, 1); // Large but extremely diffuse and faint
-          return sprite;
+        linkDirectionalParticleWidth={4}
+        linkDirectionalParticleResolution={16} // High-res smooth sphere, built-in instanced rendering
+        linkDirectionalParticleColor={(link: any) => {
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
+          return 'rgba(255, 255, 255, 0.08)';
         }}
         linkColor={(link: any) => {
           if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
