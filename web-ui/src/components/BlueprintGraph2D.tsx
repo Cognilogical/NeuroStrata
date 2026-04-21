@@ -41,20 +41,20 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
           ctx.fillText(label, mNode.x || 0, (mNode.y || 0) + size + fontSize);
         }}
         linkDirectionalParticles={2}
-        linkDirectionalParticleWidth={4} // Larger for blurred plasma look
+        linkDirectionalParticleWidth={2} // Reduced width for fainter plasma bead
         linkDirectionalParticleColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.4)';
-          return 'rgba(100, 255, 218, 0.4)';
-        }}
-        linkDirectionalParticleSpeed={0.005}
-        linkColor={(link: any) => {
-          // Physical lines between nodes
           if (link.type === 'contains') return 'rgba(100, 150, 255, 0.2)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
-          return 'rgba(100, 255, 218, 0.3)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.3)';
+          return 'rgba(100, 255, 218, 0.2)';
         }}
-        linkWidth={(link: any) => link.type === 'links_to' ? 2 : 1}
+        linkDirectionalParticleSpeed={0.003}
+        linkColor={(link: any) => {
+          // Physical lines between nodes (faint so they don't overpower)
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
+          return 'rgba(100, 255, 218, 0.1)';
+        }}
+        linkWidth={(link: any) => link.type === 'links_to' ? 3 : 1.5} // Fatter physical lines
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
       />
