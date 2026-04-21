@@ -13,11 +13,11 @@ export const FileExplorer: React.FC<Props> = ({ nodes, selectedNode, onNodeSelec
   // Filter only physical files/directories
   const fileNodes = nodes.filter(n => ['directory', 'markdown', 'code_ast'].includes(n.memory_type));
   
-  // Sort alphabetically
-  fileNodes.sort((a, b) => a.name.localeCompare(b.name));
+  // Sort by path (id) to keep directories and their files grouped naturally
+  fileNodes.sort((a, b) => a.id.localeCompare(b.id));
 
   return (
-    <div className={`w-72 h-full flex flex-col ${panelGlassClass} pointer-events-auto overflow-hidden`}>
+    <div className={`w-80 h-full flex flex-col ${panelGlassClass} pointer-events-auto overflow-hidden`}>
       <h2 className="text-xl font-bold mb-4 drop-shadow-md text-blue-300">File Explorer</h2>
       <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 flex flex-col gap-1 text-sm">
         {fileNodes.length === 0 ? (
@@ -25,17 +25,26 @@ export const FileExplorer: React.FC<Props> = ({ nodes, selectedNode, onNodeSelec
         ) : (
           fileNodes.map(node => {
             const isSelected = selectedNode?.id === node.id;
+            
+            // Calculate indentation based on path depth
+            // Path looks like "./src/components/FileExplorer.tsx"
+            const parts = node.id.replace(/^\.\//, '').split('/');
+            const depth = parts.length - 1;
+            const displayName = parts[parts.length - 1];
+            const isDirectory = node.memory_type === 'directory';
+
             return (
               <button
                 key={node.id}
                 onClick={() => onNodeSelect(node)}
-                className={`text-left px-2 py-1.5 rounded transition-all truncate ${isSelected ? 'bg-blue-500/30 text-blue-100 font-bold border border-blue-500/50' : 'hover:bg-white/10 text-gray-300 border border-transparent'}`}
-                title={node.name}
+                style={{ paddingLeft: `${depth * 12 + 8}px` }}
+                className={`text-left py-1 rounded transition-all truncate flex items-center ${isSelected ? 'bg-blue-500/30 text-blue-100 font-bold border-l-2 border-blue-500' : 'hover:bg-white/10 text-gray-300 border-l-2 border-transparent'}`}
+                title={node.id}
               >
-                <span className="mr-2 opacity-70">
-                  {node.memory_type === 'directory' ? '📁' : node.memory_type === 'markdown' ? '📝' : '📄'}
+                <span className="mr-2 opacity-70 flex-shrink-0">
+                  {isDirectory ? '📁' : node.memory_type === 'markdown' ? '📝' : '📄'}
                 </span>
-                {node.name}
+                <span className="truncate">{displayName}</span>
               </button>
             );
           })
