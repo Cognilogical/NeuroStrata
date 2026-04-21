@@ -1,10 +1,11 @@
-import { useRef, useMemo } from 'react';
+import { useRef, useMemo, useEffect } from 'react';
 import ForceGraph3D from 'react-force-graph-3d';
 import * as THREE from 'three';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
 
 interface Props {
   data: GraphData;
+  selectedNode: MemoryNode | null;
   onNodeClick: (node: MemoryNode) => void;
   onLinkClick: (link: MemoryLink) => void;
 }
@@ -38,10 +39,30 @@ const getGlowTexture = () => {
   return new THREE.CanvasTexture(canvas);
 };
 
-export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
+export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   
-  const { nodeMaterials, defaultNodeMaterial } = useMemo(() => {
+  useEffect(() => {
+    if (selectedNode && fgRef.current) {
+      // Find the actual node object in the graph with coordinates
+      const graphNode = fgRef.current.graphData().nodes.find((n: any) => n.id === selectedNode.id);
+      if (graphNode && graphNode.x !== undefined) {
+        // Distance relative to node size
+        const distRatio = 1 + 60 / Math.hypot(graphNode.x, graphNode.y, graphNode.z);
+        const newPos = graphNode.x || graphNode.y || graphNode.z
+          ? { x: graphNode.x * distRatio, y: graphNode.y * distRatio, z: graphNode.z * distRatio }
+          : { x: 0, y: 0, z: 100 }; // fallback
+        
+        fgRef.current.cameraPosition(
+          newPos, // new position
+          graphNode, // lookAt ({ x, y, z })
+          1500  // ms transition duration
+        );
+      }
+    }
+  }, [selectedNode, data]);
+
+  const { nodeMaterials, defaultNodeMaterial, highlightMaterial } = useMemo(() => {
     const nodeTex = getGlowTexture();
     
     const nMats: Record<string, THREE.SpriteMaterial> = {};
@@ -63,7 +84,15 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
       depthWrite: false
     });
 
-    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat };
+    const hlMat = new THREE.SpriteMaterial({
+      map: nodeTex,
+      color: '#ffffff',
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat, highlightMaterial: hlMat };
   }, []);
 
   return (
@@ -75,27 +104,31 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         nodeThreeObject={(node: any) => {
           if (!node) return new THREE.Object3D();
           const mNode = node as MemoryNode;
-          const size = Math.max(16, (mNode.degree || 1) * 3);
-          const material = nodeMaterials[mNode.memory_type] || defaultNodeMaterial;
+          const isSelected = selectedNode && selectedNode.id === mNode.id;
+          const size = Math.max(16, (mNode.degree || 1) * 3) * (isSelected ? 1.5 : 1);
+          
+          const material = isSelected ? highlightMaterial : (nodeMaterials[mNode.memory_type] || defaultNodeMaterial);
           const sprite = new THREE.Sprite(material);
           sprite.scale.set(size, size, 1);
           return sprite;
         }}
-        linkDirectionalParticles={3}
-        linkDirectionalParticleSpeed={0.003}
-        linkDirectionalParticleWidth={4}
-        linkDirectionalParticleResolution={16} // High-res smooth sphere, built-in instanced rendering
-        linkDirectionalParticleColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
-          return 'rgba(255, 255, 255, 0.08)';
-        }}
         linkColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
-          return 'rgba(255, 255, 255, 0.08)';
+          const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
+          const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
+          const highlight = isSourceSelected || isTargetSelected;
+          
+          if (highlight) return 'rgba(255, 255, 255, 0.9)';
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
+          return 'rgba(255, 255, 255, 0.2)';
         }}
-        linkWidth={(link: any) => link.type === 'links_to' ? 3 : 1.5}
+        linkWidth={(link: any) => {
+          const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
+          const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
+          if (isSourceSelected || isTargetSelected) return 6;
+          
+          return link.type === 'links_to' ? 3 : 1.5;
+        }}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
       />
