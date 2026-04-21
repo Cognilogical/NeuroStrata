@@ -39,7 +39,31 @@ const getGlowTexture = () => {
 
 export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
-  const glowTexture = useMemo(() => getGlowTexture(), []);
+  
+  const { nodeMaterials, defaultNodeMaterial } = useMemo(() => {
+    const tex = getGlowTexture();
+    
+    const nMats: Record<string, THREE.SpriteMaterial> = {};
+    for (const [key, color] of Object.entries(colorMap)) {
+      nMats[key] = new THREE.SpriteMaterial({
+        map: tex,
+        color: color,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      });
+    }
+    
+    const defNodeMat = new THREE.SpriteMaterial({
+      map: tex,
+      color: '#888888',
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat };
+  }, []);
 
   return (
     <div className="absolute inset-0 bg-black z-0">
@@ -50,41 +74,20 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         nodeThreeObject={(node: any) => {
           const mNode = node as MemoryNode;
           const size = Math.max(16, mNode.degree * 3);
-          const color = colorMap[mNode.memory_type] || '#888888';
-          
-          const material = new THREE.SpriteMaterial({
-            map: glowTexture,
-            color: color,
-            transparent: true,
-            blending: THREE.AdditiveBlending,
-            depthWrite: false
-          });
+          const material = nodeMaterials[mNode.memory_type] || defaultNodeMaterial;
           const sprite = new THREE.Sprite(material);
           sprite.scale.set(size, size, 1);
           return sprite;
         }}
         linkDirectionalParticles={3}
         linkDirectionalParticleSpeed={0.004}
-        linkDirectionalParticleThreeObject={(link: any) => {
-          let color = '#ffffff';
-          if (link.type === 'contains') color = '#6496ff';
-          else if (link.type === 'links_to') color = '#ff64ff';
-          else if (link.type === 'related_to') color = '#64ffda';
-
-          const material = new THREE.SpriteMaterial({
-            map: glowTexture,
-            color: color,
-            transparent: true,
-            opacity: 0.4, // Dropped opacity for the plasma feel
-            blending: THREE.AdditiveBlending,
-            depthWrite: false
-          });
-          const sprite = new THREE.Sprite(material);
-          sprite.scale.set(10, 10, 1); // Large heavy blur/glow
-          return sprite;
+        linkDirectionalParticleWidth={4} // High width for the plasma effect
+        linkDirectionalParticleColor={(link: any) => {
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.6)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.8)';
+          return 'rgba(100, 255, 218, 0.6)';
         }}
         linkColor={(link: any) => {
-          // Physical lines between nodes
           if (link.type === 'contains') return 'rgba(100, 150, 255, 0.25)';
           if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.5)';
           return 'rgba(255, 255, 255, 0.15)';
