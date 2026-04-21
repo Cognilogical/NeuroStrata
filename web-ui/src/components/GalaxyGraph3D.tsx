@@ -41,17 +41,17 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
 
   useEffect(() => {
     if (fgRef.current) {
-      const postProcessing = fgRef.current.postProcessing();
-      if (postProcessing) {
+      // const postProcessing = fgRef.current.postProcessing();
+      if (false) {
         const renderPass = postProcessing.passes[0];
-        postProcessing.passes = [renderPass];
+        // postProcessing.passes = [renderPass];
         const bloomPass = new UnrealBloomPass(
           new THREE.Vector2(window.innerWidth, window.innerHeight),
           1.5,
           0.4,
           0.85
         );
-        postProcessing.addPass(bloomPass);
+        // postProcessing.addPass(bloomPass);
       }
     }
   }, []);
