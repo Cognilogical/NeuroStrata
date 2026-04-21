@@ -38,6 +38,16 @@ const getGlowTexture = () => {
   return new THREE.CanvasTexture(canvas);
 };
 
+// GLOBALLY CACHED PARTICLE RESOURCES
+// Prevents WebGL Context Loss by never recreating geometry/materials during the animation loop
+// 16 segments makes it a smooth sphere, preventing the "solid polygon" look
+const particleGeom = new THREE.SphereGeometry(1, 16, 16); 
+const particleMats: Record<string, THREE.MeshBasicMaterial> = {
+  contains: new THREE.MeshBasicMaterial({ color: '#6496ff', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false }),
+  links_to: new THREE.MeshBasicMaterial({ color: '#ff64ff', transparent: true, opacity: 0.25, blending: THREE.AdditiveBlending, depthWrite: false }),
+  default: new THREE.MeshBasicMaterial({ color: '#64ffda', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false })
+};
+
 export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   
@@ -82,19 +92,17 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         }}
         linkDirectionalParticles={3}
         linkDirectionalParticleSpeed={0.003}
-        linkDirectionalParticleWidth={4} // Slightly thicker to compensate for diffuse color
-        linkDirectionalParticleColor={(link: any) => {
-          // Use standard points rendering to prevent WebGL Context Loss
-          // but drop opacity significantly to make it faint
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.3)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.4)';
-          return 'rgba(100, 255, 218, 0.3)';
+        linkDirectionalParticleWidth={1.2} // Drastically smaller so they don't look like giant nodes
+        linkDirectionalParticleThreeObject={(link: any) => {
+          // Uses the globally cached geometry and material
+          // AdditiveBlending makes them look like faint glowing energy rather than solid objects
+          const mat = particleMats[link.type] || particleMats.default;
+          return new THREE.Mesh(particleGeom, mat);
         }}
         linkColor={(link: any) => {
-          // Faint lines, but fatter physical presence
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.25)';
-          return 'rgba(255, 255, 255, 0.1)';
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
+          return 'rgba(255, 255, 255, 0.08)';
         }}
         linkWidth={(link: any) => link.type === 'links_to' ? 3 : 1.5}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}

@@ -41,11 +41,11 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
           ctx.fillText(label, mNode.x || 0, (mNode.y || 0) + size + fontSize);
         }}
         linkDirectionalParticles={2}
-        linkDirectionalParticleWidth={2} // Reduced width for fainter plasma bead
+        linkDirectionalParticleWidth={1.5} // Extremely faint, small blur on 2D
         linkDirectionalParticleColor={(link: any) => {
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.2)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.3)';
-          return 'rgba(100, 255, 218, 0.2)';
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
+          return 'rgba(100, 255, 218, 0.15)';
         }}
         linkDirectionalParticleSpeed={0.003}
         linkColor={(link: any) => {
