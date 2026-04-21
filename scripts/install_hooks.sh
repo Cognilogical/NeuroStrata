@@ -40,6 +40,13 @@ if [ "$DB_MOD_TIME" -lt "$LAST_COMMIT_TIME" ]; then
     echo -e "NEUROSTRATA_SKIP_CHECK is set. Bypassing memory check...\n"
 fi
 
+# Auto-sync the AST Software Graph on push
+if command -v neurostrata-mcp &> /dev/null; then
+    echo -e "\n\033[1;36m[NeuroStrata] Auto-syncing AST Software Graph to LanceDB...\033[0m"
+    NAMESPACE=$(basename "$PWD")
+    neurostrata-mcp ingest . "$NAMESPACE" >/dev/null 2>&1 || true
+fi
+
 exit 0
 EOF
 

@@ -94,8 +94,18 @@ pub async fn start_mcp_server(
                                         "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY if you are absolutely certain this is a brand new project namespace that doesn't exist yet." },
                                         "user_id": { "type": "string", "description": "The user making the request." },
                                         "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
-                                        "location": { "type": "string", "description": "The file path, URL, or general location this memory refers to." },
-                                        "location_lines": { "type": "string", "description": "The line numbers (e.g. '42-49') this memory refers to." },
+                                        "locations": { 
+                                            "type": "array", 
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "path": { "type": "string", "description": "File path (e.g. docs/architecture.md)" },
+                                                    "lines": { "type": "string", "description": "Line numbers (e.g. 42-49)" },
+                                                    "symbol": { "type": "string", "description": "Code symbol (e.g. startSync())" }
+                                                }
+                                            },
+                                            "description": "An array of file paths, line numbers, and symbols this memory governs. Memories MUST reference the specific documents they belong to."
+                                        },
                                         "domain": { "type": "string", "description": "Optional category or domain this rule belongs to (e.g., 'frontend', 'database', 'devops', 'api')." },
                                         "related_to": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory IDs this rule connects to, forming a knowledge graph edge." },
                                         "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
@@ -124,6 +134,18 @@ pub async fn start_mcp_server(
                                         "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." }
                                     },
                                     "required": ["namespace"]
+                                }
+                            },
+                            {
+                                "name": "neurostrata_ingest_directory",
+                                "description": "Batch ingest and parse the Abstract Syntax Tree (AST) of the current project directory to build the Software Graph.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "dir_path": { "type": "string", "description": "Absolute path to the project directory to ingest. Usually the current working directory." },
+                                        "namespace": { "type": "string", "description": "The project namespace." }
+                                    },
+                                    "required": ["dir_path", "namespace"]
                                 }
                             },
                             {
@@ -205,20 +227,37 @@ pub async fn start_mcp_server(
                                             .get("agent_name")
                                             .and_then(|a| a.as_str())
                                             .map(|s| s.to_string());
-                                        let location = arguments
-                                            .get("location")
-                                            .and_then(|l| l.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let location_lines = arguments
-                                            .get("location_lines")
-                                            .and_then(|l| l.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
+                                        let mut location = "".to_string();
+                                        let mut location_lines = "".to_string();
                                         let mut metadata = arguments
                                             .get("metadata")
                                             .cloned()
-                                            .unwrap_or(serde_json::json!({}));
+                                            .unwrap_or_else(|| serde_json::json!({}));
+                                        
+                                        if let Some(locations) = arguments.get("locations").and_then(|l| l.as_array()) {
+                                            if let Some(first) = locations.first() {
+                                                location = first.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                                                location_lines = first.get("lines").and_then(|l| l.as_str()).unwrap_or("").to_string();
+                                            }
+                                            
+                                            // Map to metadata.refs for the Obsidian canvas generator
+                                            if let Some(obj) = metadata.as_object_mut() {
+                                                let refs: Vec<serde_json::Value> = locations.iter().map(|loc| {
+                                                    let mut ref_obj = serde_json::Map::new();
+                                                    if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
+                                                        ref_obj.insert("file".to_string(), serde_json::json!(path));
+                                                    }
+                                                    if let Some(lines) = loc.get("lines").and_then(|l| l.as_str()) {
+                                                        ref_obj.insert("lines".to_string(), serde_json::json!(lines));
+                                                    }
+                                                    if let Some(sym) = loc.get("symbol").and_then(|s| s.as_str()) {
+                                                        ref_obj.insert("symbol".to_string(), serde_json::json!(sym));
+                                                    }
+                                                    serde_json::Value::Object(ref_obj)
+                                                }).collect();
+                                                obj.insert("refs".to_string(), serde_json::Value::Array(refs));
+                                            }
+                                        }
 
                                         // Merge cognitive fields into metadata JSON blob
                                         if let Some(meta_obj) = metadata.as_object_mut() {
@@ -584,6 +623,55 @@ pub async fn start_mcp_server(
                                         }
                                     } else {
                                         result_text = "Missing 'namespace' parameter.".to_string();
+                                    }
+                                }
+                                "neurostrata_ingest_directory" => {
+                                    if let Some(dir_path) = arguments.get("dir_path").and_then(|d| d.as_str()) {
+                                        if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
+                                            let schema_str = r#"
+                                            {
+                                                "languages": {
+                                                    "rust": {
+                                                        "extensions": ["rs"],
+                                                        "queries": {
+                                                            "functions": "(function_item name: (identifier) @name) @func",
+                                                            "structs": "(struct_item name: (type_identifier) @name) @struct",
+                                                            "impls": "(impl_item type: (type_identifier) @name) @impl"
+                                                        }
+                                                    },
+                                                    "javascript": {
+                                                        "extensions": ["js", "jsx", "ts", "tsx"],
+                                                        "queries": {
+                                                            "functions": "(function_declaration name: (identifier) @name) @func",
+                                                            "classes": "(class_declaration name: (identifier) @name) @class"
+                                                        }
+                                                    },
+                                                    "python": {
+                                                        "extensions": ["py"],
+                                                        "queries": {
+                                                            "functions": "(function_definition name: (identifier) @name) @func",
+                                                            "classes": "(class_definition name: (identifier) @name) @class"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            "#;
+                                            
+                                            if let Ok(schema) = crate::parser::schema::ParserSchema::load(schema_str) {
+                                                let dir = std::path::Path::new(dir_path);
+                                                if let Ok(_) = crate::parser::ingest::ingest_directory(dir, &schema, emb.clone(), store.clone(), namespace).await {
+                                                    result_text = format!("Successfully ingested AST from {} into namespace '{}'", dir_path, namespace);
+                                                } else {
+                                                    result_text = "Failed to ingest directory. Ensure tree-sitter and parsing logic is fully initialized.".to_string();
+                                                }
+                                            } else {
+                                                result_text = "Failed to load default parser schema.".to_string();
+                                            }
+                                        } else {
+                                            result_text = "ERROR: namespace missing.".to_string();
+                                        }
+                                    } else {
+                                        result_text = "ERROR: dir_path missing.".to_string();
                                     }
                                 }
                                 "neurostrata_move_memory" => {

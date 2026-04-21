@@ -66,14 +66,40 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let dir_path = std::path::Path::new(&args[2]);
                 let namespace = &args[3];
-                let schema_path = args.get(4).map(|s| s.as_str()).unwrap_or("parser_schema.json");
-                
-                let schema_str = match std::fs::read_to_string(schema_path) {
-                    Ok(s) => s,
-                    Err(e) => {
+                let schema_str = if let Some(schema_path) = args.get(4) {
+                    std::fs::read_to_string(schema_path).unwrap_or_else(|e| {
                         eprintln!("Failed to read schema from {}: {}", schema_path, e);
-                        return Ok(());
+                        std::process::exit(1);
+                    })
+                } else {
+                    r#"
+                    {
+                        "languages": {
+                            "rust": {
+                                "extensions": ["rs"],
+                                "queries": {
+                                    "functions": "(function_item name: (identifier) @name) @func",
+                                    "structs": "(struct_item name: (type_identifier) @name) @struct",
+                                    "impls": "(impl_item type: (type_identifier) @name) @impl"
+                                }
+                            },
+                            "javascript": {
+                                "extensions": ["js", "jsx", "ts", "tsx"],
+                                "queries": {
+                                    "functions": "(function_declaration name: (identifier) @name) @func",
+                                    "classes": "(class_declaration name: (identifier) @name) @class"
+                                }
+                            },
+                            "python": {
+                                "extensions": ["py"],
+                                "queries": {
+                                    "functions": "(function_definition name: (identifier) @name) @func",
+                                    "classes": "(class_definition name: (identifier) @name) @class"
+                                }
+                            }
+                        }
                     }
+                    "#.to_string()
                 };
 
                 let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
@@ -84,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                println!("Ingesting AST from {:?} into namespace '{}' using schema '{}'", dir_path, namespace, schema_path);
+                println!("Ingesting AST from {:?} into namespace '{}' using default/provided schema", dir_path, namespace);
                 crate::parser::ingest::ingest_directory(dir_path, &schema, embedder, vector_store, namespace).await?;
                 println!("Ingestion complete.");
                 return Ok(());
