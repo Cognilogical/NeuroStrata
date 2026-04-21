@@ -1,7 +1,6 @@
-import { useRef, useMemo, useEffect } from 'react';
+import { useRef, useMemo } from 'react';
 import ForceGraph3D from 'react-force-graph-3d';
 import * as THREE from 'three';
-import { UnrealBloomPass } from 'three-stdlib';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
 
 interface Props {
@@ -38,23 +37,6 @@ const getGlowTexture = () => {
 export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   const glowTexture = useMemo(() => getGlowTexture(), []);
-
-  useEffect(() => {
-    if (fgRef.current) {
-      // const postProcessing = fgRef.current.postProcessing();
-      if (false) {
-        const renderPass = postProcessing.passes[0];
-        // postProcessing.passes = [renderPass];
-        const bloomPass = new UnrealBloomPass(
-          new THREE.Vector2(window.innerWidth, window.innerHeight),
-          1.5,
-          0.4,
-          0.85
-        );
-        // postProcessing.addPass(bloomPass);
-      }
-    }
-  }, []);
 
   return (
     <div className="absolute inset-0 bg-black z-0">

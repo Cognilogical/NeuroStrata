@@ -9,9 +9,9 @@ function App() {
   const [viewMode, setViewMode] = useState<'2d' | '3d'>('3d');
   const [selectedNode, setSelectedNode] = useState<MemoryNode | null>(null);
   const [selectedLink, setSelectedLink] = useState<MemoryLink | null>(null);
-  const [showGlobal, setShowGlobal] = useState(true);
   
-  const [filters, setFilters] = useState<Record<string, boolean>>({
+  const [namespaceFilters, setNamespaceFilters] = useState<Record<string, boolean>>({});
+  const [typeFilters, setTypeFilters] = useState<Record<string, boolean>>({
     rule: true,
     preference: true,
     bootstrap: true,
@@ -21,18 +21,31 @@ function App() {
   });
 
   useEffect(() => {
-    // In production/desktop app this would load from .NeuroStrata/graph/graph.json
-    // For local dev with Vite, we might need a symlink or custom server setup, but we use an absolute or relative path that points there.
     fetch('/graph.json')
       .then(res => res.json())
-      .then(data => setGraphData(data))
+      .then((data: GraphData) => {
+        setGraphData(data);
+        
+        // Dynamically initialize namespace filters based on data
+        const uniqueNamespaces = Array.from(new Set(data.nodes.map(n => n.namespace).filter(Boolean))) as string[];
+        setNamespaceFilters(prev => {
+          const next = { ...prev };
+          uniqueNamespaces.forEach(ns => {
+            if (next[ns] === undefined) next[ns] = true;
+          });
+          return next;
+        });
+      })
       .catch(e => console.error("Failed to load graph data", e));
   }, []);
 
   const filteredData = useMemo(() => {
     const nodes = graphData.nodes.filter(n => {
-      if (!showGlobal && n.namespace === 'global') return false;
-      return filters[n.memory_type] !== false;
+      // If namespace filter exists and is false, hide the node
+      if (n.namespace && namespaceFilters[n.namespace] === false) return false;
+      // If type filter is false, hide the node
+      if (typeFilters[n.memory_type] === false) return false;
+      return true;
     });
     
     const nodeIds = new Set(nodes.map(n => n.id));
@@ -42,7 +55,7 @@ function App() {
     );
     
     return { nodes, links };
-  }, [graphData, filters, showGlobal]);
+  }, [graphData, typeFilters, namespaceFilters]);
 
   const handleNodeClick = (node: MemoryNode) => {
     setSelectedNode(node);
@@ -67,14 +80,13 @@ function App() {
         setViewMode={setViewMode}
         selectedNode={selectedNode}
         selectedLink={selectedLink}
-        filters={filters}
-        setFilters={setFilters}
-        showGlobal={showGlobal}
-        setShowGlobal={setShowGlobal}
+        typeFilters={typeFilters}
+        setTypeFilters={setTypeFilters}
+        namespaceFilters={namespaceFilters}
+        setNamespaceFilters={setNamespaceFilters}
       />
     </div>
   );
 }
 
 export default App;
-
