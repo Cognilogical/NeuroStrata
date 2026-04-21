@@ -63,10 +63,15 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
           sprite.scale.set(size, size, 1);
           return sprite;
         }}
-        linkDirectionalParticles={2}
+        linkDirectionalParticles={3}
         linkDirectionalParticleWidth={2}
-        linkDirectionalParticleSpeed={(d: any) => d.type === 'related_to' ? 0.01 : 0}
-        linkColor={() => 'rgba(255,255,255,0.2)'}
+        linkDirectionalParticleSpeed={0.005}
+        linkColor={(link: any) => {
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.4)';
+          return 'rgba(255, 255, 255, 0.3)';
+        }}
+        linkWidth={(link: any) => link.type === 'links_to' ? 2 : 1}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
       />
