@@ -46,7 +46,7 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         backgroundColor="#000000"
         nodeThreeObject={(node: any) => {
           const mNode = node as MemoryNode;
-          const size = Math.max(8, mNode.degree * 2);
+          const size = Math.max(16, mNode.degree * 3);
           const color = colorMap[mNode.memory_type] || '#ffffff';
           
           const material = new THREE.SpriteMaterial({
