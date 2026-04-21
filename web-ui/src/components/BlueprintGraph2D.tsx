@@ -18,7 +18,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
           const mNode = node as MemoryNode;
           const label = mNode.name;
           const fontSize = 12 / globalScale;
-          const size = Math.max(4, mNode.degree);
+          const size = Math.max(8, mNode.degree * 2);
           
           ctx.beginPath();
           ctx.arc(mNode.x || 0, mNode.y || 0, size, 0, 2 * Math.PI, false);
