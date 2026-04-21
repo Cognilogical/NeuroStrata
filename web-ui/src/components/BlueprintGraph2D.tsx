@@ -35,13 +35,15 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
         backgroundColor="transparent"
         nodeCanvasObject={(node, ctx, globalScale) => {
           const mNode = node as MemoryNode;
+          if (mNode.x === undefined || mNode.y === undefined) return;
+          
           const label = mNode.name;
           const fontSize = 12 / globalScale;
-          const baseSize = Math.max(12, mNode.degree * 2); 
+          const baseSize = Math.max(12, (mNode.degree || 1) * 2); 
           const color = mNode.memory_type === 'markdown' ? '#ffffff' : mNode.memory_type === 'directory' ? '#888888' : mNode.namespace === 'global' ? '#64ffda' : '#e6f1ff';
           
           ctx.save();
-          ctx.translate(mNode.x || 0, mNode.y || 0);
+          ctx.translate(mNode.x, mNode.y);
 
           // Neon/Blueprint Glow effect
           ctx.shadowBlur = 12;
@@ -64,7 +66,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, onNodeClick, onLinkCli
           ctx.textAlign = 'center';
           ctx.textBaseline = 'top';
           ctx.fillStyle = '#a8b2d1';
-          ctx.fillText(label, mNode.x || 0, (mNode.y || 0) + baseSize + 4);
+          ctx.fillText(label, mNode.x, mNode.y + baseSize + 4);
         }}
         linkDirectionalParticles={2}
         linkDirectionalParticleWidth={2} // Extremely faint, small blur on 2D
