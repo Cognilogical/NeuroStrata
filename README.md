@@ -1,4 +1,6 @@
 # 🧠 NeuroStrata
+![NeuroStrata Banner](docs/assets/NeuroStrata-banner.png)
+
 **The Long-Term Memory Layer for AI Coding Agents**
 
 [![Rust](https://img.shields.io/badge/Rust-1.75+-000000?style=flat-square&logo=rust)](https://www.rust-lang.org/)
