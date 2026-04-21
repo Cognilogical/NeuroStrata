@@ -41,7 +41,7 @@ const getGlowTexture = () => {
 export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
   
-  const { nodeMaterials, defaultNodeMaterial, plasmaMaterials } = useMemo(() => {
+  const { nodeMaterials, defaultNodeMaterial } = useMemo(() => {
     const tex = getGlowTexture();
     
     const nMats: Record<string, THREE.SpriteMaterial> = {};
@@ -63,20 +63,7 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
       depthWrite: false
     });
 
-    // Plasma materials pre-cached to prevent WebGL Context Loss
-    const pMats: Record<string, THREE.SpriteMaterial> = {
-      contains: new THREE.SpriteMaterial({
-        map: tex, color: '#6496ff', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false
-      }),
-      links_to: new THREE.SpriteMaterial({
-        map: tex, color: '#ff64ff', transparent: true, opacity: 0.25, blending: THREE.AdditiveBlending, depthWrite: false
-      }),
-      default: new THREE.SpriteMaterial({
-        map: tex, color: '#64ffda', transparent: true, opacity: 0.15, blending: THREE.AdditiveBlending, depthWrite: false
-      })
-    };
-
-    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat, plasmaMaterials: pMats };
+    return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat };
   }, []);
 
   return (
@@ -95,19 +82,19 @@ export const GalaxyGraph3D = ({ data, onNodeClick, onLinkClick }: Props) => {
         }}
         linkDirectionalParticles={3}
         linkDirectionalParticleSpeed={0.003}
-        linkDirectionalParticleThreeObject={(link: any) => {
-          // Re-use pre-cached materials to avoid memory leak
-          const material = plasmaMaterials[link.type] || plasmaMaterials.default;
-          const sprite = new THREE.Sprite(material);
-          // Scale down to make them smaller, but diffuse
-          sprite.scale.set(6, 6, 1); 
-          return sprite;
+        linkDirectionalParticleWidth={4} // Slightly thicker to compensate for diffuse color
+        linkDirectionalParticleColor={(link: any) => {
+          // Use standard points rendering to prevent WebGL Context Loss
+          // but drop opacity significantly to make it faint
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.3)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.4)';
+          return 'rgba(100, 255, 218, 0.3)';
         }}
         linkColor={(link: any) => {
           // Faint lines, but fatter physical presence
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.1)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.2)';
-          return 'rgba(255, 255, 255, 0.08)';
+          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.15)';
+          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.25)';
+          return 'rgba(255, 255, 255, 0.1)';
         }}
         linkWidth={(link: any) => link.type === 'links_to' ? 3 : 1.5}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
