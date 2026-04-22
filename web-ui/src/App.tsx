@@ -35,7 +35,10 @@ function App() {
         setTypeFilters(prev => {
           const next = { ...prev };
           uniqueTypes.forEach(t => {
-            if (next[t] === undefined) next[t] = true;
+            // Default to true, except for physical files which we want to hide from the graph by default
+            if (next[t] === undefined) {
+              next[t] = !['directory', 'markdown', 'code_ast'].includes(t);
+            }
           });
           return next;
         });
@@ -84,7 +87,7 @@ function App() {
       {/* Left Pane: File Explorer */}
       <div className="z-10 p-6 pointer-events-none h-full">
         <FileExplorer 
-          nodes={filteredData.nodes} 
+          nodes={graphData.nodes} 
           selectedNode={selectedNode} 
           onNodeSelect={handleNodeClick} 
         />
