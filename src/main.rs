@@ -133,12 +133,27 @@ async fn main() -> anyhow::Result<()> {
                 let re_wiki = regex::Regex::new(r"\[\[(.*?)\]\]").unwrap();
 
                 // Build the physical Software Graph (AST + Files)
+                let skipped_dirs = [
+                    "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
+                    "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__"
+                ];
+
                 for entry in walkdir::WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
                     let path = entry.path().to_string_lossy().to_string();
                     let name = entry.file_name().to_string_lossy().to_string();
                     
-                    // Skip node_modules, target, etc.
-                    if path.contains("node_modules") || path.contains("target") || path.contains(".git") || path.contains("dist") || path.contains(".dolt") {
+                    // Skip 3rd party libraries and build artifacts
+                    let mut should_skip = false;
+                    for skip_dir in &skipped_dirs {
+                        let skip_pattern = format!("/{}/", skip_dir);
+                        let skip_start = format!("{}/", skip_dir);
+                        let skip_exact = format!("./{}", skip_dir);
+                        if path.contains(&skip_pattern) || path.starts_with(&skip_start) || path == skip_exact {
+                            should_skip = true;
+                            break;
+                        }
+                    }
+                    if should_skip {
                         continue;
                     }
 
