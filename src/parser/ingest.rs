@@ -21,7 +21,14 @@ pub async fn ingest_directory(
         }
     }
 
-    let walker = WalkBuilder::new(dir_path).build();
+    let walker_builder = WalkBuilder::new(dir_path);
+    // Explicitly ignore common 3rd party and build directories even if not gitignored
+    let walker = walker_builder.build();
+
+    let skipped_dirs = [
+        "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
+        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__"
+    ];
 
     for result in walker {
         let entry = match result {
@@ -34,6 +41,22 @@ pub async fn ingest_directory(
         }
 
         let path = entry.path();
+        let path_str = path.to_string_lossy();
+        
+        let mut should_skip = false;
+        for skip_dir in &skipped_dirs {
+            let skip_pattern = format!("/{}/", skip_dir);
+            let skip_start = format!("{}/", skip_dir);
+            if path_str.contains(&skip_pattern) || path_str.starts_with(&skip_start) {
+                should_skip = true;
+                break;
+            }
+        }
+        
+        if should_skip {
+            continue;
+        }
+
         if let Some(ext_os) = path.extension() {
             let ext = format!(".{}", ext_os.to_string_lossy());
             if let Some(lang_name) = ext_to_lang.get(&ext) {
