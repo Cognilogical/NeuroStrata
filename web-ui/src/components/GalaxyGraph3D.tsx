@@ -46,16 +46,23 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     if (selectedNode && fgRef.current) {
       // Find the actual node object in the graph with coordinates
       const graphNode = fgRef.current.graphData().nodes.find((n: any) => n.id === selectedNode.id);
-      if (graphNode && graphNode.x !== undefined) {
-        // Distance relative to node size
-        const distRatio = 1 + 60 / Math.hypot(graphNode.x, graphNode.y, graphNode.z);
-        const newPos = graphNode.x || graphNode.y || graphNode.z
+      
+      if (graphNode && typeof graphNode.x === 'number' && !Number.isNaN(graphNode.x)) {
+        // Safe check for distance calculation
+        const distance = Math.hypot(graphNode.x, graphNode.y, graphNode.z);
+        const distRatio = 1 + 60 / (distance || 1); // fallback to 1 if distance is 0
+        
+        // Define new camera position relative to node
+        const newPos = distance > 0
           ? { x: graphNode.x * distRatio, y: graphNode.y * distRatio, z: graphNode.z * distRatio }
           : { x: 0, y: 0, z: 100 }; // fallback
         
+        // Explicitly extract primitive numbers for lookAt to avoid proxy object mutations
+        const lookAtPos = { x: graphNode.x, y: graphNode.y, z: graphNode.z };
+        
         fgRef.current.cameraPosition(
           newPos, // new position
-          graphNode, // lookAt ({ x, y, z })
+          lookAtPos, // lookAt
           1500  // ms transition duration
         );
       }
