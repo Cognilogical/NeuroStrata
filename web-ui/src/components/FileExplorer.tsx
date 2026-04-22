@@ -38,13 +38,13 @@ export const FileExplorer: React.FC<Props> = ({ nodes, selectedNode, onNodeSelec
                 key={node.id}
                 onClick={() => onNodeSelect(node)}
                 style={{ paddingLeft: `${depth * 12 + 8}px` }}
-                className={`text-left py-1 rounded transition-all truncate flex items-center ${isSelected ? 'bg-blue-500/30 text-blue-100 font-bold border-l-2 border-blue-500' : 'hover:bg-white/10 text-gray-300 border-l-2 border-transparent'}`}
+                className={`text-left py-1.5 min-h-[32px] w-full rounded transition-all flex items-center ${isSelected ? 'bg-blue-500/30 text-blue-100 font-bold border-l-2 border-blue-500' : 'hover:bg-white/10 text-gray-300 border-l-2 border-transparent'}`}
                 title={node.id}
               >
-                <span className="mr-2 opacity-70 flex-shrink-0">
+                <span className="mr-2 opacity-70 flex-shrink-0 text-base leading-none">
                   {isDirectory ? '📁' : node.memory_type === 'markdown' ? '📝' : '📄'}
                 </span>
-                <span className="truncate">{displayName}</span>
+                <span className="truncate leading-tight mt-0.5">{displayName}</span>
               </button>
             );
           })
