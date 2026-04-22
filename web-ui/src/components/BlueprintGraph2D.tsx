@@ -35,9 +35,11 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
   useEffect(() => {
     if (selectedNode && fgRef.current) {
       const graphNode = fgRef.current.graphData().nodes.find((n: any) => n.id === selectedNode.id);
-      if (graphNode && graphNode.x !== undefined && graphNode.y !== undefined) {
+      if (graphNode && typeof graphNode.x === 'number' && !Number.isNaN(graphNode.x)) {
+        // centerAt and zoom synchronously can sometimes conflict. 
+        // We use just centerAt or we offset them.
         fgRef.current.centerAt(graphNode.x, graphNode.y, 1000);
-        fgRef.current.zoom(2, 1000);
+        fgRef.current.zoom(8, 1000); // 8x zoom to node
       }
     }
   }, [selectedNode, data]);
