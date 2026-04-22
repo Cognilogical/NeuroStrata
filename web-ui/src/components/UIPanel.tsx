@@ -45,13 +45,13 @@ export const UIPanel: React.FC<Props> = ({
   };
 
   // Candy glassmorphism bevel effect class
-  const panelGlassClass = "p-5 rounded-2xl bg-white/10 backdrop-blur-xl border border-white/20 shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_1px_1px_rgba(255,255,255,0.4),inset_0_-1px_1px_rgba(255,255,255,0.1)]";
+  const panelGlassClass = "p-5 rounded-2xl bg-black/60 backdrop-blur-xl border border-white/20 shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_1px_1px_rgba(255,255,255,0.4),inset_0_-1px_1px_rgba(255,255,255,0.1)] text-white";
 
   return (
     <div className="absolute inset-0 pointer-events-none flex flex-row-reverse p-6 z-10 text-white font-sans overflow-hidden">
       
       {/* Right Column Stack */}
-      <div className="w-80 flex flex-col gap-4 pointer-events-none max-h-full">
+      <div className="w-96 flex flex-col gap-4 pointer-events-none max-h-full">
         
         {/* Filters Box */}
         <div className={`pointer-events-auto flex flex-col max-h-[50vh] ${panelGlassClass}`}>
@@ -63,9 +63,9 @@ export const UIPanel: React.FC<Props> = ({
                   type="checkbox" 
                   checked={checked} 
                   onChange={(e) => setNamespaceFilters({ ...namespaceFilters, [ns]: e.target.checked })} 
-                  className="accent-blue-500 w-4 h-4 rounded-sm border-white/20 bg-white/10" 
+                  className="accent-blue-500 w-4 h-4 rounded-sm border-white/20 bg-white/10 flex-shrink-0" 
                 />
-                <span className="truncate drop-shadow-sm font-medium" title={ns}>{ns}</span>
+                <span className="break-all drop-shadow-sm font-medium leading-tight" title={ns}>{ns}</span>
               </label>
             ))}
           </div>
@@ -98,8 +98,8 @@ export const UIPanel: React.FC<Props> = ({
                   
                   {selectedNode.absolute_path && (
                     <div className="mt-2 flex flex-col gap-2 p-3 bg-white/5 rounded-lg border border-white/10">
-                      <div className="text-xs text-gray-400">Location: <span className="truncate max-w-[200px] inline-block align-bottom">{selectedNode.location}</span></div>
-                      <div className="flex items-center justify-between gap-2">
+                      <div className="text-xs text-gray-400">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
+                      <div className="flex items-center justify-between gap-2 mt-2">
                         <select 
                           className="bg-black/50 text-xs text-white border border-white/20 rounded p-1"
                           value={editor}
