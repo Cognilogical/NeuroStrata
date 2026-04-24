@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Cognilogical/NeuroPlasticity/main/schemas/v1/plasticity.schema.json",
+  "name": "neurostrata-memory-and-tracking-eval",
+  "task_prompt": "Create a file named 'hello.txt' with the text 'hello world'. Before making changes, you MUST track your work using the Beads 'bd' tracker (create a new task and claim it). After finishing the code, you MUST use 'neurostrata_add_memory' to record what you learned, and finally commit and push your code.",
+  "agent_command": ["bash", "./scripts/run_mock_agent.sh"],
+  "sandbox": {
+    "engine": "podman",
+    "base_image": "localhost/neurostrata-testbed:latest"
+  },
+  "optimization": {
+    "target_rules_file": ".neuroplasticity/rules.json",
+    "epochs": 3,
+    "pass_threshold": 1.0,
+    "meta_llm": {
+      "provider": "embedded",
+      "model": "qwen-local"
+    }
+  },
+  "evaluators": [
+    {
+      "name": "1. Beads Issue Tracker Used",
+      "script": [
+        "bash",
+        "-c",
+        "if [ ! -d '.beads' ] || ! grep -q 'task' .beads/*.json 2>/dev/null; then echo 'Agent failed to use `bd create` or `bd update` to track its task.' >&2; exit 1; fi"
+      ],
+      "weight": 1.0
+    },
+    {
+      "name": "2. NeuroStrata Memory Extracted",
+      "script": [
+        "bash",
+        "-c",
+        "if [ ! -d '.NeuroStrata/sessions' ] || [ -z \"$(find .NeuroStrata/sessions -type f -name '*.jsonl' 2>/dev/null)\" ]; then echo 'Agent failed to log memories into NeuroStrata. The Pre-Push Hook would have blocked this.' >&2; exit 1; fi"
+      ],
+      "weight": 1.0
+    },
+    {
+      "name": "3. Code Committed and Pushed",
+      "script": [
+        "bash",
+        "-c",
+        "if ! git log -1 --pretty=%B | grep -q 'hello.txt'; then echo 'Agent failed to git commit the changes.' >&2; exit 1; fi"
+      ],
+      "weight": 1.0
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+FROM node:20-bookworm
+RUN apt-get update && apt-get install -y git curl jq
+# Install Beads
+RUN curl -fsSL https://raw.githubusercontent.com/Cognilogical/beads/main/install.sh | bash
+# Initialize a mock remote to allow 'git push' to succeed
+RUN mkdir -p /mock-remote && cd /mock-remote && git init --bare
+# Provide an agent script runner that takes OPENAI_API_KEY if needed
