@@ -35,13 +35,35 @@ export const UIPanel: React.FC<Props> = ({
   const handleOpenInEditor = () => {
     if (!selectedNode || !selectedNode.absolute_path) return;
     const path = selectedNode.absolute_path;
-    let url = '';
-    switch (editor) {
-      case 'vscode': url = `vscode://file/${encodeURIComponent(path)}`; break;
-      case 'cursor': url = `cursor://file/${encodeURIComponent(path)}`; break;
-      case 'obsidian': url = `obsidian://open?path=${encodeURIComponent(path)}`; break;
+    
+    // Attempt to derive project root from absolute path and relative location
+    let rootPath = '';
+    if (selectedNode.location) {
+      // Remove leading ./ or / from location
+      const loc = selectedNode.location.replace(/^(\.\/|\/)/, '');
+      if (path.endsWith(loc)) {
+         rootPath = path.slice(0, -loc.length);
+         // remove trailing slash
+         if (rootPath.endsWith('/')) rootPath = rootPath.slice(0, -1);
+      }
     }
-    window.open(url, '_blank');
+
+    if (editor === 'vscode' || editor === 'cursor') {
+      const scheme = editor === 'vscode' ? 'vscode://file' : 'cursor://file';
+      if (rootPath) {
+        // Open the workspace folder first
+        window.open(`${scheme}${encodeURI(rootPath)}`, '_self');
+        // Give the editor a moment to focus the workspace, then open the specific file
+        setTimeout(() => {
+          window.open(`${scheme}${encodeURI(path)}`, '_self');
+        }, 500);
+      } else {
+        window.open(`${scheme}${encodeURI(path)}`, '_self');
+      }
+    } else {
+      const url = `obsidian://open?path=${encodeURIComponent(path)}`;
+      window.open(url, '_self');
+    }
   };
 
   // Candy glassmorphism bevel effect class
