@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/2.0.0/tauri.schema.json",
-  "productName": "NeuroStrata",
+  "productName": "SynapticGraph Visualizer",
   "version": "0.1.1",
   "identifier": "com.cognilogical.neurostrata",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "NeuroStrata Graph",
+        "title": "SynapticGraph Visualizer",
         "width": 1200,
         "height": 800,
         "fullscreen": false,

@@ -136,7 +136,7 @@ export const UIPanel: React.FC<Props> = ({
                       <div className="text-xs text-gray-400">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
                       <div className="flex items-center justify-between gap-2 mt-2">
                         <select 
-                          className="bg-black/50 text-xs text-white border border-white/20 rounded p-1 outline-none focus:bg-gray-800"
+                          className="bg-gray-800 hover:bg-gray-700 text-white text-sm font-medium border border-gray-600 rounded px-2 py-1.5 shadow-sm focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer transition-colors"
                           value={editor}
                           onChange={handleEditorChange}
                         >
@@ -184,7 +184,7 @@ export const UIPanel: React.FC<Props> = ({
             type="checkbox" 
             checked={viewMode === '3d'} 
             onChange={(e) => setViewMode(e.target.checked ? '3d' : '2d')} 
-            className="accent-white w-5 h-5 rounded border-white/30 bg-white/10 cursor-pointer" 
+            className="appearance-none w-5 h-5 border-2 border-white rounded-sm bg-transparent checked:bg-white checked:border-white relative flex items-center justify-center cursor-pointer transition-colors after:content-[''] checked:after:content-['✔'] checked:after:text-black checked:after:text-sm checked:after:font-black checked:after:absolute" 
           />
           <span className="font-bold text-lg tracking-wider drop-shadow-md group-hover:text-white text-gray-200">3D</span>
         </label>
