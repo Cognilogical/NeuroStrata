@@ -44,32 +44,29 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
   
   useEffect(() => {
     if (selectedNode && fgRef.current) {
-      // Find the actual node object in the graph with coordinates
-      const graphNode = fgRef.current.graphData().nodes.find((n: any) => n.id === selectedNode.id);
+      if (!data || !data.nodes) return;
+      
+      const graphNode = data.nodes.find((n: any) => n.id === selectedNode.id);
       
       if (graphNode && typeof graphNode.x === 'number' && !Number.isNaN(graphNode.x)) {
-        // Safely extract coordinates (defaulting to 0 to prevent NaN or undefined passing to WebGL)
         const nx = graphNode.x || 0;
         const ny = graphNode.y || 0;
         const nz = graphNode.z || 0;
 
-        // Safe check for distance calculation
         const distance = Math.hypot(nx, ny, nz);
-        const distRatio = 1 + 60 / (distance || 1); // fallback to 1 if distance is 0
+        const distRatio = 1 + 60 / (distance || 1);
         
-        // Define new camera position relative to node
         const newPos = distance > 0
           ? { x: nx * distRatio, y: ny * distRatio, z: nz * distRatio }
-          : { x: 0, y: 0, z: 100 }; // fallback
+          : { x: 0, y: 0, z: 100 };
         
-        // Explicitly extract primitive numbers for lookAt to avoid proxy object mutations
         const lookAtPos = { x: nx, y: ny, z: nz };
         
-        fgRef.current.cameraPosition(
-          newPos, // new position
-          lookAtPos, // lookAt
-          1500  // ms transition duration
-        );
+        try {
+          fgRef.current.cameraPosition(newPos, lookAtPos, 1500);
+        } catch (err) {
+          console.error('Failed to set camera position:', err);
+        }
       }
     }
   }, [selectedNode, data]);
@@ -115,26 +112,34 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     
     const sprite = new THREE.Sprite(material);
     sprite.scale.set(size, size, 1);
+    
+    // Store original size and material for selection toggling
+    sprite.userData = {
+      originalMaterial: material,
+      originalSize: size
+    };
+    
     return sprite;
   }, [nodeMaterials, defaultNodeMaterial]);
 
   useEffect(() => {
-    if (fgRef.current) {
-      const nodes = fgRef.current.graphData().nodes;
-      nodes.forEach((node: any) => {
-        if (node.__threeObj) {
-          const mNode = node as MemoryNode;
-          const isSelected = selectedNode && selectedNode.id === mNode.id;
-          const size = Math.max(16, (mNode.degree || 1) * 3) * (isSelected ? 1.5 : 1);
-          const material = isSelected ? highlightMaterial : (nodeMaterials[mNode.memory_type] || defaultNodeMaterial);
-          
-          const sprite = node.__threeObj as THREE.Sprite;
-          sprite.material = material;
-          sprite.scale.set(size, size, 1);
-        }
-      });
-    }
-  }, [selectedNode, data, nodeMaterials, highlightMaterial, defaultNodeMaterial]);
+    if (!data || !data.nodes) return;
+    
+    data.nodes.forEach((node: any) => {
+      const obj = node.__threeObj;
+      if (!obj) return;
+      
+      const isSelected = selectedNode && selectedNode.id === node.id;
+      
+      if (isSelected) {
+        obj.material = highlightMaterial;
+        obj.scale.set(obj.userData.originalSize * 1.5, obj.userData.originalSize * 1.5, 1);
+      } else {
+        obj.material = obj.userData.originalMaterial;
+        obj.scale.set(obj.userData.originalSize, obj.userData.originalSize, 1);
+      }
+    });
+  }, [selectedNode, data, highlightMaterial]);
 
   const getLinkColor = useCallback((link: any) => {
     const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);

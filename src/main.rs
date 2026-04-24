@@ -135,7 +135,8 @@ async fn main() -> anyhow::Result<()> {
                 // Build the physical Software Graph (AST + Files)
                 let skipped_dirs = [
                     "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
-                    "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__"
+                    "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__",
+                    ".fastembed_cache", ".idea", ".vscode", "coverage"
                 ];
 
                 for entry in walkdir::WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {

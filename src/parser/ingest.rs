@@ -27,7 +27,8 @@ pub async fn ingest_directory(
 
     let skipped_dirs = [
         "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
-        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__"
+        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__",
+        ".fastembed_cache", ".idea", ".vscode", "coverage"
     ];
 
     for result in walker {

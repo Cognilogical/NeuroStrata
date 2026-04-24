@@ -1,0 +1,8 @@
+{
+  "run_id": "e51ac96d-4257-48ff-88d5-98d5b7bf4cba",
+  "epoch_number": 1,
+  "stdout": "",
+  "stderr": "bash: ./.neuroplasticity/run_mock_agent.sh: No such file or directory\n",
+  "score": 0.0,
+  "mutations": []
+}
