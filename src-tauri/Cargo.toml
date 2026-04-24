@@ -1,0 +1,15 @@
+[package]
+name = "neurostrata"
+version = "0.1.1"
+description = "NeuroStrata Graph Explorer"
+authors = ["Cognilogical"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0.0", features = [] }
+tauri-plugin-shell = "2.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
