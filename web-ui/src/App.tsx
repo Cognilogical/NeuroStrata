@@ -37,7 +37,7 @@ function App() {
           uniqueTypes.forEach(t => {
             // Default to true, except for physical files which we want to hide from the graph by default
             if (next[t] === undefined) {
-              next[t] = !['directory', 'markdown', 'code_ast'].includes(t);
+              next[t] = !['directory'].includes(t);
             }
           });
           return next;
