@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { open } from '@tauri-apps/plugin-shell';
 import type { MemoryNode, MemoryLink } from '../types';
 
 interface Props {
@@ -32,6 +33,18 @@ export const UIPanel: React.FC<Props> = ({
     localStorage.setItem('neurostrata_editor', val);
   };
 
+  const launchUrl = async (url: string) => {
+    try {
+      if ('__TAURI_INTERNALS__' in window) {
+        await open(url);
+      } else {
+        window.open(url, '_self');
+      }
+    } catch (e) {
+      console.error("Failed to open URL:", e);
+    }
+  };
+
   const handleOpenInEditor = () => {
     if (!selectedNode || !selectedNode.absolute_path) return;
     const path = selectedNode.absolute_path;
@@ -52,17 +65,17 @@ export const UIPanel: React.FC<Props> = ({
       const scheme = editor === 'vscode' ? 'vscode://file' : 'cursor://file';
       if (rootPath) {
         // Open the workspace folder first
-        window.open(`${scheme}${encodeURI(rootPath)}`, '_self');
+        launchUrl(`${scheme}${encodeURI(rootPath)}`);
         // Give the editor a moment to focus the workspace, then open the specific file
         setTimeout(() => {
-          window.open(`${scheme}${encodeURI(path)}`, '_self');
+          launchUrl(`${scheme}${encodeURI(path)}`);
         }, 500);
       } else {
-        window.open(`${scheme}${encodeURI(path)}`, '_self');
+        launchUrl(`${scheme}${encodeURI(path)}`);
       }
     } else {
       const url = `obsidian://open?path=${encodeURIComponent(path)}`;
-      window.open(url, '_self');
+      launchUrl(url);
     }
   };
 
@@ -123,13 +136,13 @@ export const UIPanel: React.FC<Props> = ({
                       <div className="text-xs text-gray-400">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
                       <div className="flex items-center justify-between gap-2 mt-2">
                         <select 
-                          className="bg-black/50 text-xs text-white border border-white/20 rounded p-1"
+                          className="bg-black/50 text-xs text-white border border-white/20 rounded p-1 outline-none focus:bg-gray-800"
                           value={editor}
                           onChange={handleEditorChange}
                         >
-                          <option value="vscode">VS Code</option>
-                          <option value="cursor">Cursor</option>
-                          <option value="obsidian">Obsidian</option>
+                          <option className="bg-gray-900 text-white" value="vscode">VS Code</option>
+                          <option className="bg-gray-900 text-white" value="cursor">Cursor</option>
+                          <option className="bg-gray-900 text-white" value="obsidian">Obsidian</option>
                         </select>
                         <button 
                           onClick={handleOpenInEditor}
