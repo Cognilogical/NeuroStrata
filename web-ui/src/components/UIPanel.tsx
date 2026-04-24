@@ -136,13 +136,14 @@ export const UIPanel: React.FC<Props> = ({
                       <div className="text-xs text-gray-400">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
                       <div className="flex items-center justify-between gap-2 mt-2">
                         <select 
-                          className="bg-gray-800 hover:bg-gray-700 text-white text-sm font-medium border border-gray-600 rounded px-2 py-1.5 shadow-sm focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer transition-colors"
+                          className="text-sm font-bold border border-gray-500 rounded px-2 py-1.5 shadow-sm focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
+                          style={{ backgroundColor: '#111827', color: '#ffffff' }}
                           value={editor}
                           onChange={handleEditorChange}
                         >
-                          <option className="bg-gray-900 text-white" value="vscode">VS Code</option>
-                          <option className="bg-gray-900 text-white" value="cursor">Cursor</option>
-                          <option className="bg-gray-900 text-white" value="obsidian">Obsidian</option>
+                          <option style={{ backgroundColor: '#111827', color: '#ffffff' }} value="vscode">VS Code</option>
+                          <option style={{ backgroundColor: '#111827', color: '#ffffff' }} value="cursor">Cursor</option>
+                          <option style={{ backgroundColor: '#111827', color: '#ffffff' }} value="obsidian">Obsidian</option>
                         </select>
                         <button 
                           onClick={handleOpenInEditor}
