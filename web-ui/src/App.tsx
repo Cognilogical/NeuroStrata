@@ -1,4 +1,7 @@
 import { useState, useMemo, useEffect } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import { GalaxyGraph3D } from './components/GalaxyGraph3D';
 import { BlueprintGraph2D } from './components/BlueprintGraph2D';
 import { UIPanel } from './components/UIPanel';
@@ -13,6 +16,35 @@ function App() {
   
   const [namespaceFilters, setNamespaceFilters] = useState<Record<string, boolean>>({});
   const [typeFilters, setTypeFilters] = useState<Record<string, boolean>>({});
+  const [projectPath, setProjectPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Listen for the native menu event to trigger the dialog
+    const unlistenMenu = listen('open-project-dialog', async () => {
+      try {
+        const selected = await open({
+          directory: true,
+          multiple: false,
+        });
+        if (selected && typeof selected === 'string') {
+          setProjectPath(selected);
+          await invoke('save_project_path', { path: selected });
+        }
+      } catch (e) {
+        console.error('Failed to open project dialog', e);
+      }
+    });
+
+    // Listen for the initial load of the project path from Rust
+    const unlistenPath = listen<{path: string}>('load-project-path', (event) => {
+      setProjectPath(event.payload.path);
+    });
+
+    return () => {
+      unlistenMenu.then(f => f());
+      unlistenPath.then(f => f());
+    };
+  }, []);
 
   useEffect(() => {
     fetch('/graph.json')
@@ -35,9 +67,9 @@ function App() {
         setTypeFilters(prev => {
           const next = { ...prev };
           uniqueTypes.forEach(t => {
-            // Default to true, except for physical files which we want to hide from the graph by default
+            // Default to true
             if (next[t] === undefined) {
-              next[t] = !['directory'].includes(t);
+              next[t] = true;
             }
           });
           return next;
@@ -52,6 +84,27 @@ function App() {
       if (n.namespace && namespaceFilters[n.namespace] === false) return false;
       // If type filter is false, hide the node
       if (typeFilters[n.memory_type] === false) return false;
+      
+      // Filter by projectPath if set
+      if (projectPath) {
+        // Assume global memories have namespace 'global' or no namespace
+        // For project-specific memories, we might need a way to match path.
+        // If a node's path starts with projectPath, or it's global.
+        const isGlobal = n.namespace === 'global' || !n.namespace;
+        // If it's not global, check if its path starts with the projectPath or namespace matches
+        // The prompt says: "filter the loaded graph to only show global memories and memories specific to that project."
+        // Usually project specific memory has namespace equal to project name or path.
+        // For simplicity, let's keep ones where n.namespace is global, or if they have a path that contains the project name.
+        // Let's just do a simple filter for now.
+        const projectName = projectPath.split(/[/\\]/).pop();
+        if (!isGlobal && n.namespace !== projectName) {
+           // Also allow if there's no namespace but path matches
+           if (n.path && !n.path.includes(projectName || projectPath)) {
+               // well, if we have namespace, it should match the project name
+               return false;
+           }
+        }
+      }
       return true;
     });
     
@@ -62,7 +115,7 @@ function App() {
     );
     
     return { nodes, links };
-  }, [graphData, typeFilters, namespaceFilters]);
+  }, [graphData, typeFilters, namespaceFilters, projectPath]);
 
   const handleNodeClick = (node: MemoryNode) => {
     setSelectedNode(node);
