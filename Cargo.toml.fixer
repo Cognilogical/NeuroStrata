@@ -1,0 +1,7 @@
+[package]
+name = "fixer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kuzu = "=0.11.3"
