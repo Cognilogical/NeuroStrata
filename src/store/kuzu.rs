@@ -365,7 +365,7 @@ impl VectorStore for KuzuStore {
         
         // 1. Fetch all nodes
         let mut nodes = Vec::new();
-        let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.domain;";
+        let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
         let mut result_nodes = conn.query(query_nodes)?;
         
         while let Some(row) = result_nodes.next() {
@@ -373,13 +373,39 @@ impl VectorStore for KuzuStore {
             let namespace = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
             let memory_type = if let kuzu::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
             let content = if let kuzu::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
-            let domain = if let kuzu::Value::String(s) = &row[4] { Some(s.clone()) } else { None };
+            let location = if let kuzu::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
+            
+            let mut absolute_path = "".to_string();
+            let mut domain = None;
+
+            if let kuzu::Value::String(metadata_str) = &row[5] {
+                if let Ok(metadata_val) = serde_json::from_str::<serde_json::Value>(metadata_str) {
+                    if let Some(abs_path) = metadata_val.get("absolute_path").and_then(|v| v.as_str()) {
+                        absolute_path = abs_path.to_string();
+                    }
+                    if let Some(d) = metadata_val.get("domain").and_then(|v| v.as_str()) {
+                        domain = Some(d.to_string());
+                    }
+                }
+            }
+
+            // If absolute_path wasn't in metadata, try to compute it from location
+            if absolute_path.is_empty() && !location.is_empty() {
+                let p = std::path::Path::new(&location);
+                if p.is_absolute() {
+                    absolute_path = location.clone();
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    absolute_path = cwd.join(p).canonicalize().unwrap_or_default().to_string_lossy().to_string();
+                }
+            }
             
             nodes.push(serde_json::json!({
                 "id": id,
                 "namespace": namespace,
                 "memory_type": memory_type,
                 "content": content,
+                "location": location,
+                "absolute_path": absolute_path,
                 "domain": domain,
             }));
         }

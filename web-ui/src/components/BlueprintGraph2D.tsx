@@ -14,6 +14,7 @@ const ICON_PATHS: Record<string, string> = {
   directory: 'M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z', // Folder
   markdown: 'M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z', // File text
   code_ast: 'M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z', // Code brackets
+  file: 'M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z', // Code brackets
   rule: 'M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z', // Shield
   persona: 'M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z', // User
   bootstrap: 'M7 2v11h3v9l7-12h-4l4-8z', // Flash/Lightning
@@ -93,8 +94,9 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
           const highlight = isSourceSelected || isTargetSelected;
           
           if (highlight) return 'rgba(255, 255, 255, 0.9)';
-          if (link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
-          if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
+          if (link.type === 'CONTAINS' || link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
+          if (link.type === 'RELATES_TO' || link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
+          if (link.type === 'GOVERNS') return 'rgba(100, 255, 218, 0.6)';
           return 'rgba(100, 255, 218, 0.2)';
         }}
         linkWidth={(link: any) => {
@@ -102,7 +104,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
           const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
           if (isSourceSelected || isTargetSelected) return 4;
 
-          return link.type === 'links_to' ? 3 : 1.5;
+          return (link.type === 'RELATES_TO' || link.type === 'links_to') ? 3 : 1.5;
         }}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
