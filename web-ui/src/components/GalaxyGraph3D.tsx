@@ -19,6 +19,7 @@ const colorMap: Record<string, string> = {
   directory: '#555555',
   markdown: '#ffffff',
   code_ast: '#ffcc00',
+  file: '#ffcc00',
 };
 
 const getGlowTexture = () => {
@@ -147,8 +148,9 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     const highlight = isSourceSelected || isTargetSelected;
     
     if (highlight) return 'rgba(255, 255, 255, 0.9)';
-    if (link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
-    if (link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
+    if (link.type === 'CONTAINS' || link.type === 'contains') return 'rgba(100, 150, 255, 0.4)';
+    if (link.type === 'RELATES_TO' || link.type === 'links_to') return 'rgba(255, 100, 255, 0.6)';
+    if (link.type === 'GOVERNS') return 'rgba(100, 255, 218, 0.6)';
     return 'rgba(255, 255, 255, 0.2)';
   }, [selectedNode]);
 
@@ -157,7 +159,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
     if (isSourceSelected || isTargetSelected) return 6;
     
-    return link.type === 'links_to' ? 3 : 1.5;
+    return (link.type === 'RELATES_TO' || link.type === 'links_to') ? 3 : 1.5;
   }, [selectedNode]);
 
   return (

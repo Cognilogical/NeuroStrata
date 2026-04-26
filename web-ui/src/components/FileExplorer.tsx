@@ -13,7 +13,7 @@ export const FileExplorer: React.FC<Props> = ({ nodes, selectedNode, onNodeSelec
   const panelGlassClass = "p-5 rounded-2xl bg-black/60 backdrop-blur-xl border border-white/20 shadow-[0_8px_32px_rgba(0,0,0,0.5),inset_0_1px_1px_rgba(255,255,255,0.4),inset_0_-1px_1px_rgba(255,255,255,0.1)] text-white";
 
   // Filter only physical files/directories
-  const fileNodes = nodes.filter(n => ['directory', 'markdown', 'code_ast'].includes(n.memory_type));
+  const fileNodes = nodes.filter(n => ['directory', 'markdown', 'code_ast', 'file'].includes(n.memory_type));
   
   // Sort by path (id) to keep directories and their files grouped naturally
   fileNodes.sort((a, b) => a.id.localeCompare(b.id));

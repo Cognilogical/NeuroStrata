@@ -125,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
                     std::fs::create_dir_all(parent)?;
                 }
 
+                // Ensure tables exist before exporting
+                vector_store.init("global").await?;
+
                 // Query the graph natively through the active store (Kuzu)
                 let graph_data = vector_store.export_graph().await?;
 

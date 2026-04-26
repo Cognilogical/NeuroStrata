@@ -50,6 +50,27 @@ function App() {
     fetch('/graph.json')
       .then(res => res.json())
       .then((data: GraphData) => {
+        
+        // Backwards compatibility & new mechanics parsing
+        data.nodes.forEach(n => {
+          // If node doesn't have a name, derive it from the ID
+          if (!n.name) {
+            n.name = n.id.split(/[/\\]/).pop() || n.id;
+          }
+          n.degree = 0;
+        });
+
+        // Compute degree for node sizing based on Kuzu edges
+        data.links.forEach(l => {
+          const sourceId = typeof l.source === 'object' ? (l.source as any).id : l.source;
+          const targetId = typeof l.target === 'object' ? (l.target as any).id : l.target;
+          
+          const sNode = data.nodes.find(n => n.id === sourceId);
+          const tNode = data.nodes.find(n => n.id === targetId);
+          if (sNode) sNode.degree++;
+          if (tNode) tNode.degree++;
+        });
+
         setGraphData(data);
         
         // Dynamically initialize namespace filters based on data
