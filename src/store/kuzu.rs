@@ -64,15 +64,15 @@ impl VectorStore for KuzuStore {
     ) -> Result<()> {
         let conn = self.get_conn()?;
 
-        let safe_id = id.replace("'", "''");
-        let safe_ns = namespace.replace("'", "''");
-        let safe_content = payload.content.replace("'", "''");
-        let safe_user_id = payload.user_id.replace("'", "''");
-        let safe_memory_type = payload.memory_type.replace("'", "''");
-        let safe_agent_name = payload.agent_name.unwrap_or_else(|| "unknown".to_string()).replace("'", "''");
-        let safe_location = payload.location.replace("'", "''");
-        let safe_location_lines = payload.location_lines.replace("'", "''");
-        let safe_metadata = serde_json::to_string(&payload.metadata)?.replace("'", "''");
+        let safe_id = id.replace("'", "\\'");
+        let safe_ns = namespace.replace("'", "\\'");
+        let safe_content = payload.content.replace("'", "\\'");
+        let safe_user_id = payload.user_id.replace("'", "\\'");
+        let safe_memory_type = payload.memory_type.replace("'", "\\'");
+        let safe_agent_name = payload.agent_name.unwrap_or_else(|| "unknown".to_string()).replace("'", "\\'");
+        let safe_location = payload.location.replace("'", "\\'");
+        let safe_location_lines = payload.location_lines.replace("'", "\\'");
+        let safe_metadata = serde_json::to_string(&payload.metadata)?.replace("'", "\\'");
         
         let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
@@ -90,7 +90,7 @@ impl VectorStore for KuzuStore {
         if let Some(related) = payload.metadata.get("related_to").and_then(|r| r.as_array()) {
             for rel in related {
                 if let Some(rel_id) = rel.as_str() {
-                    let rel_id_safe = rel_id.replace("'", "''");
+                    let rel_id_safe = rel_id.replace("'", "\\'");
                     let edge_query = format!(
                         "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:RELATES_TO]->(b)",
                         safe_id, rel_id_safe
@@ -110,7 +110,7 @@ impl VectorStore for KuzuStore {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "''");
+        let safe_ns = namespace.replace("'", "\\'");
         let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
         // Use array_distance for distance metric
@@ -171,8 +171,8 @@ impl VectorStore for KuzuStore {
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "''");
-        let safe_id = id.replace("'", "''");
+        let safe_ns = namespace.replace("'", "\\'");
+        let safe_id = id.replace("'", "\\'");
         
         let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
         conn.query(&query)?;
@@ -181,10 +181,10 @@ impl VectorStore for KuzuStore {
 
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "''");
+        let safe_ns = namespace.replace("'", "\\'");
         
         let query = if let Some(uid) = user_id {
-            format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, uid.replace("'", "''"))
+            format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, uid.replace("'", "\\'"))
         } else {
             format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns)
         };
@@ -224,8 +224,8 @@ impl VectorStore for KuzuStore {
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "''");
-        let safe_id = id.replace("'", "''");
+        let safe_ns = namespace.replace("'", "\\'");
+        let safe_id = id.replace("'", "\\'");
 
         let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
         

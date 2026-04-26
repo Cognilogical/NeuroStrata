@@ -78,25 +78,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(batch) = stream.next().await {
             let batch: RecordBatch = batch?;
             let ids = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let contents = batch.column_by_name("content").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let user_ids = batch.column_by_name("user_id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let memory_types = batch.column_by_name("memory_type").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let agent_names = batch.column_by_name("agent_name").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let locations = batch.column_by_name("location").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let location_lines = batch.column_by_name("location_lines").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-            let metadatas = batch.column_by_name("metadata").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+            let contents = if let Some(col) = batch.column_by_name("content") {
+                col.as_any().downcast_ref::<StringArray>().unwrap()
+            } else {
+                batch.column_by_name("data").unwrap().as_any().downcast_ref::<StringArray>().unwrap()
+            };
+            let user_ids_opt = batch.column_by_name("user_id").map(|c| c.as_any().downcast_ref::<StringArray>().unwrap());
+            let memory_types_opt = batch.column_by_name("memory_type").map(|c| c.as_any().downcast_ref::<StringArray>().unwrap());
+            let agent_names_opt = batch.column_by_name("agent_name").map(|c| c.as_any().downcast_ref::<StringArray>().unwrap());
+            let locations_opt = batch.column_by_name("location").map(|c| c.as_any().downcast_ref::<StringArray>().unwrap());
+            let location_lines_opt = batch.column_by_name("location_lines").map(|c| c.as_any().downcast_ref::<StringArray>().unwrap());
+            let metadatas_opt = batch.column_by_name("metadata").map(|c| c.as_any().downcast_ref::<StringArray>().unwrap());
             let vectors = batch.column_by_name("vector").unwrap().as_any().downcast_ref::<FixedSizeListArray>().unwrap();
 
             for i in 0..batch.num_rows() {
-                let id = ids.value(i).replace("'", "''");
-                let ns = namespace.replace("'", "''");
-                let content = contents.value(i).replace("'", "''");
-                let user_id = user_ids.value(i).replace("'", "''");
-                let memory_type = memory_types.value(i).replace("'", "''");
-                let agent_name = agent_names.value(i).replace("'", "''");
-                let location = locations.value(i).replace("'", "''");
-                let location_lines = location_lines.value(i).replace("'", "''");
-                let metadata = metadatas.value(i).replace("'", "''");
+                let id = ids.value(i).replace("'", "\\'");
+                let ns = namespace.replace("'", "\\'");
+                let content = contents.value(i).replace("'", "\\'");
+                let user_id = user_ids_opt.map(|a| a.value(i)).unwrap_or("user").replace("'", "\\'");
+                let memory_type = memory_types_opt.map(|a| a.value(i)).unwrap_or("rule").replace("'", "\\'");
+                let agent_name = agent_names_opt.map(|a| a.value(i)).unwrap_or("system").replace("'", "\\'");
+                let location = locations_opt.map(|a| a.value(i)).unwrap_or("").replace("'", "\\'");
+                let location_lines = location_lines_opt.map(|a| a.value(i)).unwrap_or("").replace("'", "\\'");
+                let metadata = metadatas_opt.map(|a| a.value(i)).unwrap_or("{}").replace("'", "\\'");
                 
                 let float_arr = vectors.value(i).as_any().downcast_ref::<Float32Array>().unwrap().clone();
                 let vec: Vec<f32> = float_arr.values().to_vec();
@@ -129,12 +133,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(related) = metadata_val.get("related_to").and_then(|r| r.as_array()) {
                     for rel in related {
                         if let Some(rel_id) = rel.as_str() {
-                            let rel_id_safe = rel_id.replace("'", "''");
+                            let rel_id_safe = rel_id.replace("'", "\\'");
                             // Create edge if both nodes exist
                             let edge_query = format!(
                                 "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}})
                                 MERGE (a)-[:RELATES_TO]->(b)",
-                                id.replace("'", "''"), rel_id_safe
+                                id.replace("'", "\\'"), rel_id_safe
                             );
                             if let Err(e) = conn.query(&edge_query) {
                                 eprintln!("Failed to create edge {} -> {}: {}", id, rel_id, e);
