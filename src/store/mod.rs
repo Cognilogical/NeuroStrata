@@ -1,3 +1,4 @@
 pub mod lancedb;
+pub mod kuzu;
 
-pub use self::lancedb::LanceDBStore;
+pub use self::kuzu::KuzuStore;
