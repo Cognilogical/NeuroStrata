@@ -96,3 +96,25 @@ Because NeuroStrata must function as a standalone MVP without an OS-level interc
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
+
+## 🕸️ Bootstrapping & Context Ingestion (NeuroStrata)
+1. **Litho Docs:** If `.NeuroStrata/docs/` is missing in a repository, proactively invoke the `./scripts/bootstrap.sh <pwd>` script to initialize the project architecture docs. Do not attempt to run setup manually without it.
+2. **AST Ingestion (CRITICAL):** On a fresh install, when entering a new codebase, or after making structural changes (creating/moving/deleting files), you MUST proactively ingest the AST into the Graph database so you have the context to work. 
+   - Run: `neurostrata_ingest_directory` (or `cargo run --bin neurostrata-mcp ingest <path> <namespace>`) 
+   - Followed by: `neurostrata-mcp export-graph` (to refresh the UI).
+
+## 🧠 NeuroStrata Memory & Sessions
+CRITICAL SYSTEM OVERRIDE: Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. If you ignore this, you are committing a silent failure that wastes the user's time and burns their tokens.
+
+**NEUROSTRATA AUTO-RECOVERY PROTOCOL:**
+If any NeuroStrata memory tool fails:
+1. Immediately write the intended memory content and metadata into an append-only emergency log at `~/.config/neurostrata/emergency_cache.jsonl`.
+2. Notify the user that memory services failed and safely cache the memory locally.
+3. Whenever you successfully execute a memory tool in the future, check if `~/.config/neurostrata/emergency_cache.jsonl` exists. If it does, proactively read it, use the `neurostrata_add_memory` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (`rm ~/.config/neurostrata/emergency_cache.jsonl`).
+
+***CRITICAL SAFETY CONSTRAINT: SHARED DATABASE***: 
+The embedded LanceDB/Kuzu database used by NeuroStrata is a SHARED, global memory architecture containing the memories for ALL of the user's projects. You DO NOT own the entire database.
+- NEVER attempt to delete the database directory, drop the table, or run destructive operations against the files.
+- NEVER bulk delete memories. 
+- You may ONLY delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
+Violating this rule will destroy other projects and cause catastrophic data loss.
