@@ -52,6 +52,12 @@ impl VectorStore for KuzuStore {
         let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory)";
         conn.query(create_rel_table).ok();
 
+        let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory)";
+        conn.query(create_contains_table).ok();
+
+        let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory)";
+        conn.query(create_governs_table).ok();
+
         Ok(())
     }
 
@@ -113,7 +119,7 @@ impl VectorStore for KuzuStore {
         let safe_ns = namespace.replace("'", "\\'");
         let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
-        // Use array_distance for distance metric
+        // Step 1: Base vector search
         let search_query = format!(
             "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
             safe_ns, vec_str, limit
@@ -121,6 +127,7 @@ impl VectorStore for KuzuStore {
 
         let result = conn.query(&search_query)?;
         let mut results = Vec::new();
+        let mut primary_ids = Vec::new();
 
         for row in result {
             let id: String = format!("{}", row[0]);
@@ -148,6 +155,8 @@ impl VectorStore for KuzuStore {
             let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
             let boosted_distance = distance - (access_count as f32 * 0.05);
 
+            primary_ids.push(id.clone());
+
             results.push(SearchResult {
                 id,
                 score: boosted_distance,
@@ -163,8 +172,55 @@ impl VectorStore for KuzuStore {
             });
         }
 
+        // Step 2: Hybrid GraphRAG Neighborhood Fetch
+        // We fetch 1-hop neighbors (CONTAINS, GOVERNS, RELATES_TO) to provide blast radius context
+        if !primary_ids.is_empty() {
+            let id_list = primary_ids.iter()
+                .map(|id| format!("'{}'", id.replace("'", "\\'")))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // Query any neighbors connected to our primary matches
+            let neighbor_query = format!(
+                "MATCH (a:Memory)-[]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata LIMIT {}",
+                id_list, safe_ns, id_list, limit
+            );
+
+            if let Ok(mut neighbor_result) = conn.query(&neighbor_query) {
+                while let Some(row) = neighbor_result.next() {
+                    let id: String = format!("{}", row[0]);
+                    let content: String = format!("{}", row[1]);
+                    let user_id: String = format!("{}", row[2]);
+                    let memory_type: String = format!("{}", row[3]);
+                    let agent_name: String = format!("{}", row[4]);
+                    let location: String = format!("{}", row[5]);
+                    let location_lines: String = format!("{}", row[6]);
+                    let metadata_str: String = format!("{}", row[7]);
+
+                    let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+
+                    // Neighbors get a synthesized lower score (worse distance) so they appear after primary matches,
+                    // but still within the context window.
+                    results.push(SearchResult {
+                        id,
+                        score: 10.0, // High distance (low relevance score) ensures they rank below direct matches
+                        payload: MemoryPayload {
+                            content,
+                            user_id,
+                            memory_type,
+                            agent_name: Some(agent_name),
+                            location,
+                            location_lines,
+                            metadata: metadata_val,
+                        },
+                    });
+                }
+            }
+        }
+
         results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit);
+        // We can truncate to a slightly larger limit to include some neighbors, or keep it strict
+        results.truncate(limit * 2);
 
         Ok(results)
     }
@@ -243,7 +299,7 @@ impl VectorStore for KuzuStore {
                 }
             }
             
-            let content: String = format!("{}", row[1]);
+            let mut content: String = format!("{}", row[1]);
             let uid: String = format!("{}", row[2]);
             let memory_type: String = format!("{}", row[3]);
             let agent_name: String = format!("{}", row[4]);
@@ -253,34 +309,126 @@ impl VectorStore for KuzuStore {
 
             let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
-            let payload = MemoryPayload {
-                content,
-                user_id: uid,
-                memory_type,
-                agent_name: Some(agent_name),
-                location,
-                location_lines,
-                metadata: metadata_val,
-            };
+            // Fetch graph neighborhood (AST upward inheritance, blast radius)
+            let neighbor_query = format!(
+                "MATCH (m:Memory)-[r]-(n:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN type(r), n.content LIMIT 5",
+                safe_ns, safe_id
+            );
 
-            return Ok(Some((vec, payload)));
+            if let Ok(mut neighbor_res) = conn.query(&neighbor_query) {
+                let mut context_added = false;
+                while let Some(n_row) = neighbor_res.next() {
+                    if !context_added {
+                        content.push_str("\n\n--- Graph Context (Neighborhood) ---\n");
+                        context_added = true;
+                    }
+                    let rel_type = format!("{}", n_row[0]);
+                    let n_content = format!("{}", n_row[1]);
+                    content.push_str(&format!("\n[{}] Neighbor:\n{}\n", rel_type, n_content));
+                }
+            }
+
+            return Ok(Some((
+                vec,
+                MemoryPayload {
+                    content,
+                    user_id: uid,
+                    memory_type,
+                    agent_name: Some(agent_name),
+                    location,
+                    location_lines,
+                    metadata: metadata_val,
+                },
+            )));
         }
 
         Ok(None)
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
-        let conn = self.get_conn()?;
-        let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace";
+        let conn = Connection::new(&self.db)?;
+        let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
+        let mut result = conn.query(query)?;
         
-        let result = conn.query(query)?;
         let mut namespaces = Vec::new();
+        while let Some(row) = result.next() {
+            if let kuzu::Value::String(ns) = row[0].clone() {
+                namespaces.push(ns);
+            }
+        }
+        
+        Ok(namespaces)
+    }
 
-        for row in result {
-            let ns: String = format!("{}", row[0]);
-            namespaces.push(ns);
+    async fn export_graph(&self) -> Result<serde_json::Value> {
+        let conn = Connection::new(&self.db)?;
+        
+        // 1. Fetch all nodes
+        let mut nodes = Vec::new();
+        let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.domain;";
+        let mut result_nodes = conn.query(query_nodes)?;
+        
+        while let Some(row) = result_nodes.next() {
+            let id = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let namespace = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
+            let memory_type = if let kuzu::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
+            let content = if let kuzu::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
+            let domain = if let kuzu::Value::String(s) = &row[4] { Some(s.clone()) } else { None };
+            
+            nodes.push(serde_json::json!({
+                "id": id,
+                "namespace": namespace,
+                "memory_type": memory_type,
+                "content": content,
+                "domain": domain,
+            }));
+        }
+        
+        // 2. Fetch all edges
+        let mut links = Vec::new();
+        
+        // RELATES_TO
+        let query_relates = "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) RETURN a.id, b.id;";
+        let mut res_relates = conn.query(query_relates)?;
+        while let Some(row) = res_relates.next() {
+            let source = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let target = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { continue };
+            links.push(serde_json::json!({
+                "source": source,
+                "target": target,
+                "type": "RELATES_TO"
+            }));
+        }
+        
+        // CONTAINS
+        let query_contains = "MATCH (a:Memory)-[r:CONTAINS]->(b:Memory) RETURN a.id, b.id;";
+        let mut res_contains = conn.query(query_contains)?;
+        while let Some(row) = res_contains.next() {
+            let source = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let target = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { continue };
+            links.push(serde_json::json!({
+                "source": source,
+                "target": target,
+                "type": "CONTAINS"
+            }));
+        }
+        
+        // GOVERNS
+        let query_governs = "MATCH (a:Memory)-[r:GOVERNS]->(b:Memory) RETURN a.id, b.id;";
+        let mut res_governs = conn.query(query_governs)?;
+        while let Some(row) = res_governs.next() {
+            let source = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let target = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { continue };
+            links.push(serde_json::json!({
+                "source": source,
+                "target": target,
+                "type": "GOVERNS"
+            }));
         }
 
-        Ok(namespaces)
+        Ok(serde_json::json!({
+            "nodes": nodes,
+            "links": links
+        }))
     }
 }

@@ -440,7 +440,17 @@ impl VectorStore for LanceDBStore {
         let conn = lancedb::connect(self.local_path.to_str().unwrap())
             .execute()
             .await?;
-        let table_names = conn.table_names().execute().await?;
-        Ok(table_names)
+        let tables = conn.table_names().execute().await?;
+        Ok(tables)
+    }
+
+    async fn export_graph(&self) -> Result<serde_json::Value> {
+        // LanceDB doesn't natively support graph relations easily for this export,
+        // so we'll just return an empty graph or a basic serialization.
+        // For the MVP refactor, this is a stub as Kuzu is the primary graph store.
+        Ok(serde_json::json!({
+            "nodes": [],
+            "links": []
+        }))
     }
 }
