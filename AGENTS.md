@@ -113,7 +113,7 @@ If any NeuroStrata memory tool fails:
 3. Whenever you successfully execute a memory tool in the future, check if `~/.config/neurostrata/emergency_cache.jsonl` exists. If it does, proactively read it, use the `neurostrata_add_memory` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (`rm ~/.config/neurostrata/emergency_cache.jsonl`).
 
 ***CRITICAL SAFETY CONSTRAINT: SHARED DATABASE***: 
-The embedded LanceDB/Kuzu database used by NeuroStrata is a SHARED, global memory architecture containing the memories for ALL of the user's projects. You DO NOT own the entire database.
+The embedded Kuzu database used by NeuroStrata is a SHARED, global memory architecture containing the memories for ALL of the user's projects. You DO NOT own the entire database.
 - NEVER attempt to delete the database directory, drop the table, or run destructive operations against the files.
 - NEVER bulk delete memories. 
 - You may ONLY delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.

@@ -156,9 +156,9 @@ async fn main() -> anyhow::Result<()> {
     let embedder = Arc::new(FastEmbedder::new()?);
     println!("Embedder initialized.");
 
-    // Initialize Embedded LanceDB VectorStore
+    // Initialize Embedded Kuzu VectorStore
     println!(
-        "Initializing Embedded LanceDB Store at {:?}",
+        "Initializing Embedded Kuzu Store at {:?}",
         config.db_path
     );
     let vector_store: Arc<dyn VectorStore> = Arc::new(KuzuStore::new(

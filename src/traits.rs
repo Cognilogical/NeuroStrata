@@ -39,7 +39,7 @@ pub trait Embedder: Send + Sync {
 
 /// The core interface for vector storage and retrieval.
 /// By making this a trait, we can swap between Embedded Qdrant,
-/// Remote Qdrant, LanceDB, or SQLite-VSS.
+/// Remote Qdrant, Kuzu, or SQLite-VSS.
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     /// Ensure the necessary collections/tables exist.
