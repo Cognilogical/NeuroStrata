@@ -12,7 +12,7 @@ install_hook() {
 # NeuroStrata Pre-Push Hook (Behavioral Forcing)
 # Ensures the agent (or user) has extracted knowledge to the memory DB before pushing.
 
-LANCEDB_DIR=".NeuroStrata/lancedb"
+LANCEDB_DIR=".NeuroStrata/kuzu"
 
 # If DB doesn't exist yet, allow the push (might be initial commit or non-NeuroStrata repo)
 if [ ! -d "$LANCEDB_DIR" ]; then
@@ -42,7 +42,7 @@ fi
 
 # Auto-sync the AST Software Graph on push
 if command -v neurostrata-mcp &> /dev/null; then
-    echo -e "\n\033[1;36m[NeuroStrata] Auto-syncing AST Software Graph to LanceDB...\033[0m"
+    echo -e "\n\033[1;36m[NeuroStrata] Auto-syncing AST Software Graph to Kuzu...\033[0m"
     NAMESPACE=$(basename "$PWD")
     neurostrata-mcp ingest . "$NAMESPACE" >/dev/null 2>&1 || true
 fi

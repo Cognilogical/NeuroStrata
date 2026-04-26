@@ -16,7 +16,7 @@ async-trait = "0.1"
 anyhow = "1.0"
 fastembed = "4"
 tracing = "0.1"
-lancedb = "0.27.2"
+
 arrow = "57.3.0"
 schema = "0.1.0"
 futures = "0.3.32"

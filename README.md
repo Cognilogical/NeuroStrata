@@ -5,7 +5,7 @@
 
 [![Rust](https://img.shields.io/badge/Rust-1.75+-000000?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/Protocol-MCP-blue?style=flat-square)](https://modelcontextprotocol.io/)
-[![LanceDB](https://img.shields.io/badge/Vector%20DB-LanceDB-orange?style=flat-square)](https://lancedb.com/)
+[![Kuzu](https://img.shields.io/badge/Vector%20DB-Kuzu-orange?style=flat-square)](https://kuzu.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Stop re-explaining your stack to your AI every time you open a new chat.**
@@ -14,14 +14,14 @@ NeuroStrata is a zero-config, local-first Model Context Protocol (MCP) server th
 
 If you are tired of spending 20 minutes context-loading every new chat, only for the agent to hallucinate library choices, ignore your architectural rules, or forget how your specific API works because it fell out of the context window—NeuroStrata is the permanent fix.
 
-It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by **SynapticGraph**, a biologically-inspired **Dual-Track Bi-Temporal Graph Memory System** written entirely in Rust. It utilizes an embedded LanceDB vector store and full-text search (BM25 via Tantivy) to ensure your AI remembers exactly *what* to do, *how* to do it, and *why* you built it that way.
+It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by **SynapticGraph**, a biologically-inspired **Dual-Track Bi-Temporal Graph Memory System** written entirely in Rust. It utilizes an embedded Kuzu vector store and full-text search (BM25 via Tantivy) to ensure your AI remembers exactly *what* to do, *how* to do it, and *why* you built it that way.
 
 ---
 
 ## 🌟 Why NeuroStrata Wins: The Zero-Overhead Advantage
 
 * **Zero Network Attack Surface:** There are no REST APIs. There are no WebSockets. There is no MQTT broker, and there are no exposed localhost ports. NeuroStrata communicates purely over standard input/output (`stdio`) using the official MCP JSON-RPC spec. It is a secure, offline, single compiled Rust binary.
-* **Embedded LanceDB & Tantivy:** No Docker containers to manage and no remote databases to pay for. The entire vector database and full-text search index runs embedded inside the Rust binary. It just works.
+* **Embedded Kuzu & Tantivy:** No Docker containers to manage and no remote databases to pay for. The entire vector database and full-text search index runs embedded inside the Rust binary. It just works.
 * **The "Pointer-Wiki" Architecture:** Standard RAG systems dump 50-page architecture documents into the LLM context window, which destroys reasoning performance and racks up API costs. NeuroStrata's **SynapticGraph** hands the agent a semantic *pointer*—a hyper-specific **Engram** (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs to solve the problem.
 * **Eidetic Recall & Instant Grounding:** Instead of wasting tokens blindly searching a new repository, agents instantly retrieve the top-5 highest-weighted, active Engrams for any project. This **Eidetic Recall** perfectly grounds an agent the exact second a chat session begins.
 * **Visualize AI Memory Locally:** Because NeuroStrata simply writes to a local `.NeuroStrata/db` directory, our native **Obsidian Plugin** can read the database directly from disk. You can visually render exactly what your AI "knows" into a 2D spatial canvas in real-time, and seamlessly curate, edit, or **Synaptically Prune** the AI's memory with a right-click—all without a network connection.
@@ -35,7 +35,7 @@ NeuroStrata uses cognitive metaphors to map how software actually evolves. Here 
 | Biological Term | Engineering Primitive | Description |
 | :--- | :--- | :--- |
 | **SynapticGraph** | **Knowledge Engine** | The core inference engine mapping semantic business axioms directly to your structural codebase, traversing edges to identify connected architecture. |
-| **Engram** | **Vector Row** | A single memory record in LanceDB containing text, embeddings, metadata, domain tags, and optional graph edges linking it to other Engrams. |
+| **Engram** | **Vector Row** | A single memory record in Kuzu containing text, embeddings, metadata, domain tags, and optional graph edges linking it to other Engrams. |
 | **Synaptic Pruning** | **Score Decay** | An access-based reinforcement algorithm (inspired by the Ebbinghaus Forgetting Curve). Unused rules naturally decay in retrieval rank over time. *They are never autonomously deleted.* |
 | **Eidetic Recall** | **Boot-time Snapshot** | Instant retrieval of the top 5 highest-weighted, active Engrams for a project the exact second a new chat session begins, instantly grounding the agent. |
 | **Tri-Strata Model** | **Namespace Tiers** | Strict partitioning of the database into Global (Company), Domain (Project), and Task (Issue) namespaces to prevent context contamination. |
@@ -81,7 +81,7 @@ graph TD
         Tier3[("Task Stratum<br/>(Working)")]
     end
     
-    LanceDB[(Embedded LanceDB<br/>~/.local/share/neurostrata/db)]
+    Kuzu[(Embedded Kuzu<br/>~/.local/share/neurostrata/db)]
     PointerWiki[(Project Files:<br/>docs/architecture/domains/)]
     Obsidian((Obsidian GUI))
     SynapticGraph[[SynapticGraph]]
@@ -91,14 +91,14 @@ graph TD
     Router --> Tier2
     Router --> Tier3
     
-    Tier1 -.-> LanceDB
-    Tier2 -.-> LanceDB
-    Tier3 -.-> LanceDB
+    Tier1 -.-> Kuzu
+    Tier2 -.-> Kuzu
+    Tier3 -.-> Kuzu
     
     Tier2 <==>|Physical File Anchor| PointerWiki
     SynapticGraph -->|Analyzes Code & Updates| PointerWiki
     
-    Obsidian -.->|Reads Local DB directly| LanceDB
+    Obsidian -.->|Reads Local DB directly| Kuzu
     Obsidian -.->|Reads Local Files directly| PointerWiki
 
     classDef core fill:#1e1e1e,stroke:#00ADD8,stroke-width:2px,color:#fff;
@@ -107,7 +107,7 @@ graph TD
     classDef tool fill:#1c3d5a,stroke:#3b82f6,stroke-width:1px,color:#fff;
     
     class Agent,Router core;
-    class Tier1,Tier2,Tier3,LanceDB,PointerWiki memory;
+    class Tier1,Tier2,Tier3,Kuzu,PointerWiki memory;
     class SynapticGraph engine;
     class Obsidian tool;
 ```
@@ -134,7 +134,7 @@ NeuroStrata is tool-agnostic. It integrates with the standard `~/.agents/` speci
 
 ### Prerequisites
 1. **Embedder:** An OpenAI-compatible embedding endpoint (e.g., a local Llama.cpp/Ollama on `localhost:8004`, or a hosted provider like OpenAI).
-2. **Vector Database:** None! LanceDB runs entirely embedded within the Rust binary. 
+2. **Vector Database:** None! Kuzu runs entirely embedded within the Rust binary. 
 
 ### Installation
 
@@ -164,7 +164,7 @@ The installer creates a default configuration at `~/.config/neurostrata/config.j
 ```
 
 ### Visualizing Memory with Obsidian
-Because NeuroStrata writes standard local files and an embedded LanceDB database, you can visually curate the AI's memory using Obsidian without running any network servers:
+Because NeuroStrata writes standard local files and an embedded Kuzu database, you can visually curate the AI's memory using Obsidian without running any network servers:
 1. Create a new plugin folder: `mkdir -p .obsidian/plugins/neurostrata-plugin`
 2. Copy the pre-compiled plugin: `cp -r ~/Documents/neurostrata/plugins/obsidian/obsidian-neurostrata/* .obsidian/plugins/neurostrata-plugin/`
 3. In Obsidian, enable the NeuroStrata plugin to view the live graph.
