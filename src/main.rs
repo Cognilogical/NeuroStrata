@@ -8,7 +8,7 @@ mod traits;
 use config::Config;
 use embed::FastEmbedder;
 use std::sync::Arc;
-use store::LanceDBStore;
+use store::KuzuStore;
 use traits::{Embedder, VectorStore};
 
 #[tokio::main]
@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
         let command = &args[1];
         let config = Config::from_default_path()?;
         let embedder = Arc::new(FastEmbedder::new()?);
-        let vector_store: Arc<dyn VectorStore> = Arc::new(LanceDBStore::new(
+        let vector_store: Arc<dyn VectorStore> = Arc::new(KuzuStore::new(
             config.db_path.to_str().unwrap().to_string(),
             embedder.dimensions(),
         )?);
@@ -338,7 +338,7 @@ async fn main() -> anyhow::Result<()> {
         "Initializing Embedded LanceDB Store at {:?}",
         config.db_path
     );
-    let vector_store: Arc<dyn VectorStore> = Arc::new(LanceDBStore::new(
+    let vector_store: Arc<dyn VectorStore> = Arc::new(KuzuStore::new(
         config.db_path.to_str().unwrap().to_string(),
         embedder.dimensions(),
     )?);
