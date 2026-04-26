@@ -73,4 +73,7 @@ pub trait VectorStore: Send + Sync {
 
     /// List all existing namespaces (tables)
     async fn list_namespaces(&self) -> Result<Vec<String>>;
+
+    /// Export the entire graph as a JSON object with `nodes` and `links`.
+    async fn export_graph(&self) -> Result<serde_json::Value>;
 }
