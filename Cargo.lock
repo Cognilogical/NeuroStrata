@@ -1751,10 +1751,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuzu"
-version = "0.11.3"
+name = "lbug"
+version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06952b00b1a2eabf4caf1426672395f9b1def04207d984af204693dec3da287a"
+checksum = "c983bfdf95753e2359889e3c0534580f7689302f55271bba293e72b24ba9924b"
 dependencies = [
  "cmake",
  "cxx",
@@ -2068,7 +2068,7 @@ dependencies = [
  "fastembed",
  "futures",
  "ignore",
- "kuzu",
+ "lbug",
  "openssl",
  "regex",
  "schema",

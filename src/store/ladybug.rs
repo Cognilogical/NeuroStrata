@@ -4,17 +4,17 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kuzu::{Connection, Database, SystemConfig};
+use lbug::{Connection, Database, SystemConfig};
 
 use crate::traits::{MemoryPayload, SearchResult, VectorStore};
 
-pub struct KuzuStore {
+pub struct LadybugStore {
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
 }
 
-impl KuzuStore {
+impl LadybugStore {
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         let local_path = local_path.into();
 
@@ -35,7 +35,7 @@ impl KuzuStore {
 }
 
 #[async_trait]
-impl VectorStore for KuzuStore {
+impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
         let conn = self.get_conn()?;
 
@@ -132,8 +132,8 @@ impl VectorStore for KuzuStore {
         for row in result {
             let id: String = format!("{}", row[0]);
             let distance: f32 = match &row[1] {
-                kuzu::Value::Float(f) => *f,
-                kuzu::Value::Double(d) => *d as f32,
+                lbug::Value::Float(f) => *f,
+                lbug::Value::Double(d) => *d as f32,
                 _ => 0.0,
             };
             
@@ -289,11 +289,11 @@ impl VectorStore for KuzuStore {
         
         if let Some(row) = result.next() {
             let mut vec: Vec<f32> = Vec::new();
-            if let kuzu::Value::List(_, list_vals) = &row[0] {
+            if let lbug::Value::List(_, list_vals) = &row[0] {
                 for v in list_vals {
-                    if let kuzu::Value::Float(f) = v {
+                    if let lbug::Value::Float(f) = v {
                         vec.push(*f);
-                    } else if let kuzu::Value::Double(d) = v {
+                    } else if let lbug::Value::Double(d) = v {
                         vec.push(*d as f32);
                     }
                 }
@@ -352,7 +352,7 @@ impl VectorStore for KuzuStore {
         
         let mut namespaces = Vec::new();
         while let Some(row) = result.next() {
-            if let kuzu::Value::String(ns) = row[0].clone() {
+            if let lbug::Value::String(ns) = row[0].clone() {
                 namespaces.push(ns);
             }
         }
@@ -369,16 +369,16 @@ impl VectorStore for KuzuStore {
         let mut result_nodes = conn.query(query_nodes)?;
         
         while let Some(row) = result_nodes.next() {
-            let id = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let namespace = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
-            let memory_type = if let kuzu::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
-            let content = if let kuzu::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
-            let location = if let kuzu::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
+            let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
+            let memory_type = if let lbug::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
+            let content = if let lbug::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
+            let location = if let lbug::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
             
             let mut absolute_path = "".to_string();
             let mut domain = None;
 
-            if let kuzu::Value::String(metadata_str) = &row[5] {
+            if let lbug::Value::String(metadata_str) = &row[5] {
                 if let Ok(metadata_val) = serde_json::from_str::<serde_json::Value>(metadata_str) {
                     if let Some(abs_path) = metadata_val.get("absolute_path").and_then(|v| v.as_str()) {
                         absolute_path = abs_path.to_string();
@@ -417,8 +417,8 @@ impl VectorStore for KuzuStore {
         let query_relates = "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) RETURN a.id, b.id;";
         let mut res_relates = conn.query(query_relates)?;
         while let Some(row) = res_relates.next() {
-            let source = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let target = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { continue };
+            let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
             links.push(serde_json::json!({
                 "source": source,
                 "target": target,
@@ -430,8 +430,8 @@ impl VectorStore for KuzuStore {
         let query_contains = "MATCH (a:Memory)-[r:CONTAINS]->(b:Memory) RETURN a.id, b.id;";
         let mut res_contains = conn.query(query_contains)?;
         while let Some(row) = res_contains.next() {
-            let source = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let target = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { continue };
+            let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
             links.push(serde_json::json!({
                 "source": source,
                 "target": target,
@@ -443,8 +443,8 @@ impl VectorStore for KuzuStore {
         let query_governs = "MATCH (a:Memory)-[r:GOVERNS]->(b:Memory) RETURN a.id, b.id;";
         let mut res_governs = conn.query(query_governs)?;
         while let Some(row) = res_governs.next() {
-            let source = if let kuzu::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let target = if let kuzu::Value::String(s) = &row[1] { s.clone() } else { continue };
+            let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+            let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
             links.push(serde_json::json!({
                 "source": source,
                 "target": target,

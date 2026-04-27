@@ -34,6 +34,38 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
   const fgRef = useRef<any>(null);
 
   useEffect(() => {
+    if (fgRef.current) {
+      fgRef.current.d3Force('charge').strength(-200);
+      fgRef.current.d3Force('link').distance(50);
+      
+      // Hook into the d3 force engine to herd global nodes apart from project nodes
+      fgRef.current.d3Force('namespace-clustering', (alpha: number) => {
+        const nodes = data.nodes;
+        if (!nodes) return;
+        
+        for (let i = 0; i < nodes.length; i++) {
+          const node: any = nodes[i];
+          const isGlobal = node.namespace === 'global' || node.namespace === 'Global';
+          
+          if (isGlobal) {
+            // Pull Global nodes to a distant satellite cluster (x: 800, y: -800)
+            const strength = 0.5 * alpha;
+            node.vx += (800 - (node.x || 0)) * strength;
+            node.vy += (-800 - (node.y || 0)) * strength;
+          } else {
+            // Pull Project nodes gently towards the origin (0,0) to keep them centered
+            const strength = 0.1 * alpha;
+            node.vx += (0 - (node.x || 0)) * strength;
+            node.vy += (0 - (node.y || 0)) * strength;
+          }
+        }
+      });
+      
+      fgRef.current.d3ReheatSimulation();
+    }
+  }, [data]);
+
+  useEffect(() => {
     if (selectedNode && fgRef.current) {
       if (!data || !data.nodes) return;
       const graphNode = data.nodes.find((n: any) => n.id === selectedNode.id);

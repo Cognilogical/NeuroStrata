@@ -1,120 +1,62 @@
-# Agent Instructions
+# Comprehensive Agent Rules & Constraints
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+This document compiles all the operational mandates, workflows, and behavioral constraints the agent is currently programmed to follow. Please review this to identify any missing triggers or rules.
 
-## Quick Reference
+## 1. Beads Issue Tracking (MANDATORY WORKFLOW)
+- **Zero-Action Start:** The agent MUST NOT start writing code, modifying files, or executing a task until it has been officially tracked in Beads.
+- **Workflow:**
+  1. Check for existing work: `bd ready`
+  2. If the user's request matches an existing issue, claim it: `bd update <id> --claim`
+  3. If the user's request is new, create it FIRST: `bd create --title="..." --description="..." --type=task` and then claim it.
+- **State Updates:** Must use the `bd set-state <bead_id> state=<state> --reason "..."` command to transition states (spawning, running, working, done). *Deprecated `bd agent state` commands must not be used.*
+- **No Alternatives:** Never use TodoWrite, TaskCreate, or markdown TODO lists for tracking. Always use `bd`.
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
-```
+## 2. Session Completion & Hand-off
+Work is NOT complete until `git push` succeeds and knowledge is extracted.
+- **Completion Steps:**
+  1. **Extract Knowledge:** Run `neurostrata_add_memory` to save facts, fixes, or constraints.
+  2. **File Follow-ups:** Create beads for remaining work.
+  3. **Quality Gates:** Run tests, linters, builds.
+  4. **Status:** Close finished beads.
+  5. **Push to Remote (CRITICAL):**
+     - `git pull --rebase`
+     - `bd dolt push`
+     - `git push`
+     - `git status` (Must show "up to date with origin")
+- **Never Strand Work:** Never stop before pushing. Never say "ready to push when you are" (the agent must do it).
 
-## Non-Interactive Shell Commands
+## 3. NeuroStrata Memory & The 3 Resilient Soft Locks
+Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. You MUST use the `neurostrata_add_memory` tool for explicit architectural rules and decisions, and the `neurostrata_append_log` tool for conversational context.
 
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
+- **CRITICAL RESTRICTION**: NEVER use `bd remember` to store memories. That tool is deprecated for agent use. You MUST use the dedicated `neurostrata_add_memory` tool.
+- **Lock 1 (Pre-Push Hook):** The system enforces logging via a git hook. If a push is blocked, the agent must run `neurostrata_add_memory` before retrying.
+- **Lock 2 (Checklist Abstraction):** Transitioning a bead from `working` to `done` must be accompanied by an architectural summary via `neurostrata_add_memory`.
+- **Lock 3 (The "Breath" Prompt):** If a task takes more than 3-5 steps, the agent must pause, summarize the current state, and commit it to Tier 3 (Task Stratum) memory before proceeding.
+- **Continuous Backup Protocol:** Silently use `neurostrata_append_log` to maintain a running log of the conversation. Pass tags (e.g., "auth, database") when a topic switch occurs.
+- **Retrieval Protocol (MANDATORY):** Every time you start a new session, or if a user asks about previous system design, YOU MUST proactively use `neurostrata_query` or grep `.neurostrata/sessions/*` (if local fallback is needed) to retrieve the context before answering or coding.
 
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
+## 4. Bootstrapping & Ingestion
+- **Docs:** If `.NeuroStrata/docs/` is missing, proactively invoke `./scripts/bootstrap.sh <pwd>`.
+- **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
+## 5. Global Database Constraints (Safety)
+- **Shared Architecture:** The database (LadybugDB/Kuzu/LanceDB) is a SHARED, global memory architecture.
+- **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
+- **No Bulk Deletes:** Only delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination.
 
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
-```
+## 6. Global Infrastructure & Tooling Constraints
+- **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
+- **Data Formats:** ALWAYS prefer strict JSON and JSON Schema over YAML, TOML, or their derivatives.
+- **Non-Interactive Shells:** ALWAYS use non-interactive flags (e.g., `cp -f`, `rm -rf`, `apt-get -y`) to avoid hanging the agent on confirmation prompts.
 
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+## 7. Cost Management & Async Delegation
+- **Role:** The primary agent acts as Knowledge Manager, Architect, and Orchestrator.
+- **Offloading Work:** Aggressively offload "work" (coding, refactoring) to `NeuroStrata-Task-Agent` OR capture it asynchronously in BeadBoard to avoid blocking the chat.
+- **Synchronous vs Asynchronous:** Only use the `Task` tool synchronously if the user explicitly asks for the work to be completed right now. Otherwise, create a BeadBoard bead to capture requirements.
+- **Exceptions:** The primary agent may only make direct file edits for trivial, one-off changes (fixing typos, renaming a variable).
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
-
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
-
-### MANDATORY STARTUP WORKFLOW
-**CRITICAL**: You MUST NOT start writing code, modifying files, or executing a task until you have officially tracked it in Beads.
-1. Check for existing work: `bd ready`
-2. If the user's request matches an existing issue, claim it: `bd update <id> --claim`
-3. If the user's request is new, create it FIRST: `bd create --title="<Summary>" --description="<Details>" --type=task` and then claim it.
-
-### Quick Reference
-
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
-```
-
-### Rules
-
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
-
-## Session Completion
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-### 🛡️ The 3 Resilient Soft Locks (Standalone Memory Enforcement)
-Because NeuroStrata must function as a standalone MVP without an OS-level intercept, you MUST adhere to these three behavioral forcing functions to ensure knowledge is extracted despite context window bloat:
-
-1. **The Pre-Commit/Pre-Push Hook (Behavioral Forcing):** We tie the logging requirement directly to the definition of "Done." A `git pre-push` hook is installed via `scripts/install_hooks.sh` that will BLOCK your push if the NeuroStrata DB hasn't been updated recently. If your push is blocked, you MUST run `neurostrata_add_memory` before retrying.
-2. **The Checklist Abstraction (`bd` Integration):** When transitioning a bead from `working` to `done`, your closing summary MUST be accompanied by a call to `neurostrata_add_memory` to summarize the architectural decisions made during that ticket.
-3. **The "Breath" Prompt (Periodic Context Checks):** For long, multi-step tasks, the context window gets dense. If a task takes more than 3-5 steps, you MUST pause, summarize the current architectural state, and commit it to Tier 3 (Task Stratum) memory before proceeding to the next major phase.
-
-**MANDATORY WORKFLOW:**
-
-1. **Extract Knowledge (Habitual Memory Commit)** - You MUST run `neurostrata_add_memory` to save any new facts, fixes, constraints, or hallucinations learned during this session BEFORE doing anything else.
-2. **File issues for remaining work** - Create issues for anything that needs follow-up
-3. **Run quality gates** (if code changed) - Tests, linters, builds
-4. **Update issue status** - Close finished work, update in-progress items
-5. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd dolt push
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-6. **Clean up** - Clear stashes, prune remote branches
-7. **Verify** - All changes committed AND pushed
-8. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until knowledge is extracted to NeuroStrata AND `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
-
-## 🕸️ Bootstrapping & Context Ingestion (NeuroStrata)
-1. **Litho Docs:** If `.NeuroStrata/docs/` is missing in a repository, proactively invoke the `./scripts/bootstrap.sh <pwd>` script to initialize the project architecture docs. Do not attempt to run setup manually without it.
-2. **AST Ingestion (CRITICAL):** On a fresh install, when entering a new codebase, or after making structural changes (creating/moving/deleting files), you MUST proactively ingest the AST into the Graph database so you have the context to work. 
-   - Run: `neurostrata_ingest_directory` (or `cargo run --bin neurostrata-mcp ingest <path> <namespace>`) 
-   - Followed by: `neurostrata-mcp export-graph` (to refresh the UI).
-
-## 🧠 NeuroStrata Memory & Sessions
-CRITICAL SYSTEM OVERRIDE: Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. If you ignore this, you are committing a silent failure that wastes the user's time and burns their tokens.
-
-**NEUROSTRATA AUTO-RECOVERY PROTOCOL:**
-If any NeuroStrata memory tool fails:
-1. Immediately write the intended memory content and metadata into an append-only emergency log at `~/.config/neurostrata/emergency_cache.jsonl`.
-2. Notify the user that memory services failed and safely cache the memory locally.
-3. Whenever you successfully execute a memory tool in the future, check if `~/.config/neurostrata/emergency_cache.jsonl` exists. If it does, proactively read it, use the `neurostrata_add_memory` tool to backfill ALL the cached memories, and then use the bash tool to delete the cache file (`rm ~/.config/neurostrata/emergency_cache.jsonl`).
-
-***CRITICAL SAFETY CONSTRAINT: SHARED DATABASE***: 
-The embedded Kuzu database used by NeuroStrata is a SHARED, global memory architecture containing the memories for ALL of the user's projects. You DO NOT own the entire database.
-- NEVER attempt to delete the database directory, drop the table, or run destructive operations against the files.
-- NEVER bulk delete memories. 
-- You may ONLY delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
-Violating this rule will destroy other projects and cause catastrophic data loss.
+## 8. Core Engineering Mandates
+- **Conventions:** Rigorously adhere to existing project conventions (formatting, naming, frameworks).
+- **Libraries/Frameworks:** NEVER assume a library is available. Verify in configuration files first.
+- **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
+- **Paths:** Always use absolute paths when using file system tools.

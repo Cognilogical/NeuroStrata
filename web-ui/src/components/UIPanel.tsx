@@ -23,15 +23,11 @@ export const UIPanel: React.FC<Props> = ({
   namespaceFilters,
   setNamespaceFilters,
 }) => {
-  const [editor, setEditor] = useState<'vscode' | 'cursor' | 'obsidian'>(
-    (localStorage.getItem('neurostrata_editor') as any) || 'vscode'
-  );
-
-  const handleEditorChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const val = e.target.value as 'vscode' | 'cursor' | 'obsidian';
-    setEditor(val);
-    localStorage.setItem('neurostrata_editor', val);
-  };
+  const [editor, setEditor] = useState<'vscode' | 'cursor' | 'obsidian'>(() => {
+    const saved = localStorage.getItem('neurostrata_editor');
+    if (saved === 'vscode' || saved === 'cursor' || saved === 'obsidian') return saved;
+    return 'vscode';
+  });
 
   const launchUrl = async (url: string) => {
     try {
@@ -69,7 +65,7 @@ export const UIPanel: React.FC<Props> = ({
         // Give the editor a moment to focus the workspace, then open the specific file
         setTimeout(() => {
           launchUrl(`${scheme}${encodeURI(path)}`);
-        }, 500);
+        }, 1000);
       } else {
         launchUrl(`${scheme}${encodeURI(path)}`);
       }
@@ -133,23 +129,28 @@ export const UIPanel: React.FC<Props> = ({
                   
                   {selectedNode.absolute_path && (
                     <div className="mt-2 flex flex-col gap-2 p-3 bg-white/5 rounded-lg border border-white/10">
-                      <div className="text-xs text-gray-400">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
-                      <div className="flex items-center justify-between gap-2 mt-2">
-                        <select 
-                          className="text-sm font-bold border border-gray-500 rounded px-2 py-1.5 shadow-sm focus:ring-2 focus:ring-blue-500 outline-none cursor-pointer"
-                          style={{ backgroundColor: '#111827', color: '#ffffff' }}
-                          value={editor}
-                          onChange={handleEditorChange}
-                        >
-                          <option style={{ backgroundColor: '#111827', color: '#ffffff' }} value="vscode">VS Code</option>
-                          <option style={{ backgroundColor: '#111827', color: '#ffffff' }} value="cursor">Cursor</option>
-                          <option style={{ backgroundColor: '#111827', color: '#ffffff' }} value="obsidian">Obsidian</option>
-                        </select>
+                      <div className="text-xs text-gray-400 mb-1">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
+                      <div className="flex flex-col gap-2 mt-2">
+                        <div className="flex bg-black/40 p-1 rounded-md border border-white/10 w-full">
+                          {(['vscode', 'cursor', 'obsidian'] as const).map(ed => (
+                            <button
+                              key={ed}
+                              onClick={() => {
+                                setEditor(ed);
+                                localStorage.setItem('neurostrata_editor', ed);
+                              }}
+                              className={`flex-1 text-xs font-bold py-1.5 px-2 rounded-sm transition-all ${editor === ed ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'}`}
+                            >
+                              {ed === 'vscode' ? 'VS Code' : ed === 'cursor' ? 'Cursor' : 'Obsidian'}
+                            </button>
+                          ))}
+                        </div>
                         <button 
                           onClick={handleOpenInEditor}
-                          className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold py-1 px-2 rounded transition-colors shadow-sm border border-blue-400/50"
+                          className="w-full bg-blue-600/20 hover:bg-blue-600/40 text-blue-200 border border-blue-500/30 text-xs font-bold py-2 px-2 rounded transition-colors shadow-sm mt-1 flex items-center justify-center gap-2"
                         >
-                          Open File
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+                          Open in {editor === 'vscode' ? 'VS Code' : editor === 'cursor' ? 'Cursor' : 'Obsidian'}
                         </button>
                       </div>
                     </div>
