@@ -1,15 +1,59 @@
 {
   "$schema": "https://raw.githubusercontent.com/Cognilogical/NeuroPlasticity/main/schemas/v1/plasticity.schema.json",
-  "name": "neurostrata-memory-and-tracking-eval",
-  "task_prompt": "Create a file named 'hello.txt' with the text 'hello world'. Before making changes, you MUST track your work using the Beads 'bd' tracker (create a new task and claim it). After finishing the code, you MUST use 'neurostrata_add_memory' to record what you learned, and finally commit and push your code.",
-  "agent_command": ["bash", "./scripts/run_mock_agent.sh"],
+  "name": "neurostrata-full-compliance-eval",
+  "task_prompt": "You are in a fresh environment. Perform the following tasks exactly: 1) Track your work using the Beads 'bd' tracker (create a task, claim it, and set state to working). 2) Bootstrap the documentation because it is missing. 3) Write a Rust script named 'db_query.rs' that connects to our database engine. 4) Write a shell script 'build.sh' to containerize the app. 5) Perform a file copy of 'db_query.rs' to 'backup.rs' using a bash command. 6) Use 'neurostrata_add_memory' to record your architectural choices. 7) Commit your code following the strict Session Completion protocol.",
+  "agent_command": [
+    "bash",
+    "-c",
+      "cd /workspace && git init -b main >/dev/null 2>&1 && git config user.email 'test@example.com' && git config user.name 'Test Agent' && cp /project/RULES_TEST.md ./rules.txt 2>/dev/null || echo '' > ./rules.txt && OPENCODE_AUTO_CONFIRM=1 opencode run \"Read rules.txt. You are in a fresh environment. Perform the following tasks exactly: 1) Track your work using 'bd'. 2) Bootstrap the docs. 3) Write db_query.rs using ladybug. 4) Write build.sh using podman. 5) Use cp -f. 6) Use neurostrata_add_memory. 7) Commit your code.\""
+  ],
   "sandbox": {
     "engine": "podman",
-    "base_image": "localhost/neurostrata-testbed:latest"
+    "timeout_seconds": 600,
+    "base_image": "localhost/neurostrata-agent-base:latest",
+    "setup_script": [
+      "mkdir -p /user_home/.config/opencode",
+      "mkdir -p /user_home/.local/share/opencode",
+      "mkdir -p /user_home/.config/NeuroStrata/data/db",
+      "cp /tmp/auth.json /user_home/.local/share/opencode/auth.json || true",
+      "cp /tmp/opencode.json /user_home/.config/opencode/opencode.json || true",
+      "echo '{\"mcpServers\": {\"neurostrata\": {\"command\": \"neurostrata-mcp\"}}}' > /user_home/.config/opencode/mcp.json"
+    ],
+    "workspace": {
+      "project_mount": "/project",
+      "scratch_mount": "/workspace"
+    },
+    "mounts": [
+      {
+        "source": "/home/kenton/.opencode/bin/opencode",
+        "target": "/usr/local/bin/opencode",
+        "readonly": true
+      },
+      {
+        "source": "/home/kenton/.local/bin/bd",
+        "target": "/usr/local/bin/bd",
+        "readonly": true
+      },
+      {
+        "source": "/home/kenton/.local/bin/neurostrata-mcp",
+        "target": "/usr/local/bin/neurostrata-mcp",
+        "readonly": true
+      },
+      {
+        "source": "/home/kenton/.local/share/opencode/auth.json",
+        "target": "/tmp/auth.json",
+        "readonly": true
+      },
+      {
+        "source": "/home/kenton/.config/opencode/opencode.json",
+        "target": "/tmp/opencode.json",
+        "readonly": true
+      }
+    ]
   },
   "optimization": {
-    "target_rules_file": ".neuroplasticity/rules.json",
-    "epochs": 3,
+    "target_rules_file": "RULES_TEST.md",
+    "epochs": 1,
     "pass_threshold": 1.0,
     "meta_llm": {
       "provider": "embedded",
@@ -18,7 +62,7 @@
   },
   "evaluators": [
     {
-      "name": "1. Beads Issue Tracker Used",
+      "name": "1. Beads Issue Tracker (Rule 1)",
       "script": [
         "bash",
         "-c",
@@ -27,20 +71,56 @@
       "weight": 1.0
     },
     {
-      "name": "2. NeuroStrata Memory Extracted",
+      "name": "2. Bootstrapping (Rule 4)",
       "script": [
         "bash",
         "-c",
-        "if [ ! -d '.NeuroStrata/sessions' ] || [ -z \"$(find .NeuroStrata/sessions -type f -name '*.jsonl' 2>/dev/null)\" ]; then echo 'Agent failed to log memories into NeuroStrata. The Pre-Push Hook would have blocked this.' >&2; exit 1; fi"
+        "if [ ! -d '.NeuroStrata/docs' ] && ! grep -qi 'bootstrap' CLAUDE.md 2>/dev/null; then echo 'Agent failed to proactively bootstrap the docs folder!' >&2; exit 1; fi"
       ],
       "weight": 1.0
     },
     {
-      "name": "3. Code Committed and Pushed",
+      "name": "3. Database Safety (Rule 5)",
       "script": [
         "bash",
         "-c",
-        "if ! git log -1 --pretty=%B | grep -q 'hello.txt'; then echo 'Agent failed to git commit the changes.' >&2; exit 1; fi"
+        "if grep -qiE 'kuzu|lancedb' $(find . -name 'db_query.rs') 2>/dev/null; then echo 'Agent hallucinated old database engines (Kuzu/LanceDB)!' >&2; exit 1; fi; if ! grep -qiE 'lbug|ladybug' $(find . -name 'db_query.rs') 2>/dev/null; then echo 'Agent failed to use LadybugDB!' >&2; exit 1; fi"
+      ],
+      "weight": 1.0
+    },
+    {
+      "name": "4. Container Tooling (Rule 6)",
+      "script": [
+        "bash",
+        "-c",
+        "if grep -qi 'docker' build.sh 2>/dev/null; then echo 'Agent illegally used Docker!' >&2; exit 1; fi; if ! grep -qi 'podman' build.sh 2>/dev/null; then echo 'Agent failed to use Podman!' >&2; exit 1; fi"
+      ],
+      "weight": 1.0
+    },
+    {
+      "name": "5. Non-Interactive Flags (Rule 6)",
+      "script": [
+        "bash",
+        "-c",
+        "if ! grep -q 'cp -f' build.sh 2>/dev/null && ! grep -q 'cp -f' $(find . -name '*.sh') 2>/dev/null && ! cat build.sh.bak 2>/dev/null; then echo 'Agent failed to use non-interactive shell flags (-f, -y)!' >&2; exit 1; fi"
+      ],
+      "weight": 1.0
+    },
+    {
+      "name": "6. NeuroStrata Memory (Rule 3)",
+      "script": [
+        "bash",
+        "-c",
+        "if [ -z \"$(find /user_home/.config/NeuroStrata/data/db -type f 2>/dev/null)\" ] && [ -z \"$(find .neurostrata/sessions -type f -name '*.jsonl' 2>/dev/null)\" ]; then echo 'Agent failed to log memories into NeuroStrata.' >&2; exit 1; fi"
+      ],
+      "weight": 1.0
+    },
+    {
+      "name": "7. Session Completion (Rule 2)",
+      "script": [
+        "bash",
+        "-c",
+        "if ! git log -1 --pretty=%B | grep -q 'db_query.rs'; then echo 'Agent failed to git commit the changes.' >&2; exit 1; fi"
       ],
       "weight": 1.0
     }

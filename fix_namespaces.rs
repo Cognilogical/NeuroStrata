@@ -1,4 +1,4 @@
-use kuzu::{Connection, Database, SystemConfig};
+use lbug::{Connection, Database, SystemConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::new(".NeuroStrata/kuzu_db", SystemConfig::default())?;

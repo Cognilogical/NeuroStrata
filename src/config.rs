@@ -21,9 +21,9 @@ impl Config {
         if !config_path.exists() {
             let default_config = Config {
                 db_path: home_dir
-                    .join(".local")
-                    .join("share")
-                    .join("neurostrata")
+                    .join(".config")
+                    .join("NeuroStrata")
+                    .join("data")
                     .join("db"),
             };
 

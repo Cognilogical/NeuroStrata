@@ -44,6 +44,44 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
   const fgRef = useRef<any>(null);
   
   useEffect(() => {
+    if (fgRef.current) {
+      // Basic repulsion to spread out nodes
+      fgRef.current.d3Force('charge').strength(-200);
+      fgRef.current.d3Force('link').distance(50);
+      
+      // We manually hook into the d3 force engine loop to herd global nodes.
+      // D3 applies forces step by step. We push global nodes towards a distant anchor,
+      // and project nodes towards the center.
+      fgRef.current.d3Force('namespace-clustering', (alpha: number) => {
+        const nodes = data.nodes;
+        if (!nodes) return;
+        
+        for (let i = 0; i < nodes.length; i++) {
+          const node: any = nodes[i];
+          const isGlobal = node.namespace === 'global' || node.namespace === 'Global';
+          
+          if (isGlobal) {
+            // Pull Global nodes to a distant satellite cluster (x: 800, y: 800, z: 800)
+            const strength = 0.5 * alpha;
+            node.vx += (800 - (node.x || 0)) * strength;
+            node.vy += (800 - (node.y || 0)) * strength;
+            node.vz += (800 - (node.z || 0)) * strength;
+          } else {
+            // Pull Project nodes gently towards the origin (0,0,0) to keep them centered
+            const strength = 0.1 * alpha;
+            node.vx += (0 - (node.x || 0)) * strength;
+            node.vy += (0 - (node.y || 0)) * strength;
+            node.vz += (0 - (node.z || 0)) * strength;
+          }
+        }
+      });
+      
+      // Optional: re-warm the simulation so the custom force takes effect immediately
+      fgRef.current.d3ReheatSimulation();
+    }
+  }, [data]);
+
+  useEffect(() => {
     if (selectedNode && fgRef.current) {
       if (!data || !data.nodes) return;
       

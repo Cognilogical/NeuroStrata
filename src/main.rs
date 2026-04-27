@@ -8,7 +8,8 @@ mod traits;
 use config::Config;
 use embed::FastEmbedder;
 use std::sync::Arc;
-use store::KuzuStore;
+use crate::traits::SearchResult;
+use store::LadybugStore;
 use traits::{Embedder, VectorStore};
 
 #[tokio::main]
@@ -20,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
         let command = &args[1];
         let config = Config::from_default_path()?;
         let embedder = Arc::new(FastEmbedder::new()?);
-        let vector_store: Arc<dyn VectorStore> = Arc::new(KuzuStore::new(
+        let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
             config.db_path.to_str().unwrap().to_string(),
             embedder.dimensions(),
         )?);
@@ -40,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 let namespace = &args[2];
-                let results = vector_store.list(namespace, None).await?;
+                let results: Vec<SearchResult> = vector_store.list(namespace, None).await?;
                 println!("Found {} memories in namespace '{}':\n", results.len(), namespace);
                 for res in results {
                     let location_str = if res.payload.location.is_empty() {
@@ -139,6 +140,46 @@ async fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
+            "delete" => {
+                if args.len() < 4 {
+                    eprintln!("Usage: neurostrata-mcp delete <namespace> <id>");
+                    return Ok(());
+                }
+                let namespace = &args[2];
+                let id = &args[3];
+                vector_store.delete(namespace, id).await?;
+                println!("Deleted memory {} from namespace {}", id, namespace);
+                return Ok(());
+            }
+            "edit" => {
+                if args.len() < 6 {
+                    eprintln!("Usage: neurostrata-mcp edit <namespace> <id> <new_namespace> <content> <location>");
+                    return Ok(());
+                }
+                let old_namespace = &args[2];
+                let id = &args[3];
+                let new_namespace = &args[4];
+                let content = &args[5];
+                let location = &args[6];
+                
+                let existing = vector_store.get(old_namespace, id).await?;
+                if let Some((_, mut payload)) = existing {
+                    // Delete old node
+                    vector_store.delete(old_namespace, id).await?;
+                    
+                    // Update payload
+                    payload.content = content.clone();
+                    payload.location = location.clone();
+                    
+                    // Re-embed and insert to new namespace
+                    let vector = embedder.embed(content).await?;
+                    vector_store.upsert(new_namespace, id, vector, payload).await?;
+                    println!("Successfully edited memory {}", id);
+                } else {
+                    eprintln!("Memory {} not found in namespace {}", id, old_namespace);
+                }
+                return Ok(());
+            }
             _ => {
                 // If it's something else, fall through or print usage? Let's just start the server.
                 // Or maybe they passed a random arg. Let's start the server but we can ignore it.
@@ -161,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
         "Initializing Embedded Kuzu Store at {:?}",
         config.db_path
     );
-    let vector_store: Arc<dyn VectorStore> = Arc::new(KuzuStore::new(
+    let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
         config.db_path.to_str().unwrap().to_string(),
         embedder.dimensions(),
     )?);

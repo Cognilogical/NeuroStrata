@@ -7,10 +7,14 @@
   ],
   "permissions": [
     "core:default",
+    "dialog:default",
+    "shell:allow-open",
     {
       "identifier": "shell:allow-open",
       "allow": [
-        { "args": ["vscode://*", "cursor://*", "obsidian://*"] }
+        { "url": "^vscode://.*" },
+        { "url": "^cursor://.*" },
+        { "url": "^obsidian://.*" }
       ]
     }
   ]

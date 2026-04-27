@@ -1,4 +1,4 @@
 
-pub mod kuzu;
+pub mod ladybug;
 
-pub use self::kuzu::KuzuStore;
+pub use self::ladybug::LadybugStore;
