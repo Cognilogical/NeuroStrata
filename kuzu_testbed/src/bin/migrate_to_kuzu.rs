@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use futures::StreamExt;
-use kuzu::{Connection, Database, SystemConfig};
+use lbug::{Connection, Database, SystemConfig};
 use lancedb::query::ExecutableQuery;
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow_schema::DataType;

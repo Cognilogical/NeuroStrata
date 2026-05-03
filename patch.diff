@@ -1,0 +1,13 @@
+--- ../NeuroPlasticity/src/main.rs	2026-04-27 08:00:00.000000000 +0000
++++ ../NeuroPlasticity/src/main.rs	2026-04-27 08:20:00.000000000 +0000
+@@ -92,6 +92,10 @@
+             stdout = sandbox_stdout;
+             stderr = sandbox_stderr;
+ 
++            // TEMP: print agent output for debugging
++            println!("=== AGENT STDOUT ===\n{}\n=== END STDOUT ===", stdout);
++            println!("=== AGENT STDERR ===\n{}\n=== END STDERR ===", stderr);
++
+             // 4. Evaluate & Score
+             println!("Evaluating side effects...");
+             let eval_result = evaluator::evaluate(

@@ -18,8 +18,40 @@ impl LadybugStore {
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         let local_path = local_path.into();
 
-        // We initialize the embedded Kuzu database once, and keep it in Arc to spawn connections from it
-        let db = Database::new(&local_path, SystemConfig::default())?;
+        // We initialize the embedded Ladybug database once, and keep it in Arc to spawn connections from it
+        let config = SystemConfig::default();
+        let db = match Database::new(&local_path, config) {
+            Ok(db) => db,
+            Err(e) => {
+                let err_msg = e.to_string();
+                if err_msg.contains("Corrupted wal file") || err_msg.contains("invalid WAL record type") {
+                    println!("⚠️ WAL CORRUPTION DETECTED. Initiating automated self-healing rollback...");
+                    
+                    let mut wal_path = local_path.clone().into_os_string();
+                    wal_path.push(".wal");
+                    let wal_file = std::path::PathBuf::from(wal_path);
+                    
+                    if wal_file.exists() {
+                        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                        let mut corrupted_path = wal_file.clone().into_os_string();
+                        corrupted_path.push(format!(".corrupted.{}", timestamp));
+                        let corrupted_file = std::path::PathBuf::from(corrupted_path);
+                        
+                        println!("Moving corrupted WAL file from {:?} to {:?}", wal_file, corrupted_file);
+                        std::fs::rename(&wal_file, &corrupted_file)
+                            .map_err(|err| anyhow::anyhow!("Self-healing failed: Could not move corrupted WAL file: {}", err))?;
+                        
+                        println!("Self-healing successful. Retrying database connection...");
+                        Database::new(&local_path, SystemConfig::default())
+                            .map_err(|retry_e| anyhow::anyhow!("Retry failed after self-healing: {}", retry_e))?
+                    } else {
+                        return Err(anyhow::anyhow!("WAL corruption detected, but WAL file not found at {:?}", wal_file));
+                    }
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
 
         Ok(Self {
             local_path,
