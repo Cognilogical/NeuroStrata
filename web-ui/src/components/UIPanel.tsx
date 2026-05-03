@@ -24,9 +24,9 @@ export const UIPanel: React.FC<Props> = ({
   namespaceFilters,
   setNamespaceFilters,
 }) => {
-  const [editor, setEditor] = useState<'vscode' | 'cursor' | 'obsidian'>(() => {
+  const [editor, setEditor] = useState<'vscode' | 'cursor'>(() => {
     const saved = localStorage.getItem('neurostrata_editor');
-    if (saved === 'vscode' || saved === 'cursor' || saved === 'obsidian') return saved;
+    if (saved === 'vscode' || saved === 'cursor') return saved;
     return 'vscode';
   });
 
@@ -58,21 +58,16 @@ export const UIPanel: React.FC<Props> = ({
       }
     }
 
-    if (editor === 'vscode' || editor === 'cursor') {
-      const scheme = editor === 'vscode' ? 'vscode://file' : 'cursor://file';
-      if (rootPath) {
-        // Open the workspace folder first
-        launchUrl(`${scheme}${encodeURI(rootPath)}`);
-        // Give the editor a moment to focus the workspace, then open the specific file
-        setTimeout(() => {
-          launchUrl(`${scheme}${encodeURI(path)}`);
-        }, 1000);
-      } else {
+    const scheme = editor === 'vscode' ? 'vscode://file' : 'cursor://file';
+    if (rootPath) {
+      // Open the workspace folder first
+      launchUrl(`${scheme}${encodeURI(rootPath)}`);
+      // Give the editor a moment to focus the workspace, then open the specific file
+      setTimeout(() => {
         launchUrl(`${scheme}${encodeURI(path)}`);
-      }
+      }, 1000);
     } else {
-      const url = `obsidian://open?path=${encodeURIComponent(path)}`;
-      launchUrl(url);
+      launchUrl(`${scheme}${encodeURI(path)}`);
     }
   };
 
@@ -140,7 +135,7 @@ export const UIPanel: React.FC<Props> = ({
                       <div className="text-xs text-gray-400 mb-1">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
                       <div className="flex flex-col gap-2 mt-2">
                         <div className="flex bg-black/40 p-1 rounded-md border border-white/10 w-full">
-                          {(['vscode', 'cursor', 'obsidian'] as const).map(ed => (
+                          {(['vscode', 'cursor'] as const).map(ed => (
                             <button
                               key={ed}
                               onClick={() => {
@@ -149,7 +144,7 @@ export const UIPanel: React.FC<Props> = ({
                               }}
                               className={`flex-1 text-xs font-bold py-1.5 px-2 rounded-sm transition-all ${editor === ed ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'}`}
                             >
-                              {ed === 'vscode' ? 'VS Code' : ed === 'cursor' ? 'Cursor' : 'Obsidian'}
+                              {ed === 'vscode' ? 'VS Code' : 'Cursor'}
                             </button>
                           ))}
         <button
@@ -164,7 +159,7 @@ export const UIPanel: React.FC<Props> = ({
                           className="w-full bg-blue-600/20 hover:bg-blue-600/40 text-blue-200 border border-blue-500/30 text-xs font-bold py-2 px-2 rounded transition-colors shadow-sm mt-1 flex items-center justify-center gap-2"
                         >
                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-                          Open in {editor === 'vscode' ? 'VS Code' : editor === 'cursor' ? 'Cursor' : 'Obsidian'}
+                          Open in {editor === 'vscode' ? 'VS Code' : 'Cursor'}
                         </button>
                       </div>
                     </div>
