@@ -9,6 +9,7 @@ use lbug::{Connection, Database, SystemConfig};
 use crate::traits::{MemoryPayload, SearchResult, VectorStore};
 
 pub struct LadybugStore {
+    #[allow(dead_code)]
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
@@ -263,6 +264,16 @@ impl VectorStore for LadybugStore {
         let safe_id = id.replace("'", "\\'");
         
         let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
+        conn.query(&query)?;
+        Ok(())
+    }
+
+    async fn clear_ast(&self, namespace: &str) -> Result<()> {
+        let conn = self.get_conn()?;
+        let safe_ns = namespace.replace("'", "\\'");
+        
+        // Delete all AST memories for this namespace
+        let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
         conn.query(&query)?;
         Ok(())
     }

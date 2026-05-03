@@ -39,7 +39,7 @@ pub trait Embedder: Send + Sync {
 
 /// The core interface for vector storage and retrieval.
 /// By making this a trait, we can swap between Embedded Qdrant,
-/// Remote Qdrant, Kuzu, or SQLite-VSS.
+/// Remote Qdrant, LadybugDB, or SQLite-VSS.
 #[async_trait]
 pub trait VectorStore: Send + Sync {
     /// Ensure the necessary collections/tables exist.
@@ -64,6 +64,9 @@ pub trait VectorStore: Send + Sync {
 
     /// Delete a specific memory by its ID.
     async fn delete(&self, namespace: &str, id: &str) -> Result<()>;
+
+    /// Clear all auto-ingested AST data from a namespace
+    async fn clear_ast(&self, namespace: &str) -> Result<()>;
 
     /// List all memories
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
