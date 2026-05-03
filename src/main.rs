@@ -204,9 +204,30 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         _ => {
-            eprintln!("Unknown command or plugin script executed: {}", command);
-            eprintln!("Please ensure this command is valid. (e.g. 'plasticity run' should be invoked on the plasticity runner, not neurostrata-mcp core).");
-            std::process::exit(1);
+            // Unrecognized commands are assumed to be external plugins/runners
+            let mut cmd = std::process::Command::new(command);
+            cmd.args(&args[2..]);
+            
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = cmd.exec();
+                eprintln!("Failed to execute external command '{}': {}", command, err);
+                std::process::exit(1);
+            }
+            
+            #[cfg(not(unix))]
+            {
+                match cmd.status() {
+                    Ok(status) => {
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to execute external command '{}': {}", command, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
         }
     }
 
