@@ -40,7 +40,7 @@ Memory architecture is the single most important aspect of this system. It is NO
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
 ## 5. Global Database Constraints (Safety)
-- **Shared Architecture:** The database (LadybugDB/Kuzu/LanceDB) is a SHARED, global memory architecture.
+- **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
 - **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
 - **No Bulk Deletes:** Only delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination.
 

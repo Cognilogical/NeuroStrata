@@ -5,10 +5,10 @@ description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task). Repl
 # NeuroStrata (The Tri-Strata Model)
 
 ## Overview
-NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Golang Model Context Protocol (MCP) server connected directly to an embedded Kuzu vector database partitioned into three distinct tiers (The Tri-Strata Model).
+NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Golang Model Context Protocol (MCP) server connected directly to an embedded LadybugDB vector database partitioned into three distinct tiers (The Tri-Strata Model).
 
 ## The Tri-Strata Model
-1. **Global Stratum (`namespace="global"`)**: Company-wide constraints, infrastructure mandates (e.g., Kuzu only, no REST, Clojure for parsing), and universal tool usage rules. **CRITICAL: NEVER use 'global' unless the user EXPLICITLY instructs you to make a company-wide machine rule. Assume all architecture rules are local to the current project and DEFAULT TO THE PROJECT NAMESPACE.**
+1. **Global Stratum (`namespace="global"`)**: Company-wide constraints, infrastructure mandates (e.g., LadybugDB only, no REST, Clojure for parsing), and universal tool usage rules. **CRITICAL: NEVER use 'global' unless the user EXPLICITLY instructs you to make a company-wide machine rule. Assume all architecture rules are local to the current project and DEFAULT TO THE PROJECT NAMESPACE.**
 2. **Domain Stratum (SynapticGraph, `namespace="<project_name>"`)**: Hidden business rules, API contracts, and spatial code layouts specific to the project's domains.
    * **SynapticGraph Linking**: To prevent context bloat, NeuroStrata stores *pointers* (e.g., "See `docs/architecture/domains/sync.md` for full narrative") instead of dumping entire narratives into an Engram.
 3. **Task Stratum (`namespace="<task_id>"`)**: Specific insights, decisions, and context scoped to a single active task.
@@ -66,11 +66,11 @@ If an agent skips the verification step (e.g., claiming a fix is complete withou
 3. **Autonomously Prune & Update**: When inscribing a new Engram, first `neurostrata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, do NOT just append a new one. Use `neurostrata_update_memory` or `neurostrata_delete_memory` to maintain a single, coherent source of truth.
 
 ## 🌱 EIDETIC RECALL (Project Genesis)
-Every active project MUST have a foundational "Bootstrap" Engram (a Kuzu node with `memory_type="bootstrap"`). This acts as the supreme context anchor for the entire repository.
+Every active project MUST have a foundational "Bootstrap" Engram (a LadybugDB node with `memory_type="bootstrap"`). This acts as the supreme context anchor for the entire repository.
 
 1. **The Initial Check:** When starting work on an unfamiliar project, use `neurostrata_get_snapshot` or search the namespace to verify a bootstrap Engram exists.
 2. **The Autonomous Rummage:** If no bootstrap Engram exists, you MUST build one immediately. Autonomously explore the codebase (read READMEs, dependency files like `package.json` or `Cargo.toml`, and core structural folders).
-   * **Crucial Dependency (The AST Graph):** If the bootstrap Engram does not exist, the codebase is completely unknown to the AI architecture. You MUST use the `neurostrata_ingest_directory` tool to parse the Abstract Syntax Tree (AST) into Kuzu BEFORE generating the bootstrap Engram. This automatically maps the physical codebase into the vector database.
+   * **Crucial Dependency (The AST Graph):** If the bootstrap Engram does not exist, the codebase is completely unknown to the AI architecture. You MUST use the `neurostrata_ingest_directory` tool to parse the Abstract Syntax Tree (AST) into LadybugDB BEFORE generating the bootstrap Engram. This automatically maps the physical codebase into the vector database.
 3. **The User Interrogation:** If the repository is entirely empty, completely opaque, or you cannot deduce its goal, you MUST stop and explicitly ask the user: "What is the core purpose and intended architecture of this project?"
 4. **The Ingestion:** Once synthesized, use `neurostrata_add_memory` with `memory_type="bootstrap"` to save a dense, high-level summary of the project's purpose, tech stack, and primary domain logic. You MUST pass the `locations` array mapping this memory to the key architectural files (e.g. `README.md`, `src/main.rs`).
 5. **The Evolution (Refinement):** The codebase lives and breathes. Every few major tasks or feature epics, proactively review the existing bootstrap Engram. If the project has expanded or pivoted, update the bootstrap Engram to reflect the new reality (by creating a new, more refined bootstrap Engram and deprecating the old one).
@@ -94,7 +94,7 @@ You are an **Information Architect specializing in Knowledge Organization System
 
 **The 8 Categories of Passive Knowledge Extraction:**
 Instead of relying on a background process, YOU are responsible for continuously monitoring the chat stream for the following 8 categories of structural facts. When you detect one, you must autonomously extract it and save it using `neurostrata_add_memory` (or update an existing one):
-1. **System Architecture & Technical Constraints:** Infrastructure mandates (e.g., Embedded Kuzu vs External DB), tech stacks, languages, and strict engineering rules.
+1. **System Architecture & Technical Constraints:** Infrastructure mandates (e.g., Embedded LadybugDB vs External DB), tech stacks, languages, and strict engineering rules.
 2. **Domain & Business Logic:** Core rules governing specific fields (e.g., Financial calculations, Health/HIPAA compliance, domain-driven data models).
 3. **Workflows & Operational Processes:** CI/CD pipelines, testing requirements, deployment steps, and required methodologies.
 4. **Project Goals & Milestones:** The overarching purpose of the system being built, target features, and phased roadmaps.
@@ -166,8 +166,8 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
     *   **Write/Modify Requests:** Do NOT modify the external project's files directly. Instead, suggest capturing the requested changes, code, or tasks into a handoff document (e.g., `cross_project_handoff.md`) inside the external project's directory. This allows the user to switch to the correct agent to execute the work contextually.
 *   **CRITICAL RULE ENFORCEMENT:** When you retrieve Engrams using `neurostrata_search_memory`, you will see them prefixed with `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`. These are **absolute, non-negotiable constraints**. You MUST follow them perfectly. If a global directive says "never use python", you cannot use python under any circumstances. Do not ignore these prefixes.
 *   **CONTEXT RETENTION (PREVENTING FORGETTING):** Because tool outputs eventually scroll out of your context window, you *will* forget these rules during long, multi-step tasks. When you retrieve a `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`, you MUST anchor it in your working memory. Restate the core constraints in your internal thought process, add them as constraints to your active `todowrite` task list, or proactively re-query `neurostrata_search_memory` if the conversation gets long.
-*   **CRITICAL SAFETY CONSTRAINT:** The embedded Kuzu vector database is a SHARED, global memory architecture containing Engrams for ALL of the user's projects. You DO NOT own the entire database.
-*   **NEVER** attempt to delete the Kuzu database directory, drop the table, or run destructive operations against the Kuzu files. 
+*   **CRITICAL SAFETY CONSTRAINT:** The embedded LadybugDB vector database is a SHARED, global memory architecture containing Engrams for ALL of the user's projects. You DO NOT own the entire database.
+*   **NEVER** attempt to delete the LadybugDB database directory, drop the table, or run destructive operations against the LadybugDB files. 
 *   **NEVER** bulk delete Engrams. You may ONLY delete specific Engram IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
 *   **NEVER** use `bd remember`.
 *   **NEVER** create or update `MEMORY.md` files.
@@ -175,17 +175,17 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
 *   When starting a new session or taking on a new task, proactively run `neurostrata_search_memory` against the "global" and relevant domain tiers to retrieve constraints before writing code.
 *   **Proactively fix memory!** If you spot a hallucination or an outdated architectural rule during your work, use `neurostrata_delete_memory` or `neurostrata_update_memory` to fix the database without asking for permission.
 
-## Synaptic Pruning Threshold (Keeping Kuzu Compact)
+## Synaptic Pruning Threshold (Keeping LadybugDB Compact)
 Vector memory is cheap to search but should not become a dumping ground for massive text blobs that bloat the context window upon retrieval. You must actively manage the threshold between a raw Semantic Engram and a Domain Narrative Markdown file.
 
-**When to keep it as a raw Semantic Engram (Kuzu only):**
+**When to keep it as a raw Semantic Engram (LadybugDB only):**
 - Short constraints (1-4 sentences).
 - Quick "gotchas", negative knowledge, and anti-patterns (e.g., "Use `platform: browser` for esbuild").
 - Simple CLI commands or single-step fixes.
 
 **When to PROMOTE to SynapticGraph format (.md file in `docs/architecture/domains/`):**
 1. **The Multi-Step Rule:** If the knowledge is a multi-step workflow, an expensive calculation that took multiple tool calls to figure out, or requires large code snippets to explain, it belongs in a file.
-2. **The Aggregation Rule:** If you notice multiple fragmented Engrams accumulating about the same component (e.g., 4 different Engrams about "MQTT" or "Kuzu schemas"), the vector space is getting cluttered.
+2. **The Aggregation Rule:** If you notice multiple fragmented Engrams accumulating about the same component (e.g., 4 different Engrams about "MQTT" or "LadybugDB schemas"), the vector space is getting cluttered.
 3. **The Promotion Action:** You MUST synthesize those fragmented Engrams into a single cohesive `.md` file. Then, use `neurostrata_delete_memory` to clear out the verbose vectors, and `neurostrata_add_memory` to create a single **Pointer Engram** (e.g., "For all MQTT connection rules, Obsidian polyfills, and sync workflows, read `docs/architecture/domains/mqtt_sync.md`").
 
 ## Harvesting Hallucinations & Expensive Computations

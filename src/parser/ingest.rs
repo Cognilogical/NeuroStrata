@@ -14,6 +14,11 @@ pub async fn ingest_directory(
     vector_store: Arc<dyn VectorStore>,
     namespace: &str,
 ) -> anyhow::Result<()> {
+    // Clear out existing AST nodes for this namespace so we don't duplicate or leave ghost files
+    if let Err(e) = vector_store.clear_ast(namespace).await {
+        eprintln!("Warning: Failed to clear old AST entries for namespace {}: {}", namespace, e);
+    }
+
     let mut ext_to_lang = HashMap::new();
     for (lang_name, lang_schema) in &schema.languages {
         for ext in &lang_schema.extensions {
@@ -32,7 +37,7 @@ pub async fn ingest_directory(
     ];
 
     let zero_vector = vec![0.0; embedder.dimensions()];
-    let mut ingested_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let _ingested_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for result in walker {
         let entry = match result {

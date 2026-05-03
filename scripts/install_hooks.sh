@@ -12,17 +12,17 @@ install_hook() {
 # NeuroStrata Pre-Push Hook (Behavioral Forcing)
 # Ensures the agent (or user) has extracted knowledge to the memory DB before pushing.
 
-LANCEDB_DIR=".NeuroStrata/kuzu"
+DB_DIR="$HOME/.config/NeuroStrata/data/db"
 
 # If DB doesn't exist yet, allow the push (might be initial commit or non-NeuroStrata repo)
-if [ ! -d "$LANCEDB_DIR" ]; then
+if [ ! -d "$DB_DIR" ]; then
     exit 0
 fi
 
 # Get the latest commit time
 LAST_COMMIT_TIME=$(git log -1 --format="%ct" 2>/dev/null || echo 0)
 # Get the db modification time (macOS/Linux compatible-ish)
-DB_MOD_TIME=$(stat -c "%Y" "$LANCEDB_DIR" 2>/dev/null || stat -f "%m" "$LANCEDB_DIR" 2>/dev/null || echo 0)
+DB_MOD_TIME=$(stat -c "%Y" "$DB_DIR" 2>/dev/null || stat -f "%m" "$DB_DIR" 2>/dev/null || echo 0)
 
 # If the database hasn't been touched since the last commit, flag it.
 if [ "$DB_MOD_TIME" -lt "$LAST_COMMIT_TIME" ]; then
@@ -42,7 +42,7 @@ fi
 
 # Auto-sync the AST Software Graph on push
 if command -v neurostrata-mcp &> /dev/null; then
-    echo -e "\n\033[1;36m[NeuroStrata] Auto-syncing AST Software Graph to Kuzu...\033[0m"
+    echo -e "\n\033[1;36m[NeuroStrata] Auto-syncing AST Software Graph to LadybugDB...\033[0m"
     NAMESPACE=$(basename "$PWD")
     neurostrata-mcp ingest . "$NAMESPACE" >/dev/null 2>&1 || true
 fi
@@ -51,19 +51,49 @@ exit 0
 EOF
 
     chmod +x "$hook_file"
-    echo "NeuroStrata pre-push hook installed successfully at $hook_file"
+    echo "NeuroStrata hook installed successfully at $hook_file"
+}
+
+install_sync_hook() {
+    local hook_file="$1"
+    
+    mkdir -p "$(dirname "$hook_file")"
+    
+    cat << 'EOF' > "$hook_file"
+#!/bin/bash
+# NeuroStrata Auto-Sync Hook
+# Automatically syncs the AST graph when codebase state changes (commit/checkout).
+
+if command -v neurostrata-mcp &> /dev/null; then
+    # Run in background to not block the developer
+    (
+        NAMESPACE=$(basename "$PWD")
+        neurostrata-mcp ingest . "$NAMESPACE" >/dev/null 2>&1 || true
+    ) &
+fi
+exit 0
+EOF
+
+    chmod +x "$hook_file"
+    echo "NeuroStrata AST sync hook installed at $hook_file"
 }
 
 if [ "$1" == "--global" ]; then
     echo "Installing global git hook template..."
     TEMPLATE_DIR="$HOME/.git-templates/hooks"
     install_hook "$TEMPLATE_DIR/pre-push"
+    install_sync_hook "$TEMPLATE_DIR/post-commit"
+    install_sync_hook "$TEMPLATE_DIR/post-checkout"
+    install_sync_hook "$TEMPLATE_DIR/post-merge"
     git config --global init.templateDir "$HOME/.git-templates"
     echo "Global template configured! Future 'git init' or 'git clone' will include this hook."
     
     # Also install to the current NeuroStrata repo
     if [ -d ".git" ]; then
         install_hook ".git/hooks/pre-push"
+        install_sync_hook ".git/hooks/post-commit"
+        install_sync_hook ".git/hooks/post-checkout"
+        install_sync_hook ".git/hooks/post-merge"
     fi
 else
     if [ ! -d ".git" ]; then
@@ -71,4 +101,7 @@ else
         exit 1
     fi
     install_hook ".git/hooks/pre-push"
+    install_sync_hook ".git/hooks/post-commit"
+    install_sync_hook ".git/hooks/post-checkout"
+    install_sync_hook ".git/hooks/post-merge"
 fi

@@ -80,6 +80,7 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "content": { "type": "string", "description": "The text of the memory to save." },
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
+                                "project_root": { "type": "string", "description": "The absolute path to the project root directory where the agent is currently working." },
                                 "memory_type": { "type": "string", "description": "Type of memory: 'rule', 'preference', 'bootstrap', 'persona', or 'context'. Defaults to 'context'." },
                                 "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY if you are absolutely certain this is a brand new project namespace that doesn't exist yet." },
                                 "user_id": { "type": "string", "description": "The user making the request." },
@@ -100,7 +101,7 @@ pub async fn process_mcp_request(
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory IDs this rule connects to, forming a knowledge graph edge." },
                                 "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                             },
-                            "required": ["content", "namespace"]
+                            "required": ["content", "namespace", "project_root"]
                         }
                     },
                     {
@@ -184,6 +185,31 @@ pub async fn process_mcp_request(
                                 {
                                     result_text = "ERROR [SECURITY]: Memory rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your request and try storing the memory again.".to_string();
                                 } else if let Some(namespace) = arguments.get("namespace").and_then(|n| n.as_str()) {
+                                    if namespace.contains('/') || namespace.contains('\\') {
+                                        result_text = "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+                                        return serde_json::json!({
+                                            "content": [
+                                                { "type": "text", "text": result_text }
+                                            ],
+                                            "isError": true
+                                        });
+                                    }
+
+                                    if namespace != "global" {
+                                        if let Some(project_root) = arguments.get("project_root").and_then(|r| r.as_str()) {
+                                            let ns_dir = std::path::Path::new(project_root).join(".NeuroStrata");
+                                            if !ns_dir.exists() {
+                                                result_text = format!("ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, or which existing namespace it belongs to.", project_root);
+                                                return serde_json::json!({
+                                                    "content": [
+                                                        { "type": "text", "text": result_text }
+                                                    ],
+                                                    "isError": true
+                                                });
+                                            }
+                                        }
+                                    }
+
                                     let memory_type = arguments
                                     .get("memory_type")
                                     .and_then(|m| m.as_str())

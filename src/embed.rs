@@ -96,7 +96,7 @@ impl FastEmbedder {
             fs::create_dir_all(&cache_dir).context("Failed to create shared model cache directory")?;
         }
 
-        println!("Initializing FastEmbedder with model: {} using cache: {:?}", target_model.model_name, cache_dir);
+        eprintln!("Initializing FastEmbedder with model: {} using cache: {:?}", target_model.model_name, cache_dir);
 
         let model = TextEmbedding::try_new(
             InitOptions::new(model_enum)

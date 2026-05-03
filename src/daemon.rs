@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -55,7 +55,7 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:34343").await?;
-    println!("NeuroStrata Daemon listening on 127.0.0.1:34343");
+    eprintln!("NeuroStrata Daemon listening on 127.0.0.1:34343");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -66,7 +66,7 @@ async fn handle_get_graph(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let ns = query.namespace.unwrap_or_else(|| "global".to_string());
     
-    // Using export_graph here temporarily or implement native Kuzu querying here
+    // Using export_graph here temporarily or implement native LadybugDB querying here
     // For now, let's just use export_graph (which gets everything) and filter by namespace
     // In a real refactor, we would add get_graph_by_namespace to VectorStore.
     // Wait! VectorStore has export_graph() returning the whole graph!
