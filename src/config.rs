@@ -24,11 +24,15 @@ impl Config {
                     .join(".config")
                     .join("NeuroStrata")
                     .join("data")
-                    .join("db"),
+                    .join("db")
+                    .join("ladybug.db"),
             };
 
             if let Some(parent) = config_path.parent() {
                 fs::create_dir_all(parent)?;
+            }
+            if let Some(db_parent) = default_config.db_path.parent() {
+                fs::create_dir_all(db_parent)?;
             }
 
             let json = serde_json::to_string_pretty(&default_config)?;
@@ -38,7 +42,14 @@ impl Config {
         }
 
         let content = fs::read_to_string(&config_path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let mut config: Config = serde_json::from_str(&content)?;
+        
+        // If they have a legacy config where db_path points to an existing directory (from LanceDB),
+        // we need to append a filename so LadybugDB doesn't crash.
+        if config.db_path.is_dir() {
+            config.db_path = config.db_path.join("ladybug.db");
+        }
+        
         Ok(config)
     }
 }

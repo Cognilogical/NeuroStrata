@@ -13,16 +13,25 @@ install_hook() {
 # Ensures the agent (or user) has extracted knowledge to the memory DB before pushing.
 
 DB_DIR="$HOME/.config/NeuroStrata/data/db"
+DB_FILE="$HOME/.config/NeuroStrata/data/db/ladybug.db"
+OLD_DB_FILE="$HOME/.config/NeuroStrata/data/db"
 
-# If DB doesn't exist yet, allow the push (might be initial commit or non-NeuroStrata repo)
-if [ ! -d "$DB_DIR" ]; then
+# Determine which DB to check
+if [ -f "$DB_FILE" ]; then
+    DB_TARGET="$DB_FILE"
+elif [ -f "$OLD_DB_FILE" ]; then
+    DB_TARGET="$OLD_DB_FILE"
+elif [ -d "$DB_DIR" ]; then
+    DB_TARGET="$DB_DIR"
+else
+    # If no DB exists yet, allow the push
     exit 0
 fi
 
 # Get the latest commit time
 LAST_COMMIT_TIME=$(git log -1 --format="%ct" 2>/dev/null || echo 0)
 # Get the db modification time (macOS/Linux compatible-ish)
-DB_MOD_TIME=$(stat -c "%Y" "$DB_DIR" 2>/dev/null || stat -f "%m" "$DB_DIR" 2>/dev/null || echo 0)
+DB_MOD_TIME=$(stat -c "%Y" "$DB_TARGET" 2>/dev/null || stat -f "%m" "$DB_TARGET" 2>/dev/null || echo 0)
 
 # If the database hasn't been touched since the last commit, flag it.
 if [ "$DB_MOD_TIME" -lt "$LAST_COMMIT_TIME" ]; then
