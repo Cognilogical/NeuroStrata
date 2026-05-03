@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { open } from '@tauri-apps/plugin-shell';
+import { emit } from '@tauri-apps/api/event';
 import type { MemoryNode, MemoryLink } from '../types';
 
 interface Props {
@@ -83,6 +84,13 @@ export const UIPanel: React.FC<Props> = ({
       
       {/* Right Column Stack */}
       <div className="w-96 flex flex-col gap-4 pointer-events-none max-h-full">
+
+        <button
+          onClick={() => emit('open-project-dialog', "open")}
+          className="w-full pointer-events-auto px-4 py-3 bg-blue-600/30 hover:bg-blue-500/40 border border-blue-500/50 rounded-xl text-blue-100 font-bold shadow-lg transition-all flex items-center justify-center gap-2 text-sm backdrop-blur-md"
+        >
+          📂 Load Project Workspace
+        </button>
         
         {/* Filters Box */}
         <div className={`pointer-events-auto flex flex-col max-h-[50vh] ${panelGlassClass}`}>
@@ -144,7 +152,13 @@ export const UIPanel: React.FC<Props> = ({
                               {ed === 'vscode' ? 'VS Code' : ed === 'cursor' ? 'Cursor' : 'Obsidian'}
                             </button>
                           ))}
-                        </div>
+        <button
+          onClick={() => emit('open-project-dialog', "open")}
+          className="w-full mt-2 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/40 border border-blue-500/30 rounded text-blue-300 font-medium transition-colors flex items-center justify-center gap-2 text-sm"
+        >
+          📂 Open Project Folder
+        </button>
+      </div>
                         <button 
                           onClick={handleOpenInEditor}
                           className="w-full bg-blue-600/20 hover:bg-blue-600/40 text-blue-200 border border-blue-500/30 text-xs font-bold py-2 px-2 rounded transition-colors shadow-sm mt-1 flex items-center justify-center gap-2"

@@ -53,6 +53,9 @@ function App() {
       });
 
       setGraphData(data);
+      invoke('log_message', { msg: `Loaded graph: ${data.nodes.length} nodes, ${data.links.length} links` });
+      invoke('log_message', { msg: `Sample node: ${JSON.stringify(data.nodes[0])}` });
+      invoke('log_message', { msg: `Sample link: ${JSON.stringify(data.links[0])}` });
       
       const uniqueNamespaces = Array.from(new Set(data.nodes.map(n => n.namespace).filter(Boolean))) as string[];
       setNamespaceFilters(prev => {
@@ -72,17 +75,21 @@ function App() {
         return next;
       });
     } catch (e) {
-      console.error("Failed to load graph from Kuzu", e);
+      invoke('log_message', { msg: `Failed to load graph from Ladybug: ${e}` });
+      console.error("Failed to load graph from Ladybug", e);
     }
   };
 
   useEffect(() => {
-    const unlistenMenu = listen('open-project-dialog', async () => {
+    invoke('log_message', { msg: "Registering open-project-dialog listener" });
+    const unlistenMenu = listen('open-project-dialog', async (e) => {
+      invoke('log_message', { msg: `RECEIVED open-project-dialog: ${JSON.stringify(e)}` });
       try {
         const selected = await open({
           directory: true,
           multiple: false,
         });
+        invoke('log_message', { msg: `Selected directory: ${selected}` });
         if (selected && typeof selected === 'string') {
           setProjectPath(selected);
           await invoke('save_project_path', { path: selected });
@@ -91,20 +98,21 @@ function App() {
           setIsIngesting(true);
           try {
             await invoke('ingest_ast', { projectPath: selected });
-            console.log("AST ingestion completed successfully.");
+            invoke('log_message', { msg: "AST ingestion completed successfully." });
           } catch (e) {
-            console.error("AST Ingestion failed", e);
+            invoke('log_message', { msg: `AST Ingestion failed: ${e}` });
           } finally {
             setIsIngesting(false);
           }
           await loadGraph(selected);
         }
       } catch (e) {
-        console.error('Failed to open project dialog', e);
+        invoke('log_message', { msg: `Failed to open project dialog: ${e}` });
       }
     });
 
     return () => {
+      invoke('log_message', { msg: "Unregistering open-project-dialog listener" });
       unlistenMenu.then(f => f());
     };
   }, []);
@@ -150,6 +158,7 @@ function App() {
       nodeIds.has(typeof l.target === 'object' ? (l.target as any).id : l.target)
     );
     
+    invoke('log_message', { msg: `Filtered data has ${nodes.length} nodes and ${links.length} links` });
     return { nodes, links };
   }, [graphData, typeFilters, namespaceFilters]);
 

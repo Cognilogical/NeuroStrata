@@ -1,4 +1,5 @@
 mod config;
+mod daemon;
 mod embed;
 mod parser;
 mod server;
@@ -129,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
                 // Ensure tables exist before exporting
                 vector_store.init("global").await?;
 
-                // Query the graph natively through the active store (Kuzu)
+                // Query the graph natively through the active store (Ladybug)
                 let graph_data = vector_store.export_graph().await?;
 
                 let json = serde_json::to_string_pretty(&graph_data)?;
@@ -148,7 +149,33 @@ async fn main() -> anyhow::Result<()> {
                 let namespace = &args[2];
                 let id = &args[3];
                 vector_store.delete(namespace, id).await?;
-                println!("Deleted memory {} from namespace {}", id, namespace);
+                println!("Memory deleted successfully.");
+                return Ok(());
+            }
+            "add" => {
+                if args.len() < 5 {
+                    eprintln!("Usage: neurostrata-mcp add <namespace> <type> <content> [location]");
+                    return Ok(());
+                }
+                use crate::traits::MemoryPayload;
+                let namespace = &args[2];
+                let mem_type = &args[3];
+                let content = &args[4];
+                let location = args.get(5).cloned().unwrap_or_default();
+                
+                let vector = embedder.embed(content).await?;
+                let payload = MemoryPayload {
+                    content: content.clone(),
+                    memory_type: mem_type.clone(),
+                    location,
+                    user_id: "system".to_string(),
+                    agent_name: Some("NeuroStrata".to_string()),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                };
+                let id = uuid::Uuid::new_v4().to_string();
+                vector_store.upsert(namespace, &id, vector, payload).await?;
+                println!("Memory added successfully with ID: {}", id);
                 return Ok(());
             }
             "edit" => {
@@ -180,6 +207,20 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            "daemon" => {
+                println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
+                let config = Config::from_default_path()?;
+                let embedder = Arc::new(FastEmbedder::new()?);
+                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                    config.db_path.to_str().unwrap().to_string(),
+                    embedder.dimensions(),
+                )?);
+                vector_store.init("global").await?;
+                
+                // Run daemon and block forever
+                daemon::start_daemon(embedder, vector_store).await?;
+                return Ok(());
+            }
             _ => {
                 // If it's something else, fall through or print usage? Let's just start the server.
                 // Or maybe they passed a random arg. Let's start the server but we can ignore it.
@@ -197,9 +238,9 @@ async fn main() -> anyhow::Result<()> {
     let embedder = Arc::new(FastEmbedder::new()?);
     println!("Embedder initialized.");
 
-    // Initialize Embedded Kuzu VectorStore
+    // Initialize Embedded Ladybug VectorStore
     println!(
-        "Initializing Embedded Kuzu Store at {:?}",
+        "Initializing Embedded Ladybug Store at {:?}",
         config.db_path
     );
     let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
@@ -210,9 +251,35 @@ async fn main() -> anyhow::Result<()> {
     vector_store.init("global").await?;
     println!("Vector store tables ensured.");
 
-    // Boot actual MCP server loop
-    println!("Starting in MCP JSON-RPC mode");
-    server::start_mcp_server(embedder, vector_store).await?;
+    // Check if the daemon is already running on port 34343
+    let daemon_running = reqwest::Client::new()
+        .get("http://127.0.0.1:34343/health")
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .await
+        .is_ok();
+
+    if daemon_running {
+        println!("Daemon is already running. Starting MCP proxy...");
+        server::start_mcp_proxy().await?;
+    } else {
+        println!("Starting MCP daemon and proxy...");
+        
+        let emb = embedder.clone();
+        let vs = vector_store.clone();
+        
+        // Spawn daemon in background
+        tokio::spawn(async move {
+            if let Err(e) = daemon::start_daemon(emb, vs).await {
+                eprintln!("Daemon failed: {}", e);
+            }
+        });
+        
+        // Wait a tiny bit for the server to bind
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        server::start_mcp_proxy().await?;
+    }
 
     Ok(())
 }

@@ -63,15 +63,15 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
           if (isGlobal) {
             // Pull Global nodes to a distant satellite cluster (x: 800, y: 800, z: 800)
             const strength = 0.5 * alpha;
-            node.vx += (800 - (node.x || 0)) * strength;
-            node.vy += (800 - (node.y || 0)) * strength;
-            node.vz += (800 - (node.z || 0)) * strength;
+            node.vx = (node.vx || 0) + (800 - (node.x || 0)) * strength;
+            node.vy = (node.vy || 0) + (800 - (node.y || 0)) * strength;
+            node.vz = (node.vz || 0) + (800 - (node.z || 0)) * strength;
           } else {
-            // Pull Project nodes gently towards the origin (0,0,0) to keep them centered
+            // Pull Project nodes closer to center (0,0,0)
             const strength = 0.1 * alpha;
-            node.vx += (0 - (node.x || 0)) * strength;
-            node.vy += (0 - (node.y || 0)) * strength;
-            node.vz += (0 - (node.z || 0)) * strength;
+            node.vx = (node.vx || 0) + (0 - (node.x || 0)) * strength;
+            node.vy = (node.vy || 0) + (0 - (node.y || 0)) * strength;
+            node.vz = (node.vz || 0) + (0 - (node.z || 0)) * strength;
           }
         }
       });
