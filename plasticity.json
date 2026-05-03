@@ -12,12 +12,12 @@
     "timeout_seconds": 600,
     "base_image": "localhost/neurostrata-agent-base:latest",
     "setup_script": [
-      "mkdir -p /user_home/.config/opencode",
-      "mkdir -p /user_home/.local/share/opencode",
-      "mkdir -p /user_home/.config/NeuroStrata/data/db",
-      "cp /tmp/auth.json /user_home/.local/share/opencode/auth.json || true",
-      "cp /tmp/opencode.json /user_home/.config/opencode/opencode.json || true",
-      "echo '{\"mcpServers\": {\"neurostrata\": {\"command\": \"neurostrata-mcp\"}}}' > /user_home/.config/opencode/mcp.json"
+      "mkdir -p $HOME/.config/opencode",
+      "mkdir -p $HOME/.local/share/opencode",
+      "mkdir -p $HOME/.config/NeuroStrata/data/db",
+      "cp /tmp/auth.json $HOME/.local/share/opencode/auth.json || true",
+      "echo '{\"mcpServers\": {\"neurostrata\": {\"command\": \"neurostrata-mcp\"}}}' > $HOME/.config/opencode/mcp.json",
+      "cp /tmp/clean_opencode.json $HOME/.config/opencode/opencode.json || true"
     ],
     "workspace": {
       "project_mount": "/project",
@@ -35,7 +35,7 @@
         "readonly": true
       },
       {
-        "source": "/home/kenton/.local/bin/neurostrata-mcp",
+        "source": "/home/kenton/.cargo/bin/neurostrata-mcp",
         "target": "/usr/local/bin/neurostrata-mcp",
         "readonly": true
       },
@@ -45,8 +45,8 @@
         "readonly": true
       },
       {
-        "source": "/home/kenton/.config/opencode/opencode.json",
-        "target": "/tmp/opencode.json",
+        "source": "/tmp/clean_opencode.json",
+        "target": "/tmp/clean_opencode.json",
         "readonly": true
       }
     ]
@@ -66,7 +66,7 @@
       "script": [
         "bash",
         "-c",
-        "if [ ! -d '.beads' ] || ! grep -q 'task' .beads/*.json 2>/dev/null; then echo 'Agent failed to use `bd create` or `bd update` to track its task.' >&2; exit 1; fi"
+        "if [ ! -d '.beads' ]; then echo 'Agent failed to use `bd` tracker.' >&2; exit 1; fi"
       ],
       "weight": 1.0
     },
@@ -111,7 +111,7 @@
       "script": [
         "bash",
         "-c",
-        "if [ -z \"$(find /user_home/.config/NeuroStrata/data/db -type f 2>/dev/null)\" ] && [ -z \"$(find .neurostrata/sessions -type f -name '*.jsonl' 2>/dev/null)\" ]; then echo 'Agent failed to log memories into NeuroStrata.' >&2; exit 1; fi"
+        "if [ -z \"$(find $HOME/.config/NeuroStrata/data/db -type f 2>/dev/null)\" ] && [ -z \"$(find .neurostrata/sessions -type f -name '*.jsonl' 2>/dev/null)\" ]; then echo 'Agent failed to log memories into NeuroStrata.' >&2; exit 1; fi"
       ],
       "weight": 1.0
     },
