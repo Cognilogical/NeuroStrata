@@ -199,13 +199,30 @@ pub async fn process_mcp_request(
                                         if let Some(project_root) = arguments.get("project_root").and_then(|r| r.as_str()) {
                                             let ns_dir = std::path::Path::new(project_root).join(".NeuroStrata");
                                             if !ns_dir.exists() {
-                                                result_text = format!("ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, or which existing namespace it belongs to.", project_root);
-                                                return serde_json::json!({
-                                                    "content": [
-                                                        { "type": "text", "text": result_text }
-                                                    ],
-                                                    "isError": true
-                                                });
+                                                let create_new_namespace = arguments
+                                                    .get("create_new_namespace")
+                                                    .and_then(|v| v.as_bool())
+                                                    .unwrap_or(false);
+
+                                                if !create_new_namespace {
+                                                    result_text = format!("ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, and if so, call this tool again with create_new_namespace=true.", project_root);
+                                                    return serde_json::json!({
+                                                        "content": [
+                                                            { "type": "text", "text": result_text }
+                                                        ],
+                                                        "isError": true
+                                                    });
+                                                } else {
+                                                    if let Err(e) = std::fs::create_dir_all(&ns_dir) {
+                                                        result_text = format!("ERROR: Failed to create .NeuroStrata directory: {}", e);
+                                                        return serde_json::json!({
+                                                            "content": [
+                                                                { "type": "text", "text": result_text }
+                                                            ],
+                                                            "isError": true
+                                                        });
+                                                    }
+                                                }
                                             }
                                         }
                                     }
