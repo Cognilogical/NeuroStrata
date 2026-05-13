@@ -33,26 +33,21 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         } else {
             eprintln!("NeuroStrata MCP Server initializing...");
-            let config = Config::from_default_path()?;
-            let embedder = Arc::new(FastEmbedder::new()?);
-            let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                config.db_path.to_str().unwrap().to_string(),
-                embedder.dimensions(),
-            )?);
-            vector_store.init("global").await?;
             
-            eprintln!("Starting MCP daemon and proxy...");
-            let emb = embedder.clone();
-            let vs = vector_store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = daemon::start_daemon(emb, vs).await {
-                    eprintln!("Daemon failed: {}", e);
-                }
-            });
+            // Spawn the daemon as a detached process
+            let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("neurostrata-mcp"));
+            std::process::Command::new(exe)
+                .arg("daemon")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            
+            eprintln!("Waiting for daemon to become ready (this may take a moment while models load)...");
             
             // Wait for daemon to become ready
             let client = reqwest::Client::new();
-            for _ in 0..50 { // 5 seconds max
+            for _ in 0..300 { // 30 seconds max
                 if client.get("http://127.0.0.1:34343/health").send().await.is_ok() {
                     break;
                 }
