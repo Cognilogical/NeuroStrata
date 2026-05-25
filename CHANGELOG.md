@@ -4,6 +4,16 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.3.0] - 2026-05-25
+
+### Added
+- **Clap Subcommand CLI Integration**: Integrated `clap` v4 with derive-style command parsing to cleanly structure vector store CLI operations (`daemon`, `namespaces`, `list`, `ingest`, `export-graph`, `delete`, `add`, `edit`).
+- **External Plugin Fallback**: Implemented robust prefix matching and cross-platform child subprocess spawning for unrecognized commands, ensuring 100% backward compatibility for external plugin runners.
+- **GitHub Issue Synchronizer**: Created a standalone `sync_github_issues.sh` utility to sync outstanding tasks and post comments, with a smart offline/unauthenticated fallback to local markdown files under `docs/github_issues/`.
+- **Dolt Beads Tracking**: Created and completed issue tracking beads for Phases 4-8 in the local beads Dolt database.
+
+---
+
 ## [1.2.0] - 2026-05-25
 
 ### Added
