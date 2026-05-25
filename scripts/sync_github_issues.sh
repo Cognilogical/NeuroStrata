@@ -4,7 +4,11 @@
 #
 # Usage: ./scripts/sync_github_issues.sh [--dry-run]
 #
-# Requires: gh CLI authenticated (run `gh auth login` first)
+# Requires: gh CLI authenticated via keyring (run `gh auth login` first),
+#           OR export GH_TOKEN=<your-token> before running.
+#
+# NOTE: If gh stores the token in macOS keyring (not config file), run this
+#       script directly from your terminal — not through a sandboxed shell.
 set -euo pipefail
 
 REPO="Cognilogical/NeuroStrata"
@@ -18,11 +22,15 @@ warn() { echo "  ⚠ $*"; }
 
 # ─── pre-flight ────────────────────────────────────────────────────────────────
 log "Checking gh authentication…"
-if ! gh auth status --hostname github.com &>/dev/null; then
-  echo "ERROR: gh CLI is not authenticated. Run: gh auth login"
+# Try a lightweight API call — covers both keyring tokens and GH_TOKEN env var
+if ! gh api user --jq '.login' &>/dev/null; then
+  echo "ERROR: gh CLI cannot reach GitHub API."
+  echo "  Option A: Run 'gh auth login' then re-run this script from your terminal."
+  echo "  Option B: Export GH_TOKEN=<your-pat> and re-run."
   exit 1
 fi
-note "Authenticated."
+ACTOR=$(gh api user --jq '.login')
+note "Authenticated as @${ACTOR}."
 
 # ─── helper ────────────────────────────────────────────────────────────────────
 create_issue() {
