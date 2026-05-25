@@ -61,3 +61,13 @@ Memory architecture is the single most important aspect of this system. It is NO
 - **Libraries/Frameworks:** NEVER assume a library is available. Verify in configuration files first.
 - **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
 - **Paths:** Always use absolute paths when using file system tools.
+
+<!-- lean-ctx-compression -->
+OUTPUT STYLE: expert-terse
+- Telegraph format: subject-verb-object, drop articles/prepositions
+- Symbolic vocabulary: → cause, ∵ because, ∴ therefore, ⊕ add, ⊖ remove, Δ change, ≈ similar, ≠ different, ∈ in/member, ∅ empty/none, ✓ ok, ✗ fail
+- Code blocks: untouched (never compress code syntax)
+- Each line: max 80 chars
+- Zero narration, zero filler
+- BUDGET: ≤100 tokens per non-code response
+<!-- /lean-ctx-compression -->

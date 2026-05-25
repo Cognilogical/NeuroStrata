@@ -64,7 +64,16 @@ pub async fn process_mcp_request(
                     "tools": {}
                 }
             });
-            serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap()
+            serde_json::to_value(JsonRpcResponse::success(id.clone(), result)).unwrap_or_else(|e| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!("Internal serialization error: {}", e)
+                    }
+                })
+            })
         }
         "notifications/initialized" => {
             serde_json::json!({})
@@ -149,7 +158,16 @@ pub async fn process_mcp_request(
                     }
                 ]
             });
-            serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap()
+            serde_json::to_value(JsonRpcResponse::success(id.clone(), result)).unwrap_or_else(|e| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!("Internal serialization error: {}", e)
+                    }
+                })
+            })
         }
         "tools/call" => {
             let mut result_text = "Tool execution failed".to_string();
@@ -198,7 +216,7 @@ pub async fn process_mcp_request(
                                     if namespace != "global" {
                                         if let Some(project_root) = arguments.get("project_root").and_then(|r| r.as_str()) {
                                             let ns_dir = std::path::Path::new(project_root).join(".NeuroStrata");
-                                            if !ns_dir.exists() {
+                                            if !tokio::fs::try_exists(&ns_dir).await.unwrap_or(false) {
                                                 let create_new_namespace = arguments
                                                     .get("create_new_namespace")
                                                     .and_then(|v| v.as_bool())
@@ -213,7 +231,7 @@ pub async fn process_mcp_request(
                                                         "isError": true
                                                     });
                                                 } else {
-                                                    if let Err(e) = std::fs::create_dir_all(&ns_dir) {
+                                                    if let Err(e) = tokio::fs::create_dir_all(&ns_dir).await {
                                                         result_text = format!("ERROR: Failed to create .NeuroStrata directory: {}", e);
                                                         return serde_json::json!({
                                                             "content": [
@@ -361,9 +379,12 @@ pub async fn process_mcp_request(
                                     store.list(namespace, None).await
                                 {
                                     // Filter temporal (active memories only)
+                                    let now = chrono::Utc::now().timestamp();
                                     all_memories.retain(|r| {
-                                        r.payload.metadata.get("valid_to").is_none()
-                                            || r.payload.metadata["valid_to"].is_null()
+                                        match r.payload.metadata.get("valid_to") {
+                                            None => true,
+                                            Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
+                                        }
                                     });
                                     // Sort by access_count (neural gain) descending
                                     all_memories.sort_by(|a, b| {
@@ -498,6 +519,15 @@ pub async fn process_mcp_request(
                                                 result_text = "No relevant memories found."
                                                     .to_string();
                                             } else {
+                                                for res in &results {
+                                                    let store_clone = store.clone();
+                                                    let ns_clone = namespace.to_string();
+                                                    let id_clone = res.id.clone();
+                                                    tokio::spawn(async move {
+                                                        let _ = store_clone.increment_access_count(&ns_clone, &id_clone).await;
+                                                    });
+                                                }
+
                                                 let formatted: Vec<String> = results
                                                     .into_iter()
                                                     .map(|r| {
@@ -562,7 +592,16 @@ pub async fn process_mcp_request(
                     { "type": "text", "text": result_text }
                 ]
             });
-            serde_json::to_value(JsonRpcResponse::success(id, result)).unwrap()
+            serde_json::to_value(JsonRpcResponse::success(id.clone(), result)).unwrap_or_else(|e| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!("Internal serialization error: {}", e)
+                    }
+                })
+            })
         }
         _ => serde_json::json!({})
     }

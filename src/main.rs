@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         let config = Config::from_default_path()?;
         let embedder = Arc::new(FastEmbedder::new()?);
         let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-            config.db_path.to_str().unwrap().to_string(),
+            config.db_path.to_string_lossy().to_string(),
             embedder.dimensions(),
         )?);
         vector_store.init("global").await?;
@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::from_default_path()?;
             let embedder = Arc::new(FastEmbedder::new()?);
             let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                config.db_path.to_str().unwrap().to_string(),
+                config.db_path.to_string_lossy().to_string(),
                 embedder.dimensions(),
             )?);
             

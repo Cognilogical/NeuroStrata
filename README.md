@@ -181,15 +181,21 @@ Once installed, your AI agent automatically gains access to the following tools 
 | `neurostrata_search_memory` | Semantic search across the 3 Tiers to enforce architectural compliance. |
 | `neurostrata_update_memory` | Overwrite an existing memory to fix hallucinations or update obsolete rules. |
 | `neurostrata_delete_memory` | Hard-delete dead context from the latent space (Manual verification required). |
-| `neurostrata_generate_canvas` | Autonomously render the vector database into an Obsidian `.canvas` spatial graph. |
 | `neurostrata_ingest_directory` | Batch-embed an entire architectural documentation folder. |
 | `neurostrata_dump_db` | Export the entire vector database to a JSON file for backup and portability. |
+
+## 📖 CLI and Changelog Documentation
+
+For advanced administration, direct manipulation of the cognitive graph, and history of updates, refer to:
+*   [CLI Interface Guide](file:///Users/neo/projects/NeuroStrata/CLI-readme.md) — Complete manual for `neurostrata-mcp` commands (`namespaces`, `list`, `ingest`, `export-graph`, `delete`, `add`, `edit`).
+*   [Project Changelog](file:///Users/neo/projects/NeuroStrata/CHANGELOG.md) — Detailed version-by-version changes and migration logs.
 
 ## 🛡️ Security & Compliance
 
 NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications** and common AI red-teaming vectors:
 - **Zero Network Attack Surface (Mitigates LLM07):** NeuroStrata is a pure `stdio` MCP server. It listens on zero ports and has no external APIs, neutralizing remote RCE and plugin exploitation vectors.
 - **Active Secret Scrubbing (Mitigates LLM06):** The Rust backend actively scans memory payloads for high-entropy secrets (API keys, passwords, JWTs) and explicitly rejects insertions, forcing the agent into a "Redaction Loop" to prevent permanent context contamination.
+- **Kuzu Injection Hardening (Mitigates SQL/Cypher Injection):** Active escaping of single quotes and backslashes in database interpolations eliminates Cypher database injection and prompt-driven database crash vectors.
 - **Role-Based Memory Access (Mitigates LLM08):** Destructive actions (`neurostrata_delete_memory`) are strictly restricted. Task sub-agents cannot delete memories or drop the database, ensuring only the manager agent can curate the vector space.
 - **Resilient Soft Locks (Mitigates LLM09):** To combat context degradation and "happy path" tunnel vision, NeuroStrata enforces memory extraction through OS-level Git hooks (Pre-Push Behavioral Forcing) rather than relying solely on fragile system prompts.
 
