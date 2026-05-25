@@ -79,4 +79,7 @@ pub trait VectorStore: Send + Sync {
 
     /// Export the entire graph as a JSON object with `nodes` and `links`.
     async fn export_graph(&self) -> Result<serde_json::Value>;
+
+    /// Increment the access count of a specific memory by its ID.
+    async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()>;
 }

@@ -37,7 +37,6 @@ pub async fn ingest_directory(
     ];
 
     let zero_vector = vec![0.0; embedder.dimensions()];
-    let _ingested_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for result in walker {
         let entry = match result {
@@ -94,10 +93,8 @@ pub async fn ingest_directory(
         } else if is_file {
             if path_str.ends_with(".md") {
                 "markdown"
-            } else if path_str.ends_with(".rs") || path_str.ends_with(".ts") || path_str.ends_with(".tsx") {
-                "file"
             } else {
-                continue;
+                "file"
             }
         } else {
             continue;
@@ -128,46 +125,6 @@ pub async fn ingest_directory(
         }
 
         // Now if it is a parseable file, extract AST nodes
-
-    }
-
-    let walker_builder = WalkBuilder::new(dir_path);
-    // Explicitly ignore common 3rd party and build directories even if not gitignored
-    let walker = walker_builder.build();
-
-    let skipped_dirs = [
-        "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
-        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__",
-        ".fastembed_cache", ".idea", ".vscode", "coverage"
-    ];
-
-    for result in walker {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-            continue;
-        }
-
-        let path = entry.path();
-        let path_str = path.to_string_lossy();
-        
-        let mut should_skip = false;
-        for skip_dir in &skipped_dirs {
-            let skip_pattern = format!("/{}/", skip_dir);
-            let skip_start = format!("{}/", skip_dir);
-            if path_str.contains(&skip_pattern) || path_str.starts_with(&skip_start) {
-                should_skip = true;
-                break;
-            }
-        }
-        
-        if should_skip {
-            continue;
-        }
-
         if let Some(ext_os) = path.extension() {
             let ext = format!(".{}", ext_os.to_string_lossy());
             if let Some(lang_name) = ext_to_lang.get(&ext) {
@@ -213,26 +170,26 @@ pub async fn ingest_directory(
                         let summary = format!("File: {}\nAST Symbols:\n{}", path.display(), extracted_symbols.join("\n"));
                         let id = uuid::Uuid::new_v4().to_string();
                         
-                            let mut metadata = serde_json::Map::new();
-                            metadata.insert("domain".to_string(), serde_json::json!("code_ast"));
-                            metadata.insert("related_to".to_string(), serde_json::json!([path.to_string_lossy().to_string()]));
-                            metadata.insert("refs".to_string(), serde_json::json!([
-                                { "file": path.to_string_lossy().to_string() }
-                            ]));
+                        let mut metadata = serde_json::Map::new();
+                        metadata.insert("domain".to_string(), serde_json::json!("code_ast"));
+                        metadata.insert("related_to".to_string(), serde_json::json!([path.to_string_lossy().to_string()]));
+                        metadata.insert("refs".to_string(), serde_json::json!([
+                            { "file": path.to_string_lossy().to_string() }
+                        ]));
 
-                            let payload = MemoryPayload {
-                                content: summary.clone(),
-                                location: path.to_string_lossy().to_string(),
-                                location_lines: String::new(),
-                                memory_type: "code_ast".to_string(),
-                                metadata: serde_json::Value::Object(metadata),
-                                user_id: "auto-ingestor".to_string(),
-                                agent_name: Some("neurostrata-mcp-ingestor".to_string()),
-                            };
+                        let payload = MemoryPayload {
+                            content: summary.clone(),
+                            location: path.to_string_lossy().to_string(),
+                            location_lines: String::new(),
+                            memory_type: "code_ast".to_string(),
+                            metadata: serde_json::Value::Object(metadata),
+                            user_id: "auto-ingestor".to_string(),
+                            agent_name: Some("neurostrata-mcp-ingestor".to_string()),
+                        };
 
-                            match embedder.embed(&summary).await {
-                                Ok(embedding) => {
-                                    if let Err(e) = vector_store.upsert(namespace, &id, embedding, payload).await {
+                        match embedder.embed(&summary).await {
+                            Ok(embedding) => {
+                                if let Err(e) = vector_store.upsert(namespace, &id, embedding, payload).await {
                                     eprintln!("Failed to store AST for {}: {}", path.display(), e);
                                 } else {
                                     println!("Ingested AST for {}", path.display());

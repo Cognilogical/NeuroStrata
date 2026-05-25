@@ -67,6 +67,10 @@ impl LadybugStore {
     }
 }
 
+fn escape_kuzu_string(s: &str) -> String {
+    s.replace("\\", "\\\\").replace("'", "\\'")
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
@@ -103,15 +107,15 @@ impl VectorStore for LadybugStore {
     ) -> Result<()> {
         let conn = self.get_conn()?;
 
-        let safe_id = id.replace("'", "\\'");
-        let safe_ns = namespace.replace("'", "\\'");
-        let safe_content = payload.content.replace("'", "\\'");
-        let safe_user_id = payload.user_id.replace("'", "\\'");
-        let safe_memory_type = payload.memory_type.replace("'", "\\'");
-        let safe_agent_name = payload.agent_name.unwrap_or_else(|| "unknown".to_string()).replace("'", "\\'");
-        let safe_location = payload.location.replace("'", "\\'");
-        let safe_location_lines = payload.location_lines.replace("'", "\\'");
-        let safe_metadata = serde_json::to_string(&payload.metadata)?.replace("'", "\\'");
+        let safe_id = escape_kuzu_string(id);
+        let safe_ns = escape_kuzu_string(namespace);
+        let safe_content = escape_kuzu_string(&payload.content);
+        let safe_user_id = escape_kuzu_string(&payload.user_id);
+        let safe_memory_type = escape_kuzu_string(&payload.memory_type);
+        let safe_agent_name = escape_kuzu_string(&payload.agent_name.unwrap_or_else(|| "unknown".to_string()));
+        let safe_location = escape_kuzu_string(&payload.location);
+        let safe_location_lines = escape_kuzu_string(&payload.location_lines);
+        let safe_metadata = escape_kuzu_string(&serde_json::to_string(&payload.metadata)?);
         
         let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
@@ -129,7 +133,7 @@ impl VectorStore for LadybugStore {
         if let Some(related) = payload.metadata.get("related_to").and_then(|r| r.as_array()) {
             for rel in related {
                 if let Some(rel_id) = rel.as_str() {
-                    let rel_id_safe = rel_id.replace("'", "\\'");
+                    let rel_id_safe = escape_kuzu_string(rel_id);
                     let edge_query = format!(
                         "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:RELATES_TO]->(b)",
                         safe_id, rel_id_safe
@@ -149,7 +153,7 @@ impl VectorStore for LadybugStore {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "\\'");
+        let safe_ns = escape_kuzu_string(namespace);
         let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
         // Step 1: Base vector search
@@ -181,12 +185,18 @@ impl VectorStore for LadybugStore {
             let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
             // Temporal filtering
-            if metadata_val.get("valid_to").is_some() && !metadata_val["valid_to"].is_null() {
-                continue;
+            if let Some(valid_to) = metadata_val.get("valid_to") {
+                if !valid_to.is_null() {
+                    let now = chrono::Utc::now().timestamp();
+                    if valid_to.as_i64().unwrap_or(0) <= now {
+                        continue;
+                    }
+                }
             }
 
             let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let boosted_distance = distance - (access_count as f32 * 0.05);
+            let gain = if access_count > 0 { (access_count as f32).ln() * 0.05 } else { 0.0 };
+            let boosted_distance = distance - gain;
 
             primary_ids.push(id.clone());
 
@@ -209,7 +219,7 @@ impl VectorStore for LadybugStore {
         // We fetch 1-hop neighbors (CONTAINS, GOVERNS, RELATES_TO) to provide blast radius context
         if !primary_ids.is_empty() {
             let id_list = primary_ids.iter()
-                .map(|id| format!("'{}'", id.replace("'", "\\'")))
+                .map(|id| format!("'{}'", escape_kuzu_string(id)))
                 .collect::<Vec<_>>()
                 .join(", ");
 
@@ -260,8 +270,8 @@ impl VectorStore for LadybugStore {
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "\\'");
-        let safe_id = id.replace("'", "\\'");
+        let safe_ns = escape_kuzu_string(namespace);
+        let safe_id = escape_kuzu_string(id);
         
         let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
         conn.query(&query)?;
@@ -270,7 +280,7 @@ impl VectorStore for LadybugStore {
 
     async fn clear_ast(&self, namespace: &str) -> Result<()> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "\\'");
+        let safe_ns = escape_kuzu_string(namespace);
         
         // Delete all AST memories for this namespace
         let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
@@ -280,10 +290,10 @@ impl VectorStore for LadybugStore {
 
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "\\'");
+        let safe_ns = escape_kuzu_string(namespace);
         
         let query = if let Some(uid) = user_id {
-            format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, uid.replace("'", "\\'"))
+            format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, escape_kuzu_string(uid))
         } else {
             format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns)
         };
@@ -323,8 +333,8 @@ impl VectorStore for LadybugStore {
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
         let conn = self.get_conn()?;
-        let safe_ns = namespace.replace("'", "\\'");
-        let safe_id = id.replace("'", "\\'");
+        let safe_ns = escape_kuzu_string(namespace);
+        let safe_id = escape_kuzu_string(id);
 
         let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
         
@@ -352,24 +362,7 @@ impl VectorStore for LadybugStore {
 
             let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
-            // Fetch graph neighborhood (AST upward inheritance, blast radius)
-            let neighbor_query = format!(
-                "MATCH (m:Memory)-[r]-(n:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN type(r), n.content LIMIT 5",
-                safe_ns, safe_id
-            );
 
-            if let Ok(mut neighbor_res) = conn.query(&neighbor_query) {
-                let mut context_added = false;
-                while let Some(n_row) = neighbor_res.next() {
-                    if !context_added {
-                        content.push_str("\n\n--- Graph Context (Neighborhood) ---\n");
-                        context_added = true;
-                    }
-                    let rel_type = format!("{}", n_row[0]);
-                    let n_content = format!("{}", n_row[1]);
-                    content.push_str(&format!("\n[{}] Neighbor:\n{}\n", rel_type, n_content));
-                }
-            }
 
             return Ok(Some((
                 vec,
@@ -499,5 +492,20 @@ impl VectorStore for LadybugStore {
             "nodes": nodes,
             "links": links
         }))
+    }
+
+    async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {
+        if let Some((vector, mut payload)) = self.get(namespace, id).await? {
+            let count = payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert("access_count".to_string(), serde_json::json!(count + 1));
+            } else {
+                let mut obj = serde_json::Map::new();
+                obj.insert("access_count".to_string(), serde_json::json!(count + 1));
+                payload.metadata = Value::Object(obj);
+            }
+            self.upsert(namespace, id, vector, payload).await?;
+        }
+        Ok(())
     }
 }
