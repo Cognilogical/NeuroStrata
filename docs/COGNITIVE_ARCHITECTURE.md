@@ -14,7 +14,7 @@ Agents never overwrite history. When an architectural decision changes, the syst
 
 ### 3. Neural Gain Mechanism (Access-Based Synaptic Weighting)
 *Inspired by the Ebbinghaus Forgetting Curve and synaptic plasticity.*
-All vector databases rank results by mathematical distance (e.g., L2 or Cosine). NeuroStrata applies a **Neural Gain Filter** on top of this. Every time a memory is retrieved, the engine asynchronously increments its `access_count` metadata in the background. During retrieval, the engine dynamically calculates a final salience score: `Base Distance - (Access Frequency * Neural Boost)`. Outdated, unused rules naturally decay out of the context window, while highly-accessed core principles permanently float to the top.
+All vector databases rank results by mathematical distance (e.g., L2 or Cosine). NeuroStrata applies a **Neural Gain Filter** on top of this. Every time a memory is retrieved, the engine asynchronously increments its `access_count` metadata in the background. During retrieval, the engine dynamically calculates a final salience score: `Base Distance - (ln(Access Frequency) * Neural Boost)`. Outdated, unused rules naturally decay out of the context window, while highly-accessed core principles permanently float to the top without completely dominating standard semantic search results due to the logarithmic limit.
 
 ### 4. Domain-Isolated Knowledge Shelves (Contextual Compartmentalization)
 *Inspired by declarative knowledge clustering.*

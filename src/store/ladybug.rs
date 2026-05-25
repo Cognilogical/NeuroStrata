@@ -195,7 +195,8 @@ impl VectorStore for LadybugStore {
             }
 
             let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let boosted_distance = distance - (access_count as f32 * 0.05);
+            let gain = if access_count > 0 { (access_count as f32).ln() * 0.05 } else { 0.0 };
+            let boosted_distance = distance - gain;
 
             primary_ids.push(id.clone());
 
@@ -361,24 +362,7 @@ impl VectorStore for LadybugStore {
 
             let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
-            // Fetch graph neighborhood (AST upward inheritance, blast radius)
-            let neighbor_query = format!(
-                "MATCH (m:Memory)-[r]-(n:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN type(r), n.content LIMIT 5",
-                safe_ns, safe_id
-            );
 
-            if let Ok(mut neighbor_res) = conn.query(&neighbor_query) {
-                let mut context_added = false;
-                while let Some(n_row) = neighbor_res.next() {
-                    if !context_added {
-                        content.push_str("\n\n--- Graph Context (Neighborhood) ---\n");
-                        context_added = true;
-                    }
-                    let rel_type = format!("{}", n_row[0]);
-                    let n_content = format!("{}", n_row[1]);
-                    content.push_str(&format!("\n[{}] Neighbor:\n{}\n", rel_type, n_content));
-                }
-            }
 
             return Ok(Some((
                 vec,

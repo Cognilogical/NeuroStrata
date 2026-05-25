@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
                             std::process::exit(1);
                         })
                     } else {
-                        r#"{ "languages": {} }"#.to_string()
+                        include_str!("schema.json").to_string()
                     };
 
                     if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
@@ -203,24 +203,13 @@ async fn main() -> anyhow::Result<()> {
             let mut cmd = std::process::Command::new(command);
             cmd.args(&args[2..]);
             
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                let err = cmd.exec();
-                eprintln!("Failed to execute external command '{}': {}", command, err);
-                std::process::exit(1);
-            }
-            
-            #[cfg(not(unix))]
-            {
-                match cmd.status() {
-                    Ok(status) => {
-                        std::process::exit(status.code().unwrap_or(1));
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to execute external command '{}': {}", command, e);
-                        std::process::exit(1);
-                    }
+            match cmd.status() {
+                Ok(status) => {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                Err(e) => {
+                    eprintln!("Failed to execute external command '{}': {}", command, e);
+                    std::process::exit(1);
                 }
             }
         }

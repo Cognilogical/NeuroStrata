@@ -85,7 +85,11 @@ pub struct FastEmbedder {
 impl FastEmbedder {
     pub fn new() -> Result<Self> {
         let acceptable_models = get_acceptable_embedders()?;
-        let target_model = &acceptable_models[0];
+        
+        let env_model = std::env::var("NEUROSTRATA_MODEL").unwrap_or_default();
+        let target_model = acceptable_models.iter()
+            .find(|m| m.model_name.eq_ignore_ascii_case(&env_model))
+            .unwrap_or(&acceptable_models[0]);
         
         let model_enum = EmbeddingModel::from_str(&target_model.model_name)
             .unwrap_or(EmbeddingModel::NomicEmbedTextV15);

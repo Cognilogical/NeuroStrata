@@ -43,7 +43,7 @@ neurostrata-mcp ingest <dir_path> <namespace> [schema_path]
 ```
 *   `dir_path`: The directory containing source code files to parse.
 *   `namespace`: Destination namespace.
-*   `schema_path` (Optional): JSON file defining specific parser rules and AST patterns. If omitted, defaults to `{ "languages": {} }`.
+*   `schema_path` (Optional): JSON file defining specific parser rules and AST patterns. If omitted, defaults to the internally extracted `schema.json`.
 
 *Example:*
 ```bash

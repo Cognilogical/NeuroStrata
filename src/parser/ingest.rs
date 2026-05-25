@@ -93,10 +93,8 @@ pub async fn ingest_directory(
         } else if is_file {
             if path_str.ends_with(".md") {
                 "markdown"
-            } else if path_str.ends_with(".rs") || path_str.ends_with(".ts") || path_str.ends_with(".tsx") {
-                "file"
             } else {
-                continue;
+                "file"
             }
         } else {
             continue;

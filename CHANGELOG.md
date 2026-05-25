@@ -4,6 +4,24 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.2.0] - 2026-05-25
+
+### Added
+- **Regex Secret Scrubber**: Implemented robust regex-based secret scanning prior to DB insertion.
+- **Extracted AST Schema**: Separated AST schemas out to a declarative `schema.json` file for cleaner maintainability.
+
+### Changed
+- **Logarithmic Neural Gain**: Replaced linear boost in semantic search with logarithmic scaling to prevent query saturation blindness.
+- **Subprocess Spawning**: Transitioned to cross-platform `.status()` execution over Unix-only `.exec()` hijacking.
+- **Decoupled Handlers**: Completely refactored server route handling into independent controller functions.
+- **Model Configuration Support**: Allowed FastEmbed models to be dynamically instantiated via the `NEUROSTRATA_MODEL` env var.
+
+### Fixed
+- **Graph Inlining Defect**: Removed context neighborhood concatenation on direct fetches to solve permanent visualization corruption during DB moves.
+- **Ingestor Exclusion**: Corrected extension filter omitting structural graph processing on unspecified languages.
+
+---
+
 ## [1.1.1] - 2026-05-25
 
 ### Added

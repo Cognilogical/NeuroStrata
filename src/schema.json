@@ -1,0 +1,26 @@
+{
+    "languages": {
+        "rust": {
+            "extensions": ["rs"],
+            "queries": {
+                "functions": "(function_item name: (identifier) @name) @func",
+                "structs": "(struct_item name: (type_identifier) @name) @struct",
+                "impls": "(impl_item type: (type_identifier) @name) @impl"
+            }
+        },
+        "javascript": {
+            "extensions": ["js", "jsx", "ts", "tsx"],
+            "queries": {
+                "functions": "(function_declaration name: (identifier) @name) @func",
+                "classes": "(class_declaration name: (identifier) @name) @class"
+            }
+        },
+        "python": {
+            "extensions": ["py"],
+            "queries": {
+                "functions": "(function_definition name: (identifier) @name) @func",
+                "classes": "(class_definition name: (identifier) @name) @class"
+            }
+        }
+    }
+}
