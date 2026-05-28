@@ -201,6 +201,7 @@ pub async fn process_mcp_request(
                             result_text = format!("Unknown tool: {}", name);
                         }
                     }
+                }
             }
 
             let result = serde_json::json!({
