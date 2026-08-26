@@ -8,7 +8,6 @@ name = "neurostrata-mcp"
 path = "src/main.rs"
 
 [dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
 tokio = { version = "1.36", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -40,6 +39,14 @@ arrow-array = "=57.3.0"
 arrow-schema = "=57.3.0"
 axum = "0.7.5"
 reqwest = { version = "0.12", features = ["json"] }
+
+# native-tls (pulled in by reqwest, ureq and hf-hub) only links OpenSSL on
+# platforms without a system TLS stack. Windows uses SChannel and Apple targets
+# use Security.framework, so vendoring OpenSSL there compiles it from source for
+# nothing -- and on Windows that build additionally needs Perl and NASM.
+# This condition mirrors native-tls's own target gate.
+[target.'cfg(not(any(target_os = "windows", target_vendor = "apple")))'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 cxx-build = "=1.0.138"
