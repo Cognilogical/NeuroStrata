@@ -21,3 +21,15 @@ target/
 .NeuroStrata/
 *.log
 *.pid
+
+# IDE / editor settings - never tracked
+.idea/
+*.iml
+.vscode/
+
+# fastembed ONNX model cache (~523 MB). Created in-repo whenever the daemon
+# runs with HOME unset.
+.cache/
+
+# Cygwin/MSYS crash dumps
+*.stackdump
