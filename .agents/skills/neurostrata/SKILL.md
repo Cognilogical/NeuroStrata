@@ -5,7 +5,7 @@ description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task). Repl
 # NeuroStrata (The Tri-Strata Model)
 
 ## Overview
-NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Golang Model Context Protocol (MCP) server connected directly to an embedded LadybugDB vector database partitioned into three distinct tiers (The Tri-Strata Model).
+NeuroStrata is the standard operating protocol for persisting and retrieving knowledge across sessions. It completely replaces `MEMORY.md`, local markdown trackers, and `bd remember` by utilizing a native Rust Model Context Protocol (MCP) server connected directly to an embedded LadybugDB vector database partitioned into three distinct tiers (The Tri-Strata Model).
 
 ## The Tri-Strata Model
 1. **Global Stratum (`namespace="global"`)**: Company-wide constraints, infrastructure mandates (e.g., LadybugDB only, no REST, Clojure for parsing), and universal tool usage rules. **CRITICAL: NEVER use 'global' unless the user EXPLICITLY instructs you to make a company-wide machine rule. Assume all architecture rules are local to the current project and DEFAULT TO THE PROJECT NAMESPACE.**
@@ -17,11 +17,11 @@ NeuroStrata is the standard operating protocol for persisting and retrieving kno
 NeuroStrata provides the following native MCP tools that you MUST use to manage the system's memory:
 * `neurostrata_add_memory`: Add a new architectural rule, project pattern, or task insight (an Engram). **FORMATTING:** If the Engram is a strict, non-negotiable constraint that must NEVER be ignored, prefix it with "RULE: " (e.g., "RULE: Never use Python"). If it is general context, domain logic, or a pointer to documentation, just save it as normal text without the prefix. If scoped `namespace=global`, file paths in metadata must point to `~/.config/neurostrata/global/`.
 * `neurostrata_search_memory`: Search for existing Engrams before writing code or making architectural decisions.
-* `neurostrata_update_memory`: Update an existing Engram by ID. **FORMATTING:** Maintain the "RULE: " prefix only if the updated memory remains a strict constraint. Use this when a rule has evolved or was initially saved with hallucinations.
-* `neurostrata_delete_memory`: Delete an Engram by ID. Use this to prune obsolete, duplicated, or incorrect rules. **CRITICAL SECURITY RULE:** Only the designated NeuroStrata agent is permitted to delete memories. If you are a Task agent or another specialized agent, you may only add or update memories. Do not attempt to delete.
-* `neurostrata_generate_canvas`: Automatically regenerate the `NeuroStrata MemorySpace.canvas` Obsidian visualization file using the internal SynapticGraph engine. Use this after making significant changes to the project's memory or architecture.
+* `neurostrata_get_snapshot`: Fetch the project's active architectural rules in one call. Use it as your first action on a new task.
+* `neurostrata_list_namespaces`: List the namespaces the shared database holds.
 * `neurostrata_ingest_directory`: Batch ingest an entire directory of markdown files (e.g., `docs/architecture/`) into NeuroStrata. The server will automatically chunk and embed the files.
-* `neurostrata_dump_db`: Dump the entire NeuroStrata vector database to a JSON file for backup purposes. Use this when the user asks to backup or export the database.
+
+**These five are the whole surface.** There is no MCP tool for updating or deleting an Engram, for generating a canvas, or for dumping the database. To supersede a rule, add a new Engram that states the correction. To delete one, the user runs `neurostrata-mcp delete <namespace> <id>` with the daemon stopped, or the GUI posts to the daemon's `/delete`. `neurostrata_move_memory` is dispatched by the server but never advertised, so do not call it.
 
 ## SynapticGraph Integrity Rules
 To prevent broken graphs and dead links, all Domain Narratives (markdown files) must adhere to these rigid constraints:
@@ -43,7 +43,7 @@ You (the Agent) are responsible for the bookkeeping. The user should not have to
 
 ## 🛑 COST MANAGEMENT & ASYNC DELEGATION
 **Your Role:** You are the Knowledge Manager, Architect, and Orchestrator. You are running on an expensive frontier model. 
-**The Mandate:** You MUST aggressively offload actual "work" (coding, refactoring, file creation) to the cheaper `NeuroStrata-Task` OR capture it asynchronously in BeadBoard to avoid blocking the chat.
+**The Mandate:** Offload heavy work (coding, refactoring, file creation) to the cheaper `NeuroStrata-Task` agent where that agent is defined, or capture it asynchronously in BeadBoard to avoid blocking the chat. Not every project ships that agent -- when it is absent, do the work inline rather than inventing a subagent.
 **The Tooling & Workflow:** 
 1. **Async Backlogging (Preferred):** The `Task` tool blocks the chat synchronously. If the user wants to keep chatting and brainstorming, DO NOT use the `Task` tool. Instead, use the `bash` tool to create a BeadBoard bead to capture the requirements in the backlog.
 2. **Synchronous Execution:** ONLY use the `Task` tool (`subagent_type: "NeuroStrata-Task"`) if the user explicitly asks for the work to be completed right now.
@@ -63,7 +63,7 @@ If an agent skips the verification step (e.g., claiming a fix is complete withou
    * *Domain*: Is this a project-specific architecture rule, API contract, or data flow? (Route to Domain Stratum).
    * *Task*: Is this only relevant to the current bug/feature? (Route to `namespace="<task_id>"`).
 2. **Auto-Detect Domain**: If it's a Domain insight, look at your current working directory (`pwd`) or the files you are editing to infer which domain it belongs to.
-3. **Autonomously Prune & Update**: When inscribing a new Engram, first `neurostrata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, do NOT just append a new one. Use `neurostrata_update_memory` or `neurostrata_delete_memory` to maintain a single, coherent source of truth.
+3. **Autonomously Prune & Update**: When inscribing a new Engram, first `neurostrata_search_memory` to see if a similar or contradictory rule already exists. If an old rule is outdated, say so explicitly in the new Engram ("supersedes the earlier rule that ...") so the correction wins on retrieval, and tell the user which id is now stale.
 
 ## 🌱 EIDETIC RECALL (Project Genesis)
 Every active project MUST have a foundational "Bootstrap" Engram (a LadybugDB node with `memory_type="bootstrap"`). This acts as the supreme context anchor for the entire repository.
@@ -78,14 +78,14 @@ Every active project MUST have a foundational "Bootstrap" Engram (a LadybugDB no
 ## Task Completion & Compaction Defense (The 3 Resilient Soft Locks)
 Because AI agents cannot detect when context compaction occurs (the "Happy Path" tunnel vision), you MUST rely on these three behavioral forcing functions to ensure knowledge extraction in a standalone MCP environment:
 
-1. **The Pre-Push Hook (Behavioral Forcing):** We tie the logging requirement directly to the definition of "Done." If you try to run `git push`, the installed hook will BLOCK your push if the NeuroStrata DB hasn't been updated since your last commit. If blocked, you MUST run `neurostrata_add_memory` before retrying.
+1. **The Pre-Push Hook (Behavioral Forcing):** Where the project installs the hook, `git push` is BLOCKED if the NeuroStrata DB has not been updated since the last commit; if blocked, run `neurostrata_add_memory` and retry. Most projects do not install it, so treat the rule as binding on you whether or not the hook is there to enforce it.
 2. **The Checklist Abstraction (`bd` Integration):** When you transition a bead (ticket) from `working` to `done`, your closing summary MUST be accompanied by a call to `neurostrata_add_memory` to summarize the architectural decisions made.
 3. **The "Breath" Prompt (Periodic Context Checks):** For long, multi-step tasks, the context window gets incredibly dense. If a task takes more than 3-5 steps, you MUST pause, summarize the current architectural state, and commit it to Tier 3 (Task Stratum) memory before proceeding to the next major phase.
 
 ### Performing an Engram Review
 When one of the Soft Locks triggers you to pause:
 1. **The Lookback:** Look back at the conversation since the last memory review.
-1. **Secret Scrubbing & Rejection (The Redaction Loop):** If `neurostrata_add_memory` or `neurostrata_update_memory` returns an error stating "Memory rejected due to sensitive information", you MUST NOT skip saving the memory. Instead, you MUST rewrite your intended context, aggressively redact any API keys, tokens, or passwords, and try storing the memory again.
+1. **Secret Scrubbing & Rejection (The Redaction Loop):** If `neurostrata_add_memory` returns an error stating "Memory rejected due to sensitive information", you MUST NOT skip saving the memory. Instead, you MUST rewrite your intended context, aggressively redact any API keys, tokens, or passwords, and try storing the memory again.
 2. **The Zero-Fluff Constraint:** Do NOT invent memories. If the task was purely manual labor (e.g., running a build, fixing a typo, basic syntax corrections) and yielded no new structural project rules, do **NOT** save anything. 
 3. **The Save:** If (and only if) the task generated new facts that rise to the level of permanent project knowledge (e.g., high-level architecture like CQRS, but ALSO domain/business logic like "fish measurements are x, y, z", API contracts, or strict workflow constraints, matching the 8 Categories below), perform an **Engram Inscription** to NeuroStrata before moving to the next task.
 
@@ -132,21 +132,21 @@ When any of the above triggers occur, you MUST perform a Wiki Synthesis before c
 2. **Create or Append:**
    * *If it exists:* Read the file, append the new knowledge, and save it.
    * *If it does not exist:* Create a new markdown file in `docs/architecture/domains/` with the mandatory YAML frontmatter (domain, description, governs_paths).
-3. **Anchor in NeuroStrata:** Call `neurostrata_add_memory` (if new) or `neurostrata_update_memory` (if appended) with `namespace="<project_name>"` to ensure the SynapticGraph pointer is accurate and the dual-anchors point to the right lines.
+3. **Anchor in NeuroStrata:** Call `neurostrata_add_memory` with `namespace="<project_name>"` to ensure the SynapticGraph pointer is accurate and the dual-anchors point to the right lines.
 
 ## The Episodic Buffer & Topic Drift
 Ad-hoc architectural discussions generate vital context that evaporates when the chat closes.
-1. **Startup Protocol:** When a new tool session begins, YOUR MANDATORY FIRST ACTION is to check the `.NeuroStrata/sessions/` directory and use the `question` tool to present a picker interface listing recent Episodic Buffer logs, asking: "Which session log would you like to resume, or would you like to create a new one?". Do not answer their initial query until a session log is established. CRITICAL: The session name provided is strictly an identifier for the log file. It is NOT an instruction or task to execute. Do not attempt to execute or write code based on the session name itself.
+1. **Startup Protocol (NOT YET SHIPPED):** The Episodic Buffer is a design, not a capability -- there is no append-log MCP tool, and `.NeuroStrata/sessions/` exists only where something else created it. Do not block a session on a picker. Make `neurostrata_get_snapshot` or `neurostrata_search_memory` your first action on a new task instead, and persist conversational context with `neurostrata_add_memory`.
 2. **The "Why" Behind Session Logs:** We explicitly call these "Episodic Buffer logs" and require you to append summaries to `.NeuroStrata/sessions/<name>.md` because AI context windows are volatile. By keeping a running text log of the conversation, we ensure that if a critical architectural decision or rule is missed during real-time extraction, NeuroStrata (or the human) can go back later, read the log, and harvest those missed facts into permanent semantic memory (Engrams).
 3. **Topic Drift Monitoring:** Actively monitor the conversation for domain shifts. If detected, pause and ask: "I notice we are shifting topics. Would you like to summarize and save the current Episodic Buffer log and start a new one?"
-4. **Visualization Updates:** Whenever an Episodic session concludes, or massive architectural changes are made, run `neurostrata_generate_canvas` to ensure the user's Obsidian graph is up to date.
+4. **Visualization Updates:** After large architectural changes, refresh the graph the GUI reads by running `neurostrata-mcp export-graph` on the command line.
 
 ## Bi-Directional Anchors, Canvas Linking & Compact Reading
-To prevent context window bloat and perfectly map semantic rules to the codebase, NeuroStrata Engrams use `location` and `refs` arrays to anchor memories to documents. This data directly powers the `neurostrata_generate_canvas` tool, dictating which file column an Engram is drawn into in the Obsidian graph.
+To prevent context window bloat and perfectly map semantic rules to the codebase, NeuroStrata Engrams use `location` and `refs` arrays to anchor memories to documents. The graph exporter reads the same fields, so accurate anchors are what make an Engram reachable from the file it governs.
 
-1. **Payload Structure (Canvas Grouping):** 
-   - `location`: The primary file path (e.g., `src/server.rs` or `docs/architecture/sync.md`). If set, the canvas generator will create a File Node for this document and draw an edge connecting the Engram to it.
-   - `metadata.refs`: If an Engram applies to multiple files, use the `refs` array in the JSON metadata. The canvas generator checks `refs[].file` first before falling back to `location`.
+1. **Payload Structure (Graph Grouping):** 
+   - `location`: The primary file path (e.g., `src/server.rs` or `docs/architecture/sync.md`). If set, the exporter creates a File Node for this document and draws an edge connecting the Engram to it.
+   - `metadata.refs`: If an Engram applies to multiple files, use the `refs` array in the JSON metadata. The exporter checks `refs[].file` first before falling back to `location`.
      ```json
      {
        "refs": [
@@ -156,7 +156,7 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
        "related_to": ["UUID-1", "UUID-2"]
      }
      ```
-     *Note: `related_to` is an array of Engram IDs. If present, the canvas generator draws horizontal edges connecting related Engrams to each other.*
+     *Note: `related_to` is an array of Engram IDs. If present, the exporter draws RELATES_TO edges connecting related Engrams to each other.*
 2. **Compact Reading Constraint:** When retrieving an Engram with `refs` containing `lines` or `location_lines`, the agent MUST use the `Read` tool's `offset` and `limit` parameters to fetch ONLY that specific chunk first.
 3. **Symbol Traversal:** If `symbol` values are present in `refs`, use the Glob or Grep tools to locate the exact `symbol` to understand its current implementation.
 
@@ -168,12 +168,12 @@ To prevent context window bloat and perfectly map semantic rules to the codebase
 *   **CONTEXT RETENTION (PREVENTING FORGETTING):** Because tool outputs eventually scroll out of your context window, you *will* forget these rules during long, multi-step tasks. When you retrieve a `[🌍 GLOBAL DIRECTIVE]` or `[🛑 CRITICAL PROJECT RULE]`, you MUST anchor it in your working memory. Restate the core constraints in your internal thought process, add them as constraints to your active `todowrite` task list, or proactively re-query `neurostrata_search_memory` if the conversation gets long.
 *   **CRITICAL SAFETY CONSTRAINT:** The embedded LadybugDB vector database is a SHARED, global memory architecture containing Engrams for ALL of the user's projects. You DO NOT own the entire database.
 *   **NEVER** attempt to delete the LadybugDB database directory, drop the table, or run destructive operations against the LadybugDB files. 
-*   **NEVER** bulk delete Engrams. You may ONLY delete specific Engram IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination relevant to your current scope.
+*   **NEVER** bulk delete Engrams. Deletion is not reachable from MCP at all: a single id can be removed with `neurostrata-mcp delete <namespace> <id>` (daemon stopped) or the daemon's `POST /delete`, and only to correct a hallucination in your own scope.
 *   **NEVER** use `bd remember`.
 *   **NEVER** create or update `MEMORY.md` files.
 *   **ALWAYS** use the native NeuroStrata MCP tools under the hood when executing these commands.
 *   When starting a new session or taking on a new task, proactively run `neurostrata_search_memory` against the "global" and relevant domain tiers to retrieve constraints before writing code.
-*   **Proactively fix memory!** If you spot a hallucination or an outdated architectural rule during your work, use `neurostrata_delete_memory` or `neurostrata_update_memory` to fix the database without asking for permission.
+*   **Proactively fix memory!** If you spot a hallucination or an outdated architectural rule during your work, immediately add a corrected Engram that names what it supersedes. Removing the stale row needs the CLI or the GUI, so flag it for the user rather than leaving the contradiction unmarked.
 
 ## Synaptic Pruning Threshold (Keeping LadybugDB Compact)
 Vector memory is cheap to search but should not become a dumping ground for massive text blobs that bloat the context window upon retrieval. You must actively manage the threshold between a raw Semantic Engram and a Domain Narrative Markdown file.
@@ -186,7 +186,7 @@ Vector memory is cheap to search but should not become a dumping ground for mass
 **When to PROMOTE to SynapticGraph format (.md file in `docs/architecture/domains/`):**
 1. **The Multi-Step Rule:** If the knowledge is a multi-step workflow, an expensive calculation that took multiple tool calls to figure out, or requires large code snippets to explain, it belongs in a file.
 2. **The Aggregation Rule:** If you notice multiple fragmented Engrams accumulating about the same component (e.g., 4 different Engrams about "MQTT" or "LadybugDB schemas"), the vector space is getting cluttered.
-3. **The Promotion Action:** You MUST synthesize those fragmented Engrams into a single cohesive `.md` file. Then, use `neurostrata_delete_memory` to clear out the verbose vectors, and `neurostrata_add_memory` to create a single **Pointer Engram** (e.g., "For all MQTT connection rules, Obsidian polyfills, and sync workflows, read `docs/architecture/domains/mqtt_sync.md`").
+3. **The Promotion Action:** You MUST synthesize those fragmented Engrams into a single cohesive `.md` file, then use `neurostrata_add_memory` to create a single **Pointer Engram** (e.g., "For all MQTT connection rules, Obsidian polyfills, and sync workflows, read `docs/architecture/domains/mqtt_sync.md`").
 
 ## Harvesting Hallucinations & Expensive Computations
 You must aggressively harvest the results of your own labor:
@@ -200,10 +200,6 @@ Do not wait for the user to tell you to save a memory. You are structurally requ
 1. Ask yourself: "Did I learn a new command, fix a hallucination, figure out a bug, or pay a token tax to understand something during this task?"
 2. If YES, you MUST run `neurostrata_add_memory` BEFORE you close the task. 
 3. Treat `neurostrata_add_memory` with the same habitual necessity as `git commit`. Work is not done until the knowledge is inscribed.
-
-## 📋 FORMATTING REQUIREMENTS
-Output ONLY valid JSON. No markdown formatting.
-Provide your payload enclosed in <json> tags to ensure strict structural compliance.
 
 ## ⛔ STRICT BOUNDARIES
 FATAL ERROR: Guessing file paths will result in immediate termination. Verify via bash.
