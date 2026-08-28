@@ -7,6 +7,22 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
+/// Schemas declare extensions bare ("rs"), but one passed via --schema-path may
+/// use the dotted form. Both sides go through here so either convention matches.
+fn normalize_ext(ext: &str) -> String {
+    ext.trim_start_matches('.').to_ascii_lowercase()
+}
+
+fn build_ext_map(schema: &ParserSchema) -> HashMap<String, String> {
+    let mut ext_to_lang = HashMap::new();
+    for (lang_name, lang_schema) in &schema.languages {
+        for ext in &lang_schema.extensions {
+            ext_to_lang.insert(normalize_ext(ext), lang_name.clone());
+        }
+    }
+    ext_to_lang
+}
+
 pub async fn ingest_directory(
     dir_path: &Path,
     schema: &ParserSchema,
@@ -19,12 +35,7 @@ pub async fn ingest_directory(
         eprintln!("Warning: Failed to clear old AST entries for namespace {}: {}", namespace, e);
     }
 
-    let mut ext_to_lang = HashMap::new();
-    for (lang_name, lang_schema) in &schema.languages {
-        for ext in &lang_schema.extensions {
-            ext_to_lang.insert(ext.clone(), lang_name.clone());
-        }
-    }
+    let ext_to_lang = build_ext_map(schema);
 
     let walker_builder = WalkBuilder::new(dir_path);
     // Explicitly ignore common 3rd party and build directories even if not gitignored
@@ -126,7 +137,7 @@ pub async fn ingest_directory(
 
         // Now if it is a parseable file, extract AST nodes
         if let Some(ext_os) = path.extension() {
-            let ext = format!(".{}", ext_os.to_string_lossy());
+            let ext = normalize_ext(&ext_os.to_string_lossy());
             if let Some(lang_name) = ext_to_lang.get(&ext) {
                 if let Some(ts_lang) = get_language(lang_name) {
                     let content = match std::fs::read_to_string(path) {
@@ -203,4 +214,40 @@ pub async fn ingest_directory(
         }
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_from(json: &str) -> HashMap<String, String> {
+        build_ext_map(&ParserSchema::load(json).expect("schema parses"))
+    }
+
+    /// The shipped src/schema.json declares extensions without a dot. The lookup
+    /// used to prepend one, so nothing ever matched and no symbols were extracted.
+    #[test]
+    fn bare_schema_extension_matches_a_file_extension() {
+        let map = map_from(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{}}}}"#);
+        assert_eq!(map.get(&normalize_ext("rs")), Some(&"rust".to_string()));
+    }
+
+    #[test]
+    fn dotted_schema_extension_matches_too() {
+        let map = map_from(r#"{"languages":{"rust":{"extensions":[".rs"],"queries":{}}}}"#);
+        assert_eq!(map.get(&normalize_ext("rs")), Some(&"rust".to_string()));
+    }
+
+    #[test]
+    fn lookup_is_case_insensitive() {
+        let map = map_from(r#"{"languages":{"python":{"extensions":["py"],"queries":{}}}}"#);
+        assert_eq!(map.get(&normalize_ext("PY")), Some(&"python".to_string()));
+    }
+
+    #[test]
+    fn unknown_extension_has_no_language() {
+        let map = map_from(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{}}}}"#);
+        assert_eq!(map.get(&normalize_ext("toml")), None);
+    }
 }
