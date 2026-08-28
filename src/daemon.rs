@@ -5,12 +5,20 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
+
+/// How often the daemon flushes to durable storage. Anything written between
+/// checkpoints is lost if the process is killed, so this bounds the damage.
+const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone)]
 struct AppState {
     embedder: Arc<dyn Embedder>,
     vector_store: Arc<dyn VectorStore>,
+    /// Fires once, when something asks the daemon to stop. Taken by whoever
+    /// gets there first so a second /shutdown call is harmless.
+    shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 #[derive(Deserialize)]
@@ -40,9 +48,12 @@ struct GraphQuery {
 }
 
 pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn VectorStore>) -> anyhow::Result<()> {
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
     let state = AppState {
         embedder,
-        vector_store,
+        vector_store: vector_store.clone(),
+        shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
 
     let app = Router::new()
@@ -52,11 +63,31 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         .route("/delete", post(handle_delete))
         .route("/edit", post(handle_edit))
         .route("/mcp", post(handle_mcp))
+        .route("/shutdown", post(handle_shutdown))
         .with_state(state);
+
+    // Bound the loss window for anything that kills us without warning.
+    let periodic_store = vector_store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CHECKPOINT_INTERVAL).await;
+            if let Err(e) = periodic_store.checkpoint().await {
+                eprintln!("WARNING: periodic checkpoint failed, writes remain at risk: {}", e);
+            }
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:34343").await?;
     eprintln!("NeuroStrata Daemon listening on 127.0.0.1:34343");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await?;
+
+    // The whole point of stopping gracefully: get everything on disk before exit.
+    match vector_store.checkpoint().await {
+        Ok(()) => eprintln!("Checkpoint complete. NeuroStrata Daemon stopped."),
+        Err(e) => eprintln!("ERROR: final checkpoint failed, recent writes may be lost: {}", e),
+    }
     Ok(())
 }
 
@@ -174,5 +205,60 @@ async fn handle_mcp(
         Json(response)
     } else {
         Json(serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}))
+    }
+}
+
+/// Resolves when the daemon should stop: an explicit POST /shutdown, Ctrl-C, or
+/// the OS asking us to go away. On Windows a console close gives roughly five
+/// seconds before the process is killed regardless, so the checkpoint that
+/// follows has to be quick.
+async fn shutdown_signal(rx: oneshot::Receiver<()>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("Received Ctrl-C, shutting down.");
+    };
+
+    #[cfg(windows)]
+    let os_signal = async {
+        let mut close = match tokio::signal::windows::ctrl_close() {
+            Ok(s) => s,
+            Err(_) => return std::future::pending::<()>().await,
+        };
+        let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
+            Ok(s) => s,
+            Err(_) => return std::future::pending::<()>().await,
+        };
+        tokio::select! {
+            _ = close.recv() => eprintln!("Console is closing, shutting down."),
+            _ = shutdown.recv() => eprintln!("System is shutting down."),
+        }
+    };
+
+    #[cfg(unix)]
+    let os_signal = async {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return std::future::pending::<()>().await,
+        };
+        term.recv().await;
+        eprintln!("Received SIGTERM, shutting down.");
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = os_signal => {}
+        _ = rx => eprintln!("Shutdown requested over HTTP."),
+    }
+}
+
+async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
+    // A second caller finds None here; stopping twice is not an error.
+    let sender = state.shutdown.lock().ok().and_then(|mut guard| guard.take());
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(());
+            "Shutting down"
+        }
+        None => "Already shutting down",
     }
 }

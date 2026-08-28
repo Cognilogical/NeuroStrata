@@ -82,4 +82,9 @@ pub trait VectorStore: Send + Sync {
 
     /// Increment the access count of a specific memory by its ID.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()>;
+
+    /// Flush everything written so far to durable storage. A long-running
+    /// process must call this; writes that only reached the WAL are discarded
+    /// if the process dies before the engine checkpoints on its own.
+    async fn checkpoint(&self) -> Result<()>;
 }

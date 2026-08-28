@@ -26,7 +26,7 @@ impl LadybugStore {
             Err(e) => {
                 let err_msg = e.to_string();
                 if err_msg.contains("Corrupted wal file") || err_msg.contains("invalid WAL record type") {
-                    println!("⚠️ WAL CORRUPTION DETECTED. Initiating automated self-healing rollback...");
+                    eprintln!("WARNING: the write-ahead log could not be read, which is what an ungraceful shutdown leaves behind. Rolling back to the last checkpoint.");
                     
                     let mut wal_path = local_path.clone().into_os_string();
                     wal_path.push(".wal");
@@ -38,11 +38,18 @@ impl LadybugStore {
                         corrupted_path.push(format!(".corrupted.{}", timestamp));
                         let corrupted_file = std::path::PathBuf::from(corrupted_path);
                         
-                        println!("Moving corrupted WAL file from {:?} to {:?}", wal_file, corrupted_file);
+                        let dropped_bytes = std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
                         std::fs::rename(&wal_file, &corrupted_file)
-                            .map_err(|err| anyhow::anyhow!("Self-healing failed: Could not move corrupted WAL file: {}", err))?;
-                        
-                        println!("Self-healing successful. Retrying database connection...");
+                            .map_err(|err| anyhow::anyhow!("Recovery failed: Could not move the unreadable WAL file: {}", err))?;
+
+                        // The WAL is set aside, never replayed. Everything written since the
+                        // last checkpoint is gone, so say so plainly instead of reporting success.
+                        eprintln!(
+                            "ERROR: DATA LOSS. {} bytes of un-checkpointed writes were discarded to reopen the database.",
+                            dropped_bytes
+                        );
+                        eprintln!("ERROR: The discarded write-ahead log was kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
+                        eprintln!("Reopening the database without them...");
                         Database::new(&local_path, SystemConfig::default())
                             .map_err(|retry_e| anyhow::anyhow!("Retry failed after self-healing: {}", retry_e))?
                     } else {
@@ -275,6 +282,12 @@ impl VectorStore for LadybugStore {
         
         let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
         conn.query(&query)?;
+        Ok(())
+    }
+
+    async fn checkpoint(&self) -> Result<()> {
+        let conn = self.get_conn()?;
+        conn.query("CHECKPOINT")?;
         Ok(())
     }
 

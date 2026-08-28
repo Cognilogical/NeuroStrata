@@ -79,6 +79,9 @@ enum Commands {
         location: Option<String>,
     },
 
+    /// Stop a running daemon so it checkpoints before exiting
+    Shutdown,
+
     /// Edit an existing memory
     Edit {
         /// The target namespace
@@ -149,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
     let command_str = args[1].as_str();
     let recognized = matches!(
         command_str,
-        "daemon" | "namespaces" | "list" | "ingest" | "export-graph" | "delete" | "add" | "edit" | "-h" | "--help" | "-V" | "--version"
+        "daemon" | "shutdown" | "namespaces" | "list" | "ingest" | "export-graph" | "delete" | "add" | "edit" | "-h" | "--help" | "-V" | "--version"
     );
 
     if !recognized {
@@ -183,11 +186,41 @@ async fn main() -> anyhow::Result<()> {
                 vector_store.init("global").await?;
                 daemon::start_daemon(embedder, vector_store).await?;
             }
+            Commands::Shutdown => {
+                if !daemon_running {
+                    println!("No daemon is running on 127.0.0.1:34343.");
+                    return Ok(());
+                }
+                let client = reqwest::Client::new();
+                client
+                    .post("http://127.0.0.1:34343/shutdown")
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await?;
+
+                // Wait for it to actually go: the checkpoint happens after the
+                // HTTP response, and a CLI command run too early hits the lock.
+                for _ in 0..300 {
+                    let still_up = client
+                        .get("http://127.0.0.1:34343/health")
+                        .timeout(std::time::Duration::from_millis(500))
+                        .send()
+                        .await
+                        .is_ok();
+                    if !still_up {
+                        println!("Daemon stopped and checkpointed.");
+                        return Ok(());
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+                eprintln!("Daemon did not stop within 30 seconds.");
+                std::process::exit(1);
+            }
             other => {
                 if daemon_running {
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
                     eprintln!("You cannot run database-modifying CLI commands while the daemon is active.");
-                    eprintln!("Please shut down OpenCode, or kill the daemon process to run this command.");
+                    eprintln!("Run `neurostrata-mcp shutdown` to stop it safely -- killing the process discards any writes made since the last checkpoint.");
                     std::process::exit(1);
                 }
                 
@@ -279,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("Successfully edited memory {}", id);
                         }
                     }
-                    Commands::Daemon => unreachable!(),
+                    Commands::Daemon | Commands::Shutdown => unreachable!(),
                 }
             }
         }
