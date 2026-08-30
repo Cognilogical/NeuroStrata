@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod embed;
+mod ingest_jobs;
 mod parser;
 mod server;
 mod store;
@@ -739,7 +740,17 @@ async fn main() -> anyhow::Result<()> {
 
                         if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
                             println!("Ingesting AST from {:?} into namespace '{}'", dir_path, namespace);
-                            crate::parser::ingest::ingest_directory(dir_path, &schema, embedder, vector_store, &namespace).await?;
+                            crate::parser::ingest::ingest_directory(
+                                dir_path,
+                                &schema,
+                                embedder,
+                                vector_store,
+                                &namespace,
+                                // The CLI has nowhere to report progress to: it
+                                // is already printing each file as it goes.
+                                None,
+                            )
+                            .await?;
                             println!("Ingestion complete.");
                         }
                     }
