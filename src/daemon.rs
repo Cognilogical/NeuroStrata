@@ -16,6 +16,8 @@ const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 struct AppState {
     embedder: Arc<dyn Embedder>,
     vector_store: Arc<dyn VectorStore>,
+    /// The walks in flight, which outlive the requests that started them.
+    ingests: Arc<crate::ingest_jobs::IngestJobs>,
     /// Fires once, when something asks the daemon to stop. Taken by whoever
     /// gets there first so a second /shutdown call is harmless.
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -58,6 +60,7 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
     let state = AppState {
         embedder,
         vector_store: vector_store.clone(),
+        ingests: Arc::new(crate::ingest_jobs::IngestJobs::new()),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
 
@@ -237,7 +240,7 @@ async fn handle_get_graph(
 async fn handle_ingest(
     State(state): State<AppState>,
     Json(req): Json<IngestReq>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     // Provide default schema if none passed, but we should use ParserSchema
     let schema_str = r#"
     {
@@ -251,17 +254,30 @@ async fn handle_ingest(
         }
     }
     "#;
-    let schema = crate::parser::schema::ParserSchema::load(schema_str).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    let dir_path = std::path::Path::new(&req.dir);
+    let schema = crate::parser::schema::ParserSchema::load(schema_str)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     // The GUI derives this from the folder name, so it arrives in whatever
     // case the checkout happens to use (bead neurostrata-fld).
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    crate::parser::ingest::ingest_directory(dir_path, &schema, state.embedder.clone(), state.vector_store.clone(), &namespace)
+
+    // The walk belongs to the registry, not to this request: a client that
+    // disconnects no longer takes it down half-finished (bead neurostrata-7ej).
+    let progress = state
+        .ingests
+        .run(
+            &namespace,
+            &req.dir,
+            schema,
+            state.embedder.clone(),
+            state.vector_store.clone(),
+        )
         .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    Ok("OK")
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::to_value(progress).unwrap_or_else(
+        |_| serde_json::json!({ "state": "finished" }),
+    )))
 }
 
 /// Backup and restore run here rather than in the CLI so they work against a
@@ -349,7 +365,13 @@ async fn handle_mcp(
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
-        let response = crate::server::process_mcp_request(rpc_req, state.embedder.clone(), state.vector_store.clone()).await;
+        let response = crate::server::process_mcp_request(
+            rpc_req,
+            state.embedder.clone(),
+            state.vector_store.clone(),
+            state.ingests.clone(),
+        )
+        .await;
         Json(response)
     } else {
         Json(serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}))
