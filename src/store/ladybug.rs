@@ -26,7 +26,7 @@ pub struct LadybugStore {
     /// checkpoint deliberately does NOT take this lock: it waits for
     /// transactions to drain, so holding writers out for its duration would
     /// recreate the stall it was moved out of the request path to avoid.
-    write_lock: tokio::sync::Mutex<()>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Set once the tables exist. init() is called on the way into add, move
     /// and -- because it is cheap to write and expensive to mean -- every
     /// search, and each call issued CREATE NODE TABLE only to be told it
@@ -205,7 +205,7 @@ impl LadybugStore {
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
-            write_lock: tokio::sync::Mutex::new(()),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -218,27 +218,48 @@ impl LadybugStore {
     /// The deadline releases the CALLER, not the query: spawn_blocking cannot be
     /// cancelled, so the statement may still land afterwards. The message says
     /// so, because retrying blind could otherwise duplicate work.
+    ///
+    /// Which is why the writer's turn belongs to the blocking task and not to
+    /// the caller. It used to be a guard inside the timed future, so a caller
+    /// that gave up released the turn while its statement was still running,
+    /// and the next writer promptly opened a second one against an engine that
+    /// already had one. That is how a single stalled write became five in a row
+    /// (bead neurostrata-4nk): each waited its 30s, gave up, and handed the
+    /// turn to the next. Held by the task, the turn is released when the work
+    /// actually finishes, so a caller giving up costs a wait instead.
     async fn write_with_deadline<T, F>(&self, what: &'static str, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: Fn(&Connection) -> Result<T> + Clone + Send + 'static,
     {
-        let outcome = bounded(what, write_timeout(), async {
+        let write_lock = Arc::clone(&self.write_lock);
+        let db = self.db.clone();
+
+        let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
             // rather than making it wait. The deadline covers this queue too:
             // a caller stuck behind a stalled write hears that the database is
-            // busy instead of waiting indefinitely for its turn.
-            let _turn = self.write_lock.lock().await;
+            // busy instead of waiting indefinitely for its turn. Giving up
+            // while merely waiting for the turn leaks nothing -- no statement
+            // has been started yet.
+            let mut turn = write_lock.lock_owned().await;
 
-            // The lock orders our own writers; the background checkpoint and
+            // The turn orders our own writers; the background checkpoint and
             // any other process are outside it, so a refusal can still arrive.
             // Those clear in milliseconds, so wait and try again rather than
             // handing the caller a failure it can do nothing about.
             let mut attempt = 0;
             loop {
-                match self.with_conn(f.clone()).await {
+                let (returned, result) = Self::write_owning_turn(db.clone(), turn, f.clone()).await?;
+                turn = returned;
+
+                match result {
                     Err(e) if is_write_collision(&e) && attempt < WRITE_COLLISION_RETRIES => {
+                        WRITE_COLLISIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         attempt += 1;
+                        // The turn is held across this pause on purpose: it is
+                        // ours until we stop retrying, and nothing is running
+                        // inside the engine while we wait.
                         tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64))
                             .await;
                     }
@@ -248,11 +269,45 @@ impl LadybugStore {
         })
         .await;
 
+        if outcome.is_err() {
+            WRITES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("DIAGNOSTIC: gave up waiting on {} -- engine: {}", what, engine_stats());
+        }
+
         // Marked whatever the outcome: a write that timed out may still land,
         // and an unnecessary checkpoint attempt costs nothing next to a write
         // that never reaches disk.
         self.dirty.mark();
         outcome
+    }
+
+    /// Runs one attempt on a blocking thread, and gives that thread the
+    /// writer's turn for as long as it lasts.
+    ///
+    /// The turn travels back out with the result so a retry can keep it. A
+    /// caller that has stopped waiting never reads that result, so the turn is
+    /// dropped when the task completes -- which is exactly when the next writer
+    /// should be allowed to start.
+    async fn write_owning_turn<T, F>(
+        db: Arc<Database>,
+        turn: tokio::sync::OwnedMutexGuard<()>,
+        f: F,
+    ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::task::spawn_blocking(move || {
+            let outcome = (|| -> Result<T> {
+                let conn = Connection::new(&db)?;
+                f(&conn)
+            })();
+            ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (turn, outcome)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("the database thread did not finish: {}", e))
     }
 
     /// Runs one piece of database work on a blocking thread.
@@ -273,9 +328,17 @@ impl LadybugStore {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
         let db = self.db.clone();
+        ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
-            let conn = Connection::new(&db)?;
-            f(&conn)
+            let outcome = (|| -> Result<T> {
+                let conn = Connection::new(&db)?;
+                f(&conn)
+            })();
+            // Counted here rather than after the await: the await is what a
+            // deadline drops, and the whole question is whether the work
+            // outlives the caller that stopped waiting for it.
+            ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            outcome
         })
         .await
         .map_err(|e| anyhow::anyhow!("the database thread did not finish: {}", e))?
@@ -1022,6 +1085,43 @@ impl VectorStore for LadybugStore {
     }
 }
 
+/// Diagnostic counters for work handed to the engine.
+///
+/// Process-wide on purpose: there is one store per process, and the question
+/// they exist to answer -- does blocking work pile up and never come back -- is
+/// about the process, not about any one call.
+///
+/// `STARTED` minus `FINISHED` is how many engine calls are inside lbug right
+/// now. If that number climbs and does not come down, a deadline that could not
+/// cancel its statement has left the work running, which is the hypothesis these
+/// were added to test (bead neurostrata-4nk).
+pub static ENGINE_CALLS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Writes whose caller gave up. The statement may still be running.
+pub static WRITES_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Times the engine refused a second write transaction.
+pub static WRITE_COLLISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many engine calls are inside lbug right now.
+pub fn engine_in_flight() -> u64 {
+    ENGINE_CALLS_STARTED
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_sub(ENGINE_CALLS_FINISHED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The counters as a line worth logging.
+pub fn engine_stats() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "{} in flight ({} started, {} finished), {} abandoned, {} collisions",
+        engine_in_flight(),
+        ENGINE_CALLS_STARTED.load(Relaxed),
+        ENGINE_CALLS_FINISHED.load(Relaxed),
+        WRITES_ABANDONED.load(Relaxed),
+        WRITE_COLLISIONS.load(Relaxed)
+    )
+}
+
 /// How long a write may wait before the caller is told the database is busy.
 /// Override with NEUROSTRATA_WRITE_TIMEOUT_SECS where an unusually large
 /// database makes the default too tight.
@@ -1202,6 +1302,44 @@ eurostrata\src\daemon.rs", &known).as_deref(),
 
         assert!(err.contains("the database is busy"), "{}", err);
         drop(held);
+    }
+
+    /// The invariant the writer's turn exists for. Held by the caller, giving
+    /// up released it while the statement was still running, and the next
+    /// writer opened a second transaction against an engine that already had
+    /// one -- which is how one stalled write became five in a row (bead
+    /// neurostrata-4nk).
+    #[tokio::test]
+    async fn giving_up_does_not_hand_on_a_turn_that_is_still_in_use() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Stands in for a statement spawn_blocking cannot cancel: it owns the
+        // turn and keeps it for as long as it runs.
+        let turn = Arc::clone(&lock).lock_owned().await;
+        let statement = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(turn);
+        });
+
+        let err = bounded("writing a memory", std::time::Duration::from_millis(20), async {
+            let _held = Arc::clone(&lock).lock_owned().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("the database is busy"), "{}", err);
+
+        assert!(
+            lock.try_lock().is_err(),
+            "the turn was handed on while the statement was still running"
+        );
+
+        statement.await.expect("the statement finishes");
+        assert!(
+            lock.try_lock().is_ok(),
+            "the turn is free once the statement has actually ended"
+        );
     }
 
     #[tokio::test]
