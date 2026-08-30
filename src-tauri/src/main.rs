@@ -60,6 +60,37 @@ fn save_project_path(path: String) {
     save_config(&config);
 }
 
+/// A client for talking to the daemon, with the timeout stated rather than
+/// inherited.
+///
+/// `reqwest::blocking::Client::new()` applies a THIRTY SECOND timeout of its
+/// own -- the blocking client does this, the async client does not -- and every
+/// call here used to take it. A directory ingest of a real repository runs
+/// longer than that, so the GUI was aborting its own ingest partway through:
+/// the daemon saw the client disconnect, dropped the request with it, and
+/// stopped mid-walk without ever reaching relink_edges. What the user saw was a
+/// graph frozen half-built with no GOVERNS edges, a daemon still answering
+/// /health, and no error anywhere (bead neurostrata-zbw).
+fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        // Separate from the call's own bound: a port with nothing behind it
+        // hangs rather than refusing here, so without this a daemon that is not
+        // running is indistinguishable from one that is merely busy.
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Ingestion walks and embeds a whole repository, which is minutes of work on a
+/// large one.
+const INGEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Everything else is a single query, but not necessarily a fast one: /graph
+/// has been measured at 28s while a write was in flight, so the old 30s left
+/// nothing spare.
+const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn ensure_daemon() -> Result<(), String> {
     // Check if daemon is responding
     let client = reqwest::blocking::Client::builder()
@@ -168,7 +199,7 @@ fn ingest_ast(project_path: String) -> Result<String, String> {
     
     let namespace = namespace_for(&project_path);
 
-    let client = reqwest::blocking::Client::new();
+    let client = daemon_client(INGEST_TIMEOUT)?;
     let resp = client.post("http://127.0.0.1:34343/ingest")
         .json(&serde_json::json!({
             "dir": project_path,
@@ -188,7 +219,7 @@ fn ingest_ast(project_path: String) -> Result<String, String> {
 fn delete_memory(namespace: String, id: String) -> Result<String, String> {
     ensure_daemon()?;
     
-    let client = reqwest::blocking::Client::new();
+    let client = daemon_client(QUERY_TIMEOUT)?;
     let resp = client.post("http://127.0.0.1:34343/delete")
         .json(&serde_json::json!({
             "namespace": namespace,
@@ -214,7 +245,7 @@ fn edit_memory(
 ) -> Result<String, String> {
     ensure_daemon()?;
 
-    let client = reqwest::blocking::Client::new();
+    let client = daemon_client(QUERY_TIMEOUT)?;
     let resp = client.post("http://127.0.0.1:34343/edit")
         .json(&serde_json::json!({
             "old_namespace": old_namespace,
@@ -242,7 +273,7 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
         namespace_filter = namespace_for(path_str);
     }
     
-    let client = reqwest::blocking::Client::new();
+    let client = daemon_client(QUERY_TIMEOUT)?;
     let resp = client.get("http://127.0.0.1:34343/graph")
         .query(&[("namespace", namespace_filter)])
         .send()
