@@ -659,8 +659,22 @@ async fn main() -> anyhow::Result<()> {
                             let mut resolvable = Vec::new();
                             let mut missing = Vec::new();
                             let mut never_read = 0;
+                            let mut ingested = 0;
+                            let mut unqualified = Vec::new();
 
                             for memory in &memories {
+                                // Ingested ids carry the namespace that owns them.
+                                // One written before that changed does not, and a
+                                // bare path is unique to a project rather than to
+                                // the database -- so two projects holding the same
+                                // path still collide until each is re-ingested.
+                                if memory.payload.user_id == "auto-ingestor" {
+                                    ingested += 1;
+                                    if !crate::parser::ingest::is_qualified(ns, &memory.id) {
+                                        unqualified.push(memory.id.clone());
+                                    }
+                                }
+
                                 if memory.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
                                     never_read += 1;
                                 }
@@ -676,6 +690,33 @@ async fn main() -> anyhow::Result<()> {
                             }
 
                             println!("{}: {} memories", ns, memories.len());
+                            println!(
+                                "  ingested nodes carrying this namespace in their id: {} of {}",
+                                ingested - unqualified.len(),
+                                ingested
+                            );
+                            if !unqualified.is_empty() {
+                                println!(
+                                    "    {} were written before ids carried a namespace. They still resolve,",
+                                    unqualified.len()
+                                );
+                                println!(
+                                    "    but a bare path is unique to a project rather than to the database, so"
+                                );
+                                println!(
+                                    "    another project ingesting the same path can still take them."
+                                );
+                                for id in unqualified.iter().take(3) {
+                                    println!("      {}", id);
+                                }
+                                println!(
+                                    "    Re-ingest this namespace to migrate them: neurostrata-mcp ingest <dir> {}",
+                                    ns
+                                );
+                                println!(
+                                    "    Back up first -- every ingested id changes, so it is not a reversible edit."
+                                );
+                            }
                             println!(
                                 "  declared targets that need the older absolute form resolved: {}",
                                 resolvable.len()
