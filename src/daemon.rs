@@ -28,6 +28,11 @@ struct IngestReq {
 }
 
 #[derive(Deserialize)]
+struct BackupReq {
+    dir: String,
+}
+
+#[derive(Deserialize)]
 struct DeleteReq {
     namespace: String,
     id: String,
@@ -63,6 +68,7 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         .route("/delete", post(handle_delete))
         .route("/edit", post(handle_edit))
         .route("/mcp", post(handle_mcp))
+        .route("/backup", post(handle_backup))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state);
 
@@ -167,6 +173,28 @@ async fn handle_ingest(
     Ok("OK")
 }
 
+/// Backup and restore run here rather than in the CLI so they work against a
+/// live daemon: the database is single-writer, and the daemon holds that writer.
+async fn handle_backup(
+    State(state): State<AppState>,
+    Json(req): Json<BackupReq>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    state
+        .vector_store
+        .export_database(&req.dir)
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(format!("Backed up to {}", req.dir))
+}
+
+/// Same reasoning as the MCP surface: a write is durable only once checkpointed,
+/// because WAL replay does not restore rows (bead neurostrata-kug).
+async fn checkpoint_after_write(state: &AppState, what: &str) {
+    if let Err(e) = state.vector_store.checkpoint().await {
+        eprintln!("WARNING: {} was applied but the checkpoint failed, so it is not durable yet: {}", what, e);
+    }
+}
+
 async fn handle_delete(
     State(state): State<AppState>,
     Json(req): Json<DeleteReq>,
@@ -174,6 +202,7 @@ async fn handle_delete(
     state.vector_store.delete(&req.namespace, &req.id)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    checkpoint_after_write(&state, "the deletion").await;
     Ok("OK")
 }
 
@@ -192,6 +221,7 @@ async fn handle_edit(
         
         state.vector_store.delete(&req.old_namespace, &req.id).await.ok();
         state.vector_store.upsert(&req.new_namespace, &req.id, vector, payload).await.ok();
+        checkpoint_after_write(&state, "the edit").await;
     }
     Ok("OK")
 }

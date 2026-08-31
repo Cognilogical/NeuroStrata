@@ -264,6 +264,17 @@ async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
     }
 }
 
+/// A memory is only durable once it is checkpointed: WAL replay restores the
+/// catalog but not row insertions (bead neurostrata-kug), so an ungraceful stop
+/// loses everything written since the last one. Writes through this surface are
+/// few and small, so paying for a checkpoint on each closes that window; the
+/// daemon's periodic checkpoint stays as a backstop for anything that misses it.
+async fn checkpoint_after_write(store: &Arc<dyn VectorStore>, what: &str) {
+    if let Err(e) = store.checkpoint().await {
+        eprintln!("WARNING: {} was written but the checkpoint failed, so it is not durable yet: {}", what, e);
+    }
+}
+
 async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore>) -> String {
     let content = match arguments.get("content").and_then(|c| c.as_str()) {
         Some(c) => c,
@@ -394,6 +405,7 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
             if let Ok(vec) = emb.embed(&content).await {
                 let new_id = uuid::Uuid::new_v4().to_string();
                 if let Ok(_) = store.upsert(namespace, &new_id, vec, payload).await {
+                    checkpoint_after_write(&store, "the memory").await;
                     return format!("Successfully added memory for namespace: {}", namespace);
                 } else {
                     return "Failed to store memory in database.".to_string();
@@ -455,6 +467,9 @@ async fn handle_ingest_directory(arguments: Value, emb: Arc<dyn Embedder>, store
     if let Ok(schema) = crate::parser::schema::ParserSchema::load(schema_str) {
         let dir = std::path::Path::new(dir_path);
         if let Ok(_) = crate::parser::ingest::ingest_directory(dir, &schema, emb.clone(), store.clone(), namespace).await {
+            // Once for the whole walk: ingestion upserts thousands of rows, and
+            // checkpointing each one would dominate the run.
+            checkpoint_after_write(&store, "the ingested directory").await;
             format!("Successfully ingested AST from {} into namespace '{}'", dir_path, namespace)
         } else {
             "Failed to ingest directory. Ensure tree-sitter and parsing logic is fully initialized.".to_string()
@@ -482,6 +497,7 @@ async fn handle_move_memory(arguments: Value, store: Arc<dyn VectorStore>) -> St
         if let Ok(_) = store.init(tgt).await {
             if let Ok(_) = store.upsert(tgt, id, vec, payload).await {
                 if let Ok(_) = store.delete(src, id).await {
+                    checkpoint_after_write(&store, "the moved memory").await;
                     format!("Successfully moved memory {} from {} to {}", id, src, tgt)
                 } else {
                     "Memory copied to target but failed to delete from source.".to_string()

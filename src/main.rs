@@ -82,6 +82,23 @@ enum Commands {
     /// Stop a running daemon so it checkpoints before exiting
     Shutdown,
 
+    /// Write a portable copy of the database to a directory
+    Backup {
+        /// Directory to write the backup into. Must not already exist
+        dir: String,
+    },
+
+    /// Rebuild a database from a backup, into a file that does not exist yet
+    Restore {
+        /// Directory a backup was written to
+        dir: String,
+
+        /// Where to build the restored database. Defaults to the configured
+        /// db_path, which must not already exist
+        #[arg(long)]
+        into: Option<String>,
+    },
+
     /// Edit an existing memory
     Edit {
         /// The target namespace
@@ -152,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
     let command_str = args[1].as_str();
     let recognized = matches!(
         command_str,
-        "daemon" | "shutdown" | "namespaces" | "list" | "ingest" | "export-graph" | "delete" | "add" | "edit" | "-h" | "--help" | "-V" | "--version"
+        "daemon" | "shutdown" | "backup" | "restore" | "namespaces" | "list" | "ingest" | "export-graph" | "delete" | "add" | "edit" | "-h" | "--help" | "-V" | "--version"
     );
 
     if !recognized {
@@ -215,6 +232,73 @@ async fn main() -> anyhow::Result<()> {
                 }
                 eprintln!("Daemon did not stop within 30 seconds.");
                 std::process::exit(1);
+            }
+            Commands::Backup { dir } => {
+                // The database is single-writer. When a daemon holds it, ask the
+                // daemon to do the work rather than fighting it for the lock.
+                if daemon_running {
+                    let res = reqwest::Client::new()
+                        .post("http://127.0.0.1:34343/backup")
+                        .json(&serde_json::json!({ "dir": dir }))
+                        .send()
+                        .await?;
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        eprintln!("Backup failed: {}", body);
+                        std::process::exit(1);
+                    }
+                    println!("{}", body);
+                    return Ok(());
+                }
+
+                let config = Config::from_default_path()?;
+                let embedder = Arc::new(FastEmbedder::new()?);
+                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                    config.db_path.to_string_lossy().to_string(),
+                    embedder.dimensions(),
+                )?);
+                vector_store.export_database(&dir).await?;
+                println!("Backed up to {}", dir);
+                return Ok(());
+            }
+            Commands::Restore { dir, into } => {
+                // IMPORT DATABASE replays the exported schema, so it only works
+                // against a database that has none. Restoring therefore builds a
+                // new file rather than overwriting a live one -- nothing existing
+                // is dropped, and the switch stays a deliberate step.
+                let config = Config::from_default_path()?;
+                let target = into
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| config.db_path.clone());
+
+                if target.exists() {
+                    eprintln!("{:?} already exists, and restoring into it would mean replacing what it holds.", target);
+                    eprintln!("Restore into a new path instead: neurostrata-mcp restore <backup-dir> --into <new-db-path>");
+                    eprintln!("Then point db_path in ~/.config/neurostrata/config.json at it once you have checked it.");
+                    std::process::exit(1);
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let embedder = Arc::new(FastEmbedder::new()?);
+                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                    target.to_string_lossy().to_string(),
+                    embedder.dimensions(),
+                )?);
+                // Deliberately no init() here: the backup carries its own schema.
+                vector_store.import_database(&dir).await?;
+
+                let namespaces = vector_store.list_namespaces().await.unwrap_or_default();
+                println!("Restored {} into {:?}", dir, target);
+                if !namespaces.is_empty() {
+                    println!("It holds {} namespace(s): {}", namespaces.len(), namespaces.join(", "));
+                }
+                if target != config.db_path {
+                    println!("To use it, set db_path in ~/.config/neurostrata/config.json to {:?}", target);
+                }
+                return Ok(());
             }
             other => {
                 if daemon_running {
@@ -312,7 +396,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("Successfully edited memory {}", id);
                         }
                     }
-                    Commands::Daemon | Commands::Shutdown => unreachable!(),
+                    Commands::Daemon | Commands::Shutdown | Commands::Backup { .. } | Commands::Restore { .. } => unreachable!(),
                 }
             }
         }
