@@ -697,25 +697,15 @@ async fn main() -> anyhow::Result<()> {
                             );
                             if !unqualified.is_empty() {
                                 println!(
-                                    "    {} were written before ids carried a namespace. They still resolve,",
+                                    "    {} predate namespace qualification. They resolve, but the next",
                                     unqualified.len()
                                 );
-                                println!(
-                                    "    but a bare path is unique to a project rather than to the database, so"
-                                );
-                                println!(
-                                    "    another project ingesting the same path can still take them."
-                                );
+                                println!("    project ingesting a shared path takes them.");
                                 for id in unqualified.iter().take(3) {
                                     println!("      {}", id);
                                 }
-                                println!(
-                                    "    Re-ingest this namespace to migrate them: neurostrata-mcp ingest <dir> {}",
-                                    ns
-                                );
-                                println!(
-                                    "    Back up first -- every ingested id changes, so it is not a reversible edit."
-                                );
+                                println!("    Migrate: neurostrata-mcp ingest <dir> {}", ns);
+                                println!("    Backup first: re-ingest rewrites every id.");
                             }
                             println!(
                                 "  declared targets that need the older absolute form resolved: {}",
