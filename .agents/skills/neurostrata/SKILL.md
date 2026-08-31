@@ -13,7 +13,7 @@ NeuroStrata is the standard operating protocol for persisting and retrieving kno
    * **SynapticGraph Linking**: To prevent context bloat, NeuroStrata stores *pointers* (e.g., "See `docs/architecture/domains/sync.md` for full narrative") instead of dumping entire narratives into an Engram.
 3. **Task Stratum (`namespace="<task_id>"`)**: Specific insights, decisions, and context scoped to a single active task.
 
-## Available MCP Tools
+## Available MCP Tools  
 NeuroStrata provides the following native MCP tools that you MUST use to manage the system's memory:
 * `neurostrata_add_memory`: Add a new architectural rule, project pattern, or task insight (an Engram). **FORMATTING:** If the Engram is a strict, non-negotiable constraint that must NEVER be ignored, prefix it with "RULE: " (e.g., "RULE: Never use Python"). If it is general context, domain logic, or a pointer to documentation, just save it as normal text without the prefix. If scoped `namespace=global`, file paths in metadata must point to `~/.config/neurostrata/global/`.
 * `neurostrata_search_memory`: Search for existing Engrams before writing code or making architectural decisions.
@@ -24,9 +24,10 @@ NeuroStrata provides the following native MCP tools that you MUST use to manage 
 
 **These six are the whole surface.** There is no MCP tool for updating or deleting an Engram, for generating a canvas, or for dumping the database. To supersede a rule, add a new Engram that states the correction. To delete one, the user runs `neurostrata-mcp delete <namespace> <id>` with the daemon stopped, or the GUI posts to the daemon's `/delete`. `neurostrata_move_memory` is dispatched by the server but never advertised, so do not call it.
 
-**Ids.** A node id is a repository-relative path (`src/parser/ingest.rs`),
+**Ids and namespaces.** A node id is a repository-relative path (`src/parser/ingest.rs`),
 so that is the form to use in `locations` when a memory governs a file; the absolute path
-lives in metadata as `absolute_path`.
+lives in metadata as `absolute_path`. A namespace is the project name, never the checkout
+folder, and names differing only by case resolve to the one already stored.
 
 ## SynapticGraph Integrity Rules
 To prevent broken graphs and dead links, all Domain Narratives (markdown files) must adhere to these rigid constraints:

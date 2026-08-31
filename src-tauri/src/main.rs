@@ -120,20 +120,59 @@ fn daemon_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+/// The namespace a project's memories live under.
+///
+/// Nothing in the design derives this from a directory: the MCP schema calls it
+/// "the exact project name". Deriving it from the checkout folder was this
+/// application's own invention, and it split one project into two strata when
+/// the folder was cloned as `neurostrata` while the project is `NeuroStrata`
+/// (bead neurostrata-fld).
+///
+/// So it is decided once and remembered. The folder name only seeds the first
+/// answer; after that the stored name is what this project is called, whatever
+/// the directory is renamed to afterwards. The daemon still resolves case, so an
+/// older seed keeps finding the namespace it named.
+fn namespace_for(project_path: &str) -> String {
+    if let Ok(stored) = fs::read_to_string(namespace_path(project_path)) {
+        let stored = stored.trim().to_string();
+        if !stored.is_empty() {
+            return stored;
+        }
+    }
+
+    let seeded = std::path::Path::new(project_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("global")
+        .to_string();
+
+    let record = namespace_path(project_path);
+    if let Some(parent) = record.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    fs::write(&record, &seeded).ok();
+    seeded
+}
+
+/// Kept beside the project, in the directory add_memory already uses as the
+/// marker that a project has a stratum at all.
+fn namespace_path(project_path: &str) -> PathBuf {
+    std::path::Path::new(project_path)
+        .join(".NeuroStrata")
+        .join("namespace")
+}
+
 #[tauri::command]
 fn ingest_ast(project_path: String) -> Result<String, String> {
     ensure_daemon()?;
     
-    let folder_name = std::path::Path::new(&project_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("global");
+    let namespace = namespace_for(&project_path);
 
     let client = reqwest::blocking::Client::new();
     let resp = client.post("http://127.0.0.1:34343/ingest")
         .json(&serde_json::json!({
             "dir": project_path,
-            "namespace": folder_name
+            "namespace": namespace
         }))
         .send()
         .map_err(|e| e.to_string())?;
@@ -200,10 +239,7 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
 
     let mut namespace_filter = "global".to_string();
     if let Some(path_str) = &project_path {
-        let path = std::path::Path::new(path_str);
-        if let Some(folder_name) = path.components().last().and_then(|c| c.as_os_str().to_str()) {
-            namespace_filter = folder_name.to_string();
-        }
+        namespace_filter = namespace_for(path_str);
     }
     
     let client = reqwest::blocking::Client::new();
