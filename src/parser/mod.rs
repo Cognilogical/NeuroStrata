@@ -7,6 +7,8 @@ pub fn get_language(name: &str) -> Option<Language> {
     match name {
         "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
         "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        // .tsx needs its own grammar: the TypeScript one does not parse JSX.
+        "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "python" => Some(tree_sitter_python::LANGUAGE.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "java" => Some(tree_sitter_java::LANGUAGE.into()),

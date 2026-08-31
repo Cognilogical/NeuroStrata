@@ -74,6 +74,50 @@ impl LadybugStore {
     }
 }
 
+/// One edge a memory asks for, read off its metadata.
+#[derive(Debug, PartialEq)]
+pub struct EdgeSpec {
+    pub rel_type: &'static str,
+    pub target_id: String,
+    /// true for `self -> target`, false for `target -> self`. Containment reads
+    /// the other way round: the parent contains the child, not the reverse.
+    pub points_at_target: bool,
+}
+
+/// Maps metadata arrays onto the three edge tables. `related_to` is a semantic
+/// link, `contained_by` is structure (directory to file to symbol), and
+/// `governs` connects a rule to the code it constrains -- the edge that lets an
+/// architectural memory be found from the file it applies to.
+pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
+    let mut specs = Vec::new();
+    for (key, rel_type, points_at_target) in [
+        ("related_to", "RELATES_TO", true),
+        ("contained_by", "CONTAINS", false),
+        ("governs", "GOVERNS", true),
+    ] {
+        if let Some(items) = metadata.get(key).and_then(|v| v.as_array()) {
+            for item in items {
+                if let Some(target) = item.as_str() {
+                    if target.is_empty() {
+                        continue;
+                    }
+                    specs.push(EdgeSpec {
+                        rel_type,
+                        target_id: target.to_string(),
+                        points_at_target,
+                    });
+                }
+            }
+        }
+    }
+    specs
+}
+
+/// Memory types written with a zero vector by directory ingestion. They describe
+/// where something lives, not what it says, so they carry no meaning for a
+/// similarity search.
+const STRUCTURAL_MEMORY_TYPES: [&str; 3] = ["directory", "file", "markdown"];
+
 fn escape_kuzu_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
@@ -136,18 +180,21 @@ impl VectorStore for LadybugStore {
 
         conn.query(&insert_query)?;
         
-        // Edge linking logic (if related_to is present)
-        if let Some(related) = payload.metadata.get("related_to").and_then(|r| r.as_array()) {
-            for rel in related {
-                if let Some(rel_id) = rel.as_str() {
-                    let rel_id_safe = escape_kuzu_string(rel_id);
-                    let edge_query = format!(
-                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:RELATES_TO]->(b)",
-                        safe_id, rel_id_safe
-                    );
-                    conn.query(&edge_query).ok();
-                }
-            }
+        // Materialise the edges this memory declares. A target that does not exist
+        // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
+        // That is deliberate -- a rule may name a file the ingester has not reached.
+        for edge in edge_specs(&payload.metadata) {
+            let target_safe = escape_kuzu_string(&edge.target_id);
+            let (from, to) = if edge.points_at_target {
+                (safe_id.as_str(), target_safe.as_str())
+            } else {
+                (target_safe.as_str(), safe_id.as_str())
+            };
+            let edge_query = format!(
+                "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
+                from, to, edge.rel_type
+            );
+            conn.query(&edge_query).ok();
         }
 
         Ok(())
@@ -163,10 +210,21 @@ impl VectorStore for LadybugStore {
         let safe_ns = escape_kuzu_string(namespace);
         let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
-        // Step 1: Base vector search
+        // Step 1: Base vector search.
+        //
+        // Structural nodes are stored with an all-zero embedding, and the distance
+        // from an all-zero row is the query vector's own magnitude -- the same value
+        // for every one of them, whatever was asked. Left in, they tie with each
+        // other and can fill the limit with path stubs. They stay reachable through
+        // the graph expansion in step 2, which is where they are actually useful.
+        let structural_types = STRUCTURAL_MEMORY_TYPES
+            .iter()
+            .map(|t| format!("'{}'", t))
+            .collect::<Vec<_>>()
+            .join(", ");
         let search_query = format!(
-            "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
-            safe_ns, vec_str, limit
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
+            safe_ns, structural_types, vec_str, limit
         );
 
         let result = conn.query(&search_query)?;
@@ -230,42 +288,57 @@ impl VectorStore for LadybugStore {
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            // Query any neighbors connected to our primary matches
+            // Anything one hop from a primary match.
             let neighbor_query = format!(
                 "MATCH (a:Memory)-[]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata LIMIT {}",
                 id_list, safe_ns, id_list, limit
             );
 
-            if let Ok(mut neighbor_result) = conn.query(&neighbor_query) {
-                while let Some(row) = neighbor_result.next() {
-                    let id: String = format!("{}", row[0]);
-                    let content: String = format!("{}", row[1]);
-                    let user_id: String = format!("{}", row[2]);
-                    let memory_type: String = format!("{}", row[3]);
-                    let agent_name: String = format!("{}", row[4]);
-                    let location: String = format!("{}", row[5]);
-                    let location_lines: String = format!("{}", row[6]);
-                    let metadata_str: String = format!("{}", row[7]);
+            // And one step further, but only along GOVERNS. A match is usually a
+            // symbol, whose file is one hop away, which puts the rule governing
+            // that file two hops out -- exactly the thing worth surfacing, and
+            // unreachable from the query above.
+            let governing_query = format!(
+                "MATCH (a:Memory)-[]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata LIMIT {}",
+                id_list, safe_ns, id_list, limit
+            );
 
-                    let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+            for expansion in [neighbor_query, governing_query] {
+                if let Ok(mut rows) = conn.query(&expansion) {
+                    while let Some(row) = rows.next() {
+                        let id: String = format!("{}", row[0]);
+                        let content: String = format!("{}", row[1]);
+                        let user_id: String = format!("{}", row[2]);
+                        let memory_type: String = format!("{}", row[3]);
+                        let agent_name: String = format!("{}", row[4]);
+                        let location: String = format!("{}", row[5]);
+                        let location_lines: String = format!("{}", row[6]);
+                        let metadata_str: String = format!("{}", row[7]);
 
-                    // Neighbors get a synthesized lower score (worse distance) so they appear after primary matches,
-                    // but still within the context window.
-                    results.push(SearchResult {
-                        id,
-                        score: 10.0, // High distance (low relevance score) ensures they rank below direct matches
-                        payload: MemoryPayload {
-                            content,
-                            user_id,
-                            memory_type,
-                            agent_name: Some(agent_name),
-                            location,
-                            location_lines,
-                            metadata: metadata_val,
-                        },
-                    });
+                        let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+
+                        // Neighbors get a synthesized lower score (worse distance) so they appear after primary matches,
+                        // but still within the context window.
+                        results.push(SearchResult {
+                            id,
+                            score: 10.0, // High distance (low relevance score) ensures they rank below direct matches
+                            payload: MemoryPayload {
+                                content,
+                                user_id,
+                                memory_type,
+                                agent_name: Some(agent_name),
+                                location,
+                                location_lines,
+                                metadata: metadata_val,
+                            },
+                        });
+                    }
                 }
             }
+
+            // Both expansions can return the same memory; keep the first of each.
+            let mut seen = std::collections::HashSet::new();
+            results.retain(|r| seen.insert(r.id.clone()));
         }
 
         results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -291,11 +364,12 @@ impl VectorStore for LadybugStore {
         Ok(())
     }
 
-    async fn clear_ast(&self, namespace: &str) -> Result<()> {
+    async fn clear_ingested(&self, namespace: &str) -> Result<()> {
         let conn = self.get_conn()?;
         let safe_ns = escape_kuzu_string(namespace);
-        
-        // Delete all AST memories for this namespace
+
+        // Every row the ingester owns: the AST symbols and the directory/file
+        // nodes too, since ingestion rebuilds the whole structure for a namespace
         let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
         conn.query(&query)?;
         Ok(())
@@ -520,5 +594,40 @@ impl VectorStore for LadybugStore {
             self.upsert(namespace, id, vector, payload).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn each_metadata_key_maps_to_its_edge_table() {
+        let specs = edge_specs(&json!({
+            "related_to": ["a"],
+            "contained_by": ["parent"],
+            "governs": ["src/lib.rs"]
+        }));
+        assert_eq!(specs.len(), 3);
+        assert!(specs.contains(&EdgeSpec { rel_type: "RELATES_TO", target_id: "a".into(), points_at_target: true }));
+        assert!(specs.contains(&EdgeSpec { rel_type: "GOVERNS", target_id: "src/lib.rs".into(), points_at_target: true }));
+    }
+
+    /// Containment points from the parent to the child, so a directory contains
+    /// its files rather than the other way round.
+    #[test]
+    fn containment_points_from_the_parent() {
+        let specs = edge_specs(&json!({ "contained_by": ["src"] }));
+        assert_eq!(specs[0].rel_type, "CONTAINS");
+        assert!(!specs[0].points_at_target);
+    }
+
+    #[test]
+    fn absent_or_empty_metadata_asks_for_no_edges() {
+        assert!(edge_specs(&json!({})).is_empty());
+        assert!(edge_specs(&json!({ "related_to": [] })).is_empty());
+        assert!(edge_specs(&json!({ "related_to": [""] })).is_empty());
+        assert!(edge_specs(&json!(null)).is_empty());
     }
 }

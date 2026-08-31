@@ -81,6 +81,10 @@ fn find_existing_cache_dir() -> PathBuf {
     primary_neuro_cache
 }
 
+/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
+/// at ~3.5 characters per token, with headroom for the header lines.
+const MAX_EMBED_TOKENS: usize = 2048;
+
 pub struct FastEmbedder {
     model: TextEmbedding,
     dimensions: usize,
@@ -106,9 +110,14 @@ impl FastEmbedder {
 
         eprintln!("Initializing FastEmbedder with model: {} using cache: {:?}", target_model.model_name, cache_dir);
 
+        // fastembed defaults to 512 tokens regardless of what the model supports
+        // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
+        // what ingestion actually stores per symbol is wasted, so this is set to
+        // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
         let model = TextEmbedding::try_new(
             InitOptions::new(model_enum)
                 .with_cache_dir(cache_dir)
+                .with_max_length(MAX_EMBED_TOKENS)
                 .with_show_download_progress(true),
         )?;
         

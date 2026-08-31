@@ -123,7 +123,8 @@ async fn handle_get_graph(
         }
     }
 
-    if let Some(links) = data.get("edges").and_then(|l| l.as_array()) {
+    // export_graph emits "links"; reading "edges" here served an edgeless graph.
+    if let Some(links) = data.get("links").and_then(|l| l.as_array()) {
         for link in links {
             let source = link.get("source").and_then(|s| s.as_str()).unwrap_or("");
             let target = link.get("target").and_then(|s| s.as_str()).unwrap_or("");

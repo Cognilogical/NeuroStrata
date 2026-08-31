@@ -303,6 +303,11 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
     let memory_type = arguments.get("memory_type").and_then(|m| m.as_str()).unwrap_or("context");
     let create_new_namespace = arguments.get("create_new_namespace").and_then(|v| v.as_bool()).unwrap_or(false);
     let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("unknown");
+    if user_id == "auto-ingestor" {
+        // Directory ingestion deletes every row owned by this user_id before it
+        // rebuilds, so a memory stored under it would vanish on the next ingest.
+        return "ERROR: 'auto-ingestor' is reserved for directory ingestion, and memories stored under it are deleted by the next ingest. Please use a different user_id.".to_string();
+    }
     let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
     let mut location = "".to_string();
     let mut location_lines = "".to_string();
@@ -329,6 +334,30 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
                 serde_json::Value::Object(ref_obj)
             }).collect();
             obj.insert("refs".to_string(), serde_json::Value::Array(refs));
+
+            // A rule that names files governs them. This is the edge that makes an
+            // architectural memory reachable from the code it constrains, rather
+            // than only from a similar-sounding query.
+            let governed: Vec<serde_json::Value> = locations
+                .iter()
+                .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
+                .filter(|p| !p.is_empty())
+                // Same normalisation the ingester applies to its node ids, so a
+                // path written by hand lands on the file node it names.
+                .map(crate::parser::ingest::normalize_node_path)
+                .fold(Vec::new(), |mut acc: Vec<String>, path| {
+                    // Several locations often sit in one file; one edge is enough.
+                    if !acc.contains(&path) {
+                        acc.push(path);
+                    }
+                    acc
+                })
+                .into_iter()
+                .map(|p| serde_json::json!(p))
+                .collect();
+            if !governed.is_empty() {
+                obj.insert("governs".to_string(), serde_json::Value::Array(governed));
+            }
         }
     }
 
@@ -513,10 +542,16 @@ Content: {}",
                                 }
                             }
                         }
-                        if let Some(related) = r.payload.metadata.get("related_to") {
-                            if let Some(arr) = related.as_array() {
-                                if !arr.is_empty() {
-                                    out.push_str(&format!("\nRelated Nodes: {}", related));
+                        for (key, label) in [
+                            ("related_to", "Related Nodes"),
+                            ("contained_by", "Contained By"),
+                            ("governs", "Governs"),
+                        ] {
+                            if let Some(value) = r.payload.metadata.get(key) {
+                                if let Some(arr) = value.as_array() {
+                                    if !arr.is_empty() {
+                                        out.push_str(&format!("\n{}: {}", label, value));
+                                    }
                                 }
                             }
                         }

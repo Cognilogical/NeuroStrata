@@ -65,8 +65,9 @@ pub trait VectorStore: Send + Sync {
     /// Delete a specific memory by its ID.
     async fn delete(&self, namespace: &str, id: &str) -> Result<()>;
 
-    /// Clear all auto-ingested AST data from a namespace
-    async fn clear_ast(&self, namespace: &str) -> Result<()>;
+    /// Remove every row owned by the directory ingester in a namespace: the AST
+    /// symbols and the directory/file nodes, which ingestion then rebuilds.
+    async fn clear_ingested(&self, namespace: &str) -> Result<()>;
 
     /// List all memories
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
