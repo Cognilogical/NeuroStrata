@@ -47,6 +47,72 @@ pub fn normalize_node_path(path: &str) -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
+/// The separator between a namespace and the path it qualifies.
+///
+/// Two colons because a path cannot contain them on any platform we ingest
+/// from, so splitting a qualified id back apart is unambiguous.
+pub const NAMESPACE_SEPARATOR: &str = "::";
+
+/// A node id, qualified by the namespace that owns it.
+///
+/// Node ids are paths, and the Memory table is PRIMARY KEY (id) -- one column,
+/// because lbug 0.15.3 has no composite key (see examples/composite_pk_repro.rs
+/// for the parser refusing one). So an id is unique across the WHOLE database,
+/// while paths are only unique within a project. Every repository has a `src`
+/// and a `README.md`, and the database is shared by all of them, which meant the
+/// second project ingested silently took the first project's nodes: upsert
+/// MERGEs on the id, finds the existing row, and updates it.
+///
+/// Qualifying the id with its namespace is what makes "projects are separated by
+/// namespace" true in the schema rather than only in the documentation. It is
+/// also the only one of the three candidate fixes the engine allows.
+///
+/// The bare path is still what a memory's `location` carries and what a rule
+/// names, so declarations keep reading the way a human writes them --
+/// `resolve_declared_target` bridges the two.
+pub fn qualified_id(namespace: &str, node_path: &str) -> String {
+    format!("{}{}{}", namespace, NAMESPACE_SEPARATOR, node_path)
+}
+
+/// The id a node gets, relative to the directory being ingested.
+///
+/// Ids used to inherit whatever the caller passed: the CLI walked a relative
+/// path and produced `src/store/ladybug.rs`, while the GUI passes an absolute
+/// project path and produced `C:/dev/projects/neurostrata/src/store/ladybug.rs`.
+/// GOVERNS edges match ids by exact string, so a rule an agent wrote against
+/// `src/store/ladybug.rs` could never link to the same file ingested from the
+/// GUI -- and an absolute id does not survive the repository being checked out
+/// anywhere else (bead neurostrata-fld).
+pub fn node_id_for(root: &Path, path: &Path) -> String {
+    // A relative walk already produces the documented form. `ingest ./src <ns>`
+    // is the example in CLI-readme.md, and it must keep yielding src/lib.rs --
+    // the same shape a rule names when it says "src/lib.rs" -- rather than the
+    // lib.rs that stripping the ingest root would leave.
+    let relative = if path.is_relative() {
+        path.to_path_buf()
+    } else {
+        // Absolute: prefer the working directory, so ingesting an absolute
+        // subdirectory of the project still reads relative to the project.
+        std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(Path::to_path_buf))
+            .unwrap_or_else(|| path.strip_prefix(root).unwrap_or(path).to_path_buf())
+    };
+
+    let normalized = normalize_node_path(&relative.to_string_lossy());
+    if normalized.is_empty() {
+        // The root itself. Name it, rather than leaving an empty id.
+        normalize_node_path(
+            &root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.to_string_lossy().to_string()),
+        )
+    } else {
+        normalized
+    }
+}
+
 /// One extracted symbol, owned so that no tree-sitter type is alive when the
 /// embedding and upsert futures are awaited.
 struct SymbolRow {
@@ -122,12 +188,12 @@ pub async fn ingest_directory(
             std::env::current_dir().unwrap_or_default().join(path).to_string_lossy().to_string()
         };
 
-        let node_path = normalize_node_path(&path_str);
+        let node_path = node_id_for(dir_path, path);
 
         // Create parent edge mapping
         let parent_id = if let Some(p) = path.parent() {
-            let p_str = normalize_node_path(&p.to_string_lossy());
-            if p_str != "." && p_str != "" {
+            let p_str = node_id_for(dir_path, p);
+            if p_str != "." && p_str != "" && p_str != node_path {
                 Some(p_str)
             } else {
                 None
@@ -138,7 +204,7 @@ pub async fn ingest_directory(
 
         let mut contained_by = Vec::new();
         if let Some(pid) = parent_id {
-            contained_by.push(pid);
+            contained_by.push(qualified_id(namespace, &pid));
         }
 
         let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
@@ -162,7 +228,7 @@ pub async fn ingest_directory(
         // Structure is containment, not a semantic link: the directory contains the file.
         metadata.insert("contained_by".to_string(), serde_json::json!(contained_by));
 
-        let node_id = node_path.clone();
+        let node_id = qualified_id(namespace, &node_path);
         let payload = MemoryPayload {
             content: format!("Path: {}", node_path),
             location: node_path.clone(),
@@ -260,7 +326,10 @@ pub async fn ingest_directory(
                             "{} {} in {}\nlines {}-{}\n\n{}",
                             symbol.kind, symbol.name, node_path, symbol.start_line, symbol.end_line, symbol.body
                         );
-                        let id = symbol_id(&node_path, &symbol.kind, &symbol.name, symbol.start_line);
+                        let id = qualified_id(
+                            namespace,
+                            &symbol_id(&node_path, &symbol.kind, &symbol.name, symbol.start_line),
+                        );
                         let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
 
                         let mut metadata = serde_json::Map::new();
@@ -269,7 +338,10 @@ pub async fn ingest_directory(
                         metadata.insert("symbol_kind".to_string(), serde_json::json!(symbol.kind));
                         metadata.insert("language".to_string(), serde_json::json!(lang_name));
                         // The file contains the symbol, so this is a CONTAINS edge too.
-                        metadata.insert("contained_by".to_string(), serde_json::json!([node_path.clone()]));
+                        metadata.insert(
+                            "contained_by".to_string(),
+                            serde_json::json!([qualified_id(namespace, &node_path)]),
+                        );
                         metadata.insert("refs".to_string(), serde_json::json!([
                             { "file": node_path.clone(), "lines": lines.clone() }
                         ]));
@@ -303,6 +375,20 @@ pub async fn ingest_directory(
             }
         }
     }
+
+    // Clearing the previous ingest took every edge attached to those nodes with
+    // it, including the GOVERNS edges rules had to them -- and a rule is not
+    // rewritten just because its file came back. Replay what the memories still
+    // declare, now that the nodes they point at exist again (bead
+    // neurostrata-sij).
+    match vector_store.relink_edges(namespace).await {
+        Ok(linked) => println!("Relinked {} declared edges in namespace {}", linked, namespace),
+        Err(e) => eprintln!(
+            "WARNING: ingestion finished but the declared edges could not be relinked, so rules may not reach their code: {}",
+            e
+        ),
+    }
+
     Ok(())
 }
 
@@ -361,8 +447,71 @@ mod tests {
         assert_eq!(map.get(&normalize_ext("tsx")), Some(&"tsx".to_string()));
     }
 
+    /// A project root that is absolute on the platform running the test.
+    ///
+    /// A literal `C:\dev\projects\neurostrata` is absolute only on Windows. On
+    /// Linux and macOS it has no leading separator, so `node_id_for` would take
+    /// its `is_relative()` branch and return the whole string instead of
+    /// stripping the root.
+    fn absolute_root() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\dev\projects\neurostrata")
+        } else {
+            std::path::PathBuf::from("/dev/projects/neurostrata")
+        }
+    }
+
     /// Node ids double as edge targets, so a path an agent writes
     /// ("src/lib.rs") has to land on the same string the walker produced.
+    #[test]
+    fn a_node_id_is_relative_to_the_directory_being_ingested() {
+        let root = absolute_root();
+
+        assert_eq!(
+            node_id_for(&root, &root.join("src").join("store").join("ladybug.rs")),
+            "src/store/ladybug.rs",
+            "an absolute walk must produce the same id as a relative one"
+        );
+        assert_eq!(
+            node_id_for(Path::new("."), Path::new("./src/store/ladybug.rs")),
+            "src/store/ladybug.rs"
+        );
+    }
+
+    #[test]
+    fn ingesting_a_subdirectory_keeps_the_documented_repo_relative_form() {
+        // CLI-readme.md documents `neurostrata-mcp ingest ./src my-rust-project`,
+        // and rules name files as "src/lib.rs". Stripping the ingest root would
+        // leave "lib.rs" and quietly unlink every rule that names the file.
+        assert_eq!(
+            node_id_for(Path::new("./src"), Path::new("./src/store/ladybug.rs")),
+            "src/store/ladybug.rs"
+        );
+        assert_eq!(
+            node_id_for(Path::new("src"), Path::new("src/lib.rs")),
+            "src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn the_ingest_root_is_named_rather_than_left_empty() {
+        let root = absolute_root();
+        assert_eq!(node_id_for(&root, &root), "neurostrata");
+    }
+
+    #[test]
+    fn a_path_outside_everything_keeps_its_absolute_shape() {
+        // Neither the working directory nor the ingest root is a prefix, so
+        // there is nothing to strip. A usable absolute id beats a panic.
+        assert_eq!(
+            node_id_for(
+                Path::new(r"C:\dev\projects\other"),
+                Path::new(r"D:\elsewhere\a.rs")
+            ),
+            "D:/elsewhere/a.rs"
+        );
+    }
+
     #[test]
     fn node_paths_normalise_to_one_form() {
         assert_eq!(normalize_node_path(r".\src\lib.rs"), "src/lib.rs");
@@ -371,7 +520,44 @@ mod tests {
         assert_eq!(normalize_node_path("src/"), "src");
     }
 
+        /// The whole point: two projects both have a `src`, the Memory table has a
+    /// single-column primary key, and the database is shared. Without the
+    /// namespace in the id the second project ingested takes the first's node.
     #[test]
+    fn two_projects_sharing_a_path_get_different_ids() {
+        assert_ne!(
+            qualified_id("ProjectA", "src/main.rs"),
+            qualified_id("ProjectB", "src/main.rs")
+        );
+        assert_eq!(qualified_id("NeuroStrata", "src"), "NeuroStrata::src");
+    }
+
+    /// A rule names a file the way a human writes it. The id it has to reach is
+    /// qualified. If that bridge breaks, every GOVERNS edge silently stops
+    /// forming and the graph looks fine while meaning nothing.
+    #[test]
+    fn a_bare_declaration_still_reaches_its_qualified_id() {
+        let known = vec![
+            qualified_id("NeuroStrata", "src/store/ladybug.rs"),
+            qualified_id("NeuroStrata", "src/daemon.rs"),
+        ];
+        assert_eq!(
+            crate::store::ladybug::resolve_declared_target("src/store/ladybug.rs", &known).as_deref(),
+            Some("NeuroStrata::src/store/ladybug.rs")
+        );
+    }
+
+    /// A suffix must not match a longer filename that merely ends the same way.
+    #[test]
+    fn a_suffix_does_not_match_a_longer_name() {
+        let known = vec![qualified_id("NeuroStrata", "src/mylib.rs")];
+        assert_eq!(
+            crate::store::ladybug::resolve_declared_target("lib.rs", &known),
+            None
+        );
+    }
+
+#[test]
     fn symbol_ids_are_stable_and_distinguish_repeated_names() {
         let a = symbol_id("src/lib.rs", "functions", "main", 12);
         assert_eq!(a, symbol_id("src/lib.rs", "functions", "main", 12));
