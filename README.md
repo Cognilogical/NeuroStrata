@@ -192,10 +192,17 @@ Once installed, your AI agent automatically gains access to the following tools 
 | :--- | :--- |
 | `neurostrata_add_memory` | Store a new architectural rule, project pattern, or task insight. |
 | `neurostrata_search_memory` | Semantic search across the 3 Tiers to enforce architectural compliance. |
-| `neurostrata_update_memory` | Overwrite an existing memory to fix hallucinations or update obsolete rules. |
-| `neurostrata_delete_memory` | Hard-delete dead context from the latent space (Manual verification required). |
+| `neurostrata_get_memory` | Read one memory by id, to follow a pointer instead of guessing at a search. |
+| `neurostrata_get_snapshot` | The top active rules for a project, in one call, to ground a new session. |
+| `neurostrata_supersede_memory` | Correct a rule. Stores the new text and retires the old one, which keeps its wording as history. |
+| `neurostrata_list_namespaces` | List the namespaces the shared database holds. |
 | `neurostrata_ingest_directory` | Batch-embed an entire architectural documentation folder. |
-| `neurostrata_dump_db` | Export the entire vector database to a JSON file for backup and portability. |
+
+Every tool an agent can reach is additive: none of them destroys a memory. Editing a rule in
+place, deleting one, moving one between namespaces and restoring a backup are **CLI and GUI
+commands** (`neurostrata-mcp delete|edit|move|restore`, and the daemon's `/delete` and `/edit`,
+which the GUI posts to), so a person is present when bytes are lost. This is enforced by those
+operations being absent from the MCP surface entirely, not by asking an agent to seek approval.
 
 ## 📖 CLI and Changelog Documentation
 
@@ -223,7 +230,7 @@ NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications
 - **Loopback-Only Network Surface (Mitigates LLM07):** Agents talk to NeuroStrata over `stdio`. Behind that, a local daemon binds **`127.0.0.1:34343`** and serves `/health`, `/graph`, `/ingest`, `/delete`, `/edit`, `/mcp`, `/backup` and `/shutdown` -- the stdio process starts it automatically when none is running, so the port is open in normal operation. It is bound to loopback and never to an external interface, and nothing is published beyond the machine, which is what neutralises remote RCE and plugin exploitation vectors. Anything running as your user on the same machine can reach it: there is no authentication on those routes.
 - **Active Secret Scrubbing (Mitigates LLM06):** The Rust backend actively scans memory payloads for high-entropy secrets (API keys, passwords, JWTs) and explicitly rejects insertions, forcing the agent into a "Redaction Loop" to prevent permanent context contamination.
 - **Kuzu Injection Hardening (Mitigates SQL/Cypher Injection):** Active escaping of single quotes and backslashes in database interpolations eliminates Cypher database injection and prompt-driven database crash vectors.
-- **Guarded Curation (Mitigates LLM08):** No advertised MCP tool edits or deletes a memory. Editing and deleting are CLI and GUI operations (`neurostrata-mcp edit` and `delete`, and the daemon's `/edit` and `/delete`, which the GUI posts to). Deletion works one id at a time and never in bulk, and the database directory is never dropped. None of these has a separate guard for the machine-wide `global` namespace. Sub-agent restraint is a convention in the agent instructions, not something the server enforces.
+- **Guarded Curation (Mitigates LLM08):** No tool on the MCP surface destroys a memory, so an agent cannot lose one. Corrections go through `neurostrata_supersede_memory`, which retires the old row rather than overwriting it and refuses the machine-wide `global` namespace unless the caller passes `allow_global`. Editing, deleting and moving are CLI and GUI operations; deletion works one id at a time and never in bulk, and the database directory is never dropped. Sub-agent restraint is a convention in the agent instructions, not something the server enforces.
 - **Resilient Soft Locks (Mitigates LLM09):** To combat context degradation and "happy path" tunnel vision, NeuroStrata enforces memory extraction through OS-level Git hooks (Pre-Push Behavioral Forcing) rather than relying solely on fragile system prompts.
 
 ## License

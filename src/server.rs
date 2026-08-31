@@ -185,6 +185,20 @@ pub async fn process_mcp_request(
                             },
                             "required": ["query", "namespace"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_supersede_memory",
+                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. This is the correct way to fix a rule: it loses nothing, and unlike an edit it re-embeds, so search stops matching the words you replaced.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory being corrected. Get it from a search result or neurostrata_get_memory." },
+                                "namespace": { "type": "string", "description": "The namespace the memory lives in." },
+                                "content": { "type": "string", "description": "The corrected text, written in full. It replaces the old wording rather than being appended to it." },
+                                "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." }
+                            },
+                            "required": ["id", "namespace", "content"]
+                        }
                     }
                 ]
             });
@@ -224,11 +238,11 @@ pub async fn process_mcp_request(
                         "neurostrata_ingest_directory" => {
                             result_text = handle_ingest_directory(arguments, emb.clone(), store.clone(), ingests.clone()).await;
                         }
-                        "neurostrata_move_memory" => {
-                            result_text = handle_move_memory(arguments, store.clone()).await;
-                        }
                         "neurostrata_search_memory" => {
                             result_text = handle_search_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_supersede_memory" => {
+                            result_text = handle_supersede_memory(arguments, emb.clone(), store.clone()).await;
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -775,36 +789,123 @@ async fn handle_ingest_directory(
     }
 }
 
-async fn handle_move_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+/// Retire a memory and store its replacement, keeping both.
+///
+/// docs/COGNITIVE_ARCHITECTURE.md section 2 promises that agents never
+/// overwrite history: the old node gets a `valid_to` stamp and a new node
+/// carries the correction. Only the reading half of that was ever built --
+/// `valid_to` was filtered on but never written -- so the only correction paths
+/// were destructive rewrites, and `/edit` additionally kept the old embedding.
+/// This is the writing half, and it is the reason an agent needs no destructive
+/// tool: superseding loses nothing, so it needs no human at the keyboard.
+async fn handle_supersede_memory(
+    arguments: Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
-        None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
+        None => return "Missing 'id' parameter: supersede needs the memory it replaces.".to_string(),
     };
-    let src = match arguments.get("source_namespace").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
+    let content = match arguments.get("content").and_then(|c| c.as_str()) {
+        Some(c) => c,
+        None => return "Missing 'content' parameter: supersede needs the corrected text.".to_string(),
     };
-    let src = resolve_namespace(&store, src).await;
-    let src = src.as_str();
-    let tgt = match arguments.get("target_namespace").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
+    let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace.".to_string(),
     };
 
-    match store.relocate(id, src, tgt).await {
-        Ok(crate::traits::RelocateOutcome::Moved) => {
-            format!("Successfully moved memory {} from {} to {}", id, src, tgt)
-        }
-        Ok(crate::traits::RelocateOutcome::NotFound) => "Memory not found in source namespace.".to_string(),
-        Ok(crate::traits::RelocateOutcome::Ingested) => format!(
-            "Memory {} was written by directory ingestion for namespace {} and cannot be moved; ingest the directory into {} instead.",
-            id, src, tgt
-        ),
-        Ok(crate::traits::RelocateOutcome::SameNamespace) => {
-            format!("Memory {} is already in namespace {}.", id, src)
-        }
-        Err(e) => format!("Failed to move memory {}: {}", id, e),
+    // Same scanner add_memory uses. A correction is still an insertion, and a
+    // secret pasted into one would be just as permanent.
+    let secret_regex = regex::Regex::new(r"(?i)(sk-ant-|ghp_|xoxb-|eyjhbg|api_key\s*=|password\s*=|sk-proj-)").unwrap();
+    if secret_regex.is_match(content) {
+        return "ERROR [SECURITY]: Memory rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your request and try again.".to_string();
     }
+
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
+
+    // Retiring a row hides it from every future search, so the machine-wide
+    // stratum keeps the same guard the destructive tools carry.
+    if namespace == "global" && !arguments.get("allow_global").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return "ERROR [GLOBAL]: Refusing to supersede a memory in the machine-wide 'global' namespace. Rules there apply to every project on this machine. Pass allow_global=true only if you are certain, or supersede the project-local rule instead.".to_string();
+    }
+
+    let (old_vector, mut old_payload) = match store.get(namespace, id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return format!("No memory with id {} in namespace {}.", id, namespace),
+        Err(e) => return format!("Failed to read memory {}: {}", id, e),
+    };
+
+    if old_payload
+        .metadata
+        .get("valid_to")
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+    {
+        return format!(
+            "Memory {} was already superseded; it is history. Supersede the memory that replaced it, or add a new one.",
+            id
+        );
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let new_id = uuid::Uuid::new_v4().to_string();
+
+    // The replacement inherits everything the old row established -- who stored
+    // it, what it governs, which files it points at -- because a correction to
+    // the text is not a change of subject.
+    let mut new_payload = old_payload.clone();
+    new_payload.content = content.to_string();
+    if let Some(obj) = new_payload.metadata.as_object_mut() {
+        obj.remove("valid_to");
+        obj.insert("valid_from".to_string(), serde_json::json!(now));
+        obj.insert("access_count".to_string(), serde_json::json!(0));
+        obj.insert("supersedes".to_string(), serde_json::json!(id));
+    }
+
+    let vector = match emb.embed(&content).await {
+        Ok(v) => v,
+        // The whole point of superseding rather than editing: the new text gets
+        // its own embedding, so search stops matching the words we replaced.
+        Err(e) => return format!("Failed to embed the new content, nothing was changed: {}", e),
+    };
+
+    // Write the replacement BEFORE retiring the original. If the second write
+    // fails the namespace holds both versions, which is visible and repairable;
+    // the other order would leave the rule retired with no successor.
+    if let Err(e) = store.upsert(namespace, &new_id, vector, new_payload).await {
+        return format!("Failed to store the replacement, nothing was changed: {}", e);
+    }
+
+    if let Some(obj) = old_payload.metadata.as_object_mut() {
+        obj.insert("valid_to".to_string(), serde_json::json!(now));
+        obj.insert("superseded_by".to_string(), serde_json::json!(new_id));
+    }
+    // Writing the old row back with an empty embedding would have the engine
+    // reject it, and the row is deleted before it is re-inserted -- so an empty
+    // vector here destroys the history this whole call exists to preserve.
+    if old_vector.len() != emb.dimensions() {
+        return format!(
+            "Stored the replacement as {}, but refused to rewrite {}: its embedding read back as {} floats, expected {}. Both are active.",
+            new_id,
+            id,
+            old_vector.len(),
+            emb.dimensions()
+        );
+    }
+    if let Err(e) = store.upsert(namespace, id, old_vector, old_payload).await {
+        return format!(
+            "Stored the replacement as {}, but failed to retire {}: {}. Both are active; retire the old one from the GUI or CLI.",
+            new_id, id, e
+        );
+    }
+
+    format!(
+        "Superseded {} with {} in namespace {}. The old memory keeps its text and is no longer returned by search; it is still readable by id.",
+        id, new_id, namespace
+    )
 }
 
 async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore>) -> String {
@@ -895,7 +996,7 @@ pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &
                         }
                     }
                     eprintln!(
-                        "WARNING: '{}' matches {:?}; using '{}', which holds the most memories. Merge them with neurostrata_move_memory.",
+                        "WARNING: '{}' matches {:?}; using '{}', which holds the most memories. Merge them with: neurostrata-mcp move <from> <id> <to>",
                         requested, candidates, best
                     );
                     best
@@ -1268,5 +1369,158 @@ mod tests {
 
         assert!(!out.contains("Governs"));
         assert!(!out.contains("Related Nodes"));
+    }
+
+    /// Embeds deterministically from the text, so two different strings can
+    /// never collide. That is the whole point of the assertions below.
+    struct StubEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for StubEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let mut v = vec![0.0f32; 4];
+            for (i, b) in text.bytes().enumerate() {
+                v[i % 4] += b as f32;
+            }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    async fn store_with_one_rule(namespace: &str) -> (Arc<dyn VectorStore>, String) {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+        store.init(namespace).await.expect("create the schema");
+        let id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("always use podman").await.unwrap();
+        store
+            .upsert(namespace, &id, vector, payload("always use podman"))
+            .await
+            .expect("seed the rule");
+        (store, id)
+    }
+
+    fn new_id_from(message: &str) -> String {
+        // "Superseded <old> with <new> in namespace <ns>."
+        message
+            .split(" with ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("the reply names the replacement")
+            .to_string()
+    }
+
+    /// The bi-temporal contract: the old wording survives, stamped with the
+    /// moment it stopped being true, and the correction is a separate row.
+    #[tokio::test]
+    async fn superseding_retires_the_old_row_and_keeps_its_text() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use docker" }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+
+        let (_, old) = store.get("probe", &old_id).await.unwrap().expect("still readable by id");
+        assert_eq!(old.content, "always use podman", "history keeps its own wording");
+        assert!(old.metadata["valid_to"].as_i64().is_some(), "retired");
+        assert_eq!(old.metadata["superseded_by"], serde_json::json!(new_id_from(&reply)));
+
+        let (_, new) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .expect("the replacement was stored");
+        assert_eq!(new.content, "always use docker");
+        assert_eq!(new.metadata["supersedes"], serde_json::json!(old_id));
+        assert!(new.metadata["valid_from"].as_i64().is_some());
+        assert!(
+            new.metadata.get("valid_to").map(|v| v.is_null()).unwrap_or(true),
+            "the replacement is current, not history"
+        );
+    }
+
+    /// The defect that made editing useless: the row kept the vector of text it
+    /// no longer contained, so search matched the wording we replaced.
+    #[tokio::test]
+    async fn the_replacement_is_embedded_from_its_own_text() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use docker" }),
+            emb,
+            store.clone(),
+        )
+        .await;
+
+        let (old_vector, _) = store.get("probe", &old_id).await.unwrap().unwrap();
+        let (new_vector, _) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_ne!(old_vector, new_vector, "the correction carries its own embedding");
+        assert_eq!(new_vector, StubEmbedder.embed("always use docker").await.unwrap());
+    }
+
+    /// History is not a chain to rewrite: correct the current row instead.
+    #[tokio::test]
+    async fn a_retired_memory_cannot_be_superseded_again() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let args = serde_json::json!({ "id": old_id, "namespace": "probe", "content": "second" });
+
+        handle_supersede_memory(args.clone(), emb.clone(), store.clone()).await;
+        let again = handle_supersede_memory(args, emb, store).await;
+        assert!(again.contains("already superseded"), "got {}", again);
+    }
+
+    /// Retiring a row hides it from every project on the machine, so the global
+    /// stratum takes the same guard the destructive tools carry.
+    #[tokio::test]
+    async fn the_global_namespace_needs_an_explicit_flag() {
+        let (store, old_id) = store_with_one_rule("global").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let refused = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "global", "content": "changed" }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(refused.contains("ERROR [GLOBAL]"), "got {}", refused);
+
+        let (_, untouched) = store.get("global", &old_id).await.unwrap().unwrap();
+        assert!(untouched.metadata.get("valid_to").is_none(), "nothing was retired");
+
+        let allowed = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "global", "content": "changed", "allow_global": true }),
+            emb,
+            store,
+        )
+        .await;
+        assert!(allowed.starts_with("Superseded"), "got {}", allowed);
+    }
+
+    /// A correction is still an insertion, so it meets the same scanner.
+    #[tokio::test]
+    async fn a_secret_in_the_correction_is_refused() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let refused = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "use ghp_aaaabbbbccccdddd" }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(refused.contains("ERROR [SECURITY]"), "got {}", refused);
+
+        let (_, untouched) = store.get("probe", &old_id).await.unwrap().unwrap();
+        assert!(untouched.metadata.get("valid_to").is_none(), "nothing was retired");
     }
 }
