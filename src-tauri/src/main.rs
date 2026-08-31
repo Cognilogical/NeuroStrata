@@ -70,26 +70,54 @@ fn ensure_daemon() -> Result<(), String> {
     if client.get("http://127.0.0.1:34343/health").send().is_err() {
         // Not running, spawn it
         println!("MCP Daemon not running. Starting it...");
-        let mcp_bin = dirs::home_dir()
-            .map(|mut p| {
-                p.push(".local/bin/neurostrata-mcp");
-                p
-            })
-            .unwrap_or_else(|| PathBuf::from("neurostrata-mcp"));
 
-        if mcp_bin.exists() {
-            std::process::Command::new(&mcp_bin)
-                .arg("daemon")
-                .spawn()
-                .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
-            
-            // Wait for it to boot
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        } else {
-            return Err(format!("neurostrata-mcp binary not found at {:?}", mcp_bin));
+        let mut tried: Vec<String> = Vec::new();
+        let mut spawned = false;
+
+        for candidate in daemon_candidates() {
+            tried.push(candidate.display().to_string());
+            match std::process::Command::new(&candidate).arg("daemon").spawn() {
+                Ok(_) => {
+                    spawned = true;
+                    break;
+                }
+                // Only "not found" is worth trying the next candidate for.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("Failed to spawn {}: {}", candidate.display(), e)),
+            }
         }
+
+        if !spawned {
+            return Err(format!(
+                "Could not find the neurostrata-mcp binary. Tried: {}. Install it (cargo install --path .) or put it on PATH.",
+                tried.join(", ")
+            ));
+        }
+
+        // Wait for it to boot
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
     Ok(())
+}
+
+/// Where to look for the daemon binary, in order.
+///
+/// The bare command comes first because that is what every MCP registration
+/// this project writes uses, and it is the only form that finds the `.exe` on
+/// Windows. The hard-coded `~/.local/bin/neurostrata-mcp` that used to be the
+/// only candidate cannot exist there at all, so the GUI could never autostart
+/// the daemon on Windows (bead neurostrata-a9a) -- and `cargo install` puts it
+/// in `~/.cargo/bin` on every platform anyway.
+fn daemon_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("neurostrata-mcp")];
+
+    if let Some(home) = dirs::home_dir() {
+        for relative in [".cargo/bin/neurostrata-mcp", ".local/bin/neurostrata-mcp"] {
+            candidates.push(home.join(relative));
+        }
+    }
+
+    candidates
 }
 
 #[tauri::command]
