@@ -78,7 +78,26 @@ neurostrata-mcp delete my-rust-project 550e8400-e29b-41d4-a716-446655440000
 
 ---
 
-### 6. `add`
+### 6. `move`
+Moves a memory into another namespace, by ID. This is the command `doctor` prints when two
+spellings of one project need merging: run it once per id.
+
+It is deliberately a CLI command and not an MCP tool. It copies the row and then deletes the
+original, so it destroys something, and every destructive operation in NeuroStrata requires a
+person at the keyboard rather than an agent asking permission.
+
+```bash
+neurostrata-mcp move <source_namespace> <id> <target_namespace>
+```
+
+*Example:*
+```bash
+neurostrata-mcp move neurostrata 550e8400-e29b-41d4-a716-446655440000 NeuroStrata
+```
+
+---
+
+### 7. `add`
 Directly embeds and adds a new custom memory node to a namespace.
 ```bash
 neurostrata-mcp add <namespace> <type> <content> [location]
@@ -94,7 +113,7 @@ neurostrata-mcp add my-rust-project rule "Avoid using unwrap() in library module
 
 ---
 
-### 7. `edit`
+### 8. `edit`
 Modifies an existing memory node's namespace, content, and location context.
 ```bash
 neurostrata-mcp edit <namespace> <id> <new_namespace> <content> <location>
