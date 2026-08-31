@@ -114,6 +114,18 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_get_memory",
+                        "description": "Fetch a single memory by id. Use it to read a memory before editing it, and to follow a Related Nodes or Governs pointer to the exact record instead of guessing at it with a search.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to fetch." },
+                                "namespace": { "type": "string", "description": "The namespace the memory lives in." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_get_snapshot",
                         "description": "Get a pre-computed cognitive snapshot of the most important active architectural rules for a project. Use this immediately upon starting a new task to ground yourself in the project's core architecture before searching.",
                         "inputSchema": {
@@ -184,6 +196,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_add_memory" => {
                             result_text = handle_add_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_get_memory" => {
+                            result_text = handle_get_memory(arguments, store.clone()).await;
                         }
                         "neurostrata_get_snapshot" => {
                             result_text = handle_get_snapshot(arguments, store.clone()).await;
@@ -529,41 +544,10 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
                         });
                     }
 
-                    let formatted: Vec<String> = results.into_iter().map(|r| {
-                        let mut out = format!(
-                            "--- Memory ID: {} ---
-Type: {}
-Content: {}",
-                            r.id, r.payload.memory_type, r.payload.content
-                        );
-                        if !r.payload.location.is_empty() {
-                            out.push_str(&format!("\nFile Location: {}", r.payload.location));
-                            if !r.payload.location_lines.is_empty() {
-                                out.push_str(&format!(" (Lines: {})", r.payload.location_lines));
-                            }
-                        }
-                        if let Some(locations) = r.payload.metadata.get("locations") {
-                            if let Some(arr) = locations.as_array() {
-                                if !arr.is_empty() {
-                                    out.push_str(&format!("\nCode Graph Locations: {}", locations));
-                                }
-                            }
-                        }
-                        for (key, label) in [
-                            ("related_to", "Related Nodes"),
-                            ("contained_by", "Contained By"),
-                            ("governs", "Governs"),
-                        ] {
-                            if let Some(value) = r.payload.metadata.get(key) {
-                                if let Some(arr) = value.as_array() {
-                                    if !arr.is_empty() {
-                                        out.push_str(&format!("\n{}: {}", label, value));
-                                    }
-                                }
-                            }
-                        }
-                        out
-                    }).collect();
+                    let formatted: Vec<String> = results
+                        .into_iter()
+                        .map(|r| format_memory(&r.id, &r.payload))
+                        .collect();
                     formatted.join("\n\n")
                 }
             } else {
@@ -574,5 +558,115 @@ Content: {}",
         }
     } else {
         "Failed to initialize namespace table.".to_string()
+    }
+}
+
+/// One rendering of a memory, shared by search and get, so a record reads the
+/// same however the agent reached it.
+fn format_memory(id: &str, payload: &MemoryPayload) -> String {
+    let mut out = format!(
+        "--- Memory ID: {} ---\nType: {}\nContent: {}",
+        id, payload.memory_type, payload.content
+    );
+    if !payload.location.is_empty() {
+        out.push_str(&format!("\nFile Location: {}", payload.location));
+        if !payload.location_lines.is_empty() {
+            out.push_str(&format!(" (Lines: {})", payload.location_lines));
+        }
+    }
+    if let Some(locations) = payload.metadata.get("locations") {
+        if let Some(arr) = locations.as_array() {
+            if !arr.is_empty() {
+                out.push_str(&format!("\nCode Graph Locations: {}", locations));
+            }
+        }
+    }
+    for (key, label) in [
+        ("related_to", "Related Nodes"),
+        ("contained_by", "Contained By"),
+        ("governs", "Governs"),
+    ] {
+        if let Some(value) = payload.metadata.get(key) {
+            if let Some(arr) = value.as_array() {
+                if !arr.is_empty() {
+                    out.push_str(&format!("\n{}: {}", label, value));
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let id = match arguments.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i,
+        None => return "Missing 'id' parameter. Ids are returned by neurostrata_search_memory.".to_string(),
+    };
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string(),
+    };
+    if namespace.contains('/') || namespace.contains('\\') {
+        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    }
+
+    match store.get(namespace, id).await {
+        Ok(Some((_, payload))) => {
+            let store_clone = store.clone();
+            let ns_clone = namespace.to_string();
+            let id_clone = id.to_string();
+            tokio::spawn(async move {
+                let _ = store_clone.increment_access_count(&ns_clone, &id_clone).await;
+            });
+            format_memory(id, &payload)
+        }
+        Ok(None) => format!(
+            "No memory with id '{}' in namespace '{}'. Ids come from neurostrata_search_memory; check the namespace with neurostrata_list_namespaces.",
+            id, namespace
+        ),
+        Err(e) => format!("Failed to read memory '{}': {}", id, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(content: &str) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+                #[test]
+    fn a_formatted_memory_carries_its_anchors() {
+        let mut p = payload("checkpoint every write");
+        p.location = "src/store/ladybug.rs".to_string();
+        p.location_lines = "428-440".to_string();
+        p.metadata = serde_json::json!({ "governs": ["src/daemon.rs"] });
+
+        let out = format_memory("abc-123", &p);
+
+        assert!(out.contains("--- Memory ID: abc-123 ---"));
+        assert!(out.contains("Content: checkpoint every write"));
+        assert!(out.contains("File Location: src/store/ladybug.rs (Lines: 428-440)"));
+        assert!(out.contains("Governs: [\"src/daemon.rs\"]"));
+    }
+
+    #[test]
+    fn an_empty_anchor_list_is_not_rendered() {
+        let mut p = payload("a rule with no edges");
+        p.metadata = serde_json::json!({ "governs": [], "related_to": [] });
+
+        let out = format_memory("abc-123", &p);
+
+        assert!(!out.contains("Governs"));
+        assert!(!out.contains("Related Nodes"));
     }
 }
