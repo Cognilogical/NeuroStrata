@@ -358,19 +358,51 @@ async fn handle_edit(
     State(state): State<AppState>,
     Json(req): Json<EditReq>,
 ) -> Result<&'static str, axum::http::StatusCode> {
-    // Basic edit implementation
+    // The operator's repair path: an in-place rewrite that keeps the id and
+    // keeps no history. Agents get neurostrata_supersede_memory instead, which
+    // is additive. Editing stays here, behind a human, because it destroys.
     let old_namespace = crate::server::resolve_namespace(&state.vector_store, &req.old_namespace).await;
     let new_namespace = crate::server::resolve_namespace(&state.vector_store, &req.new_namespace).await;
     let existing = state.vector_store.get(&old_namespace, &req.id)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-        
+
     if let Some((vector, mut payload)) = existing {
+        // Re-embed whenever the text changes. Reusing the old vector left the
+        // row ranked by wording it no longer contained, so correcting a wrong
+        // rule kept the wrong rule findable and hid the correction
+        // (bead neurostrata-vbj).
+        let vector = if payload.content == req.content {
+            vector
+        } else {
+            state
+                .embedder
+                .embed(&req.content)
+                .await
+                .map_err(|e| {
+                    eprintln!("edit of {} in {} failed to embed: {}", req.id, old_namespace, e);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                })?
+        };
+
         payload.content = req.content;
         payload.location = req.location;
-        
-        state.vector_store.delete(&old_namespace, &req.id).await.ok();
-        state.vector_store.upsert(&new_namespace, &req.id, vector, payload).await.ok();
+
+        // Write before deleting, and only delete when the row actually moved.
+        // The old order -- delete, then upsert with `.ok()` swallowing the
+        // result -- destroyed the memory outright whenever the write failed.
+        state
+            .vector_store
+            .upsert(&new_namespace, &req.id, vector, payload)
+            .await
+            .map_err(|e| {
+                eprintln!("edit of {} in {} failed to write: {}", req.id, new_namespace, e);
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        if old_namespace != new_namespace {
+            state.vector_store.delete(&old_namespace, &req.id).await.ok();
+        }
     }
     Ok("OK")
 }
