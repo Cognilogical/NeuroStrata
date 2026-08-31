@@ -73,12 +73,51 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         .with_state(state);
 
     // Bound the loss window for anything that kills us without warning.
+    //
+    // This is the ONLY place a checkpoint happens while the daemon is serving.
+    // It used to run inside each write handler, which looked safer and was far
+    // worse: a checkpoint waits for every active transaction to drain, and
+    // under a steady stream of queries that window never opens, so the engine
+    // blocked for its own timeout -- around two and a half minutes -- with the
+    // caller still waiting on the response (bead neurostrata-3fi.6.4). Out here
+    // a failure costs a retry instead of a request, and the write is already in
+    // the log either way.
     let periodic_store = vector_store.clone();
     tokio::spawn(async move {
+        let mut wait = CHECKPOINT_INTERVAL;
+        let mut failures: u32 = 0;
+
         loop {
-            tokio::time::sleep(CHECKPOINT_INTERVAL).await;
-            if let Err(e) = periodic_store.checkpoint().await {
-                eprintln!("WARNING: periodic checkpoint failed, writes remain at risk: {}", e);
+            tokio::time::sleep(wait).await;
+
+            if !periodic_store.is_dirty() {
+                wait = CHECKPOINT_INTERVAL;
+                continue;
+            }
+
+            match periodic_store.checkpoint().await {
+                Ok(()) => {
+                    if failures > 0 {
+                        eprintln!(
+                            "Checkpoint succeeded after {} failed attempts; those writes are on disk now.",
+                            failures
+                        );
+                    }
+                    failures = 0;
+                    wait = CHECKPOINT_INTERVAL;
+                }
+                Err(e) => {
+                    failures += 1;
+                    // Say it once, then only occasionally: a busy database can
+                    // refuse the quiet moment for a while, and a warning per
+                    // attempt would bury the log without adding anything.
+                    if failures == 1 {
+                        eprintln!("WARNING: checkpoint failed, so recent writes stay in the log until one succeeds. Retrying: {}", e);
+                    } else if failures % 10 == 0 {
+                        eprintln!("WARNING: {} checkpoints in a row have failed -- everything written since the last success would be lost to a hard kill: {}", failures, e);
+                    }
+                    wait = checkpoint_backoff(failures);
+                }
             }
         }
     });
@@ -187,22 +226,27 @@ async fn handle_backup(
     Ok(format!("Backed up to {}", req.dir))
 }
 
-/// Same reasoning as the MCP surface: a write is durable only once checkpointed,
-/// because WAL replay does not restore rows (bead neurostrata-kug).
-async fn checkpoint_after_write(state: &AppState, what: &str) {
-    if let Err(e) = state.vector_store.checkpoint().await {
-        eprintln!("WARNING: {} was applied but the checkpoint failed, so it is not durable yet: {}", what, e);
-    }
+/// How long to wait after a checkpoint that could not get its quiet moment.
+/// Short at first, because the window can open as soon as one query finishes,
+/// and capped so a lull is never missed by much.
+fn checkpoint_backoff(failures: u32) -> std::time::Duration {
+    let secs = 1u64 << failures.min(5);
+    std::time::Duration::from_secs(secs.min(30))
 }
 
 async fn handle_delete(
     State(state): State<AppState>,
     Json(req): Json<DeleteReq>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<&'static str, (axum::http::StatusCode, String)> {
+    // Answer with what the engine said. A bare 500 cost an afternoon here: a
+    // caller could not tell a write conflict from a missing id, and neither
+    // could the log (bead neurostrata-3fi.6.5).
     state.vector_store.delete(&req.namespace, &req.id)
         .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    checkpoint_after_write(&state, "the deletion").await;
+        .map_err(|e| {
+            eprintln!("delete of {} in {} failed: {}", req.id, req.namespace, e);
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
     Ok("OK")
 }
 
@@ -221,7 +265,6 @@ async fn handle_edit(
         
         state.vector_store.delete(&req.old_namespace, &req.id).await.ok();
         state.vector_store.upsert(&req.new_namespace, &req.id, vector, payload).await.ok();
-        checkpoint_after_write(&state, "the edit").await;
     }
     Ok("OK")
 }
@@ -291,5 +334,30 @@ async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
             "Shutting down"
         }
         None => "Already shutting down",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_retry_comes_quickly() {
+        // The quiet moment a checkpoint needs can open as soon as one query
+        // finishes, so the first wait is seconds, not the full interval.
+        assert!(checkpoint_backoff(1) < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn repeated_failures_back_off_but_never_give_up_for_long() {
+        let waits: Vec<u64> = (1..=8).map(|n| checkpoint_backoff(n).as_secs()).collect();
+
+        assert!(waits.windows(2).all(|w| w[1] >= w[0]), "{:?} should not shrink", waits);
+        assert!(
+            waits.iter().all(|w| *w <= 30),
+            "a lull must never be missed by more than half a minute: {:?}",
+            waits
+        );
+        assert_eq!(*waits.last().unwrap(), 30, "and it settles at the cap");
     }
 }

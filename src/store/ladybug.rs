@@ -13,6 +13,48 @@ pub struct LadybugStore {
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
+    dirty: Dirty,
+    /// LadybugDB allows exactly one write transaction and REFUSES a second
+    /// rather than queueing it, so two writers that overlap produce "Cannot
+    /// start a new write transaction in the system" for whichever arrives
+    /// second. Every search spawns access-count writes, which makes that
+    /// collision ordinary rather than exotic (bead neurostrata-3fi.6.6).
+    ///
+    /// Taking a turn here converts a random failure into a short wait. Writes
+    /// are milliseconds now that checkpointing has left the request path, and
+    /// the caller's deadline covers the wait as well as the write. The
+    /// checkpoint deliberately does NOT take this lock: it waits for
+    /// transactions to drain, so holding writers out for its duration would
+    /// recreate the stall it was moved out of the request path to avoid.
+    write_lock: tokio::sync::Mutex<()>,
+    /// Set once the tables exist. init() is called on the way into add, move
+    /// and -- because it is cheap to write and expensive to mean -- every
+    /// search, and each call issued CREATE NODE TABLE only to be told it
+    /// already exists. That is a write transaction per read, colliding with
+    /// real writes for nothing.
+    schema_ready: std::sync::atomic::AtomicBool,
+}
+
+/// Whether a write is sitting in the log with no checkpoint behind it yet.
+///
+/// `take` clears and reports in one step so a write landing mid-checkpoint is
+/// not swallowed: the flag is cleared before the flush, and put back if the
+/// flush fails.
+#[derive(Default)]
+struct Dirty(std::sync::atomic::AtomicBool);
+
+impl Dirty {
+    fn mark(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn take(&self) -> bool {
+        self.0.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
 }
 
 /// Normal open: checksums on, and replay failures throw. The throw is the whole
@@ -162,12 +204,81 @@ impl LadybugStore {
             local_path,
             dimensions,
             db: Arc::new(db),
+            dirty: Dirty::default(),
+            write_lock: tokio::sync::Mutex::new(()),
+            schema_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Gets a short-lived connection
-    fn get_conn(&self) -> Result<Connection<'_>> {
-        Ok(Connection::new(&self.db)?)
+    /// Runs a write with a deadline, so a caller is told the database is busy
+    /// rather than left holding a connection that never answers. Engine-level
+    /// lock waits of two and a half minutes were measured while a burst of
+    /// writes was in flight (bead neurostrata-3fi.6).
+    ///
+    /// The deadline releases the CALLER, not the query: spawn_blocking cannot be
+    /// cancelled, so the statement may still land afterwards. The message says
+    /// so, because retrying blind could otherwise duplicate work.
+    async fn write_with_deadline<T, F>(&self, what: &'static str, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Fn(&Connection) -> Result<T> + Clone + Send + 'static,
+    {
+        let outcome = bounded(what, write_timeout(), async {
+            // One writer at a time, because the engine refuses the second
+            // rather than making it wait. The deadline covers this queue too:
+            // a caller stuck behind a stalled write hears that the database is
+            // busy instead of waiting indefinitely for its turn.
+            let _turn = self.write_lock.lock().await;
+
+            // The lock orders our own writers; the background checkpoint and
+            // any other process are outside it, so a refusal can still arrive.
+            // Those clear in milliseconds, so wait and try again rather than
+            // handing the caller a failure it can do nothing about.
+            let mut attempt = 0;
+            loop {
+                match self.with_conn(f.clone()).await {
+                    Err(e) if is_write_collision(&e) && attempt < WRITE_COLLISION_RETRIES => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64))
+                            .await;
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await;
+
+        // Marked whatever the outcome: a write that timed out may still land,
+        // and an unnecessary checkpoint attempt costs nothing next to a write
+        // that never reaches disk.
+        self.dirty.mark();
+        outcome
+    }
+
+    /// Runs one piece of database work on a blocking thread.
+    ///
+    /// Every lbug call is synchronous FFI. Called straight from an async handler
+    /// it occupies a tokio worker for as long as the engine takes, and a handful
+    /// of concurrent queries can therefore starve the runtime outright: during a
+    /// write burst even /health -- an async closure returning a constant -- had
+    /// no thread to run on, which is what made the daemon look dead while it was
+    /// still listening (bead neurostrata-3fi.6).
+    ///
+    /// The connection is opened inside the closure on purpose. It borrows the
+    /// Database and is not Send, so it must never be created here and moved, nor
+    /// held across an await.
+    async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::new(&db)?;
+            f(&conn)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("the database thread did not finish: {}", e))?
     }
 }
 
@@ -222,28 +333,46 @@ fn escape_kuzu_string(s: &str) -> String {
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
-        let conn = self.get_conn()?;
-
-        let create_node_table = format!(
-            "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
-            self.dimensions
-        );
-        if let Err(e) = conn.query(&create_node_table) {
-            if !e.to_string().contains("already exists") {
-                return Err(e.into());
-            }
+        if self.schema_ready.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
         }
 
-        let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory)";
-        conn.query(create_rel_table).ok();
+        let _namespace = _namespace.to_string();
+        let dimensions = self.dimensions;
+        let _turn = self.write_lock.lock().await;
+        let outcome = self.with_conn(move |conn| {
 
-        let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory)";
-        conn.query(create_contains_table).ok();
+            let create_node_table = format!(
+                "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
+                dimensions
+            );
+            if let Err(e) = conn.query(&create_node_table) {
+                if !e.to_string().contains("already exists") {
+                    return Err(e.into());
+                }
+            }
 
-        let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory)";
-        conn.query(create_governs_table).ok();
+            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory)";
+            conn.query(create_rel_table).ok();
 
-        Ok(())
+            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory)";
+            conn.query(create_contains_table).ok();
+
+            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory)";
+            conn.query(create_governs_table).ok();
+
+            Ok(())
+        })
+        .await;
+
+        if outcome.is_ok() {
+            self.schema_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        // Creating the tables is itself a write worth flushing.
+        self.dirty.mark();
+        outcome
     }
 
     async fn upsert(
@@ -253,48 +382,54 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<()> {
-        let conn = self.get_conn()?;
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        self.write_with_deadline("writing a memory", move |conn| {
 
-        let safe_id = escape_kuzu_string(id);
-        let safe_ns = escape_kuzu_string(namespace);
-        let safe_content = escape_kuzu_string(&payload.content);
-        let safe_user_id = escape_kuzu_string(&payload.user_id);
-        let safe_memory_type = escape_kuzu_string(&payload.memory_type);
-        let safe_agent_name = escape_kuzu_string(&payload.agent_name.unwrap_or_else(|| "unknown".to_string()));
-        let safe_location = escape_kuzu_string(&payload.location);
-        let safe_location_lines = escape_kuzu_string(&payload.location_lines);
-        let safe_metadata = escape_kuzu_string(&serde_json::to_string(&payload.metadata)?);
-        
-        let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
-
-        let insert_query = format!(
-            "MERGE (m:Memory {{id: '{}'}})
-             ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
-             ON MATCH SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
-            safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
-            safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
-        );
-
-        conn.query(&insert_query)?;
-        
-        // Materialise the edges this memory declares. A target that does not exist
-        // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
-        // That is deliberate -- a rule may name a file the ingester has not reached.
-        for edge in edge_specs(&payload.metadata) {
-            let target_safe = escape_kuzu_string(&edge.target_id);
-            let (from, to) = if edge.points_at_target {
-                (safe_id.as_str(), target_safe.as_str())
-            } else {
-                (target_safe.as_str(), safe_id.as_str())
-            };
-            let edge_query = format!(
-                "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
-                from, to, edge.rel_type
+            let safe_id = escape_kuzu_string(&id);
+            let safe_ns = escape_kuzu_string(&namespace);
+            let safe_content = escape_kuzu_string(&payload.content);
+            let safe_user_id = escape_kuzu_string(&payload.user_id);
+            let safe_memory_type = escape_kuzu_string(&payload.memory_type);
+            let safe_agent_name = escape_kuzu_string(
+                payload.agent_name.as_deref().unwrap_or("unknown"),
             );
-            conn.query(&edge_query).ok();
-        }
+            let safe_location = escape_kuzu_string(&payload.location);
+            let safe_location_lines = escape_kuzu_string(&payload.location_lines);
+            let safe_metadata = escape_kuzu_string(&serde_json::to_string(&payload.metadata)?);
+        
+            let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
-        Ok(())
+            let insert_query = format!(
+                "MERGE (m:Memory {{id: '{}'}})
+                 ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
+                 ON MATCH SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+                safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
+                safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+            );
+
+            conn.query(&insert_query)?;
+        
+            // Materialise the edges this memory declares. A target that does not exist
+            // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
+            // That is deliberate -- a rule may name a file the ingester has not reached.
+            for edge in edge_specs(&payload.metadata) {
+                let target_safe = escape_kuzu_string(&edge.target_id);
+                let (from, to) = if edge.points_at_target {
+                    (safe_id.as_str(), target_safe.as_str())
+                } else {
+                    (target_safe.as_str(), safe_id.as_str())
+                };
+                let edge_query = format!(
+                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
+                    from, to, edge.rel_type
+                );
+                conn.query(&edge_query).ok();
+            }
+
+            Ok(())
+        })
+        .await
     }
 
     async fn search(
@@ -303,419 +438,678 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
-        let conn = self.get_conn()?;
-        let safe_ns = escape_kuzu_string(namespace);
-        let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_kuzu_string(&namespace);
+            let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
-        // Step 1: Base vector search.
-        //
-        // Structural nodes are stored with an all-zero embedding, and the distance
-        // from an all-zero row is the query vector's own magnitude -- the same value
-        // for every one of them, whatever was asked. Left in, they tie with each
-        // other and can fill the limit with path stubs. They stay reachable through
-        // the graph expansion in step 2, which is where they are actually useful.
-        let structural_types = STRUCTURAL_MEMORY_TYPES
-            .iter()
-            .map(|t| format!("'{}'", t))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let search_query = format!(
-            "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
-            safe_ns, structural_types, vec_str, limit
-        );
-
-        let result = conn.query(&search_query)?;
-        let mut results = Vec::new();
-        let mut primary_ids = Vec::new();
-
-        for row in result {
-            let id: String = format!("{}", row[0]);
-            let distance: f32 = match &row[1] {
-                lbug::Value::Float(f) => *f,
-                lbug::Value::Double(d) => *d as f32,
-                _ => 0.0,
-            };
-            
-            let content: String = format!("{}", row[2]);
-            let user_id: String = format!("{}", row[3]);
-            let memory_type: String = format!("{}", row[4]);
-            let agent_name: String = format!("{}", row[5]);
-            let location: String = format!("{}", row[6]);
-            let location_lines: String = format!("{}", row[7]);
-            let metadata_str: String = format!("{}", row[8]);
-
-            let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
-
-            // Temporal filtering
-            if let Some(valid_to) = metadata_val.get("valid_to") {
-                if !valid_to.is_null() {
-                    let now = chrono::Utc::now().timestamp();
-                    if valid_to.as_i64().unwrap_or(0) <= now {
-                        continue;
-                    }
-                }
-            }
-
-            let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let gain = if access_count > 0 { (access_count as f32).ln() * 0.05 } else { 0.0 };
-            let boosted_distance = distance - gain;
-
-            primary_ids.push(id.clone());
-
-            results.push(SearchResult {
-                id,
-                score: boosted_distance,
-                payload: MemoryPayload {
-                    content,
-                    user_id,
-                    memory_type,
-                    agent_name: Some(agent_name),
-                    location,
-                    location_lines,
-                    metadata: metadata_val,
-                },
-            });
-        }
-
-        // Step 2: Hybrid GraphRAG Neighborhood Fetch
-        // We fetch 1-hop neighbors (CONTAINS, GOVERNS, RELATES_TO) to provide blast radius context
-        if !primary_ids.is_empty() {
-            let id_list = primary_ids.iter()
-                .map(|id| format!("'{}'", escape_kuzu_string(id)))
+            // Step 1: Base vector search.
+            //
+            // Structural nodes are stored with an all-zero embedding, and the distance
+            // from an all-zero row is the query vector's own magnitude -- the same value
+            // for every one of them, whatever was asked. Left in, they tie with each
+            // other and can fill the limit with path stubs. They stay reachable through
+            // the graph expansion in step 2, which is where they are actually useful.
+            let structural_types = STRUCTURAL_MEMORY_TYPES
+                .iter()
+                .map(|t| format!("'{}'", t))
                 .collect::<Vec<_>>()
                 .join(", ");
-
-            // Anything one hop from a primary match.
-            let neighbor_query = format!(
-                "MATCH (a:Memory)-[]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata LIMIT {}",
-                id_list, safe_ns, id_list, limit
+            let search_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
+                safe_ns, structural_types, vec_str, limit
             );
 
-            // And one step further, but only along GOVERNS. A match is usually a
-            // symbol, whose file is one hop away, which puts the rule governing
-            // that file two hops out -- exactly the thing worth surfacing, and
-            // unreachable from the query above.
-            let governing_query = format!(
-                "MATCH (a:Memory)-[]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata LIMIT {}",
-                id_list, safe_ns, id_list, limit
-            );
+            let result = conn.query(&search_query)?;
+            let mut results = Vec::new();
+            let mut primary_ids = Vec::new();
 
-            for expansion in [neighbor_query, governing_query] {
-                if let Ok(mut rows) = conn.query(&expansion) {
-                    while let Some(row) = rows.next() {
-                        let id: String = format!("{}", row[0]);
-                        let content: String = format!("{}", row[1]);
-                        let user_id: String = format!("{}", row[2]);
-                        let memory_type: String = format!("{}", row[3]);
-                        let agent_name: String = format!("{}", row[4]);
-                        let location: String = format!("{}", row[5]);
-                        let location_lines: String = format!("{}", row[6]);
-                        let metadata_str: String = format!("{}", row[7]);
+            for row in result {
+                let id: String = format!("{}", row[0]);
+                let distance: f32 = match &row[1] {
+                    lbug::Value::Float(f) => *f,
+                    lbug::Value::Double(d) => *d as f32,
+                    _ => 0.0,
+                };
+            
+                let content: String = format!("{}", row[2]);
+                let user_id: String = format!("{}", row[3]);
+                let memory_type: String = format!("{}", row[4]);
+                let agent_name: String = format!("{}", row[5]);
+                let location: String = format!("{}", row[6]);
+                let location_lines: String = format!("{}", row[7]);
+                let metadata_str: String = format!("{}", row[8]);
 
-                        let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
-                        // Neighbors get a synthesized lower score (worse distance) so they appear after primary matches,
-                        // but still within the context window.
-                        results.push(SearchResult {
-                            id,
-                            score: 10.0, // High distance (low relevance score) ensures they rank below direct matches
-                            payload: MemoryPayload {
-                                content,
-                                user_id,
-                                memory_type,
-                                agent_name: Some(agent_name),
-                                location,
-                                location_lines,
-                                metadata: metadata_val,
-                            },
-                        });
+                // Temporal filtering
+                if let Some(valid_to) = metadata_val.get("valid_to") {
+                    if !valid_to.is_null() {
+                        let now = chrono::Utc::now().timestamp();
+                        if valid_to.as_i64().unwrap_or(0) <= now {
+                            continue;
+                        }
                     }
                 }
+
+                let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let gain = if access_count > 0 { (access_count as f32).ln() * 0.05 } else { 0.0 };
+                let boosted_distance = distance - gain;
+
+                primary_ids.push(id.clone());
+
+                results.push(SearchResult {
+                    id,
+                    score: boosted_distance,
+                    payload: MemoryPayload {
+                        content,
+                        user_id,
+                        memory_type,
+                        agent_name: Some(agent_name),
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                });
             }
 
-            // Both expansions can return the same memory; keep the first of each.
-            let mut seen = std::collections::HashSet::new();
-            results.retain(|r| seen.insert(r.id.clone()));
-        }
+            // Step 2: Hybrid GraphRAG Neighborhood Fetch
+            // We fetch 1-hop neighbors (CONTAINS, GOVERNS, RELATES_TO) to provide blast radius context
+            if !primary_ids.is_empty() {
+                let id_list = primary_ids.iter()
+                    .map(|id| format!("'{}'", escape_kuzu_string(&id)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
-        results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
-        // We can truncate to a slightly larger limit to include some neighbors, or keep it strict
-        results.truncate(limit * 2);
+                // Anything one hop from a primary match.
+                let neighbor_query = format!(
+                    "MATCH (a:Memory)-[]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata LIMIT {}",
+                    id_list, safe_ns, id_list, limit
+                );
 
-        Ok(results)
+                // And one step further, but only along GOVERNS. A match is usually a
+                // symbol, whose file is one hop away, which puts the rule governing
+                // that file two hops out -- exactly the thing worth surfacing, and
+                // unreachable from the query above.
+                let governing_query = format!(
+                    "MATCH (a:Memory)-[]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata LIMIT {}",
+                    id_list, safe_ns, id_list, limit
+                );
+
+                for expansion in [neighbor_query, governing_query] {
+                    if let Ok(mut rows) = conn.query(&expansion) {
+                        while let Some(row) = rows.next() {
+                            let id: String = format!("{}", row[0]);
+                            let content: String = format!("{}", row[1]);
+                            let user_id: String = format!("{}", row[2]);
+                            let memory_type: String = format!("{}", row[3]);
+                            let agent_name: String = format!("{}", row[4]);
+                            let location: String = format!("{}", row[5]);
+                            let location_lines: String = format!("{}", row[6]);
+                            let metadata_str: String = format!("{}", row[7]);
+
+                            let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+
+                            // Neighbors get a synthesized lower score (worse distance) so they appear after primary matches,
+                            // but still within the context window.
+                            results.push(SearchResult {
+                                id,
+                                score: 10.0, // High distance (low relevance score) ensures they rank below direct matches
+                                payload: MemoryPayload {
+                                    content,
+                                    user_id,
+                                    memory_type,
+                                    agent_name: Some(agent_name),
+                                    location,
+                                    location_lines,
+                                    metadata: metadata_val,
+                                },
+                            });
+                        }
+                    }
+                }
+
+                // Both expansions can return the same memory; keep the first of each.
+                let mut seen = std::collections::HashSet::new();
+                results.retain(|r| seen.insert(r.id.clone()));
+            }
+
+            results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+            // We can truncate to a slightly larger limit to include some neighbors, or keep it strict
+            results.truncate(limit * 2);
+
+            Ok(results)
+        })
+        .await
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
-        let conn = self.get_conn()?;
-        let safe_ns = escape_kuzu_string(namespace);
-        let safe_id = escape_kuzu_string(id);
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        self.write_with_deadline("deleting a memory", move |conn| {
+            let safe_ns = escape_kuzu_string(&namespace);
+            let safe_id = escape_kuzu_string(&id);
         
-        let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
-        conn.query(&query)?;
-        Ok(())
+            let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
+            conn.query(&query)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn export_database(&self, dir: &str) -> Result<()> {
-        let conn = self.get_conn()?;
-        // Checkpoint first so the export cannot miss writes still in the WAL --
-        // which, since replay does not restore rows, would otherwise be lost.
-        conn.query("CHECKPOINT")?;
-        let safe_dir = escape_kuzu_string(dir);
-        conn.query(&format!("EXPORT DATABASE '{}' (format='parquet')", safe_dir))?;
-        Ok(())
+        let dir = dir.to_string();
+        self.with_conn(move |conn| {
+            // Checkpoint first so the export cannot miss writes still in the WAL --
+            // which, since replay does not restore rows, would otherwise be lost.
+            conn.query("CHECKPOINT")?;
+            let safe_dir = escape_kuzu_string(&dir);
+            conn.query(&format!("EXPORT DATABASE '{}' (format='parquet')", safe_dir))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn import_database(&self, dir: &str) -> Result<()> {
-        let conn = self.get_conn()?;
-        let safe_dir = escape_kuzu_string(dir);
-        conn.query(&format!("IMPORT DATABASE '{}'", safe_dir))?;
-        conn.query("CHECKPOINT")?;
-        Ok(())
+        let dir = dir.to_string();
+        self.with_conn(move |conn| {
+            let safe_dir = escape_kuzu_string(&dir);
+            conn.query(&format!("IMPORT DATABASE '{}'", safe_dir))?;
+            conn.query("CHECKPOINT")?;
+            Ok(())
+        })
+        .await
     }
 
     async fn checkpoint(&self) -> Result<()> {
-        let conn = self.get_conn()?;
-        conn.query("CHECKPOINT")?;
-        Ok(())
+        // Cleared first: a write that lands while the engine is flushing must
+        // survive, and clearing afterwards would drop its mark.
+        let had_writes = self.dirty.take();
+
+        let outcome = self
+            .with_conn(move |conn| {
+                conn.query("CHECKPOINT")?;
+                Ok(())
+            })
+            .await;
+
+        if outcome.is_err() && had_writes {
+            self.dirty.mark();
+        }
+        outcome
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.is_set()
     }
 
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
-        let conn = self.get_conn()?;
-        let safe_ns = escape_kuzu_string(namespace);
+        let namespace = namespace.to_string();
+        self.write_with_deadline("clearing the ingested rows", move |conn| {
+            let safe_ns = escape_kuzu_string(&namespace);
 
-        // Every row the ingester owns: the AST symbols and the directory/file
-        // nodes too, since ingestion rebuilds the whole structure for a namespace
-        let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
-        conn.query(&query)?;
-        Ok(())
+            // Every row the ingester owns: the AST symbols and the directory/file
+            // nodes too, since ingestion rebuilds the whole structure for a namespace
+            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
+            conn.query(&query)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>> {
-        let conn = self.get_conn()?;
-        let safe_ns = escape_kuzu_string(namespace);
+        let namespace = namespace.to_string();
+        let user_id = user_id.map(|v| v.to_string());
+        self.with_conn(move |conn| {
+            let safe_ns = escape_kuzu_string(&namespace);
         
-        let query = if let Some(uid) = user_id {
-            format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, escape_kuzu_string(uid))
-        } else {
-            format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns)
-        };
+            let query = if let Some(uid) = user_id {
+                format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, escape_kuzu_string(&uid))
+            } else {
+                format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns)
+            };
 
-        let result = conn.query(&query)?;
-        let mut results = Vec::new();
+            let result = conn.query(&query)?;
+            let mut results = Vec::new();
 
-        for row in result {
-            let id: String = format!("{}", row[0]);
-            let content: String = format!("{}", row[1]);
-            let uid: String = format!("{}", row[2]);
-            let memory_type: String = format!("{}", row[3]);
-            let agent_name: String = format!("{}", row[4]);
-            let location: String = format!("{}", row[5]);
-            let location_lines: String = format!("{}", row[6]);
-            let metadata_str: String = format!("{}", row[7]);
+            for row in result {
+                let id: String = format!("{}", row[0]);
+                let content: String = format!("{}", row[1]);
+                let uid: String = format!("{}", row[2]);
+                let memory_type: String = format!("{}", row[3]);
+                let agent_name: String = format!("{}", row[4]);
+                let location: String = format!("{}", row[5]);
+                let location_lines: String = format!("{}", row[6]);
+                let metadata_str: String = format!("{}", row[7]);
 
-            let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
-            results.push(SearchResult {
-                id,
-                score: 0.0,
-                payload: MemoryPayload {
-                    content,
-                    user_id: uid,
-                    memory_type,
-                    agent_name: Some(agent_name),
-                    location,
-                    location_lines,
-                    metadata: metadata_val,
-                },
-            });
-        }
+                results.push(SearchResult {
+                    id,
+                    score: 0.0,
+                    payload: MemoryPayload {
+                        content,
+                        user_id: uid,
+                        memory_type,
+                        agent_name: Some(agent_name),
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                });
+            }
 
-        Ok(results)
+            Ok(results)
+        })
+        .await
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
-        let conn = self.get_conn()?;
-        let safe_ns = escape_kuzu_string(namespace);
-        let safe_id = escape_kuzu_string(id);
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_kuzu_string(&namespace);
+            let safe_id = escape_kuzu_string(&id);
 
-        let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
+            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
         
-        let mut result = conn.query(&query)?;
+            let mut result = conn.query(&query)?;
         
-        if let Some(row) = result.next() {
-            let mut vec: Vec<f32> = Vec::new();
-            if let lbug::Value::List(_, list_vals) = &row[0] {
-                for v in list_vals {
-                    if let lbug::Value::Float(f) = v {
-                        vec.push(*f);
-                    } else if let lbug::Value::Double(d) = v {
-                        vec.push(*d as f32);
+            if let Some(row) = result.next() {
+                let mut vec: Vec<f32> = Vec::new();
+                if let lbug::Value::List(_, list_vals) = &row[0] {
+                    for v in list_vals {
+                        if let lbug::Value::Float(f) = v {
+                            vec.push(*f);
+                        } else if let lbug::Value::Double(d) = v {
+                            vec.push(*d as f32);
+                        }
                     }
                 }
-            }
             
-            let mut content: String = format!("{}", row[1]);
-            let uid: String = format!("{}", row[2]);
-            let memory_type: String = format!("{}", row[3]);
-            let agent_name: String = format!("{}", row[4]);
-            let location: String = format!("{}", row[5]);
-            let location_lines: String = format!("{}", row[6]);
-            let metadata_str: String = format!("{}", row[7]);
+                let mut content: String = format!("{}", row[1]);
+                let uid: String = format!("{}", row[2]);
+                let memory_type: String = format!("{}", row[3]);
+                let agent_name: String = format!("{}", row[4]);
+                let location: String = format!("{}", row[5]);
+                let location_lines: String = format!("{}", row[6]);
+                let metadata_str: String = format!("{}", row[7]);
 
-            let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
 
 
-            return Ok(Some((
-                vec,
-                MemoryPayload {
-                    content,
-                    user_id: uid,
-                    memory_type,
-                    agent_name: Some(agent_name),
-                    location,
-                    location_lines,
-                    metadata: metadata_val,
-                },
-            )));
-        }
+                return Ok(Some((
+                    vec,
+                    MemoryPayload {
+                        content,
+                        user_id: uid,
+                        memory_type,
+                        agent_name: Some(agent_name),
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                )));
+            }
 
-        Ok(None)
+            Ok(None)
+        })
+        .await
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
-        let conn = Connection::new(&self.db)?;
-        let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
-        let mut result = conn.query(query)?;
+        self.with_conn(move |conn| {
+            let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
+            let mut result = conn.query(query)?;
         
-        let mut namespaces = Vec::new();
-        while let Some(row) = result.next() {
-            if let lbug::Value::String(ns) = row[0].clone() {
-                namespaces.push(ns);
+            let mut namespaces = Vec::new();
+            while let Some(row) = result.next() {
+                if let lbug::Value::String(ns) = row[0].clone() {
+                    namespaces.push(ns);
+                }
             }
-        }
         
-        Ok(namespaces)
+            Ok(namespaces)
+        })
+        .await
     }
 
     async fn export_graph(&self) -> Result<serde_json::Value> {
-        let conn = Connection::new(&self.db)?;
+        self.with_conn(move |conn| {
         
-        // 1. Fetch all nodes
-        let mut nodes = Vec::new();
-        let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
-        let mut result_nodes = conn.query(query_nodes)?;
+            // 1. Fetch all nodes
+            let mut nodes = Vec::new();
+            let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
+            let mut result_nodes = conn.query(query_nodes)?;
         
-        while let Some(row) = result_nodes.next() {
-            let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
-            let memory_type = if let lbug::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
-            let content = if let lbug::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
-            let location = if let lbug::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
+            while let Some(row) = result_nodes.next() {
+                let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
+                let memory_type = if let lbug::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
+                let content = if let lbug::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
+                let location = if let lbug::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
             
-            let mut absolute_path = "".to_string();
-            let mut domain = None;
+                let mut absolute_path = "".to_string();
+                let mut domain = None;
 
-            if let lbug::Value::String(metadata_str) = &row[5] {
-                if let Ok(metadata_val) = serde_json::from_str::<serde_json::Value>(metadata_str) {
-                    if let Some(abs_path) = metadata_val.get("absolute_path").and_then(|v| v.as_str()) {
-                        absolute_path = abs_path.to_string();
-                    }
-                    if let Some(d) = metadata_val.get("domain").and_then(|v| v.as_str()) {
-                        domain = Some(d.to_string());
+                if let lbug::Value::String(metadata_str) = &row[5] {
+                    if let Ok(metadata_val) = serde_json::from_str::<serde_json::Value>(metadata_str) {
+                        if let Some(abs_path) = metadata_val.get("absolute_path").and_then(|v| v.as_str()) {
+                            absolute_path = abs_path.to_string();
+                        }
+                        if let Some(d) = metadata_val.get("domain").and_then(|v| v.as_str()) {
+                            domain = Some(d.to_string());
+                        }
                     }
                 }
-            }
 
-            // If absolute_path wasn't in metadata, try to compute it from location
-            if absolute_path.is_empty() && !location.is_empty() {
-                let p = std::path::Path::new(&location);
-                if p.is_absolute() {
-                    absolute_path = location.clone();
-                } else if let Ok(cwd) = std::env::current_dir() {
-                    absolute_path = cwd.join(p).canonicalize().unwrap_or_default().to_string_lossy().to_string();
+                // If absolute_path wasn't in metadata, try to compute it from location
+                if absolute_path.is_empty() && !location.is_empty() {
+                    let p = std::path::Path::new(&location);
+                    if p.is_absolute() {
+                        absolute_path = location.clone();
+                    } else if let Ok(cwd) = std::env::current_dir() {
+                        absolute_path = cwd.join(p).canonicalize().unwrap_or_default().to_string_lossy().to_string();
+                    }
                 }
-            }
             
-            nodes.push(serde_json::json!({
-                "id": id,
-                "namespace": namespace,
-                "memory_type": memory_type,
-                "content": content,
-                "location": location,
-                "absolute_path": absolute_path,
-                "domain": domain,
-            }));
-        }
+                nodes.push(serde_json::json!({
+                    "id": id,
+                    "namespace": namespace,
+                    "memory_type": memory_type,
+                    "content": content,
+                    "location": location,
+                    "absolute_path": absolute_path,
+                    "domain": domain,
+                }));
+            }
         
-        // 2. Fetch all edges
-        let mut links = Vec::new();
+            // 2. Fetch all edges
+            let mut links = Vec::new();
         
-        // RELATES_TO
-        let query_relates = "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) RETURN a.id, b.id;";
-        let mut res_relates = conn.query(query_relates)?;
-        while let Some(row) = res_relates.next() {
-            let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
-            links.push(serde_json::json!({
-                "source": source,
-                "target": target,
-                "type": "RELATES_TO"
-            }));
-        }
+            // RELATES_TO
+            let query_relates = "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) RETURN a.id, b.id;";
+            let mut res_relates = conn.query(query_relates)?;
+            while let Some(row) = res_relates.next() {
+                let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                links.push(serde_json::json!({
+                    "source": source,
+                    "target": target,
+                    "type": "RELATES_TO"
+                }));
+            }
         
-        // CONTAINS
-        let query_contains = "MATCH (a:Memory)-[r:CONTAINS]->(b:Memory) RETURN a.id, b.id;";
-        let mut res_contains = conn.query(query_contains)?;
-        while let Some(row) = res_contains.next() {
-            let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
-            links.push(serde_json::json!({
-                "source": source,
-                "target": target,
-                "type": "CONTAINS"
-            }));
-        }
+            // CONTAINS
+            let query_contains = "MATCH (a:Memory)-[r:CONTAINS]->(b:Memory) RETURN a.id, b.id;";
+            let mut res_contains = conn.query(query_contains)?;
+            while let Some(row) = res_contains.next() {
+                let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                links.push(serde_json::json!({
+                    "source": source,
+                    "target": target,
+                    "type": "CONTAINS"
+                }));
+            }
         
-        // GOVERNS
-        let query_governs = "MATCH (a:Memory)-[r:GOVERNS]->(b:Memory) RETURN a.id, b.id;";
-        let mut res_governs = conn.query(query_governs)?;
-        while let Some(row) = res_governs.next() {
-            let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
-            let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
-            links.push(serde_json::json!({
-                "source": source,
-                "target": target,
-                "type": "GOVERNS"
-            }));
-        }
+            // GOVERNS
+            let query_governs = "MATCH (a:Memory)-[r:GOVERNS]->(b:Memory) RETURN a.id, b.id;";
+            let mut res_governs = conn.query(query_governs)?;
+            while let Some(row) = res_governs.next() {
+                let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                links.push(serde_json::json!({
+                    "source": source,
+                    "target": target,
+                    "type": "GOVERNS"
+                }));
+            }
 
-        Ok(serde_json::json!({
-            "nodes": nodes,
-            "links": links
-        }))
+            Ok(serde_json::json!({
+                "nodes": nodes,
+                "links": links
+            }))
+        })
+        .await
     }
 
+    /// Retrieval bumps a counter, so it has to cost about what a counter costs.
+    /// Routing it through get() and upsert() rewrote the entire row -- its
+    /// 768-float embedding included -- and re-ran every edge MERGE, five times
+    /// per search, fire and forget. Later writes queued behind that burst: a
+    /// delete issued with no pause after a search took 154s where an idle one
+    /// takes none (bead neurostrata-3fi.6). Touch one column instead.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {
-        if let Some((vector, mut payload)) = self.get(namespace, id).await? {
-            let count = payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            if let Some(obj) = payload.metadata.as_object_mut() {
-                obj.insert("access_count".to_string(), serde_json::json!(count + 1));
-            } else {
-                let mut obj = serde_json::Map::new();
-                obj.insert("access_count".to_string(), serde_json::json!(count + 1));
-                payload.metadata = Value::Object(obj);
-            }
-            self.upsert(namespace, id, vector, payload).await?;
-        }
-        Ok(())
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        self.write_with_deadline("counting a read", move |conn| {
+            let safe_ns = escape_kuzu_string(&namespace);
+            let safe_id = escape_kuzu_string(&id);
+
+            let read = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.metadata",
+                safe_ns, safe_id
+            );
+            let mut result = conn.query(&read)?;
+            let current = match result.next() {
+                Some(row) => format!("{}", row[0]),
+                None => return Ok(()),
+            };
+
+            let write = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                safe_ns,
+                safe_id,
+                escape_kuzu_string(&bump_access_count(&current))
+            );
+            conn.query(&write)?;
+            Ok(())
+        })
+        .await
     }
+}
+
+/// How long a write may wait before the caller is told the database is busy.
+/// Override with NEUROSTRATA_WRITE_TIMEOUT_SECS where an unusually large
+/// database makes the default too tight.
+fn write_timeout() -> std::time::Duration {
+    let secs = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(30);
+    std::time::Duration::from_secs(secs)
+}
+
+/// How many times a write retries after being refused the write transaction.
+/// Waits are 25ms, 50ms and so on, and the caller's deadline caps the total
+/// regardless, so this only decides how patient a single attempt is.
+const WRITE_COLLISION_RETRIES: u32 = 6;
+
+/// The engine's refusal when something else already holds the write
+/// transaction. Worth recognising by name: the fix is to wait a moment, not to
+/// report a failure, and the in-process lock cannot prevent every case -- the
+/// background checkpoint and any other process opening the same database are
+/// both outside it.
+fn is_write_collision(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("Cannot start a new write transaction")
+}
+
+/// Fails a future that outstays its deadline, with a message that says what was
+/// waiting and admits the work may still be running.
+async fn bounded<T>(
+    what: &str,
+    limit: std::time::Duration,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "the database is busy: {} did not finish within {}s. The statement may still be running, so read the record back before retrying.",
+            what,
+            limit.as_secs()
+        )),
+    }
+}
+
+/// Adds one to `access_count` and leaves the rest of the blob alone. Metadata
+/// that is missing, empty or unparseable starts a fresh object at 1 instead of
+/// failing: reading a memory must never be the thing that errors.
+fn bump_access_count(metadata: &str) -> String {
+    let mut value: Value = serde_json::from_str(metadata).unwrap_or_else(|_| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    if let Some(obj) = value.as_object_mut() {
+        let count = obj.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        obj.insert("access_count".to_string(), serde_json::json!(count + 1));
+    }
+    value.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_engines_refusal_is_recognised_as_a_collision() {
+        let refusal = anyhow::anyhow!(
+            "Query execution failed: Cannot start a new write transaction in the system. Only one write transaction at a time is allowed in the system."
+        );
+        assert!(is_write_collision(&refusal));
+    }
+
+    #[test]
+    fn an_ordinary_failure_is_not_retried_as_a_collision() {
+        let other = anyhow::anyhow!("Binder exception: Table Memory does not exist");
+        assert!(!is_write_collision(&other));
+    }
+
+    #[test]
+    fn a_fresh_store_has_nothing_to_flush() {
+        let dirty = Dirty::default();
+        assert!(!dirty.is_set());
+        assert!(!dirty.take());
+    }
+
+    #[test]
+    fn taking_the_flag_clears_it_so_one_checkpoint_answers_for_many_writes() {
+        let dirty = Dirty::default();
+        dirty.mark();
+        dirty.mark();
+
+        assert!(dirty.take(), "the flag was set, so taking it reports true");
+        assert!(!dirty.is_set(), "and leaves nothing behind");
+        assert!(!dirty.take(), "a second take has nothing to report");
+    }
+
+    #[test]
+    fn a_write_during_a_checkpoint_is_not_swallowed() {
+        let dirty = Dirty::default();
+        dirty.mark();
+
+        // The checkpoint takes the flag first, then a write lands while the
+        // engine is still flushing. That write must survive the clear.
+        let _flushing = dirty.take();
+        dirty.mark();
+
+        assert!(dirty.is_set());
+    }
+
+    #[tokio::test]
+    async fn a_write_that_outstays_its_deadline_says_the_database_is_busy() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let err = bounded("deleting a memory", std::time::Duration::from_millis(50), slow)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("the database is busy"), "{}", err);
+        assert!(err.contains("deleting a memory"), "{}", err);
+        // The caller is released, not the query -- saying so is the point.
+        assert!(err.contains("may still be running"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn waiting_a_turn_to_write_counts_against_the_deadline() {
+        // The shape write_with_deadline uses: the queue for the single writer
+        // sits inside the bound, so a caller stuck behind a stalled write is
+        // told the database is busy rather than waiting for its turn forever.
+        let lock = tokio::sync::Mutex::new(());
+        let held = lock.lock().await;
+
+        let err = bounded("writing a memory", std::time::Duration::from_millis(50), async {
+            let _turn = lock.lock().await;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("the database is busy"), "{}", err);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_write_inside_its_deadline_is_left_alone() {
+        let quick = async { Ok::<u8, anyhow::Error>(7) };
+        let out = bounded("writing a memory", std::time::Duration::from_secs(5), quick)
+            .await
+            .unwrap();
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn the_write_deadline_can_be_overridden() {
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "90");
+        assert_eq!(write_timeout(), std::time::Duration::from_secs(90));
+
+        // A nonsense or zero value falls back rather than disabling the bound.
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "0");
+        assert_eq!(write_timeout(), std::time::Duration::from_secs(30));
+        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn a_first_read_starts_the_count_at_one() {
+        assert_eq!(bump_access_count("{}"), json!({"access_count": 1}).to_string());
+    }
+
+    #[test]
+    fn counting_a_read_leaves_the_rest_of_the_blob_alone() {
+        let before = json!({
+            "domain": "database",
+            "governs": ["src/daemon.rs"],
+            "access_count": 4
+        })
+        .to_string();
+
+        let after: Value = serde_json::from_str(&bump_access_count(&before)).unwrap();
+
+        assert_eq!(after["access_count"], json!(5));
+        assert_eq!(after["domain"], json!("database"));
+        assert_eq!(after["governs"], json!(["src/daemon.rs"]));
+    }
+
+    #[test]
+    fn unusable_metadata_does_not_fail_a_read() {
+        for junk in ["", "not json at all", "[1,2,3]", "null"] {
+            assert_eq!(
+                bump_access_count(junk),
+                json!({"access_count": 1}).to_string(),
+                "junk metadata {:?} should still count the read",
+                junk
+            );
+        }
+    }
 
     #[test]
     fn each_metadata_key_maps_to_its_edge_table() {

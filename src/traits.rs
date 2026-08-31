@@ -96,4 +96,14 @@ pub trait VectorStore: Send + Sync {
     /// process must call this; writes that only reached the WAL are discarded
     /// if the process dies before the engine checkpoints on its own.
     async fn checkpoint(&self) -> Result<()>;
+
+    /// True when a write has landed that no checkpoint has flushed yet.
+    ///
+    /// A checkpoint waits for every active transaction to drain, so it cannot
+    /// get that window while queries keep arriving. Knowing there is nothing to
+    /// flush lets the daemon skip the attempt entirely rather than block on one
+    /// that would only time out. Conservative by default: assume there is.
+    fn is_dirty(&self) -> bool {
+        true
+    }
 }

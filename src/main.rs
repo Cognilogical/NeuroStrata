@@ -118,17 +118,76 @@ enum Commands {
     },
 }
 
+/// What a health probe actually found.
+///
+/// Silence is the case worth naming. A daemon busy inside the engine answers
+/// nothing for minutes at a time, and reporting that as "no daemon is running"
+/// sends people hunting a process that is very much alive -- or worse, killing
+/// it and losing every write since the last checkpoint. Silence cannot be
+/// resolved from here either: on this machine a connection to the port with
+/// nothing behind it hangs instead of being refused, so a timeout genuinely
+/// means "one of two things". Say that, rather than pick one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DaemonProbe {
+    Responsive,
+    Silent,
+    Absent,
+}
+
+/// Kept separate from the request so the distinction can be tested without a
+/// socket. Only an explicit refusal proves absence.
+fn classify_probe(reached: bool, refused: bool) -> DaemonProbe {
+    if reached {
+        DaemonProbe::Responsive
+    } else if refused {
+        DaemonProbe::Absent
+    } else {
+        DaemonProbe::Silent
+    }
+}
+
+async fn probe_daemon() -> DaemonProbe {
+    match reqwest::Client::new()
+        .get("http://127.0.0.1:34343/health")
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .await
+    {
+        Ok(_) => classify_probe(true, false),
+        Err(e) => classify_probe(false, e.is_connect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_refusal_proves_no_daemon() {
+        assert_eq!(classify_probe(false, true), DaemonProbe::Absent);
+    }
+
+    #[test]
+    fn silence_is_not_reported_as_an_absent_daemon() {
+        assert_eq!(classify_probe(false, false), DaemonProbe::Silent);
+    }
+
+    #[test]
+    fn an_answered_probe_is_a_live_daemon() {
+        assert_eq!(classify_probe(true, false), DaemonProbe::Responsive);
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Check if the daemon is already running on port 34343
-    let daemon_running = reqwest::Client::new()
-        .get("http://127.0.0.1:34343/health")
-        .timeout(std::time::Duration::from_millis(500))
-        .send()
-        .await
-        .is_ok();
+    let probe = probe_daemon().await;
+    // Only a daemon that answered gets to hold the database lock as far as the
+    // CLI is concerned. Treating silence as "running" would refuse every local
+    // command on a machine where an empty port times out rather than refuses.
+    let daemon_running = probe == DaemonProbe::Responsive;
 
     // If no arguments, start standard MCP stdio mode
     if args.len() == 1 {
@@ -204,20 +263,39 @@ async fn main() -> anyhow::Result<()> {
                 daemon::start_daemon(embedder, vector_store).await?;
             }
             Commands::Shutdown => {
-                if !daemon_running {
-                    println!("No daemon is running on 127.0.0.1:34343.");
-                    return Ok(());
+                match probe {
+                    DaemonProbe::Absent => {
+                        println!("No daemon is running on 127.0.0.1:34343.");
+                        return Ok(());
+                    }
+                    DaemonProbe::Silent => {
+                        eprintln!("Nothing answered on 127.0.0.1:34343 within 500ms. Either no daemon is running, or one is busy in the database and cannot answer yet -- those look identical from here. Sending a stop request and waiting; if a daemon is there, this can take a couple of minutes. Do not kill it.");
+                    }
+                    DaemonProbe::Responsive => {}
                 }
+
                 let client = reqwest::Client::new();
-                client
+                // A busy daemon may not answer this either. That is not a
+                // failure: the request is queued, so fall through to the wait.
+                if let Err(e) = client
                     .post("http://127.0.0.1:34343/shutdown")
                     .timeout(std::time::Duration::from_secs(10))
                     .send()
-                    .await?;
+                    .await
+                {
+                    if e.is_connect() {
+                        println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
+                        return Ok(());
+                    }
+                    eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
+                }
 
                 // Wait for it to actually go: the checkpoint happens after the
                 // HTTP response, and a CLI command run too early hits the lock.
-                for _ in 0..300 {
+                // A daemon that was already wedged gets longer, because engine
+                // waits of two and a half minutes have been measured.
+                let attempts = if probe == DaemonProbe::Responsive { 300 } else { 2400 };
+                for _ in 0..attempts {
                     let still_up = client
                         .get("http://127.0.0.1:34343/health")
                         .timeout(std::time::Duration::from_millis(500))
@@ -230,7 +308,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
-                eprintln!("Daemon did not stop within 30 seconds.");
+                eprintln!(
+                    "The daemon was still listening after {} seconds. It is probably still finishing a database operation -- leave it, and do not kill it: writes since the last checkpoint would be lost.",
+                    attempts / 10
+                );
                 std::process::exit(1);
             }
             Commands::Backup { dir } => {
