@@ -345,53 +345,89 @@ impl LadybugStore {
     }
 }
 
-/// Finds the node a declaration means, when it does not name one exactly.
+/// The ids a namespace actually holds, indexed so a declaration can be resolved
+/// without scanning them.
 ///
 /// Node ids became repository-relative, so a memory written when ingestion
-/// produced absolute ids declares `C:/proj/src/foo.rs` and now matches nothing.
+/// produced absolute ids declares `C:/proj/src/foo.rs` and matches nothing now.
 /// Its tail still identifies the file, so a declaration ending in `/<id>`
-/// resolves to that id. A suffix matching more than one node is ambiguous and
-/// is left alone: a wrong edge is worse than a missing one.
-pub fn resolve_declared_target(declared: &str, known: &[String]) -> Option<String> {
-    if known.iter().any(|id| id == declared) {
-        return Some(declared.to_string());
+/// resolves to that id, and a suffix matching more than one node is left alone.
+///
+/// That rule is unchanged. Asking it of every known id in turn was the problem:
+/// O(declarations x nodes) comparisons with a `format!` allocation per
+/// comparison, on the path that runs at the end of every ingest. A declaration
+/// has only as many path suffixes as it has separators, so looking each of
+/// those up answers the same question in a handful of hashes however large the
+/// namespace grows.
+pub struct KnownIds<'a> {
+    ids: std::collections::HashSet<&'a str>,
+    /// Qualified ids indexed by the bare path inside them, so a rule naming
+    /// `src/lib.rs` finds `NeuroStrata::src/lib.rs` without scanning. A path
+    /// held by more than one namespace is recorded as ambiguous and resolves to
+    /// neither: a GOVERNS edge into another project's file is worse than none.
+    by_path: std::collections::HashMap<&'a str, Option<&'a str>>,
+}
+
+impl<'a> KnownIds<'a> {
+    pub fn new(ids: impl IntoIterator<Item = &'a str>) -> Self {
+        let ids: std::collections::HashSet<&'a str> =
+            ids.into_iter().filter(|id| !id.is_empty()).collect();
+
+        let mut by_path: std::collections::HashMap<&'a str, Option<&'a str>> =
+            std::collections::HashMap::new();
+        for id in &ids {
+            if let Some(cut) = id.find(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                let path = &id[cut + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
+                if path.is_empty() {
+                    continue;
+                }
+                by_path
+                    .entry(path)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(id));
+            }
+        }
+
+        Self { ids, by_path }
     }
 
-    let declared = declared.replace('\\', "/");
-    // Suffix relations in both directions, because a declaration and an id can
-    // be longer than each other either way.
-    //
-    //   declared ends with id   a legacy absolute declaration naming the file
-    //                           an id already describes: the caller wrote
-    //                           C:/dev/proj/src/lib.rs, the id is src/lib.rs
-    //   id ends with declared   an id qualified by its namespace: the caller
-    //                           wrote src/lib.rs the way a human does, the id
-    //                           is NeuroStrata::src/lib.rs
-    //   declared ends with the  both at once: a legacy absolute declaration,
-    //   id's path               C:/dev/proj/src/lib.rs, against the qualified
-    //                           NeuroStrata::src/lib.rs that re-ingesting --
-    //                           the documented migration -- gave the file
-    //
-    // All are anchored on a separator so that `lib.rs` cannot match
-    // `mylib.rs`, and an ambiguous suffix is still left alone rather than
-    // guessed at.
-    let mut matches = known.iter().filter(|id| {
-        if id.is_empty() {
-            return false;
-        }
-        let qualified_path = id
-            .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
-            .map(|(_, path)| path)
-            .filter(|path| !path.is_empty());
-        declared.ends_with(&format!("/{}", id))
-            || id.ends_with(&format!("{}{}", crate::parser::ingest::NAMESPACE_SEPARATOR, declared))
-            || id.ends_with(&format!("/{}", declared))
-            || qualified_path.map_or(false, |path| declared.ends_with(&format!("/{}", path)))
-    });
+    pub fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
 
-    match (matches.next(), matches.next()) {
-        (Some(only), None) => Some(only.clone()),
-        _ => None,
+    /// Finds the node a declaration means, when it does not name one exactly.
+    pub fn resolve(&self, declared: &str) -> Option<String> {
+        // Deliberately before normalisation: an id stored with backslashes is
+        // still matched by naming it exactly, as it always was.
+        if self.ids.contains(declared) {
+            return Some(declared.to_string());
+        }
+
+        let declared = declared.replace('\\', "/");
+
+        // An id qualified by its namespace is LONGER than the declaration that
+        // names it: a rule says `src/lib.rs`, the id is `NeuroStrata::src/lib.rs`.
+        // That is the common case now, so it is asked first. A path held by two
+        // namespaces was indexed as ambiguous and resolves to neither.
+        if let Some(found) = self.by_path.get(declared.as_str()) {
+            return found.map(str::to_string);
+        }
+
+        // The other direction: a declaration longer than the id it means, which
+        // is a legacy absolute path naming a file the graph already holds.
+        let mut only: Option<&str> = None;
+        for (separator, _) in declared.match_indices('/') {
+            let suffix = &declared[separator + 1..];
+            if let Some(id) = self.ids.get(suffix) {
+                if only.is_some() {
+                    // A suffix matching more than one node is ambiguous, and a
+                    // wrong edge is worse than a missing one.
+                    return None;
+                }
+                only = Some(id);
+            }
+        }
+        only.map(|id| id.to_string())
     }
 }
 
@@ -441,6 +477,73 @@ const STRUCTURAL_MEMORY_TYPES: [&str; 3] = ["directory", "file", "markdown"];
 
 fn escape_kuzu_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
+}
+
+/// How many edges go into one relinking statement. The pairs are written into
+/// the query text, so this is what bounds how large that text can get.
+const RELINK_BATCH: usize = 500;
+
+/// Replays one relationship type in a couple of statements instead of one per
+/// edge.
+///
+/// The obvious spelling is a single UNWIND driving MERGE, which would say "link
+/// these unless they are linked already" in one statement. lbug 0.15.3 cannot
+/// run it: MERGE inside an UNWIND pipeline fails with an internal
+/// `invalid unordered_map<K, T> key`, while the same UNWIND with MATCH, or the
+/// same MERGE without UNWIND, both succeed. So the pairs that already exist are
+/// read back and subtracted here, which makes CREATE safe and keeps the
+/// statement count independent of the number of edges.
+///
+/// It also reports the truth. The loop this replaces counted statements that
+/// did not error -- including every one whose MATCH found nothing -- so an
+/// ingest that linked nothing still announced hundreds of relinked edges.
+fn create_missing_edges(conn: &Connection, rel_type: &str, pairs: &[(String, String)]) -> Result<usize> {
+    let existing = conn.query(&format!(
+        "MATCH (x:Memory)-[:{}]->(y:Memory) RETURN x.id, y.id",
+        rel_type
+    ))?;
+
+    let mut present = std::collections::HashSet::new();
+    for row in existing {
+        present.insert((format!("{}", row[0]), format!("{}", row[1])));
+    }
+
+    // The same edge can be declared by both ends, and CREATE would honour each
+    // declaration separately, so the batch is deduplicated as well.
+    let mut missing = Vec::new();
+    for pair in pairs {
+        if !present.contains(pair) {
+            present.insert(pair.clone());
+            missing.push(pair);
+        }
+    }
+
+    let mut created = 0usize;
+    for chunk in missing.chunks(RELINK_BATCH) {
+        let list = chunk
+            .iter()
+            .map(|(from, to)| {
+                format!(
+                    "{{f: '{}', t: '{}'}}",
+                    escape_kuzu_string(from),
+                    escape_kuzu_string(to)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Both ends must exist; a rule naming a file the ingester never reached
+        // still produces nothing, exactly as before.
+        let query = format!(
+            "UNWIND [{}] AS e MATCH (a:Memory {{id: e.f}}), (b:Memory {{id: e.t}}) CREATE (a)-[:{}]->(b) RETURN count(*)",
+            list, rel_type
+        );
+        for row in conn.query(&query)? {
+            created += format!("{}", row[0]).parse::<usize>().unwrap_or(0);
+        }
+    }
+
+    Ok(created)
 }
 
 #[async_trait]
@@ -806,71 +909,67 @@ impl VectorStore for LadybugStore {
         // therefore a read of what is already stored, not a guess.
         let memories = self.list(namespace, None).await?;
 
-        let declared: Vec<(String, Vec<EdgeSpec>)> = memories
-            .into_iter()
-            // A retired memory no longer governs anything. Replaying its
-            // declarations would give the corrected-away wording its edges back.
-            // Its id stays among the known targets below, though: something
-            // live may still point at it.
-            .filter(|m| !is_retired(&m.payload.metadata))
-            .map(|m| (m.id, edge_specs(&m.payload.metadata)))
-            .filter(|(_, specs)| !specs.is_empty())
-            .collect();
-
-        if declared.is_empty() {
-            return Ok(0);
-        }
-
         // Ids stored before node ids became repository-relative are absolute, so
         // a rule written to match them declares C:/proj/src/foo.rs and matches
         // nothing now. Resolve those by path suffix against the ids that do
         // exist, and leave an ambiguous suffix alone rather than guess.
-        let known: Vec<String> = self
-            .list(namespace, None)
-            .await?
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
+        let known = KnownIds::new(memories.iter().map(|m| m.id.as_str()));
+
+        // Grouped by relationship because the type is part of the statement and
+        // cannot be a value in it: three groups, so three statements, whatever
+        // the edge count.
+        let mut wanted: std::collections::HashMap<&'static str, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        let mut by_suffix = 0usize;
+
+        for memory in &memories {
+            // A retired memory no longer governs anything. Replaying its
+            // declarations would give the corrected-away wording its edges back.
+            // Its id stays among the known targets above, though: something live
+            // may still point at it.
+            if is_retired(&memory.payload.metadata) {
+                continue;
+            }
+            for edge in edge_specs(&memory.payload.metadata) {
+                let target = match known.resolve(&edge.target_id) {
+                    Some(resolved) => {
+                        if resolved != edge.target_id {
+                            by_suffix += 1;
+                        }
+                        resolved
+                    }
+                    // Kept as declared rather than dropped: it names nothing this
+                    // namespace holds, but the match is not namespaced, so it can
+                    // still land on a node another namespace ingested -- which is
+                    // what the statement-per-edge loop did.
+                    None => edge.target_id.clone(),
+                };
+                let pair = if edge.points_at_target {
+                    (memory.id.clone(), target)
+                } else {
+                    (target, memory.id.clone())
+                };
+                wanted.entry(edge.rel_type).or_default().push(pair);
+            }
+        }
+
+        if wanted.is_empty() {
+            return Ok(0);
+        }
+
+        if by_suffix > 0 {
+            println!(
+                "Relinked {} edge(s) whose declared target was an older absolute path",
+                by_suffix
+            );
+        }
 
         self.write_with_deadline("relinking the graph", move |conn| {
-            let mut linked = 0usize;
-            let mut by_suffix = 0usize;
-            for (id, specs) in &declared {
-                let safe_id = escape_kuzu_string(id);
-                for edge in specs {
-                    let target = match resolve_declared_target(&edge.target_id, &known) {
-                        Some(resolved) => {
-                            if resolved != edge.target_id {
-                                by_suffix += 1;
-                            }
-                            resolved
-                        }
-                        None => edge.target_id.clone(),
-                    };
-                    let target_safe = escape_kuzu_string(&target);
-                    let (from, to) = if edge.points_at_target {
-                        (safe_id.as_str(), target_safe.as_str())
-                    } else {
-                        (target_safe.as_str(), safe_id.as_str())
-                    };
-                    // Both ends must exist; a rule naming a file the ingester
-                    // never reached still produces nothing, exactly as before.
-                    let query = format!(
-                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
-                        from, to, edge.rel_type
-                    );
-                    if conn.query(&query).is_ok() {
-                        linked += 1;
-                    }
-                }
+            let mut created = 0usize;
+            for (rel_type, pairs) in &wanted {
+                created += create_missing_edges(conn, rel_type, pairs)?;
             }
-            if by_suffix > 0 {
-                println!(
-                    "Relinked {} edge(s) whose declared target was an older absolute path",
-                    by_suffix
-                );
-            }
-            Ok(linked)
+            Ok(created)
         })
         .await
     }
@@ -1318,6 +1417,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The resolution rule as every caller now reaches it: build the index
+    /// once, then ask it.
+    fn resolve(declared: &str, known: &[String]) -> Option<String> {
+        KnownIds::new(known.iter().map(|id| id.as_str())).resolve(declared)
+    }
+
     #[test]
     fn the_engines_refusal_is_recognised_as_a_collision() {
         let refusal = anyhow::anyhow!(
@@ -1336,12 +1441,12 @@ mod tests {
     fn a_legacy_absolute_declaration_finds_the_file_it_meant() {
         let known = vec!["src/store/ladybug.rs".to_string(), "src/daemon.rs".to_string()];
         assert_eq!(
-            resolve_declared_target("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
+            resolve("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
             Some("src/store/ladybug.rs")
         );
         // Backslashes are the same path, written the way Windows hands it over.
         assert_eq!(
-            resolve_declared_target(r"C:\dev\projects
+            resolve(r"C:\dev\projects
 eurostrata\src\daemon.rs", &known).as_deref(),
             Some("src/daemon.rs")
         );
@@ -1350,7 +1455,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn an_exact_declaration_is_returned_untouched() {
         let known = vec!["src/daemon.rs".to_string()];
-        assert_eq!(resolve_declared_target("src/daemon.rs", &known).as_deref(), Some("src/daemon.rs"));
+        assert_eq!(resolve("src/daemon.rs", &known).as_deref(), Some("src/daemon.rs"));
     }
 
     #[test]
@@ -1358,28 +1463,13 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         // A wrong edge is worse than a missing one.
         // Both "mod.rs" and "x/mod.rs" are suffixes of the declaration.
         let known = vec!["mod.rs".to_string(), "x/mod.rs".to_string()];
-        assert_eq!(resolve_declared_target("C:/proj/x/mod.rs", &known), None);
+        assert_eq!(resolve("C:/proj/x/mod.rs", &known), None);
     }
 
     #[test]
     fn a_target_that_was_never_ingested_stays_unresolved() {
         let known = vec!["src/daemon.rs".to_string()];
-        assert_eq!(resolve_declared_target("C:/proj/src/nowhere.rs", &known), None);
-    }
-
-    /// The migration doctor prescribes is a re-ingest, which qualifies every
-    /// id. A rule that still declares the old absolute path must follow it.
-    #[test]
-    fn a_legacy_absolute_declaration_finds_its_qualified_id() {
-        let known = vec![
-            "probe::src/store/ladybug.rs".to_string(),
-            "probe::src/daemon.rs".to_string(),
-        ];
-        assert_eq!(
-            resolve_declared_target("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
-            Some("probe::src/store/ladybug.rs")
-        );
-        assert_eq!(resolve_declared_target("C:/old/mylib.rs", &["probe::lib.rs".to_string()]), None);
+        assert_eq!(resolve("C:/proj/src/nowhere.rs", &known), None);
     }
 
     #[test]
@@ -1747,5 +1837,103 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         assert!(edge_specs(&json!({ "related_to": [] })).is_empty());
         assert!(edge_specs(&json!({ "related_to": [""] })).is_empty());
         assert!(edge_specs(&json!(null)).is_empty());
+    }
+
+    /// A store with three nodes: a rule that declares the file it governs, a
+    /// second rule that declares the same file the way ingestion used to write
+    /// it -- absolute -- and the file itself.
+    async fn store_with_two_declarations() -> LadybugStore {
+        let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let seed = |id: &str, metadata: &str| {
+            format!(
+                "CREATE (m:Memory {{id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                escape_kuzu_string(id),
+                escape_kuzu_string(metadata)
+            )
+        };
+        let rows = [
+            seed("rule", r#"{"governs": ["src/a.rs"]}"#),
+            seed("legacy", r#"{"governs": ["C:/old/checkout/src/a.rs"]}"#),
+            seed("src/a.rs", "{}"),
+        ];
+        for row in rows {
+            store
+                .with_conn(move |conn| {
+                    conn.query(&row)?;
+                    Ok(())
+                })
+                .await
+                .expect("seed a memory");
+        }
+        store
+    }
+
+    async fn governs_count(store: &LadybugStore) -> usize {
+        store
+            .with_conn(|conn| {
+                let result = conn.query("MATCH (:Memory)-[:GOVERNS]->(:Memory) RETURN count(*)")?;
+                let mut count = 0usize;
+                for row in result {
+                    count += format!("{}", row[0]).parse::<usize>().unwrap_or(0);
+                }
+                Ok(count)
+            })
+            .await
+            .expect("count the edges")
+    }
+
+    /// Both declarations are replayed, including the one that names the file by
+    /// its old absolute path.
+    #[tokio::test]
+    async fn relinking_replays_every_declaration_once() {
+        let store = store_with_two_declarations().await;
+
+        let created = store.relink_edges("probe").await.expect("relink");
+        assert_eq!(created, 2, "both declarations name a node that exists");
+        assert_eq!(governs_count(&store).await, 2);
+    }
+
+    /// Relinking runs at the end of every ingest, so running it twice must not
+    /// double the graph. The count is of edges actually created, not of
+    /// statements that did not error -- the loop this replaced reported the
+    /// latter, so it claimed hundreds of edges on a run that made none.
+    #[tokio::test]
+    async fn relinking_twice_creates_nothing_the_second_time() {
+        let store = store_with_two_declarations().await;
+
+        assert_eq!(store.relink_edges("probe").await.expect("first"), 2);
+        assert_eq!(
+            store.relink_edges("probe").await.expect("second"),
+            0,
+            "the edges already exist, so none are created"
+        );
+        assert_eq!(governs_count(&store).await, 2);
+    }
+
+    /// A declaration naming something that was never ingested links nothing,
+    /// and is not counted as though it had.
+    #[tokio::test]
+    async fn a_declaration_with_no_node_behind_it_links_nothing() {
+        let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let row = format!(
+            "CREATE (m:Memory {{id: 'rule', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+            escape_kuzu_string(r#"{"governs": ["src/never-ingested.rs"]}"#)
+        );
+        store
+            .with_conn(move |conn| {
+                conn.query(&row)?;
+                Ok(())
+            })
+            .await
+            .expect("seed a memory");
+
+        assert_eq!(store.relink_edges("probe").await.expect("relink"), 0);
+        assert_eq!(governs_count(&store).await, 0);
     }
 }

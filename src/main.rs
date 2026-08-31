@@ -637,7 +637,9 @@ async fn main() -> anyhow::Result<()> {
 
                         for ns in &namespaces {
                             let memories = vector_store.list(ns, None).await?;
-                            let known: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+                            let known = crate::store::ladybug::KnownIds::new(
+                                memories.iter().map(|m| m.id.as_str()),
+                            );
 
                             let mut resolvable = Vec::new();
                             let mut missing = Vec::new();
@@ -648,10 +650,10 @@ async fn main() -> anyhow::Result<()> {
                                     never_read += 1;
                                 }
                                 for edge in crate::store::ladybug::edge_specs(&memory.payload.metadata) {
-                                    if known.iter().any(|id| *id == edge.target_id) {
+                                    if known.contains(&edge.target_id) {
                                         continue;
                                     }
-                                    match crate::store::ladybug::resolve_declared_target(&edge.target_id, &known) {
+                                    match known.resolve(&edge.target_id) {
                                         Some(_) => resolvable.push(edge.target_id.clone()),
                                         None => missing.push(edge.target_id.clone()),
                                     }
