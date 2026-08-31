@@ -253,19 +253,13 @@ async fn handle_ingest(
     State(state): State<AppState>,
     Json(req): Json<IngestReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    // Provide default schema if none passed, but we should use ParserSchema
-    let schema_str = r#"
-    {
-        "languages": {
-            "rust": {
-                "extensions": ["rs"],
-                "queries": {
-                    "functions": "(function_item name: (identifier) @name) @func"
-                }
-            }
-        }
-    }
-    "#;
+    // The shipped schema, the same one the CLI and the MCP tool use. This route
+    // carried its own inline copy declaring rust and nothing else, so the GUI --
+    // which is this route's main caller -- built a graph with no Python, Go,
+    // TypeScript or Java symbols in it, and no structs or impls even in Rust.
+    // Two ingests of one repository produced different graphs depending on which
+    // surface asked (bead neurostrata-tad).
+    let schema_str = include_str!("schema.json");
     let schema = crate::parser::schema::ParserSchema::load(schema_str)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
