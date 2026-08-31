@@ -1157,7 +1157,21 @@ impl VectorStore for LadybugStore {
                     if p.is_absolute() {
                         absolute_path = location.clone();
                     } else if let Ok(cwd) = std::env::current_dir() {
-                        absolute_path = cwd.join(p).canonicalize().unwrap_or_default().to_string_lossy().to_string();
+                        // dunce, not std. std::fs::canonicalize returns Windows'
+                        // extended-length form, \\?\C:\dev\..., which most
+                        // consumers cannot use: the visualizer turns this into a
+                        // vscode://file URL, where \\?\ becomes //?/, and the
+                        // editor opens and reports that the file does not exist.
+                        // dunce returns the plain form where one exists, and
+                        // leaves a genuine UNC path alone rather than corrupting
+                        // it -- which is the case a hand-rolled prefix strip
+                        // tends to get wrong.
+                        if let Ok(resolved) = dunce::canonicalize(cwd.join(p)) {
+                            absolute_path = resolved.to_string_lossy().to_string();
+                        }
+                        // canonicalize fails when the file is gone -- a memory
+                        // naming a since-deleted path. absolute_path stays empty,
+                        // which is what tells the UI it has nothing to open.
                     }
                 }
             

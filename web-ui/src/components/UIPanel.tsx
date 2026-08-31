@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { open } from '@tauri-apps/plugin-shell';
+import { invoke } from '@tauri-apps/api/core';
 import { emit } from '@tauri-apps/api/event';
 import type { MemoryNode, MemoryLink } from '../types';
 
@@ -30,30 +30,53 @@ export const UIPanel: React.FC<Props> = ({
     return 'vscode';
   });
 
+  const [openError, setOpenError] = useState<string | null>(null);
+
   const launchUrl = async (url: string) => {
+    setOpenError(null);
     try {
       if ('__TAURI_INTERNALS__' in window) {
-        await open(url);
+        // Deliberately not plugin-shell's open(): on Windows it rejected this
+        // before reaching the shell and the only trace was a console.error a
+        // release build never shows, so the button looked dead.
+        await invoke('open_external', { url });
       } else {
         window.open(url, '_self');
       }
     } catch (e) {
-      console.error("Failed to open URL:", e);
+      // Say so in the panel. A button that silently does nothing gets mistaken
+      // for a missing editor or a bad install -- this one was, twice.
+      setOpenError(String(e));
     }
+  };
+
+  // vscode://file expects a URL path: forward slashes, and a leading one.
+  //
+  // A Windows path supplies neither. 'C:\dev\proj\x.rs' concatenated onto
+  // 'vscode://file' gives 'vscode://fileC:\dev\proj\x.rs', whose authority is
+  // 'fileC:' rather than 'file', and encodeURI leaves the backslashes alone
+  // because they are legal characters that simply are not path separators.
+  // A POSIX path already starts with '/', which is why this only ever failed
+  // on Windows.
+  const toUrlPath = (p: string) => {
+    const forward = p.replace(/\\/g, '/');
+    return forward.startsWith('/') ? forward : `/${forward}`;
   };
 
   const handleOpenInEditor = () => {
     if (!selectedNode || !selectedNode.absolute_path) return;
     const path = selectedNode.absolute_path;
-    
+
     // Attempt to derive project root from absolute path and relative location
     let rootPath = '';
     if (selectedNode.location) {
       // Remove leading ./ or / from location
       const loc = selectedNode.location.replace(/^(\.\/|\/)/, '');
-      if (path.endsWith(loc)) {
-         rootPath = path.slice(0, -loc.length);
-         // remove trailing slash
+      // The stored location uses forward slashes; the absolute path may not.
+      const comparable = path.replace(/\\/g, '/');
+      if (comparable.endsWith(loc)) {
+         rootPath = comparable.slice(0, -loc.length);
+         // remove trailing separator
          if (rootPath.endsWith('/')) rootPath = rootPath.slice(0, -1);
       }
     }
@@ -61,13 +84,13 @@ export const UIPanel: React.FC<Props> = ({
     const scheme = editor === 'vscode' ? 'vscode://file' : 'cursor://file';
     if (rootPath) {
       // Open the workspace folder first
-      launchUrl(`${scheme}${encodeURI(rootPath)}`);
+      launchUrl(`${scheme}${encodeURI(toUrlPath(rootPath))}`);
       // Give the editor a moment to focus the workspace, then open the specific file
       setTimeout(() => {
-        launchUrl(`${scheme}${encodeURI(path)}`);
+        launchUrl(`${scheme}${encodeURI(toUrlPath(path))}`);
       }, 1000);
     } else {
-      launchUrl(`${scheme}${encodeURI(path)}`);
+      launchUrl(`${scheme}${encodeURI(toUrlPath(path))}`);
     }
   };
 
@@ -161,6 +184,11 @@ export const UIPanel: React.FC<Props> = ({
                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
                           Open in {editor === 'vscode' ? 'VS Code' : 'Cursor'}
                         </button>
+                        {openError && (
+                          <div className="text-xs text-red-300 bg-red-900/30 border border-red-500/30 rounded p-2 break-all">
+                            {openError}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
