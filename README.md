@@ -203,6 +203,13 @@ For advanced administration, direct manipulation of the cognitive graph, and his
 *   [CLI Interface Guide](file:///Users/neo/projects/NeuroStrata/CLI-readme.md) — Complete manual for `neurostrata-mcp` commands (`namespaces`, `list`, `ingest`, `export-graph`, `delete`, `add`, `edit`).
 *   [Project Changelog](file:///Users/neo/projects/NeuroStrata/CHANGELOG.md) — Detailed version-by-version changes and migration logs.
 
+### Upgrading an existing database
+
+Node ids are **repository-relative** (`src/store/ladybug.rs`). The absolute path stays
+available as `absolute_path` in metadata, which is what the visualizer deep-links with.
+Ingest once after upgrading so older rows take the new form; declarations left over from
+an absolute-id ingest are matched by path suffix and reported as they are relinked.
+
 ## 🛡️ Security & Compliance
 
 NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications** and common AI red-teaming vectors:

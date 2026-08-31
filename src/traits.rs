@@ -69,6 +69,16 @@ pub trait VectorStore: Send + Sync {
     /// symbols and the directory/file nodes, which ingestion then rebuilds.
     async fn clear_ingested(&self, namespace: &str) -> Result<()>;
 
+    /// Rebuilds the edges a namespace's memories declare, and reports how many
+    /// were materialised.
+    ///
+    /// An edge is written when the memory that declares it is written, so a
+    /// target that did not exist yet simply produced nothing. Ingestion deletes
+    /// and re-creates every code node, taking those edges with it -- and the
+    /// rules pointing at that code are not rewritten, so the links stay lost
+    /// until something replays them (bead neurostrata-sij).
+    async fn relink_edges(&self, namespace: &str) -> Result<usize>;
+
     /// List all memories
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
 

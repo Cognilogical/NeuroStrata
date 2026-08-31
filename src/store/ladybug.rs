@@ -282,8 +282,49 @@ impl LadybugStore {
     }
 }
 
+/// Finds the node a declaration means, when it does not name one exactly.
+///
+/// Node ids became repository-relative, so a memory written when ingestion
+/// produced absolute ids declares `C:/proj/src/foo.rs` and now matches nothing.
+/// Its tail still identifies the file, so a declaration ending in `/<id>`
+/// resolves to that id. A suffix matching more than one node is ambiguous and
+/// is left alone: a wrong edge is worse than a missing one.
+pub fn resolve_declared_target(declared: &str, known: &[String]) -> Option<String> {
+    if known.iter().any(|id| id == declared) {
+        return Some(declared.to_string());
+    }
+
+    let declared = declared.replace('\\', "/");
+    // Two suffix relations, not one, because a declaration and an id can be
+    // longer than each other in either direction.
+    //
+    //   declared ends with id   a legacy absolute declaration naming the file
+    //                           an id already describes: the caller wrote
+    //                           C:/dev/proj/src/lib.rs, the id is src/lib.rs
+    //   id ends with declared   an id qualified by its namespace: the caller
+    //                           wrote src/lib.rs the way a human does, the id
+    //                           is NeuroStrata::src/lib.rs
+    //
+    // Both are anchored on a separator so that `lib.rs` cannot match
+    // `mylib.rs`, and an ambiguous suffix is still left alone rather than
+    // guessed at.
+    let mut matches = known.iter().filter(|id| {
+        if id.is_empty() {
+            return false;
+        }
+        declared.ends_with(&format!("/{}", id))
+            || id.ends_with(&format!("{}{}", crate::parser::ingest::NAMESPACE_SEPARATOR, declared))
+            || id.ends_with(&format!("/{}", declared))
+    });
+
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
+}
+
 /// One edge a memory asks for, read off its metadata.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct EdgeSpec {
     pub rel_type: &'static str,
     pub target_id: String,
@@ -403,9 +444,9 @@ impl VectorStore for LadybugStore {
             let insert_query = format!(
                 "MERGE (m:Memory {{id: '{}'}})
                  ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
-                 ON MATCH SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+                 ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
                 safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
-                safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+                safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
             );
 
             conn.query(&insert_query)?;
@@ -641,6 +682,76 @@ impl VectorStore for LadybugStore {
 
     fn is_dirty(&self) -> bool {
         self.dirty.is_set()
+    }
+
+    async fn relink_edges(&self, namespace: &str) -> Result<usize> {
+        // Declarations live in each memory's metadata, which survives ingestion;
+        // only the edges themselves are lost with the nodes. Replaying them is
+        // therefore a read of what is already stored, not a guess.
+        let memories = self.list(namespace, None).await?;
+
+        let declared: Vec<(String, Vec<EdgeSpec>)> = memories
+            .into_iter()
+            .map(|m| (m.id, edge_specs(&m.payload.metadata)))
+            .filter(|(_, specs)| !specs.is_empty())
+            .collect();
+
+        if declared.is_empty() {
+            return Ok(0);
+        }
+
+        // Ids stored before node ids became repository-relative are absolute, so
+        // a rule written to match them declares C:/proj/src/foo.rs and matches
+        // nothing now. Resolve those by path suffix against the ids that do
+        // exist, and leave an ambiguous suffix alone rather than guess.
+        let known: Vec<String> = self
+            .list(namespace, None)
+            .await?
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        self.write_with_deadline("relinking the graph", move |conn| {
+            let mut linked = 0usize;
+            let mut by_suffix = 0usize;
+            for (id, specs) in &declared {
+                let safe_id = escape_kuzu_string(id);
+                for edge in specs {
+                    let target = match resolve_declared_target(&edge.target_id, &known) {
+                        Some(resolved) => {
+                            if resolved != edge.target_id {
+                                by_suffix += 1;
+                            }
+                            resolved
+                        }
+                        None => edge.target_id.clone(),
+                    };
+                    let target_safe = escape_kuzu_string(&target);
+                    let (from, to) = if edge.points_at_target {
+                        (safe_id.as_str(), target_safe.as_str())
+                    } else {
+                        (target_safe.as_str(), safe_id.as_str())
+                    };
+                    // Both ends must exist; a rule naming a file the ingester
+                    // never reached still produces nothing, exactly as before.
+                    let query = format!(
+                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
+                        from, to, edge.rel_type
+                    );
+                    if conn.query(&query).is_ok() {
+                        linked += 1;
+                    }
+                }
+            }
+            if by_suffix > 0 {
+                println!(
+                    "Relinked {} edge(s) whose declared target was an older absolute path",
+                    by_suffix
+                );
+            }
+            Ok(linked)
+        })
+        .await
     }
 
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
@@ -987,6 +1098,41 @@ mod tests {
     fn an_ordinary_failure_is_not_retried_as_a_collision() {
         let other = anyhow::anyhow!("Binder exception: Table Memory does not exist");
         assert!(!is_write_collision(&other));
+    }
+
+    #[test]
+    fn a_legacy_absolute_declaration_finds_the_file_it_meant() {
+        let known = vec!["src/store/ladybug.rs".to_string(), "src/daemon.rs".to_string()];
+        assert_eq!(
+            resolve_declared_target("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
+            Some("src/store/ladybug.rs")
+        );
+        // Backslashes are the same path, written the way Windows hands it over.
+        assert_eq!(
+            resolve_declared_target(r"C:\dev\projects
+eurostrata\src\daemon.rs", &known).as_deref(),
+            Some("src/daemon.rs")
+        );
+    }
+
+    #[test]
+    fn an_exact_declaration_is_returned_untouched() {
+        let known = vec!["src/daemon.rs".to_string()];
+        assert_eq!(resolve_declared_target("src/daemon.rs", &known).as_deref(), Some("src/daemon.rs"));
+    }
+
+    #[test]
+    fn an_ambiguous_suffix_is_left_alone() {
+        // A wrong edge is worse than a missing one.
+        // Both "mod.rs" and "x/mod.rs" are suffixes of the declaration.
+        let known = vec!["mod.rs".to_string(), "x/mod.rs".to_string()];
+        assert_eq!(resolve_declared_target("C:/proj/x/mod.rs", &known), None);
+    }
+
+    #[test]
+    fn a_target_that_was_never_ingested_stays_unresolved() {
+        let known = vec!["src/daemon.rs".to_string()];
+        assert_eq!(resolve_declared_target("C:/proj/src/nowhere.rs", &known), None);
     }
 
     #[test]
