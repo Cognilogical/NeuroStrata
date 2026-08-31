@@ -65,6 +65,22 @@ enum Commands {
         id: String,
     },
 
+    /// Move a memory into another namespace, by ID
+    ///
+    /// Destructive: it copies the row and then deletes the original, so it is
+    /// a CLI command rather than an MCP tool. `doctor` prints one of these per
+    /// id when two spellings of a project need merging.
+    Move {
+        /// The namespace the memory is in now
+        source_namespace: String,
+
+        /// The memory ID to move
+        id: String,
+
+        /// The namespace to move it into
+        target_namespace: String,
+    },
+
     /// Add a new memory to a namespace
     Add {
         /// The target namespace
@@ -640,7 +656,7 @@ async fn main() -> anyhow::Result<()> {
                                     println!("  '{}' holds {} memories", b, b_len);
                                     let (from, to) = if a_len < b_len { (a, b) } else { (b, a) };
                                     println!(
-                                        "  Merge with neurostrata_move_memory, moving each id from '{}' into '{}'.\n",
+                                        "  Merge with: neurostrata-mcp move '{}' <id> '{}'  (one per id)\n",
                                         from, to
                                     );
                                 }
@@ -800,6 +816,21 @@ async fn main() -> anyhow::Result<()> {
                     Commands::Delete { namespace, id } => {
                         vector_store.delete(&namespace, &id).await?;
                         println!("Memory deleted successfully.");
+                    }
+                    Commands::Move { source_namespace, id, target_namespace } => {
+                        // Copy first, delete second. The reverse order loses the
+                        // memory outright if the write fails.
+                        let (vector, payload) = vector_store
+                            .get(&source_namespace, &id)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "No memory with id {} in namespace {}.",
+                                id, source_namespace
+                            ))?;
+                        vector_store.init(&target_namespace).await?;
+                        vector_store.upsert(&target_namespace, &id, vector, payload).await?;
+                        vector_store.delete(&source_namespace, &id).await?;
+                        println!("Moved {} from '{}' to '{}'.", id, source_namespace, target_namespace);
                     }
                     Commands::Add { namespace, memory_type, content, location } => {
                         let vector = embedder.embed(&content).await?;
