@@ -98,6 +98,38 @@ The four run concurrently, so a full CI cycle is bounded by Windows.
 
 ---
 
+## Building the desktop app
+
+`scripts/build.ps1` builds `neurostrata-mcp`, the daemon and CLI. The visualizer
+in `src-tauri/` is a separate build, and it has one trap.
+
+```
+cd web-ui && npm run build          # the frontend, into web-ui/dist
+cd ..
+cargo build --release --features custom-protocol --manifest-path src-tauri/Cargo.toml
+```
+
+**`--features custom-protocol` is not optional.** The tauri crate's build script
+sets `dev = !custom_protocol`, so a plain `cargo build` produces a DEV build: the
+webview loads `tauri.conf.json`'s `devUrl`, `http://localhost:5173`, instead of
+the bundled `web-ui/dist`. The window then shows whatever happens to be serving
+that port on the machine — a frontend dev server, another project, or nothing.
+
+It fails silently. The app launches, the window opens, and only the contents are
+wrong, so it looks like a data or daemon problem rather than a build one.
+
+`cargo tauri build` passes the feature itself and also runs the frontend build,
+so it is the safer command where the tauri CLI is installed. Everything above is
+for the case where it is not.
+
+To confirm a build is right, check the frontend is actually inside the binary:
+
+```
+grep -c index- src-tauri/target/release/neurostrata.exe    # 0 = dev build
+```
+
+---
+
 ## Installing it
 
 `cargo build` leaves the binary in `target/release/`. To put it on `PATH`, where
