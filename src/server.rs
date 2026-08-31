@@ -188,7 +188,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_supersede_memory",
-                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. This is the correct way to fix a rule: it loses nothing, and unlike an edit it re-embeds, so search stops matching the words you replaced.",
+                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced. This is the only tool on this surface that changes an existing memory.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -796,8 +796,8 @@ async fn handle_ingest_directory(
 /// carries the correction. Only the reading half of that was ever built --
 /// `valid_to` was filtered on but never written -- so the only correction paths
 /// were destructive rewrites, and `/edit` additionally kept the old embedding.
-/// This is the writing half, and it is the reason an agent needs no destructive
-/// tool: superseding loses nothing, so it needs no human at the keyboard.
+/// This is the writing half. It adds rather than overwrites, so it is reachable
+/// over MCP where edit, delete and move are not.
 async fn handle_supersede_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,

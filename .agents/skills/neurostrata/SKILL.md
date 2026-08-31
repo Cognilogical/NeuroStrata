@@ -21,13 +21,13 @@ NeuroStrata provides the following native MCP tools that you MUST use to manage 
 * `neurostrata_list_namespaces`: List the namespaces the shared database holds.
 * `neurostrata_ingest_directory`: Batch ingest an entire directory of markdown files (e.g., `docs/architecture/`) into NeuroStrata. The server will automatically chunk and embed the files.
 * `neurostrata_get_memory`: Fetch one Engram by id. Use it to read a rule before correcting it, and to follow a Governs or Related Nodes pointer to the exact record.
-* `neurostrata_supersede_memory`: Correct an Engram that is wrong or out of date. Your new text is stored as a new Engram and the old one is retired: it keeps its original wording as history and stops being returned by search. This is the only correction tool you have, and it needs no permission because it loses nothing.
+* `neurostrata_supersede_memory`: Correct an Engram that is wrong or out of date. Your new text is stored as a new Engram and the old one is retired: it keeps its original wording as history and stops being returned by search. Use it to fix a rule you got wrong; it is the only tool here that changes an existing Engram.
 
 **These seven are the whole surface, and every one of them is additive.** Nothing you can
 reach destroys a memory. That is deliberate: operations that lose bytes -- editing a rule in
 place, deleting one, moving one between namespaces, restoring a backup -- are CLI and GUI
-commands, so a human is at the keyboard when they run. There is no MCP tool for them, and
-asking for one is asking to skip the person. To correct a rule use
+commands, so a human is at the keyboard when they run. There is no MCP tool for them. To
+correct a rule use
 `neurostrata_supersede_memory`. To delete one, the user runs
 `neurostrata-mcp delete <namespace> <id>` with the daemon stopped, or the GUI posts to the
 daemon's `/delete`. To merge two spellings of a project, the user runs
