@@ -98,6 +98,50 @@ The four run concurrently, so a full CI cycle is bounded by Windows.
 
 ---
 
+## Installing it
+
+`cargo build` leaves the binary in `target/release/`. To put it on `PATH`, where
+an MCP client will find it:
+
+```
+cargo install --path . --force --locked
+```
+
+**All three flags matter.**
+
+`--locked` is the important one. Without it `cargo install` ignores `Cargo.lock`
+and re-resolves dependencies, which picks up whatever newer `lbug` has been
+published -- installing 0.15.4 where the lockfile pins 0.15.3. That silently
+swaps the storage engine underneath an existing database. The pin is deliberate:
+`recovering_config()` in `src/store/ladybug.rs` disables WAL checksums because
+leaving them on loses every row after an ungraceful stop, and the engine version
+that behaviour was measured against is the one in the lockfile.
+
+`--force` is needed because the binary already exists after the first install;
+without it cargo stops with "binary `neurostrata-mcp.exe` already exists".
+
+Installing also needs the C++ toolchain on `PATH`, exactly as a build does. A
+bare `cargo install` outside a Developer Command Prompt fails inside the `lbug`
+build script with:
+
+```
+CMake Error: CMake was unable to find a build program corresponding to "Ninja".
+CMAKE_MAKE_PROGRAM is not set.
+```
+
+On Windows, run it from a Developer PowerShell, or import the environment the
+way `scripts/build.ps1` does before calling cargo.
+
+**Stop the daemon first.** The running daemon *is* the binary being replaced, so
+the install fails with `Access is denied. (os error 5)` while it is up -- and
+that error arrives after a successful compile, which makes it look like a build
+failure rather than a lock. `neurostrata-mcp shutdown` stops it and checkpoints;
+never kill it -- writes that only reached the WAL are discarded if the process
+dies before a checkpoint. Any stdio proxy started by an MCP client
+holds the installed binary too, and has to stop for the same reason.
+
+---
+
 ## Windows quirks
 
 None of this affects a Linux or macOS build.
