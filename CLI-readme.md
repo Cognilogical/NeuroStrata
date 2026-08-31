@@ -82,9 +82,8 @@ neurostrata-mcp delete my-rust-project 550e8400-e29b-41d4-a716-446655440000
 Moves a memory into another namespace, by ID. This is the command `doctor` prints when two
 spellings of one project need merging: run it once per id.
 
-It is deliberately a CLI command and not an MCP tool. It copies the row and then deletes the
-original, so it destroys something, and every destructive operation in NeuroStrata requires a
-person at the keyboard rather than an agent asking permission.
+It copies the row and then deletes the original. Destructive operations are CLI and GUI
+commands rather than MCP tools, so a person runs them.
 
 ```bash
 neurostrata-mcp move <source_namespace> <id> <target_namespace>
