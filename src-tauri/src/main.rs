@@ -193,6 +193,39 @@ fn namespace_path(project_path: &str) -> PathBuf {
         .join("namespace")
 }
 
+/// Hands a URL to the OS to open, and says so when it cannot.
+///
+/// The frontend used tauri-plugin-shell's `open` for this. On Windows nothing
+/// happened and nothing was reported -- the call was rejected before it reached
+/// the shell, and the only trace was a console.error the release build does not
+/// surface. Meanwhile the identical URL opens correctly through ShellExecute,
+/// which is what this does.
+///
+/// The result is a Result on purpose: a button that silently does nothing is
+/// indistinguishable from a missing editor, a bad path, or a broken build, and
+/// this one was mistaken for all three.
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    // Only schemes the visualizer actually emits. An unrestricted opener
+    // reachable from the webview would run whatever a memory's content asked
+    // for, and node content is not ours.
+    const ALLOWED: [&str; 4] = ["vscode://", "cursor://", "https://", "http://"];
+    if !ALLOWED.iter().any(|s| url.starts_with(s)) {
+        return Err(format!(
+            "Refusing to open '{}': only {} are allowed.",
+            url,
+            ALLOWED.join(", ")
+        ));
+    }
+
+    // The `open` crate rather than a hand-rolled Command per platform: it is
+    // what tauri-plugin-shell uses underneath, so it is already in the tree, and
+    // it knows the cases that are easy to get subtly wrong -- `start` being a
+    // cmd builtin whose first quoted argument is the window title, xdg-open
+    // versus the desktop-specific openers, quoting on each.
+    open::that(&url).map_err(|e| format!("Could not open '{}': {}", url, e))
+}
+
 #[tauri::command]
 fn ingest_ast(project_path: String) -> Result<String, String> {
     ensure_daemon()?;
@@ -297,6 +330,7 @@ fn main() {
             get_last_project_path,
             save_project_path,
             ingest_ast,
+            open_external,
             delete_memory,
             edit_memory,
             log_message
