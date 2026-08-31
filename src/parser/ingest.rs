@@ -74,6 +74,17 @@ pub fn qualified_id(namespace: &str, node_path: &str) -> String {
     format!("{}{}{}", namespace, NAMESPACE_SEPARATOR, node_path)
 }
 
+/// Whether an ingested id names the namespace holding it.
+///
+/// False for anything written before ids carried a namespace. Such a node still
+/// resolves -- KnownIds matches a bare path either way -- but its id is unique
+/// only within its project rather than within the database, so another project
+/// ingesting the same path can still take it. `doctor` reports these so the
+/// state is visible instead of silent; a re-ingest is what migrates them.
+pub fn is_qualified(namespace: &str, id: &str) -> bool {
+    id.starts_with(&qualified_id(namespace, ""))
+}
+
 /// The id a node gets, relative to the directory being ingested.
 ///
 /// Ids used to inherit whatever the caller passed: the CLI walked a relative
@@ -580,6 +591,19 @@ mod tests {
         /// The whole point: two projects both have a `src`, the Memory table has a
     /// single-column primary key, and the database is shared. Without the
     /// namespace in the id the second project ingested takes the first's node.
+    /// doctor reports migration state from this, so a wrong answer either hides
+    /// a namespace that is still collidable or nags about one that is not.
+    #[test]
+    fn an_id_is_qualified_only_by_its_own_namespace() {
+        assert!(is_qualified("NeuroStrata", "NeuroStrata::src/main.rs"));
+        // Written before ids carried a namespace.
+        assert!(!is_qualified("NeuroStrata", "src/main.rs"));
+        // Another project's node, which this namespace must not count as its own.
+        assert!(!is_qualified("NeuroStrata", "Other::src/main.rs"));
+        // A namespace that merely starts the same way is a different namespace.
+        assert!(!is_qualified("Neuro", "NeuroStrata::src/main.rs"));
+    }
+
     #[test]
     fn two_projects_sharing_a_path_get_different_ids() {
         assert_ne!(
