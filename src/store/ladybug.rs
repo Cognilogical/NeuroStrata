@@ -587,13 +587,8 @@ impl VectorStore for LadybugStore {
                 let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
                 // Temporal filtering
-                if let Some(valid_to) = metadata_val.get("valid_to") {
-                    if !valid_to.is_null() {
-                        let now = chrono::Utc::now().timestamp();
-                        if valid_to.as_i64().unwrap_or(0) <= now {
-                            continue;
-                        }
-                    }
+                if is_retired(&metadata_val) {
+                    continue;
                 }
 
                 let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -653,6 +648,11 @@ impl VectorStore for LadybugStore {
                             let metadata_str: String = format!("{}", row[7]);
 
                             let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+
+                            // The graph must not bring back what the match filtered out.
+                            if is_retired(&metadata_val) {
+                                continue;
+                            }
 
                             // Neighbors get a synthesized lower score (worse distance) so they appear after primary matches,
                             // but still within the context window.
@@ -755,6 +755,11 @@ impl VectorStore for LadybugStore {
 
         let declared: Vec<(String, Vec<EdgeSpec>)> = memories
             .into_iter()
+            // A retired memory no longer governs anything. Replaying its
+            // declarations would give the corrected-away wording its edges back.
+            // Its id stays among the known targets below, though: something
+            // live may still point at it.
+            .filter(|m| !is_retired(&m.payload.metadata))
             .map(|m| (m.id, edge_specs(&m.payload.metadata)))
             .filter(|(_, specs)| !specs.is_empty())
             .collect();
@@ -1149,6 +1154,20 @@ fn is_write_collision(err: &anyhow::Error) -> bool {
         .contains("Cannot start a new write transaction")
 }
 
+/// Whether a memory has been retired, meaning its `valid_to` has passed.
+///
+/// A retired row has to stop surfacing wherever results come from: the vector
+/// match, the graph around that match, and the edges relinking replays.
+/// Filtering only the first lets the graph hand back what the match left out.
+fn is_retired(metadata: &Value) -> bool {
+    match metadata.get("valid_to") {
+        Some(valid_to) if !valid_to.is_null() => {
+            valid_to.as_i64().unwrap_or(0) <= chrono::Utc::now().timestamp()
+        }
+        _ => false,
+    }
+}
+
 /// Fails a future that outstays its deadline, with a message that says what was
 /// waiting and admits the work may still be running.
 async fn bounded<T>(
@@ -1393,6 +1412,103 @@ eurostrata\src\daemon.rs", &known).as_deref(),
                 junk
             );
         }
+    }
+
+    async fn retired_test_store() -> LadybugStore {
+        let dir = std::env::temp_dir().join(format!("ns-retired-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+        store
+    }
+
+    fn retired_test_payload(memory_type: &str, user_id: &str, metadata: Value) -> MemoryPayload {
+        MemoryPayload {
+            content: format!("a {} row", memory_type),
+            user_id: user_id.to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        }
+    }
+
+    async fn governs_edges_from(store: &LadybugStore, id: &str) -> usize {
+        let id = escape_kuzu_string(id);
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!(
+                    "MATCH (a:Memory {{id: '{}'}})-[:GOVERNS]->(:Memory) RETURN count(*)",
+                    id
+                ))?;
+                Ok(rows
+                    .next()
+                    .map(|row| format!("{}", row[0]).parse().unwrap_or(0))
+                    .unwrap_or(0))
+            })
+            .await
+            .expect("count GOVERNS edges")
+    }
+
+    #[tokio::test]
+    async fn relinking_does_not_give_a_retired_rule_its_edges_back() {
+        let store = retired_test_store().await;
+        let file = "probe::src/a.rs";
+        let zero = vec![0.0f32; 4];
+
+        // Both rules are written before the file exists, so only relinking can
+        // give them edges.
+        store
+            .upsert("probe", "retired-rule", zero.clone(), retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "live-rule", zero.clone(), retired_test_payload("rule", "agent", json!({ "governs": [file] })))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", file, zero, retired_test_payload("file", "auto-ingestor", json!({})))
+            .await
+            .unwrap();
+
+        store.relink_edges("probe").await.expect("relink");
+
+        assert_eq!(governs_edges_from(&store, "live-rule").await, 1, "a live rule is relinked");
+        assert_eq!(governs_edges_from(&store, "retired-rule").await, 0, "a retired rule is not");
+    }
+
+    #[tokio::test]
+    async fn the_graph_does_not_bring_back_a_retired_rule() {
+        let store = retired_test_store().await;
+        let file = "probe::src/a.rs";
+
+        store
+            .upsert("probe", file, vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "symbol", vec![1.0, 0.0, 0.0, 0.0], retired_test_payload("code_ast", "auto-ingestor", json!({ "contained_by": [file] })))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "retired-rule", vec![0.0, 1.0, 0.0, 0.0], retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })))
+            .await
+            .unwrap();
+
+        // The symbol matches; its file is governed by the retired rule, two hops
+        // out -- exactly the path the governing expansion follows. The query
+        // vector is not whole numbers: `1` and `0` would print as an integer
+        // list, which array_distance refuses.
+        let ids: Vec<String> = store
+            .search("probe", vec![0.9, 0.1, 0.1, 0.1], 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        assert!(ids.contains(&"symbol".to_string()), "{:?}", ids);
+        assert!(!ids.contains(&"retired-rule".to_string()), "a retired rule stays retired: {:?}", ids);
     }
 
     #[test]
