@@ -191,6 +191,31 @@ impl IngestJobs {
             }
         }
     }
+
+    /// Waits until no walk is running, or until `limit` passes, and says which.
+    ///
+    /// A walk is detached from the request that started it, so graceful shutdown
+    /// does not wait for it on its own. Without this the daemon checkpointed
+    /// and exited mid-walk, and the runtime dropped the walk after it had
+    /// cleared the namespace but before it had rebuilt or relinked it.
+    pub async fn wait_idle(&self, limit: std::time::Duration) -> bool {
+        let receivers: Vec<watch::Receiver<IngestProgress>> =
+            self.jobs.lock().unwrap().values().cloned().collect();
+
+        let all_finished = async move {
+            for mut rx in receivers {
+                loop {
+                    let running = rx.borrow_and_update().state == IngestState::Running;
+                    // A sender that has gone cannot report any more progress.
+                    if !running || rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+
+        tokio::time::timeout(limit, all_finished).await.is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +272,27 @@ mod tests {
         assert_eq!(progress.symbols_ingested, 7);
         assert_eq!(progress.last_file.as_deref(), Some("src/b.rs"));
         assert_eq!(progress.relinked_edges, Some(20));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_running_walk_but_not_past_its_limit() {
+        let jobs = IngestJobs::new();
+        let (tx, rx) = watch::channel(progress(IngestState::Running));
+        jobs.jobs.lock().unwrap().insert("ns".to_string(), rx);
+
+        assert!(
+            !jobs.wait_idle(std::time::Duration::from_millis(20)).await,
+            "a walk still running outlasts a short limit"
+        );
+
+        let finish = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tx.send_modify(|progress| progress.state = IngestState::Finished);
+        });
+        assert!(
+            jobs.wait_idle(std::time::Duration::from_secs(5)).await,
+            "and is waited for until it finishes"
+        );
+        finish.await.expect("the walk reports its end");
     }
 }

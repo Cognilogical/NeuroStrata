@@ -57,10 +57,12 @@ struct GraphQuery {
 pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn VectorStore>) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+    // Kept here as well as in the state, because stopping has to wait for it.
+    let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
     let state = AppState {
         embedder,
         vector_store: vector_store.clone(),
-        ingests: Arc::new(crate::ingest_jobs::IngestJobs::new()),
+        ingests: ingests.clone(),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
 
@@ -145,6 +147,17 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         })
         .await?;
 
+    let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
+
+    // An ingest runs detached from the request that started it, so the graceful
+    // shutdown above did not wait for it. Stopping without waiting left the
+    // runtime to drop the walk after it had cleared the namespace but before it
+    // had rebuilt or relinked it. The periodic checkpoint keeps running
+    // meanwhile, and is stopped only once the walk is done.
+    if !ingests.wait_idle(ingest_wait_budget(cause)).await {
+        eprintln!("WARNING: an ingest was still running when the daemon had to stop, so its namespace may be only partly rebuilt. Ingest it again.");
+    }
+
     let _ = stop_periodic.send(true);
     let _ = periodic.await;
 
@@ -152,7 +165,6 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
     // A checkpoint needs every transaction to drain, and detached work such as
     // access counting can still be finishing, so a refusal is retried rather
     // than accepted. Exiting after one that never succeeded is an error.
-    let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
     let deadline = tokio::time::Instant::now() + final_checkpoint_budget(cause);
     let mut failures: u32 = 0;
     loop {
@@ -321,6 +333,16 @@ fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
     }
 }
 
+/// How long a stopping daemon waits for a running ingest to finish. A closing
+/// console leaves no time for one. Anything else waits, because stopping
+/// mid-walk leaves the namespace cleared and only partly rebuilt.
+fn ingest_wait_budget(cause: ShutdownCause) -> std::time::Duration {
+    match cause {
+        ShutdownCause::ConsoleClosing => std::time::Duration::ZERO,
+        ShutdownCause::Requested => std::time::Duration::from_secs(300),
+    }
+}
+
 async fn handle_delete(
     State(state): State<AppState>,
     Json(req): Json<DeleteReq>,
@@ -470,5 +492,11 @@ mod tests {
     #[test]
     fn an_explicit_stop_waits_out_a_busy_engine() {
         assert!(final_checkpoint_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn only_a_closing_console_stops_without_waiting_for_an_ingest() {
+        assert_eq!(ingest_wait_budget(ShutdownCause::ConsoleClosing), std::time::Duration::ZERO);
+        assert!(ingest_wait_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(60));
     }
 }
