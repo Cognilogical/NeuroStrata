@@ -225,6 +225,25 @@ fn daemon_busy(probe: DaemonProbe, lock_held: bool) -> bool {
     lock_held && probe != DaemonProbe::Responsive
 }
 
+/// The CLI names ingested files relative to where it runs, as CLI-readme.md
+/// documents: `ingest ./src` from a project yields `src/lib.rs`. An absolute
+/// path to a subdirectory of the working directory is the same request written
+/// out in full, so it is walked as that relative path. The working directory
+/// itself stays absolute, so its root node is named the way the GUI names it.
+fn cli_ingest_root(dir: &str) -> String {
+    let path = std::path::Path::new(dir);
+    if path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(rest) = path.strip_prefix(&cwd) {
+                if !rest.as_os_str().is_empty() {
+                    return rest.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+    dir.to_string()
+}
+
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
 
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
@@ -273,6 +292,18 @@ mod tests {
     #[test]
     fn an_answered_probe_is_a_live_daemon() {
         assert_eq!(classify_probe(true, false), DaemonProbe::Responsive);
+    }
+
+    #[test]
+    fn an_absolute_cli_path_under_the_working_directory_is_walked_relative() {
+        let cwd = std::env::current_dir().expect("working directory");
+        assert_eq!(cli_ingest_root(&cwd.join("src").to_string_lossy()), "src");
+        assert_eq!(
+            cli_ingest_root(&cwd.to_string_lossy()),
+            cwd.to_string_lossy(),
+            "the working directory itself stays absolute"
+        );
+        assert_eq!(cli_ingest_root("./src"), "./src");
     }
 
     #[test]
@@ -567,6 +598,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Commands::Ingest { dir, namespace, schema_path } => {
+                        let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
                             std::fs::read_to_string(&path).unwrap_or_else(|e| {
