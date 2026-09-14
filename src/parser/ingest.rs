@@ -381,13 +381,18 @@ pub async fn ingest_directory(
     // rewritten just because its file came back. Replay what the memories still
     // declare, now that the nodes they point at exist again (bead
     // neurostrata-sij).
-    match vector_store.relink_edges(namespace).await {
-        Ok(linked) => println!("Relinked {} declared edges in namespace {}", linked, namespace),
-        Err(e) => eprintln!(
-            "WARNING: ingestion finished but the declared edges could not be relinked, so rules may not reach their code: {}",
+    //
+    // A failure here fails the ingest rather than warning about it. The clear
+    // above already took every GOVERNS edge, so reporting success would hand
+    // back a graph whose rules reach none of their code.
+    let linked = vector_store.relink_edges(namespace).await.map_err(|e| {
+        anyhow::anyhow!(
+            "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; ingest again to retry: {}",
+            namespace,
             e
-        ),
-    }
+        )
+    })?;
+    println!("Relinked {} declared edges in namespace {}", linked, namespace);
 
     Ok(())
 }
