@@ -415,10 +415,26 @@ impl<'a> KnownIds<'a> {
 
         // The other direction: a declaration longer than the id it means, which
         // is a legacy absolute path naming a file the graph already holds.
+        //
+        // Its suffix can name that file two ways. Before migrating it is an id
+        // (`src/lib.rs`); after doctor's migration, a re-ingest, it is the path
+        // inside a qualified id (`NeuroStrata::src/lib.rs`). Checking only ids
+        // meant every absolute declaration lost its edge at exactly the step
+        // the migration tells people to take.
         let mut only: Option<&str> = None;
         for (separator, _) in declared.match_indices('/') {
             let suffix = &declared[separator + 1..];
+            let mut hits: Vec<&str> = Vec::new();
             if let Some(id) = self.ids.get(suffix) {
+                hits.push(id);
+            }
+            match self.by_path.get(suffix) {
+                Some(Some(qualified)) => hits.push(qualified),
+                // Held by more than one namespace: ambiguous, as above.
+                Some(None) => return None,
+                None => {}
+            }
+            for id in hits {
                 if only.is_some() {
                     // A suffix matching more than one node is ambiguous, and a
                     // wrong edge is worse than a missing one.
@@ -1456,6 +1472,29 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     fn an_exact_declaration_is_returned_untouched() {
         let known = vec!["src/daemon.rs".to_string()];
         assert_eq!(resolve("src/daemon.rs", &known).as_deref(), Some("src/daemon.rs"));
+    }
+
+    /// The migration doctor prescribes is a re-ingest, which qualifies every
+    /// id. A rule that still declares the old absolute path must follow it.
+    #[test]
+    fn a_legacy_absolute_declaration_finds_its_qualified_id() {
+        let known = vec![
+            "probe::src/store/ladybug.rs".to_string(),
+            "probe::src/daemon.rs".to_string(),
+        ];
+        assert_eq!(
+            resolve("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
+            Some("probe::src/store/ladybug.rs")
+        );
+        assert_eq!(resolve("C:/old/mylib.rs", &["probe::lib.rs".to_string()]), None);
+        assert_eq!(
+            resolve(
+                "C:/old/src/a.rs",
+                &["probe::src/a.rs".to_string(), "other::src/a.rs".to_string()]
+            ),
+            None,
+            "a path two namespaces hold is ambiguous"
+        );
     }
 
     #[test]
