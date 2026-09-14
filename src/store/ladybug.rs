@@ -358,8 +358,8 @@ pub fn resolve_declared_target(declared: &str, known: &[String]) -> Option<Strin
     }
 
     let declared = declared.replace('\\', "/");
-    // Two suffix relations, not one, because a declaration and an id can be
-    // longer than each other in either direction.
+    // Suffix relations in both directions, because a declaration and an id can
+    // be longer than each other either way.
     //
     //   declared ends with id   a legacy absolute declaration naming the file
     //                           an id already describes: the caller wrote
@@ -367,17 +367,26 @@ pub fn resolve_declared_target(declared: &str, known: &[String]) -> Option<Strin
     //   id ends with declared   an id qualified by its namespace: the caller
     //                           wrote src/lib.rs the way a human does, the id
     //                           is NeuroStrata::src/lib.rs
+    //   declared ends with the  both at once: a legacy absolute declaration,
+    //   id's path               C:/dev/proj/src/lib.rs, against the qualified
+    //                           NeuroStrata::src/lib.rs that re-ingesting --
+    //                           the documented migration -- gave the file
     //
-    // Both are anchored on a separator so that `lib.rs` cannot match
+    // All are anchored on a separator so that `lib.rs` cannot match
     // `mylib.rs`, and an ambiguous suffix is still left alone rather than
     // guessed at.
     let mut matches = known.iter().filter(|id| {
         if id.is_empty() {
             return false;
         }
+        let qualified_path = id
+            .split_once(crate::parser::ingest::NAMESPACE_SEPARATOR)
+            .map(|(_, path)| path)
+            .filter(|path| !path.is_empty());
         declared.ends_with(&format!("/{}", id))
             || id.ends_with(&format!("{}{}", crate::parser::ingest::NAMESPACE_SEPARATOR, declared))
             || id.ends_with(&format!("/{}", declared))
+            || qualified_path.map_or(false, |path| declared.ends_with(&format!("/{}", path)))
     });
 
     match (matches.next(), matches.next()) {
@@ -1252,6 +1261,21 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     fn a_target_that_was_never_ingested_stays_unresolved() {
         let known = vec!["src/daemon.rs".to_string()];
         assert_eq!(resolve_declared_target("C:/proj/src/nowhere.rs", &known), None);
+    }
+
+    /// The migration doctor prescribes is a re-ingest, which qualifies every
+    /// id. A rule that still declares the old absolute path must follow it.
+    #[test]
+    fn a_legacy_absolute_declaration_finds_its_qualified_id() {
+        let known = vec![
+            "probe::src/store/ladybug.rs".to_string(),
+            "probe::src/daemon.rs".to_string(),
+        ];
+        assert_eq!(
+            resolve_declared_target("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
+            Some("probe::src/store/ladybug.rs")
+        );
+        assert_eq!(resolve_declared_target("C:/old/mylib.rs", &["probe::lib.rs".to_string()]), None);
     }
 
     #[test]
