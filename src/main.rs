@@ -818,19 +818,28 @@ async fn main() -> anyhow::Result<()> {
                         println!("Memory deleted successfully.");
                     }
                     Commands::Move { source_namespace, id, target_namespace } => {
-                        // Copy first, delete second. The reverse order loses the
-                        // memory outright if the write fails.
-                        let (vector, payload) = vector_store
-                            .get(&source_namespace, &id)
-                            .await?
-                            .ok_or_else(|| anyhow::anyhow!(
-                                "No memory with id {} in namespace {}.",
-                                id, source_namespace
-                            ))?;
-                        vector_store.init(&target_namespace).await?;
-                        vector_store.upsert(&target_namespace, &id, vector, payload).await?;
-                        vector_store.delete(&source_namespace, &id).await?;
-                        println!("Moved {} from '{}' to '{}'.", id, source_namespace, target_namespace);
+                        // One statement that changes the namespace. Copying to the
+                        // target and deleting from the source removed the only copy,
+                        // because upsert never rewrites a row's namespace.
+                        match vector_store.relocate(&id, &source_namespace, &target_namespace).await? {
+                            crate::traits::RelocateOutcome::Moved => {
+                                println!("Moved {} from '{}' to '{}'.", id, source_namespace, target_namespace);
+                            }
+                            crate::traits::RelocateOutcome::SameNamespace => {
+                                println!("{} is already in '{}'.", id, source_namespace);
+                            }
+                            crate::traits::RelocateOutcome::NotFound => {
+                                eprintln!("No memory with id {} in namespace {}.", id, source_namespace);
+                                std::process::exit(1);
+                            }
+                            crate::traits::RelocateOutcome::Ingested => {
+                                eprintln!(
+                                    "{} was written by directory ingestion for '{}' and cannot be moved; ingest the directory into '{}' instead.",
+                                    id, source_namespace, target_namespace
+                                );
+                                std::process::exit(1);
+                            }
+                        }
                     }
                     Commands::Add { namespace, memory_type, content, location } => {
                         let vector = embedder.embed(&content).await?;
@@ -848,13 +857,29 @@ async fn main() -> anyhow::Result<()> {
                         println!("Memory added successfully with ID: {}", id);
                     }
                     Commands::Edit { namespace, id, new_namespace, content, location } => {
-                        if let Some((_, mut payload)) = vector_store.get(&namespace, &id).await? {
-                            vector_store.delete(&namespace, &id).await?;
-                            payload.content = content.clone();
-                            payload.location = location.clone();
-                            let vector = embedder.embed(&content).await?;
-                            vector_store.upsert(&new_namespace, &id, vector, payload).await?;
-                            println!("Successfully edited memory {}", id);
+                        match crate::server::edit_memory(
+                            &*vector_store,
+                            &*embedder,
+                            &namespace,
+                            &id,
+                            &new_namespace,
+                            &content,
+                            &location,
+                        )
+                        .await?
+                        {
+                            crate::server::EditOutcome::Edited => println!("Successfully edited memory {}", id),
+                            crate::server::EditOutcome::NotFound => {
+                                eprintln!("No memory with id {} in namespace {}.", id, namespace);
+                                std::process::exit(1);
+                            }
+                            crate::server::EditOutcome::Ingested => {
+                                eprintln!(
+                                    "{} was written by directory ingestion, so the next ingest would overwrite an edit. Change the file and ingest again instead.",
+                                    id
+                                );
+                                std::process::exit(1);
+                            }
                         }
                     }
                     // Handled above, before the database is ever opened.
