@@ -1009,6 +1009,59 @@ pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &
     }
 }
 
+/// What an operator's edit did.
+#[derive(Debug, PartialEq)]
+pub(crate) enum EditOutcome {
+    Edited,
+    NotFound,
+    /// Written by directory ingestion, so the next ingest would overwrite the
+    /// edit. The file is what to change.
+    Ingested,
+}
+
+/// The operator's in-place edit, shared by the CLI and the daemon's /edit.
+///
+/// It rewrites the text where the memory is, then moves the row with relocate
+/// if the namespace changes, and never deletes anything. Both earlier orders
+/// lost memories: deleting first lost one whenever the write that followed
+/// failed, and writing to the new namespace first found the old row by id --
+/// upsert never rewrites a namespace -- so the delete that followed removed
+/// the only copy.
+pub(crate) async fn edit_memory(
+    store: &dyn VectorStore,
+    embedder: &dyn Embedder,
+    old_namespace: &str,
+    id: &str,
+    new_namespace: &str,
+    content: &str,
+    location: &str,
+) -> anyhow::Result<EditOutcome> {
+    let (vector, mut payload) = match store.get(old_namespace, id).await? {
+        Some(found) => found,
+        None => return Ok(EditOutcome::NotFound),
+    };
+    if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+        return Ok(EditOutcome::Ingested);
+    }
+
+    // Re-embed whenever the text changes. Reusing the old vector left the row
+    // ranked by wording it no longer contained, so correcting a wrong rule kept
+    // the wrong rule findable and hid the correction (bead neurostrata-vbj).
+    let vector = if payload.content == content {
+        vector
+    } else {
+        embedder.embed(content).await?
+    };
+    payload.content = content.to_string();
+    payload.location = location.to_string();
+
+    store.upsert(old_namespace, id, vector, payload).await?;
+    if old_namespace != new_namespace {
+        store.relocate(id, old_namespace, new_namespace).await?;
+    }
+    Ok(EditOutcome::Edited)
+}
+
 /// One stored anchor as `src/lib.rs:10-20 (parse)`. add_memory stores the path
 /// as `file`; `path` is the name the tool's own arguments use.
 fn render_anchor(anchor: &Value) -> String {
@@ -1401,6 +1454,45 @@ mod tests {
             .await
             .expect("seed the rule");
         (store, id)
+    }
+
+    #[tokio::test]
+    async fn editing_a_memory_into_another_namespace_keeps_it() {
+        let (store, id) = store_with_one_rule("probe").await;
+
+        let outcome = edit_memory(
+            &*store,
+            &StubEmbedder,
+            "probe",
+            &id,
+            "other",
+            "always use podman, pinned",
+            "docs/tools.md",
+        )
+        .await
+        .expect("edit");
+
+        assert_eq!(outcome, EditOutcome::Edited);
+        let (_, edited) = store.get("other", &id).await.unwrap().expect("the memory is in its new namespace");
+        assert_eq!(edited.content, "always use podman, pinned");
+        assert_eq!(edited.location, "docs/tools.md");
+        assert!(store.get("probe", &id).await.unwrap().is_none(), "and nowhere else");
+    }
+
+    #[tokio::test]
+    async fn an_ingested_node_is_not_edited() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let mut node = payload("Path: src/a.rs");
+        node.user_id = "auto-ingestor".to_string();
+        store.upsert("probe", "probe::src/a.rs", vec![0.0; 4], node).await.unwrap();
+
+        let outcome = edit_memory(&*store, &StubEmbedder, "probe", "probe::src/a.rs", "probe", "hand-written", "")
+            .await
+            .expect("edit");
+
+        assert_eq!(outcome, EditOutcome::Ingested);
+        let (_, kept) = store.get("probe", "probe::src/a.rs").await.unwrap().expect("still there");
+        assert_eq!(kept.content, "Path: src/a.rs", "and unchanged");
     }
 
     fn new_id_from(message: &str) -> String {
