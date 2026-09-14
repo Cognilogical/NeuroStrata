@@ -488,22 +488,19 @@ async fn handle_move_memory(arguments: Value, store: Arc<dyn VectorStore>) -> St
         None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
     };
 
-    if let Ok(Some((vec, payload))) = store.get(src, id).await {
-        if let Ok(_) = store.init(tgt).await {
-            if let Ok(_) = store.upsert(tgt, id, vec, payload).await {
-                if let Ok(_) = store.delete(src, id).await {
-                    format!("Successfully moved memory {} from {} to {}", id, src, tgt)
-                } else {
-                    "Memory copied to target but failed to delete from source.".to_string()
-                }
-            } else {
-                "Failed to insert memory into target namespace.".to_string()
-            }
-        } else {
-            "Failed to initialize target namespace.".to_string()
+    match store.relocate(id, src, tgt).await {
+        Ok(crate::traits::RelocateOutcome::Moved) => {
+            format!("Successfully moved memory {} from {} to {}", id, src, tgt)
         }
-    } else {
-        "Memory not found in source namespace.".to_string()
+        Ok(crate::traits::RelocateOutcome::NotFound) => "Memory not found in source namespace.".to_string(),
+        Ok(crate::traits::RelocateOutcome::Ingested) => format!(
+            "Memory {} was written by directory ingestion for namespace {} and cannot be moved; ingest the directory into {} instead.",
+            id, src, tgt
+        ),
+        Ok(crate::traits::RelocateOutcome::SameNamespace) => {
+            format!("Memory {} is already in namespace {}.", id, src)
+        }
+        Err(e) => format!("Failed to move memory {}: {}", id, e),
     }
 }
 

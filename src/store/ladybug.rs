@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use lbug::{Connection, Database, SystemConfig};
 
-use crate::traits::{MemoryPayload, SearchResult, VectorStore};
+use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult, VectorStore};
 
 pub struct LadybugStore {
     #[allow(dead_code)]
@@ -719,6 +719,37 @@ impl VectorStore for LadybugStore {
             let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
             conn.query(&query)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
+        if from == to {
+            return Ok(RelocateOutcome::SameNamespace);
+        }
+        let payload = match self.get(from, id).await? {
+            Some((_, payload)) => payload,
+            None => return Ok(RelocateOutcome::NotFound),
+        };
+        // An ingested node's id names the namespace that owns it, and the next
+        // ingest of that namespace would MERGE onto the moved row and update it
+        // where it now sits -- the cross-project theft qualified ids exist to stop.
+        if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+            return Ok(RelocateOutcome::Ingested);
+        }
+
+        let (id, from, to) = (id.to_string(), from.to_string(), to.to_string());
+        self.write_with_deadline("moving a memory", move |conn| {
+            // One statement, so there is no moment at which the memory exists in
+            // neither namespace, and the row keeps its id, vector and edges.
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' AND m.user_id <> 'auto-ingestor' SET m.namespace = '{}'",
+                escape_kuzu_string(&id),
+                escape_kuzu_string(&from),
+                escape_kuzu_string(&to)
+            );
+            conn.query(&query)?;
+            Ok(RelocateOutcome::Moved)
         })
         .await
     }
@@ -1648,6 +1679,45 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .unwrap();
 
         assert_eq!(governs_edges_from(&store, "rule").await, 1);
+    }
+
+    /// Moving used to be "write to the target, delete from the source". upsert
+    /// never rewrites a namespace, so the write updated the source row in place
+    /// and the delete then removed the only copy.
+    #[tokio::test]
+    async fn moving_a_memory_keeps_the_row_and_its_edges() {
+        let store = retired_test_store().await;
+        store
+            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": ["probe::src/a.rs"] })))
+            .await
+            .unwrap();
+
+        assert_eq!(store.relocate("rule", "probe", "global").await.unwrap(), RelocateOutcome::Moved);
+
+        assert!(store.get("global", "rule").await.unwrap().is_some(), "the memory is in its new namespace");
+        assert!(store.get("probe", "rule").await.unwrap().is_none(), "and no longer in the old one");
+        assert_eq!(governs_edges_from(&store, "rule").await, 1, "its edges came with it");
+    }
+
+    #[tokio::test]
+    async fn an_ingested_node_is_not_moved() {
+        let store = retired_test_store().await;
+        store
+            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.relocate("probe::src/a.rs", "probe", "other").await.unwrap(),
+            RelocateOutcome::Ingested
+        );
+        assert!(store.get("probe", "probe::src/a.rs").await.unwrap().is_some(), "and it stays where it was");
+        assert_eq!(store.relocate("missing", "probe", "other").await.unwrap(), RelocateOutcome::NotFound);
+        assert_eq!(store.relocate("rule", "probe", "probe").await.unwrap(), RelocateOutcome::SameNamespace);
     }
 
     #[test]

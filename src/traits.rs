@@ -25,6 +25,19 @@ pub struct SearchResult {
     pub payload: MemoryPayload,
 }
 
+/// What an attempt to move a memory between namespaces found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RelocateOutcome {
+    Moved,
+    NotFound,
+    /// Written by directory ingestion. Its id carries the namespace that owns
+    /// it, so the move is refused: ingest the directory into the other
+    /// namespace instead.
+    Ingested,
+    /// Source and target are the same namespace, so there is nothing to do.
+    SameNamespace,
+}
+
 /// The core interface for generating vector embeddings from text.
 /// By making this a trait, we can swap between Local (FastEmbed/ONNX),
 /// Remote (Ollama), or Cloud (OpenAI) implementations.
@@ -84,6 +97,15 @@ pub trait VectorStore: Send + Sync {
 
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
+
+    /// Moves a memory to another namespace by changing that one field, so its
+    /// id, vector and edges stay as they were and nothing is ever deleted.
+    ///
+    /// Not built from upsert and delete: upsert deliberately never rewrites a
+    /// namespace, so that an ingest cannot pull another project's node into its
+    /// own, which makes "write to the target, delete from the source" delete the
+    /// only copy.
+    async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome>;
 
     /// List all existing namespaces (tables)
     async fn list_namespaces(&self) -> Result<Vec<String>>;
