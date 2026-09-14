@@ -158,9 +158,98 @@ async fn probe_daemon() -> DaemonProbe {
     }
 }
 
+/// The file a daemon holds an exclusive lock on for its whole life.
+///
+/// The port cannot say when a daemon is finished: axum closes its listener
+/// before the final checkpoint runs, so a refused connection arrives while the
+/// process still owns the database. The OS releases this lock only when the
+/// process exits -- cleanly, killed or crashed -- so a held lock proves the
+/// daemon is still there, and a free one proves it is gone.
+fn daemon_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".daemon.lock");
+    std::path::PathBuf::from(path)
+}
+
+fn open_daemon_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let path = daemon_lock_path(db_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Held for the life of the daemon process and never dropped, so the lock goes
+/// with the process rather than with anything that runs before the database
+/// has closed.
+static DAEMON_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// What a stopping daemon leaves in its lock file for `shutdown` to read.
+const FINAL_CHECKPOINT_OK: &str = "checkpointed";
+
+/// Takes the daemon lock, or refuses: a second daemon would open the database
+/// while the first one is writing to it.
+fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let file = open_daemon_lock(db_path)?;
+    match file.try_lock() {
+        Ok(()) => {
+            // Whatever the last daemon reported is not about this one.
+            file.set_len(0)?;
+            Ok(file)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!(
+            "Another NeuroStrata daemon is already running against {:?}.",
+            db_path
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Whether some process holds the daemon lock right now.
+fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
+    match open_daemon_lock(db_path) {
+        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
+    }
+}
+
+/// Records how the daemon's final checkpoint went, for `shutdown` to report.
+fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
+    use std::io::Write;
+    if let Some(file) = DAEMON_LOCK.get() {
+        let report = match outcome {
+            Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
+            Err(e) => format!("error: {}", e),
+        };
+        let _ = file.set_len(0);
+        let _ = (&*file).write_all(report.as_bytes());
+        let _ = file.sync_all();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_daemon_lock_is_seen_and_goes_with_its_holder() {
+        let db = std::env::temp_dir()
+            .join(format!("ns-daemon-lock-{}", uuid::Uuid::new_v4()))
+            .join("ladybug.db");
+        assert!(!daemon_holds_lock(&db), "nothing holds a fresh lock");
+
+        let held = take_daemon_lock(&db).expect("the first daemon takes the lock");
+        assert!(daemon_holds_lock(&db), "a live holder is visible to shutdown");
+        assert!(take_daemon_lock(&db).is_err(), "a second daemon is refused");
+
+        drop(held);
+        assert!(!daemon_holds_lock(&db), "the lock is free once its holder is gone");
+    }
 
     #[test]
     fn only_a_refusal_proves_no_daemon() {
@@ -254,19 +343,31 @@ async fn main() -> anyhow::Result<()> {
             Commands::Daemon => {
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
                 let config = Config::from_default_path()?;
+                // Taken before the database opens. `shutdown` waits for this lock
+                // to be released rather than for the port to close.
+                let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
                 let embedder = Arc::new(FastEmbedder::new()?);
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embedder.dimensions(),
                 )?);
                 vector_store.init("global").await?;
-                daemon::start_daemon(embedder, vector_store).await?;
+                let outcome = daemon::start_daemon(embedder, vector_store).await;
+                record_final_checkpoint(&outcome);
+                outcome?;
             }
             Commands::Shutdown => {
+                let config = Config::from_default_path()?;
+                let db_path = config.db_path.clone();
+                let held = daemon_holds_lock(&db_path);
+
                 match probe {
-                    DaemonProbe::Absent => {
+                    DaemonProbe::Absent if !held => {
                         println!("No daemon is running on 127.0.0.1:34343.");
                         return Ok(());
+                    }
+                    DaemonProbe::Absent => {
+                        eprintln!("A daemon has stopped listening but still holds the database, so it is finishing its final checkpoint. Waiting for it to exit.");
                     }
                     DaemonProbe::Silent => {
                         eprintln!("Nothing answered on 127.0.0.1:34343 within 500ms. Either no daemon is running, or one is busy in the database and cannot answer yet -- those look identical from here. Sending a stop request and waiting; if a daemon is there, this can take a couple of minutes. Do not kill it.");
@@ -277,34 +378,56 @@ async fn main() -> anyhow::Result<()> {
                 let client = reqwest::Client::new();
                 // A busy daemon may not answer this either. That is not a
                 // failure: the request is queued, so fall through to the wait.
-                if let Err(e) = client
-                    .post("http://127.0.0.1:34343/shutdown")
-                    .timeout(std::time::Duration::from_secs(10))
-                    .send()
-                    .await
-                {
-                    if e.is_connect() {
-                        println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
-                        return Ok(());
+                if probe != DaemonProbe::Absent {
+                    if let Err(e) = client
+                        .post("http://127.0.0.1:34343/shutdown")
+                        .timeout(std::time::Duration::from_secs(10))
+                        .send()
+                        .await
+                    {
+                        if e.is_connect() && !daemon_holds_lock(&db_path) {
+                            println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
+                            return Ok(());
+                        }
+                        eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
                     }
-                    eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
                 }
 
-                // Wait for it to actually go: the checkpoint happens after the
-                // HTTP response, and a CLI command run too early hits the lock.
-                // A daemon that was already wedged gets longer, because engine
-                // waits of two and a half minutes have been measured.
-                let attempts = if probe == DaemonProbe::Responsive { 300 } else { 2400 };
+                // Wait for the process, not the port. The listener closes before
+                // the final checkpoint runs, so a quiet port proves nothing; the
+                // lock is released only once the process has exited. A daemon
+                // that was already wedged gets longer, because engine waits of
+                // two and a half minutes have been measured.
+                let mut saw_lock = held;
+                let attempts = if probe == DaemonProbe::Responsive { 900 } else { 2400 };
                 for _ in 0..attempts {
-                    let still_up = client
+                    if daemon_holds_lock(&db_path) {
+                        saw_lock = true;
+                    } else if saw_lock {
+                        let report = std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
+                        if report == FINAL_CHECKPOINT_OK {
+                            println!("Daemon stopped and checkpointed.");
+                            return Ok(());
+                        }
+                        if report.is_empty() {
+                            eprintln!("The daemon exited without reporting its final checkpoint, so writes since the last one may not be on disk.");
+                        } else {
+                            eprintln!("The daemon exited, but its final checkpoint did not complete: {}", report);
+                        }
+                        std::process::exit(1);
+                    } else if let Err(e) = client
                         .get("http://127.0.0.1:34343/health")
                         .timeout(std::time::Duration::from_millis(500))
                         .send()
                         .await
-                        .is_ok();
-                    if !still_up {
-                        println!("Daemon stopped and checkpointed.");
-                        return Ok(());
+                    {
+                        // No lock was ever seen: a daemon built before the lock
+                        // existed. Only a refused connection counts as it having
+                        // gone, and its checkpoint cannot be confirmed.
+                        if e.is_connect() {
+                            println!("Daemon stopped. It predates the shutdown lock, so its final checkpoint cannot be confirmed from here.");
+                            return Ok(());
+                        }
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
