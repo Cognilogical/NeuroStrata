@@ -218,6 +218,15 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     }
 }
 
+/// A daemon that holds the database but did not answer the probe is busy, not
+/// gone, and opening the database from here would contend with its writer. An
+/// answering daemon is not busy in this sense: it can be asked to do the work.
+fn daemon_busy(probe: DaemonProbe, lock_held: bool) -> bool {
+    lock_held && probe != DaemonProbe::Responsive
+}
+
+const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
+
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
 fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
     use std::io::Write;
@@ -264,6 +273,14 @@ mod tests {
     #[test]
     fn an_answered_probe_is_a_live_daemon() {
         assert_eq!(classify_probe(true, false), DaemonProbe::Responsive);
+    }
+
+    #[test]
+    fn a_daemon_that_holds_the_lock_but_is_silent_is_busy_not_gone() {
+        assert!(daemon_busy(DaemonProbe::Silent, true));
+        assert!(daemon_busy(DaemonProbe::Absent, true), "listener closed, still checkpointing");
+        assert!(!daemon_busy(DaemonProbe::Silent, false), "silence with no holder is no daemon");
+        assert!(!daemon_busy(DaemonProbe::Responsive, true), "an answering daemon is asked, not refused");
     }
 }
 
@@ -457,6 +474,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let config = Config::from_default_path()?;
+                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                    eprintln!("{}", DAEMON_BUSY_MESSAGE);
+                    std::process::exit(1);
+                }
                 // The width opens the store; exporting never embeds anything.
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
@@ -512,6 +533,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 
                 let config = Config::from_default_path()?;
+                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                    eprintln!("{}", DAEMON_BUSY_MESSAGE);
+                    std::process::exit(1);
+                }
                 let embedder = Arc::new(FastEmbedder::new()?);
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
