@@ -334,10 +334,10 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let config = Config::from_default_path()?;
-                let embedder = Arc::new(FastEmbedder::new()?);
+                // The width opens the store; exporting never embeds anything.
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
+                    embed::configured_dimensions()?,
                 )?);
                 vector_store.export_database(&dir).await?;
                 println!("Backed up to {}", dir);
@@ -363,10 +363,9 @@ async fn main() -> anyhow::Result<()> {
                     std::fs::create_dir_all(parent)?;
                 }
 
-                let embedder = Arc::new(FastEmbedder::new()?);
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     target.to_string_lossy().to_string(),
-                    embedder.dimensions(),
+                    embed::configured_dimensions()?,
                 )?);
                 // Deliberately no init() here: the backup carries its own schema.
                 vector_store.import_database(&dir).await?;
