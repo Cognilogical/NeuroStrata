@@ -527,7 +527,20 @@ impl VectorStore for LadybugStore {
             // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
             // That is deliberate -- a rule may name a file the ingester has not reached.
             for edge in edge_specs(&payload.metadata) {
-                let target_safe = escape_kuzu_string(&edge.target_id);
+                // A qualified id names its node exactly, and is what ingestion
+                // writes, so it goes straight to the MERGE. Anything else may be
+                // a path written the way a human writes it -- src/lib.rs, for a
+                // node ingested as NeuroStrata::src/lib.rs -- and is resolved
+                // now, rather than waiting for the next ingest to relink it.
+                let target = if edge.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                    edge.target_id.clone()
+                } else {
+                    match resolve_target_on_write(conn, &namespace, &edge.target_id) {
+                        Some(found) => found,
+                        None => continue,
+                    }
+                };
+                let target_safe = escape_kuzu_string(&target);
                 let (from, to) = if edge.points_at_target {
                     (safe_id.as_str(), target_safe.as_str())
                 } else {
@@ -1177,6 +1190,66 @@ fn is_retired(metadata: &Value) -> bool {
     }
 }
 
+/// The ids a declared edge target could stand for when it is not already a
+/// qualified id: the declaration qualified by the memory's own namespace, and
+/// every separator-anchored suffix of it, bare and qualified. A suffix is how a
+/// legacy absolute path finds the file it meant.
+fn declared_target_candidates(namespace: &str, declared: &str) -> Vec<String> {
+    let declared = declared.replace('\\', "/");
+    let mut candidates = vec![crate::parser::ingest::qualified_id(namespace, &declared)];
+    for (cut, _) in declared.match_indices('/') {
+        let suffix = &declared[cut + 1..];
+        if !suffix.is_empty() {
+            candidates.push(suffix.to_string());
+            candidates.push(crate::parser::ingest::qualified_id(namespace, suffix));
+        }
+    }
+    candidates
+}
+
+/// Chooses among the ids that exist: the memory's own namespace first, then the
+/// id exactly as declared, then a suffix -- but only one. An ambiguous suffix
+/// produces no edge, because a wrong edge is worse than a missing one.
+fn pick_declared_target(namespace: &str, declared: &str, found: &[String]) -> Option<String> {
+    let qualified = crate::parser::ingest::qualified_id(namespace, &declared.replace('\\', "/"));
+    if found.iter().any(|id| *id == qualified) {
+        return Some(qualified);
+    }
+    if found.iter().any(|id| id == declared) {
+        return Some(declared.to_string());
+    }
+    let mut suffixes = found.iter().filter(|id| **id != qualified && id.as_str() != declared);
+    match (suffixes.next(), suffixes.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// Resolves a declared edge target while a memory is being written, in one read.
+///
+/// The exact id stays unscoped, as edges always have been; everything inferred
+/// from it is confined to the memory's own namespace, so a bare `src/lib.rs`
+/// cannot land on another project's file.
+fn resolve_target_on_write(conn: &Connection, namespace: &str, declared: &str) -> Option<String> {
+    let candidates = declared_target_candidates(namespace, declared)
+        .iter()
+        .map(|c| format!("'{}'", escape_kuzu_string(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "MATCH (b:Memory) WHERE b.id = '{}' OR (b.namespace = '{}' AND b.id IN [{}]) RETURN DISTINCT b.id",
+        escape_kuzu_string(declared),
+        escape_kuzu_string(namespace),
+        candidates
+    );
+    let mut rows = conn.query(&query).ok()?;
+    let mut found = Vec::new();
+    while let Some(row) = rows.next() {
+        found.push(format!("{}", row[0]));
+    }
+    pick_declared_target(namespace, declared, &found)
+}
+
 /// Fails a future that outstays its deadline, with a message that says what was
 /// waiting and admits the work may still be running.
 async fn bounded<T>(
@@ -1533,6 +1606,48 @@ eurostrata\src\daemon.rs", &known).as_deref(),
 
         assert!(ids.contains(&"symbol".to_string()), "{:?}", ids);
         assert!(!ids.contains(&"retired-rule".to_string()), "a retired rule stays retired: {:?}", ids);
+    }
+
+    #[test]
+    fn a_declaration_prefers_its_own_namespace_then_its_exact_id_then_one_suffix() {
+        let both = vec!["probe::src/a.rs".to_string(), "src/a.rs".to_string()];
+        assert_eq!(pick_declared_target("probe", "src/a.rs", &both).as_deref(), Some("probe::src/a.rs"));
+        assert_eq!(
+            pick_declared_target("probe", "src/a.rs", &["src/a.rs".to_string()]).as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(
+            pick_declared_target("probe", "C:/old/src/a.rs", &["probe::src/a.rs".to_string()]).as_deref(),
+            Some("probe::src/a.rs")
+        );
+        assert_eq!(
+            pick_declared_target(
+                "probe",
+                "C:/old/src/a.rs",
+                &["probe::src/a.rs".to_string(), "probe::a.rs".to_string()]
+            ),
+            None,
+            "an ambiguous suffix is left alone"
+        );
+        assert!(declared_target_candidates("probe", "C:/old/src/a.rs").contains(&"probe::src/a.rs".to_string()));
+    }
+
+    /// Ingestion qualifies node ids, and a rule names the file the way a human
+    /// writes it. The edge has to form when the rule is written, not only after
+    /// the next ingest happens to relink it.
+    #[tokio::test]
+    async fn a_rule_added_after_ingest_governs_the_file_it_names() {
+        let store = retired_test_store().await;
+        store
+            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": ["src/a.rs"] })))
+            .await
+            .unwrap();
+
+        assert_eq!(governs_edges_from(&store, "rule").await, 1);
     }
 
     #[test]
