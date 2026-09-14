@@ -83,12 +83,19 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
     // a failure costs a retry instead of a request, and the write is already in
     // the log either way.
     let periodic_store = vector_store.clone();
-    tokio::spawn(async move {
+    // Stopped before the final checkpoint, not aborted: a checkpoint it has
+    // already started runs on a blocking thread that abort cannot reach, and the
+    // final checkpoint would then contend with it.
+    let (stop_periodic, mut periodic_stopped) = tokio::sync::watch::channel(false);
+    let periodic = tokio::spawn(async move {
         let mut wait = CHECKPOINT_INTERVAL;
         let mut failures: u32 = 0;
 
         loop {
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = periodic_stopped.changed() => break,
+            }
 
             if !periodic_store.is_dirty() {
                 wait = CHECKPOINT_INTERVAL;
@@ -124,16 +131,57 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:34343").await?;
     eprintln!("NeuroStrata Daemon listening on 127.0.0.1:34343");
+    let cause = Arc::new(Mutex::new(ShutdownCause::Requested));
+    let recorded_cause = cause.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .with_graceful_shutdown(async move {
+            let why = shutdown_signal(shutdown_rx).await;
+            if let Ok(mut slot) = recorded_cause.lock() {
+                *slot = why;
+            }
+        })
         .await?;
 
+    let _ = stop_periodic.send(true);
+    let _ = periodic.await;
+
     // The whole point of stopping gracefully: get everything on disk before exit.
-    match vector_store.checkpoint().await {
-        Ok(()) => eprintln!("Checkpoint complete. NeuroStrata Daemon stopped."),
-        Err(e) => eprintln!("ERROR: final checkpoint failed, recent writes may be lost: {}", e),
+    // A checkpoint needs every transaction to drain, and detached work such as
+    // access counting can still be finishing, so a refusal is retried rather
+    // than accepted. Exiting after one that never succeeded is an error.
+    let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
+    let deadline = tokio::time::Instant::now() + final_checkpoint_budget(cause);
+    let mut failures: u32 = 0;
+    loop {
+        match vector_store.checkpoint().await {
+            Ok(()) => {
+                eprintln!("Checkpoint complete. NeuroStrata Daemon stopped.");
+                return Ok(());
+            }
+            Err(e) => {
+                failures += 1;
+                let wait = checkpoint_backoff(failures);
+                if tokio::time::Instant::now() + wait > deadline {
+                    eprintln!(
+                        "ERROR: final checkpoint failed {} time(s), recent writes may be lost: {}",
+                        failures, e
+                    );
+                    return Err(anyhow::anyhow!(
+                        "final checkpoint failed after {} attempt(s): {}",
+                        failures,
+                        e
+                    ));
+                }
+                eprintln!(
+                    "Final checkpoint refused (attempt {}), retrying in {}s: {}",
+                    failures,
+                    wait.as_secs(),
+                    e
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
     }
-    Ok(())
 }
 
 async fn handle_get_graph(
@@ -234,6 +282,25 @@ fn checkpoint_backoff(failures: u32) -> std::time::Duration {
     std::time::Duration::from_secs(secs.min(30))
 }
 
+/// Why the daemon is stopping, which decides how long its final checkpoint may
+/// keep retrying.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ShutdownCause {
+    /// Windows kills the process roughly five seconds after this, whatever it
+    /// is doing.
+    ConsoleClosing,
+    /// Everything else: /shutdown, Ctrl-C, SIGTERM. Nothing outside is counting
+    /// down, so it can wait out a busy engine.
+    Requested,
+}
+
+fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
+    match cause {
+        ShutdownCause::ConsoleClosing => std::time::Duration::from_secs(4),
+        ShutdownCause::Requested => std::time::Duration::from_secs(60),
+    }
+}
+
 async fn handle_delete(
     State(state): State<AppState>,
     Json(req): Json<DeleteReq>,
@@ -286,7 +353,7 @@ async fn handle_mcp(
 /// the OS asking us to go away. On Windows a console close gives roughly five
 /// seconds before the process is killed regardless, so the checkpoint that
 /// follows has to be quick.
-async fn shutdown_signal(rx: oneshot::Receiver<()>) {
+async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
         eprintln!("Received Ctrl-C, shutting down.");
@@ -296,32 +363,37 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) {
     let os_signal = async {
         let mut close = match tokio::signal::windows::ctrl_close() {
             Ok(s) => s,
-            Err(_) => return std::future::pending::<()>().await,
+            Err(_) => return std::future::pending::<ShutdownCause>().await,
         };
         let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
             Ok(s) => s,
-            Err(_) => return std::future::pending::<()>().await,
+            Err(_) => return std::future::pending::<ShutdownCause>().await,
         };
         tokio::select! {
             _ = close.recv() => eprintln!("Console is closing, shutting down."),
             _ = shutdown.recv() => eprintln!("System is shutting down."),
         }
+        ShutdownCause::ConsoleClosing
     };
 
     #[cfg(unix)]
     let os_signal = async {
         let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(s) => s,
-            Err(_) => return std::future::pending::<()>().await,
+            Err(_) => return std::future::pending::<ShutdownCause>().await,
         };
         term.recv().await;
         eprintln!("Received SIGTERM, shutting down.");
+        ShutdownCause::Requested
     };
 
     tokio::select! {
-        _ = ctrl_c => {}
-        _ = os_signal => {}
-        _ = rx => eprintln!("Shutdown requested over HTTP."),
+        _ = ctrl_c => ShutdownCause::Requested,
+        cause = os_signal => cause,
+        _ = rx => {
+            eprintln!("Shutdown requested over HTTP.");
+            ShutdownCause::Requested
+        }
     }
 }
 
@@ -359,5 +431,15 @@ mod tests {
             waits
         );
         assert_eq!(*waits.last().unwrap(), 30, "and it settles at the cap");
+    }
+
+    #[test]
+    fn a_closing_console_gets_less_time_than_windows_allows() {
+        assert!(final_checkpoint_budget(ShutdownCause::ConsoleClosing) < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_explicit_stop_waits_out_a_busy_engine() {
+        assert!(final_checkpoint_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(30));
     }
 }
