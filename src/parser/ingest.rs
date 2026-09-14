@@ -137,6 +137,18 @@ pub async fn ingest_directory(
     vector_store: Arc<dyn VectorStore>,
     namespace: &str,
 ) -> anyhow::Result<()> {
+    // Prove the root is a readable directory before anything is deleted. A
+    // missing or mistyped path used to clear the namespace, walk nothing -- the
+    // walker's errors were skipped -- and report success over an emptied graph.
+    std::fs::read_dir(dir_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so nothing was cleared: {}",
+            dir_path,
+            namespace,
+            e
+        )
+    })?;
+
     // Rebuild this namespace's ingested rows from scratch. Failing here is fatal:
     // ingesting on top of a stale tree would leave rows for files that no longer exist.
     vector_store
@@ -158,10 +170,20 @@ pub async fn ingest_directory(
 
     let zero_vector = vec![0.0; embedder.dimensions()];
 
+    // Counted rather than skipped in silence: a subtree that cannot be read is
+    // absent from the rebuilt graph, and whoever ingested should hear that.
+    let mut unreadable = 0usize;
+
     for result in walker {
         let entry = match result {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                unreadable += 1;
+                if unreadable <= 5 {
+                    eprintln!("Could not read part of {:?}: {}", dir_path, e);
+                }
+                continue;
+            }
         };
 
         let path = entry.path();
@@ -376,6 +398,13 @@ pub async fn ingest_directory(
         }
     }
 
+    if unreadable > 0 {
+        eprintln!(
+            "WARNING: {} path(s) under {:?} could not be read, so they are missing from this ingest of namespace {}.",
+            unreadable, dir_path, namespace
+        );
+    }
+
     // Clearing the previous ingest took every edge attached to those nodes with
     // it, including the GOVERNS edges rules had to them -- and a rule is not
     // rewritten just because its file came back. Replay what the memories still
@@ -587,5 +616,48 @@ mod tests {
     fn unknown_extension_has_no_language() {
         let map = map_from(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{}}}}"#);
         assert_eq!(map.get(&normalize_ext("toml")), None);
+    }
+
+    struct ZeroEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for ZeroEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_is_refused_before_anything_is_cleared() {
+        let db = std::env::temp_dir().join(format!("ns-missing-root-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::new(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+
+        let node = qualified_id("probe", "src/lib.rs");
+        let previous = MemoryPayload {
+            content: "Path: src/lib.rs".to_string(),
+            user_id: "auto-ingestor".to_string(),
+            memory_type: "file".to_string(),
+            agent_name: None,
+            location: "src/lib.rs".to_string(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        store.upsert("probe", &node, vec![0.0; 4], previous).await.expect("seed a previous ingest");
+
+        let missing = std::env::temp_dir().join(format!("ns-no-such-dir-{}", uuid::Uuid::new_v4()));
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(&missing, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe").await;
+
+        assert!(outcome.is_err(), "a root that does not exist is an error, not an empty ingest");
+        assert!(
+            store.get("probe", &node).await.expect("read back").is_some(),
+            "and the previous ingest is still there"
+        );
     }
 }
