@@ -561,6 +561,24 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
     }
 }
 
+/// One stored anchor as `src/lib.rs:10-20 (parse)`. add_memory stores the path
+/// as `file`; `path` is the name the tool's own arguments use.
+fn render_anchor(anchor: &Value) -> String {
+    let mut out = anchor
+        .get("file")
+        .or_else(|| anchor.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(lines) = anchor.get("lines").and_then(|v| v.as_str()).filter(|l| !l.is_empty()) {
+        out.push_str(&format!(":{}", lines));
+    }
+    if let Some(symbol) = anchor.get("symbol").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        out.push_str(&format!(" ({})", symbol));
+    }
+    out
+}
+
 /// One rendering of a memory, shared by search and get, so a record reads the
 /// same however the agent reached it.
 fn format_memory(id: &str, payload: &MemoryPayload) -> String {
@@ -574,12 +592,18 @@ fn format_memory(id: &str, payload: &MemoryPayload) -> String {
             out.push_str(&format!(" (Lines: {})", payload.location_lines));
         }
     }
-    if let Some(locations) = payload.metadata.get("locations") {
-        if let Some(arr) = locations.as_array() {
-            if !arr.is_empty() {
-                out.push_str(&format!("\nCode Graph Locations: {}", locations));
-            }
-        }
+    // add_memory stores every anchor under `refs`, one {file, lines, symbol} each.
+    // This used to read `locations`, which nothing writes, so only the first
+    // anchor ever showed -- as File Location above, with no symbol.
+    if let Some(anchors) = payload
+        .metadata
+        .get("refs")
+        .or_else(|| payload.metadata.get("locations"))
+        .and_then(|v| v.as_array())
+        .filter(|arr| !arr.is_empty())
+    {
+        let rendered: Vec<String> = anchors.iter().map(render_anchor).collect();
+        out.push_str(&format!("\nCode Graph Locations: {}", rendered.join(", ")));
     }
     for (key, label) in [
         ("related_to", "Related Nodes"),
@@ -657,6 +681,20 @@ mod tests {
         assert!(out.contains("Content: checkpoint every write"));
         assert!(out.contains("File Location: src/store/ladybug.rs (Lines: 428-440)"));
         assert!(out.contains("Governs: [\"src/daemon.rs\"]"));
+    }
+
+    #[test]
+    fn every_stored_anchor_is_rendered_with_its_lines_and_symbol() {
+        let mut p = payload("parse before storing");
+        p.metadata = serde_json::json!({ "refs": [
+            { "file": "src/parser/ingest.rs", "lines": "133-160", "symbol": "ingest_directory" },
+            { "file": "src/store/ladybug.rs" }
+        ]});
+
+        let out = format_memory("abc-123", &p);
+
+        assert!(out.contains("src/parser/ingest.rs:133-160 (ingest_directory)"), "{}", out);
+        assert!(out.contains("src/store/ladybug.rs"), "{}", out);
     }
 
     #[test]
