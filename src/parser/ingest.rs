@@ -91,12 +91,12 @@ pub fn node_id_for(root: &Path, path: &Path) -> String {
     let relative = if path.is_relative() {
         path.to_path_buf()
     } else {
-        // Absolute: prefer the working directory, so ingesting an absolute
-        // subdirectory of the project still reads relative to the project.
-        std::env::current_dir()
-            .ok()
-            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(Path::to_path_buf))
-            .unwrap_or_else(|| path.strip_prefix(root).unwrap_or(path).to_path_buf())
+        // Absolute: relative to the root being ingested. This used to try the
+        // process's working directory first, which made an id depend on where
+        // the daemon happened to be launched -- ingesting /workspace/Project
+        // from /workspace produced Project/src/main.rs, which no rule names.
+        // The CLI's subdirectory case is handled where the CLI reads its path.
+        path.strip_prefix(root).unwrap_or(path).to_path_buf()
     };
 
     let normalized = normalize_node_path(&relative.to_string_lossy());
@@ -525,6 +525,14 @@ mod tests {
             node_id_for(Path::new("src"), Path::new("src/lib.rs")),
             "src/lib.rs"
         );
+    }
+
+    /// The daemon inherits the working directory of whatever launched it, and a
+    /// parent of the project used to win over the ingest root.
+    #[test]
+    fn a_node_id_does_not_depend_on_the_working_directory() {
+        let root = std::env::current_dir().expect("working directory").join("sub");
+        assert_eq!(node_id_for(&root, &root.join("a.rs")), "a.rs");
     }
 
     #[test]
