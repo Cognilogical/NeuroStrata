@@ -91,6 +91,49 @@ impl IngestObserver for ProgressReporter {
     }
 }
 
+/// Whether two ways of naming a directory name the same one. Canonicalising
+/// settles `.`, `..`, separators and, where the filesystem ignores it, case; if
+/// either path cannot be resolved, the strings have to match exactly.
+fn same_directory(a: &str, b: &str) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The walk a caller should wait on instead of starting one, if there is one.
+///
+/// Attaching is right only for the same directory. A caller naming a different
+/// one used to be attached anyway, and was then told its directory had been
+/// ingested when nothing had walked it. It cannot start a second walk either:
+/// that would clear what the first is rebuilding.
+fn attach_to_running(
+    jobs: &HashMap<String, watch::Receiver<IngestProgress>>,
+    namespace: &str,
+    dir: &str,
+) -> anyhow::Result<Option<watch::Receiver<IngestProgress>>> {
+    let Some(rx) = jobs.get(namespace) else {
+        return Ok(None);
+    };
+    let running_dir = {
+        let progress = rx.borrow();
+        if progress.state != IngestState::Running {
+            return Ok(None);
+        }
+        progress.dir.clone()
+    };
+    if same_directory(&running_dir, dir) {
+        Ok(Some(rx.clone()))
+    } else {
+        Err(anyhow::anyhow!(
+            "namespace '{}' is already ingesting {}; wait for that to finish before ingesting {} into it",
+            namespace,
+            running_dir,
+            dir
+        ))
+    }
+}
+
 /// One walk per namespace, owned here rather than by whoever asked for it.
 #[derive(Default)]
 pub struct IngestJobs {
@@ -121,12 +164,8 @@ impl IngestJobs {
         let mut rx = {
             let mut jobs = self.jobs.lock().unwrap();
 
-            let already_running = jobs
-                .get(namespace)
-                .is_some_and(|rx| rx.borrow().state == IngestState::Running);
-
-            if already_running {
-                jobs.get(namespace).expect("checked just above").clone()
+            if let Some(running) = attach_to_running(&jobs, namespace, dir)? {
+                running
             } else {
                 let (tx, rx) = watch::channel(IngestProgress::started(namespace, dir));
                 jobs.insert(namespace.to_string(), rx.clone());
@@ -294,5 +333,23 @@ mod tests {
             "and is waited for until it finishes"
         );
         finish.await.expect("the walk reports its end");
+    }
+
+    #[test]
+    fn a_second_directory_for_a_running_namespace_is_refused() {
+        let mut jobs = HashMap::new();
+        let (_tx, rx) = watch::channel(IngestProgress::started("ns", "/projects/a"));
+        jobs.insert("ns".to_string(), rx);
+
+        assert!(
+            attach_to_running(&jobs, "ns", "/projects/a").unwrap().is_some(),
+            "the same directory waits on the walk already running"
+        );
+        let refused = attach_to_running(&jobs, "ns", "/projects/b").unwrap_err().to_string();
+        assert!(refused.contains("/projects/a"), "{}", refused);
+        assert!(
+            attach_to_running(&jobs, "other", "/projects/b").unwrap().is_none(),
+            "another namespace starts its own"
+        );
     }
 }
