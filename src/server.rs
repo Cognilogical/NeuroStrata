@@ -647,6 +647,49 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
     }
 }
 
+/// What to tell an agent when this namespace still holds ids written before
+/// they carried a namespace, or None when there is nothing to say.
+///
+/// It rides on get_snapshot because that is the one call an agent is required
+/// to make at the start of a task, and because the snapshot has already fetched
+/// the list this counts from. `doctor` reports the same condition, but doctor
+/// only runs with the daemon stopped, so an agent in a session would otherwise
+/// never learn of it -- and an agent is the only party present to raise it.
+///
+/// The message deliberately hands the work to the user rather than describing
+/// something to attempt. Migrating means stopping the daemon, which is the
+/// human's transport and would end the session's own connection; an agent that
+/// shelled out to do it would be going around the surface it was given.
+fn unmigrated_ids_notice(namespace: &str, memories: &[crate::traits::SearchResult]) -> Option<String> {
+    let ingested: Vec<&crate::traits::SearchResult> = memories
+        .iter()
+        .filter(|m| m.payload.user_id == "auto-ingestor")
+        .collect();
+
+    let stale = ingested
+        .iter()
+        .filter(|m| !crate::parser::ingest::is_qualified(namespace, &m.id))
+        .count();
+
+    if stale == 0 {
+        return None;
+    }
+
+    Some(format!(
+        "MIGRATION NEEDED -- {} of {} ingested ids in '{}' predate namespace qualification.\n\
+         They resolve, but the next project ingesting a shared path takes them.\n\
+         Not yours to run: it needs the daemon stopped. Give the user:\n\n  \
+         neurostrata-mcp backup <dir>      # daemon still up\n  \
+         neurostrata-mcp shutdown\n  \
+         neurostrata-mcp ingest <dir> {}\n\n\
+         Backup first: re-ingest rewrites every id.",
+        stale,
+        ingested.len(),
+        namespace,
+        namespace
+    ))
+}
+
 async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
         Some(n) => n,
@@ -656,6 +699,10 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> S
     let namespace = namespace.as_str();
 
     if let Ok(mut all_memories) = store.list(namespace, None).await {
+        // Counted from the list the snapshot already had to fetch, so this
+        // costs nothing beyond the scan.
+        let migration = unmigrated_ids_notice(namespace, &all_memories);
+
         let now = chrono::Utc::now().timestamp();
         all_memories.retain(|r| {
             match r.payload.metadata.get("valid_to") {
@@ -670,10 +717,15 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> S
         });
         all_memories.truncate(5);
 
-        if all_memories.is_empty() {
+        let snapshot = if all_memories.is_empty() {
             format!("No active memories found for namespace: {}", namespace)
         } else {
             serde_json::to_string_pretty(&all_memories).unwrap()
+        };
+
+        match migration {
+            Some(notice) => format!("{}\n\n{}", snapshot, notice),
+            None => snapshot,
         }
     } else {
         "Failed to list memories or namespace does not exist.".to_string()
@@ -1018,6 +1070,70 @@ mod startup_tests {
             Duration::from_secs(1),
             BUDGET
         ));
+    }
+}
+
+#[cfg(test)]
+mod migration_notice_tests {
+    use super::unmigrated_ids_notice;
+    use crate::traits::{MemoryPayload, SearchResult};
+
+    fn node(id: &str, user_id: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            score: 0.0,
+            payload: MemoryPayload {
+                content: String::new(),
+                location: String::new(),
+                location_lines: String::new(),
+                memory_type: "file".to_string(),
+                metadata: serde_json::json!({}),
+                user_id: user_id.to_string(),
+                agent_name: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_migrated_namespace_says_nothing() {
+        let memories = vec![
+            node("NeuroStrata::src", "auto-ingestor"),
+            node("NeuroStrata::src/main.rs", "auto-ingestor"),
+        ];
+        assert!(unmigrated_ids_notice("NeuroStrata", &memories).is_none());
+    }
+
+    /// Hand-written memories are keyed by UUID and always will be. Counting
+    /// them as unmigrated would make the notice permanent and therefore
+    /// ignorable, which is worse than not having it.
+    #[test]
+    fn hand_written_memories_are_not_counted() {
+        let memories = vec![
+            node("550e8400-e29b-41d4-a716-446655440000", "anthomus"),
+            node("NeuroStrata::src", "auto-ingestor"),
+        ];
+        assert!(unmigrated_ids_notice("NeuroStrata", &memories).is_none());
+    }
+
+    #[test]
+    fn an_unmigrated_namespace_says_how_many_and_what_to_run() {
+        let memories = vec![
+            node("src", "auto-ingestor"),
+            node("README.md", "auto-ingestor"),
+            node("NeuroStrata::src/main.rs", "auto-ingestor"),
+        ];
+        let notice = unmigrated_ids_notice("NeuroStrata", &memories)
+            .expect("two of the three ids predate qualification");
+        assert!(notice.contains("2 of 3"), "{}", notice);
+        assert!(notice.contains("neurostrata-mcp backup"), "{}", notice);
+        assert!(notice.contains("neurostrata-mcp ingest"), "{}", notice);
+        // The agent must hand this to the user, not attempt it.
+        assert!(notice.contains("MIGRATION NEEDED"), "{}", notice);
+    }
+
+    #[test]
+    fn a_namespace_with_nothing_ingested_says_nothing() {
+        assert!(unmigrated_ids_notice("NeuroStrata", &[]).is_none());
     }
 }
 
