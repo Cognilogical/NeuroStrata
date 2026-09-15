@@ -8,11 +8,18 @@
                 "impls": "(impl_item type: (type_identifier) @name) @impl"
             }
         },
-        "javascript": {
-            "extensions": ["js", "jsx", "ts", "tsx"],
+        "typescript": {
+            "extensions": ["ts"],
             "queries": {
                 "functions": "(function_declaration name: (identifier) @name) @func",
-                "classes": "(class_declaration name: (identifier) @name) @class"
+                "classes": "(class_declaration name: (type_identifier) @name) @class"
+            }
+        },
+        "tsx": {
+            "extensions": ["tsx"],
+            "queries": {
+                "functions": "(function_declaration name: (identifier) @name) @func",
+                "classes": "(class_declaration name: (type_identifier) @name) @class"
             }
         },
         "python": {
@@ -20,6 +27,22 @@
             "queries": {
                 "functions": "(function_definition name: (identifier) @name) @func",
                 "classes": "(class_definition name: (identifier) @name) @class"
+            }
+        },
+        "go": {
+            "extensions": ["go"],
+            "queries": {
+                "functions": "(function_declaration name: (identifier) @name) @func",
+                "methods": "(method_declaration name: (field_identifier) @name) @method",
+                "types": "(type_declaration (type_spec name: (type_identifier) @name)) @type"
+            }
+        },
+        "java": {
+            "extensions": ["java"],
+            "queries": {
+                "classes": "(class_declaration name: (identifier) @name) @class",
+                "methods": "(method_declaration name: (identifier) @name) @method",
+                "interfaces": "(interface_declaration name: (identifier) @name) @interface"
             }
         }
     }

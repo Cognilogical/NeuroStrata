@@ -79,6 +79,26 @@ enum Commands {
         location: Option<String>,
     },
 
+    /// Stop a running daemon so it checkpoints before exiting
+    Shutdown,
+
+    /// Write a portable copy of the database to a directory
+    Backup {
+        /// Directory to write the backup into. Must not already exist
+        dir: String,
+    },
+
+    /// Rebuild a database from a backup, into a file that does not exist yet
+    Restore {
+        /// Directory a backup was written to
+        dir: String,
+
+        /// Where to build the restored database. Defaults to the configured
+        /// db_path, which must not already exist
+        #[arg(long)]
+        into: Option<String>,
+    },
+
     /// Edit an existing memory
     Edit {
         /// The target namespace
@@ -98,17 +118,213 @@ enum Commands {
     },
 }
 
+/// What a health probe actually found.
+///
+/// Silence is the case worth naming. A daemon busy inside the engine answers
+/// nothing for minutes at a time, and reporting that as "no daemon is running"
+/// sends people hunting a process that is very much alive -- or worse, killing
+/// it and losing every write since the last checkpoint. Silence cannot be
+/// resolved from here either: on this machine a connection to the port with
+/// nothing behind it hangs instead of being refused, so a timeout genuinely
+/// means "one of two things". Say that, rather than pick one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DaemonProbe {
+    Responsive,
+    Silent,
+    Absent,
+}
+
+/// Kept separate from the request so the distinction can be tested without a
+/// socket. Only an explicit refusal proves absence.
+fn classify_probe(reached: bool, refused: bool) -> DaemonProbe {
+    if reached {
+        DaemonProbe::Responsive
+    } else if refused {
+        DaemonProbe::Absent
+    } else {
+        DaemonProbe::Silent
+    }
+}
+
+async fn probe_daemon() -> DaemonProbe {
+    match reqwest::Client::new()
+        .get("http://127.0.0.1:34343/health")
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .await
+    {
+        Ok(_) => classify_probe(true, false),
+        Err(e) => classify_probe(false, e.is_connect()),
+    }
+}
+
+/// The file a daemon holds an exclusive lock on for its whole life.
+///
+/// The port cannot say when a daemon is finished: axum closes its listener
+/// before the final checkpoint runs, so a refused connection arrives while the
+/// process still owns the database. The OS releases this lock only when the
+/// process exits -- cleanly, killed or crashed -- so a held lock proves the
+/// daemon is still there, and a free one proves it is gone.
+fn daemon_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".daemon.lock");
+    std::path::PathBuf::from(path)
+}
+
+fn open_daemon_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let path = daemon_lock_path(db_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Held for the life of the daemon process and never dropped, so the lock goes
+/// with the process rather than with anything that runs before the database
+/// has closed.
+static DAEMON_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// What a stopping daemon leaves in its lock file for `shutdown` to read.
+const FINAL_CHECKPOINT_OK: &str = "checkpointed";
+
+/// Takes the daemon lock, or refuses: a second daemon would open the database
+/// while the first one is writing to it.
+fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let file = open_daemon_lock(db_path)?;
+    match file.try_lock() {
+        Ok(()) => {
+            // Whatever the last daemon reported is not about this one.
+            file.set_len(0)?;
+            Ok(file)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!(
+            "Another NeuroStrata daemon is already running against {:?}.",
+            db_path
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Whether some process holds the daemon lock right now.
+fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
+    match open_daemon_lock(db_path) {
+        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
+    }
+}
+
+/// A daemon that holds the database but did not answer the probe is busy, not
+/// gone, and opening the database from here would contend with its writer. An
+/// answering daemon is not busy in this sense: it can be asked to do the work.
+fn daemon_busy(probe: DaemonProbe, lock_held: bool) -> bool {
+    lock_held && probe != DaemonProbe::Responsive
+}
+
+/// The CLI names ingested files relative to where it runs, as CLI-readme.md
+/// documents: `ingest ./src` from a project yields `src/lib.rs`. An absolute
+/// path to a subdirectory of the working directory is the same request written
+/// out in full, so it is walked as that relative path. The working directory
+/// itself stays absolute, so its root node is named the way the GUI names it.
+fn cli_ingest_root(dir: &str) -> String {
+    let path = std::path::Path::new(dir);
+    if path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(rest) = path.strip_prefix(&cwd) {
+                if !rest.as_os_str().is_empty() {
+                    return rest.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+    dir.to_string()
+}
+
+const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
+
+/// Records how the daemon's final checkpoint went, for `shutdown` to report.
+fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
+    use std::io::Write;
+    if let Some(file) = DAEMON_LOCK.get() {
+        let report = match outcome {
+            Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
+            Err(e) => format!("error: {}", e),
+        };
+        let _ = file.set_len(0);
+        let _ = (&*file).write_all(report.as_bytes());
+        let _ = file.sync_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_daemon_lock_is_seen_and_goes_with_its_holder() {
+        let db = std::env::temp_dir()
+            .join(format!("ns-daemon-lock-{}", uuid::Uuid::new_v4()))
+            .join("ladybug.db");
+        assert!(!daemon_holds_lock(&db), "nothing holds a fresh lock");
+
+        let held = take_daemon_lock(&db).expect("the first daemon takes the lock");
+        assert!(daemon_holds_lock(&db), "a live holder is visible to shutdown");
+        assert!(take_daemon_lock(&db).is_err(), "a second daemon is refused");
+
+        drop(held);
+        assert!(!daemon_holds_lock(&db), "the lock is free once its holder is gone");
+    }
+
+    #[test]
+    fn only_a_refusal_proves_no_daemon() {
+        assert_eq!(classify_probe(false, true), DaemonProbe::Absent);
+    }
+
+    #[test]
+    fn silence_is_not_reported_as_an_absent_daemon() {
+        assert_eq!(classify_probe(false, false), DaemonProbe::Silent);
+    }
+
+    #[test]
+    fn an_answered_probe_is_a_live_daemon() {
+        assert_eq!(classify_probe(true, false), DaemonProbe::Responsive);
+    }
+
+    #[test]
+    fn an_absolute_cli_path_under_the_working_directory_is_walked_relative() {
+        let cwd = std::env::current_dir().expect("working directory");
+        assert_eq!(cli_ingest_root(&cwd.join("src").to_string_lossy()), "src");
+        assert_eq!(
+            cli_ingest_root(&cwd.to_string_lossy()),
+            cwd.to_string_lossy(),
+            "the working directory itself stays absolute"
+        );
+        assert_eq!(cli_ingest_root("./src"), "./src");
+    }
+
+    #[test]
+    fn a_daemon_that_holds_the_lock_but_is_silent_is_busy_not_gone() {
+        assert!(daemon_busy(DaemonProbe::Silent, true));
+        assert!(daemon_busy(DaemonProbe::Absent, true), "listener closed, still checkpointing");
+        assert!(!daemon_busy(DaemonProbe::Silent, false), "silence with no holder is no daemon");
+        assert!(!daemon_busy(DaemonProbe::Responsive, true), "an answering daemon is asked, not refused");
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Check if the daemon is already running on port 34343
-    let daemon_running = reqwest::Client::new()
-        .get("http://127.0.0.1:34343/health")
-        .timeout(std::time::Duration::from_millis(500))
-        .send()
-        .await
-        .is_ok();
+    let probe = probe_daemon().await;
+    // Only a daemon that answered gets to hold the database lock as far as the
+    // CLI is concerned. Treating silence as "running" would refuse every local
+    // command on a machine where an empty port times out rather than refuses.
+    let daemon_running = probe == DaemonProbe::Responsive;
 
     // If no arguments, start standard MCP stdio mode
     if args.len() == 1 {
@@ -149,7 +365,7 @@ async fn main() -> anyhow::Result<()> {
     let command_str = args[1].as_str();
     let recognized = matches!(
         command_str,
-        "daemon" | "namespaces" | "list" | "ingest" | "export-graph" | "delete" | "add" | "edit" | "-h" | "--help" | "-V" | "--version"
+        "daemon" | "shutdown" | "backup" | "restore" | "namespaces" | "list" | "ingest" | "export-graph" | "delete" | "add" | "edit" | "-h" | "--help" | "-V" | "--version"
     );
 
     if !recognized {
@@ -175,23 +391,183 @@ async fn main() -> anyhow::Result<()> {
             Commands::Daemon => {
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");
                 let config = Config::from_default_path()?;
+                // Taken before the database opens. `shutdown` waits for this lock
+                // to be released rather than for the port to close.
+                let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
                 let embedder = Arc::new(FastEmbedder::new()?);
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embedder.dimensions(),
                 )?);
                 vector_store.init("global").await?;
-                daemon::start_daemon(embedder, vector_store).await?;
+                let outcome = daemon::start_daemon(embedder, vector_store).await;
+                record_final_checkpoint(&outcome);
+                outcome?;
+            }
+            Commands::Shutdown => {
+                let config = Config::from_default_path()?;
+                let db_path = config.db_path.clone();
+                let held = daemon_holds_lock(&db_path);
+
+                match probe {
+                    DaemonProbe::Absent if !held => {
+                        println!("No daemon is running on 127.0.0.1:34343.");
+                        return Ok(());
+                    }
+                    DaemonProbe::Absent => {
+                        eprintln!("A daemon has stopped listening but still holds the database, so it is finishing its final checkpoint. Waiting for it to exit.");
+                    }
+                    DaemonProbe::Silent => {
+                        eprintln!("Nothing answered on 127.0.0.1:34343 within 500ms. Either no daemon is running, or one is busy in the database and cannot answer yet -- those look identical from here. Sending a stop request and waiting; if a daemon is there, this can take a couple of minutes. Do not kill it.");
+                    }
+                    DaemonProbe::Responsive => {}
+                }
+
+                let client = reqwest::Client::new();
+                // A busy daemon may not answer this either. That is not a
+                // failure: the request is queued, so fall through to the wait.
+                if probe != DaemonProbe::Absent {
+                    if let Err(e) = client
+                        .post("http://127.0.0.1:34343/shutdown")
+                        .timeout(std::time::Duration::from_secs(10))
+                        .send()
+                        .await
+                    {
+                        if e.is_connect() && !daemon_holds_lock(&db_path) {
+                            println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
+                            return Ok(());
+                        }
+                        eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
+                    }
+                }
+
+                // Wait for the process, not the port. The listener closes before
+                // the final checkpoint runs, so a quiet port proves nothing; the
+                // lock is released only once the process has exited. A daemon
+                // that was already wedged gets longer, because engine waits of
+                // two and a half minutes have been measured.
+                let mut saw_lock = held;
+                let attempts = if probe == DaemonProbe::Responsive { 900 } else { 2400 };
+                for _ in 0..attempts {
+                    if daemon_holds_lock(&db_path) {
+                        saw_lock = true;
+                    } else if saw_lock {
+                        let report = std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
+                        if report == FINAL_CHECKPOINT_OK {
+                            println!("Daemon stopped and checkpointed.");
+                            return Ok(());
+                        }
+                        if report.is_empty() {
+                            eprintln!("The daemon exited without reporting its final checkpoint, so writes since the last one may not be on disk.");
+                        } else {
+                            eprintln!("The daemon exited, but its final checkpoint did not complete: {}", report);
+                        }
+                        std::process::exit(1);
+                    } else if let Err(e) = client
+                        .get("http://127.0.0.1:34343/health")
+                        .timeout(std::time::Duration::from_millis(500))
+                        .send()
+                        .await
+                    {
+                        // No lock was ever seen: a daemon built before the lock
+                        // existed. Only a refused connection counts as it having
+                        // gone, and its checkpoint cannot be confirmed.
+                        if e.is_connect() {
+                            println!("Daemon stopped. It predates the shutdown lock, so its final checkpoint cannot be confirmed from here.");
+                            return Ok(());
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+                eprintln!(
+                    "The daemon was still listening after {} seconds. It is probably still finishing a database operation -- leave it, and do not kill it: writes since the last checkpoint would be lost.",
+                    attempts / 10
+                );
+                std::process::exit(1);
+            }
+            Commands::Backup { dir } => {
+                // The database is single-writer. When a daemon holds it, ask the
+                // daemon to do the work rather than fighting it for the lock.
+                if daemon_running {
+                    let res = reqwest::Client::new()
+                        .post("http://127.0.0.1:34343/backup")
+                        .json(&serde_json::json!({ "dir": dir }))
+                        .send()
+                        .await?;
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        eprintln!("Backup failed: {}", body);
+                        std::process::exit(1);
+                    }
+                    println!("{}", body);
+                    return Ok(());
+                }
+
+                let config = Config::from_default_path()?;
+                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                    eprintln!("{}", DAEMON_BUSY_MESSAGE);
+                    std::process::exit(1);
+                }
+                // The width opens the store; exporting never embeds anything.
+                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                    config.db_path.to_string_lossy().to_string(),
+                    embed::configured_dimensions()?,
+                )?);
+                vector_store.export_database(&dir).await?;
+                println!("Backed up to {}", dir);
+                return Ok(());
+            }
+            Commands::Restore { dir, into } => {
+                // IMPORT DATABASE replays the exported schema, so it only works
+                // against a database that has none. Restoring therefore builds a
+                // new file rather than overwriting a live one -- nothing existing
+                // is dropped, and the switch stays a deliberate step.
+                let config = Config::from_default_path()?;
+                let target = into
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| config.db_path.clone());
+
+                if target.exists() {
+                    eprintln!("{:?} already exists, and restoring into it would mean replacing what it holds.", target);
+                    eprintln!("Restore into a new path instead: neurostrata-mcp restore <backup-dir> --into <new-db-path>");
+                    eprintln!("Then point db_path in ~/.config/neurostrata/config.json at it once you have checked it.");
+                    std::process::exit(1);
+                }
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+
+                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                    target.to_string_lossy().to_string(),
+                    embed::configured_dimensions()?,
+                )?);
+                // Deliberately no init() here: the backup carries its own schema.
+                vector_store.import_database(&dir).await?;
+
+                let namespaces = vector_store.list_namespaces().await.unwrap_or_default();
+                println!("Restored {} into {:?}", dir, target);
+                if !namespaces.is_empty() {
+                    println!("It holds {} namespace(s): {}", namespaces.len(), namespaces.join(", "));
+                }
+                if target != config.db_path {
+                    println!("To use it, set db_path in ~/.config/neurostrata/config.json to {:?}", target);
+                }
+                return Ok(());
             }
             other => {
                 if daemon_running {
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
                     eprintln!("You cannot run database-modifying CLI commands while the daemon is active.");
-                    eprintln!("Please shut down OpenCode, or kill the daemon process to run this command.");
+                    eprintln!("Run `neurostrata-mcp shutdown` to stop it safely -- killing the process discards any writes made since the last checkpoint.");
                     std::process::exit(1);
                 }
                 
                 let config = Config::from_default_path()?;
+                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                    eprintln!("{}", DAEMON_BUSY_MESSAGE);
+                    std::process::exit(1);
+                }
                 let embedder = Arc::new(FastEmbedder::new()?);
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
@@ -222,6 +598,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Commands::Ingest { dir, namespace, schema_path } => {
+                        let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
                             std::fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -279,7 +656,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("Successfully edited memory {}", id);
                         }
                     }
-                    Commands::Daemon => unreachable!(),
+                    Commands::Daemon | Commands::Shutdown | Commands::Backup { .. } | Commands::Restore { .. } => unreachable!(),
                 }
             }
         }

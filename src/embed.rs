@@ -81,6 +81,31 @@ fn find_existing_cache_dir() -> PathBuf {
     primary_neuro_cache
 }
 
+/// The model this process is configured to use: the one NEUROSTRATA_MODEL names
+/// when it is acceptable, otherwise the first acceptable entry.
+fn configured_model() -> Result<AcceptableEmbedder> {
+    let acceptable_models = get_acceptable_embedders()?;
+    let env_model = std::env::var("NEUROSTRATA_MODEL").unwrap_or_default();
+    Ok(acceptable_models
+        .iter()
+        .find(|m| m.model_name.eq_ignore_ascii_case(&env_model))
+        .unwrap_or(&acceptable_models[0])
+        .clone())
+}
+
+/// The embedding width of the configured model, without loading the model.
+///
+/// Backup and restore need only this number to open the store. Loading the model
+/// can mean a 523 MB download, which is the wrong thing to require on the fresh
+/// or offline machine a restore is usually run on.
+pub fn configured_dimensions() -> Result<usize> {
+    Ok(configured_model()?.dimensions)
+}
+
+/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
+/// at ~3.5 characters per token, with headroom for the header lines.
+const MAX_EMBED_TOKENS: usize = 2048;
+
 pub struct FastEmbedder {
     model: TextEmbedding,
     dimensions: usize,
@@ -88,13 +113,8 @@ pub struct FastEmbedder {
 
 impl FastEmbedder {
     pub fn new() -> Result<Self> {
-        let acceptable_models = get_acceptable_embedders()?;
-        
-        let env_model = std::env::var("NEUROSTRATA_MODEL").unwrap_or_default();
-        let target_model = acceptable_models.iter()
-            .find(|m| m.model_name.eq_ignore_ascii_case(&env_model))
-            .unwrap_or(&acceptable_models[0]);
-        
+        let target_model = configured_model()?;
+
         let model_enum = EmbeddingModel::from_str(&target_model.model_name)
             .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
 
@@ -106,9 +126,14 @@ impl FastEmbedder {
 
         eprintln!("Initializing FastEmbedder with model: {} using cache: {:?}", target_model.model_name, cache_dir);
 
+        // fastembed defaults to 512 tokens regardless of what the model supports
+        // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
+        // what ingestion actually stores per symbol is wasted, so this is set to
+        // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
         let model = TextEmbedding::try_new(
             InitOptions::new(model_enum)
                 .with_cache_dir(cache_dir)
+                .with_max_length(MAX_EMBED_TOKENS)
                 .with_show_download_progress(true),
         )?;
         
@@ -128,5 +153,15 @@ impl Embedder for FastEmbedder {
 
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_configured_width_is_known_without_loading_a_model() {
+        assert!(configured_dimensions().expect("embedders resolve") > 0);
     }
 }

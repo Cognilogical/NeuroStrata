@@ -25,6 +25,19 @@ pub struct SearchResult {
     pub payload: MemoryPayload,
 }
 
+/// What an attempt to move a memory between namespaces found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RelocateOutcome {
+    Moved,
+    NotFound,
+    /// Written by directory ingestion. Its id carries the namespace that owns
+    /// it, so the move is refused: ingest the directory into the other
+    /// namespace instead.
+    Ingested,
+    /// Source and target are the same namespace, so there is nothing to do.
+    SameNamespace,
+}
+
 /// The core interface for generating vector embeddings from text.
 /// By making this a trait, we can swap between Local (FastEmbed/ONNX),
 /// Remote (Ollama), or Cloud (OpenAI) implementations.
@@ -65,14 +78,34 @@ pub trait VectorStore: Send + Sync {
     /// Delete a specific memory by its ID.
     async fn delete(&self, namespace: &str, id: &str) -> Result<()>;
 
-    /// Clear all auto-ingested AST data from a namespace
-    async fn clear_ast(&self, namespace: &str) -> Result<()>;
+    /// Remove every row owned by the directory ingester in a namespace: the AST
+    /// symbols and the directory/file nodes, which ingestion then rebuilds.
+    async fn clear_ingested(&self, namespace: &str) -> Result<()>;
+
+    /// Rebuilds the edges a namespace's memories declare, and reports how many
+    /// were materialised.
+    ///
+    /// An edge is written when the memory that declares it is written, so a
+    /// target that did not exist yet simply produced nothing. Ingestion deletes
+    /// and re-creates every code node, taking those edges with it -- and the
+    /// rules pointing at that code are not rewritten, so the links stay lost
+    /// until something replays them (bead neurostrata-sij).
+    async fn relink_edges(&self, namespace: &str) -> Result<usize>;
 
     /// List all memories
     async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
 
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
+
+    /// Moves a memory to another namespace by changing that one field, so its
+    /// id, vector and edges stay as they were and nothing is ever deleted.
+    ///
+    /// Not built from upsert and delete: upsert deliberately never rewrites a
+    /// namespace, so that an ingest cannot pull another project's node into its
+    /// own, which makes "write to the target, delete from the source" delete the
+    /// only copy.
+    async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome>;
 
     /// List all existing namespaces (tables)
     async fn list_namespaces(&self) -> Result<Vec<String>>;
@@ -82,4 +115,27 @@ pub trait VectorStore: Send + Sync {
 
     /// Increment the access count of a specific memory by its ID.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()>;
+
+    /// Write a portable copy of the whole database into `dir`, which must be
+    /// empty. The engine's own export: parquet per table plus the schema.
+    async fn export_database(&self, dir: &str) -> Result<()>;
+
+    /// Load a database previously written by `export_database`. Replays the
+    /// exported schema, so it is destructive against a database that has one.
+    async fn import_database(&self, dir: &str) -> Result<()>;
+
+    /// Flush everything written so far to durable storage. A long-running
+    /// process must call this; writes that only reached the WAL are discarded
+    /// if the process dies before the engine checkpoints on its own.
+    async fn checkpoint(&self) -> Result<()>;
+
+    /// True when a write has landed that no checkpoint has flushed yet.
+    ///
+    /// A checkpoint waits for every active transaction to drain, so it cannot
+    /// get that window while queries keep arriving. Knowing there is nothing to
+    /// flush lets the daemon skip the attempt entirely rather than block on one
+    /// that would only time out. Conservative by default: assume there is.
+    fn is_dirty(&self) -> bool {
+        true
+    }
 }
