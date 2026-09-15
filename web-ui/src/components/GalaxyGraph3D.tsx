@@ -1,7 +1,31 @@
-import { useRef, useMemo, useEffect, useCallback } from 'react';
+import { useRef, useMemo, useEffect, useCallback, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import ForceGraph3D from 'react-force-graph-3d';
 import * as THREE from 'three';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
+
+/// Whether this webview can actually give three.js a canvas to draw on.
+///
+/// The 3D view failed silently before this check existed: no crash, no message,
+/// just the black background of an empty scene, which is indistinguishable from
+/// a graph that has not loaded. A webview without hardware acceleration is a
+/// normal state, not an error -- say so and offer the 2D view.
+const detectWebGL = (): { ok: boolean; detail: string } => {
+  try {
+    const canvas = document.createElement('canvas');
+    const gl =
+      (canvas.getContext('webgl2') as WebGL2RenderingContext | null) ??
+      (canvas.getContext('webgl') as WebGLRenderingContext | null);
+    if (!gl) {
+      return { ok: false, detail: 'the webview refused a WebGL context' };
+    }
+    const info = gl.getExtension('WEBGL_debug_renderer_info');
+    const renderer = info ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : 'unknown renderer';
+    return { ok: true, detail: renderer };
+  } catch (e) {
+    return { ok: false, detail: String(e) };
+  }
+};
 
 interface Props {
   data: GraphData;
@@ -42,7 +66,43 @@ const getGlowTexture = () => {
 
 export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: Props) => {
   const fgRef = useRef<any>(null);
-  
+  const [webgl] = useState(detectWebGL);
+
+  useEffect(() => {
+    invoke('log_message', {
+      msg: webgl.ok
+        ? `3D view: WebGL available (${webgl.detail})`
+        : `3D view unavailable: ${webgl.detail}`,
+    });
+  }, [webgl]);
+
+  // Frame the graph once per load. The camera starts around 870 units out while
+  // the simulation settles the whole graph inside roughly 100 units, so every
+  // sprite lands in a dim smudge a few pixels wide in the middle of a black
+  // screen -- which reads as "the 3D view is broken" (bead neurostrata-u30).
+  // The 2D view never had the problem because its default zoom happens to suit
+  // that scale.
+  const framedFor = useRef<GraphData | null>(null);
+
+  const frameGraph = useCallback(() => {
+    if (!fgRef.current || !data?.nodes?.length || framedFor.current === data) return;
+    framedFor.current = data;
+    try {
+      fgRef.current.zoomToFit(600, 80);
+      invoke('log_message', { msg: `3D view framed ${data.nodes.length} nodes` });
+    } catch (e) {
+      invoke('log_message', { msg: `3D view could not frame the graph: ${e}` });
+    }
+  }, [data]);
+
+  useEffect(() => {
+    framedFor.current = null;
+    // The engine usually settles first and onEngineStop does the framing; this
+    // is the backstop for a graph small enough that it never fires.
+    const timer = setTimeout(frameGraph, 2500);
+    return () => clearTimeout(timer);
+  }, [data, frameGraph]);
+
   useEffect(() => {
     if (fgRef.current) {
       // Basic repulsion to spread out nodes
@@ -200,6 +260,24 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     return (link.type === 'RELATES_TO' || link.type === 'links_to') ? 3 : 1.5;
   }, [selectedNode]);
 
+  if (!webgl.ok) {
+    return (
+      <div className="absolute inset-0 bg-black z-0 flex items-center justify-center p-8">
+        <div className="max-w-md text-center border border-white/15 rounded-2xl bg-white/5 px-8 py-6">
+          <p className="text-lg font-semibold text-blue-200">The 3D view needs WebGL</p>
+          <p className="mt-2 text-sm text-gray-300">
+            This window could not get a WebGL context, so the galaxy has nothing to draw on
+            ({webgl.detail}). Turn off the 3D switch to use the 2D graph, which draws on a plain
+            canvas and shows the same memories and edges.
+          </p>
+          <p className="mt-3 text-xs text-gray-500">
+            Hardware acceleration being off or unavailable is the usual cause.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="absolute inset-0 bg-black z-0">
       <ForceGraph3D
@@ -211,6 +289,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
         linkWidth={getLinkWidth}
         onNodeClick={(n) => onNodeClick(n as MemoryNode)}
         onLinkClick={(l) => onLinkClick(l as MemoryLink)}
+        onEngineStop={frameGraph}
       />
     </div>
   );

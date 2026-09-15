@@ -18,3 +18,13 @@ tauri-plugin-store = "2.4.2"
 dirs = "6.0.0"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 
+[features]
+# The tauri crate's build script sets `dev = !custom_protocol`. Without this
+# alias every build is a dev build, and the webview loads tauri.conf.json's
+# devUrl -- http://localhost:5173 -- rather than the bundled web-ui/dist. A
+# release built that way shows whatever happens to be serving on that port on
+# the user's machine, which is how this was found. DO NOT REMOVE.
+#
+# `tauri build` passes it; a plain cargo build needs --features custom-protocol.
+custom-protocol = ["tauri/custom-protocol"]
+
