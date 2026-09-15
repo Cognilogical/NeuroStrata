@@ -130,12 +130,21 @@ fn symbol_id(path: &str, kind: &str, name: &str, start_line: usize) -> String {
     format!("{}#{}:{}@{}", path, kind, name, start_line)
 }
 
+/// Told what the walk has done so far, so a caller does not have to wait for
+/// the whole thing to find out. Implementations are called from the walk, so
+/// they must be cheap and must not block.
+pub trait IngestObserver: Send + Sync {
+    fn file_ingested(&self, path: &str, symbols: usize);
+    fn relinked(&self, edges: usize);
+}
+
 pub async fn ingest_directory(
     dir_path: &Path,
     schema: &ParserSchema,
     embedder: Arc<dyn Embedder>,
     vector_store: Arc<dyn VectorStore>,
     namespace: &str,
+    observer: Option<Arc<dyn IngestObserver>>,
 ) -> anyhow::Result<()> {
     // Prove the root is a readable directory before anything is deleted. A
     // missing or mistyped path used to clear the namespace, walk nothing -- the
@@ -392,6 +401,9 @@ pub async fn ingest_directory(
 
                     if symbols_stored > 0 {
                         println!("Ingested {} symbols from {}", symbols_stored, path.display());
+                        if let Some(observer) = &observer {
+                            observer.file_ingested(&path.display().to_string(), symbols_stored);
+                        }
                     }
                 }
             }
@@ -422,6 +434,9 @@ pub async fn ingest_directory(
         )
     })?;
     println!("Relinked {} declared edges in namespace {}", linked, namespace);
+    if let Some(observer) = &observer {
+        observer.relinked(linked);
+    }
 
     Ok(())
 }
@@ -672,7 +687,7 @@ mod tests {
 
         let missing = std::env::temp_dir().join(format!("ns-no-such-dir-{}", uuid::Uuid::new_v4()));
         let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
-        let outcome = ingest_directory(&missing, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe").await;
+        let outcome = ingest_directory(&missing, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None).await;
 
         assert!(outcome.is_err(), "a root that does not exist is an error, not an empty ingest");
         assert!(

@@ -16,6 +16,8 @@ const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 struct AppState {
     embedder: Arc<dyn Embedder>,
     vector_store: Arc<dyn VectorStore>,
+    /// The walks in flight, which outlive the requests that started them.
+    ingests: Arc<crate::ingest_jobs::IngestJobs>,
     /// Fires once, when something asks the daemon to stop. Taken by whoever
     /// gets there first so a second /shutdown call is harmless.
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -55,9 +57,12 @@ struct GraphQuery {
 pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn VectorStore>) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+    // Kept here as well as in the state, because stopping has to wait for it.
+    let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
     let state = AppState {
         embedder,
         vector_store: vector_store.clone(),
+        ingests: ingests.clone(),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
     };
 
@@ -142,6 +147,17 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         })
         .await?;
 
+    let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
+
+    // An ingest runs detached from the request that started it, so the graceful
+    // shutdown above did not wait for it. Stopping without waiting left the
+    // runtime to drop the walk after it had cleared the namespace but before it
+    // had rebuilt or relinked it. The periodic checkpoint keeps running
+    // meanwhile, and is stopped only once the walk is done.
+    if !ingests.wait_idle(ingest_wait_budget(cause)).await {
+        eprintln!("WARNING: an ingest was still running when the daemon had to stop, so its namespace may be only partly rebuilt. Ingest it again.");
+    }
+
     let _ = stop_periodic.send(true);
     let _ = periodic.await;
 
@@ -149,7 +165,6 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
     // A checkpoint needs every transaction to drain, and detached work such as
     // access counting can still be finishing, so a refusal is retried rather
     // than accepted. Exiting after one that never succeeded is an error.
-    let cause = cause.lock().map(|c| *c).unwrap_or(ShutdownCause::Requested);
     let deadline = tokio::time::Instant::now() + final_checkpoint_budget(cause);
     let mut failures: u32 = 0;
     loop {
@@ -237,7 +252,7 @@ async fn handle_get_graph(
 async fn handle_ingest(
     State(state): State<AppState>,
     Json(req): Json<IngestReq>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     // Provide default schema if none passed, but we should use ParserSchema
     let schema_str = r#"
     {
@@ -251,17 +266,30 @@ async fn handle_ingest(
         }
     }
     "#;
-    let schema = crate::parser::schema::ParserSchema::load(schema_str).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    let dir_path = std::path::Path::new(&req.dir);
+    let schema = crate::parser::schema::ParserSchema::load(schema_str)
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     // The GUI derives this from the folder name, so it arrives in whatever
     // case the checkout happens to use (bead neurostrata-fld).
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    crate::parser::ingest::ingest_directory(dir_path, &schema, state.embedder.clone(), state.vector_store.clone(), &namespace)
+
+    // The walk belongs to the registry, not to this request: a client that
+    // disconnects no longer takes it down half-finished (bead neurostrata-7ej).
+    let progress = state
+        .ingests
+        .run(
+            &namespace,
+            &req.dir,
+            schema,
+            state.embedder.clone(),
+            state.vector_store.clone(),
+        )
         .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    Ok("OK")
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(serde_json::to_value(progress).unwrap_or_else(
+        |_| serde_json::json!({ "state": "finished" }),
+    )))
 }
 
 /// Backup and restore run here rather than in the CLI so they work against a
@@ -302,6 +330,16 @@ fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
     match cause {
         ShutdownCause::ConsoleClosing => std::time::Duration::from_secs(4),
         ShutdownCause::Requested => std::time::Duration::from_secs(60),
+    }
+}
+
+/// How long a stopping daemon waits for a running ingest to finish. A closing
+/// console leaves no time for one. Anything else waits, because stopping
+/// mid-walk leaves the namespace cleared and only partly rebuilt.
+fn ingest_wait_budget(cause: ShutdownCause) -> std::time::Duration {
+    match cause {
+        ShutdownCause::ConsoleClosing => std::time::Duration::ZERO,
+        ShutdownCause::Requested => std::time::Duration::from_secs(300),
     }
 }
 
@@ -349,7 +387,13 @@ async fn handle_mcp(
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
-        let response = crate::server::process_mcp_request(rpc_req, state.embedder.clone(), state.vector_store.clone()).await;
+        let response = crate::server::process_mcp_request(
+            rpc_req,
+            state.embedder.clone(),
+            state.vector_store.clone(),
+            state.ingests.clone(),
+        )
+        .await;
         Json(response)
     } else {
         Json(serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}))
@@ -448,5 +492,11 @@ mod tests {
     #[test]
     fn an_explicit_stop_waits_out_a_busy_engine() {
         assert!(final_checkpoint_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn only_a_closing_console_stops_without_waiting_for_an_ingest() {
+        assert_eq!(ingest_wait_budget(ShutdownCause::ConsoleClosing), std::time::Duration::ZERO);
+        assert!(ingest_wait_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(60));
     }
 }
