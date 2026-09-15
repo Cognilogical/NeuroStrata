@@ -358,21 +358,30 @@ async fn handle_edit(
     State(state): State<AppState>,
     Json(req): Json<EditReq>,
 ) -> Result<&'static str, axum::http::StatusCode> {
-    // Basic edit implementation
+    // The operator's repair path: an in-place rewrite that keeps the id and
+    // keeps no history. Agents get neurostrata_supersede_memory instead, which
+    // is additive. Editing stays here, behind a human, because it destroys.
     let old_namespace = crate::server::resolve_namespace(&state.vector_store, &req.old_namespace).await;
     let new_namespace = crate::server::resolve_namespace(&state.vector_store, &req.new_namespace).await;
-    let existing = state.vector_store.get(&old_namespace, &req.id)
-        .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-        
-    if let Some((vector, mut payload)) = existing {
-        payload.content = req.content;
-        payload.location = req.location;
-        
-        state.vector_store.delete(&old_namespace, &req.id).await.ok();
-        state.vector_store.upsert(&new_namespace, &req.id, vector, payload).await.ok();
+    match crate::server::edit_memory(
+        &*state.vector_store,
+        &*state.embedder,
+        &old_namespace,
+        &req.id,
+        &new_namespace,
+        &req.content,
+        &req.location,
+    )
+    .await
+    {
+        Ok(crate::server::EditOutcome::Edited) | Ok(crate::server::EditOutcome::NotFound) => Ok("OK"),
+        // The next ingest of that namespace would overwrite the edit.
+        Ok(crate::server::EditOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
+        Err(e) => {
+            eprintln!("edit of {} in {} failed: {}", req.id, old_namespace, e);
+            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
-    Ok("OK")
 }
 
 // Handle a single MCP JSON-RPC line
