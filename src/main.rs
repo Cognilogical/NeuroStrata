@@ -82,6 +82,9 @@ enum Commands {
     /// Stop a running daemon so it checkpoints before exiting
     Shutdown,
 
+    /// Report what an upgrade left inconsistent, changing nothing
+    Doctor,
+
     /// Run an external plugin or helper, explicitly
     ///
     /// This used to happen implicitly for any unrecognised subcommand, which
@@ -604,6 +607,88 @@ async fn main() -> anyhow::Result<()> {
                 )?);
 
                 match other {
+                    Commands::Doctor => {
+                        // Read-only by design: it names what an upgrade left
+                        // behind and how to fix it, and touches nothing itself.
+                        let namespaces = vector_store.list_namespaces().await?;
+                        println!("Namespaces: {:?}\n", namespaces);
+
+                        let mut collisions = 0;
+                        for (i, a) in namespaces.iter().enumerate() {
+                            for b in namespaces.iter().skip(i + 1) {
+                                if a.eq_ignore_ascii_case(b) {
+                                    collisions += 1;
+                                    let a_len = vector_store.list(a, None).await.map(|m| m.len()).unwrap_or(0);
+                                    let b_len = vector_store.list(b, None).await.map(|m| m.len()).unwrap_or(0);
+                                    println!("Two spellings of one project:");
+                                    println!("  '{}' holds {} memories", a, a_len);
+                                    println!("  '{}' holds {} memories", b, b_len);
+                                    let (from, to) = if a_len < b_len { (a, b) } else { (b, a) };
+                                    println!(
+                                        "  Merge with neurostrata_move_memory, moving each id from '{}' into '{}'.\n",
+                                        from, to
+                                    );
+                                }
+                            }
+                        }
+                        if collisions == 0 {
+                            println!("No namespaces differ only by case.\n");
+                        }
+
+                        for ns in &namespaces {
+                            let memories = vector_store.list(ns, None).await?;
+                            let known = crate::store::ladybug::KnownIds::new(
+                                memories.iter().map(|m| m.id.as_str()),
+                            );
+
+                            let mut resolvable = Vec::new();
+                            let mut missing = Vec::new();
+                            let mut never_read = 0;
+
+                            for memory in &memories {
+                                if memory.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+                                    never_read += 1;
+                                }
+                                for edge in crate::store::ladybug::edge_specs(&memory.payload.metadata) {
+                                    if known.contains(&edge.target_id) {
+                                        continue;
+                                    }
+                                    match known.resolve(&edge.target_id) {
+                                        Some(_) => resolvable.push(edge.target_id.clone()),
+                                        None => missing.push(edge.target_id.clone()),
+                                    }
+                                }
+                            }
+
+                            println!("{}: {} memories", ns, memories.len());
+                            println!(
+                                "  declared targets that need the older absolute form resolved: {}",
+                                resolvable.len()
+                            );
+                            for target in resolvable.iter().take(3) {
+                                println!("    {}", target);
+                            }
+                            println!("  declared targets that match nothing ingested: {}", missing.len());
+                            for target in missing.iter().take(3) {
+                                println!("    {}", target);
+                            }
+                            println!(
+                                "  memories never counted as read: {} of {}",
+                                never_read,
+                                memories.len()
+                            );
+                            if never_read == memories.len() && !memories.is_empty() {
+                                println!(
+                                    "    Every one. Before the embedding decode was fixed, each retrieval tried to"
+                                );
+                                println!(
+                                    "    write an empty vector and was refused, so the Neural Gain Filter had nothing"
+                                );
+                                println!("    to rank by. Counts start rising again from the next search.");
+                            }
+                            println!();
+                        }
+                    }
                     Commands::Namespaces => {
                         let namespaces = vector_store.list_namespaces().await?;
                         println!("Namespaces:");

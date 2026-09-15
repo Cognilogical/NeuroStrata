@@ -203,12 +203,19 @@ For advanced administration, direct manipulation of the cognitive graph, and his
 *   [CLI Interface Guide](file:///Users/neo/projects/NeuroStrata/CLI-readme.md) — Complete manual for `neurostrata-mcp` commands (`namespaces`, `list`, `ingest`, `export-graph`, `delete`, `add`, `edit`).
 *   [Project Changelog](file:///Users/neo/projects/NeuroStrata/CHANGELOG.md) — Detailed version-by-version changes and migration logs.
 
+
 ### Upgrading an existing database
 
 Node ids are **repository-relative** (`src/store/ladybug.rs`). The absolute path stays
 available as `absolute_path` in metadata, which is what the visualizer deep-links with.
 Ingest once after upgrading so older rows take the new form; declarations left over from
 an absolute-id ingest are matched by path suffix and reported as they are relinked.
+
+A namespace is the **project name**, not the checkout folder: a project cloned as
+`neurostrata` and one cloned as `NeuroStrata` are the same stratum. Names that differ
+only by case resolve to the one already stored, and `neurostrata-mcp doctor` reports
+anything an upgrade left inconsistent -- duplicate namespaces, declarations that match
+no file, and how many memories have never been counted as read.
 
 ## 🛡️ Security & Compliance
 
