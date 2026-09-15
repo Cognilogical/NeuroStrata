@@ -1063,9 +1063,15 @@ impl VectorStore for LadybugStore {
             let mut result = conn.query(&query)?;
         
             if let Some(row) = result.next() {
+                // The column is FLOAT[N], a fixed-size ARRAY, so the engine hands
+                // back Value::Array. Matching only Value::List meant this always
+                // returned an empty vector, and every caller that read a memory
+                // and wrote it back stored an embedding of length zero -- which
+                // the engine rejects, silently in /edit's case (bead
+                // neurostrata-vbj). Accept both: a LIST column would still parse.
                 let mut vec: Vec<f32> = Vec::new();
-                if let lbug::Value::List(_, list_vals) = &row[0] {
-                    for v in list_vals {
+                if let lbug::Value::Array(_, vals) | lbug::Value::List(_, vals) = &row[0] {
+                    for v in vals {
                         if let lbug::Value::Float(f) = v {
                             vec.push(*f);
                         } else if let lbug::Value::Double(d) = v {
@@ -1988,5 +1994,45 @@ eurostrata\src\daemon.rs", &known).as_deref(),
 
         assert_eq!(store.relink_edges("probe").await.expect("relink"), 0);
         assert_eq!(governs_count(&store).await, 0);
+    }
+
+    /// `get` reads back the embedding it stored.
+    ///
+    /// The column is FLOAT[N] -- an ARRAY -- and the reader matched only
+    /// Value::List, so this came back empty every time. Nothing caught it
+    /// because search never returns a vector: it computes array_distance in the
+    /// engine. Only the read-modify-write callers saw it, and they wrote the
+    /// empty vector straight back (bead neurostrata-vbj).
+    #[tokio::test]
+    async fn get_reads_back_the_embedding_it_stored() {
+        let dir = std::env::temp_dir().join(format!("ns-embed-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let stored = vec![0.25f32, -1.5, 3.0, 0.0];
+        store
+            .upsert(
+                "probe",
+                "rule",
+                stored.clone(),
+                MemoryPayload {
+                    content: "c".to_string(),
+                    user_id: "u".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .expect("store the row");
+
+        let (read_back, _) = store
+            .get("probe", "rule")
+            .await
+            .expect("query succeeds")
+            .expect("the row is there");
+        assert_eq!(read_back, stored, "the embedding survives a round trip");
     }
 }
