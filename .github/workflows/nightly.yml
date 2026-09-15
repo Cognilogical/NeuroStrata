@@ -1,0 +1,204 @@
+name: Nightly
+
+# A rolling channel: one fixed URL that always has a fresh binary, for anyone who
+# would rather not stand up a C++ toolchain. Carried over from the previous
+# "Deploy v1.0.0 (Nightly)" workflow.
+#
+# It publishes to a tag named `nightly` rather than to a v* release. A version tag
+# resolves as "Latest release" and is expected to keep describing the same build;
+# this one is replaced every run, so it is marked prerelease and kept separate.
+# Versioned assets come from release.yml. The two never target the same tag.
+#
+# Scope: linux-amd64 and windows-amd64. v* releases also cover macOS and arm64.
+
+on:
+  schedule:
+    # 06:17 UTC. Deliberately off the hour -- scheduled workflows queue behind
+    # everyone else's on-the-hour crons.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    name: Has main moved?
+    # Forks inherit this file. They should not try to publish releases.
+    if: github.repository == 'Cognilogical/NeuroStrata'
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Rebuilding an unchanged commit every night costs runner minutes and
+      # republishes byte-identical assets. The nightly tag records what was last
+      # built, so comparing against it is enough.
+      - name: Compare against the last nightly
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run: building regardless."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          previous="$(git rev-parse -q --verify 'refs/tags/nightly^{commit}' || true)"
+          if [ -n "$previous" ] && [ "$previous" = "$sha" ]; then
+            echo "main is unchanged since the last nightly ($sha). Nothing to build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$previous" ]; then
+            echo "main moved: $previous -> $sha"
+          else
+            echo "No nightly tag yet; this is the first run."
+          fi
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.archive }}
+    needs: guard
+    if: needs.guard.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not deny the other a build.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            distdir: linux
+            bin: neurostrata-mcp
+            archive: neurostrata-mcp-nightly-linux-amd64.tar.gz
+          - os: windows-latest
+            distdir: windows
+            bin: neurostrata-mcp.exe
+            archive: neurostrata-mcp-nightly-windows-amd64.zip
+
+    steps:
+      # Pinned to the commit the guard resolved, so the binaries and the tag
+      # cannot come from different commits if main moves mid-run.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      # lbug (LadybugDB) compiles a C++ core with CMake. Assert it rather than
+      # discovering its absence as a cryptic build-script panic minutes in.
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Stage into the dist layout
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.distdir }}"
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.distdir }}/${{ matrix.bin }}"
+          ls -l "dist/${{ matrix.distdir }}/${{ matrix.bin }}"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          "dist/${{ matrix.distdir }}/${{ matrix.bin }}" --version
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "${{ matrix.archive }}" "dist/${{ matrix.distdir }}/${{ matrix.bin }}"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path 'dist' -DestinationPath '${{ matrix.archive }}'
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish nightly
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          # Glob only the binaries so the sums file cannot include itself.
+          sha256sum neurostrata-mcp-nightly-* > SHA256SUMS
+          echo "--- assets built ---"
+          cat SHA256SUMS
+
+      # The tag has to move, and GitHub will not retarget an already-published
+      # release. Deleting the release and the tag, then recreating both, is the
+      # version-independent way to do that.
+      - name: Replace the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          gh release delete nightly --yes || echo "No nightly release to delete."
+          git push --delete origin refs/tags/nightly || echo "No nightly tag to delete."
+
+          cat > notes.md <<EOF
+          Rolling build of \`main\` at \`${SHA}\`.
+
+          **This is not a release.** The \`nightly\` tag moves and these assets are
+          replaced whenever \`main\` changes. For something fixed, use a \`v*\` release.
+
+          Built for linux-amd64 and windows-amd64. The \`v*\` releases also cover
+          macOS and arm64.
+          EOF
+
+          gh release create nightly \
+            --prerelease \
+            --target "$SHA" \
+            --title "Nightly build" \
+            --notes-file notes.md \
+            dist/*

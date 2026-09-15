@@ -1,54 +1,162 @@
-name: "Deploy v1.0.0 (Nightly)"
+name: Release
+
+# Publishes the neurostrata-mcp binary for each supported platform, on v* tags.
+# The rolling build lives in nightly.yml and targets its own tag, so the two
+# never write to the same release.
+#
+# Each target builds on its own native runner. This dependency tree makes
+# cross-compilation impractical: openssl is vendored (built from source),
+# cxx/cxx-build needs a C++ toolchain, and fastembed links the ONNX runtime.
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach assets to (e.g. v1.3.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  build:
+    name: ${{ matrix.archive }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A failure on one platform still lets the rest build, so a single run
+      # shows every platform that is broken rather than just the first.
+      #
+      # Publishing stays all-or-nothing: the release job keeps the default
+      # success() gate, so a failed platform blocks the upload. That is
+      # deliberate -- a version tag missing an architecture looks complete on
+      # the releases page, and nothing signals otherwise. Fix the platform and
+      # re-run; the upload uses --clobber and is safe to repeat.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            distdir: linux
+            bin: neurostrata-mcp
+            archive: neurostrata-mcp-linux-amd64.tar.gz
+          # Public repos get ARM runners for free. Drop this entry if the
+          # repository is private and ARM minutes are not available.
+          - os: ubuntu-24.04-arm
+            distdir: linux
+            bin: neurostrata-mcp
+            archive: neurostrata-mcp-linux-arm64.tar.gz
+          - os: macos-15-intel    # Intel (macos-13 was retired)
+            distdir: darwin
+            bin: neurostrata-mcp
+            archive: neurostrata-mcp-darwin-amd64.tar.gz
+          - os: macos-15          # Apple Silicon
+            distdir: darwin
+            bin: neurostrata-mcp
+            archive: neurostrata-mcp-darwin-arm64.tar.gz
+          - os: windows-latest
+            distdir: windows
+            bin: neurostrata-mcp.exe
+            archive: neurostrata-mcp-windows-amd64.zip
 
     steps:
-      - name: Checkout Code
+      # The same expression the publish job uses for TAG, so the commit built
+      # and the tag published to cannot disagree. Without an explicit ref, a
+      # workflow_dispatch run builds whatever branch it was launched from and
+      # then attaches those binaries to the requested tag.
+      - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          ref: ${{ inputs.tag || github.ref_name }}
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Build NeuroStrata Unified Core + Shims
+      - name: Toolchain versions
+        shell: bash
         run: |
-          chmod +x ./mcp/build.sh
-          
-          # Install dependencies for the typescript plugin
-          cd plugins/opencode/neurostrata-plugin && npm ci && cd ../..
-          
-          # Execute the build script
-          ./mcp/build.sh
-          
-          # Ensure consistent asset names
-          if [ -f dist/opencode-neurostrata-1.0.0.tgz ]; then
-            mv dist/opencode-neurostrata-1.0.0.tgz dist/opencode-neurostrata.tgz
-          fi
+          rustc --version
+          cargo --version
 
-      - name: Clobber v1.0.0 Release Assets
+      # lbug (LadybugDB) compiles a C++ core with CMake. GitHub-hosted images
+      # ship it, but assert it rather than discovering its absence as a cryptic
+      # build-script panic several minutes in.
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      # --locked fails rather than silently resolving different versions than
+      # Cargo.lock records. A release should build exactly what is committed.
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked
+
+      # The archive carries the os/arch in its NAME; the binary inside keeps its
+      # plain name under dist/<os>/. That gives anyone without a Rust toolchain
+      # a fixed path to extract and copy onto PATH, with no renaming step.
+      - name: Stage into the dist layout
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.distdir }}"
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.distdir }}/${{ matrix.bin }}"
+          ls -l "dist/${{ matrix.distdir }}/${{ matrix.bin }}"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          "dist/${{ matrix.distdir }}/${{ matrix.bin }}" --version
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "${{ matrix.archive }}" "dist/${{ matrix.distdir }}/${{ matrix.bin }}"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path 'dist' -DestinationPath '${{ matrix.archive }}'
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          # Glob only the binaries so the sums file cannot include itself.
+          sha256sum neurostrata-mcp-* > SHA256SUMS
+          echo "--- assets built ---"
+          cat SHA256SUMS
+
+      - name: Publish
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release upload v1.0.0 \
-            bin/neurostrata-mcp-linux-amd64 \
-            bin/neurostrata-mcp-linux-arm64 \
-            bin/neurostrata-mcp-darwin-amd64 \
-            bin/neurostrata-mcp-darwin-arm64 \
-            bin/neurostrata-mcp-windows-amd64.exe \
-            dist/opencode-neurostrata.tgz \
-            --clobber
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Creating release $TAG"
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          else
+            echo "Release $TAG already exists; attaching assets"
+          fi
+          gh release upload "$TAG" dist/* --clobber

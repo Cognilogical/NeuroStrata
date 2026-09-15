@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "neurostrata-mcp")]
-#[command(about = "🧠 NeuroStrata — MCP Server & CLI Engine", version = "0.1.1")]
+#[command(about = "🧠 NeuroStrata — MCP Server & CLI Engine", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

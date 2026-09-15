@@ -1,0 +1,70 @@
+# Build environment for neurostrata-mcp.
+#
+# Exists because building this project needs more than a Rust toolchain: lbug
+# (LadybugDB) compiles a C++ graph engine from vendored source via CMake, and
+# that engine requires C++20. Two failure modes this image prevents:
+#
+#   * no cmake  -> "is `cmake` not installed?" panic, minutes into the build
+#   * GCC 12    -> "fatal error: format: No such file or directory", because
+#                  lbug's common/assert.h includes <format> (C++20, GCC 13+)
+#
+# ---------------------------------------------------------------------------
+# Usage (podman; AGENTS.md section 6 mandates podman over docker)
+#
+#   podman build -f Dockerfile.build -t neurostrata-build .
+#   podman volume create ns-target
+#   podman volume create ns-cargo
+#
+#   podman run --rm \
+#     -v "C:\path\to\neurostrata:/w" \
+#     -v ns-target:/target \
+#     -v ns-cargo:/cargo \
+#     -w /w -e CARGO_TARGET_DIR=/target -e CARGO_HOME=/cargo \
+#     neurostrata-build cargo build --release --locked
+#
+# Why named volumes rather than bind-mounting target/:
+#   A cargo build writes tens of thousands of small files. On a Windows bind
+#   mount those cross the 9p/virtiofs boundary. Measured on this project:
+#
+#     bind mount    write 1500 files: 4585 ms   read: 3505 ms
+#     named volume  write 1500 files:  128 ms   read:   54 ms
+#
+#   ~36x slower writes, ~65x slower reads. Source stays bind-mounted (small and
+#   read-mostly); only the hot paths -- build artifacts and the cargo registry
+#   -- live on the VM's native filesystem.
+#
+# Where the engine runs in a VM (Windows, macOS), give that VM room: cargo
+# parallelises across crates, so cores matter, and a build killed for memory
+# surfaces as "unexpected EOF" partway through rather than as an OOM message.
+# ---------------------------------------------------------------------------
+
+# Debian trixie ships GCC 14. Bookworm's GCC 12 cannot build lbug: it lacks the
+# C++20 <format> header.
+FROM rust:1-trixie
+
+# cmake + a C++20 toolchain for lbug's vendored engine; pkg-config and perl are
+# needed by the vendored OpenSSL build on non-Windows, non-Apple targets.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        cmake \
+        build-essential \
+        pkg-config \
+        perl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cmake --version && c++ --version && cargo --version
+
+# Prove C++20 <format> works, at image build time rather than 20 minutes into a
+# cargo build. This is the check that would have caught the GCC 12 failure.
+COPY <<'EOF' /tmp/fmt.cpp
+#include <format>
+#include <string>
+int main() { return std::format("{}", 1) == "1" ? 0 : 1; }
+EOF
+RUN c++ -std=c++20 /tmp/fmt.cpp -o /tmp/fmt \
+    && /tmp/fmt \
+    && echo "C++20 <format>: OK" \
+    && rm -f /tmp/fmt /tmp/fmt.cpp
+
+WORKDIR /w
+CMD ["cargo", "build", "--release", "--locked"]

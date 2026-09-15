@@ -14,10 +14,12 @@ pub struct AcceptableEmbedder {
 }
 
 fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
-    let config_dir = match std::env::var("HOME") {
-        Ok(home) => PathBuf::from(home).join(".config/neurostrata"),
-        Err(_) => PathBuf::from(".neurostrata"),
-    };
+    // dirs::home_dir() rather than $HOME: Windows sets USERPROFILE, not HOME, so
+    // reading the variable directly sends this to a relative path under whatever
+    // directory happened to launch the process. config.rs already resolves it this way.
+    let config_dir = dirs::home_dir()
+        .map(|home| home.join(".config").join("neurostrata"))
+        .unwrap_or_else(|| PathBuf::from(".neurostrata"));
 
     if !config_dir.exists() {
         fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
@@ -55,8 +57,10 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
 }
 
 fn find_existing_cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let home_path = PathBuf::from(home);
+    // Same reason as above: $HOME is absent on Windows, and an empty home turns
+    // every candidate below into a relative path, which is how a 523 MB model
+    // cache ends up inside the caller's working directory.
+    let home_path = dirs::home_dir().unwrap_or_default();
     
     // Adopt the Neuro cache pattern: share models across all Neuro* tools
     let primary_neuro_cache = home_path.join(".cache/neuro/models/fastembed");
