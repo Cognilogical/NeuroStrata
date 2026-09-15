@@ -1,0 +1,94 @@
+name: CI
+
+# The publishing workflows run on tags and on a schedule, so this is what covers
+# ordinary pushes. A --locked build here surfaces lockfile drift at the commit
+# that introduces it: Cargo.lock had been missing 9 packages, including
+# clap_derive, which src/main.rs requires via #[derive(Parser)].
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR rather than paying for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One runner per way this build can differ:
+        #   ubuntu  - the cheap gate for lockfile and compile breakage, and the
+        #             only target where OpenSSL is vendored.
+        #   windows - MSVC and the CMake/Ninja assumptions, plus the 4 GiB
+        #             static-library limit that decides debug vs release.
+        #   macos   - Clang and libc++ rather than GCC or MSVC, and the other
+        #             side of the OpenSSL target gate (Security.framework).
+        #             Both architectures, because release.yml ships both and
+        #             a tag is a poor place to discover one of them is broken.
+        #             macos-15 is arm64, macos-15-intel is x64; both are
+        #             standard runners, so free on a public repository.
+        os: [ubuntu-latest, windows-latest, macos-15, macos-15-intel]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      # lbug (LadybugDB) compiles a C++ core with CMake. Any 3.15+ works,
+      # including the CMake 4 the macOS image ships -- verified by building the
+      # whole tree against 4.3.1 with no policy override.
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN=target/release/neurostrata-mcp.exe
+          else
+            BIN=target/release/neurostrata-mcp
+          fi
+          "$BIN" --version
+
+      # The binary reports CARGO_PKG_VERSION. If someone reintroduces a
+      # hardcoded string in the clap attribute, this catches it.
+      - name: Version matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN=target/release/neurostrata-mcp.exe
+          else
+            BIN=target/release/neurostrata-mcp
+          fi
+          expected="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          reported="$("$BIN" --version | tr -d '\r' | awk '{print $NF}')"
+          echo "Cargo.toml=$expected  binary=$reported"
+          if [ "$expected" != "$reported" ]; then
+            echo "::error::Binary reports '$reported' but Cargo.toml says '$expected'."
+            exit 1
+          fi

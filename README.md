@@ -136,6 +136,19 @@ NeuroStrata is tool-agnostic. It integrates with the standard `~/.agents/` speci
 1. **Embedder:** An OpenAI-compatible embedding endpoint (e.g., a local Llama.cpp/Ollama on `localhost:8004`, or a hosted provider like OpenAI).
 2. **Vector Database:** None! LadybugDB runs entirely embedded within the Rust binary. 
 
+### Building from source
+
+`cargo build --release` is the whole build, but LadybugDB compiles a C++ engine from vendored source, so it also needs CMake and a C++20 toolchain. These scripts find them and hand off to cargo.
+
+```bash
+scripts/build.sh            # Linux / macOS
+```
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1    # Windows
+```
+
+Both take `--check` / `-CheckOnly` to report the toolchain and build nothing. There is also a container route that needs no host toolchain at all. See **[docs/BUILDING.md](docs/BUILDING.md)**.
+
 ### Installation
 
 Clone the repository and run the automated installer. The installer uses a pre-compiled native binary, sets up global symlinks, and patches the client's configuration automatically—**no Rust toolchain required**.

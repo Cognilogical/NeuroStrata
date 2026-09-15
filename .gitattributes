@@ -1,0 +1,21 @@
+# Deliberately narrow: this pins ONLY the line endings that break things if
+# they are wrong. There is no "* text=auto" here on purpose -- the repo has a
+# checked-in LanceDB store (.neurostrata/*.lance/) whose .txn and .manifest
+# files carry CR bytes with no NUL in the first 8k, so a blanket text=auto
+# would misdetect them as text and strip those bytes.
+
+# Shell scripts must stay LF even on Windows checkouts, or they fail with
+# "bad interpreter: /usr/bin/env bash^M".
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# PowerShell and batch: keep CRLF, the platform convention these ship with.
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+
+# Batch files must stay CRLF. cmd.exe mis-parses LF-only labels and blocks.
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+# The embedded database is opaque bytes. Never convert anything inside it.
+.neurostrata/** -text
