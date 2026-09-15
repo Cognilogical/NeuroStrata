@@ -67,6 +67,7 @@ pub async fn process_mcp_request(
     request: JsonRpcRequest,
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
+    ingests: Arc<crate::ingest_jobs::IngestJobs>,
 ) -> Value {
     let id = request.id.clone();
     match request.method.as_str() {
@@ -221,7 +222,7 @@ pub async fn process_mcp_request(
                             result_text = handle_get_snapshot(arguments, store.clone()).await;
                         }
                         "neurostrata_ingest_directory" => {
-                            result_text = handle_ingest_directory(arguments, emb.clone(), store.clone()).await;
+                            result_text = handle_ingest_directory(arguments, emb.clone(), store.clone(), ingests.clone()).await;
                         }
                         "neurostrata_move_memory" => {
                             result_text = handle_move_memory(arguments, store.clone()).await;
@@ -679,7 +680,12 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> S
     }
 }
 
-async fn handle_ingest_directory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore>) -> String {
+async fn handle_ingest_directory(
+    arguments: Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+    ingests: Arc<crate::ingest_jobs::IngestJobs>,
+) -> String {
     let dir_path = match arguments.get("dir_path").and_then(|d| d.as_str()) {
         Some(d) => d,
         None => return "ERROR: dir_path missing.".to_string(),
@@ -692,18 +698,28 @@ async fn handle_ingest_directory(arguments: Value, emb: Arc<dyn Embedder>, store
     let namespace = namespace.as_str();
 
     let schema_str = include_str!("schema.json");
-    
-    if let Ok(schema) = crate::parser::schema::ParserSchema::load(schema_str) {
-        let dir = std::path::Path::new(dir_path);
-        if let Ok(_) = crate::parser::ingest::ingest_directory(dir, &schema, emb.clone(), store.clone(), namespace).await {
-            // Once for the whole walk: ingestion upserts thousands of rows, and
-            // checkpointing each one would dominate the run.
-            format!("Successfully ingested AST from {} into namespace '{}'", dir_path, namespace)
-        } else {
-            "Failed to ingest directory. Ensure tree-sitter and parsing logic is fully initialized.".to_string()
-        }
-    } else {
-        "Failed to load default parser schema.".to_string()
+    let schema = match crate::parser::schema::ParserSchema::load(schema_str) {
+        Ok(schema) => schema,
+        Err(_) => return "Failed to load default parser schema.".to_string(),
+    };
+
+    // Handed to the registry so the walk survives this call: an MCP client that
+    // times out and disconnects no longer leaves the graph half-built (bead
+    // neurostrata-7ej). Ingestion upserts thousands of rows, and checkpointing
+    // each one would dominate the run, so that happens once at the end.
+    match ingests.run(namespace, dir_path, schema, emb.clone(), store.clone()).await {
+        Ok(progress) => format!(
+            "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols, {} declared edges relinked.",
+            dir_path,
+            namespace,
+            progress.files_ingested,
+            progress.symbols_ingested,
+            progress
+                .relinked_edges
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "no".to_string())
+        ),
+        Err(e) => format!("Failed to ingest directory {}: {}", dir_path, e),
     }
 }
 
