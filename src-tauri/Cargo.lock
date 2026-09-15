@@ -2035,6 +2035,7 @@ name = "neurostrata"
 version = "0.1.1"
 dependencies = [
  "dirs",
+ "open",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
