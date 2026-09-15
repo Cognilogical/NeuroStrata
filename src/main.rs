@@ -82,6 +82,20 @@ enum Commands {
     /// Stop a running daemon so it checkpoints before exiting
     Shutdown,
 
+    /// Run an external plugin or helper, explicitly
+    ///
+    /// This used to happen implicitly for any unrecognised subcommand, which
+    /// meant a typo executed whatever it named. Ask for it by name instead:
+    ///   neurostrata-mcp run my-plugin --flag value
+    Run {
+        /// The program to execute
+        program: String,
+
+        /// Arguments passed to it unchanged
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Write a portable copy of the database to a directory
     Backup {
         /// Directory to write the backup into. Must not already exist
@@ -265,6 +279,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_mistyped_subcommand_is_an_error_not_an_execution() {
+        let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
+        assert!(parsed.is_err(), "a typo must never reach std::process::Command");
+    }
+
+    #[test]
+    fn running_a_plugin_has_to_be_asked_for_by_name() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "run", "my-plugin", "--flag", "value"])
+            .expect("run takes a program and passes its arguments through");
+
+        match cli.command {
+            Some(Commands::Run { program, args }) => {
+                assert_eq!(program, "my-plugin");
+                assert_eq!(args, vec!["--flag".to_string(), "value".to_string()]);
+            }
+            other => panic!("expected Run, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn a_held_daemon_lock_is_seen_and_goes_with_its_holder() {
         let db = std::env::temp_dir()
             .join(format!("ns-daemon-lock-{}", uuid::Uuid::new_v4()))
@@ -360,28 +394,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Unrecognized commands are assumed to be external plugins/runners
-    // Check if the first argument matches any known command or help/version flags
-    let command_str = args[1].as_str();
-    let recognized = matches!(
-        command_str,
-        "daemon" | "shutdown" | "backup" | "restore" | "namespaces" | "list" | "ingest" | "export-graph" | "delete" | "add" | "edit" | "-h" | "--help" | "-V" | "--version"
-    );
-
-    if !recognized {
-        let mut cmd = std::process::Command::new(command_str);
-        cmd.args(&args[2..]);
-        
-        match cmd.status() {
-            Ok(status) => {
-                std::process::exit(status.code().unwrap_or(1));
-            }
-            Err(e) => {
-                eprintln!("Failed to execute external command '{}': {}", command_str, e);
-                std::process::exit(1);
-            }
-        }
-    }
+    // An unrecognised first argument used to be run as an external program.
+    // That made every typo an execution: `neurostrata-mcp lsit` ran whatever
+    // `lsit` resolved to on PATH, and anything that could put a file on the
+    // PATH could therefore have it invoked by a mistyped memory command. The
+    // capability now needs asking for, by name, through `run` (bead
+    // neurostrata-7s8). clap reports anything else as the unknown subcommand
+    // it is.
 
     // Now parse using clap
     let cli = Cli::parse();
@@ -403,6 +422,16 @@ async fn main() -> anyhow::Result<()> {
                 let outcome = daemon::start_daemon(embedder, vector_store).await;
                 record_final_checkpoint(&outcome);
                 outcome?;
+            }
+            Commands::Run { program, args } => {
+                // Deliberate, named, and it never touches the database.
+                match std::process::Command::new(&program).args(&args).status() {
+                    Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+                    Err(e) => {
+                        eprintln!("Could not run '{}': {}", program, e);
+                        std::process::exit(1);
+                    }
+                }
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;
@@ -656,7 +685,12 @@ async fn main() -> anyhow::Result<()> {
                             println!("Successfully edited memory {}", id);
                         }
                     }
-                    Commands::Daemon | Commands::Shutdown | Commands::Backup { .. } | Commands::Restore { .. } => unreachable!(),
+                    // Handled above, before the database is ever opened.
+                    Commands::Daemon
+                    | Commands::Shutdown
+                    | Commands::Run { .. }
+                    | Commands::Backup { .. }
+                    | Commands::Restore { .. } => unreachable!(),
                 }
             }
         }
