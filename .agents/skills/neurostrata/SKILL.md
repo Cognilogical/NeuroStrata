@@ -20,8 +20,9 @@ NeuroStrata provides the following native MCP tools that you MUST use to manage 
 * `neurostrata_get_snapshot`: Fetch the project's active architectural rules in one call. Use it as your first action on a new task.
 * `neurostrata_list_namespaces`: List the namespaces the shared database holds.
 * `neurostrata_ingest_directory`: Batch ingest an entire directory of markdown files (e.g., `docs/architecture/`) into NeuroStrata. The server will automatically chunk and embed the files.
+* `neurostrata_get_memory`: Fetch one Engram by id. Use it to read a rule before correcting it, and to follow a Governs or Related Nodes pointer to the exact record.
 
-**These five are the whole surface.** There is no MCP tool for updating or deleting an Engram, for generating a canvas, or for dumping the database. To supersede a rule, add a new Engram that states the correction. To delete one, the user runs `neurostrata-mcp delete <namespace> <id>` with the daemon stopped, or the GUI posts to the daemon's `/delete`. `neurostrata_move_memory` is dispatched by the server but never advertised, so do not call it.
+**These six are the whole surface.** There is no MCP tool for updating or deleting an Engram, for generating a canvas, or for dumping the database. To supersede a rule, add a new Engram that states the correction. To delete one, the user runs `neurostrata-mcp delete <namespace> <id>` with the daemon stopped, or the GUI posts to the daemon's `/delete`. `neurostrata_move_memory` is dispatched by the server but never advertised, so do not call it.
 
 **Ids.** A node id is a repository-relative path (`src/parser/ingest.rs`),
 so that is the form to use in `locations` when a memory governs a file; the absolute path

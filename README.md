@@ -20,7 +20,7 @@ It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by
 
 ## 🌟 Why NeuroStrata Wins: The Zero-Overhead Advantage
 
-* **Zero Network Attack Surface:** There are no REST APIs. There are no WebSockets. There is no MQTT broker, and there are no exposed localhost ports. NeuroStrata communicates purely over standard input/output (`stdio`) using the official MCP JSON-RPC spec. It is a secure, offline, single compiled Rust binary.
+* **Nothing Leaves The Machine:** There are no REST APIs to the outside world, no WebSockets, and no MQTT broker. Agents speak to NeuroStrata over standard input/output (`stdio`) using the official MCP JSON-RPC spec; a local daemon listens on `127.0.0.1:34343` for the GUI and for the stdio proxy, bound to loopback only. It is an offline, single compiled Rust binary.
 * **Embedded LadybugDB & Tantivy:** No Docker containers to manage and no remote databases to pay for. The entire vector database and full-text search index runs embedded inside the Rust binary. It just works.
 * **The "Pointer-Wiki" Architecture:** Standard RAG systems dump 50-page architecture documents into the LLM context window, which destroys reasoning performance and racks up API costs. NeuroStrata's **SynapticGraph** hands the agent a semantic *pointer*—a hyper-specific **Engram** (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs to solve the problem.
 * **Eidetic Recall & Instant Grounding:** Instead of wasting tokens blindly searching a new repository, agents instantly retrieve the top-5 highest-weighted, active Engrams for any project. This **Eidetic Recall** perfectly grounds an agent the exact second a chat session begins.
@@ -213,10 +213,10 @@ an absolute-id ingest are matched by path suffix and reported as they are relink
 ## 🛡️ Security & Compliance
 
 NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications** and common AI red-teaming vectors:
-- **Zero Network Attack Surface (Mitigates LLM07):** NeuroStrata is a pure `stdio` MCP server. It listens on zero ports and has no external APIs, neutralizing remote RCE and plugin exploitation vectors.
+- **Loopback-Only Network Surface (Mitigates LLM07):** Agents talk to NeuroStrata over `stdio`. Behind that, a local daemon binds **`127.0.0.1:34343`** and serves `/health`, `/graph`, `/ingest`, `/delete`, `/edit`, `/mcp`, `/backup` and `/shutdown` -- the stdio process starts it automatically when none is running, so the port is open in normal operation. It is bound to loopback and never to an external interface, and nothing is published beyond the machine, which is what neutralises remote RCE and plugin exploitation vectors. Anything running as your user on the same machine can reach it: there is no authentication on those routes.
 - **Active Secret Scrubbing (Mitigates LLM06):** The Rust backend actively scans memory payloads for high-entropy secrets (API keys, passwords, JWTs) and explicitly rejects insertions, forcing the agent into a "Redaction Loop" to prevent permanent context contamination.
 - **Kuzu Injection Hardening (Mitigates SQL/Cypher Injection):** Active escaping of single quotes and backslashes in database interpolations eliminates Cypher database injection and prompt-driven database crash vectors.
-- **Role-Based Memory Access (Mitigates LLM08):** Destructive actions (`neurostrata_delete_memory`) are strictly restricted. Task sub-agents cannot delete memories or drop the database, ensuring only the manager agent can curate the vector space.
+- **Guarded Curation (Mitigates LLM08):** No advertised MCP tool edits or deletes a memory. Editing and deleting are CLI and GUI operations (`neurostrata-mcp edit` and `delete`, and the daemon's `/edit` and `/delete`, which the GUI posts to). Deletion works one id at a time and never in bulk, and the database directory is never dropped. None of these has a separate guard for the machine-wide `global` namespace. Sub-agent restraint is a convention in the agent instructions, not something the server enforces.
 - **Resilient Soft Locks (Mitigates LLM09):** To combat context degradation and "happy path" tunnel vision, NeuroStrata enforces memory extraction through OS-level Git hooks (Pre-Push Behavioral Forcing) rather than relying solely on fragile system prompts.
 
 ## License
