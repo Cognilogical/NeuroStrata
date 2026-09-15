@@ -18,6 +18,8 @@ pub struct JsonRpcRequest {
 pub struct JsonRpcResponse<T> {
     jsonrpc: String,
     id: Option<Value>,
+    // A response carries a result or an error, never both.
+    #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
@@ -32,7 +34,22 @@ impl<T> JsonRpcResponse<T> {
             error: None,
         }
     }
+
+    pub fn failure(id: Option<Value>, code: i64, message: String) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(serde_json::json!({ "code": code, "message": message })),
+        }
+    }
 }
+
+/// The request was not JSON.
+const PARSE_ERROR: i64 = -32700;
+/// The request was JSON-RPC, and answering it failed here rather than at the
+/// far end.
+const INTERNAL_ERROR: i64 = -32603;
 
 #[allow(dead_code)]
 impl JsonRpcResponse<Value> {
@@ -240,35 +257,230 @@ pub async fn process_mcp_request(
 }
 
 // Optional proxy helper to keep backwards compat with the stdio loop
-pub async fn start_mcp_proxy() -> io::Result<()> {
+/// How long a proxied call may run before the caller is told it failed.
+///
+/// A blanket 60 seconds used to sit here, which is shorter than the operation
+/// that most needs the proxy: a full directory ingest of this repository takes
+/// 58 to 86 seconds, so it was cut off every time. The bound is now generous
+/// enough for real work and overridable, and -- unlike before -- reaching it
+/// produces an answer rather than silence.
+fn proxy_timeout() -> std::time::Duration {
+    let secs = std::env::var("NEUROSTRATA_PROXY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(1800);
+    std::time::Duration::from_secs(secs)
+}
+
+/// How long the proxy will keep waiting for a daemon THIS PROCESS started before
+/// it reports the daemon as unreachable. Generous because the first run of a new
+/// install downloads the embedding model, which is minutes on a slow link.
+/// Irrelevant when the daemon was already up: that case never waits.
+fn daemon_startup_budget() -> std::time::Duration {
+    let secs = std::env::var("NEUROSTRATA_DAEMON_STARTUP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(600);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Whether to keep waiting rather than report the daemon unreachable.
+///
+/// Pure so it can be tested: the loop it drives needs a live socket, but the
+/// decision is four facts and no I/O. Only a CONNECT failure is worth waiting
+/// on -- a timeout means something answered and then took too long, and any
+/// other error is not going to fix itself by being asked again.
+fn should_wait_for_startup(
+    daemon_has_answered: bool,
+    is_connect_error: bool,
+    waited: std::time::Duration,
+    budget: std::time::Duration,
+) -> bool {
+    !daemon_has_answered && is_connect_error && waited < budget
+}
+
+/// Which of the two ways this proxy came to exist.
+///
+/// `neurostrata-mcp` with no arguments is a proxy either way, but not the same
+/// proxy: one is talking to a daemon that was already answering, the other to a
+/// daemon it has just spawned and that may still be loading its model. A connect
+/// failure means opposite things in the two cases, and saying "it is not running"
+/// about a daemon this process started thirty seconds ago is simply wrong.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DaemonOrigin {
+    /// A daemon answered /health before the proxy started.
+    AlreadyRunning,
+    /// This process spawned the daemon and did not wait for it to finish.
+    SpawnedByUs,
+}
+
+/// Writes one JSON-RPC message and flushes it, so the caller sees it now rather
+/// than whenever the buffer happens to fill.
+async fn write_message(writer: &mut io::Stdout, message: &str) -> io::Result<()> {
+    writer.write_all(message.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await
+}
+
+/// The reply a failed request gets, or None when it must not get one.
+///
+/// JSON-RPC notifications carry no id and must never be answered, so a failure
+/// on one is reported to stderr and goes no further. Everything else gets an
+/// error response: a request read and then dropped leaves the client waiting on
+/// an id that never comes back, which is a hang with no error reported
+/// anywhere (bead neurostrata-oty).
+fn failure_line(id: Option<Value>, code: i64, message: &str) -> Option<String> {
+    id.as_ref()?;
+    let response = JsonRpcResponse::<Value>::failure(id, code, message.to_string());
+    serde_json::to_string(&response).ok()
+}
+
+async fn answer_with_error(
+    writer: &mut io::Stdout,
+    id: Option<Value>,
+    code: i64,
+    message: String,
+) -> io::Result<()> {
+    eprintln!("{}", message);
+    match failure_line(id, code, &message) {
+        Some(line) => write_message(writer, &line).await,
+        None => Ok(()),
+    }
+}
+
+pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin).lines();
     let mut writer = stdout;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        // Separate from the overall bound on purpose. A port with nothing behind
+        // it hangs rather than refusing on this machine -- the same behaviour
+        // DaemonProbe in main.rs exists to describe -- so without this, a daemon
+        // that is not running is indistinguishable from one that is merely slow,
+        // and the wait is the whole timeout rather than a few seconds.
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(proxy_timeout())
         .build()
         .unwrap();
 
+    // Whether anything has ever answered on the port. Until something has, a
+    // daemon we spawned ourselves is presumed to be still starting; after it
+    // has, a connect failure means it went away, which is a different report.
+    let mut daemon_has_answered = origin == DaemonOrigin::AlreadyRunning;
+
     while let Some(line) = reader.next_line().await? {
-        if let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) {
-            match client.post("http://127.0.0.1:34343/mcp").json(&request).send().await {
-                Ok(resp) => {
-                    if let Ok(text) = resp.text().await {
-                        writer.write_all(text.as_bytes()).await?;
-                        writer.write_all(b"\n").await?;
-                        writer.flush().await?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Every path from here answers, or deliberately does not because the
+        // message was a notification. Reading a request and then dropping it --
+        // which is what this loop did whenever the daemon could not be reached,
+        // or the line did not parse -- leaves the client waiting on an id that
+        // never comes back: a hang with no error reported anywhere.
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(e) => {
+                answer_with_error(
+                    &mut writer,
+                    Some(Value::Null),
+                    PARSE_ERROR,
+                    format!("The MCP request could not be parsed as JSON: {}", e),
+                )
+                .await?;
+                continue;
+            }
+        };
+
+        let id = request.get("id").cloned();
+
+        // A daemon this process spawned is not ready the moment it is spawned,
+        // and the first request usually arrives before it is. Waiting here is
+        // the difference between a session that starts slowly and one that
+        // reports every tool as broken.
+        let waiting_since = std::time::Instant::now();
+        let response = loop {
+            let attempt = client
+                .post("http://127.0.0.1:34343/mcp")
+                .json(&request)
+                .send()
+                .await;
+
+            let still_starting = should_wait_for_startup(
+                daemon_has_answered,
+                attempt.as_ref().err().is_some_and(reqwest::Error::is_connect),
+                waiting_since.elapsed(),
+                daemon_startup_budget(),
+            );
+
+            if !still_starting {
+                break attempt;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        };
+
+        if response.is_ok() {
+            daemon_has_answered = true;
+        }
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(text) if status.is_success() => {
+                        // A notification the daemon chose not to answer stays
+                        // unanswered here too.
+                        if !text.is_empty() {
+                            write_message(&mut writer, &text).await?;
+                        }
+                    }
+                    Ok(text) => {
+                        answer_with_error(
+                            &mut writer,
+                            id,
+                            INTERNAL_ERROR,
+                            format!("The NeuroStrata daemon answered {}: {}", status, text.trim()),
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        answer_with_error(
+                            &mut writer,
+                            id,
+                            INTERNAL_ERROR,
+                            format!("The NeuroStrata daemon's reply could not be read: {}", e),
+                        )
+                        .await?;
                     }
                 }
-                Err(e) => {
-                    eprintln!("Failed to proxy MCP request to daemon: {}", e);
-                }
+            }
+            Err(e) => {
+                let cause = if e.is_connect() && !daemon_has_answered {
+                    "this process started one, but it has not begun listening on                      127.0.0.1:34343 within the startup budget -- a first run                      downloads the embedding model, which can take several                      minutes; raise NEUROSTRATA_DAEMON_STARTUP_SECS, or run                      `neurostrata-mcp daemon` in a terminal to watch it start"
+                } else if e.is_connect() {
+                    "it is not running or is not listening on 127.0.0.1:34343"
+                } else if e.is_timeout() {
+                    "it did not answer in time; the work may still be running"
+                } else {
+                    "the request to it failed"
+                };
+                answer_with_error(
+                    &mut writer,
+                    id,
+                    INTERNAL_ERROR,
+                    format!("Could not reach the NeuroStrata daemon: {} ({})", cause, e),
+                )
+                .await?;
             }
         }
     }
     Ok(())
 }
+
 
 
 async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
@@ -722,8 +934,123 @@ async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> Str
 }
 
 #[cfg(test)]
+mod startup_tests {
+    use super::{should_wait_for_startup, DaemonOrigin};
+    use std::time::Duration;
+
+    const BUDGET: Duration = Duration::from_secs(600);
+
+    /// The bug this exists for: `neurostrata-mcp` with no daemon spawns one and
+    /// starts proxying without waiting for it. Reporting the first request as
+    /// "the daemon is not running" describes a daemon this process just started.
+    #[test]
+    fn a_daemon_we_started_is_waited_for_rather_than_declared_absent() {
+        assert!(should_wait_for_startup(
+            false,
+            true,
+            Duration::from_secs(45),
+            BUDGET
+        ));
+    }
+
+    /// A daemon that was already answering is not starting up, so a refusal is
+    /// the truth and the caller should hear it now.
+    #[test]
+    fn a_daemon_that_was_already_up_is_never_waited_for() {
+        assert_eq!(DaemonOrigin::AlreadyRunning, DaemonOrigin::AlreadyRunning);
+        assert!(!should_wait_for_startup(
+            true,
+            true,
+            Duration::from_secs(1),
+            BUDGET
+        ));
+    }
+
+    /// Once something has answered, a later refusal means the daemon went away.
+    /// Waiting on that would turn a real failure into a hang, which is the
+    /// behaviour this whole file exists to remove.
+    #[test]
+    fn a_daemon_that_answered_and_then_vanished_is_reported_not_awaited() {
+        assert!(!should_wait_for_startup(
+            true,
+            true,
+            Duration::from_secs(0),
+            BUDGET
+        ));
+    }
+
+    /// The budget is a bound, not a suggestion: past it the caller gets an
+    /// answer, because an unanswered request is the failure mode being fixed.
+    #[test]
+    fn waiting_stops_at_the_budget() {
+        assert!(!should_wait_for_startup(
+            false,
+            true,
+            Duration::from_secs(601),
+            BUDGET
+        ));
+    }
+
+    /// Only a connect failure is a daemon that has not opened its port yet. A
+    /// timeout means something answered and then took too long; retrying it
+    /// would re-run work that may still be running.
+    #[test]
+    fn only_a_connect_failure_is_worth_waiting_on() {
+        assert!(!should_wait_for_startup(
+            false,
+            false,
+            Duration::from_secs(1),
+            BUDGET
+        ));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+
+    /// A request the proxy could not forward is answered, not dropped. Dropping
+    /// it left the client waiting on an id that never came back: a hang with no
+    /// error anywhere.
+    #[test]
+    fn a_request_that_cannot_be_forwarded_is_answered() {
+        let line = failure_line(Some(serde_json::json!(7)), INTERNAL_ERROR, "daemon unreachable")
+            .expect("a request carrying an id gets a reply");
+        let parsed: Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+
+        assert_eq!(parsed["id"], serde_json::json!(7));
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(parsed["error"]["message"], "daemon unreachable");
+    }
+
+    /// A response carries a result or an error, never both, and never a null
+    /// result beside an error.
+    #[test]
+    fn an_error_response_carries_no_result() {
+        let line = failure_line(Some(serde_json::json!(1)), PARSE_ERROR, "not JSON").unwrap();
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert!(parsed.get("result").is_none(), "got {}", parsed);
+    }
+
+    /// Notifications have no id and must never be answered, however badly they
+    /// fail.
+    #[test]
+    fn a_notification_is_never_answered() {
+        assert!(failure_line(None, INTERNAL_ERROR, "daemon unreachable").is_none());
+    }
+
+    /// 60 seconds used to be the bound, and a directory ingest of this
+    /// repository takes 58 to 86 -- so the call that most needs the proxy was
+    /// the one it cut off.
+    #[test]
+    fn the_proxy_bound_outlasts_a_directory_ingest() {
+        if std::env::var("NEUROSTRATA_PROXY_TIMEOUT_SECS").is_ok() {
+            return;
+        }
+        assert!(proxy_timeout() > std::time::Duration::from_secs(300));
+    }
 
     fn payload(content: &str) -> MemoryPayload {
         MemoryPayload {

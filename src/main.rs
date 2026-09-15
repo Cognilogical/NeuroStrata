@@ -367,7 +367,7 @@ async fn main() -> anyhow::Result<()> {
     if args.len() == 1 {
         if daemon_running {
             eprintln!("Daemon is already running. Starting MCP proxy...");
-            server::start_mcp_proxy().await?;
+            server::start_mcp_proxy(server::DaemonOrigin::AlreadyRunning).await?;
             return Ok(());
         } else {
             eprintln!("NeuroStrata MCP Server initializing...");
@@ -383,16 +383,30 @@ async fn main() -> anyhow::Result<()> {
             
             eprintln!("Waiting for daemon to become ready (this may take a moment while models load)...");
             
-            // Wait for daemon to become ready
+            // Wait for daemon to become ready. Bounded per attempt as well as
+            // overall: an unbound port on this machine hangs rather than
+            // refusing -- the behaviour DaemonProbe exists to describe -- so an
+            // untimed send here could spend the whole "30 seconds max" inside
+            // one call.
             let client = reqwest::Client::new();
             for _ in 0..300 { // 30 seconds max
-                if client.get("http://127.0.0.1:34343/health").send().await.is_ok() {
+                if client
+                    .get("http://127.0.0.1:34343/health")
+                    .timeout(std::time::Duration::from_millis(500))
+                    .send()
+                    .await
+                    .is_ok()
+                {
                     break;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
-            
-            server::start_mcp_proxy().await?;
+
+            // Deliberately not conditional on that loop having succeeded. A
+            // first run downloads the embedding model and takes far longer than
+            // 30s, and the proxy is told where the daemon came from so it waits
+            // rather than reporting a daemon it started itself as absent.
+            server::start_mcp_proxy(server::DaemonOrigin::SpawnedByUs).await?;
             return Ok(());
         }
     }
