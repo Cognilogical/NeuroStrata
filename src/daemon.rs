@@ -188,7 +188,8 @@ async fn handle_get_graph(
     State(state): State<AppState>,
     Query(query): Query<GraphQuery>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let ns = query.namespace.unwrap_or_else(|| "global".to_string());
+    let requested = query.namespace.unwrap_or_else(|| "global".to_string());
+    let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
     
     // Using export_graph here temporarily or implement native LadybugDB querying here
     // For now, let's just use export_graph (which gets everything) and filter by namespace
@@ -253,7 +254,10 @@ async fn handle_ingest(
     let schema = crate::parser::schema::ParserSchema::load(schema_str).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     
     let dir_path = std::path::Path::new(&req.dir);
-    crate::parser::ingest::ingest_directory(dir_path, &schema, state.embedder.clone(), state.vector_store.clone(), &req.namespace)
+    // The GUI derives this from the folder name, so it arrives in whatever
+    // case the checkout happens to use (bead neurostrata-fld).
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    crate::parser::ingest::ingest_directory(dir_path, &schema, state.embedder.clone(), state.vector_store.clone(), &namespace)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     
@@ -308,7 +312,8 @@ async fn handle_delete(
     // Answer with what the engine said. A bare 500 cost an afternoon here: a
     // caller could not tell a write conflict from a missing id, and neither
     // could the log (bead neurostrata-3fi.6.5).
-    state.vector_store.delete(&req.namespace, &req.id)
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    state.vector_store.delete(&namespace, &req.id)
         .await
         .map_err(|e| {
             eprintln!("delete of {} in {} failed: {}", req.id, req.namespace, e);
@@ -322,7 +327,9 @@ async fn handle_edit(
     Json(req): Json<EditReq>,
 ) -> Result<&'static str, axum::http::StatusCode> {
     // Basic edit implementation
-    let existing = state.vector_store.get(&req.old_namespace, &req.id)
+    let old_namespace = crate::server::resolve_namespace(&state.vector_store, &req.old_namespace).await;
+    let new_namespace = crate::server::resolve_namespace(&state.vector_store, &req.new_namespace).await;
+    let existing = state.vector_store.get(&old_namespace, &req.id)
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
         
@@ -330,8 +337,8 @@ async fn handle_edit(
         payload.content = req.content;
         payload.location = req.location;
         
-        state.vector_store.delete(&req.old_namespace, &req.id).await.ok();
-        state.vector_store.upsert(&req.new_namespace, &req.id, vector, payload).await.ok();
+        state.vector_store.delete(&old_namespace, &req.id).await.ok();
+        state.vector_store.upsert(&new_namespace, &req.id, vector, payload).await.ok();
     }
     Ok("OK")
 }

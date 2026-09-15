@@ -583,8 +583,9 @@ mod tests {
             qualified_id("NeuroStrata", "src/store/ladybug.rs"),
             qualified_id("NeuroStrata", "src/daemon.rs"),
         ];
+        let index = crate::store::ladybug::KnownIds::new(known.iter().map(String::as_str));
         assert_eq!(
-            crate::store::ladybug::resolve_declared_target("src/store/ladybug.rs", &known).as_deref(),
+            index.resolve("src/store/ladybug.rs").as_deref(),
             Some("NeuroStrata::src/store/ladybug.rs")
         );
     }
@@ -593,10 +594,21 @@ mod tests {
     #[test]
     fn a_suffix_does_not_match_a_longer_name() {
         let known = vec![qualified_id("NeuroStrata", "src/mylib.rs")];
-        assert_eq!(
-            crate::store::ladybug::resolve_declared_target("lib.rs", &known),
-            None
-        );
+        let index = crate::store::ladybug::KnownIds::new(known.iter().map(String::as_str));
+        assert_eq!(index.resolve("lib.rs"), None);
+    }
+
+    /// The same path under two namespaces must resolve to neither. A wrong
+    /// GOVERNS edge points a rule at another project's file, which is worse
+    /// than the rule having no edge at all.
+    #[test]
+    fn a_path_held_by_two_namespaces_is_ambiguous() {
+        let known = vec![
+            qualified_id("ProjectA", "src/main.rs"),
+            qualified_id("ProjectB", "src/main.rs"),
+        ];
+        let index = crate::store::ladybug::KnownIds::new(known.iter().map(String::as_str));
+        assert_eq!(index.resolve("src/main.rs"), None);
     }
 
 #[test]

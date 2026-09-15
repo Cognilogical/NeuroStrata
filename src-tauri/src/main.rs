@@ -120,20 +120,31 @@ fn daemon_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+/// The namespace to ask the daemon for: the project folder's name.
+///
+/// The daemon resolves it against the namespaces that already exist, ignoring
+/// case, so a checkout cloned as `neurostrata` reaches the `NeuroStrata` stratum
+/// agents write to (bead neurostrata-fld). Nothing is written into the project:
+/// the app only reads the graph and asks the daemon to ingest.
+fn namespace_for(project_path: &str) -> String {
+    std::path::Path::new(project_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("global")
+        .to_string()
+}
+
 #[tauri::command]
 fn ingest_ast(project_path: String) -> Result<String, String> {
     ensure_daemon()?;
     
-    let folder_name = std::path::Path::new(&project_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("global");
+    let namespace = namespace_for(&project_path);
 
     let client = reqwest::blocking::Client::new();
     let resp = client.post("http://127.0.0.1:34343/ingest")
         .json(&serde_json::json!({
             "dir": project_path,
-            "namespace": folder_name
+            "namespace": namespace
         }))
         .send()
         .map_err(|e| e.to_string())?;
@@ -200,10 +211,7 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
 
     let mut namespace_filter = "global".to_string();
     if let Some(path_str) = &project_path {
-        let path = std::path::Path::new(path_str);
-        if let Some(folder_name) = path.components().last().and_then(|c| c.as_os_str().to_str()) {
-            namespace_filter = folder_name.to_string();
-        }
+        namespace_filter = namespace_for(path_str);
     }
     
     let client = reqwest::blocking::Client::new();

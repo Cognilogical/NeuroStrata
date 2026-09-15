@@ -302,6 +302,8 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace. NEVER default to 'global' unless instructed.".to_string(),
     };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
 
     if namespace.contains('/') || namespace.contains('\\') {
         return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
@@ -437,6 +439,8 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> S
         Some(n) => n,
         None => return "Missing 'namespace' parameter.".to_string(),
     };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
 
     if let Ok(mut all_memories) = store.list(namespace, None).await {
         let now = chrono::Utc::now().timestamp();
@@ -472,6 +476,8 @@ async fn handle_ingest_directory(arguments: Value, emb: Arc<dyn Embedder>, store
         Some(n) => n,
         None => return "ERROR: namespace missing.".to_string(),
     };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
 
     let schema_str = include_str!("schema.json");
     
@@ -498,6 +504,8 @@ async fn handle_move_memory(arguments: Value, store: Arc<dyn VectorStore>) -> St
         Some(s) => s,
         None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
     };
+    let src = resolve_namespace(&store, src).await;
+    let src = src.as_str();
     let tgt = match arguments.get("target_namespace").and_then(|v| v.as_str()) {
         Some(t) => t,
         None => return "Missing required parameters: id, source_namespace, or target_namespace.".to_string(),
@@ -528,6 +536,8 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to search in.".to_string(),
     };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
 
     if let Ok(_) = store.init(namespace).await {
         if let Ok(vec) = emb.embed(&query).await {
@@ -558,6 +568,63 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
         }
     } else {
         "Failed to initialize namespace table.".to_string()
+    }
+}
+
+/// Resolves a namespace against the ones that already exist, ignoring case.
+///
+/// A project's identity should not depend on how somebody spelled the folder
+/// when they cloned it. This machine's checkout is .../neurostrata while the
+/// repository is NeuroStrata; the GUI derives the namespace from the folder
+/// name and agents pass the project name, so one project quietly became two
+/// strata (bead neurostrata-fld). Windows and macOS being case-insensitive
+/// means the same directory can be addressed several ways besides.
+///
+/// An existing namespace wins on a case-insensitive match and keeps the
+/// spelling it was stored with; a genuinely new name is left exactly as the
+/// caller wrote it. Listing namespaces costs about two milliseconds, so this
+/// runs on every call rather than being cached and going stale.
+pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &str) -> String {
+    match store.list_namespaces().await {
+        Ok(existing) => {
+            // An exact name always wins. Only when nothing matches exactly does
+            // case decide, so a caller naming a namespace that really exists is
+            // never redirected to a differently-cased neighbour.
+            if existing.iter().any(|known| known == requested) {
+                return requested.to_string();
+            }
+            let mut candidates: Vec<String> = existing
+                .into_iter()
+                .filter(|known| known.eq_ignore_ascii_case(requested))
+                .collect();
+
+            match candidates.len() {
+                0 => requested.to_string(),
+                1 => candidates.remove(0),
+                _ => {
+                    // Two spellings already exist. Row order is not a decision,
+                    // so take the fuller namespace and say what was passed over.
+                    candidates.sort();
+                    let mut best = candidates[0].clone();
+                    let mut best_len = 0usize;
+                    for candidate in &candidates {
+                        let held = store.list(candidate, None).await.map(|m| m.len()).unwrap_or(0);
+                        if held > best_len {
+                            best_len = held;
+                            best = candidate.clone();
+                        }
+                    }
+                    eprintln!(
+                        "WARNING: '{}' matches {:?}; using '{}', which holds the most memories. Merge them with neurostrata_move_memory.",
+                        requested, candidates, best
+                    );
+                    best
+                }
+            }
+        }
+        // A namespace that cannot be verified is used as given: refusing the
+        // write would be worse than writing it where the caller asked.
+        Err(_) => requested.to_string(),
     }
 }
 
@@ -630,6 +697,8 @@ async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> Str
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string(),
     };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
     if namespace.contains('/') || namespace.contains('\\') {
         return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
     }
@@ -668,7 +737,41 @@ mod tests {
         }
     }
 
-                #[test]
+    fn namespace_from(existing: &[&str], requested: &str) -> String {
+        // The same rule resolve_namespace applies, over a list instead of the store.
+        if existing.iter().any(|known| *known == requested) {
+            return requested.to_string();
+        }
+        existing
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(requested))
+            .map(|known| known.to_string())
+            .unwrap_or_else(|| requested.to_string())
+    }
+
+    #[test]
+    fn a_differently_cased_checkout_lands_in_the_existing_namespace() {
+        let existing = ["NeuroStrata", "NeuroPlasticity"];
+        assert_eq!(namespace_from(&existing, "neurostrata"), "NeuroStrata");
+        assert_eq!(namespace_from(&existing, "NEUROSTRATA"), "NeuroStrata");
+    }
+
+    #[test]
+    fn an_exact_name_is_never_redirected() {
+        // Both spellings exist here, which is the mess this repairs. A caller
+        // asking for the one that exists must still reach it.
+        let existing = ["NeuroStrata", "neurostrata"];
+        assert_eq!(namespace_from(&existing, "neurostrata"), "neurostrata");
+        assert_eq!(namespace_from(&existing, "NeuroStrata"), "NeuroStrata");
+    }
+
+    #[test]
+    fn a_genuinely_new_namespace_keeps_the_spelling_it_was_given() {
+        let existing = ["NeuroStrata"];
+        assert_eq!(namespace_from(&existing, "SomethingElse"), "SomethingElse");
+    }
+
+                                    #[test]
     fn a_formatted_memory_carries_its_anchors() {
         let mut p = payload("checkpoint every write");
         p.location = "src/store/ladybug.rs".to_string();
