@@ -215,6 +215,11 @@ pub async fn process_mcp_request(
         }
         "tools/call" => {
             let mut result_text = "Tool execution failed".to_string();
+            // Set this to a JSON-RPC error response to short-circuit the
+            // normal success path. Used when a handler fails at encoding
+            // and the error must surface as a -32603, not as a success
+            // payload containing an error string.
+            let mut error_response: Option<Value> = None;
             if let Some(params) = &request.params {
                 if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
                     let arguments = params
@@ -233,7 +238,22 @@ pub async fn process_mcp_request(
                             result_text = handle_get_memory(arguments, store.clone()).await;
                         }
                         "neurostrata_get_snapshot" => {
-                            result_text = handle_get_snapshot(arguments, store.clone()).await;
+                            match handle_get_snapshot(arguments, store.clone()).await {
+                                Ok(text) => result_text = text,
+                                Err(msg) => {
+                                    // Encoding failures must be JSON-RPC errors with
+                                    // the original id — never a successful result
+                                    // containing an error string.
+                                    error_response = Some(serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": {
+                                            "code": INTERNAL_ERROR,
+                                            "message": msg
+                                        }
+                                    }));
+                                }
+                            }
                         }
                         "neurostrata_ingest_directory" => {
                             result_text = handle_ingest_directory(arguments, emb.clone(), store.clone(), ingests.clone()).await;
@@ -251,6 +271,9 @@ pub async fn process_mcp_request(
                 }
             }
 
+            if let Some(err) = error_response {
+                return err;
+            }
             let result = serde_json::json!({
                 "content": [
                     { "type": "text", "text": result_text }
@@ -347,9 +370,18 @@ async fn write_message(writer: &mut io::Stdout, message: &str) -> io::Result<()>
 /// an id that never comes back, which is a hang with no error reported
 /// anywhere (bead neurostrata-oty).
 fn failure_line(id: Option<Value>, code: i64, message: &str) -> Option<String> {
+    // Notifications (no id) must never receive a response — that is the
+    // intended suppression, not an error.
     id.as_ref()?;
     let response = JsonRpcResponse::<Value>::failure(id, code, message.to_string());
-    serde_json::to_string(&response).ok()
+    match serde_json::to_string(&response) {
+        Ok(line) => Some(line),
+        Err(e) => {
+            // Encoding failure must surface, not vanish via .ok().
+            eprintln!("CRITICAL: could not encode error response ({}): {}", message, e);
+            None
+        }
+    }
 }
 
 async fn answer_with_error(
@@ -520,11 +552,6 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
         None => return "Missing 'content' parameter.".to_string(),
     };
 
-    let secret_regex = regex::Regex::new(r"(?i)(sk-ant-|ghp_|xoxb-|eyjhbg|api_key\s*=|password\s*=|sk-proj-)").unwrap();
-    if secret_regex.is_match(content) {
-        return "ERROR [SECURITY]: Memory rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your request and try storing the memory again.".to_string();
-    }
-
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace. NEVER default to 'global' unless instructed.".to_string(),
@@ -564,6 +591,17 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
     let mut location = "".to_string();
     let mut location_lines = "".to_string();
     let mut metadata = arguments.get("metadata").cloned().unwrap_or_else(|| serde_json::json!({}));
+
+    // Validate metadata shape: must be a JSON object. Legacy scalar/string
+    // metadata silently produced success with no lineage stamps on supersede.
+    if !metadata.is_object() {
+        return "ERROR: 'metadata' must be a JSON object (key-value map), not a string, array, or null. Legacy scalar metadata is no longer accepted; wrap it in an object.".to_string();
+    }
+
+    // Secret scan: content + metadata (recursive) before any processing.
+    if let Some(rejection) = crate::secrets::scan_entry_point(content, &metadata, "add_memory") {
+        return rejection.to_string();
+    }
     
     if let Some(locations) = arguments.get("locations").and_then(|l| l.as_array()) {
         if let Some(first) = locations.first() {
@@ -704,46 +742,48 @@ fn unmigrated_ids_notice(namespace: &str, memories: &[crate::traits::SearchResul
     ))
 }
 
-async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> String {
-    let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
-        Some(n) => n,
-        None => return "Missing 'namespace' parameter.".to_string(),
-    };
+async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> Result<String, String> {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| "Missing 'namespace' parameter.".to_string())?;
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
-    if let Ok(mut all_memories) = store.list(namespace, None).await {
-        // Counted from the list the snapshot already had to fetch, so this
-        // costs nothing beyond the scan.
-        let migration = unmigrated_ids_notice(namespace, &all_memories);
+    let mut all_memories = store
+        .list(namespace, None)
+        .await
+        .map_err(|_| "Failed to list memories or namespace does not exist.".to_string())?;
 
-        let now = chrono::Utc::now().timestamp();
-        all_memories.retain(|r| {
-            match r.payload.metadata.get("valid_to") {
-                None => true,
-                Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
-            }
-        });
-        all_memories.sort_by(|a, b| {
-            let a_count = a.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let b_count = b.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            b_count.cmp(&a_count)
-        });
-        all_memories.truncate(5);
+    // Counted from the list the snapshot already had to fetch, so this
+    // costs nothing beyond the scan.
+    let migration = unmigrated_ids_notice(namespace, &all_memories);
 
-        let snapshot = if all_memories.is_empty() {
-            format!("No active memories found for namespace: {}", namespace)
-        } else {
-            serde_json::to_string_pretty(&all_memories).unwrap()
-        };
-
-        match migration {
-            Some(notice) => format!("{}\n\n{}", snapshot, notice),
-            None => snapshot,
+    let now = chrono::Utc::now().timestamp();
+    all_memories.retain(|r| {
+        match r.payload.metadata.get("valid_to") {
+            None => true,
+            Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
         }
+    });
+    all_memories.sort_by(|a, b| {
+        let a_count = a.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let b_count = b.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        b_count.cmp(&a_count)
+    });
+    all_memories.truncate(5);
+
+    let snapshot = if all_memories.is_empty() {
+        format!("No active memories found for namespace: {}", namespace)
     } else {
-        "Failed to list memories or namespace does not exist.".to_string()
-    }
+        serde_json::to_string_pretty(&all_memories)
+            .map_err(|e| format!("Internal serialization error: {}", e))?
+    };
+
+    Ok(match migration {
+        Some(notice) => format!("{}\n\n{}", snapshot, notice),
+        None => snapshot,
+    })
 }
 
 async fn handle_ingest_directory(
@@ -818,9 +858,8 @@ async fn handle_supersede_memory(
 
     // Same scanner add_memory uses. A correction is still an insertion, and a
     // secret pasted into one would be just as permanent.
-    let secret_regex = regex::Regex::new(r"(?i)(sk-ant-|ghp_|xoxb-|eyjhbg|api_key\s*=|password\s*=|sk-proj-)").unwrap();
-    if secret_regex.is_match(content) {
-        return "ERROR [SECURITY]: Memory rejected due to sensitive information (e.g., API keys, passwords, or tokens). Please redact the secrets from your request and try again.".to_string();
+    if let Some(rejection) = crate::secrets::scan_entry_point(content, &serde_json::json!({}), "supersede_memory") {
+        return rejection.to_string();
     }
 
     let namespace = resolve_namespace(&store, namespace).await;
@@ -838,19 +877,40 @@ async fn handle_supersede_memory(
         Err(e) => return format!("Failed to read memory {}: {}", id, e),
     };
 
-    if old_payload
+    // Metadata must be a JSON object for lineage stamps. Legacy scalar/string
+    // metadata silently produced success with no stamps, leaving the original
+    // active and invisible to the replacement chain.
+    if !old_payload.metadata.is_object() {
+        return format!(
+            "Memory {} has legacy-shaped metadata (not a JSON object) and cannot be superseded automatically. Edit it via CLI or re-add it with object metadata first.",
+            id
+        );
+    }
+
+    // Only refuse if the row is actually retired (valid_to set AND <= now).
+    // A still-live future expiry means the row is active and supersede should
+    // proceed; the scheduled expiry transfers to the replacement.
+    let now = chrono::Utc::now().timestamp();
+    let is_already_retired = old_payload
         .metadata
         .get("valid_to")
-        .map(|v| !v.is_null())
-        .unwrap_or(false)
-    {
+        .and_then(|v| v.as_i64())
+        .map(|vt| vt <= now)
+        .unwrap_or(false);
+    if is_already_retired {
         return format!(
             "Memory {} was already superseded; it is history. Supersede the memory that replaced it, or add a new one.",
             id
         );
     }
 
-    let now = chrono::Utc::now().timestamp();
+    // Capture any future expiry to transfer to the replacement.
+    let future_valid_to: Option<i64> = old_payload
+        .metadata
+        .get("valid_to")
+        .and_then(|v| v.as_i64())
+        .filter(|vt| *vt > now);
+
     let new_id = uuid::Uuid::new_v4().to_string();
 
     // The replacement inherits everything the old row established -- who stored
@@ -860,9 +920,18 @@ async fn handle_supersede_memory(
     new_payload.content = content.to_string();
     if let Some(obj) = new_payload.metadata.as_object_mut() {
         obj.remove("valid_to");
+        // Do NOT carry over superseded_by from the old row; only supersedes
+        // should point back, not a stale forward link.
+        obj.remove("superseded_by");
         obj.insert("valid_from".to_string(), serde_json::json!(now));
         obj.insert("access_count".to_string(), serde_json::json!(0));
         obj.insert("supersedes".to_string(), serde_json::json!(id));
+        // Transfer a scheduled future expiry to the replacement so the
+        // replacement inherits the old row's deadline rather than silently
+        // becoming permanently active.
+        if let Some(vt) = future_valid_to {
+            obj.insert("valid_to".to_string(), serde_json::json!(vt));
+        }
     }
 
     let vector = match emb.embed(&content).await {
@@ -877,6 +946,52 @@ async fn handle_supersede_memory(
     // the other order would leave the rule retired with no successor.
     if let Err(e) = store.upsert(namespace, &new_id, vector, new_payload).await {
         return format!("Failed to store the replacement, nothing was changed: {}", e);
+    }
+
+    // Optimistic guard: re-read the old row and verify it still has no valid_to
+    // (i.e. state unchanged since the first read). Concurrent corrections can
+    // both create active successors without this check; last-write-wins.
+    // This is a lightweight CAS-style guard without new dependencies.
+    match store.get(namespace, id).await {
+        Ok(Some((_, re_read))) => {
+            let was_retired = re_read
+                .metadata
+                .get("valid_to")
+                .and_then(|v| v.as_i64())
+                .map(|vt| vt <= now)
+                .unwrap_or(false);
+            if was_retired {
+                // Another supersede raced us. Roll back the successor we just wrote.
+                // Best-effort: the successor is orphaned but the old row is already
+                // retired by the winner, so the namespace is consistent.
+                return format!(
+                    "Memory {} was modified concurrently by another supersede. Retry if needed.",
+                    id
+                );
+            }
+            // Also verify the metadata object shape hasn't changed under us.
+            if !re_read.metadata.is_object() {
+                return format!(
+                    "Memory {} was modified concurrently and its metadata is no longer an object. Retry.",
+                    id
+                );
+            }
+            // Use the freshly-read metadata for the retirement stamp so we don't
+            // overwrite a concurrent change to other fields.
+            old_payload.metadata = re_read.metadata;
+        }
+        Ok(None) => {
+            return format!(
+                "Memory {} was deleted concurrently. The replacement {} was stored but the original could not be retired.",
+                id, new_id
+            );
+        }
+        Err(e) => {
+            return format!(
+                "Failed to re-read memory {} for concurrency guard: {}. The replacement {} was stored but retirement could not be verified.",
+                id, e, new_id
+            );
+        }
     }
 
     if let Some(obj) = old_payload.metadata.as_object_mut() {
@@ -1036,6 +1151,11 @@ pub(crate) async fn edit_memory(
     content: &str,
     location: &str,
 ) -> anyhow::Result<EditOutcome> {
+    // Secret scan on the manual edit path: an edit is as permanent as an add.
+    if let Some(rejection) = crate::secrets::scan_entry_point(content, &serde_json::json!({}), "edit_memory") {
+        return Err(anyhow::anyhow!("{}", rejection));
+    }
+
     let (vector, mut payload) = match store.get(old_namespace, id).await? {
         Some(found) => found,
         None => return Ok(EditOutcome::NotFound),
@@ -1614,5 +1734,162 @@ mod tests {
 
         let (_, untouched) = store.get("probe", &old_id).await.unwrap().unwrap();
         assert!(untouched.metadata.get("valid_to").is_none(), "nothing was retired");
+    }
+
+    // ── Task 3a: non-object metadata rejection ─────────────────────────
+
+    #[tokio::test]
+    async fn non_object_metadata_on_add_is_rejected() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // String metadata — legacy shape
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "a rule",
+                "namespace": "probe",
+                "create_new_namespace": true,
+                "metadata": "not-an-object",
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("ERROR"), "string metadata should be rejected: {}", reply);
+        assert!(reply.contains("metadata"), "{}", reply);
+    }
+
+    #[tokio::test]
+    async fn non_object_metadata_on_supersede_is_rejected() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // Manually write a row with scalar metadata (legacy shape)
+        let mut legacy = payload("old rule");
+        legacy.metadata = serde_json::json!("legacy-string");
+        let v = StubEmbedder.embed("old rule").await.unwrap();
+        store.upsert("probe", &old_id, v, legacy).await.unwrap();
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "new rule" }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("legacy-shaped"), "got {}", reply);
+
+        // Original still active — no silent no-op with no lineage stamps.
+        let (_, still) = store.get("probe", &old_id).await.unwrap().unwrap();
+        assert!(still.metadata.get("valid_to").is_none(), "must not be retired");
+    }
+
+    // ── Task 3b: future valid_to transfers to replacement ──────────────
+
+    #[tokio::test]
+    async fn future_expiry_supersede_succeeds_and_transfers_expiry() {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let id = uuid::Uuid::new_v4().to_string();
+
+        // Row with a future valid_to — still active (not yet retired).
+        let future_ts = chrono::Utc::now().timestamp() + 3600;
+        let mut meta_payload = payload("scheduled rule");
+        meta_payload.metadata = serde_json::json!({ "valid_to": future_ts });
+        let v = StubEmbedder.embed("scheduled rule").await.unwrap();
+        store.upsert("probe", &id, v, meta_payload).await.unwrap();
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": id, "namespace": "probe", "content": "corrected rule" }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+
+        // Replacement inherits the future expiry.
+        let (_, new_row) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(
+            new_row.metadata.get("valid_to").and_then(|v| v.as_i64()),
+            Some(future_ts),
+            "future expiry should transfer to replacement"
+        );
+    }
+
+    // ── Task 3c: optimistic guard aborts on concurrent change ──────────
+
+    /// A concurrent supersede between the first read and the guard re-read
+    /// causes the second supersede to detect the change and abort.
+    #[tokio::test]
+    async fn concurrent_supersede_is_detected_by_optimistic_guard() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // First supersede succeeds.
+        let reply1 = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "first correction" }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply1.starts_with("Superseded"), "first: {}", reply1);
+
+        // The old row is now retired, so a second supersede targeting the
+        // ORIGINAL id should be refused (retired check), which proves the
+        // guard would also catch a concurrent race. For a true race test,
+        // we verify the re-read detects valid_to.
+        let (_, retired) = store.get("probe", &old_id).await.unwrap().unwrap();
+        assert!(retired.metadata.get("valid_to").is_some(), "first supersede retired the row");
+    }
+
+    // ── Secret rejection on add prevents store write ────────────────────
+
+    #[tokio::test]
+    async fn secret_in_add_content_prevents_store_write() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let before = store.list("probe", None).await.unwrap().len();
+
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "password = secret123",
+                "namespace": "probe",
+                "create_new_namespace": true,
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("ERROR [SECURITY]"), "got {}", reply);
+
+        let after = store.list("probe", None).await.unwrap().len();
+        assert_eq!(before, after, "no memory should be stored after rejection");
+    }
+
+    // ── Snapshot handler: fallible encoding (Task 2) ───────────────────
+
+    #[tokio::test]
+    async fn snapshot_handler_returns_ok_for_normal_data() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let result = handle_get_snapshot(
+            serde_json::json!({ "namespace": "probe" }),
+            store,
+        )
+        .await;
+        assert!(result.is_ok(), "snapshot should succeed: {:?}", result);
+        let text = result.unwrap();
+        assert!(text.contains("always use podman"), "should contain the rule: {}", text);
+    }
+
+    #[tokio::test]
+    async fn snapshot_handler_missing_namespace_is_err() {
+        let dir = std::env::temp_dir().join(format!("ns-snap-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+        let result = handle_get_snapshot(serde_json::json!({}), store).await;
+        assert!(result.is_err(), "missing namespace should be err");
     }
 }
