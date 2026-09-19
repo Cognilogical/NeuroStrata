@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AcceptableEmbedder {
@@ -107,7 +108,7 @@ pub fn configured_dimensions() -> Result<usize> {
 const MAX_EMBED_TOKENS: usize = 2048;
 
 pub struct FastEmbedder {
-    model: TextEmbedding,
+    model: Arc<TextEmbedding>,
     dimensions: usize,
 }
 
@@ -138,7 +139,7 @@ impl FastEmbedder {
         )?;
         
         Ok(Self { 
-            model,
+            model: Arc::new(model),
             dimensions: target_model.dimensions,
         })
     }
@@ -147,7 +148,15 @@ impl FastEmbedder {
 #[async_trait]
 impl Embedder for FastEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let mut embeddings = self.model.embed(vec![text], None)?;
+        // Model inference is CPU-bound and can stall the async runtime when
+        // called from a Tokio task. Isolate it on the blocking thread pool.
+        let model = Arc::clone(&self.model);
+        let text = text.to_owned();
+        let mut embeddings = tokio::task::spawn_blocking(move || {
+            model.embed(vec![&*text], None)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
         Ok(embeddings.pop().unwrap_or_default())
     }
 

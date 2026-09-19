@@ -91,16 +91,6 @@ impl IngestObserver for ProgressReporter {
     }
 }
 
-/// Whether two ways of naming a directory name the same one. Canonicalising
-/// settles `.`, `..`, separators and, where the filesystem ignores it, case; if
-/// either path cannot be resolved, the strings have to match exactly.
-fn same_directory(a: &str, b: &str) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
-
 /// The walk a caller should wait on instead of starting one, if there is one.
 ///
 /// Attaching is right only for the same directory. A caller naming a different
@@ -110,7 +100,7 @@ fn same_directory(a: &str, b: &str) -> bool {
 fn attach_to_running(
     jobs: &HashMap<String, watch::Receiver<IngestProgress>>,
     namespace: &str,
-    dir: &str,
+    canonical_dir: &str,
 ) -> anyhow::Result<Option<watch::Receiver<IngestProgress>>> {
     let Some(rx) = jobs.get(namespace) else {
         return Ok(None);
@@ -122,14 +112,16 @@ fn attach_to_running(
         }
         progress.dir.clone()
     };
-    if same_directory(&running_dir, dir) {
+    // Both running_dir and canonical_dir are pre-canonicalized outside the
+    // lock, so direct string comparison suffices — no filesystem I/O here.
+    if running_dir == canonical_dir {
         Ok(Some(rx.clone()))
     } else {
         Err(anyhow::anyhow!(
             "namespace '{}' is already ingesting {}; wait for that to finish before ingesting {} into it",
             namespace,
             running_dir,
-            dir
+            canonical_dir
         ))
     }
 }
@@ -161,17 +153,31 @@ impl IngestJobs {
         embedder: Arc<dyn Embedder>,
         vector_store: Arc<dyn VectorStore>,
     ) -> anyhow::Result<IngestProgress> {
+        // Canonicalize the incoming root before acquiring the jobs registry
+        // mutex. NFS mounts or slow filesystems would stall every other job
+        // if this happened inside the critical section.
+        let canonical_dir = {
+            let dir = dir.to_string();
+            tokio::task::spawn_blocking(move || {
+                std::fs::canonicalize(&dir)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| dir)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to resolve directory: {}", e))?
+        };
+
         let mut rx = {
             let mut jobs = self.jobs.lock().unwrap();
 
-            if let Some(running) = attach_to_running(&jobs, namespace, dir)? {
+            if let Some(running) = attach_to_running(&jobs, namespace, &canonical_dir)? {
                 running
             } else {
-                let (tx, rx) = watch::channel(IngestProgress::started(namespace, dir));
+                let (tx, rx) = watch::channel(IngestProgress::started(namespace, &canonical_dir));
                 jobs.insert(namespace.to_string(), rx.clone());
 
                 let namespace = namespace.to_string();
-                let dir = dir.to_string();
+                let dir = canonical_dir;
 
                 // Detached deliberately. tokio::spawn keeps running when its
                 // JoinHandle is dropped, which is what makes a disconnect stop
