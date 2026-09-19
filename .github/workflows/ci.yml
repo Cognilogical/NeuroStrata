@@ -60,6 +60,18 @@ jobs:
             exit 1
           }
 
+      # The vendored OpenSSL build (needed by lbug's link directives) requires
+      # a Perl with Windows module support: the Git-bundled perl that wins PATH
+      # exits 2 during Configure. Strawberry Perl is preinstalled on the image;
+      # point openssl-src at it explicitly. NASM is also preinstalled but not
+      # always on PATH.
+      - name: Configure vendored OpenSSL build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+
       - name: Build
         shell: bash
         run: cargo build --release --locked
