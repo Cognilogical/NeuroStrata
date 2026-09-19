@@ -111,7 +111,9 @@ pub trait VectorStore: Send + Sync {
     async fn list_namespaces(&self) -> Result<Vec<String>>;
 
     /// Export the entire graph as a JSON object with `nodes` and `links`.
-    async fn export_graph(&self) -> Result<serde_json::Value>;
+    /// When `include_retired` is false (the default), retired memories and
+    /// their incident edges are excluded from the view.
+    async fn export_graph(&self, include_retired: bool) -> Result<serde_json::Value>;
 
     /// Increment the access count of a specific memory by its ID.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()>;

@@ -687,36 +687,47 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let safe_ns = escape_kuzu_string(&namespace);
             let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+            let now = chrono::Utc::now().timestamp();
+
+            // Kuzu has no OFFSET, so we over-fetch with a larger LIMIT and
+            // filter/trim in Rust. The multiplier bounds cost: at most
+            // FETCH_MULTIPLIER * limit rows are scanned from the engine.
+            const FETCH_MULTIPLIER: usize = 10;
+            let fetch_limit = limit * FETCH_MULTIPLIER;
 
             // Step 1: Base vector search.
             //
-            // Structural nodes are stored with an all-zero embedding, and the distance
-            // from an all-zero row is the query vector's own magnitude -- the same value
-            // for every one of them, whatever was asked. Left in, they tie with each
-            // other and can fill the limit with path stubs. They stay reachable through
-            // the graph expansion in step 2, which is where they are actually useful.
+            // Structural nodes are stored with an all-zero embedding, and the
+            // distance from an all-zero row is the query vector's own magnitude
+            // -- the same value for every one of them, whatever was asked. Left
+            // in, they tie with each other and can fill the limit with path
+            // stubs. They stay reachable through the graph expansion in step 2,
+            // which is where they are actually useful.
+            //
+            // ORDER BY dist ASC, id ASC gives deterministic tie-breaking so the
+            // same query returns the same rows across runs.
             let structural_types = STRUCTURAL_MEMORY_TYPES
                 .iter()
                 .map(|t| format!("'{}'", t))
                 .collect::<Vec<_>>()
                 .join(", ");
             let search_query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC LIMIT {}",
-                safe_ns, structural_types, vec_str, limit
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
+                safe_ns, structural_types, vec_str, fetch_limit
             );
 
             let result = conn.query(&search_query)?;
-            let mut results = Vec::new();
             let mut primary_ids = Vec::new();
+            let mut results = Vec::new();
 
             for row in result {
                 let id: String = format!("{}", row[0]);
                 let distance: f32 = match &row[1] {
-                    lbug::Value::Float(f) => *f,
-                    lbug::Value::Double(d) => *d as f32,
-                    _ => 0.0,
+                    lbug::Value::Float(f) if f.is_finite() && *f >= 0.0 => *f,
+                    lbug::Value::Double(d) if d.is_finite() && *d >= 0.0 => *d as f32,
+                    _ => continue,
                 };
-            
+
                 let content: String = format!("{}", row[2]);
                 let user_id: String = format!("{}", row[3]);
                 let memory_type: String = format!("{}", row[4]);
@@ -727,14 +738,18 @@ impl VectorStore for LadybugStore {
 
                 let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
-                // Temporal filtering
-                if is_retired(&metadata_val) {
+                // Skip retired rows -- they do not count toward the limit.
+                if is_retired_at(&metadata_val, now) {
                     continue;
                 }
 
+                // Usage boost: ln(1+n) gives a real gain even at n=1, and the
+                // cap at half distance preserves semantic ranking order.
                 let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let gain = if access_count > 0 { (access_count as f32).ln() * 0.05 } else { 0.0 };
-                let boosted_distance = distance - gain;
+                let n = access_count.max(0) as f32;
+                let gain = 0.05 * (1.0 + n).ln();
+                let capped_gain = gain.min(0.5 * distance);
+                let boosted_distance = distance - capped_gain;
 
                 primary_ids.push(id.clone());
 
@@ -751,10 +766,17 @@ impl VectorStore for LadybugStore {
                         metadata: metadata_val,
                     },
                 });
+
+                // We have enough active primaries; stop scanning.
+                if results.len() >= limit {
+                    break;
+                }
             }
 
             // Step 2: Hybrid GraphRAG Neighborhood Fetch
-            // We fetch 1-hop neighbors (CONTAINS, GOVERNS, RELATES_TO) to provide blast radius context
+            // We fetch 1-hop neighbors (CONTAINS, GOVERNS, RELATES_TO) to provide
+            // blast radius context. Over-fetch and filter so retired neighbors
+            // cannot crowd out live ones.
             if !primary_ids.is_empty() {
                 let id_list = primary_ids.iter()
                     .map(|id| format!("'{}'", escape_kuzu_string(&id)))
@@ -764,7 +786,7 @@ impl VectorStore for LadybugStore {
                 // Anything one hop from a primary match.
                 let neighbor_query = format!(
                     "MATCH (a:Memory)-[]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata LIMIT {}",
-                    id_list, safe_ns, id_list, limit
+                    id_list, safe_ns, id_list, fetch_limit
                 );
 
                 // And one step further, but only along GOVERNS. A match is usually a
@@ -773,10 +795,11 @@ impl VectorStore for LadybugStore {
                 // unreachable from the query above.
                 let governing_query = format!(
                     "MATCH (a:Memory)-[]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata LIMIT {}",
-                    id_list, safe_ns, id_list, limit
+                    id_list, safe_ns, id_list, fetch_limit
                 );
 
                 for expansion in [neighbor_query, governing_query] {
+                    let mut expansion_count = 0usize;
                     if let Ok(mut rows) = conn.query(&expansion) {
                         while let Some(row) = rows.next() {
                             let id: String = format!("{}", row[0]);
@@ -791,15 +814,16 @@ impl VectorStore for LadybugStore {
                             let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
 
                             // The graph must not bring back what the match filtered out.
-                            if is_retired(&metadata_val) {
+                            if is_retired_at(&metadata_val, now) {
                                 continue;
                             }
 
-                            // Neighbors get a synthesized lower score (worse distance) so they appear after primary matches,
+                            // Neighbors get a synthesized lower score (worse
+                            // distance) so they appear after primary matches,
                             // but still within the context window.
                             results.push(SearchResult {
                                 id,
-                                score: 10.0, // High distance (low relevance score) ensures they rank below direct matches
+                                score: 10.0,
                                 payload: MemoryPayload {
                                     content,
                                     user_id,
@@ -810,6 +834,10 @@ impl VectorStore for LadybugStore {
                                     metadata: metadata_val,
                                 },
                             });
+                            expansion_count += 1;
+                            if expansion_count >= limit {
+                                break;
+                            }
                         }
                     }
                 }
@@ -820,7 +848,7 @@ impl VectorStore for LadybugStore {
             }
 
             results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
-            // We can truncate to a slightly larger limit to include some neighbors, or keep it strict
+            // Include some neighbors after the primary matches.
             results.truncate(limit * 2);
 
             Ok(results)
@@ -1128,11 +1156,13 @@ impl VectorStore for LadybugStore {
         .await
     }
 
-    async fn export_graph(&self) -> Result<serde_json::Value> {
+    async fn export_graph(&self, include_retired: bool) -> Result<serde_json::Value> {
         self.with_conn(move |conn| {
-        
+            let now = chrono::Utc::now().timestamp();
+
             // 1. Fetch all nodes
             let mut nodes = Vec::new();
+            let mut retired_ids = std::collections::HashSet::new();
             let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
             let mut result_nodes = conn.query(query_nodes)?;
         
@@ -1145,9 +1175,11 @@ impl VectorStore for LadybugStore {
             
                 let mut absolute_path = "".to_string();
                 let mut domain = None;
+                let mut retired = false;
 
                 if let lbug::Value::String(metadata_str) = &row[5] {
                     if let Ok(metadata_val) = serde_json::from_str::<serde_json::Value>(metadata_str) {
+                        retired = is_retired_at(&metadata_val, now);
                         if let Some(abs_path) = metadata_val.get("absolute_path").and_then(|v| v.as_str()) {
                             absolute_path = abs_path.to_string();
                         }
@@ -1155,6 +1187,11 @@ impl VectorStore for LadybugStore {
                             domain = Some(d.to_string());
                         }
                     }
+                }
+
+                // Track retired ids so edges can be filtered below.
+                if retired {
+                    retired_ids.insert(id.clone());
                 }
 
                 // If absolute_path wasn't in metadata, try to compute it from location
@@ -1180,6 +1217,10 @@ impl VectorStore for LadybugStore {
                         // which is what tells the UI it has nothing to open.
                     }
                 }
+
+                if !include_retired && retired {
+                    continue;
+                }
             
                 nodes.push(serde_json::json!({
                     "id": id,
@@ -1192,7 +1233,8 @@ impl VectorStore for LadybugStore {
                 }));
             }
         
-            // 2. Fetch all edges
+            // 2. Fetch all edges, filtering out any incident on a retired node
+            //    in active view.
             let mut links = Vec::new();
         
             // RELATES_TO
@@ -1201,6 +1243,9 @@ impl VectorStore for LadybugStore {
             while let Some(row) = res_relates.next() {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
+                    continue;
+                }
                 links.push(serde_json::json!({
                     "source": source,
                     "target": target,
@@ -1214,6 +1259,9 @@ impl VectorStore for LadybugStore {
             while let Some(row) = res_contains.next() {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
+                    continue;
+                }
                 links.push(serde_json::json!({
                     "source": source,
                     "target": target,
@@ -1227,6 +1275,9 @@ impl VectorStore for LadybugStore {
             while let Some(row) = res_governs.next() {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
+                    continue;
+                }
                 links.push(serde_json::json!({
                     "source": source,
                     "target": target,
@@ -1348,9 +1399,15 @@ fn is_write_collision(err: &anyhow::Error) -> bool {
 /// match, the graph around that match, and the edges relinking replays.
 /// Filtering only the first lets the graph hand back what the match left out.
 fn is_retired(metadata: &Value) -> bool {
+    is_retired_at(metadata, chrono::Utc::now().timestamp())
+}
+
+/// Timestamp-aware variant so callers that fetch many rows in one pass can
+/// capture `now` once instead of calling Utc::now() per row.
+fn is_retired_at(metadata: &Value, now: i64) -> bool {
     match metadata.get("valid_to") {
         Some(valid_to) if !valid_to.is_null() => {
-            valid_to.as_i64().unwrap_or(0) <= chrono::Utc::now().timestamp()
+            valid_to.as_i64().unwrap_or(0) <= now
         }
         _ => false,
     }
@@ -1443,7 +1500,7 @@ fn bump_access_count(metadata: &str) -> String {
     }
     if let Some(obj) = value.as_object_mut() {
         let count = obj.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        obj.insert("access_count".to_string(), serde_json::json!(count + 1));
+        obj.insert("access_count".to_string(), serde_json::json!(count.saturating_add(1)));
     }
     value.to_string()
 }
@@ -2034,5 +2091,254 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .expect("query succeeds")
             .expect("the row is there");
         assert_eq!(read_back, stored, "the embedding survives a round trip");
+    }
+
+    // --- TASK 1 tests: usage boost formula and counter saturation ---
+
+    #[test]
+    fn usage_boost_at_distance_zero_stays_zero() {
+        // gain = 0.05 * ln(1+5) ≈ 0.080, capped_gain = min(0.080, 0) = 0
+        let n = 5i64;
+        let distance: f32 = 0.0;
+        let gain = 0.05 * (1.0 + n.max(0) as f32).ln();
+        let capped = gain.min(0.5 * distance);
+        let boosted = distance - capped;
+        assert_eq!(boosted, 0.0);
+    }
+
+    #[test]
+    fn usage_boost_at_count_zero_gives_zero_gain() {
+        let n = 0i64;
+        let gain = 0.05 * (1.0 + n.max(0) as f32).ln();
+        assert_eq!(gain, 0.0);
+    }
+
+    #[test]
+    fn usage_boost_at_count_one_gives_real_gain() {
+        let n = 1i64;
+        let gain = 0.05 * (1.0 + n.max(0) as f32).ln();
+        assert!(gain > 0.0, "ln(1+1) should be > 0");
+    }
+
+    #[test]
+    fn usage_boost_cap_holds_at_half_distance() {
+        let distance: f32 = 0.1;
+        let n = 8i64;
+        let gain = 0.05 * (1.0 + n.max(0) as f32).ln();
+        let capped = gain.min(0.5 * distance);
+        let boosted = distance - capped;
+        assert!(boosted >= 0.0, "adjusted must be non-negative");
+        assert!(boosted >= 0.5 * distance, "cap must hold: adjusted >= d/2");
+        assert!(boosted <= distance, "adjusted must be <= d");
+    }
+
+    #[test]
+    fn usage_boost_in_range_for_finite_distance() {
+        for d in [0.01, 0.1, 0.5, 1.0, 5.0] {
+            for n in [0, 1, 5, 100, 1000] {
+                let gain = 0.05 * (1.0 + n as f32).ln();
+                let capped = gain.min(0.5 * d);
+                let boosted = d - capped;
+                assert!(boosted >= 0.5 * d, "d={}, n={}: adjusted {} < d/2", d, n, boosted);
+                assert!(boosted <= d, "d={}, n={}: adjusted {} > d", d, n, boosted);
+            }
+        }
+    }
+
+    #[test]
+    fn bump_access_count_saturates_at_i64_max() {
+        let metadata = json!({"access_count": i64::MAX}).to_string();
+        let result = bump_access_count(&metadata);
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["access_count"], json!(i64::MAX));
+    }
+
+    #[tokio::test]
+    async fn search_after_saturating_count_does_not_panic() {
+        let store = retired_test_store().await;
+        // Non-integer values: Kuzu treats whole-number floats as integers,
+        // which ARRAY_DISTANCE rejects.
+        let v = vec![1.1, 0.0, 0.0, 0.0];
+        store
+            .upsert(
+                "probe",
+                "hot-memory",
+                v.clone(),
+                retired_test_payload("rule", "agent", json!({"access_count": i64::MAX})),
+            )
+            .await
+            .unwrap();
+        // Should not panic from overflow in the gain calculation.
+        let results = store.search("probe", v, 10).await.unwrap();
+        assert!(!results.is_empty());
+    }
+
+    // --- TASK 2 tests: search paging, expansion paging, export_graph ---
+
+    #[tokio::test]
+    async fn search_returns_active_results_when_retired_rows_fill_first_pages() {
+        let store = retired_test_store().await;
+        // Insert many retired rows with very close (identical) embeddings,
+        // then one live row further away.
+        for i in 0..20 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("retired-{}", i),
+                    vec![0.1; 4],
+                    retired_test_payload("rule", "agent", json!({"valid_to": 1})),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "live-row",
+                vec![0.9; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let results = store.search("probe", vec![0.1; 4], 5).await.unwrap();
+        let ids: Vec<String> = results.into_iter().map(|r| r.id).collect();
+        assert!(
+            ids.contains(&"live-row".to_string()),
+            "paging must find the live row: {:?}",
+            ids
+        );
+        assert!(
+            ids.iter().all(|id| !id.starts_with("retired-")),
+            "no retired rows should appear: {:?}",
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn search_expansion_excludes_retired_while_live_sibling_surfaces() {
+        let store = retired_test_store().await;
+        let file = "probe::src/a.rs";
+
+        store
+            .upsert("probe", file, vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "live-rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": [file] })))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "retired-rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })))
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = store
+            .search("probe", vec![0.9, 0.1, 0.1, 0.1], 5)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        assert!(ids.contains(&"live-rule".to_string()), "{:?}", ids);
+        assert!(!ids.contains(&"retired-rule".to_string()), "{:?}", ids);
+    }
+
+    #[tokio::test]
+    async fn search_stable_tie_order() {
+        let store = retired_test_store().await;
+        // Two live rows with identical embeddings; order should be deterministic.
+        for name in &["alpha", "beta"] {
+            store
+                .upsert(
+                    "probe",
+                    name,
+                    vec![0.5; 4],
+                    retired_test_payload("rule", "agent", json!({})),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first: Vec<String> = store
+            .search("probe", vec![0.5; 4], 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let second: Vec<String> = store
+            .search("probe", vec![0.5; 4], 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(first, second, "tie order must be deterministic");
+    }
+
+    #[tokio::test]
+    async fn export_graph_excludes_retired_by_default() {
+        let store = retired_test_store().await;
+        store
+            .upsert("probe", "live-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "retired-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "valid_to": 1 })))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "another-live", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "related_to": ["live-node"] })))
+            .await
+            .unwrap();
+
+        let data = store.export_graph(false).await.unwrap();
+        let node_ids: Vec<&str> = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.get("id").and_then(|i| i.as_str()))
+            .collect();
+        assert!(node_ids.contains(&"live-node"), "{:?}", node_ids);
+        assert!(node_ids.contains(&"another-live"), "{:?}", node_ids);
+        assert!(!node_ids.contains(&"retired-node"), "{:?}", node_ids);
+
+        // No dangling edges to retired nodes.
+        let links = data["links"].as_array().unwrap();
+        let retired_set: std::collections::HashSet<&str> = ["retired-node"].iter().copied().collect();
+        for link in links {
+            let src = link.get("source").and_then(|s| s.as_str()).unwrap_or("");
+            let tgt = link.get("target").and_then(|s| s.as_str()).unwrap_or("");
+            assert!(
+                !retired_set.contains(src) && !retired_set.contains(tgt),
+                "dangling edge to retired node: {:?}",
+                link
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn export_graph_include_retired_true_shows_all() {
+        let store = retired_test_store().await;
+        store
+            .upsert("probe", "live-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "retired-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "valid_to": 1 })))
+            .await
+            .unwrap();
+
+        let data = store.export_graph(true).await.unwrap();
+        let node_ids: Vec<&str> = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.get("id").and_then(|i| i.as_str()))
+            .collect();
+        assert!(node_ids.contains(&"live-node"), "{:?}", node_ids);
+        assert!(node_ids.contains(&"retired-node"), "{:?}", node_ids);
     }
 }

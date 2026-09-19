@@ -3,6 +3,7 @@ mod daemon;
 mod embed;
 mod ingest_jobs;
 mod parser;
+mod secrets;
 mod server;
 mod store;
 mod traits;
@@ -809,7 +810,7 @@ async fn main() -> anyhow::Result<()> {
                             std::fs::create_dir_all(parent)?;
                         }
                         vector_store.init("global").await?;
-                        let graph_data = vector_store.export_graph().await?;
+                        let graph_data = vector_store.export_graph(true).await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
                     }

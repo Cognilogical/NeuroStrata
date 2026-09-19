@@ -210,7 +210,7 @@ async fn handle_get_graph(
     // For now, let's just use export_graph (which gets everything) and filter by namespace
     // In a real refactor, we would add get_graph_by_namespace to VectorStore.
     // Wait! VectorStore has export_graph() returning the whole graph!
-    let data = state.vector_store.export_graph().await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let data = state.vector_store.export_graph(false).await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     
     // We can just return it all and let the client filter, or we can filter it here.
     // The Tauri backend did: "MATCH (n:Memory) WHERE n.namespace = 'global' OR n.namespace = '{ns}'"
