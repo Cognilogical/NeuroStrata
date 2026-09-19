@@ -48,10 +48,9 @@ jobs:
             distdir: linux
             bin: neurostrata-mcp
             archive: neurostrata-mcp-linux-arm64.tar.gz
-          - os: macos-15-intel    # Intel (macos-13 was retired)
-            distdir: darwin
-            bin: neurostrata-mcp
-            archive: neurostrata-mcp-darwin-amd64.tar.gz
+          # Intel macs dropped 2026-09: ort rc.13 (pinned by fastembed >= 5)
+          # ships no prebuilt ONNX Runtime for x86_64-apple-darwin. Re-add
+          # if ort restores that target.
           - os: macos-15          # Apple Silicon
             distdir: darwin
             bin: neurostrata-mcp

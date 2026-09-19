@@ -31,13 +31,14 @@ jobs:
         #             only target where OpenSSL is vendored.
         #   windows - MSVC and the CMake/Ninja assumptions, plus the 4 GiB
         #             static-library limit that decides debug vs release.
+        #             OpenSSL is vendored here too: lbug 0.20.4 hard-links it.
         #   macos   - Clang and libc++ rather than GCC or MSVC, and the other
         #             side of the OpenSSL target gate (Security.framework).
-        #             Both architectures, because release.yml ships both and
-        #             a tag is a poor place to discover one of them is broken.
-        #             macos-15 is arm64, macos-15-intel is x64; both are
-        #             standard runners, so free on a public repository.
-        os: [ubuntu-latest, windows-latest, macos-15, macos-15-intel]
+        #             macos-15 is arm64, a standard runner, free on a public
+        #             repository. x64 macs were dropped 2026-09: ort rc.13
+        #             ships no prebuilt ONNX Runtime for x86_64-apple-darwin,
+        #             and every fastembed >= 5 pins that ort.
+        os: [ubuntu-latest, windows-latest, macos-15]
 
     steps:
       - name: Checkout
