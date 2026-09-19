@@ -76,7 +76,7 @@ pub async fn process_mcp_request(
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {
                     "name": "neurostrata-mcp",
-                    "version": "1.0.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
                     "tools": {}
