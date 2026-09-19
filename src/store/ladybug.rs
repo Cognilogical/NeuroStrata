@@ -1108,7 +1108,7 @@ impl VectorStore for LadybugStore {
                     }
                 }
             
-                let mut content: String = format!("{}", row[1]);
+                let content: String = format!("{}", row[1]);
                 let uid: String = format!("{}", row[2]);
                 let memory_type: String = format!("{}", row[3]);
                 let agent_name: String = format!("{}", row[4]);

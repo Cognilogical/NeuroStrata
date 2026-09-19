@@ -33,3 +33,6 @@ target/
 
 # Cygwin/MSYS crash dumps
 *.stackdump
+
+# transient bead gate lock
+.beads.gate.lock
