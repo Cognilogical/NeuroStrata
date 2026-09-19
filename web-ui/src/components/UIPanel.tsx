@@ -208,8 +208,8 @@ export const UIPanel: React.FC<Props> = ({
               {selectedLink && (
                 <div className="flex flex-col gap-2">
                   <div className="text-sm text-gray-300">Type: <span className="font-mono text-white drop-shadow-sm">{selectedLink.type || 'Connection'}</span></div>
-                  <div className="text-sm text-gray-300">From: <span className="font-mono text-white drop-shadow-sm">{selectedLink.source}</span></div>
-                  <div className="text-sm text-gray-300">To: <span className="font-mono text-white drop-shadow-sm">{selectedLink.target}</span></div>
+                  <div className="text-sm text-gray-300">From: <span className="font-mono text-white drop-shadow-sm">{selectedLink.source as string}</span></div>
+                  <div className="text-sm text-gray-300">To: <span className="font-mono text-white drop-shadow-sm">{selectedLink.target as string}</span></div>
                 </div>
               )}
             </div>

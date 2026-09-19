@@ -43,8 +43,8 @@ function App() {
       });
 
       data.links.forEach(l => {
-        const sourceId = typeof l.source === 'object' ? (l.source as any).id : l.source;
-        const targetId = typeof l.target === 'object' ? (l.target as any).id : l.target;
+        const sourceId = typeof l.source === 'object' ? (l.source as { id: string }).id : (l.source as string);
+        const targetId = typeof l.target === 'object' ? (l.target as { id: string }).id : (l.target as string);
         
         const sNode = data.nodes.find(n => n.id === sourceId);
         const tNode = data.nodes.find(n => n.id === targetId);
@@ -154,8 +154,8 @@ function App() {
     
     const nodeIds = new Set(nodes.map(n => n.id));
     const links = graphData.links.filter(l => 
-      nodeIds.has(typeof l.source === 'object' ? (l.source as any).id : l.source) && 
-      nodeIds.has(typeof l.target === 'object' ? (l.target as any).id : l.target)
+      nodeIds.has(typeof l.source === 'object' ? (l.source as { id: string }).id : (l.source as string)) && 
+      nodeIds.has(typeof l.target === 'object' ? (l.target as { id: string }).id : (l.target as string))
     );
     
     invoke('log_message', { msg: `Filtered data has ${nodes.length} nodes and ${links.length} links` });

@@ -1,5 +1,6 @@
 import { useRef, useEffect } from 'react';
 import ForceGraph2D from 'react-force-graph-2d';
+import type { ForceGraphMethods, NodeObject, LinkObject } from 'react-force-graph-2d';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
 
 interface Props {
@@ -31,12 +32,12 @@ if (typeof Path2D !== 'undefined') {
 }
 
 export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeClick, onLinkClick }) => {
-  const fgRef = useRef<any>(null);
+  const fgRef = useRef<ForceGraphMethods<NodeObject<MemoryNode>, LinkObject<MemoryNode, MemoryLink>> | undefined>(undefined);
 
   useEffect(() => {
     if (fgRef.current) {
-      fgRef.current.d3Force('charge').strength(-200);
-      fgRef.current.d3Force('link').distance(50);
+      fgRef.current.d3Force('charge')!.strength(-200);
+      fgRef.current.d3Force('link')!.distance(50);
       
       // Hook into the d3 force engine to herd global nodes apart from project nodes
       fgRef.current.d3Force('namespace-clustering', (alpha: number) => {
@@ -44,7 +45,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
         if (!nodes) return;
         
         for (let i = 0; i < nodes.length; i++) {
-          const node: any = nodes[i];
+          const node = nodes[i] as NodeObject<MemoryNode>;
           const isGlobal = node.namespace === 'global' || node.namespace === 'Global';
           
           if (isGlobal) {
@@ -68,7 +69,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
   useEffect(() => {
     if (selectedNode && fgRef.current) {
       if (!data || !data.nodes) return;
-      const graphNode = data.nodes.find((n: any) => n.id === selectedNode.id);
+      const graphNode = data.nodes.find((n: NodeObject<MemoryNode>) => n.id === selectedNode.id);
       if (graphNode && typeof graphNode.x === 'number' && !Number.isNaN(graphNode.x)) {
         // centerAt and zoom synchronously can sometimes conflict. 
         // We use just centerAt or we offset them.
@@ -120,7 +121,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
           ctx.fillStyle = isSelected ? '#ffffff' : '#a8b2d1';
           ctx.fillText(label, mNode.x, mNode.y + baseSize + 4);
         }}
-        linkColor={(link: any) => {
+        linkColor={(link: LinkObject<MemoryNode, MemoryLink>) => {
           const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
           const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
           const highlight = isSourceSelected || isTargetSelected;
@@ -131,7 +132,7 @@ export const BlueprintGraph2D: React.FC<Props> = ({ data, selectedNode, onNodeCl
           if (link.type === 'GOVERNS') return 'rgba(100, 255, 218, 0.6)';
           return 'rgba(100, 255, 218, 0.2)';
         }}
-        linkWidth={(link: any) => {
+        linkWidth={(link: LinkObject<MemoryNode, MemoryLink>) => {
           const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
           const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
           if (isSourceSelected || isTargetSelected) return 4;

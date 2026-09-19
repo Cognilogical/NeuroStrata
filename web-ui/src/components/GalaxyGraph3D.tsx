@@ -1,6 +1,7 @@
 import { useRef, useMemo, useEffect, useCallback, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import ForceGraph3D from 'react-force-graph-3d';
+import type { ForceGraphMethods, NodeObject, LinkObject } from 'react-force-graph-3d';
 import * as THREE from 'three';
 import type { GraphData, MemoryNode, MemoryLink } from '../types';
 
@@ -65,7 +66,7 @@ const getGlowTexture = () => {
 };
 
 export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: Props) => {
-  const fgRef = useRef<any>(null);
+  const fgRef = useRef<ForceGraphMethods<NodeObject<MemoryNode>, LinkObject<MemoryNode, MemoryLink>> | undefined>(undefined);
   const [webgl] = useState(detectWebGL);
 
   useEffect(() => {
@@ -106,8 +107,8 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
   useEffect(() => {
     if (fgRef.current) {
       // Basic repulsion to spread out nodes
-      fgRef.current.d3Force('charge').strength(-200);
-      fgRef.current.d3Force('link').distance(50);
+      fgRef.current.d3Force('charge')!.strength(-200);
+      fgRef.current.d3Force('link')!.distance(50);
       
       // We manually hook into the d3 force engine loop to herd global nodes.
       // D3 applies forces step by step. We push global nodes towards a distant anchor,
@@ -117,7 +118,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
         if (!nodes) return;
         
         for (let i = 0; i < nodes.length; i++) {
-          const node: any = nodes[i];
+          const node = nodes[i] as NodeObject<MemoryNode>;
           const isGlobal = node.namespace === 'global' || node.namespace === 'Global';
           
           if (isGlobal) {
@@ -145,7 +146,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     if (selectedNode && fgRef.current) {
       if (!data || !data.nodes) return;
       
-      const graphNode = data.nodes.find((n: any) => n.id === selectedNode.id);
+      const graphNode = data.nodes.find((n: NodeObject<MemoryNode>) => n.id === selectedNode.id);
       
       if (graphNode && typeof graphNode.x === 'number' && !Number.isNaN(graphNode.x)) {
         const nx = graphNode.x || 0;
@@ -203,7 +204,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     return { nodeMaterials: nMats, defaultNodeMaterial: defNodeMat, highlightMaterial: hlMat };
   }, []);
 
-  const createNodeObject = useCallback((node: any) => {
+  const createNodeObject = useCallback((node: NodeObject<MemoryNode>) => {
     if (!node) return new THREE.Object3D();
     const mNode = node as MemoryNode;
     const material = nodeMaterials[mNode.memory_type] || defaultNodeMaterial;
@@ -224,7 +225,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
   useEffect(() => {
     if (!data || !data.nodes) return;
     
-    data.nodes.forEach((node: any) => {
+    data.nodes.forEach((node: NodeObject<MemoryNode>) => {
       const obj = node.__threeObj;
       if (!obj) return;
       
@@ -240,7 +241,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     });
   }, [selectedNode, data, highlightMaterial]);
 
-  const getLinkColor = useCallback((link: any) => {
+  const getLinkColor = useCallback((link: LinkObject<MemoryNode, MemoryLink>) => {
     const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
     const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
     const highlight = isSourceSelected || isTargetSelected;
@@ -252,7 +253,7 @@ export const GalaxyGraph3D = ({ data, selectedNode, onNodeClick, onLinkClick }: 
     return 'rgba(255, 255, 255, 0.2)';
   }, [selectedNode]);
 
-  const getLinkWidth = useCallback((link: any) => {
+  const getLinkWidth = useCallback((link: LinkObject<MemoryNode, MemoryLink>) => {
     const isSourceSelected = selectedNode && (typeof link.source === 'object' ? link.source.id === selectedNode.id : link.source === selectedNode.id);
     const isTargetSelected = selectedNode && (typeof link.target === 'object' ? link.target.id === selectedNode.id : link.target === selectedNode.id);
     if (isSourceSelected || isTargetSelected) return 6;
