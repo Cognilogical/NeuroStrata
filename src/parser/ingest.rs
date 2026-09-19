@@ -5,6 +5,7 @@ use ignore::WalkBuilder;
 use std::path::Path;
 use std::sync::Arc;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 /// Schemas declare extensions bare ("rs"), but one passed via --schema-path may
@@ -149,49 +150,44 @@ pub trait IngestObserver: Send + Sync {
     fn relinked(&self, edges: usize);
 }
 
-pub async fn ingest_directory(
-    dir_path: &Path,
-    schema: &ParserSchema,
-    embedder: Arc<dyn Embedder>,
-    vector_store: Arc<dyn VectorStore>,
-    namespace: &str,
-    observer: Option<Arc<dyn IngestObserver>>,
+/// An owned item streamed from the blocking producer to the async consumer.
+/// No borrowed tree-sitter or filesystem types cross the channel boundary.
+enum IngestItem {
+    /// A structural (directory/file/markdown) node to upsert with zero vector.
+    NodeUpsert {
+        node_id: String,
+        node_path: String,
+        contained_by: Vec<String>,
+        mem_type: String,
+        abs_path: String,
+    },
+    /// Parsed symbols from a file, ready for embed + store.
+    ParsedSymbols {
+        node_path: String,
+        lang_name: String,
+        symbols: Vec<SymbolRow>,
+        path_display: String,
+    },
+}
+
+/// Blocking producer: walks the directory tree, reads files, parses ASTs,
+/// and streams owned results through `tx`. Runs on the blocking thread pool
+/// so filesystem I/O never stalls the async runtime.
+fn run_producer(
+    dir_path: std::path::PathBuf,
+    ext_to_lang: HashMap<String, String>,
+    schema: crate::parser::schema::ParserSchema,
+    tx: mpsc::Sender<IngestItem>,
+    namespace: String,
 ) -> anyhow::Result<()> {
-    // Prove the root is a readable directory before anything is deleted. A
-    // missing or mistyped path used to clear the namespace, walk nothing -- the
-    // walker's errors were skipped -- and report success over an emptied graph.
-    std::fs::read_dir(dir_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so nothing was cleared: {}",
-            dir_path,
-            namespace,
-            e
-        )
-    })?;
-
-    // Rebuild this namespace's ingested rows from scratch. Failing here is fatal:
-    // ingesting on top of a stale tree would leave rows for files that no longer exist.
-    vector_store
-        .clear_ingested(namespace)
-        .await
-        .map_err(|e| anyhow::anyhow!("Refusing to ingest: could not clear the previous ingest of namespace {}: {}", namespace, e))?;
-
-    let ext_to_lang = build_ext_map(schema);
-
-    let walker_builder = WalkBuilder::new(dir_path);
-    // Explicitly ignore common 3rd party and build directories even if not gitignored
-    let walker = walker_builder.build();
-
     let skipped_dirs = [
         "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
         "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__",
         ".fastembed_cache", ".idea", ".vscode", "coverage"
     ];
 
-    let zero_vector = vec![0.0; embedder.dimensions()];
+    let walker = WalkBuilder::new(&dir_path).build();
 
-    // Counted rather than skipped in silence: a subtree that cannot be read is
-    // absent from the rebuilt graph, and whoever ingested should hear that.
     let mut unreadable = 0usize;
 
     for result in walker {
@@ -208,7 +204,7 @@ pub async fn ingest_directory(
 
         let path = entry.path();
         let path_str = path.to_string_lossy();
-        
+
         let mut should_skip = false;
         for skip_dir in &skipped_dirs {
             let skip_pattern = format!("/{}/", skip_dir);
@@ -223,18 +219,16 @@ pub async fn ingest_directory(
             continue;
         }
 
-        // Upsert the directory or file node to build the graph
         let abs_path = if path.is_absolute() {
             path.to_string_lossy().to_string()
         } else {
             std::env::current_dir().unwrap_or_default().join(path).to_string_lossy().to_string()
         };
 
-        let node_path = node_id_for(dir_path, path);
+        let node_path = node_id_for(&dir_path, path);
 
-        // Create parent edge mapping
         let parent_id = if let Some(p) = path.parent() {
-            let p_str = node_id_for(dir_path, p);
+            let p_str = node_id_for(&dir_path, p);
             if p_str != "." && p_str != "" && p_str != node_path {
                 Some(p_str)
             } else {
@@ -246,7 +240,7 @@ pub async fn ingest_directory(
 
         let mut contained_by = Vec::new();
         if let Some(pid) = parent_id {
-            contained_by.push(qualified_id(namespace, &pid));
+            contained_by.push(qualified_id(&namespace, &pid));
         }
 
         let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
@@ -264,32 +258,24 @@ pub async fn ingest_directory(
             continue;
         };
 
-        // Upsert this structural node
-        let mut metadata = serde_json::Map::new();
-        metadata.insert("absolute_path".to_string(), serde_json::json!(abs_path));
-        // Structure is containment, not a semantic link: the directory contains the file.
-        metadata.insert("contained_by".to_string(), serde_json::json!(contained_by));
+        let node_id = qualified_id(&namespace, &node_path);
 
-        let node_id = qualified_id(namespace, &node_path);
-        let payload = MemoryPayload {
-            content: format!("Path: {}", node_path),
-            location: node_path.clone(),
-            location_lines: String::new(),
-            memory_type: mem_type.to_string(),
-            metadata: serde_json::Value::Object(metadata),
-            user_id: "auto-ingestor".to_string(),
-            agent_name: Some("neurostrata-mcp-ingestor".to_string()),
-        };
-
-        if let Err(e) = vector_store.upsert(namespace, &node_id, zero_vector.clone(), payload).await {
-            eprintln!("Failed to upsert graph node {}: {}", node_id, e);
+        // If the consumer has dropped (e.g. it errored), stop walking.
+        if tx.try_send(IngestItem::NodeUpsert {
+            node_id,
+            node_path: node_path.clone(),
+            contained_by,
+            mem_type: mem_type.to_string(),
+            abs_path,
+        }).is_err() {
+            return Ok(());
         }
 
         if !is_file {
             continue;
         }
 
-        // Now if it is a parseable file, extract AST nodes
+        // Parseable file: read, parse, extract symbols, send.
         if let Some(ext_os) = path.extension() {
             let ext = normalize_ext(&ext_os.to_string_lossy());
             if let Some(lang_name) = ext_to_lang.get(&ext) {
@@ -308,11 +294,6 @@ pub async fn ingest_directory(
                     };
 
                     let lang_schema = &schema.languages[lang_name];
-
-                    // Collect every symbol before touching the store. tree-sitter's
-                    // Node and QueryMatch are not Send, so holding one across an await
-                    // would make this future non-Send and the axum handler that calls
-                    // ingestion would stop compiling.
                     let mut pending: Vec<SymbolRow> = Vec::new();
 
                     for (query_name, query_str) in &lang_schema.queries {
@@ -328,9 +309,6 @@ pub async fn ingest_directory(
                         let mut iter = cursor.matches(&query, tree.root_node(), content.as_bytes());
 
                         while let Some(m) = iter.next() {
-                            // A match carries the definition node and its @name; pair them
-                            // so each symbol becomes its own memory rather than being
-                            // concatenated into one row per file.
                             let mut name: Option<&str> = None;
                             let mut definition: Option<tree_sitter::Node> = None;
 
@@ -362,58 +340,15 @@ pub async fn ingest_directory(
                         }
                     }
 
-                    let mut symbols_stored = 0usize;
-                    for symbol in pending {
-                        let summary = format!(
-                            "{} {} in {}\nlines {}-{}\n\n{}",
-                            symbol.kind, symbol.name, node_path, symbol.start_line, symbol.end_line, symbol.body
-                        );
-                        let id = qualified_id(
-                            namespace,
-                            &symbol_id(&node_path, &symbol.kind, &symbol.name, symbol.start_line),
-                        );
-                        let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
-
-                        let mut metadata = serde_json::Map::new();
-                        metadata.insert("domain".to_string(), serde_json::json!("code_ast"));
-                        metadata.insert("symbol".to_string(), serde_json::json!(symbol.name));
-                        metadata.insert("symbol_kind".to_string(), serde_json::json!(symbol.kind));
-                        metadata.insert("language".to_string(), serde_json::json!(lang_name));
-                        // The file contains the symbol, so this is a CONTAINS edge too.
-                        metadata.insert(
-                            "contained_by".to_string(),
-                            serde_json::json!([qualified_id(namespace, &node_path)]),
-                        );
-                        metadata.insert("refs".to_string(), serde_json::json!([
-                            { "file": node_path.clone(), "lines": lines.clone() }
-                        ]));
-
-                        let payload = MemoryPayload {
-                            content: summary.clone(),
-                            location: node_path.clone(),
-                            location_lines: lines,
-                            memory_type: "code_ast".to_string(),
-                            metadata: serde_json::Value::Object(metadata),
-                            user_id: "auto-ingestor".to_string(),
-                            agent_name: Some("neurostrata-mcp-ingestor".to_string()),
-                        };
-
-                        match embedder.embed(&summary).await {
-                            Ok(embedding) => {
-                                if let Err(e) = vector_store.upsert(namespace, &id, embedding, payload).await {
-                                    eprintln!("Failed to store symbol {} from {}: {}", symbol.name, path.display(), e);
-                                } else {
-                                    symbols_stored += 1;
-                                }
-                            }
-                            Err(e) => eprintln!("Failed to embed symbol {} from {}: {}", symbol.name, path.display(), e),
-                        }
-                    }
-
-                    if symbols_stored > 0 {
-                        println!("Ingested {} symbols from {}", symbols_stored, path.display());
-                        if let Some(observer) = &observer {
-                            observer.file_ingested(&path.display().to_string(), symbols_stored);
+                    if !pending.is_empty() {
+                        let path_display = path.display().to_string();
+                        if tx.try_send(IngestItem::ParsedSymbols {
+                            node_path,
+                            lang_name: lang_name.clone(),
+                            symbols: pending,
+                            path_display,
+                        }).is_err() {
+                            return Ok(());
                         }
                     }
                 }
@@ -426,6 +361,170 @@ pub async fn ingest_directory(
             "WARNING: {} path(s) under {:?} could not be read, so they are missing from this ingest of namespace {}.",
             unreadable, dir_path, namespace
         );
+    }
+
+    Ok(())
+}
+
+/// Async consumer: receives owned items from the producer, embeds symbols,
+/// and upserts everything to the vector store.
+async fn run_consumer(
+    mut rx: mpsc::Receiver<IngestItem>,
+    embedder: Arc<dyn Embedder>,
+    vector_store: Arc<dyn VectorStore>,
+    namespace: &str,
+    observer: Option<Arc<dyn IngestObserver>>,
+    zero_vector: Vec<f32>,
+) -> anyhow::Result<()> {
+    while let Some(item) = rx.recv().await {
+        match item {
+            IngestItem::NodeUpsert {
+                node_id,
+                node_path,
+                contained_by,
+                mem_type,
+                abs_path,
+            } => {
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("absolute_path".to_string(), serde_json::json!(abs_path));
+                metadata.insert("contained_by".to_string(), serde_json::json!(contained_by));
+
+                let payload = MemoryPayload {
+                    content: format!("Path: {}", node_path),
+                    location: node_path,
+                    location_lines: String::new(),
+                    memory_type: mem_type,
+                    metadata: serde_json::Value::Object(metadata),
+                    user_id: "auto-ingestor".to_string(),
+                    agent_name: Some("neurostrata-mcp-ingestor".to_string()),
+                };
+
+                if let Err(e) = vector_store.upsert(namespace, &node_id, zero_vector.clone(), payload).await {
+                    eprintln!("Failed to upsert graph node {}: {}", node_id, e);
+                }
+            }
+            IngestItem::ParsedSymbols {
+                node_path,
+                lang_name,
+                symbols,
+                path_display,
+            } => {
+                let mut symbols_stored = 0usize;
+                for symbol in symbols {
+                    let summary = format!(
+                        "{} {} in {}\nlines {}-{}\n\n{}",
+                        symbol.kind, symbol.name, node_path, symbol.start_line, symbol.end_line, symbol.body
+                    );
+                    let id = qualified_id(
+                        namespace,
+                        &symbol_id(&node_path, &symbol.kind, &symbol.name, symbol.start_line),
+                    );
+                    let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
+
+                    let mut metadata = serde_json::Map::new();
+                    metadata.insert("domain".to_string(), serde_json::json!("code_ast"));
+                    metadata.insert("symbol".to_string(), serde_json::json!(symbol.name));
+                    metadata.insert("symbol_kind".to_string(), serde_json::json!(symbol.kind));
+                    metadata.insert("language".to_string(), serde_json::json!(lang_name));
+                    metadata.insert(
+                        "contained_by".to_string(),
+                        serde_json::json!([qualified_id(namespace, &node_path)]),
+                    );
+                    metadata.insert("refs".to_string(), serde_json::json!([
+                        { "file": node_path.clone(), "lines": lines.clone() }
+                    ]));
+
+                    let payload = MemoryPayload {
+                        content: summary.clone(),
+                        location: node_path.clone(),
+                        location_lines: lines,
+                        memory_type: "code_ast".to_string(),
+                        metadata: serde_json::Value::Object(metadata),
+                        user_id: "auto-ingestor".to_string(),
+                        agent_name: Some("neurostrata-mcp-ingestor".to_string()),
+                    };
+
+                    match embedder.embed(&summary).await {
+                        Ok(embedding) => {
+                            if let Err(e) = vector_store.upsert(namespace, &id, embedding, payload).await {
+                                eprintln!("Failed to store symbol {} from {}: {}", symbol.name, path_display, e);
+                            } else {
+                                symbols_stored += 1;
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to embed symbol {} from {}: {}", symbol.name, path_display, e),
+                    }
+                }
+
+                if symbols_stored > 0 {
+                    println!("Ingested {} symbols from {}", symbols_stored, path_display);
+                    if let Some(observer) = &observer {
+                        observer.file_ingested(&path_display, symbols_stored);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn ingest_directory(
+    dir_path: &Path,
+    schema: &ParserSchema,
+    embedder: Arc<dyn Embedder>,
+    vector_store: Arc<dyn VectorStore>,
+    namespace: &str,
+    observer: Option<Arc<dyn IngestObserver>>,
+) -> anyhow::Result<()> {
+    // Prove the root is a readable directory before anything is deleted. A
+    // missing or mistyped path used to clear the namespace, walk nothing -- the
+    // walker's errors were skipped -- and report success over an emptied graph.
+    std::fs::read_dir(dir_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so nothing was cleared: {}",
+            dir_path,
+            namespace,
+            e
+        )
+    })?;
+
+    // Rebuild this namespace's ingested rows from scratch. Failing here is fatal:
+    // ingesting on top of a stale tree would leave rows for files that no longer exist.
+    vector_store
+        .clear_ingested(namespace)
+        .await
+        .map_err(|e| anyhow::anyhow!("Refusing to ingest: could not clear the previous ingest of namespace {}: {}", namespace, e))?;
+
+    let ext_to_lang = build_ext_map(schema);
+    let zero_vector = vec![0.0; embedder.dimensions()];
+    let namespace_owned = namespace.to_string();
+    let dir_path_owned = dir_path.to_path_buf();
+    let schema_clone = schema.clone();
+
+    let (tx, rx) = mpsc::channel::<IngestItem>(256);
+
+    // The blocking producer walks the filesystem and parses files on a
+    // blocking thread, streaming owned results through the channel.
+    let producer = tokio::task::spawn_blocking(move || {
+        run_producer(dir_path_owned, ext_to_lang, schema_clone, tx, namespace_owned)
+    });
+
+    // The async consumer embeds and stores each item on the async runtime.
+    let observer_clone = observer.clone();
+    let consumer_result = run_consumer(
+        rx, embedder, vector_store.clone(), namespace, observer_clone, zero_vector,
+    ).await;
+
+    let producer_result = producer.await;
+
+    // Consumer errors are the primary concern.
+    consumer_result?;
+
+    match producer_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(anyhow::anyhow!("ingest producer panicked: {}", e)),
     }
 
     // Clearing the previous ingest took every edge attached to those nodes with
@@ -718,5 +817,56 @@ mod tests {
             store.get("probe", &node).await.expect("read back").is_some(),
             "and the previous ingest is still there"
         );
+    }
+
+    #[tokio::test]
+    async fn producer_consumer_streams_items_to_store() {
+        // Create a temp directory with a parseable file.
+        let tmp = std::env::temp_dir().join(format!(
+            "ns-producer-consumer-{}", uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}")
+            .expect("write test file");
+
+        let db = std::env::temp_dir().join(format!(
+            "ns-producer-consumer-db-{}", uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::new(&db, 4)
+                .expect("open temp database"));
+        store.init("test-ns").await.expect("create the schema");
+
+        let schema = ParserSchema::load(include_str!("../schema.json"))
+            .expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            None,
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "ingestion succeeded: {:?}",
+            outcome.err()
+        );
+
+        // The file node should exist.
+        let file_id = qualified_id("test-ns", "hello.rs");
+        let entry = store.get("test-ns", &file_id).await.expect("read back");
+        assert!(entry.is_some(), "file node was stored");
+
+        // The symbol node should exist (fn main).
+        let sym_id = qualified_id("test-ns", &symbol_id("hello.rs", "functions", "main", 1));
+        let sym_entry = store.get("test-ns", &sym_id).await.expect("read back");
+        assert!(sym_entry.is_some(), "symbol node was stored");
+
+        // Clean up.
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 }
