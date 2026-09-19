@@ -5,14 +5,22 @@ export interface MemoryNode {
   namespace?: string;
   agent_name?: string;
   degree: number;
-  [key: string]: any;
+  content?: string;
+  location?: string;
+  absolute_path?: string;
+  /** d3-force adds positional state at runtime */
+  x?: number;
+  y?: number;
+  z?: number;
+  vx?: number;
+  vy?: number;
+  vz?: number;
+  [key: string]: unknown;
 }
 
 export interface MemoryLink {
-  source: string;
-  target: string;
   type?: string;
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 export interface GraphData {
