@@ -92,3 +92,31 @@ jobs:
             echo "::error::Binary reports '$reported' but Cargo.toml says '$expected'."
             exit 1
           fi
+
+  # The build job proves compilation; this proves behavior. Single test
+  # thread because the suite's per-test temp databases exhaust the mmap
+  # budget when run in parallel (intermittent "Mmap for size ... failed").
+  test:
+    name: test (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: Test
+        shell: bash
+        run: cargo test --locked -- --test-threads=1
