@@ -39,12 +39,17 @@ lbug = "0.20.4"
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json"] }
 
-# native-tls (pulled in by reqwest, ureq and hf-hub) only links OpenSSL on
-# platforms without a system TLS stack. Windows uses SChannel and Apple targets
-# use Security.framework, so vendoring OpenSSL there compiles it from source for
-# nothing -- and on Windows that build additionally needs Perl and NASM.
-# This condition mirrors native-tls's own target gate.
-[target.'cfg(not(any(target_os = "windows", target_vendor = "apple")))'.dependencies]
+# native-tls (pulled in by reqwest, ureq and hf-hub) only needs OpenSSL on
+# platforms without a system TLS stack: Windows uses SChannel and Apple targets
+# use Security.framework, so vendoring OpenSSL there would compile it from
+# source for nothing -- and on Windows that build additionally needs Perl and
+# NASM. This condition mirrors native-tls's own target gate.
+#
+# Except: lbug 0.20.4's build script unconditionally emits link directives for
+# libssl/libcrypto on every target (its C++ core hard-requires OpenSSL), so
+# Windows now needs a vendored build to satisfy the linker. Apple targets keep
+# the system-path resolution that already works.
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
 openssl = { version = "0.10.81", features = ["vendored"] }
 
 [build-dependencies]
