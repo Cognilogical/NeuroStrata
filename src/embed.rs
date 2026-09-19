@@ -1,12 +1,12 @@
 use crate::traits::Embedder;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextInitOptions, TextEmbedding};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AcceptableEmbedder {
@@ -108,7 +108,7 @@ pub fn configured_dimensions() -> Result<usize> {
 const MAX_EMBED_TOKENS: usize = 2048;
 
 pub struct FastEmbedder {
-    model: Arc<TextEmbedding>,
+    model: Arc<Mutex<TextEmbedding>>,
     dimensions: usize,
 }
 
@@ -132,14 +132,14 @@ impl FastEmbedder {
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
         let model = TextEmbedding::try_new(
-            InitOptions::new(model_enum)
+            TextInitOptions::new(model_enum)
                 .with_cache_dir(cache_dir)
                 .with_max_length(MAX_EMBED_TOKENS)
                 .with_show_download_progress(true),
         )?;
         
         Ok(Self { 
-            model: Arc::new(model),
+            model: Arc::new(Mutex::new(model)),
             dimensions: target_model.dimensions,
         })
     }
@@ -152,8 +152,9 @@ impl Embedder for FastEmbedder {
         // called from a Tokio task. Isolate it on the blocking thread pool.
         let model = Arc::clone(&self.model);
         let text = text.to_owned();
-        let mut embeddings = tokio::task::spawn_blocking(move || {
-            model.embed(vec![&*text], None)
+        let mut embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
+            let mut guard = model.lock().map_err(|e| anyhow::anyhow!("model lock poisoned: {}", e))?;
+            guard.embed(vec![&*text], None).context("fastembed embed call failed")
         })
         .await
         .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
