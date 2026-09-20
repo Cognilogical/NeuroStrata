@@ -1160,9 +1160,24 @@ impl VectorStore for LadybugStore {
         self.write_with_deadline("deleting a memory", move |conn| {
             let safe_ns = escape_kuzu_string(&namespace);
             let safe_id = escape_kuzu_string(&id);
-        
-            let query = format!("MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m", safe_id, safe_ns);
-            conn.query(&query)?;
+
+            // A silent no-op on a missing id reads as success to the caller
+            // (the CLI then reports a deletion that never happened), so
+            // resolve the row first and fail loudly when it is absent.
+            let exists = conn
+                .query(&format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.id LIMIT 1",
+                    safe_id, safe_ns
+                ))?
+                .next()
+                .is_some();
+            if !exists {
+                anyhow::bail!("No memory with id '{}' in namespace '{}'. Note: stored ids are namespace-qualified for ingested nodes.", id, namespace);
+            }
+            conn.query(&format!(
+                "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m",
+                safe_id, safe_ns
+            ))?;
             Ok(())
         })
         .await
@@ -2953,6 +2968,21 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         // File should have one-hop evidence (from symbol via CONTAINS)
         let one_hop: Vec<_> = evs.iter().filter(|e| e.kind == crate::traits::EvidenceKind::OneHop).collect();
         assert!(!one_hop.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_missing_memory_fails_loudly() {
+        let store = evidence_test_store().await;
+        // A zero-row delete must not read as success: the caller would report
+        // a deletion that never happened.
+        let missing = store.delete("probe", "no-such-id").await;
+        assert!(missing.is_err(), "deleting an absent id must error");
+        assert!(missing.unwrap_err().to_string().contains("no-such-id"));
+
+        // The real id still deletes cleanly.
+        store.delete("probe", "rule-1").await.unwrap();
+        let gone = store.get("probe", "rule-1").await.unwrap();
+        assert!(gone.is_none(), "rule-1 should be deleted");
     }
 
     #[tokio::test]
