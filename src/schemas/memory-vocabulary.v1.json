@@ -1,0 +1,74 @@
+{
+  "vocabulary_version": 1,
+  "relations": {
+    "GOVERNS": {
+      "direction": "directed",
+      "source_role": "rule",
+      "target_role": "artifact",
+      "definition": "The source constrains the target.",
+      "metadata_key": "governs",
+      "declaration_direction": "self_to_target"
+    },
+    "CONTAINS": {
+      "direction": "directed",
+      "source_role": "container",
+      "target_role": "contained",
+      "definition": "The source structurally contains the target.",
+      "metadata_key": "contained_by",
+      "declaration_direction": "target_to_self"
+    },
+    "RELATES_TO": {
+      "direction": "undirected",
+      "source_role": "memory",
+      "target_role": "memory",
+      "definition": "The endpoints have a nondirectional semantic link.",
+      "metadata_key": "related_to",
+      "declaration_direction": "self_to_target",
+      "storage_note": "One directed edge stores an undirected meaning."
+    }
+  },
+  "memory_types": {
+    "rule": {
+      "definition": "A normative architectural or behavioral constraint.",
+      "structural": false
+    },
+    "fact": {
+      "definition": "A descriptive assertion, not inherently a constraint.",
+      "structural": false
+    },
+    "directory": {
+      "definition": "An ingested directory and structural container.",
+      "structural": true
+    },
+    "file": {
+      "definition": "An ingested non-Markdown file and code container.",
+      "structural": true
+    },
+    "markdown": {
+      "definition": "An ingested Markdown document node.",
+      "structural": true
+    },
+    "symbol": {
+      "definition": "An extracted code declaration or definition.",
+      "structural": false
+    }
+  },
+  "type_aliases": {
+    "code_ast": "symbol"
+  },
+  "extensions": {
+    "custom_memory_types": "Any nonempty string is accepted unchanged.",
+    "recommended_custom_type_form": "owner.name",
+    "existing_custom_types": ["preference", "bootstrap", "persona", "context"],
+    "unknown_metadata_keys": "Accepted unchanged.",
+    "custom_relations": "Not materialized by vocabulary version 1.",
+    "role_enforcement": "Descriptive only; no endpoint type rejection.",
+    "version_policy": "Increment vocabulary_version for semantic changes."
+  },
+  "tool_summaries": {
+    "add": "Vocabulary v1: rule/fact; metadata governs, contained_by, and related_to accept target-ID arrays; custom types remain valid.",
+    "search": "Expanded matches add bounded, directed evidence paths; RELATES_TO is undirected.",
+    "ingest": "Vocabulary v1: directory/file/markdown containers and symbols; code_ast remains the stored symbol type.",
+    "memory_type": "Use rule or fact; structural types are directory/file/markdown/symbol; custom types remain valid; default context."
+  }
+}

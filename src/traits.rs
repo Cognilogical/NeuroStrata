@@ -2,6 +2,19 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::OnceLock;
+
+/// The shipped vocabulary schema, embedded at compile time.
+pub const MEMORY_VOCABULARY_JSON: &str = include_str!("schemas/memory-vocabulary.v1.json");
+
+/// Parsed vocabulary, loaded once on first access.
+pub fn memory_vocabulary() -> &'static serde_json::Value {
+    static VOCAB: OnceLock<serde_json::Value> = OnceLock::new();
+    VOCAB.get_or_init(|| {
+        serde_json::from_str(MEMORY_VOCABULARY_JSON)
+            .expect("shipped memory vocabulary parses")
+    })
+}
 
 /// Represents a stored memory payload
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -23,6 +36,36 @@ pub struct SearchResult {
     pub id: String,
     pub score: f32,
     pub payload: MemoryPayload,
+    /// Transient evidence paths attached during graph expansion. Never persisted,
+    /// never in metadata — only added as text lines to search results.
+    #[serde(skip)]
+    pub evidence: Option<Vec<SearchEvidence>>,
+}
+
+/// How a search result was discovered relative to the direct matches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    DirectMatch,
+    OneHop,
+    #[serde(rename = "governs_2hop")]
+    Governs2hop,
+}
+
+/// One directed edge in an evidence path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EvidenceEdge {
+    pub source: String,
+    pub relation: String,
+    pub target: String,
+}
+
+/// A complete evidence path explaining why an expanded result surfaced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchEvidence {
+    pub kind: EvidenceKind,
+    pub path: Vec<EvidenceEdge>,
+    pub explanation: String,
 }
 
 /// What an attempt to move a memory between namespaces found.
@@ -139,5 +182,83 @@ pub trait VectorStore: Send + Sync {
     /// that would only time out. Conservative by default: assume there is.
     fn is_dirty(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_vocabulary_v1_parses_and_has_exact_relations() {
+        let v = memory_vocabulary();
+        assert_eq!(v["vocabulary_version"], 1);
+        let rels = v["relations"].as_object().unwrap();
+        assert!(rels.contains_key("GOVERNS"));
+        assert!(rels.contains_key("CONTAINS"));
+        assert!(rels.contains_key("RELATES_TO"));
+        assert_eq!(rels.len(), 3);
+        assert_eq!(rels["GOVERNS"]["direction"], "directed");
+        assert_eq!(rels["CONTAINS"]["direction"], "directed");
+        assert_eq!(rels["RELATES_TO"]["direction"], "undirected");
+    }
+
+    #[test]
+    fn memory_vocabulary_keeps_code_ast_as_symbol_alias() {
+        let v = memory_vocabulary();
+        assert_eq!(v["type_aliases"]["code_ast"], "symbol");
+        // Structural types match STRUCTURAL_MEMORY_TYPES in ladybug.rs
+        let types = v["memory_types"].as_object().unwrap();
+        assert!(types["directory"]["structural"].as_bool().unwrap());
+        assert!(types["file"]["structural"].as_bool().unwrap());
+        assert!(types["markdown"]["structural"].as_bool().unwrap());
+        assert!(!types["symbol"]["structural"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn search_result_serialization_never_exposes_evidence() {
+        let sr = SearchResult {
+            id: "test-id".to_string(),
+            score: 1.0,
+            payload: MemoryPayload {
+                content: "c".into(), user_id: "u".into(),
+                memory_type: "rule".into(), agent_name: None,
+                location: String::new(), location_lines: String::new(),
+                metadata: serde_json::json!({}),
+            },
+            evidence: Some(vec![SearchEvidence {
+                kind: EvidenceKind::DirectMatch,
+                path: vec![],
+                explanation: "test".into(),
+            }]),
+        };
+        let json = serde_json::to_value(&sr).unwrap();
+        assert!(json.get("evidence").is_none(), "evidence must be skip-serialized");
+    }
+
+    #[test]
+    fn search_result_deserialization_defaults_evidence_to_none() {
+        let json_str = r#"{"id":"x","score":0.5,"payload":{"content":"c","user_id":"u","memory_type":"rule","location":"","location_lines":"","metadata":{}}}"#;
+        let sr: SearchResult = serde_json::from_str(json_str).unwrap();
+        assert_eq!(sr.id, "x");
+        assert!(sr.evidence.is_none());
+    }
+
+    #[test]
+    fn evidence_json_has_exact_kind_path_and_explanation() {
+        let ev = SearchEvidence {
+            kind: EvidenceKind::Governs2hop,
+            path: vec![
+                EvidenceEdge { source: "a".into(), relation: "CONTAINS".into(), target: "b".into() },
+                EvidenceEdge { source: "c".into(), relation: "GOVERNS".into(), target: "b".into() },
+            ],
+            explanation: "explanation".into(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "governs_2hop");
+        assert_eq!(json["path"][0]["source"], "a");
+        assert_eq!(json["path"][0]["relation"], "CONTAINS");
+        assert_eq!(json["path"][1]["target"], "b");
+        assert_eq!(json["explanation"], "explanation");
     }
 }
