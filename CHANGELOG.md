@@ -12,6 +12,8 @@ All notable changes to the NeuroStrata project will be documented in this file.
 - **Beads migration:** `neurostrata-mcp task import <namespace> --from-beads <path>` — one-shot and idempotent on `bead_id`; closed beads imported as `done` + `grandfathered` past the extraction gate.
 - **Episodic Buffer writer:** `neurostrata_append_log` — timestamped session entries with `### 🔄 Topic Switch` markers, 500KB rollover, retention pruning (`buffer_retention_days`), `episodic_buffer: false` disable, and secret rejection on entry.
 - **Memory vocabulary v2:** `task` memory type and the `EXTRACTED_FROM` relation.
+- **Wiring panel in `bootstrap` / `task_setup`:** the full gate registry — automatic gates vs reminders, `runs_in` (`core` | `git-pre-push` | `project-pipeline` | `agent-reminder`), `coverage.uncovered`, and a `verified` block whose confirmed items are subtracted from `instructions`. Git-first, never git-only: one instruction template names git the default instance and tells any project (CMS, media, research) to identify its own chokepoint, wire `task gate --strict` into it, and record the gate point as a rule memory.
+- **Rule honesty (vocabulary v3):** `memory_type: rule` gains `enforcement` (`ENFORCED`/`PARTIAL`/`NOT_ENFORCED`), `source`, and `guard`; `task_validate` fails ENFORCED-without-guard (`rule_overclaims_enforcement`).
 
 ### Changed
 - **Documentation scrub:** Executive-suite naming adopted (Central Executive, Goal, Supervisory Attentional System, Knowledge Consolidation, Action Initiation, Working Memory) across README, AGENTS.md, and the cognitive-architecture docs; CLI-readme documents the new subcommands; changelog backfilled for 1.4.0–1.6.0.
