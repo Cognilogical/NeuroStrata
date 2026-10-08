@@ -1242,6 +1242,10 @@ pub async fn handle_bootstrap(
 struct ProjectScan {
     git_remote: Option<String>,
     languages: Vec<String>,
+    /// Source-file counts per language, strongest first (guinea-pig BUG-4:
+    /// the presence of one manifest is not dominance -- 72 tooling JS files
+    /// must not outvote 185 Go files).
+    language_counts: Vec<(String, usize)>,
     ci: Vec<String>,
     agents_md: bool,
     beads_dir: bool,
@@ -1309,6 +1313,52 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
         scan.languages.push("java".to_string());
     }
 
+    // Weigh the tree, not the manifests (guinea-pig BUG-4). The `ignore`
+    // walker respects .gitignore, so vendored and generated trees stay out.
+    let mut counts: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    for entry in ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .max_depth(Some(6))
+        .build()
+        .flatten()
+    {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let lang = match entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+        {
+            "rs" => "rust",
+            "go" => "go",
+            "py" => "python",
+            "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => "javascript",
+            "java" | "kt" | "kts" => "java",
+            _ => continue,
+        };
+        *counts.entry(lang).or_insert(0) += 1;
+    }
+    for (lang, n) in &counts {
+        if !scan.languages.iter().any(|l| l == lang) {
+            scan.languages.push(lang.to_string());
+        }
+        scan.language_counts.push((lang.to_string(), *n));
+    }
+    scan.language_counts.sort_by(|a, b| b.1.cmp(&a.1));
+    // Manifest-detected languages with no counted files sort last, keeping the
+    // order meaningful for everything suggested_rules derives from it.
+    scan.languages.sort_by_key(|l| {
+        std::cmp::Reverse(
+            scan.language_counts
+                .iter()
+                .find(|(name, _)| name == l)
+                .map(|(_, n)| *n)
+                .unwrap_or(0),
+        )
+    });
+
     if root.join(".github/workflows").is_dir() {
         scan.ci.push("github-actions".to_string());
     }
@@ -1362,14 +1412,23 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
 /// At most three rules, each with why the scan suggests it (section 3.2).
 fn suggested_rules(scan: &ProjectScan) -> Vec<Value> {
     let mut rules = Vec::new();
-    for lang in &scan.languages {
+    let total: usize = scan.language_counts.iter().map(|(_, n)| n).sum();
+    // A language earns a suggestion by dominance, not by leaving one manifest
+    // behind: at least a fifth of the counted source files (guinea-pig BUG-4).
+    for (lang, count) in &scan.language_counts {
+        if rules.len() == 3 {
+            break;
+        }
+        if total > 0 && count * 5 < total {
+            continue;
+        }
         let rule = match lang.as_str() {
             "rust" => (
                 "Build with `cargo build`; `cargo test` and `cargo clippy` must pass before pushing.",
                 "detected cargo workspace",
             ),
             "javascript" => (
-                "Node project: install from the lockfile and keep the package scripts (test, lint) green before pushing.",
+                "JavaScript/TypeScript project: install from the lockfile and keep the package scripts (test, lint) green before pushing.",
                 "detected package.json",
             ),
             "python" => (
@@ -1386,9 +1445,53 @@ fn suggested_rules(scan: &ProjectScan) -> Vec<Value> {
             ),
             _ => continue,
         };
-        rules.push(json!({ "content": rule.0, "memory_type": "rule", "rationale": rule.1 }));
-        if rules.len() == 3 {
-            break;
+        rules.push(json!({
+            "content": rule.0,
+            "memory_type": "rule",
+            "rationale": format!("{} ({} source files counted)", rule.1, count),
+            // Generated content is never ground truth: the caller must check
+            // these against the project's standing rules before accepting.
+            "heuristic": true,
+            "verified": false,
+        }));
+    }
+    // Nothing counted (empty or exotic tree): fall back to manifest presence,
+    // still marked heuristic.
+    if rules.is_empty() {
+        for lang in &scan.languages {
+            let rule = match lang.as_str() {
+                "rust" => (
+                    "Build with `cargo build`; `cargo test` and `cargo clippy` must pass before pushing.",
+                    "detected cargo workspace",
+                ),
+                "javascript" => (
+                    "JavaScript/TypeScript project: install from the lockfile and keep the package scripts (test, lint) green before pushing.",
+                    "detected package.json",
+                ),
+                "python" => (
+                    "Python project: run the configured test suite (pytest) before pushing.",
+                    "detected python packaging files",
+                ),
+                "go" => (
+                    "Go project: `go build ./...` and `go test ./...` must pass before pushing.",
+                    "detected go.mod",
+                ),
+                "java" => (
+                    "JVM project: run the Maven/Gradle check task before pushing.",
+                    "detected a JVM build file",
+                ),
+                _ => continue,
+            };
+            rules.push(json!({
+                "content": rule.0,
+                "memory_type": "rule",
+                "rationale": rule.1,
+                "heuristic": true,
+                "verified": false,
+            }));
+            if rules.len() == 3 {
+                break;
+            }
         }
     }
     if rules.len() < 3 && !scan.ci.is_empty() {
@@ -1398,6 +1501,8 @@ fn suggested_rules(scan: &ProjectScan) -> Vec<Value> {
                 scan.ci.join(", ")
             ),
             "memory_type": "rule",
+            "heuristic": true,
+            "verified": false,
             "rationale": format!("detected CI: {}", scan.ci.join(", ")),
         }));
     }
@@ -1525,11 +1630,52 @@ pub async fn handle_task_setup(
     }
 
     let rules = suggested_rules(&scan);
+    // Generated rules are a draft, never ground truth (guinea-pig BUG-4):
+    // each suggestion carries its nearest existing memories so a potential
+    // contradiction is visible BEFORE anything is accepted, and real overlap
+    // lands in conflicts[] rather than in a flat suggestion list.
+    let mut enriched_rules: Vec<Value> = Vec::new();
+    for rule in &rules {
+        let mut r = rule.clone();
+        let content = rule
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut similar: Vec<Value> = Vec::new();
+        if let Ok(vec) = emb.embed(&content).await {
+            if let Ok(hits) = store.search(&namespace, vec, 3).await {
+                for hit in hits {
+                    let preview: String = hit.payload.content.chars().take(160).collect();
+                    similar.push(json!({
+                        "id": hit.id,
+                        "memory_type": hit.payload.memory_type,
+                        "content": preview,
+                    }));
+                    if hit.payload.memory_type == "rule" {
+                        conflicts.push(json!({
+                            "kind": "suggested_rule_overlap",
+                            "suggestion": content,
+                            "existing_id": hit.id,
+                            "existing": preview,
+                            "resolution": "review both; supersede the stale one instead of accepting a contradiction",
+                        }));
+                    }
+                }
+            }
+        }
+        if let Some(obj) = r.as_object_mut() {
+            obj.insert("similar_existing".to_string(), json!(similar));
+        }
+        enriched_rules.push(r);
+    }
+    let rules = enriched_rules;
     for rule in &rules {
         instructions.push(json!({
             "step": step,
             "action": "call_tool",
             "tool": "neurostrata_add_memory",
+            "review_first": true,
             "params": {
                 "content": rule.get("content").cloned().unwrap_or(Value::Null),
                 "memory_type": rule.get("memory_type").cloned().unwrap_or(Value::Null),
@@ -1557,6 +1703,7 @@ pub async fn handle_task_setup(
         "detected": {
             "git_remote": scan.git_remote,
             "languages": scan.languages,
+            "language_counts": scan.language_counts,
             "ci": scan.ci,
             "agents_md": scan.agents_md,
             "beads_dir": scan.beads_dir,
@@ -1564,6 +1711,7 @@ pub async fn handle_task_setup(
             "existing_hooks": scan.existing_hooks,
         },
         "suggested_rules": rules,
+        "suggested_rules_are_heuristic": true,
         "conflicts": conflicts,
         "tasks_created": tasks_created,
         "instructions": instructions,
@@ -1903,6 +2051,36 @@ mod tests {
     }
 
     #[test]
+    /// Guinea-pig BUG-4: suggestions follow the counted tree, not manifest
+    /// presence. One tooling JS file must not outvote eight Go files.
+    #[test]
+    fn language_suggestions_follow_file_counts_not_manifests() {
+        let root = std::env::temp_dir().join(format!("ns-setup-dom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("go.mod"), "module x").unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        for i in 0..8 {
+            std::fs::write(root.join(format!("f{}.go", i)), "").unwrap();
+        }
+        std::fs::write(root.join("tool.js"), "").unwrap();
+
+        let scan = detect_project(&root);
+        assert_eq!(scan.language_counts.first().unwrap().0, "go");
+        let rules = suggested_rules(&scan);
+        let contents: Vec<String> = rules
+            .iter()
+            .filter_map(|r| r.get("content").and_then(|c| c.as_str()).map(String::from))
+            .collect();
+        assert!(contents.iter().any(|c| c.contains("Go project")));
+        assert!(
+            !contents.iter().any(|c| c.contains("JavaScript")),
+            "1 tooling js file out of 9 must not earn a rule"
+        );
+        assert!(rules.iter().all(|r| r["heuristic"] == true && r["verified"] == false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn ns_key_lowercases_and_sanitizes() {
         assert_eq!(ns_key("MyProj"), "myproj");
         assert_eq!(ns_key("NeuroStrata"), "neurostrata");

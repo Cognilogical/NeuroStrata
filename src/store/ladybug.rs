@@ -1518,6 +1518,8 @@ impl VectorStore for LadybugStore {
                 let mut absolute_path = "".to_string();
                 let mut domain = None;
                 let mut retired = false;
+                let mut full_metadata = serde_json::json!({});
+                let mut superseded_by = serde_json::Value::Null;
 
                 if let lbug::Value::String(metadata_str) = &row[5] {
                     if let Ok(metadata_val) = serde_json::from_str::<serde_json::Value>(metadata_str) {
@@ -1528,6 +1530,8 @@ impl VectorStore for LadybugStore {
                         if let Some(d) = metadata_val.get("domain").and_then(|v| v.as_str()) {
                             domain = Some(d.to_string());
                         }
+                        superseded_by = metadata_val.get("superseded_by").cloned().unwrap_or(serde_json::Value::Null);
+                        full_metadata = metadata_val;
                     }
                 }
 
@@ -1572,6 +1576,14 @@ impl VectorStore for LadybugStore {
                     "location": location,
                     "absolute_path": absolute_path,
                     "domain": domain,
+                    // The graph is not a text dump: the declarative anchors and
+                    // the lineage marker travel with the node (guinea-pig BUG-6
+                    // and BUG-7). `superseded` is the live-layer concept that
+                    // search already hides by; `superseded_by` names the row
+                    // that replaced it.
+                    "metadata": full_metadata,
+                    "superseded": retired,
+                    "superseded_by": superseded_by,
                 }));
             }
         
@@ -1624,6 +1636,24 @@ impl VectorStore for LadybugStore {
                     "source": source,
                     "target": target,
                     "type": "GOVERNS"
+                }));
+            }
+
+            // EXTRACTED_FROM (vocabulary v2): the consolidation edge a completed
+            // task left behind. Without it the export loses the very link the
+            // done-funnel exists to create.
+            let query_extracted = "MATCH (a:Memory)-[r:EXTRACTED_FROM]->(b:Memory) RETURN a.id, b.id;";
+            let mut res_extracted = conn.query(query_extracted)?;
+            while let Some(row) = res_extracted.next() {
+                let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
+                    continue;
+                }
+                links.push(serde_json::json!({
+                    "source": source,
+                    "target": target,
+                    "type": "EXTRACTED_FROM"
                 }));
             }
 
@@ -2144,6 +2174,63 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             })
             .await
             .expect("count GOVERNS edges")
+    }
+
+    /// Guinea-pig BUG-6 and BUG-7: the export is the portable artifact, so it
+    /// must carry the declarative anchors, mark superseded rows with their
+    /// replacement, and include the extraction edges the done-funnel creates.
+    #[tokio::test]
+    async fn export_carries_metadata_marks_superseded_and_keeps_extraction_edges() {
+        let store = retired_test_store().await;
+        let zero = vec![0.0f32; 4];
+        // Targets first: the write-shape validator refuses edges whose target
+        // row does not exist yet.
+        store
+            .upsert("probe", "task-1", zero.clone(), retired_test_payload("task", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "new-rule",
+                zero.clone(),
+                retired_test_payload("rule", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "old-rule",
+                zero,
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({ "superseded_by": "new-rule", "valid_to": 1, "related_to": ["new-rule"] }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let all = store.export_graph(true).await.unwrap();
+        let nodes = all["nodes"].as_array().unwrap();
+        let old = nodes.iter().find(|n| n["id"] == "old-rule").unwrap();
+        assert_eq!(old["superseded"], true);
+        assert_eq!(old["superseded_by"], "new-rule");
+        assert!(old["metadata"]["related_to"].is_array(), "metadata travels with the node");
+        let new = nodes.iter().find(|n| n["id"] == "new-rule").unwrap();
+        assert_eq!(new["superseded"], false);
+        assert_eq!(new["superseded_by"], serde_json::Value::Null);
+
+        let links = all["links"].as_array().unwrap();
+        assert!(
+            links.iter().any(|l| l["type"] == "EXTRACTED_FROM"),
+            "the consolidation edge is part of the graph"
+        );
+
+        let active = store.export_graph(false).await.unwrap();
+        let ids: Vec<_> = active["nodes"].as_array().unwrap().iter().map(|n| n["id"].clone()).collect();
+        assert!(!ids.contains(&json!("old-rule")), "--exclude-superseded drops retired rows");
     }
 
     #[tokio::test]

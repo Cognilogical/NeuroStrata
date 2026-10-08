@@ -58,6 +58,13 @@ struct EditReq {
 #[derive(Deserialize)]
 struct GraphQuery {
     namespace: Option<String>,
+    /// Guinea-pig BUG-7: superseded rows are excluded by default here and
+    /// carried marked when explicitly asked for.
+    include_superseded: Option<bool>,
+    /// Skip the namespace filter and return the whole store's graph: the CLI
+    /// `export-graph` writes every namespace and must mean the same thing
+    /// with or without a daemon.
+    all: Option<bool>,
 }
 
 pub async fn start_daemon(
@@ -116,6 +123,7 @@ pub async fn start_daemon(
         .route("/validate", post(handle_validate))
         .route("/mcp", post(handle_mcp))
         .route("/backup", post(handle_backup))
+        .route("/tasks/import", post(handle_tasks_import))
         .route("/tasks/gate", post(handle_tasks_gate))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state);
@@ -253,7 +261,15 @@ async fn handle_get_graph(
     // For now, let's just use export_graph (which gets everything) and filter by namespace
     // In a real refactor, we would add get_graph_by_namespace to VectorStore.
     // Wait! VectorStore has export_graph() returning the whole graph!
-    let data = state.vector_store.export_graph(false).await.map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let data = state
+        .vector_store
+        .export_graph(query.include_superseded.unwrap_or(false))
+        .await
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if query.all.unwrap_or(false) {
+        return Ok(Json(data));
+    }
     
     // We can just return it all and let the client filter, or we can filter it here.
     // The Tauri backend did: "MATCH (n:Memory) WHERE n.namespace = 'global' OR n.namespace = '{ns}'"
@@ -341,6 +357,32 @@ async fn handle_backup(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(format!("Backed up to {}", req.dir))
+}
+
+#[derive(serde::Deserialize)]
+struct ImportReq {
+    namespace: String,
+    from_beads: String,
+}
+
+/// The beads migration runs here for the same reason (guinea-pig BUG-5): the
+/// import is a store write, and the daemon is the store's single writer. The
+/// CLI used to demand a shutdown first -- tearing down the shared daemon that
+/// every console was using, which is exactly what pushed an agent toward
+/// forcing its own instances.
+async fn handle_tasks_import(
+    State(state): State<AppState>,
+    Json(req): Json<ImportReq>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    let summary = crate::task::import_beads(
+        state.vector_store.clone(),
+        state.embedder.clone(),
+        &req.namespace,
+        &req.from_beads,
+    )
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(serde_json::to_string(&summary).unwrap_or_default())
 }
 
 /// How long to wait after a checkpoint that could not get its quiet moment.
