@@ -1643,8 +1643,8 @@ impl VectorStore for LadybugStore {
             // task left behind. Without it the export loses the very link the
             // done-funnel exists to create.
             let query_extracted = "MATCH (a:Memory)-[r:EXTRACTED_FROM]->(b:Memory) RETURN a.id, b.id;";
-            let mut res_extracted = conn.query(query_extracted)?;
-            while let Some(row) = res_extracted.next() {
+            let res_extracted = conn.query(query_extracted)?;
+            for row in res_extracted {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {

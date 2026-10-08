@@ -752,7 +752,10 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
                     &mut writer,
                     id,
                     INTERNAL_ERROR,
-                    format!("Could not reach the NeuroStrata daemon: {} ({})", cause, e),
+                    format!(
+                        "Could not reach the NeuroStrata daemon: {} ({}). FIRST: run `neurostrata-mcp status` -- do NOT start a daemon (exit 0 healthy, 1 down, 2 busy/finishing). One daemon serves every console; a forced second one risks the store.",
+                        cause, e
+                    ),
                 )
                 .await?;
             }

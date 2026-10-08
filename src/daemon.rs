@@ -124,6 +124,7 @@ pub async fn start_daemon(
         .route("/mcp", post(handle_mcp))
         .route("/backup", post(handle_backup))
         .route("/tasks/import", post(handle_tasks_import))
+        .route("/cli/read", post(handle_cli_read))
         .route("/tasks/gate", post(handle_tasks_gate))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state);
@@ -364,7 +365,6 @@ struct ImportReq {
     namespace: String,
     from_beads: String,
 }
-
 /// The beads migration runs here for the same reason (guinea-pig BUG-5): the
 /// import is a store write, and the daemon is the store's single writer. The
 /// CLI used to demand a shutdown first -- tearing down the shared daemon that
@@ -383,6 +383,47 @@ async fn handle_tasks_import(
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(serde_json::to_string(&summary).unwrap_or_default())
+}
+
+#[derive(serde::Deserialize)]
+struct ReadReq {
+    op: String,
+    namespace: Option<String>,
+}
+
+/// Read-only CLI proxy (guinea-pig BUG-8): `doctor`, `list` and `namespaces`
+/// run while the daemon holds the store, through this route, without a second
+/// engine ever opening the database.
+async fn handle_cli_read(
+    State(state): State<AppState>,
+    Json(req): Json<ReadReq>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    let value = match req.op.as_str() {
+        "namespaces" => {
+            let namespaces = state
+                .vector_store
+                .list_namespaces()
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "namespaces": namespaces })
+        }
+        "list" => {
+            let ns = req.namespace.unwrap_or_default();
+            let rows = state
+                .vector_store
+                .list(&ns, None)
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "rows": rows })
+        }
+        other => {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("unknown read op '{}': expected 'namespaces' or 'list'", other),
+            ))
+        }
+    };
+    Ok(value.to_string())
 }
 
 /// How long to wait after a checkpoint that could not get its quiet moment.

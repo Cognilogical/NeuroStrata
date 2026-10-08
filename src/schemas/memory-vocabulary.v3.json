@@ -1,5 +1,5 @@
 {
-  "vocabulary_version": 2,
+  "vocabulary_version": 3,
   "relations": {
     "GOVERNS": {
       "direction": "directed",
@@ -38,7 +38,27 @@
   "memory_types": {
     "rule": {
       "definition": "A normative architectural or behavioral constraint.",
-      "structural": false
+      "structural": false,
+      "fields": {
+        "enforcement": {
+          "type": "string",
+          "enum": [
+            "ENFORCED",
+            "PARTIAL",
+            "NOT_ENFORCED"
+          ],
+          "definition": "Whether any machine actually enforces this rule. A rule that no machine checks is a note, not a rule."
+        },
+        "source": {
+          "type": "string",
+          "definition": "Dated origin of the rule (owner ruling ref + date). Every rule carries one."
+        },
+        "guard": {
+          "type": "string",
+          "nullable": true,
+          "definition": "The wire id (from the wiring panel) that enforces this rule, or null. enforcement=ENFORCED with a null or dangling guard fails task_validate."
+        }
+      }
     },
     "fact": {
       "definition": "A descriptive assertion, not inherently a constraint.",
@@ -71,7 +91,12 @@
   "extensions": {
     "custom_memory_types": "Any nonempty string is accepted unchanged.",
     "recommended_custom_type_form": "owner.name",
-    "existing_custom_types": ["preference", "bootstrap", "persona", "context"],
+    "existing_custom_types": [
+      "preference",
+      "bootstrap",
+      "persona",
+      "context"
+    ],
     "unknown_metadata_keys": "Accepted unchanged.",
     "custom_relations": "Not materialized; only the relations declared above are materialized.",
     "role_enforcement": "Descriptive only; no endpoint type rejection.",

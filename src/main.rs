@@ -445,6 +445,195 @@ fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
     }
 }
 
+
+/// Read-only queries against the store, transparently proxied to the daemon
+/// when one is running (guinea-pig BUG-8): `doctor`, `list` and `namespaces`
+/// are documented as changing nothing and must work while the system is up.
+/// The proxy holds no engine handle -- that is the whole point.
+enum ReadSource {
+    Direct(Arc<dyn VectorStore>),
+    Daemon,
+}
+
+impl ReadSource {
+    async fn namespaces(&self) -> anyhow::Result<Vec<String>> {
+        match self {
+            ReadSource::Direct(s) => s.list_namespaces().await,
+            ReadSource::Daemon => {
+                let res = reqwest::Client::new()
+                    .post("http://127.0.0.1:34343/cli/read")
+                    .json(&serde_json::json!({ "op": "namespaces" }))
+                    .send()
+                    .await?;
+                let v: serde_json::Value = res.json().await?;
+                Ok(serde_json::from_value(v["namespaces"].clone())?)
+            }
+        }
+    }
+
+    async fn list(&self, namespace: &str) -> anyhow::Result<Vec<SearchResult>> {
+        match self {
+            ReadSource::Direct(s) => s.list(namespace, None).await,
+            ReadSource::Daemon => {
+                let res = reqwest::Client::new()
+                    .post("http://127.0.0.1:34343/cli/read")
+                    .json(&serde_json::json!({ "op": "list", "namespace": namespace }))
+                    .send()
+                    .await?;
+                let v: serde_json::Value = res.json().await?;
+                Ok(serde_json::from_value(v["rows"].clone())?)
+            }
+        }
+    }
+}
+
+async fn run_doctor(read: &ReadSource) -> anyhow::Result<()> {
+
+                    // Read-only by design: it names what an upgrade left
+                    // behind and how to fix it, and touches nothing itself.
+                    let namespaces = read.namespaces().await?;
+                    println!("Namespaces: {:?}\n", namespaces);
+
+                    let mut collisions = 0;
+                    for (i, a) in namespaces.iter().enumerate() {
+                        for b in namespaces.iter().skip(i + 1) {
+                            if a.eq_ignore_ascii_case(b) {
+                                collisions += 1;
+                                let a_len = read.list(a).await.map(|m| m.len()).unwrap_or(0);
+                                let b_len = read.list(b).await.map(|m| m.len()).unwrap_or(0);
+                                println!("Two spellings of one project:");
+                                println!("  '{}' holds {} memories", a, a_len);
+                                println!("  '{}' holds {} memories", b, b_len);
+                                let (from, to) = if a_len < b_len { (a, b) } else { (b, a) };
+                                println!(
+                                    "  Merge with: neurostrata-mcp move '{}' <id> '{}'  (one per id)\n",
+                                    from, to
+                                );
+                            }
+                        }
+                    }
+                    if collisions == 0 {
+                        println!("No namespaces differ only by case.\n");
+                    }
+
+                    for ns in &namespaces {
+                        let memories = read.list(ns).await?;
+                        let known = crate::store::ladybug::KnownIds::new(
+                            memories.iter().map(|m| m.id.as_str()),
+                        );
+
+                        let mut resolvable = Vec::new();
+                        let mut missing = Vec::new();
+                        let mut never_read = 0;
+                        let mut ingested = 0;
+                        let mut unqualified = Vec::new();
+
+                        for memory in &memories {
+                            // Ingested ids carry the namespace that owns them.
+                            // One written before that changed does not, and a
+                            // bare path is unique to a project rather than to
+                            // the database -- so two projects holding the same
+                            // path still collide until each is re-ingested.
+                            if memory.payload.user_id == "auto-ingestor" {
+                                ingested += 1;
+                                if !crate::parser::ingest::is_qualified(ns, &memory.id) {
+                                    unqualified.push(memory.id.clone());
+                                }
+                            }
+
+                            if memory.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+                                never_read += 1;
+                            }
+                            for edge in crate::store::ladybug::edge_specs(&memory.payload.metadata) {
+                                if known.contains(&edge.target_id) {
+                                    continue;
+                                }
+                                match known.resolve(&edge.target_id) {
+                                    Some(_) => resolvable.push(edge.target_id.clone()),
+                                    None => missing.push(edge.target_id.clone()),
+                                }
+                            }
+                        }
+
+                        println!("{}: {} memories", ns, memories.len());
+                        println!(
+                            "  ingested nodes carrying this namespace in their id: {} of {}",
+                            ingested - unqualified.len(),
+                            ingested
+                        );
+                        if !unqualified.is_empty() {
+                            println!(
+                                "    {} predate namespace qualification. They resolve, but the next",
+                                unqualified.len()
+                            );
+                            println!("    project ingesting a shared path takes them.");
+                            for id in unqualified.iter().take(3) {
+                                println!("      {}", id);
+                            }
+                            println!("    Migrate: neurostrata-mcp ingest <dir> {}", ns);
+                            println!("    Backup first: re-ingest rewrites every id.");
+                        }
+                        println!(
+                            "  declared targets that need the older absolute form resolved: {}",
+                            resolvable.len()
+                        );
+                        for target in resolvable.iter().take(3) {
+                            println!("    {}", target);
+                        }
+                        println!("  declared targets that match nothing ingested: {}", missing.len());
+                        for target in missing.iter().take(3) {
+                            println!("    {}", target);
+                        }
+                        println!(
+                            "  memories never counted as read: {} of {}",
+                            never_read,
+                            memories.len()
+                        );
+                        if never_read == memories.len() && !memories.is_empty() {
+                            println!(
+                                "    Every one. Before the embedding decode was fixed, each retrieval tried to"
+                            );
+                            println!(
+                                "    write an empty vector and was refused, so the Neural Gain Filter had nothing"
+                            );
+                            println!("    to rank by. Counts start rising again from the next search.");
+                        }
+                        println!();
+                    }
+                
+    Ok(())
+}
+
+async fn run_namespaces(read: &ReadSource) -> anyhow::Result<()> {
+
+                    let namespaces = read.namespaces().await?;
+                    println!("Namespaces:");
+                    for ns in namespaces {
+                        println!("  - {}", ns);
+                    }
+                
+    Ok(())
+}
+
+async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
+
+                    let results: Vec<SearchResult> = read.list(namespace).await?;
+                    println!("Found {} memories in namespace '{}':\n", results.len(), namespace);
+                    for res in results {
+                        let location_str = if res.payload.location.is_empty() {
+                            "N/A".to_string()
+                        } else {
+                            res.payload.location.clone()
+                        };
+                        println!("--- ID: {} ---", res.id);
+                        println!("Type: {}", res.payload.memory_type);
+                        println!("Location: {}", location_str);
+                        println!("Content: {}\n", res.payload.content);
+                    }
+                
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,6 +1434,26 @@ async fn main() -> anyhow::Result<()> {
                         println!("Graph exported successfully.");
                         return Ok(());
                     }
+                    // Read-only tools run against the daemon's store without
+                    // opening an engine here (guinea-pig BUG-8): doctor --help
+                    // says "changing nothing", and the recovery moment is
+                    // exactly when the daemon is up and least safe to stop.
+                    let read = ReadSource::Daemon;
+                    match &other {
+                        Commands::Doctor => {
+                            run_doctor(&read).await?;
+                            return Ok(());
+                        }
+                        Commands::Namespaces => {
+                            run_namespaces(&read).await?;
+                            return Ok(());
+                        }
+                        Commands::List { namespace } => {
+                            run_list(&read, namespace).await?;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
                     eprintln!("You cannot run database-modifying CLI commands while the daemon is active.");
                     eprintln!("Run `neurostrata-mcp shutdown` to stop it safely -- killing the process discards any writes made since the last checkpoint.");
@@ -1261,120 +1470,17 @@ async fn main() -> anyhow::Result<()> {
                     config.db_path.to_string_lossy().to_string(),
                     embedder.dimensions(),
                 )?);
+                let read = ReadSource::Direct(vector_store.clone());
 
                 match other {
                     Commands::Doctor => {
-                        // Read-only by design: it names what an upgrade left
-                        // behind and how to fix it, and touches nothing itself.
-                        let namespaces = vector_store.list_namespaces().await?;
-                        println!("Namespaces: {:?}\n", namespaces);
-
-                        let mut collisions = 0;
-                        for (i, a) in namespaces.iter().enumerate() {
-                            for b in namespaces.iter().skip(i + 1) {
-                                if a.eq_ignore_ascii_case(b) {
-                                    collisions += 1;
-                                    let a_len = vector_store.list(a, None).await.map(|m| m.len()).unwrap_or(0);
-                                    let b_len = vector_store.list(b, None).await.map(|m| m.len()).unwrap_or(0);
-                                    println!("Two spellings of one project:");
-                                    println!("  '{}' holds {} memories", a, a_len);
-                                    println!("  '{}' holds {} memories", b, b_len);
-                                    let (from, to) = if a_len < b_len { (a, b) } else { (b, a) };
-                                    println!(
-                                        "  Merge with: neurostrata-mcp move '{}' <id> '{}'  (one per id)\n",
-                                        from, to
-                                    );
-                                }
-                            }
-                        }
-                        if collisions == 0 {
-                            println!("No namespaces differ only by case.\n");
-                        }
-
-                        for ns in &namespaces {
-                            let memories = vector_store.list(ns, None).await?;
-                            let known = crate::store::ladybug::KnownIds::new(
-                                memories.iter().map(|m| m.id.as_str()),
-                            );
-
-                            let mut resolvable = Vec::new();
-                            let mut missing = Vec::new();
-                            let mut never_read = 0;
-                            let mut ingested = 0;
-                            let mut unqualified = Vec::new();
-
-                            for memory in &memories {
-                                // Ingested ids carry the namespace that owns them.
-                                // One written before that changed does not, and a
-                                // bare path is unique to a project rather than to
-                                // the database -- so two projects holding the same
-                                // path still collide until each is re-ingested.
-                                if memory.payload.user_id == "auto-ingestor" {
-                                    ingested += 1;
-                                    if !crate::parser::ingest::is_qualified(ns, &memory.id) {
-                                        unqualified.push(memory.id.clone());
-                                    }
-                                }
-
-                                if memory.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
-                                    never_read += 1;
-                                }
-                                for edge in crate::store::ladybug::edge_specs(&memory.payload.metadata) {
-                                    if known.contains(&edge.target_id) {
-                                        continue;
-                                    }
-                                    match known.resolve(&edge.target_id) {
-                                        Some(_) => resolvable.push(edge.target_id.clone()),
-                                        None => missing.push(edge.target_id.clone()),
-                                    }
-                                }
-                            }
-
-                            println!("{}: {} memories", ns, memories.len());
-                            println!(
-                                "  ingested nodes carrying this namespace in their id: {} of {}",
-                                ingested - unqualified.len(),
-                                ingested
-                            );
-                            if !unqualified.is_empty() {
-                                println!(
-                                    "    {} predate namespace qualification. They resolve, but the next",
-                                    unqualified.len()
-                                );
-                                println!("    project ingesting a shared path takes them.");
-                                for id in unqualified.iter().take(3) {
-                                    println!("      {}", id);
-                                }
-                                println!("    Migrate: neurostrata-mcp ingest <dir> {}", ns);
-                                println!("    Backup first: re-ingest rewrites every id.");
-                            }
-                            println!(
-                                "  declared targets that need the older absolute form resolved: {}",
-                                resolvable.len()
-                            );
-                            for target in resolvable.iter().take(3) {
-                                println!("    {}", target);
-                            }
-                            println!("  declared targets that match nothing ingested: {}", missing.len());
-                            for target in missing.iter().take(3) {
-                                println!("    {}", target);
-                            }
-                            println!(
-                                "  memories never counted as read: {} of {}",
-                                never_read,
-                                memories.len()
-                            );
-                            if never_read == memories.len() && !memories.is_empty() {
-                                println!(
-                                    "    Every one. Before the embedding decode was fixed, each retrieval tried to"
-                                );
-                                println!(
-                                    "    write an empty vector and was refused, so the Neural Gain Filter had nothing"
-                                );
-                                println!("    to rank by. Counts start rising again from the next search.");
-                            }
-                            println!();
-                        }
+                        run_doctor(&read).await?;
+                    }
+                    Commands::Namespaces => {
+                        run_namespaces(&read).await?;
+                    }
+                    Commands::List { namespace } => {
+                        run_list(&read, &namespace).await?;
                     }
                     // Reached only through the fallback; the dedicated Status
                     // arm exits before the store opens. Reported faithfully
@@ -1388,28 +1494,6 @@ async fn main() -> anyhow::Result<()> {
                         );
                         println!("status: down -- safe to start exactly one: neurostrata-mcp daemon");
                         std::process::exit(1);
-                    }
-                    Commands::Namespaces => {
-                        let namespaces = vector_store.list_namespaces().await?;
-                        println!("Namespaces:");
-                        for ns in namespaces {
-                            println!("  - {}", ns);
-                        }
-                    }
-                    Commands::List { namespace } => {
-                        let results: Vec<SearchResult> = vector_store.list(&namespace, None).await?;
-                        println!("Found {} memories in namespace '{}':\n", results.len(), namespace);
-                        for res in results {
-                            let location_str = if res.payload.location.is_empty() {
-                                "N/A".to_string()
-                            } else {
-                                res.payload.location.clone()
-                            };
-                            println!("--- ID: {} ---", res.id);
-                            println!("Type: {}", res.payload.memory_type);
-                            println!("Location: {}", location_str);
-                            println!("Content: {}\n", res.payload.content);
-                        }
                     }
                     Commands::Ingest { dir, namespace, schema_path } => {
                         let dir = cli_ingest_root(&dir);
