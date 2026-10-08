@@ -195,7 +195,7 @@ Before any container starts, the requested working directory is canonicalised an
 
 ### Teaching the Cortex
 
-Rules are not hand-written config. Use `neurocortex_learn_behavioral_rule` with a `constraint_text`, a `rule_class`, and a `trigger_pattern`, and the new rule is embedded into the `guard` namespace immediately, where it applies to every future validation. Combined with `neurocortex_local_guard_validate`, the Cortex is a closed loop: rules arrive from experience, and every subsequent state-mutating action is measured against them.
+Rules are not hand-written config. Store one with `neurostrata_add_memory` as a `guard_rule` memory in the `guard` namespace — `constraint_text`, `rule_class`, and `trigger_pattern` in its metadata — and the new rule is embedded immediately, where it applies to every future validation. Validation itself runs in-binary through the daemon's `POST /validate` route (the Prefrontal Cortex needs no separate MCP server). Dedicated `neurostrata_guard_validate` / `neurostrata_guard_learn` tools fold this loop onto the main MCP surface in an upcoming release.
 
 ---
 
@@ -371,13 +371,12 @@ The **Central Executive** manages Goals over the same surface:
 | `neurostrata_bootstrap` | New-project onboarding: AGENTS.md template, first Goal, ordered instructions. |
 | `neurostrata_task_setup` | Existing-project onboarding: repo scan, suggested rules, integration Goals, instructions. |
 
-The **Prefrontal Cortex** is exposed as a separate MCP surface, so an agent can consult or
-train the guard without the memory tools being able to mutate anything:
+The **Prefrontal Cortex** lives in-binary: agents validate state-mutating actions through the daemon's `POST /validate` route, and behavioral rules are ordinary `guard_rule` memories in the `guard` namespace — teachable through `neurostrata_add_memory`:
 
-| Tool Name | Description |
+| Surface | Role |
 | :--- | :--- |
-| `neurocortex_local_guard_validate` | Validate a state-mutating action (bash, file writes) *before* it executes. Returns a verdict bucket, the reasons, and the ids of the behavioral rules that triggered. |
-| `neurocortex_learn_behavioral_rule` | Teach the Cortex a new behavioral constraint — `constraint_text`, `rule_class`, and `trigger_pattern` — which applies to every future validation. |
+| `POST /validate` (daemon) | Validate a state-mutating action (bash, file writes) *before* it executes. Returns a verdict bucket, the reasons, and the ids of the behavioral rules that triggered. |
+| `neurostrata_add_memory` (`guard_rule`) | Teach the Cortex a new behavioral constraint — `constraint_text`, `rule_class`, and `trigger_pattern` in metadata — which applies to every future validation. |
 
 Every tool an agent can reach is additive: none of them destroys a memory. Editing a rule in
 place, deleting one, moving one between namespaces and restoring a backup are **CLI and GUI

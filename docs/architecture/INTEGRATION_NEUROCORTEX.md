@@ -3,6 +3,12 @@
 ## Overview
 NeuroCortex (Cognitive Deterministic Engine) and NeuroStrata (3-Tier Memory Architecture) have historically operated as separate MCP servers. However, they share a highly symbiotic relationship: NeuroCortex validates state-mutating actions and guards against hallucinations, while NeuroStrata stores the project's permanent architectural memory. 
 
+# ⚠️ RETIRED — NeuroCortex is no longer a standalone product
+
+This document described the standalone NeuroCortex MCP (`neurocortex_think`, `local_guard_validate`). NeuroCortex was merged into NeuroStrata as the **Prefrontal Cortex** (`src/guard/`) and the standalone binary/MCP has been removed from all client configurations. See `MERGE_NEUROCORTEX_VERDICT.md` for the decision record and README §"The Prefrontal Cortex" for the current surface. The remainder is kept as historical record only.
+
+---
+
 To improve token efficiency, prevent context compaction crashes, and dramatically reduce the complexity of `AGENTS.md`, NeuroCortex now natively supports a cognitive scratchpad tool (`neurocortex_think`), replacing the need for external sequential thinking MCPs or verbose prompt engineering.
 
 ## 🧠 The `neurocortex_think` Tool
