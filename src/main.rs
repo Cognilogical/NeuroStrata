@@ -1,6 +1,7 @@
 mod config;
 mod daemon;
 mod embed;
+mod guard;
 mod ingest_jobs;
 mod judgment;
 mod parser;
@@ -10,11 +11,11 @@ mod store;
 mod traits;
 
 use config::Config;
-use embed::FastEmbedder;
 use std::sync::Arc;
 use crate::traits::SearchResult;
 use store::LadybugStore;
-use traits::{Embedder, VectorStore};
+use crate::traits::{Embedder, VectorStore};
+use embed::build_embedder;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -449,7 +450,7 @@ async fn main() -> anyhow::Result<()> {
                 // Taken before the database opens. `shutdown` waits for this lock
                 // to be released rather than for the port to close.
                 let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
-                let embedder = Arc::new(FastEmbedder::new()?);
+                let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embedder.dimensions(),
@@ -637,7 +638,7 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
-                let embedder = Arc::new(FastEmbedder::new()?);
+                let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embedder.dimensions(),

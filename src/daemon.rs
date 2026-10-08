@@ -25,6 +25,8 @@ struct AppState {
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     /// Memory deduplication checker (None if disabled or misconfigured)
     deduplication_checker: Option<Arc<DeduplicationChecker>>,
+    /// Guard validator for behavioral constraint checking
+    guard_validator: Arc<crate::guard::GuardValidator>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +89,13 @@ pub async fn start_daemon(
         None
     };
 
+    // Initialize guard validator for behavioral constraint checking
+    let guard_validator = Arc::new(crate::guard::GuardValidator::new(
+        vector_store.clone(),
+        embedder.clone(),
+        "guard",
+    ));
+
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
     let state = AppState {
@@ -95,6 +104,7 @@ pub async fn start_daemon(
         ingests: ingests.clone(),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
         deduplication_checker,
+        guard_validator,
     };
 
     let app = Router::new()
@@ -103,6 +113,7 @@ pub async fn start_daemon(
         .route("/ingest", post(handle_ingest))
         .route("/delete", post(handle_delete))
         .route("/edit", post(handle_edit))
+        .route("/validate", post(handle_validate))
         .route("/mcp", post(handle_mcp))
         .route("/backup", post(handle_backup))
         .route("/shutdown", post(handle_shutdown))
@@ -493,6 +504,25 @@ async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
         }
         None => "Already shutting down",
     }
+}
+
+async fn handle_validate(
+    State(state): State<AppState>,
+    Json(request): Json<crate::guard::ValidateRequest>,
+) -> Result<Json<crate::guard::ValidateResponse>, (axum::http::StatusCode, String)> {
+    // Use sandbox if podman is available
+    let use_sandbox = true;
+    
+    let (verdict, rule_ids) = state
+        .guard_validator
+        .validate(&request.action_type, &request.payload, &request.cwd, use_sandbox)
+        .await;
+    
+    Ok(Json(crate::guard::ValidateResponse {
+        trace_id: request.trace_id,
+        verdict,
+        rule_ids_triggered: rule_ids,
+    }))
 }
 
 #[cfg(test)]
