@@ -8,6 +8,7 @@ mod parser;
 mod secrets;
 mod server;
 mod store;
+mod task;
 mod traits;
 
 use config::Config;
@@ -153,6 +154,60 @@ enum Commands {
         /// The new location
         location: String,
     },
+
+    /// Task subsystem: the gate behind the pre-push hook (section 5)
+    Task {
+        #[command(subcommand)]
+        action: TaskCommands,
+    },
+
+    /// Git hook management: installs the one hook that exists
+    Hooks {
+        #[command(subcommand)]
+        action: HooksCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum TaskCommands {
+    /// Run the gate: 0 clean, 1 violations, 2 could-not-check (section 5.1)
+    ///
+    /// Mirrors the Backup dispatch: ask a live daemon, else open the database
+    /// for a metadata-only read, else report the infrastructure failure.
+    Gate {
+        /// The exact project name, e.g. 'NeuroStrata'
+        namespace: String,
+
+        /// With violations an unavailable database blocks the push too
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// The gate as an advisory report: violations, staleness, counts. Always exits 0
+    Validate {
+        /// The exact project name
+        namespace: String,
+    },
+
+    /// One-shot, idempotent beads import: .beads/issues.jsonl -> tasks (section 7)
+    Import {
+        /// The exact project name
+        namespace: String,
+
+        /// Path to the exported JSONL (bd export .beads/beads.jsonl)
+        #[arg(long)]
+        from_beads: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum HooksCommands {
+    /// Write .git/hooks/pre-push: the only hook the task system keeps
+    Install {
+        /// Replace a pre-push hook NeuroStrata did not write
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// What a health probe actually found.
@@ -262,6 +317,87 @@ fn daemon_busy(probe: DaemonProbe, lock_held: bool) -> bool {
     lock_held && probe != DaemonProbe::Responsive
 }
 
+/// The pre-push hook, section 5.2 verbatim. Installed by `hooks install`.
+///
+/// One hook is the whole enforcement surface: tasks live in LadybugDB, never
+/// in the repo, so there is nothing to commit, sync, or rebuild. Blocks only
+/// on exit 1 -- an unavailable database (exit 2) passes here; `task gate
+/// --strict` maps its own infra failure to exit 1 instead of 2 (section 5.1).
+const PRE_PUSH_HOOK: &str = r#"#!/bin/bash
+# NeuroStrata task gate. One hook is the whole enforcement surface:
+# tasks live in LadybugDB, never in the repo, so there is nothing to
+# commit, sync, or rebuild.
+command -v neurostrata-mcp >/dev/null || exit 0
+[ -n "$NEUROSTRATA_SKIP_GATE" ] && exit 0
+
+NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+neurostrata-mcp task gate "$NAMESPACE" --strict
+code=$?
+if [ $code -eq 1 ]; then
+    echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
+    exit 1
+fi
+exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
+"#;
+
+/// The gate's exit code: verdict known -> 0/1; verdict unavailable -> strict
+/// blocks (1), otherwise 2 (section 5.1). The hook only blocks on 1, so the
+/// non-strict infra path warns and lets the push through.
+fn gate_exit_code(ok: Option<bool>, strict: bool) -> i32 {
+    match ok {
+        Some(true) => 0,
+        Some(false) => 1,
+        None => {
+            if strict {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// The enclosing git work tree, or None outside one.
+fn git_toplevel() -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(out.stdout).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
+    }
+}
+
+/// Section 5.1, path 2: no daemon to ask, so open the database for the
+/// metadata-only read. Dimensions come from config -- loading the embedding
+/// model would turn a `git push` into a model download.
+async fn direct_report(
+    config: &Config,
+    namespace: &str,
+) -> Result<crate::task::gate::GateReport, String> {
+    let dimensions = embed::configured_dimensions()
+        .map_err(|e| format!("the configured embedding dimensions could not be read: {}", e))?;
+    let store: Arc<dyn VectorStore> = Arc::new(
+        LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
+            .map_err(|e| format!("the database could not be opened: {}", e))?,
+    );
+    store
+        .init(namespace)
+        .await
+        .map_err(|e| format!("the schema could not be opened: {}", e))?;
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
+    crate::task::gate::run(&store, &namespace)
+        .await
+        .map_err(|e| format!("the gate could not list the tasks: {}", e))
+}
+
 /// The CLI names ingested files relative to where it runs, as CLI-readme.md
 /// documents: `ingest ./src` from a project yields `src/lib.rs`. An absolute
 /// path to a subdirectory of the working directory is the same request written
@@ -369,6 +505,101 @@ mod tests {
         assert!(daemon_busy(DaemonProbe::Absent, true), "listener closed, still checkpointing");
         assert!(!daemon_busy(DaemonProbe::Silent, false), "silence with no holder is no daemon");
         assert!(!daemon_busy(DaemonProbe::Responsive, true), "an answering daemon is asked, not refused");
+    }
+
+    /// Section 5.1: a verdict maps to 0/1; no verdict blocks only under
+    /// --strict and passes (2) otherwise -- and 2 is what the hook tolerates.
+    #[test]
+    fn the_gate_exit_code_flips_only_under_strict() {
+        assert_eq!(gate_exit_code(Some(true), false), 0);
+        assert_eq!(gate_exit_code(Some(true), true), 0);
+        assert_eq!(gate_exit_code(Some(false), false), 1);
+        assert_eq!(gate_exit_code(Some(false), true), 1, "a verdict never changes with the flag");
+        assert_eq!(gate_exit_code(None, false), 2, "infra warns and lets the push through");
+        assert_eq!(
+            gate_exit_code(None, true),
+            1,
+            "strict maps the infra failure to the one code the hook blocks on"
+        );
+    }
+
+    /// Section 5.2 verbatim: blocks on violations only, skips on the escape
+    /// hatch, and lets 0 and 2 pass.
+    #[test]
+    fn the_pre_push_hook_is_the_documented_script() {
+        assert!(PRE_PUSH_HOOK.starts_with("#!/bin/bash\n"));
+        assert!(PRE_PUSH_HOOK.contains("command -v neurostrata-mcp >/dev/null || exit 0"));
+        assert!(PRE_PUSH_HOOK.contains("[ -n \"$NEUROSTRATA_SKIP_GATE\" ] && exit 0"));
+        assert!(PRE_PUSH_HOOK
+            .contains("NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")"));
+        assert!(PRE_PUSH_HOOK.contains("neurostrata-mcp task gate \"$NAMESPACE\" --strict"));
+        assert!(PRE_PUSH_HOOK.contains("code=$?"));
+        assert!(PRE_PUSH_HOOK.contains("if [ $code -eq 1 ]; then"));
+        assert!(PRE_PUSH_HOOK.contains("NEUROSTRATA_SKIP_GATE=1 git push"));
+        assert!(PRE_PUSH_HOOK.contains("exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking"));
+        assert!(!PRE_PUSH_HOOK.contains("$code -eq 2"), "2 never blocks in the hook itself");
+    }
+
+    #[test]
+    fn the_gate_and_hook_commands_parse_with_their_flags() {
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "task",
+            "gate",
+            "NeuroStrata",
+            "--strict",
+        ])
+        .expect("task gate parses");
+        match cli.command {
+            Some(Commands::Task {
+                action: TaskCommands::Gate { namespace, strict },
+            }) => {
+                assert_eq!(namespace, "NeuroStrata");
+                assert!(strict);
+            }
+            other => panic!("expected Task/Gate, got {:?}", other),
+        }
+
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "task", "validate", "MyProj"])
+            .expect("task validate parses");
+        match cli.command {
+            Some(Commands::Task {
+                action: TaskCommands::Validate { namespace },
+            }) => assert_eq!(namespace, "MyProj"),
+            other => panic!("expected Task/Validate, got {:?}", other),
+        }
+
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "task", "import", "MyProj", "--from-beads", ".beads/issues.jsonl"])
+                .expect("task import parses");
+        match cli.command {
+            Some(Commands::Task {
+                action: TaskCommands::Import { namespace, from_beads },
+            }) => {
+                assert_eq!(namespace, "MyProj");
+                assert_eq!(from_beads, ".beads/issues.jsonl");
+            }
+            other => panic!("expected Task/Import, got {:?}", other),
+        }
+
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "hooks", "install", "--force"]).expect("hooks install parses");
+        match cli.command {
+            Some(Commands::Hooks {
+                action: HooksCommands::Install { force },
+            }) => assert!(force),
+            other => panic!("expected Hooks/Install, got {:?}", other),
+        }
+
+        // The flag stays optional: plain `hooks install` is the common case.
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "hooks", "install"]).expect("hooks install parses bare");
+        match cli.command {
+            Some(Commands::Hooks {
+                action: HooksCommands::Install { force },
+            }) => assert!(!force),
+            other => panic!("expected Hooks/Install, got {:?}", other),
+        }
     }
 }
 
@@ -625,6 +856,293 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+            Commands::Task { action } => match action {
+                // Read-only, so it never needs the mutating-DB refusal: ask a
+                // live daemon, else open the database metadata-only (5.1).
+                TaskCommands::Gate { namespace, strict } => {
+                    // Both policies print the escape hatch (section 5.1).
+                    if std::env::var("NEUROSTRATA_SKIP_GATE")
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false)
+                    {
+                        eprintln!(
+                            "[neurostrata:gate] NEUROSTRATA_SKIP_GATE is set; skipping the gate for '{}'.",
+                            namespace
+                        );
+                        return Ok(());
+                    }
+
+                    let outcome: Result<serde_json::Value, String> =
+                        if probe == DaemonProbe::Responsive {
+                            match reqwest::Client::new()
+                                .post("http://127.0.0.1:34343/tasks/gate")
+                                .json(&serde_json::json!({
+                                    "namespace": namespace,
+                                    "strict": strict,
+                                }))
+                                .timeout(std::time::Duration::from_secs(10))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => match resp.text().await {
+                                    Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+                                        .map_err(|e| {
+                                            format!(
+                                                "the daemon's gate reply could not be read: {}",
+                                                e
+                                            )
+                                        }),
+                                    Err(e) => Err(format!(
+                                        "the daemon's gate reply could not be read: {}",
+                                        e
+                                    )),
+                                },
+                                Ok(resp) => Err(format!(
+                                    "the daemon answered {} on /tasks/gate",
+                                    resp.status()
+                                )),
+                                Err(e) => Err(format!("the request to the daemon failed: {}", e)),
+                            }
+                        } else {
+                            match Config::from_default_path() {
+                                Err(e) => Err(format!("the config could not be read: {}", e)),
+                                Ok(config) => {
+                                    if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                                        Err(DAEMON_BUSY_MESSAGE.to_string())
+                                    } else if probe == DaemonProbe::Silent {
+                                        Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
+                                    } else {
+                                        direct_report(&config, &namespace)
+                                            .await
+                                            .map(|report| report.gate_json())
+                                    }
+                                }
+                            }
+                        };
+
+                    match outcome {
+                        Ok(body) => {
+                            let violations = body
+                                .get("violations")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            for violation in &violations {
+                                println!(
+                                    "- [{}] {}: {}",
+                                    violation
+                                        .get("kind")
+                                        .and_then(|k| k.as_str())
+                                        .unwrap_or("?"),
+                                    violation
+                                        .get("id")
+                                        .and_then(|i| i.as_str())
+                                        .unwrap_or("?"),
+                                    violation
+                                        .get("detail")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or("")
+                                );
+                            }
+                            if !violations.is_empty() {
+                                println!();
+                            }
+                            let ok = violations.is_empty();
+                            if ok {
+                                println!("Task gate: clean in '{}'.", namespace);
+                            } else {
+                                println!(
+                                    "Task gate: {} violation(s) in '{}'. Fix them (or claim and finish them), then push again.",
+                                    violations.len(),
+                                    namespace
+                                );
+                            }
+                            std::process::exit(gate_exit_code(Some(ok), strict));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[neurostrata:gate] the task gate could not run for '{}': {}",
+                                namespace, e
+                            );
+                            eprintln!(
+                                "[neurostrata:gate] {}",
+                                if strict {
+                                    "--strict: an unavailable database blocks the push. Skip explicitly with NEUROSTRATA_SKIP_GATE=1 git push."
+                                } else {
+                                    "continuing anyway: an unavailable database is an ops problem, not agent misconduct. Set NEUROSTRATA_SKIP_GATE=1 to silence this, or pass --strict to block."
+                                }
+                            );
+                            std::process::exit(gate_exit_code(None, strict));
+                        }
+                    }
+                }
+
+                // Advisory twin of the gate (section 4): always exits 0.
+                TaskCommands::Validate { namespace } => {
+                    let fetched = if probe == DaemonProbe::Responsive {
+                        match reqwest::Client::new()
+                            .post("http://127.0.0.1:34343/mcp")
+                            .json(&serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "neurostrata_task_validate",
+                                    "arguments": { "namespace": namespace },
+                                },
+                            }))
+                            .timeout(std::time::Duration::from_secs(10))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status().is_success() => resp
+                                .text()
+                                .await
+                                .ok()
+                                .and_then(|body| {
+                                    serde_json::from_str::<serde_json::Value>(&body)
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.pointer("/result/content/0/text")
+                                                .and_then(|t| t.as_str())
+                                                .map(String::from)
+                                        })
+                                }),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    match fetched {
+                        Some(report) => println!("{}", report),
+                        None => match Config::from_default_path() {
+                            Err(e) => {
+                                eprintln!("[neurostrata:gate] the report for '{}' could not be fetched: {}", namespace, e);
+                            }
+                            Ok(config)
+                                if daemon_busy(probe, daemon_holds_lock(&config.db_path))
+                                    || probe == DaemonProbe::Silent =>
+                            {
+                                eprintln!(
+                                    "[neurostrata:gate] the report for '{}' could not be fetched: {}",
+                                    namespace, DAEMON_BUSY_MESSAGE
+                                );
+                            }
+                            Ok(config) => match direct_report(&config, &namespace).await {
+                                Ok(report) => {
+                                    println!(
+                                        "{}",
+                                        serde_json::to_string_pretty(&report.validate_json())
+                                            .unwrap_or_else(|_| "{}".to_string())
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[neurostrata:gate] the report for '{}' could not be fetched: {}",
+                                        namespace, e
+                                    );
+                                }
+                            },
+                        },
+                    }
+                    // Always exit 0: the report informs, it never blocks.
+                    return Ok(());
+                }
+
+                // DB-mutating: the same refusal every mutating CLI gets (7).
+                TaskCommands::Import {
+                    namespace,
+                    from_beads,
+                } => {
+                    if daemon_running {
+                        eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running and holds the database lock.");
+                        eprintln!("You cannot run database-modifying CLI commands while the daemon is active.");
+                        eprintln!("Run `neurostrata-mcp shutdown` to stop it safely -- killing the process discards any writes made since the last checkpoint.");
+                        std::process::exit(1);
+                    }
+                    let config = Config::from_default_path()?;
+                    if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                        eprintln!("{}", DAEMON_BUSY_MESSAGE);
+                        std::process::exit(1);
+                    }
+                    let embedder = build_embedder()?;
+                    let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                        config.db_path.to_string_lossy().to_string(),
+                        embedder.dimensions(),
+                    )?);
+                    match crate::task::import_beads(
+                        vector_store,
+                        embedder.clone(),
+                        &namespace,
+                        &from_beads,
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            println!(
+                                "Imported {} new task(s) into '{}'; skipped {} already imported; {} non-issue line(s), {} malformed line(s).",
+                                summary.created,
+                                namespace,
+                                summary.skipped_existing,
+                                summary.non_issue_lines,
+                                summary.malformed_lines
+                            );
+                            if summary.created > 0 {
+                                println!(
+                                    "Check the migration with: neurostrata-mcp task validate '{}'",
+                                    namespace
+                                );
+                            }
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            },
+            Commands::Hooks { action } => match action {
+                HooksCommands::Install { force } => {
+                    let root = git_toplevel()
+                        .or_else(|| std::env::current_dir().ok())
+                        .unwrap();
+                    if !root.join(".git").exists() {
+                        eprintln!(
+                            "ERROR: {:?} is not a git repository; there is nowhere to install the pre-push hook.",
+                            root
+                        );
+                        std::process::exit(1);
+                    }
+                    let hooks_dir = root.join(".git/hooks");
+                    if !hooks_dir.is_dir() {
+                        std::fs::create_dir_all(&hooks_dir)?;
+                    }
+                    let target = hooks_dir.join("pre-push");
+                    // Overwriting our own hook needs no flag: --force is for
+                    // a pre-push somebody else wrote.
+                    let ours = std::fs::read_to_string(&target)
+                        .map(|content| content.contains("NeuroStrata task gate"))
+                        .unwrap_or(false);
+                    if target.exists() && !ours && !force {
+                        eprintln!(
+                            "{} already exists and was not written by NeuroStrata.",
+                            target.display()
+                        );
+                        eprintln!("Re-run with --force to replace it with the NeuroStrata task gate:");
+                        eprintln!("  neurostrata-mcp hooks install --force");
+                        std::process::exit(1);
+                    }
+                    std::fs::write(&target, PRE_PUSH_HOOK)?;
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+                    }
+                    println!("Installed the NeuroStrata task gate at {}.", target.display());
+                    return Ok(());
+                }
+            },
             other => {
                 if daemon_running {
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -894,7 +1412,9 @@ async fn main() -> anyhow::Result<()> {
                     | Commands::Shutdown
                     | Commands::Run { .. }
                     | Commands::Backup { .. }
-                    | Commands::Restore { .. } => unreachable!(),
+                    | Commands::Restore { .. }
+                    | Commands::Task { .. }
+                    | Commands::Hooks { .. } => unreachable!(),
                 }
             }
         }

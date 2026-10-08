@@ -182,7 +182,8 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "query": { "type": "string", "description": "What to search for." },
-                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." }
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
+                                "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -199,6 +200,131 @@ pub async fn process_mcp_request(
                                 "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." }
                             },
                             "required": ["id", "namespace", "content"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_create",
+                        "description": "Create a tracked unit of work. Zero-Action Start: no file edits before a task exists and is claimed by this session.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'MyProj'). New projects must call neurostrata_bootstrap first." },
+                                "title": { "type": "string", "description": "One line: the outcome this task delivers." },
+                                "description": { "type": "string", "description": "Optional longer context for the work." },
+                                "task_type": { "type": "string", "enum": ["task", "bug", "feature", "epic"], "description": "What kind of work this is. Defaults to 'task'." },
+                                "priority": { "type": "integer", "enum": [0, 1, 2, 3, 4], "description": "0 is highest. Defaults to 2." },
+                                "labels": { "type": "array", "items": { "type": "string" }, "description": "Free-form tags carried on the record." },
+                                "parent_id": { "type": "string", "description": "Id of an existing task this one contains (epic/subtask)." },
+                                "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Ids of tasks this one waits on; a ready task has none unfinished." }
+                            },
+                            "required": ["namespace", "title"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_claim",
+                        "description": "Claim a task for this session (open -> in_progress). Refused while another live session holds it; a stale claim (no update for 60 minutes) is released and taken over.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The task id, e.g. 'myproj-x7q2'." },
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "assignee": { "type": "string", "description": "Who is doing the work (the agent or operator name)." },
+                                "session_id": { "type": "string", "description": "Unique id of this session; the exclusivity check compares it against the holder's." }
+                            },
+                            "required": ["id", "namespace", "assignee", "session_id"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_update",
+                        "description": "Update a task: status (open/in_progress/blocked), a note appended to history (the Breath prompt lands here), priority, assignee, labels, or blockers. 'done' is rejected here on purpose: finish with neurostrata_task_complete.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The task id." },
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "status": { "type": "string", "enum": ["open", "in_progress", "blocked"], "description": "New state. 'done' is deliberately absent: it is reachable only through neurostrata_task_complete." },
+                                "note": { "type": "string", "description": "Why, in one line. Required for blocked; appended to the task's history in every case." },
+                                "priority": { "type": "integer", "enum": [0, 1, 2, 3, 4], "description": "0 is highest." },
+                                "assignee": { "type": "string", "description": "Who is working this task." },
+                                "add_labels": { "type": "array", "items": { "type": "string" }, "description": "Labels to add without replacing the existing ones." },
+                                "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Replaces the blocker list outright (an empty array clears it)." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_list",
+                        "description": "List tasks in a namespace. ready: true is the actionable backlog (open and every blocker done); done tasks are hidden unless include_done.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "status": { "type": "string", "enum": ["open", "in_progress", "blocked", "done"], "description": "Only tasks in this state." },
+                                "assignee": { "type": "string", "description": "Only tasks claimed by this assignee." },
+                                "ready": { "type": "boolean", "description": "Only actionable work: open with every blocker done." },
+                                "include_done": { "type": "boolean", "description": "Include finished tasks in the unfiltered listing." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_complete",
+                        "description": "Finish a task (-> done). Lock 2: succeeds only when at least one memory is extracted from it first -- pass memory.content (what did this task teach?), link_memory_id, or write the extraction yourself with neurostrata_add_memory and metadata extracted_from: [id]. Otherwise it fails with -32603 naming both ways to comply.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The task id to complete." },
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "reason": { "type": "string", "description": "What closed it; recorded on the done transition." },
+                                "memory": {
+                                    "type": "object",
+                                    "description": "Write the extraction inline; it lands with the completion, through the same pipeline as neurostrata_add_memory.",
+                                    "properties": {
+                                        "content": { "type": "string", "description": "What did you learn? What rule does this task prove?" },
+                                        "memory_type": { "type": "string", "description": "Defaults to 'fact'." },
+                                        "locations": { "type": "array", "items": { "type": "object" }, "description": "The same location anchors neurostrata_add_memory accepts." }
+                                    },
+                                    "required": ["content"]
+                                },
+                                "link_memory_id": { "type": "string", "description": "Bind an already-written memory to this task via EXTRACTED_FROM. Its vector is reused as-is; linking never re-embeds." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_validate",
+                        "description": "Advisory gate report: {ok, violations, stale, unextracted_done, counts}. The same engine the pre-push hook runs, but it never blocks anything.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_bootstrap",
+                        "description": "New project setup: creates the project's first task server-side and returns files to write (AGENTS.md, .NeuroStrata/docs), the hook install, and claim/ingest instructions as JSON for you to execute in order.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'MyProj'). Not a folder path." },
+                                "project_root": { "type": "string", "description": "Absolute path to the project root." },
+                                "project_description": { "type": "string", "description": "One line on what this project is; recorded on the first task." }
+                            },
+                            "required": ["namespace", "project_root"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_setup",
+                        "description": "Existing project setup: reads the repo (git remote, languages, CI, .beads, hooks, AGENTS.md) and returns suggested rules, migration tasks, conflicts, and instructions. Writes nothing itself -- execute the returned instructions.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "project_root": { "type": "string", "description": "Absolute path to the project root." }
+                            },
+                            "required": ["namespace", "project_root"]
                         }
                     }
                 ]
@@ -308,6 +434,52 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_supersede_memory" => {
                             result_text = handle_supersede_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_task_create" => {
+                            result_text = crate::task::handle_task_create(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_task_claim" => {
+                            result_text = crate::task::handle_task_claim(arguments, store.clone()).await;
+                        }
+                        "neurostrata_task_update" => {
+                            result_text = crate::task::handle_task_update(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_task_list" => {
+                            result_text = crate::task::handle_task_list(arguments, store.clone()).await;
+                        }
+                        "neurostrata_task_complete" => {
+                            match crate::task::handle_task_complete(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                                deduplication_checker.clone(),
+                            )
+                            .await
+                            {
+                                Ok(text) => result_text = text,
+                                Err(msg) => {
+                                    // A refused completion (Lock 2) is a JSON-RPC
+                                    // error, never a success payload carrying an
+                                    // error string.
+                                    error_response = Some(serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": {
+                                            "code": INTERNAL_ERROR,
+                                            "message": msg
+                                        }
+                                    }));
+                                }
+                            }
+                        }
+                        "neurostrata_task_validate" => {
+                            result_text = crate::task::handle_task_validate(arguments, store.clone()).await;
+                        }
+                        "neurostrata_bootstrap" => {
+                            result_text = crate::task::handle_bootstrap(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_task_setup" => {
+                            result_text = crate::task::handle_task_setup(arguments, emb.clone(), store.clone()).await;
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -583,6 +755,122 @@ async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
     }
 }
 
+/// The path and line range a `locations` argument's first entry carries --
+/// what the memory's `location`/`location_lines` columns hold (empty when the
+/// list is empty).
+pub(crate) fn first_location(locations: &[Value]) -> (String, String) {
+    match locations.first() {
+        Some(first) => (
+            first.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+            first.get("lines").and_then(|l| l.as_str()).unwrap_or("").to_string(),
+        ),
+        None => (String::new(), String::new()),
+    }
+}
+
+/// Adds the `refs` anchors and the GOVERNS declarations a `locations` argument
+/// carries. Split out of handle_add_memory so task_complete's inline
+/// extraction lands on the exact same anchoring path (section 3.2).
+pub(crate) fn stamp_locations(metadata: &mut Value, locations: &[Value]) {
+    if locations.is_empty() {
+        return;
+    }
+    let obj = match metadata.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
+    let refs: Vec<serde_json::Value> = locations.iter().map(|loc| {
+        let mut ref_obj = serde_json::Map::new();
+        if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
+            ref_obj.insert("file".to_string(), serde_json::json!(path));
+        }
+        if let Some(lines) = loc.get("lines").and_then(|l| l.as_str()) {
+            ref_obj.insert("lines".to_string(), serde_json::json!(lines));
+        }
+        if let Some(sym) = loc.get("symbol").and_then(|s| s.as_str()) {
+            ref_obj.insert("symbol".to_string(), serde_json::json!(sym));
+        }
+        serde_json::Value::Object(ref_obj)
+    }).collect();
+    obj.insert("refs".to_string(), serde_json::Value::Array(refs));
+
+    // A rule that names files governs them. This is the edge that makes an
+    // architectural memory reachable from the code it constrains, rather
+    // than only from a similar-sounding query.
+    let governed: Vec<serde_json::Value> = locations
+        .iter()
+        .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
+        .filter(|p| !p.is_empty())
+        // Same normalisation the ingester applies to its node ids, so a
+        // path written by hand lands on the file node it names.
+        .map(crate::parser::ingest::normalize_node_path)
+        .fold(Vec::new(), |mut acc: Vec<String>, path| {
+            // Several locations often sit in one file; one edge is enough.
+            if !acc.contains(&path) {
+                acc.push(path);
+            }
+            acc
+        })
+        .into_iter()
+        .map(|p| serde_json::json!(p))
+        .collect();
+    if !governed.is_empty() {
+        obj.insert("governs".to_string(), serde_json::Value::Array(governed));
+    }
+}
+
+/// The lineage stamps every newly written row carries: born now, seen zero
+/// times. Shared with task_complete's inline extraction so a fact written
+/// there is indistinguishable from one written by add_memory.
+pub(crate) fn stamp_new_memory(metadata: &mut Value) {
+    if let Some(meta_obj) = metadata.as_object_mut() {
+        meta_obj.insert("valid_from".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
+        meta_obj.insert("access_count".to_string(), serde_json::json!(0));
+    }
+}
+
+/// The write half of add_memory: init, embed, dedup check, upsert.
+/// task_complete's inline extraction runs this same pipeline (section 3.2,
+/// path 3) and the error strings stay identical across both callers.
+pub(crate) async fn embed_dedup_and_upsert(
+    store: &Arc<dyn VectorStore>,
+    emb: &Arc<dyn Embedder>,
+    namespace: &str,
+    payload: &MemoryPayload,
+    dedup: Option<&Arc<crate::judgment::DeduplicationChecker>>,
+) -> Result<String, String> {
+    store.init(namespace).await.map_err(|_| "Failed to initialize table.".to_string())?;
+    let vector = emb.embed(&payload.content).await.map_err(|_| "Failed to generate embedding.".to_string())?;
+    // Check for duplicates if deduplication is enabled
+    if let Some(checker) = dedup {
+        if let Ok(candidates) = store.search(namespace, vector.clone(), 5).await {
+            // Filter to only high-similarity candidates
+            let similar: Vec<_> = candidates
+                .into_iter()
+                .filter(|c| c.score >= 0.85)
+                .collect();
+
+            if !similar.is_empty() {
+                // Ask the judgment provider if this is a duplicate
+                if let Some(duplicates) = checker.check_duplicates(payload, &similar).await {
+                    if !duplicates.is_empty() {
+                        let dup = &duplicates[0];
+                        return Err(format!(
+                            "Potential duplicate detected: Memory is similar to existing memory {} (confidence: {:.2}). Use neurostrata_edit_memory to update the existing memory instead.",
+                            dup.existing_memory_id, dup.confidence
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    store.upsert(namespace, &new_id, vector, payload.clone()).await
+        .map_err(|_| "Failed to store memory in database.".to_string())?;
+    Ok(new_id)
+}
+
 // A memory is durable only once checkpointed -- WAL replay restores the catalog
 // but not row insertions (bead neurostrata-kug) -- and this surface used to
 // checkpoint after every write to close that window. It cost more than it
@@ -654,51 +942,10 @@ async fn handle_add_memory(
     }
     
     if let Some(locations) = arguments.get("locations").and_then(|l| l.as_array()) {
-        if let Some(first) = locations.first() {
-            location = first.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
-            location_lines = first.get("lines").and_then(|l| l.as_str()).unwrap_or("").to_string();
-        }
-        
-        if let Some(obj) = metadata.as_object_mut() {
-            let refs: Vec<serde_json::Value> = locations.iter().map(|loc| {
-                let mut ref_obj = serde_json::Map::new();
-                if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
-                    ref_obj.insert("file".to_string(), serde_json::json!(path));
-                }
-                if let Some(lines) = loc.get("lines").and_then(|l| l.as_str()) {
-                    ref_obj.insert("lines".to_string(), serde_json::json!(lines));
-                }
-                if let Some(sym) = loc.get("symbol").and_then(|s| s.as_str()) {
-                    ref_obj.insert("symbol".to_string(), serde_json::json!(sym));
-                }
-                serde_json::Value::Object(ref_obj)
-            }).collect();
-            obj.insert("refs".to_string(), serde_json::Value::Array(refs));
-
-            // A rule that names files governs them. This is the edge that makes an
-            // architectural memory reachable from the code it constrains, rather
-            // than only from a similar-sounding query.
-            let governed: Vec<serde_json::Value> = locations
-                .iter()
-                .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
-                .filter(|p| !p.is_empty())
-                // Same normalisation the ingester applies to its node ids, so a
-                // path written by hand lands on the file node it names.
-                .map(crate::parser::ingest::normalize_node_path)
-                .fold(Vec::new(), |mut acc: Vec<String>, path| {
-                    // Several locations often sit in one file; one edge is enough.
-                    if !acc.contains(&path) {
-                        acc.push(path);
-                    }
-                    acc
-                })
-                .into_iter()
-                .map(|p| serde_json::json!(p))
-                .collect();
-            if !governed.is_empty() {
-                obj.insert("governs".to_string(), serde_json::Value::Array(governed));
-            }
-        }
+        let (first_path, first_lines) = first_location(locations);
+        location = first_path;
+        location_lines = first_lines;
+        stamp_locations(&mut metadata, locations);
     }
 
     if let Some(meta_obj) = metadata.as_object_mut() {
@@ -708,9 +955,8 @@ async fn handle_add_memory(
         if let Some(related_to) = arguments.get("related_to") {
             meta_obj.insert("related_to".to_string(), related_to.clone());
         }
-        meta_obj.insert("valid_from".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
-        meta_obj.insert("access_count".to_string(), serde_json::json!(0));
     }
+    stamp_new_memory(&mut metadata);
 
     if let Ok(existing_namespaces) = store.list_namespaces().await {
         if !existing_namespaces.contains(&namespace.to_string()) && !create_new_namespace {
@@ -730,46 +976,20 @@ async fn handle_add_memory(
             metadata,
         };
 
-        if let Ok(_) = store.init(namespace).await {
-            if let Ok(vec) = emb.embed(&content).await {
-                // Check for duplicates if deduplication is enabled
-                if let Some(checker) = &deduplication_checker {
-                    if let Ok(candidates) = store.search(namespace, vec.clone(), 5).await {
-                        // Filter to only high-similarity candidates
-                        let similar: Vec<_> = candidates
-                            .into_iter()
-                            .filter(|c| c.score >= 0.85)
-                            .collect();
-                        
-                        if !similar.is_empty() {
-                            // Ask the judgment provider if this is a duplicate
-                            if let Some(duplicates) = checker.check_duplicates(&payload, &similar).await {
-                                if !duplicates.is_empty() {
-                                    let dup = &duplicates[0];
-                                    return format!(
-                                        "Potential duplicate detected: Memory is similar to existing memory {} (confidence: {:.2}). Use neurostrata_edit_memory to update the existing memory instead.",
-                                        dup.existing_memory_id, dup.confidence
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                let new_id = uuid::Uuid::new_v4().to_string();
-                if let Ok(_) = store.upsert(namespace, &new_id, vec, payload).await {
-                    return format!("Successfully added memory for namespace: {}", namespace);
-                } else {
-                    return "Failed to store memory in database.".to_string();
-                }
-            } else {
-                return "Failed to generate embedding.".to_string();
-            }
-        } else {
-            return "Failed to initialize table.".to_string();
+        match embed_dedup_and_upsert(
+            &store,
+            &emb,
+            namespace,
+            &payload,
+            deduplication_checker.as_ref(),
+        )
+        .await
+        {
+            Ok(_) => format!("Successfully added memory for namespace: {}", namespace),
+            Err(e) => e,
         }
     } else {
-        return "Failed to verify existing namespaces.".to_string();
+        "Failed to verify existing namespaces.".to_string()
     }
 }
 
@@ -832,6 +1052,10 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
     // Counted from the list the snapshot already had to fetch, so this
     // costs nothing beyond the scan.
     let migration = unmigrated_ids_notice(namespace, &all_memories);
+    // Computed before the top-5 cut below: tasks are never the highest-access
+    // rows, and section 6.1 requires the Zero-Action Start header on every
+    // snapshot regardless of what the body holds.
+    let task_head = crate::task::snapshot_prefix(&all_memories);
 
     let now = chrono::Utc::now().timestamp();
     all_memories.retain(|r| {
@@ -847,12 +1071,13 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
     });
     all_memories.truncate(5);
 
-    let snapshot = if all_memories.is_empty() {
+    let body = if all_memories.is_empty() {
         format!("No active memories found for namespace: {}", namespace)
     } else {
         serde_json::to_string_pretty(&all_memories)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
+    let snapshot = format!("{}\n{}", task_head, body);
 
     Ok(match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
@@ -1109,9 +1334,20 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
+    // Task rows are backlog chatter, not recall material: excluded unless the
+    // caller asks for them (section 1.1). The over-fetch keeps a full page
+    // after the filter, then trims back to the promised five.
+    let include_tasks = arguments.get("include_tasks").and_then(|v| v.as_bool()).unwrap_or(false);
+    let fetch = if include_tasks { 5 } else { 15 };
+
     if let Ok(_) = store.init(namespace).await {
         if let Ok(vec) = emb.embed(&query).await {
-            if let Ok(results) = store.search(namespace, vec, 5).await {
+            if let Ok(fetched) = store.search(namespace, vec, fetch).await {
+                let mut results = fetched;
+                if !include_tasks {
+                    results.retain(|r| r.payload.memory_type != "task");
+                }
+                results.truncate(5);
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
                 } else {
@@ -2295,27 +2531,125 @@ mod tests {
         assert!(suffix.contains("\"a\""), "should use the shorter path that fits");
     }
 
-    #[test]
-    fn tools_list_keeps_exact_seven_names_and_order() {
-        // Verify the tools list returns exactly 7 tools in the expected order
-        let _expected = [
-            "neurostrata_add_memory",
-            "neurostrata_get_memory",
-            "neurostrata_get_snapshot",
-            "neurostrata_ingest_directory",
-            "neurostrata_list_namespaces",
-            "neurostrata_search_memory",
-            "neurostrata_supersede_memory",
-        ];
-        // We can't easily call process_mcp_request without a real store,
-        // but we can verify the JSON structure is correct by parsing the
-        // tools/list section directly from the source.
-        // Instead, test that the vocabulary summaries are appended correctly.
-        let v = crate::traits::memory_vocabulary();
-        let summaries = v.get("tool_summaries").unwrap();
+    /// Every tool the surface exposes, in the order tools/list returns them.
+    /// Clients pin this list; a silent rename orphans their wiring.
+    #[tokio::test]
+    async fn tools_list_carries_all_fifteen_tools_in_a_stable_order() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().expect("every tool is named"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "neurostrata_add_memory",
+                "neurostrata_get_memory",
+                "neurostrata_get_snapshot",
+                "neurostrata_ingest_directory",
+                "neurostrata_list_namespaces",
+                "neurostrata_search_memory",
+                "neurostrata_supersede_memory",
+                "neurostrata_task_create",
+                "neurostrata_task_claim",
+                "neurostrata_task_update",
+                "neurostrata_task_list",
+                "neurostrata_task_complete",
+                "neurostrata_task_validate",
+                "neurostrata_bootstrap",
+                "neurostrata_task_setup",
+            ]
+        );
+        for tool in tools {
+            assert!(tool["inputSchema"].is_object(), "{} needs an input schema", tool["name"]);
+        }
+        // The vocabulary summaries are still appended to their tools.
+        let summaries = crate::traits::memory_vocabulary().get("tool_summaries").unwrap().clone();
         assert!(summaries.get("add").is_some());
         assert!(summaries.get("search").is_some());
         assert!(summaries.get("ingest").is_some());
         assert!(summaries.get("memory_type").is_some());
+        let add_desc = tools[0]["description"].as_str().unwrap();
+        assert!(
+            add_desc.len() > "Store an architectural rule, project pattern, or task insight.".len(),
+            "summary appended: {}",
+            add_desc
+        );
+    }
+
+    /// Lock 2 over the wire: a completion with nothing extracted comes back
+    /// as a JSON-RPC error carrying the exact section 3.2 body -- never as a
+    /// success payload holding an error string.
+    #[tokio::test]
+    async fn a_blocked_task_complete_is_a_jsonrpc_error_not_a_success_payload() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let created = crate::task::handle_task_create(
+            serde_json::json!({ "namespace": "probe", "title": "the work" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let created: Value = serde_json::from_str(&created).expect("create replies with json");
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(41)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_task_complete",
+                "arguments": { "namespace": "probe", "id": id }
+            })),
+        };
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store.clone(), ingests, None).await;
+
+        assert!(
+            response.get("result").is_none(),
+            "a blocked completion is not a success: {}",
+            response
+        );
+        assert_eq!(response["error"]["code"], INTERNAL_ERROR, "{}", response);
+        let message = response["error"]["message"].as_str().expect("a message");
+        let expected = format!(
+            "BLOCKED (Lock 2): task {id} cannot complete without an extracted memory. Either call neurostrata_add_memory with metadata extracted_from: [\"{id}\"], or retry neurostrata_task_complete with `memory.content` (what did you learn? what rule does this task prove?) or `link_memory_id`."
+        );
+        assert_eq!(message, expected);
+
+        let (_, payload) = store.get("probe", &id).await.unwrap().expect("the task");
+        assert_eq!(
+            payload.metadata["task"]["status"],
+            serde_json::json!("open"),
+            "the refused completion changes nothing"
+        );
+    }
+
+    /// Section 6.1: the mandatory pre-flight carries the Zero-Action Start
+    /// line first, before anything else in the snapshot body.
+    #[tokio::test]
+    async fn the_snapshot_opens_with_the_zero_action_start_line() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        assert!(
+            text.starts_with("Zero-Action Start: claim or create a task before editing."),
+            "{}",
+            text
+        );
+        assert!(text.contains("always use podman"), "the body still follows: {}", text);
     }
 }

@@ -116,6 +116,7 @@ pub async fn start_daemon(
         .route("/validate", post(handle_validate))
         .route("/mcp", post(handle_mcp))
         .route("/backup", post(handle_backup))
+        .route("/tasks/gate", post(handle_tasks_gate))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state);
 
@@ -523,6 +524,43 @@ async fn handle_validate(
         verdict,
         rule_ids_triggered: rule_ids,
     }))
+}
+
+#[derive(Deserialize)]
+struct TaskGateReq {
+    namespace: String,
+    /// Strict only marks the run in the log; the verdict never changes with
+    /// it, because one gate serves MCP, CLI, and the hook (section 4).
+    #[serde(default)]
+    strict: bool,
+}
+
+/// POST /tasks/gate -- what the pre-push hook sees (section 4).
+///
+/// Metadata-only by construction: the same `gate::run` the MCP validate tool
+/// and the CLI use, one `list` scan, no embedder -- so it answers inside a
+/// `git push`. Returns `{ok, violations}`; if the tasks cannot be listed at
+/// all that is a 500, because a gate that cannot see the work must never
+/// report it clean.
+async fn handle_tasks_gate(
+    State(state): State<AppState>,
+    Json(req): Json<TaskGateReq>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    let report = crate::task::gate::run(&state.vector_store, &namespace)
+        .await
+        .map_err(|e| {
+            eprintln!("[neurostrata:gate] gate for '{}' failed: {}", namespace, e);
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+    if req.strict && !report.ok() {
+        eprintln!(
+            "[neurostrata:gate] strict: {} violation(s) block the push in '{}'",
+            report.violations.len(),
+            namespace
+        );
+    }
+    Ok(Json(report.gate_json()))
 }
 
 #[cfg(test)]

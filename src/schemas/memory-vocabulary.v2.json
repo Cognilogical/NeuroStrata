@@ -1,0 +1,86 @@
+{
+  "vocabulary_version": 2,
+  "relations": {
+    "GOVERNS": {
+      "direction": "directed",
+      "source_role": "rule",
+      "target_role": "artifact",
+      "definition": "The source constrains the target.",
+      "metadata_key": "governs",
+      "declaration_direction": "self_to_target"
+    },
+    "CONTAINS": {
+      "direction": "directed",
+      "source_role": "container",
+      "target_role": "contained",
+      "definition": "The source structurally contains the target.",
+      "metadata_key": "contained_by",
+      "declaration_direction": "target_to_self"
+    },
+    "RELATES_TO": {
+      "direction": "undirected",
+      "source_role": "memory",
+      "target_role": "memory",
+      "definition": "The endpoints have a nondirectional semantic link.",
+      "metadata_key": "related_to",
+      "declaration_direction": "self_to_target",
+      "storage_note": "One directed edge stores an undirected meaning."
+    },
+    "EXTRACTED_FROM": {
+      "direction": "directed",
+      "source_role": "memory",
+      "target_role": "task",
+      "definition": "The source is a memory extracted from completing the target task.",
+      "metadata_key": "extracted_from",
+      "declaration_direction": "self_to_target"
+    }
+  },
+  "memory_types": {
+    "rule": {
+      "definition": "A normative architectural or behavioral constraint.",
+      "structural": false
+    },
+    "fact": {
+      "definition": "A descriptive assertion, not inherently a constraint.",
+      "structural": false
+    },
+    "task": {
+      "definition": "A tracked unit of work with a status. Reaches 'done' only through neurostrata_task_complete, which requires an extracted memory (Lock 2).",
+      "structural": false
+    },
+    "directory": {
+      "definition": "An ingested directory and structural container.",
+      "structural": true
+    },
+    "file": {
+      "definition": "An ingested non-Markdown file and code container.",
+      "structural": true
+    },
+    "markdown": {
+      "definition": "An ingested Markdown document node.",
+      "structural": true
+    },
+    "symbol": {
+      "definition": "An extracted code declaration or definition.",
+      "structural": false
+    }
+  },
+  "type_aliases": {
+    "code_ast": "symbol"
+  },
+  "extensions": {
+    "custom_memory_types": "Any nonempty string is accepted unchanged.",
+    "recommended_custom_type_form": "owner.name",
+    "existing_custom_types": ["preference", "bootstrap", "persona", "context"],
+    "unknown_metadata_keys": "Accepted unchanged.",
+    "custom_relations": "Not materialized; only the relations declared above are materialized.",
+    "role_enforcement": "Descriptive only; no endpoint type rejection.",
+    "version_policy": "Increment vocabulary_version for semantic changes."
+  },
+  "tool_summaries": {
+    "add": "Vocabulary v2: rule/fact/task; metadata governs, contained_by, related_to and extracted_from accept target-ID arrays; custom types remain valid.",
+    "search": "Expanded matches add bounded, directed evidence paths; RELATES_TO is undirected; memory_type 'task' is excluded unless include_tasks is true.",
+    "ingest": "Vocabulary v2: directory/file/markdown containers and symbols; code_ast remains the stored symbol type.",
+    "memory_type": "Use rule or fact; task for tracked work; structural types are directory/file/markdown/symbol; custom types remain valid; default context."
+  }
+}
