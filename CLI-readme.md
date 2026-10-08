@@ -153,10 +153,12 @@ neurostrata-mcp task validate <namespace>
 ```
 
 *Report categories:*
-*   `violations` — what the gate would block a push on: any `in_progress` task, a `done` task without a consolidated extraction, or a P0 left `open` beyond 24h.
+*   `violations` — what the gate would block a push on: any `in_progress` task, a `done` task without a consolidated extraction, a P0 left `open` beyond 24h, or a rule claiming `ENFORCED` without a real `guard` wire (rule honesty).
 *   `stale` — advisory only: `in_progress` with no update in over 60 minutes. Surfaced, never blocking.
 *   `unextracted_done` — `done` tasks with zero `EXTRACTED_FROM` edges. Impossible through `task_complete` by construction; checked anyway because imports and hand edits exist (beads-imported history is `grandfathered` and exempt).
 *   `counts` — totals per status.
+
+*The gate contract* (all gates, ours or prescribed): exit `0` pass / `1` violation found / `2` infra error. Every gate should accept `--self-test`: exit 0 iff a planted violation makes it exit 1 and the tree is byte-identical afterward — a gate that passes its own test is not a gate.
 
 *Example:*
 ```bash

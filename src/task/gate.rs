@@ -226,7 +226,35 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
         }
     }
 
+    // A6 rule honesty: "a rule that no machine checks is a note, not a rule."
+    // A rule claiming ENFORCED must name a real wire from the closed registry.
+    let known = crate::task::wiring::known_wire_ids();
+    for row in memories {
+        if row.payload.memory_type != "rule" {
+            continue;
+        }
+        let rule = &row.payload.metadata;
+        if rule.get("enforcement").and_then(|e| e.as_str()) != Some("ENFORCED") {
+            continue;
+        }
+        let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
+        if guard.is_empty() || !known.contains(&guard) {
+            report.violations.push(Violation {
+                id: row.id.clone(),
+                kind: "rule_overclaims_enforcement",
+                detail: format!(
+                    "rule '{}' claims ENFORCED but names no real guard; set enforcement honestly (PARTIAL/NOT_ENFORCED) or name an existing wire id in metadata.guard.",
+                    content_short(&row.payload.content)
+                ),
+            });
+        }
+    }
+
     report
+}
+
+fn content_short(content: &str) -> String {
+    content.chars().take(80).collect()
 }
 
 /// Runs the engine against a store: one `list`, no embedder, milliseconds.
@@ -262,6 +290,52 @@ mod tests {
 
     fn task(id: &str, task_meta: Value) -> SearchResult {
         row(id, "task", &format!("work for {}", id), json!({ "task": task_meta }))
+    }
+
+    /// A6 rule honesty: a rule that claims ENFORCED must name a real wire.
+    #[test]
+    fn a_rule_overclaiming_enforcement_fails_the_gate() {
+        let rows = vec![
+            row(
+                "rule-1",
+                "rule",
+                "Always use podman",
+                json!({ "enforcement": "ENFORCED", "guard": null, "source": "owner 2026-10-08" }),
+            ),
+            row(
+                "rule-2",
+                "rule",
+                "Always use podman for real",
+                json!({ "enforcement": "ENFORCED", "guard": "task-close-lock", "source": "owner 2026-10-08" }),
+            ),
+            row(
+                "rule-3",
+                "rule",
+                "A note pretending to be a rule",
+                json!({ "enforcement": "ENFORCED", "guard": "no-such-wire", "source": "owner 2026-10-08" }),
+            ),
+            row(
+                "rule-4",
+                "rule",
+                "Honestly unenforced",
+                json!({ "enforcement": "NOT_ENFORCED", "guard": null, "source": "owner 2026-10-08" }),
+            ),
+        ];
+        let report = evaluate(&rows, 0);
+        let kinds: Vec<&str> = report
+            .violations
+            .iter()
+            .map(|v| v.kind)
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "rule_overclaims_enforcement").count(),
+            2,
+            "rule-1 (null guard) and rule-3 (dangling guard); rule-2 and rule-4 are honest"
+        );
+        assert!(report.violations.iter().any(|v| v.id == "rule-1"));
+        assert!(report.violations.iter().any(|v| v.id == "rule-3"));
+        assert!(!report.violations.iter().any(|v| v.id == "rule-2"));
+        assert!(!report.violations.iter().any(|v| v.id == "rule-4"));
     }
 
     const NOW: i64 = 1_760_000_000;

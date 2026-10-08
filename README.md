@@ -228,6 +228,14 @@ The Central Executive instructs; it does not silently mutate your repo:
 
 > **`suggested_rules` are a draft, never ground truth.** They are weighted by counted source files (a manifest alone earns nothing), flagged `heuristic: true`, and each carries `similar_existing` memories plus any `conflicts` — review them against the project's standing rules before accepting, and supersede the stale rule rather than storing a contradiction.
 
+### The wiring panel — gates, git-first but never git-only
+
+`neurostrata_bootstrap` / `neurostrata_task_setup` return a **`wiring`** block: every gate NeuroStrata knows about, marked **automatic** (a machine fails on its own) or **reminder** (the agent is put in front of the action), with `runs_in` naming whose responsibility it is — `core` (NeuroStrata itself), `git-pre-push` (the default instance), `project-pipeline` (the project's own chokepoint), or `agent-reminder`. The **`verified`** block reports what setup checked read-only (hook installed? export fresh? gate point resolved?) and anything verified is subtracted from `instructions`.
+
+Git is named first and called the default: run `hooks install`, then wire the pipeline gates into CI. **The system is not software-specific** — a CMS, media-production, or research project gets the same instruction in the same shape with a discovery clause: identify the ONE step every unit of work must pass to leave the project (publish action, render submission, review approval), wire `neurostrata-mcp task gate <ns> --strict` (exit 1 = blocked) into it, and **record the chosen gate point as a rule memory** so no future session re-derives it. `coverage.uncovered` lists every gate with no home yet; empty is the success state.
+
+Rules carry their own honesty fields (`enforcement: ENFORCED|PARTIAL|NOT_ENFORCED`, `source`, `guard`): a rule claiming `ENFORCED` must name a real wire, or `task_validate` fails it. *A rule that no machine checks is a note, not a rule.*
+
 ---
 
 ## 🌉 The Dendritic Bridge: External Embedding Integration

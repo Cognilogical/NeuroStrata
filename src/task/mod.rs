@@ -8,6 +8,7 @@
 
 pub mod gate;
 pub mod machine;
+pub mod wiring;
 
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
@@ -1186,6 +1187,9 @@ pub async fn handle_bootstrap(
         return e;
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
+    let root = std::path::Path::new(project_root);
+    let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
+    let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
     // The instructor leaves concrete work: first_task is created here, so the
     // very first action an agent can take is already inside the system.
@@ -1212,15 +1216,46 @@ pub async fn handle_bootstrap(
         Err(e) => return e,
     };
 
-    let instructions = json!([
-        { "step": 1, "action": "write_file", "path": "AGENTS.md" },
-        { "step": 2, "action": "run", "cmd": "neurostrata-mcp hooks install" },
-        { "step": 3, "action": "call_tool", "tool": "neurostrata_task_claim",
-          "params": { "id": task_id.as_str(), "namespace": namespace.as_str(),
-                      "assignee": "this-session", "session_id": "this-session" } },
-        { "step": 4, "action": "call_tool", "tool": "neurostrata_ingest_directory",
-          "params": { "dir_path": project_root, "namespace": namespace.as_str() } },
-    ]);
+    let mut instructions: Vec<Value> = Vec::new();
+    let mut step = 1;
+    instructions.push(json!({ "step": step, "kind": "action", "action": "write_file", "path": "AGENTS.md" }));
+    step += 1;
+    if !hook_installed {
+        instructions.push(json!({ "step": step, "kind": "action", "action": "run", "cmd": "neurostrata-mcp hooks install" }));
+        step += 1;
+    }
+    instructions.push(json!({ "step": step, "kind": "action", "action": "call_tool", "tool": "neurostrata_task_claim",
+      "params": { "id": task_id.as_str(), "namespace": namespace.as_str(),
+                  "assignee": "this-session", "session_id": "this-session" } }));
+    step += 1;
+    instructions.push(json!({ "step": step, "kind": "action", "action": "call_tool", "tool": "neurostrata_ingest_directory",
+      "params": { "dir_path": project_root, "namespace": namespace.as_str() } }));
+    step += 1;
+
+    // The wiring panel's step (Q2): gate the checks at the project's
+    // chokepoint -- git's pre-push by default, the project's ship step
+    // otherwise. One template, git named first.
+    let mut wire_step = wire_instruction;
+    wire_step["step"] = json!(step);
+    instructions.push(wire_step);
+
+    // Non-git projects have no default gate point: exactly one task, so the
+    // decision lands in a Goal and its resolution lands in memory.
+    let mut tasks_created: Vec<Value> = Vec::new();
+    if !verified["gate_point_resolved"].as_bool().unwrap_or(false) {
+        let gp_title = "Identify and wire the project gate point, record it as a rule memory";
+        let mut gp_meta = Map::new();
+        gp_meta.insert("priority".to_string(), json!(1));
+        gp_meta.insert("task_type".to_string(), json!("task"));
+        gp_meta.insert(
+            "description".to_string(),
+            json!("No git detected. Find the ONE step every unit of work must pass to leave this project (CMS publish, render submission, publish script, review approval), wire `neurostrata-mcp task gate <ns> --strict` into it, and record the choice with neurostrata_add_memory (memory_type: rule)."),
+        );
+        match store_new_task(&store, &emb, &namespace, gp_title, "unknown", Some("neurostrata-bootstrap"), gp_meta, Map::new()).await {
+            Ok((id, _)) => tasks_created.push(json!({ "id": id, "title": gp_title })),
+            Err(e) => return e,
+        }
+    }
 
     encode(&json!({
         "namespace": namespace,
@@ -1229,10 +1264,148 @@ pub async fn handle_bootstrap(
             { "path": ".NeuroStrata/docs/.gitkeep", "overwrite": false, "content": "" }
         ],
         "first_task": { "id": task_id, "title": title },
+        "tasks_created": tasks_created,
         "hooks": { "install_command": "neurostrata-mcp hooks install" },
         "instructions": instructions,
+        "wiring": wiring_block,
+        "verified": verified,
         "rule": "Zero-Action Start is now active: no file edits without a claimed task.",
     }))
+}
+
+// ── the wiring panel (docs/design-wiring-panel.md) ─────────────────────────
+
+/// Read-only verification plus the wiring block, shared by bootstrap and
+/// task_setup. **Git-first, never git-only**: git is named the default
+/// instance, and a non-software project (CMS, media production, research) is
+/// told in the same breath to identify its own chokepoint and record it as a
+/// rule memory. `gate_point` is free text on purpose — we never enumerate
+/// CMSes or render farms.
+fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value) {
+    let git = root.join(".git").exists();
+    let hook_installed = std::fs::read_to_string(root.join(".git").join("hooks").join("pre-push"))
+        .map(|s| s.contains("NeuroStrata task gate"))
+        .unwrap_or(false);
+    let export_fresh: Option<bool> = {
+        let export = root.join(".NeuroStrata").join("graph").join("graph.json");
+        match (
+            git,
+            std::fs::metadata(&export).and_then(|m| m.modified()).ok(),
+        ) {
+            (false, _) => None,
+            (true, None) => Some(false),
+            (true, Some(mtime)) => {
+                let age = std::time::SystemTime::now()
+                    .duration_since(mtime)
+                    .unwrap_or_default();
+                Some(age <= std::time::Duration::from_secs(7 * 24 * 60 * 60))
+            }
+        }
+    };
+
+    // Q1 gate-point resolution: git resolves the default instance; no git
+    // leaves it null and the project's agent must name the chokepoint.
+    let gate_point: Option<String> = if git {
+        Some(if hook_installed {
+            "git-pre-push (NeuroStrata task gate installed)".to_string()
+        } else {
+            "git-pre-push (via neurostrata-mcp hooks install)".to_string()
+        })
+    } else {
+        None
+    };
+
+    let mut automatic = Vec::new();
+    let mut uncovered: Vec<&str> = Vec::new();
+    let mut pipeline_ids: Vec<&str> = Vec::new();
+    for w in wiring::AUTOMATIC_WIRES {
+        if w.runs_in == wiring::RunsIn::GitPrePush && !git {
+            continue; // the default instance only exists where git exists
+        }
+        let resolved = match w.runs_in {
+            wiring::RunsIn::Core => {
+                Some("neurostrata core (tool, error path, lock)".to_string())
+            }
+            wiring::RunsIn::GitPrePush => gate_point.clone(),
+            wiring::RunsIn::ProjectPipeline => {
+                pipeline_ids.push(w.id);
+                if git {
+                    Some("project pipeline (wire each gate into the project's CI job)".to_string())
+                } else {
+                    None
+                }
+            }
+            wiring::RunsIn::AgentReminder => None,
+        };
+        if w.runs_in == wiring::RunsIn::ProjectPipeline && resolved.is_none() {
+            uncovered.push(w.id);
+        }
+        automatic.push(json!({
+            "id": w.id,
+            "runs_in": w.runs_in.as_str(),
+            "blocks": w.blocks,
+            "gate_point": resolved,
+            "reason": w.reason,
+        }));
+    }
+
+    let reminders: Vec<Value> = wiring::REMINDER_WIRES
+        .iter()
+        .map(|r| json!({ "id": r.id, "fires_on": r.fires_on, "text": r.text }))
+        .collect();
+
+    let coverage = json!({
+        "core": ["task-close-lock", "claim-exclusivity", "stale-claim-expiry",
+                 "zero-action-start", "single-daemon-lock", "rule-honesty"],
+        "git-pre-push": if git { vec!["task-gate"] } else { Vec::<&str>::new() },
+        "project-pipeline": pipeline_ids.clone(),
+        "uncovered": uncovered,
+    });
+    let wiring_block = json!({
+        "automatic": automatic,
+        "reminders": reminders,
+        "coverage": coverage,
+    });
+
+    // Q5: verification is read-only and re-runnable; instructions subtract
+    // anything verified true (the guinea pig's existing_hooks:[] beside an
+    // install instruction becomes structurally impossible).
+    let verified = json!({
+        "hook_installed": hook_installed,
+        "status_healthy": true,
+        "export_fresh": export_fresh,
+        "gate_point_resolved": gate_point.is_some(),
+    });
+
+    // Q2: one instruction template, git first and dominant, non-git in the
+    // same sentence shape with a discovery clause that ends by writing the
+    // chosen gate point into memory.
+    let mut gate_ids = pipeline_ids.clone();
+    if git {
+        gate_ids.insert(0, "task-gate");
+    }
+    let resolve_clause = if git {
+        "Git detected -- the default and recommended instance. Run `neurostrata-mcp hooks install` to put the task gate on pre-push, then wire the project-pipeline gates above into your CI so every push and every build runs them. Verify with the `verified` block in this payload."
+    } else {
+        "No git detected. Identify the ONE step every unit of work must pass to leave this project -- a CMS publish action, a render-farm submission, a publish script, a review-approval step. Wire `neurostrata-mcp task gate NAMESPACE --strict` (exit 1 = blocked) and the project-pipeline gates above into that step so nothing ships past an unresolved gate. Record the chosen step: neurostrata_add_memory with memory_type: rule, content naming the gate point -- the next session must not have to re-derive it."
+    };
+    let point_display = gate_point
+        .clone()
+        .unwrap_or_else(|| "this project's chokepoint (to be named)".to_string());
+    let wire_instruction = json!({
+        "kind": "action",
+        "action": "wire_gates",
+        "gate_point": gate_point,
+        "gate_ids": gate_ids,
+        "text": format!(
+            "Gate these checks at {}: {}. {}",
+            point_display,
+            gate_ids.join(", "),
+            resolve_clause.replace("NAMESPACE", namespace)
+        ),
+    });
+
+    (wiring_block, verified, wire_instruction)
 }
 
 // ── tool: neurostrata_task_setup ───────────────────────────────────────────
@@ -1552,13 +1725,16 @@ pub async fn handle_task_setup(
     }
 
     let scan = detect_project(root);
+    let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
+    let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
     let mut conflicts: Vec<Value> = Vec::new();
     let mut tasks_created: Vec<Value> = Vec::new();
     let mut instructions: Vec<Value> = Vec::new();
     let mut step = 1;
 
     // One of the two hooks install runs, always first (section 8): the gate
-    // is what makes the system live on the first push.
+    // is what makes the system live on the first push. Subtracted when the
+    // hook is verified present (A10: setup verifies, it does not re-instruct).
     let hook_cmd = if scan.legacy_hook {
         conflicts.push(json!({
             "kind": "legacy_hook",
@@ -1569,8 +1745,10 @@ pub async fn handle_task_setup(
     } else {
         "neurostrata-mcp hooks install"
     };
-    instructions.push(json!({ "step": step, "action": "run", "cmd": hook_cmd }));
-    step += 1;
+    if scan.legacy_hook || !hook_installed {
+        instructions.push(json!({ "step": step, "kind": "action", "action": "run", "cmd": hook_cmd }));
+        step += 1;
+    }
 
     if scan.legacy_hook {
         let title = "Replace the legacy pre-push hook with the NeuroStrata task gate";
@@ -1622,7 +1800,7 @@ pub async fn handle_task_setup(
                     "title": title,
                     "metadata_hint": format!("run: {}", import_cmd),
                 }));
-                instructions.push(json!({ "step": step, "action": "run", "cmd": import_cmd }));
+                instructions.push(json!({ "step": step, "kind": "action", "action": "run", "cmd": import_cmd }));
                 step += 1;
             }
             Err(e) => return e,
@@ -1673,6 +1851,7 @@ pub async fn handle_task_setup(
     for rule in &rules {
         instructions.push(json!({
             "step": step,
+            "kind": "action",
             "action": "call_tool",
             "tool": "neurostrata_add_memory",
             "review_first": true,
@@ -1683,6 +1862,41 @@ pub async fn handle_task_setup(
             },
         }));
         step += 1;
+    }
+
+    // The wiring panel's own step (Q2): gate the project-pipeline checks at
+    // the project's chokepoint -- git's pre-push by default, whatever the
+    // project's ship step is otherwise. Always one instruction, one shape.
+    let mut wire_step = wire_instruction;
+    wire_step["step"] = json!(step);
+    instructions.push(wire_step);
+    step += 1;
+
+    // A non-git project has no default gate point: exactly one task, so the
+    // decision lands in a Goal and its resolution lands in memory.
+    if !verified["gate_point_resolved"].as_bool().unwrap_or(false) {
+        let title = "Identify and wire the project gate point, record it as a rule memory";
+        match new_setup_task(
+            &store,
+            &emb,
+            &namespace,
+            title,
+            Some(
+                "No git detected. Find the ONE step every unit of work must pass to leave this project (CMS publish, render submission, publish script, review approval), wire `neurostrata-mcp task gate <ns> --strict` into it, and record the choice with neurostrata_add_memory (memory_type: rule).",
+            ),
+            1,
+        )
+        .await
+        {
+            Ok((id, _)) => {
+                tasks_created.push(json!({
+                    "id": id,
+                    "title": title,
+                    "metadata_hint": "run: the wire_gates instruction in this payload",
+                }));
+            }
+            Err(e) => return e,
+        }
     }
 
     // Completing the setup tasks forces the first extractions (section 8).
@@ -1715,6 +1929,8 @@ pub async fn handle_task_setup(
         "conflicts": conflicts,
         "tasks_created": tasks_created,
         "instructions": instructions,
+        "wiring": wiring_block,
+        "verified": verified,
     }))
 }
 
@@ -2051,6 +2267,40 @@ mod tests {
     }
 
     #[test]
+    /// The git branch of the wiring panel (Q2/Q5): the default instance is
+    /// named first and dominant, and a verified hook subtracts its own
+    /// instruction instead of re-instructing.
+    #[test]
+    fn git_projects_get_the_default_instance_and_verified_subtraction() {
+        let root = std::env::temp_dir().join(format!("ns-setup-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+        std::fs::write(
+            root.join(".git").join("hooks").join("pre-push"),
+            "#!/bin/bash\n# NeuroStrata task gate marker\n",
+        )
+        .unwrap();
+
+        let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(true));
+        assert_eq!(verified["gate_point_resolved"], json!(true));
+        let text = wire_instruction["text"].as_str().unwrap();
+        assert!(text.contains("Git detected"), "{}", text);
+        assert!(text.contains("default and recommended"), "{}", text);
+        assert!(text.contains("task-gate"), "{}", text);
+        assert!(!text.contains("No git detected"), "{}", text);
+        let task_gate = wiring_block["automatic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["id"] == "task-gate")
+            .expect("the git default instance is emitted with git");
+        assert_eq!(task_gate["runs_in"], json!("git-pre-push"));
+        assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Guinea-pig BUG-4: suggestions follow the counted tree, not manifest
     /// presence. One tooling JS file must not outvote eight Go files.
     #[test]
@@ -2794,13 +3044,50 @@ mod tests {
         assert_eq!(files[1]["path"], json!(".NeuroStrata/docs/.gitkeep"));
 
         let instructions = parsed["instructions"].as_array().unwrap();
-        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions.len(), 5);
         assert_eq!(instructions[0]["action"], json!("write_file"));
         assert_eq!(instructions[1]["cmd"], json!("neurostrata-mcp hooks install"));
         assert_eq!(instructions[2]["tool"], json!("neurostrata_task_claim"));
         assert_eq!(instructions[2]["params"]["id"], json!(first_id));
         assert_eq!(instructions[3]["tool"], json!("neurostrata_ingest_directory"));
         assert_eq!(parsed["hooks"]["install_command"], json!("neurostrata-mcp hooks install"));
+
+        // The wiring panel (docs/design-wiring-panel.md): one instruction
+        // template, git-first but never git-only. /tmp has no .git, so the
+        // gate point is unresolved, the non-git clause carries the discovery
+        // instruction, and exactly one task is created to resolve it.
+        assert!(instructions.iter().all(|i| i["kind"] == json!("action")));
+        let wire = &instructions[4];
+        assert_eq!(wire["action"], json!("wire_gates"));
+        assert_eq!(wire["gate_point"], serde_json::Value::Null);
+        let text = wire["text"].as_str().unwrap();
+        assert!(text.contains("No git detected"), "{}", text);
+        assert!(text.contains("CMS publish"), "{}", text);
+        assert!(text.contains("memory_type: rule"), "{}", text);
+        assert!(!text.contains("hooks install"), "no git, no hook instruction: {}", text);
+
+        let verified = &parsed["verified"];
+        assert_eq!(verified["hook_installed"], json!(false));
+        assert_eq!(verified["gate_point_resolved"], json!(false));
+        let wiring = &parsed["wiring"];
+        assert!(wiring["coverage"]["uncovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == "memory-to-repo-drift"));
+        assert!(wiring["automatic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["id"] != "task-gate"),
+            "the git default instance is not emitted without git");
+        let gate_tasks: Vec<_> = parsed["tasks_created"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["title"].as_str().unwrap().contains("gate point"))
+            .collect();
+        assert_eq!(gate_tasks.len(), 1, "exactly one gate-point task for a non-git project");
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 /// The shipped vocabulary schema, embedded at compile time. v2 adds the
 /// `task` memory type and the EXTRACTED_FROM relation that carries the
 /// extraction edge behind the completion gate (Lock 2).
-pub const MEMORY_VOCABULARY_JSON: &str = include_str!("schemas/memory-vocabulary.v2.json");
+pub const MEMORY_VOCABULARY_JSON: &str = include_str!("schemas/memory-vocabulary.v3.json");
 
 /// Parsed vocabulary, loaded once on first access.
 pub fn memory_vocabulary() -> &'static serde_json::Value {
@@ -194,11 +194,12 @@ mod tests {
     use super::*;
 
     /// The relation-count assertion moved here from the v1 test: v2 declares
-    /// exactly four relations, the fourth being the extraction edge.
+    /// exactly four relations, the fourth being the extraction edge. v3 keeps
+    /// them and adds the rule-honesty fields (A6).
     #[test]
-    fn memory_vocabulary_v2_parses_and_has_exact_relations() {
+    fn memory_vocabulary_v3_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 2);
+        assert_eq!(v["vocabulary_version"], 3);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
@@ -221,6 +222,16 @@ mod tests {
         let types = v["memory_types"].as_object().unwrap();
         assert!(types.contains_key("task"));
         assert!(!types["task"]["structural"].as_bool().unwrap());
+    }
+
+    /// A6 rule honesty (v3): a rule declares whether any machine enforces it.
+    #[test]
+    fn memory_vocabulary_rule_declares_enforcement_fields() {
+        let v = memory_vocabulary();
+        let fields = &v["memory_types"]["rule"]["fields"];
+        assert_eq!(fields["enforcement"]["enum"], serde_json::json!(["ENFORCED", "PARTIAL", "NOT_ENFORCED"]));
+        assert!(fields["source"].is_object());
+        assert!(fields["guard"].is_object());
     }
 
     #[test]
