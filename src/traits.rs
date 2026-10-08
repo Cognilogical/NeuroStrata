@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::OnceLock;
 
-/// The shipped vocabulary schema, embedded at compile time.
-pub const MEMORY_VOCABULARY_JSON: &str = include_str!("schemas/memory-vocabulary.v1.json");
+/// The shipped vocabulary schema, embedded at compile time. v2 adds the
+/// `task` memory type and the EXTRACTED_FROM relation that carries the
+/// extraction edge behind the completion gate (Lock 2).
+pub const MEMORY_VOCABULARY_JSON: &str = include_str!("schemas/memory-vocabulary.v2.json");
 
 /// Parsed vocabulary, loaded once on first access.
 pub fn memory_vocabulary() -> &'static serde_json::Value {
@@ -189,18 +191,34 @@ pub trait VectorStore: Send + Sync {
 mod tests {
     use super::*;
 
+    /// The relation-count assertion moved here from the v1 test: v2 declares
+    /// exactly four relations, the fourth being the extraction edge.
     #[test]
-    fn memory_vocabulary_v1_parses_and_has_exact_relations() {
+    fn memory_vocabulary_v2_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 1);
+        assert_eq!(v["vocabulary_version"], 2);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
         assert!(rels.contains_key("RELATES_TO"));
-        assert_eq!(rels.len(), 3);
+        assert!(rels.contains_key("EXTRACTED_FROM"));
+        assert_eq!(rels.len(), 4);
         assert_eq!(rels["GOVERNS"]["direction"], "directed");
         assert_eq!(rels["CONTAINS"]["direction"], "directed");
         assert_eq!(rels["RELATES_TO"]["direction"], "undirected");
+        assert_eq!(rels["EXTRACTED_FROM"]["direction"], "directed");
+        assert_eq!(rels["EXTRACTED_FROM"]["source_role"], "memory");
+        assert_eq!(rels["EXTRACTED_FROM"]["target_role"], "task");
+        assert_eq!(rels["EXTRACTED_FROM"]["declaration_direction"], "self_to_target");
+        assert_eq!(rels["EXTRACTED_FROM"]["metadata_key"], "extracted_from");
+    }
+
+    #[test]
+    fn memory_vocabulary_declares_task_as_a_non_structural_type() {
+        let v = memory_vocabulary();
+        let types = v["memory_types"].as_object().unwrap();
+        assert!(types.contains_key("task"));
+        assert!(!types["task"]["structural"].as_bool().unwrap());
     }
 
     #[test]

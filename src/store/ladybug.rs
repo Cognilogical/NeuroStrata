@@ -388,6 +388,9 @@ fn parse_edge_specs(payload: &crate::traits::MemoryPayload) -> (Vec<EdgeSpec>, V
         ("related_to", "RELATES_TO", true),
         ("contained_by", "CONTAINS", false),
         ("governs", "GOVERNS", true),
+        // Vocabulary v2: a memory extracted from a completed task declares it,
+        // and the edge points memory -> task (self_to_target).
+        ("extracted_from", "EXTRACTED_FROM", true),
     ] {
         match payload.metadata.get(key) {
             None => { /* absent: ok */ }
@@ -724,6 +727,10 @@ impl VectorStore for LadybugStore {
 
             let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory)";
             conn.query(create_governs_table).ok();
+
+            // Vocabulary v2: extraction edges (memory -> task) behind Lock 2.
+            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory)";
+            conn.query(create_extracted_table).ok();
 
             Ok(())
         })
