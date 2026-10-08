@@ -125,6 +125,66 @@ neurostrata-mcp edit my-rust-project 550e8400-e29b-41d4-a716-446655440000 my-rus
 
 ---
 
+### 9. `task gate`
+Runs the Supervisory Attentional System — the Central Executive's enforcement check — over a namespace. This is what the pre-push hook runs.
+```bash
+neurostrata-mcp task gate <namespace> [--strict]
+```
+*   `namespace` (Required): The exact project name.
+*   `--strict` (Optional): Treat infrastructure failure (unreachable database) as blocking instead of warning.
+
+*Exit codes:*
+*   `0` — clean.
+*   `1` — violations (any `in_progress` task, a `done` task without a consolidated extraction, or a P0 open beyond 24h).
+*   `2` — infrastructure error (without `--strict`, this warns and allows).
+
+*Example:*
+```bash
+neurostrata-mcp task gate NeuroStrata --strict
+```
+Escape hatch for a wedged database: `NEUROSTRATA_SKIP_GATE=1 git push`.
+
+---
+
+### 10. `task validate`
+The advisory twin of `task gate`: the same engine, printed as a human/JSON report, always exit 0. Mid-session use is encouraged.
+```bash
+neurostrata-mcp task validate <namespace>
+```
+*Example:*
+```bash
+neurostrata-mcp task validate NeuroStrata
+```
+
+---
+
+### 11. `task import`
+One-shot, idempotent beads migration: reads a beads JSONL export and creates Goals in the namespace. Idempotent on `metadata.task.bead_id` — re-runs skip what is already imported. Closed beads come in as `done` with `grandfathered: true` (exempt from the extraction gate).
+```bash
+neurostrata-mcp task import <namespace> --from-beads <path>
+```
+*Example:*
+```bash
+bd export > /tmp/beads.jsonl
+neurostrata-mcp task import NeuroStrata --from-beads /tmp/beads.jsonl
+```
+
+---
+
+### 12. `hooks install`
+Writes `.git/hooks/pre-push` — the one enforcement hook. Tasks live in LadybugDB, never in the repo, so there is nothing to commit, sync, or rebuild.
+```bash
+neurostrata-mcp hooks install [--force]
+```
+*   `--force` (Optional): Replace an existing pre-push hook.
+
+*Example:*
+```bash
+neurostrata-mcp hooks install --force
+```
+
+---
+
 ## 🔒 Safety and Daemon Locks
 
 The CLI binary automatically checks if the daemon is currently active on port `34343` before running any database commands. If the daemon is active, it safely exits with a helpful error message to prevent database file corruption:

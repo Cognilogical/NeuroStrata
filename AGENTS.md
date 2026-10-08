@@ -30,21 +30,21 @@ Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate 
 Memory architecture is the single most important aspect of this system. It is NON-OPTIONAL. You MUST use the `neurostrata_add_memory` tool for explicit architectural rules and decisions, and the `neurostrata_append_log` tool for conversational context.
 
 - **CRITICAL RESTRICTION**: NEVER use `bd remember` to store memories. That tool is deprecated for agent use. You MUST use the dedicated `neurostrata_add_memory` tool.
-- **Lock 1 (Pre-Push Hook):** The system enforces logging via a git hook. If a push is blocked, the agent must run `neurostrata_add_memory` before retrying.
-- **Lock 2 (Checklist Abstraction):** Transitioning a bead from `working` to `done` must be accompanied by an architectural summary via `neurostrata_add_memory`.
-- **Lock 3 (The "Breath" Prompt):** If a task takes more than 3-5 steps, the agent must pause, summarize the current state, and commit it to Tier 3 (Task Stratum) memory before proceeding.
+- **Lock 1 (Pre-Push Hook):** The Supervisory Attentional System gates `git push` (`neurostrata-mcp task gate --strict`, installed via `neurostrata-mcp hooks install`). If a push is blocked, resolve the reported Goal violations — complete with extraction, unclaim, or unblock — before retrying.
+- **Lock 2 (Checklist Abstraction):** Completing a Goal (`working` → `done`) must be accompanied by an architectural summary via `neurostrata_add_memory`. The Central Executive enforces this: `neurostrata_task_complete` fails until a memory has been extracted from the work.
+- **Lock 3 (The "Breath" Prompt):** If a task takes more than 3-5 steps, the agent must pause, summarize the current state, and record it on the Goal (`neurostrata_task_update` note — its Working Memory history) before proceeding.
 - **Continuous Backup Protocol:** Silently use `neurostrata_append_log` to maintain a running log of the conversation. Pass tags (e.g., "auth, database") when a topic switch occurs.
-- **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** You are strictly BLOCKED from using `write`, `edit`, or `bash` (except for `bd` tracking commands) on a new task until you have FIRST executed `neurostrata_get_snapshot` to fetch the architectural rules for this project, OR `neurostrata_search_memory` using nouns/keywords from the user's prompt. You suffer from the "Unknown Unknowns" bias: you do not know when you are missing a constraint. Therefore, you must NEVER assume you know the architectural constraints of a codebase just because you read the code. The memory database is the ultimate ground truth. **You MUST call the memory tools as your very first action on every new task.**
+- **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** You are strictly BLOCKED from using `write`, `edit`, or `bash` (except for task-tracking commands) on a new task until you have FIRST executed `neurostrata_get_snapshot` to fetch the architectural rules for this project, OR `neurostrata_search_memory` using nouns/keywords from the user's prompt. You suffer from the "Unknown Unknowns" bias: you do not know when you are missing a constraint. Therefore, you must NEVER assume you know the architectural constraints of a codebase just because you read the code. The memory database is the ultimate ground truth. **You MUST call the memory tools as your very first action on every new task.**
 - **Retrieval Protocol (MANDATORY):** Every time you start a new session, or if a user asks about previous system design, YOU MUST proactively use `neurostrata_search_memory` or grep `.NeuroStrata/sessions/*` (if local fallback is needed) to retrieve the context before answering or coding.
 
 ## 4. Bootstrapping & Ingestion
-- **Docs:** If `.NeuroStrata/docs/` is missing, proactively invoke `./scripts/bootstrap.sh <pwd>`.
+- **Docs:** If `.NeuroStrata/docs/` is missing, call `neurostrata_bootstrap` (new project) or `neurostrata_task_setup` (existing project) and follow the returned instructions — they carry the AGENTS.md template and the first mandatory Goal.
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
 ## 5. Global Database Constraints (Safety)
 - **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
 - **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
-- **No Bulk Deletes:** Only delete specific memory IDs using `neurostrata_delete_memory` when explicitly correcting a hallucination.
+- **No Bulk Deletes:** Only delete specific memory IDs, one at a time, via the CLI (`neurostrata-mcp delete`) when explicitly correcting a hallucination — deletion is deliberately absent from the MCP surface.
 
 ## 6. Global Infrastructure & Tooling Constraints
 - **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
@@ -53,8 +53,8 @@ Memory architecture is the single most important aspect of this system. It is NO
 
 ## 7. Cost Management & Async Delegation
 - **Role:** The primary agent acts as Knowledge Manager, Architect, and Orchestrator.
-- **Offloading Work:** Aggressively offload "work" (coding, refactoring) to `NeuroStrata-Task-Agent` OR capture it asynchronously in BeadBoard to avoid blocking the chat.
-- **Synchronous vs Asynchronous:** Only use the `Task` tool synchronously if the user explicitly asks for the work to be completed right now. Otherwise, create a BeadBoard bead to capture requirements.
+- **Offloading Work:** Aggressively offload "work" (coding, refactoring) to `NeuroStrata-Task-Agent` OR capture it asynchronously as a Goal (`neurostrata_task_create`) to avoid blocking the chat.
+- **Synchronous vs Asynchronous:** Only use the `Task` tool synchronously if the user explicitly asks for the work to be completed right now. Otherwise, create a task to capture requirements.
 - **Exceptions:** The primary agent may only make direct file edits for trivial, one-off changes (fixing typos, renaming a variable).
 
 ## 8. Core Engineering Mandates

@@ -16,7 +16,7 @@ If you are tired of spending 20 minutes context-loading every new chat, only for
 
 It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by **SynapticGraph**, a biologically-inspired **Dual-Track Bi-Temporal Graph Memory System** written entirely in Rust. It utilizes an embedded LadybugDB vector store and full-text search (BM25 via Tantivy) to ensure your AI remembers exactly *what* to do, *how* to do it, and *why* you built it that way.
 
-That memory is now only the first organ. NeuroStrata is a **complete cognitive architecture** in three parts: **SynapticGraph** and **Engrams** for what the agent knows, a **Prefrontal Cortex** that intercepts state-mutating actions and validates them against your behavioral rules *before* they touch the disk, and a **Dendritic Bridge** that lets external embedding providers deliver signals into the cortex — degrading to a fully local embedder the moment a bridge is not declared.
+That memory is now only the first organ. NeuroStrata is a **complete cognitive architecture** in four parts: **SynapticGraph** and **Engrams** for what the agent knows, a **Prefrontal Cortex** that intercepts state-mutating actions and validates them against your behavioral rules *before* they touch the disk, a **Central Executive** that holds the agent's Goals and refuses to let work finish before it has been consolidated into memory, and a **Dendritic Bridge** that lets external embedding providers deliver signals into the cortex — degrading to a fully local embedder the moment a bridge is not declared.
 
 ---
 
@@ -44,6 +44,12 @@ NeuroStrata uses cognitive metaphors to map how software actually evolves. Here 
 | **Episodic Buffer** | **Rolling Log Files** | A silent background log written to `.NeuroStrata/sessions/` capturing all conversational context and architectural pivots so nothing is lost when a chat closes. |
 | **Prefrontal Cortex** | **Behavioral Guard** | A structural executive module that intercepts state-mutating actions (bash, file writes) *before* execution, resolving them against behavioral rules by semantic similarity in LadybugDB, with an optional ephemeral Podman dry-run. |
 | **Dendritic Bridge** | **Remote Embedder** | An external, OpenAI-compatible embedding endpoint that integrates signals from sources outside the cortex, with the local `fastembed` dendrite absorbing every request when no bridge is declared. |
+| **Central Executive** | **Task Subsystem** | Goal lifecycle management — create, claim, gate, complete — driven by a hand-rolled state machine and one enforcement hook. Named for Baddeley's executive component of working memory: it decides what gets worked on and when work is genuinely finished. |
+| **Goal** | **Task Record** | An Engram with `memory_type: "task"` — status, priority, assignee, and an append-only history in its metadata. Goals live in the same LadybugDB as everything else, so memory and task state can never decouple. |
+| **Supervisory Attentional System** | **Task Gate** | Norman & Shallice's conflict monitor, realized as `neurostrata-mcp task gate --strict`: the pre-push hook refuses to let work leave the machine while Goals are unfinished or unconsolidated. |
+| **Knowledge Consolidation** | **Done-Funnel (Lock 2)** | A Goal reaches `done` through exactly one guarded entrance — `neurostrata_task_complete` — which fails until the work has consolidated at least one Engram (an `EXTRACTED_FROM` edge). Experience is not allowed to evaporate. |
+| **Action Initiation** | **Zero-Action Start** | No state-mutating action begins before a Goal exists and is claimed. The session snapshot says it first, every time. |
+| **Working Memory** | **Goal History** | The append-only transition log and notes on each Goal — the Task Stratum made durable. Mid-task checkpoints ("the Breath") land here. |
 
 ---
 
@@ -85,6 +91,7 @@ graph TD
         Tier3[("Task Stratum<br/>(Working)")]
         
         PFC[[🛡️ Prefrontal Cortex<br/>Behavioral Guard]]
+        CE[[🕴️ Central Executive<br/>Goal Management]]
         Dendritic[[🌉 Dendritic Bridge<br/>Embedding Provider]]
     end
     
@@ -116,6 +123,10 @@ graph TD
     PFC -.->|Behavioral Rules| LadybugDB
     PFC -->|Optional Dry-Run| Sandbox
     
+    Agent -->|Goal Lifecycle| CE
+    CE -->|SAS Gate: Block Unfinished Work| Agent
+    CE -.->|Goals & Extraction Edges| LadybugDB
+    
     Router -.->|Embedding Requests| Dendritic
     Dendritic -->|Declared Bridge| RemoteAPI
     Dendritic -.->|No Bridge Declared| LocalEmbed
@@ -130,15 +141,16 @@ graph TD
     class Tier1,Tier2,Tier3,LadybugDB,PointerWiki memory;
     class SynapticGraph engine;
     class Obsidian tool;
-    class PFC,Dendritic,Sandbox,LocalEmbed guard;
+    class PFC,CE,Dendritic,Sandbox,LocalEmbed guard;
     class RemoteAPI tool;
 ```
 
 1. **Global Stratum (Tier 1):** Company-wide constraints and infrastructure mandates (e.g., "Always use `podman` instead of `docker`").
 2. **Domain Stratum (Tier 2):** Project-specific rules and API contracts. Utilizes the SynapticGraph pointer constraint: Engrams are hyper-specific references (`{"file": "docs/...", "lines": "42-49"}`) to physical architecture files.
-3. **Task Stratum (Tier 3):** Ephemeral context for active bug fixes or feature branches.
+3. **Task Stratum (Tier 3):** Goals (tracked work with their durable history) and the ephemeral context of active bug fixes or feature branches.
 4. **Prefrontal Cortex:** Intercepts state-mutating actions on their way *out* of the agent and returns a verdict *before* execution.
 5. **Dendritic Bridge:** Integrates embedding signal from either a declared external endpoint or the local dendrite.
+6. **Central Executive:** Manages the Goal lifecycle and gates completion and push behind Knowledge Consolidation.
 
 ---
 
@@ -184,6 +196,35 @@ Before any container starts, the requested working directory is canonicalised an
 ### Teaching the Cortex
 
 Rules are not hand-written config. Use `neurocortex_learn_behavioral_rule` with a `constraint_text`, a `rule_class`, and a `trigger_pattern`, and the new rule is embedded into the `guard` namespace immediately, where it applies to every future validation. Combined with `neurocortex_local_guard_validate`, the Cortex is a closed loop: rules arrive from experience, and every subsequent state-mutating action is measured against them.
+
+---
+
+## 🎼 The Central Executive: Goal Management
+
+Willpower is not a workflow. The **Central Executive** (`src/task/`) is NeuroStrata's task subsystem — the organ that decides what gets worked on, prevents duplicate effort, and refuses to let work count as finished until it has taught the brain something. Goals are ordinary Engrams (`memory_type: "task"`) living in the same LadybugDB as every other memory: one store, one backup, one truth.
+
+Named for Baddeley's executive component of working memory — the system that holds current goals, schedules attention, and marks a task *done* — because that is exactly the contract, expressed as tools instead of anatomy.
+
+### The Goal lifecycle
+
+Goals move through four states (`open → in_progress → blocked → done`) over eight legal transitions. The machine is a hand-rolled transition table — states are runtime data in a database, mutated across process invocations, so compile-time state-machine libraries would add a dependency without adding proof.
+
+| Phase | Biological Name | Mechanism |
+| :--- | :--- | :--- |
+| Starting work | **Action Initiation** | Zero-Action Start: no state-mutating action before a Goal exists and is claimed. `neurostrata_get_snapshot` injects this mandate into the mandatory pre-flight of every session. |
+| Claiming | Goal selection | `neurostrata_task_claim` is exclusive — a Goal held by another live session fails loudly at claim time, not at merge time. |
+| Working | **Working Memory** | `neurostrata_task_update(note=...)` appends to the Goal's history; the "Breath" checkpoint lands here, so mid-task recovery is a lookup, not log archaeology. |
+| Finishing | **Knowledge Consolidation** | `done` has exactly one entrance. `neurostrata_task_complete` fails — with a JSON-RPC error naming both ways to comply — until the work has consolidated at least one Engram carrying an `EXTRACTED_FROM` edge back to the Goal. Inline `memory`, `link_memory_id`, or a prior extraction all satisfy it. |
+| Shipping | **Supervisory Attentional System** | The pre-push hook runs `neurostrata-mcp task gate --strict`: unfinished Goals, unconsolidated `done`s, or rotting P0s block the push. Norman & Shallice's conflict monitor, made mechanical. |
+
+`neurostrata_task_update` *cannot* set `status: "done"` — the single guarded funnel is the whole point. Enforcement lives in one hook and one binary: there is no external task CLI to install, approve, or keep in sync, and tasks never touch the repository, so there is nothing to commit or merge.
+
+### Onboarding a project
+
+The Central Executive instructs; it does not silently mutate your repo:
+
+* **New project:** `neurostrata_bootstrap` returns an AGENTS.md template, a first mandatory Goal, and an ordered instruction list the agent executes.
+* **Existing project:** `neurostrata_task_setup` scans the repository (manifests, CI, legacy trackers, hooks), proposes rules, creates integration Goals, and returns the same ordered instructions.
 
 ---
 
@@ -233,7 +274,7 @@ Remote requests carry a 30-second timeout and a single retry after one second of
 
 Neither organ adds configuration the operator must keep in sync. The Dendritic Bridge derives itself from a single file that the tool writes for you. The Prefrontal Cortex keeps its rules *inside the same LadybugDB namespace mesh* as everything else, so there is no second store to migrate, back up, or reconcile. One database, one configuration surface, no redundant truth.
 
-Together with SynapticGraph and the Engram, the architecture is now complete: **memory** (what the agent knows), **validation** (whether the agent may act on it), and **external integration** (where new signal enters).
+Together with SynapticGraph, the Engram, and the Central Executive, the architecture is now complete: **memory** (what the agent knows), **validation** (whether the agent may act on it), **goal management** (what the agent must do — and proof that the work taught it something), and **external integration** (where new signal enters).
 
 ---
 
@@ -264,7 +305,7 @@ Both take `--check` / `-CheckOnly` to report the toolchain and build nothing. Th
 Clone the repository and run the automated installer. The installer uses a pre-compiled native binary, sets up global symlinks, and patches the client's configuration automatically—**no Rust toolchain required**.
 
 ```bash
-git clone https://github.com/your-username/NeuroStrata.git ~/Documents/neurostrata
+git clone https://github.com/Cognilogical/NeuroStrata.git ~/Documents/neurostrata
 cd ~/Documents/neurostrata
 ./install.sh
 ```
@@ -273,6 +314,14 @@ cd ~/Documents/neurostrata
 1. Installs the Rust `neurostrata-mcp` binary to `~/.local/bin/neurostrata-mcp`.
 2. Links the universal `SKILL.md` to `~/.agents/skills/neurostrata`.
 3. Registers the MCP server in your client's local configuration (e.g. `~/.config/opencode/opencode.json`).
+
+**Per-project, enable the Supervisory Attentional System** — one command per checkout writes the pre-push gate that keeps unfinished Goals from leaving the machine:
+
+```bash
+neurostrata-mcp hooks install    # --force replaces an existing pre-push hook
+```
+
+New projects then call `neurostrata_bootstrap`; existing projects call `neurostrata_task_setup` — both return ordered instructions the agent follows to wire the Central Executive into the repo.
 
 ### Configuration
 The installer creates a default configuration at `~/.config/neurostrata/config.json`. This holds only the database location, deduplication settings, and the Episodic Buffer retention policy — embedding is configured separately:
@@ -307,6 +356,20 @@ Once installed, your AI agent automatically gains access to the following tools 
 | `neurostrata_supersede_memory` | Correct a rule. Stores the new text and retires the old one, which keeps its wording as history. |
 | `neurostrata_list_namespaces` | List the namespaces the shared database holds. |
 | `neurostrata_ingest_directory` | Batch-embed an entire architectural documentation folder. |
+| `neurostrata_append_log` | Episodic Buffer writer: append a timestamped session entry, with `### 🔄 Topic Switch` markers on tagged turns and 500KB rollover. |
+
+The **Central Executive** manages Goals over the same surface:
+
+| Tool Name | Description |
+| :--- | :--- |
+| `neurostrata_task_create` | Create a Goal. Zero-Action Start: no file edits before one exists and is claimed. |
+| `neurostrata_task_claim` | Claim a Goal exclusively for this session (duplicate work fails loudly). |
+| `neurostrata_task_update` | Move a Goal between non-terminal states and append history notes. Refuses `done`. |
+| `neurostrata_task_list` | List Goals by status/assignee, with `ready: true` for unblocked work. |
+| `neurostrata_task_complete` | The one entrance to `done` — requires Knowledge Consolidation (an extracted Engram). |
+| `neurostrata_task_validate` | Advisory gate report: violations, stale claims, unconsolidated completions. |
+| `neurostrata_bootstrap` | New-project onboarding: AGENTS.md template, first Goal, ordered instructions. |
+| `neurostrata_task_setup` | Existing-project onboarding: repo scan, suggested rules, integration Goals, instructions. |
 
 The **Prefrontal Cortex** is exposed as a separate MCP surface, so an agent can consult or
 train the guard without the memory tools being able to mutate anything:
@@ -325,8 +388,8 @@ operations being absent from the MCP surface entirely, not by asking an agent to
 ## 📖 CLI and Changelog Documentation
 
 For advanced administration, direct manipulation of the cognitive graph, and history of updates, refer to:
-*   [CLI Interface Guide](file:///Users/neo/projects/NeuroStrata/CLI-readme.md) — Complete manual for `neurostrata-mcp` commands (`namespaces`, `list`, `ingest`, `export-graph`, `delete`, `add`, `edit`).
-*   [Project Changelog](file:///Users/neo/projects/NeuroStrata/CHANGELOG.md) — Detailed version-by-version changes and migration logs.
+*   [CLI Interface Guide](CLI-readme.md) — Complete manual for `neurostrata-mcp` commands (`namespaces`, `list`, `ingest`, `export-graph`, `delete`, `add`, `edit`, `task gate|validate|import`, `hooks install`).
+*   [Project Changelog](CHANGELOG.md) — Detailed version-by-version changes and migration logs.
 
 
 ### Upgrading an existing database
@@ -345,11 +408,11 @@ no file, and how many memories have never been counted as read.
 ## 🛡️ Security & Compliance
 
 NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications** and common AI red-teaming vectors:
-- **Loopback-Only Network Surface (Mitigates LLM07):** Agents talk to NeuroStrata over `stdio`. Behind that, a local daemon binds **`127.0.0.1:34343`** and serves `/health`, `/graph`, `/ingest`, `/delete`, `/edit`, `/mcp`, `/backup` and `/shutdown` -- the stdio process starts it automatically when none is running, so the port is open in normal operation. It is bound to loopback and never to an external interface, and nothing is published beyond the machine, which is what neutralises remote RCE and plugin exploitation vectors. Anything running as your user on the same machine can reach it: there is no authentication on those routes.
+- **Loopback-Only Network Surface (Mitigates LLM07):** Agents talk to NeuroStrata over `stdio`. Behind that, a local daemon binds **`127.0.0.1:34343`** and serves `/health`, `/graph`, `/ingest`, `/delete`, `/edit`, `/mcp`, `/validate`, `/tasks/gate`, `/backup` and `/shutdown` -- the stdio process starts it automatically when none is running, so the port is open in normal operation. It is bound to loopback and never to an external interface, and nothing is published beyond the machine, which is what neutralises remote RCE and plugin exploitation vectors. Anything running as your user on the same machine can reach it: there is no authentication on those routes.
 - **Active Secret Scrubbing (Mitigates LLM06):** The Rust backend actively scans memory payloads for high-entropy secrets (API keys, passwords, JWTs) and explicitly rejects insertions, forcing the agent into a "Redaction Loop" to prevent permanent context contamination.
 - **Kuzu Injection Hardening (Mitigates SQL/Cypher Injection):** Active escaping of single quotes and backslashes in database interpolations eliminates Cypher database injection and prompt-driven database crash vectors.
 - **Guarded Curation (Mitigates LLM08):** No tool on the MCP surface destroys a memory, so an agent cannot lose one. Corrections go through `neurostrata_supersede_memory`, which retires the old row rather than overwriting it and refuses the machine-wide `global` namespace unless the caller passes `allow_global`. Editing, deleting and moving are CLI and GUI operations; deletion works one id at a time and never in bulk, and the database directory is never dropped. Sub-agent restraint is a convention in the agent instructions, not something the server enforces.
-- **Resilient Soft Locks (Mitigates LLM09):** To combat context degradation and "happy path" tunnel vision, NeuroStrata enforces memory extraction through OS-level Git hooks (Pre-Push Behavioral Forcing) rather than relying solely on fragile system prompts.
+- **Resilient Soft Locks (Mitigates LLM09):** To combat context degradation and "happy path" tunnel vision, NeuroStrata enforces knowledge extraction mechanically rather than relying on fragile system prompts: the **done-funnel** makes memory consolidation the only completion path (`neurostrata_task_complete`), and the **Supervisory Attentional System** blocks `git push` while Goals are unfinished or unconsolidated. Both live inside the `neurostrata-mcp` binary and the git hook it installs — no external task tooling to approve or bypass.
 
 ## License
 MIT License. See the `LICENSE` file for details. I wrote it, you can use it, keep it, close source it, whatever—just don't sue me!
@@ -358,10 +421,13 @@ MIT License. See the `LICENSE` file for details. I wrote it, you can use it, kee
 
 ## 📚 References
 
-*Broader cognitive-science grounding is cited inline throughout this document (Liu et al., 2023; Tulving, 1972; O'Keefe & Nadel, 1978; Brooks, 1983). The works below specifically ground the Prefrontal Cortex and the Dendritic Bridge.*
+*Broader cognitive-science grounding is cited inline throughout this document (Liu et al., 2023; Tulving, 1972; O'Keefe & Nadel, 1978; Brooks, 1983). The works below specifically ground the Prefrontal Cortex, the Central Executive, and the Dendritic Bridge.*
 
 1. **Webb, T., Mondal, S.S., & Momennejad, I. (2025).** A brain-inspired agentic architecture to improve planning with LLMs. *Nature Communications*, 16, 8633. — The MAP (Modular Agentic Planner) architecture, which models executive control as a module inspired by the mammalian prefrontal cortex rather than as additional prompting.
 2. **Liu, C., Ma, J., Li, S., & Zhou, D. (2024).** Dendritic integration inspired artificial neural networks capture data correlation. *NeurIPS 2024*. — Establishes dendritic computation and quadratic integration of multiple signals as the mechanism for capturing data correlation.
 3. **An Artificial Prefrontal Cortex for LLM Agents (2026).** A structural executive module that intercepts jailbreaks, collusion, mutation attempts and long horizon evasion tactics. — The direct architectural antecedent for the behavioral guard described above.
-4. **Farquhar, S., et al. (2024).** Detecting hallucinations in large language models using semantic entropy. *Nature*. — Statistical methods for detecting confabulation, the reason NeuroStrata grounds agents in retrieved pointers rather than in generated prose.
-5. **Stemming Hallucination in Language Models Using a Licensing Oracle (2025).** arXiv:2511.06073. — An architectural approach to hallucination prevention, complementary to the Tri-Strata partitioning used here.
+4. **Baddeley, A. (1986/2000).** *Working Memory*; Baddeley, A. (2000). The episodic buffer: a new component of working memory? *Trends in Cognitive Sciences*, 4(11). — The central executive and working-memory components the Goal subsystem is named for.
+5. **Norman, D.A., & Shallice, T. (1986).** Attention to action: Willed and automatic control of behavior. — The Supervisory Attentional System (SAS): the conflict monitor realized by the pre-push task gate.
+6. **Squire, L.R., & Alvarez, P. (1995).** Retrograde amnesia and systems consolidation: a neurobiological theory. *Current Biology*. — Systems consolidation, the mechanism behind the done-funnel: experience must become long-term memory before a Goal may close.
+7. **Farquhar, S., et al. (2024).** Detecting hallucinations in large language models using semantic entropy. *Nature*. — Statistical methods for detecting confabulation, the reason NeuroStrata grounds agents in retrieved pointers rather than in generated prose.
+8. **Stemming Hallucination in Language Models Using a Licensing Oracle (2025).** arXiv:2511.06073. — An architectural approach to hallucination prevention, complementary to the Tri-Strata partitioning used here.

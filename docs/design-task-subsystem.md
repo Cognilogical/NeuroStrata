@@ -1,6 +1,7 @@
 # Task Subsystem — Replacing `bd` Inside `neurostrata-mcp`
 
-Status: design. Bead: NeuroStrata-043. Supersedes: external `bd` CLI, dolt sync, JSONL issue files.
+Status: implemented (v1.7.0). Bead: NeuroStrata-043. Supersedes: external `bd` CLI, dolt sync, JSONL issue files.
+Naming (adopted): the subsystem is the **Central Executive**, a task record is a **Goal**, the done-funnel is **Knowledge Consolidation**, the pre-push gate is the **Supervisory Attentional System**, and Zero-Action Start is **Action Initiation**.
 
 ## 0. Thesis
 

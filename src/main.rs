@@ -1,3 +1,4 @@
+mod buffer;
 mod config;
 mod daemon;
 mod embed;
