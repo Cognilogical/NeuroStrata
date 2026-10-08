@@ -68,6 +68,7 @@ pub async fn process_mcp_request(
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
     ingests: Arc<crate::ingest_jobs::IngestJobs>,
+    deduplication_checker: Option<Arc<crate::judgment::DeduplicationChecker>>,
 ) -> Value {
     let id = request.id.clone();
     match request.method.as_str() {
@@ -276,7 +277,7 @@ pub async fn process_mcp_request(
                             result_text = handle_list_namespaces(store.clone()).await;
                         }
                         "neurostrata_add_memory" => {
-                            result_text = handle_add_memory(arguments, emb.clone(), store.clone()).await;
+                            result_text = handle_add_memory(arguments, emb.clone(), store.clone(), deduplication_checker.clone()).await;
                         }
                         "neurostrata_get_memory" => {
                             result_text = handle_get_memory(arguments, store.clone()).await;
@@ -590,7 +591,12 @@ async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
 // (bead neurostrata-3fi.6.4). The store now marks itself dirty and the daemon's
 // background task does the flushing, which is also what runs at shutdown.
 
-async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore>) -> String {
+async fn handle_add_memory(
+    arguments: Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+    deduplication_checker: Option<Arc<crate::judgment::DeduplicationChecker>>,
+) -> String {
     let content = match arguments.get("content").and_then(|c| c.as_str()) {
         Some(c) => c,
         None => return "Missing 'content' parameter.".to_string(),
@@ -726,6 +732,30 @@ async fn handle_add_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<
 
         if let Ok(_) = store.init(namespace).await {
             if let Ok(vec) = emb.embed(&content).await {
+                // Check for duplicates if deduplication is enabled
+                if let Some(checker) = &deduplication_checker {
+                    if let Ok(candidates) = store.search(namespace, vec.clone(), 5).await {
+                        // Filter to only high-similarity candidates
+                        let similar: Vec<_> = candidates
+                            .into_iter()
+                            .filter(|c| c.score >= 0.85)
+                            .collect();
+                        
+                        if !similar.is_empty() {
+                            // Ask the judgment provider if this is a duplicate
+                            if let Some(duplicates) = checker.check_duplicates(&payload, &similar).await {
+                                if !duplicates.is_empty() {
+                                    let dup = &duplicates[0];
+                                    return format!(
+                                        "Potential duplicate detected: Memory is similar to existing memory {} (confidence: {:.2}). Use neurostrata_edit_memory to update the existing memory instead.",
+                                        dup.existing_memory_id, dup.confidence
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                
                 let new_id = uuid::Uuid::new_v4().to_string();
                 if let Ok(_) = store.upsert(namespace, &new_id, vec, payload).await {
                     return format!("Successfully added memory for namespace: {}", namespace);
@@ -1926,6 +1956,7 @@ mod tests {
             }),
             emb,
             store.clone(),
+            None,
         )
         .await;
         assert!(reply.contains("ERROR"), "string metadata should be rejected: {}", reply);
@@ -2034,6 +2065,7 @@ mod tests {
             }),
             emb,
             store.clone(),
+            None,
         )
         .await;
         assert!(reply.contains("ERROR [SECURITY]"), "got {}", reply);

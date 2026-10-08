@@ -2,6 +2,7 @@ mod config;
 mod daemon;
 mod embed;
 mod ingest_jobs;
+mod judgment;
 mod parser;
 mod secrets;
 mod server;
@@ -454,7 +455,11 @@ async fn main() -> anyhow::Result<()> {
                     embedder.dimensions(),
                 )?);
                 vector_store.init("global").await?;
-                let outcome = daemon::start_daemon(embedder, vector_store).await;
+                let outcome = daemon::start_daemon(
+                    embedder,
+                    vector_store,
+                    Some(config.deduplication.clone()),
+                ).await;
                 record_final_checkpoint(&outcome);
                 outcome?;
             }

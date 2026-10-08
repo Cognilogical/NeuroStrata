@@ -1,3 +1,5 @@
+use crate::config::DeduplicationConfig;
+use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
 use axum::{
     extract::{Query, State},
@@ -21,6 +23,8 @@ struct AppState {
     /// Fires once, when something asks the daemon to stop. Taken by whoever
     /// gets there first so a second /shutdown call is harmless.
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Memory deduplication checker (None if disabled or misconfigured)
+    deduplication_checker: Option<Arc<DeduplicationChecker>>,
 }
 
 #[derive(Deserialize)]
@@ -54,8 +58,34 @@ struct GraphQuery {
     namespace: Option<String>,
 }
 
-pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn VectorStore>) -> anyhow::Result<()> {
+pub async fn start_daemon(
+    embedder: Arc<dyn Embedder>,
+    vector_store: Arc<dyn VectorStore>,
+    deduplication_config: Option<DeduplicationConfig>,
+) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    // Initialize deduplication checker if config provided
+    // The presence of a judgment API key is the enable signal - no redundant config
+    let deduplication_checker = if let Some(config) = deduplication_config {
+        if config.judgment_api_key.is_some() {
+            match DeduplicationChecker::new(config) {
+                Ok(checker) => {
+                    tracing::info!("Memory deduplication enabled with judgment model");
+                    Some(Arc::new(checker))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize deduplication checker: {}", e);
+                    None
+                }
+            }
+        } else {
+            tracing::debug!("Deduplication config present but no judgment API key - feature disabled");
+            None
+        }
+    } else {
+        None
+    };
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -64,6 +94,7 @@ pub async fn start_daemon(embedder: Arc<dyn Embedder>, vector_store: Arc<dyn Vec
         vector_store: vector_store.clone(),
         ingests: ingests.clone(),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
+        deduplication_checker,
     };
 
     let app = Router::new()
@@ -395,6 +426,7 @@ async fn handle_mcp(
             state.embedder.clone(),
             state.vector_store.clone(),
             state.ingests.clone(),
+            state.deduplication_checker.clone(),
         )
         .await;
         Json(response)
