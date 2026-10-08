@@ -168,6 +168,7 @@ neurostrata-mcp task import <namespace> --from-beads <path>
 bd export > /tmp/beads.jsonl
 neurostrata-mcp task import NeuroStrata --from-beads /tmp/beads.jsonl
 ```
+**Migration runbook:** the import needs the daemon **stopped** (`neurostrata-mcp shutdown`; it restarts automatically on the next MCP call) — the CLI lock guards the store against a live daemon. Routing import through the daemon is an open task; until then, shut down first rather than working around the lock.
 
 ---
 
