@@ -9,17 +9,19 @@ to produce these — all are observed behaviour with repro steps.
 
 Severity is my read, adjust as you see fit.
 
-**STATUS UPDATE (later 2026-10-08):** All three data-safety items (BUG-1, BUG-2, BUG-3) are
-**FIXED and verified live** in v1.7.0 (stomped): `neurostrata-mcp status` exists (exit 0
-healthy / 1 down / 2 busy), a second daemon is refused at the lock with a legible message,
-and `backup` is a checkpointed file snapshot that works with or without a daemon (round-trip
-verified on an 8-namespace store) — the engine's `EXPORT DATABASE` turned out to SIGSEGV in
-lbug's planner on *every* store, so the SQL export path is gone entirely. FEATURE-1 and
-FEATURE-2 are also done (the extraction-lock error names both compliance paths; the
-one-daemon-per-store rule is now in README and CLI-readme). Open: BUG-4 (`task_setup`
-rule validation), BUG-5 (import via daemon — runbook: shutdown → import → auto-restart),
-BUG-6/7 (`export-graph` fidelity — use `backup` snapshots as the safety copy instead),
-FEATURE-3 (document `task_validate` categories). Tracked as NeuroStrata tasks.
+**STATUS UPDATE (later 2026-10-08):** **All ten findings are resolved** and stomped into
+v1.7.0. The three data-safety items (BUG-1/2/3) are fixed and verified live: `status`
+exists (exit 0 healthy / 1 down / 2 busy), a second daemon is refused at the lock with a
+legible message, and `backup` is a checkpointed file snapshot (the engine's
+`EXPORT DATABASE` turned out to SIGSEGV in lbug's planner on *every* store). BUG-5 is
+dead: `task import` and `export-graph` route through the running daemon — no shutdown
+dance. BUG-4 is fixed: `task_setup` weighs counted source files over manifest presence,
+flags every suggestion `heuristic`/`verified: false`, and surfaces `similar_existing` +
+`conflicts` before anything is accepted. BUG-6/7 are fixed: the export carries `metadata`,
+`superseded`/`superseded_by` markers, and `EXTRACTED_FROM` edges, with
+`--exclude-superseded`. FEATURE-1/2/3 all landed (extraction-lock error names both
+compliance paths; the one-daemon-per-store rule is in README and CLI-readme; the
+`task_validate` categories are documented).
 
 ---
 

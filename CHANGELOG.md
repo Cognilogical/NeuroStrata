@@ -23,6 +23,9 @@ All notable changes to the NeuroStrata project will be documented in this file.
 ### Fixed
 - **Backup no longer crashes (data safety):** `neurostrata-mcp backup` segfaulted both with and without a daemon — lbug 0.20.4's planner crashes inside `EXPORT DATABASE` on *every* store (gdb: `planExportTableData` → `std::__format` on a dangling string_view). Backups are now checkpointed file snapshots (`ladybug.store` + `manifest.json`), `restore` copies the snapshot before any engine opens it, and the daemon survives `/backup`. Verified round-trip on a live 8-namespace store.
 - **`neurostrata-mcp status`:** read-only preflight (store, daemon, lock) with distinct exit codes for healthy / down / busy — the missing check that made daemon pile-ups possible. A second daemon is refused at the lock with a legible message (verified).
+- **Migration and graph export no longer demand a daemon shutdown:** `task import` and `export-graph` now route through the running daemon (`/tasks/import`, `/graph?all=true`) instead of refusing while it holds the store — the trap that pushed a field-test agent toward forcing its own instances.
+- **`task_setup` suggests rules worth trusting:** language detection weighs counted source files, not manifest presence (a tooling `package.json` no longer outvotes a Go-majority tree); every suggestion is flagged `heuristic: true` / `verified: false`, carries its `similar_existing` memories, and real overlap lands in `conflicts[]`.
+- **`export-graph` export fidelity:** nodes now carry `metadata` and a `superseded` marker with `superseded_by`; `EXTRACTED_FROM` consolidation edges are exported alongside `RELATES_TO`/`CONTAINS`/`GOVERNS`; `--exclude-superseded` drops retired rows entirely.
 
 ---
 

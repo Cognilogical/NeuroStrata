@@ -59,6 +59,10 @@ enum Commands {
     ExportGraph {
         /// Output path for the JSON graph export
         out_path: Option<String>,
+
+        /// Leave superseded (retired) memories out of the export entirely
+        #[arg(long)]
+        exclude_superseded: bool,
     },
 
     /// Delete a memory from a namespace by ID
@@ -1103,57 +1107,69 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                // DB-mutating: the same refusal every mutating CLI gets (7).
+                // A store write the daemon can do on our behalf (guinea-pig
+                // BUG-5): tearing down the shared daemon for a migration is
+                // what pushed an agent toward forcing its own instances. The
+                // direct path stays for when no daemon runs at all.
                 TaskCommands::Import {
                     namespace,
                     from_beads,
                 } => {
-                    if daemon_running {
-                        eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running and holds the database lock.");
-                        eprintln!("You cannot run database-modifying CLI commands while the daemon is active.");
-                        eprintln!("Run `neurostrata-mcp shutdown` to stop it safely -- killing the process discards any writes made since the last checkpoint.");
-                        std::process::exit(1);
-                    }
-                    let config = Config::from_default_path()?;
-                    if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
-                        eprintln!("{}", DAEMON_BUSY_MESSAGE);
-                        std::process::exit(1);
-                    }
-                    let embedder = build_embedder()?;
-                    let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                        config.db_path.to_string_lossy().to_string(),
-                        embedder.dimensions(),
-                    )?);
-                    match crate::task::import_beads(
-                        vector_store,
-                        embedder.clone(),
-                        &namespace,
-                        &from_beads,
-                    )
-                    .await
-                    {
-                        Ok(summary) => {
-                            println!(
-                                "Imported {} new task(s) into '{}'; skipped {} already imported; {} non-issue line(s), {} malformed line(s).",
-                                summary.created,
-                                namespace,
-                                summary.skipped_existing,
-                                summary.non_issue_lines,
-                                summary.malformed_lines
-                            );
-                            if summary.created > 0 {
-                                println!(
-                                    "Check the migration with: neurostrata-mcp task validate '{}'",
-                                    namespace
-                                );
-                            }
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            eprintln!("{}", e);
+                    let summary_json: serde_json::Value = if daemon_running {
+                        let res = reqwest::Client::new()
+                            .post("http://127.0.0.1:34343/tasks/import")
+                            .json(&serde_json::json!({ "namespace": namespace, "from_beads": from_beads }))
+                            .send()
+                            .await?;
+                        let status = res.status();
+                        let body = res.text().await.unwrap_or_default();
+                        if !status.is_success() {
+                            eprintln!("Import failed: {}", body);
                             std::process::exit(1);
                         }
+                        serde_json::from_str(&body).unwrap_or_default()
+                    } else {
+                        let config = Config::from_default_path()?;
+                        if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                            eprintln!("{}", DAEMON_BUSY_MESSAGE);
+                            std::process::exit(1);
+                        }
+                        let embedder = build_embedder()?;
+                        let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
+                            config.db_path.to_string_lossy().to_string(),
+                            embedder.dimensions(),
+                        )?);
+                        match crate::task::import_beads(
+                            vector_store,
+                            embedder.clone(),
+                            &namespace,
+                            &from_beads,
+                        )
+                        .await
+                        {
+                            Ok(summary) => serde_json::to_value(&summary).unwrap_or_default(),
+                            Err(e) => {
+                                eprintln!("{}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    };
+                    let get = |k: &str| summary_json.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!(
+                        "Imported {} new task(s) into '{}'; skipped {} already imported; {} non-issue line(s), {} malformed line(s).",
+                        get("created"),
+                        namespace,
+                        get("skipped_existing"),
+                        get("non_issue_lines"),
+                        get("malformed_lines")
+                    );
+                    if get("created") > 0 {
+                        println!(
+                            "Check the migration with: neurostrata-mcp task validate '{}'",
+                            namespace
+                        );
                     }
+                    return Ok(());
                 }
             },
             Commands::Hooks { action } => match action {
@@ -1198,6 +1214,37 @@ async fn main() -> anyhow::Result<()> {
             },
             other => {
                 if daemon_running {
+                    // Read-only graph export is not a store mutation: it rides
+                    // the daemon like backup does, instead of demanding a
+                    // shutdown (the same trap as guinea-pig BUG-5).
+                    if let Commands::ExportGraph {
+                        out_path,
+                        exclude_superseded,
+                    } = &other
+                    {
+                        let default_path = ".NeuroStrata/graph/graph.json".to_string();
+                        let target_path = out_path.as_ref().unwrap_or(&default_path);
+                        let res = reqwest::Client::new()
+                            .get(format!(
+                                "http://127.0.0.1:34343/graph?include_superseded={}&all=true",
+                                !exclude_superseded
+                            ))
+                            .send()
+                            .await?;
+                        let status = res.status();
+                        let body = res.text().await.unwrap_or_default();
+                        if !status.is_success() {
+                            eprintln!("Graph export failed: {}", body);
+                            std::process::exit(1);
+                        }
+                        println!("Exporting Memory Graph to {}", target_path);
+                        if let Some(parent) = std::path::Path::new(target_path).parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(target_path, body)?;
+                        println!("Graph exported successfully.");
+                        return Ok(());
+                    }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
                     eprintln!("You cannot run database-modifying CLI commands while the daemon is active.");
                     eprintln!("Run `neurostrata-mcp shutdown` to stop it safely -- killing the process discards any writes made since the last checkpoint.");
@@ -1392,7 +1439,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("Ingestion complete.");
                         }
                     }
-                    Commands::ExportGraph { out_path } => {
+                    Commands::ExportGraph { out_path, exclude_superseded } => {
                         let default_path = ".NeuroStrata/graph/graph.json".to_string();
                         let target_path = out_path.as_ref().unwrap_or(&default_path);
                         println!("Exporting Memory Graph to {}", target_path);
@@ -1400,7 +1447,9 @@ async fn main() -> anyhow::Result<()> {
                             std::fs::create_dir_all(parent)?;
                         }
                         vector_store.init("global").await?;
-                        let graph_data = vector_store.export_graph(true).await?;
+                        // Superseded rows are exported marked (`superseded`,
+                        // `superseded_by`) unless --exclude-superseded drops them.
+                        let graph_data = vector_store.export_graph(!exclude_superseded).await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
                     }

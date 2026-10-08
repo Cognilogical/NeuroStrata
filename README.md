@@ -226,6 +226,8 @@ The Central Executive instructs; it does not silently mutate your repo:
 * **New project:** `neurostrata_bootstrap` returns an AGENTS.md template, a first mandatory Goal, and an ordered instruction list the agent executes.
 * **Existing project:** `neurostrata_task_setup` scans the repository (manifests, CI, legacy trackers, hooks), proposes rules, creates integration Goals, and returns the same ordered instructions.
 
+> **`suggested_rules` are a draft, never ground truth.** They are weighted by counted source files (a manifest alone earns nothing), flagged `heuristic: true`, and each carries `similar_existing` memories plus any `conflicts` — review them against the project's standing rules before accepting, and supersede the stale rule rather than storing a contradiction.
+
 ---
 
 ## 🌉 The Dendritic Bridge: External Embedding Integration

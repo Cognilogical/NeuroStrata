@@ -151,6 +151,13 @@ The advisory twin of `task gate`: the same engine, printed as a human/JSON repor
 ```bash
 neurostrata-mcp task validate <namespace>
 ```
+
+*Report categories:*
+*   `violations` — what the gate would block a push on: any `in_progress` task, a `done` task without a consolidated extraction, or a P0 left `open` beyond 24h.
+*   `stale` — advisory only: `in_progress` with no update in over 60 minutes. Surfaced, never blocking.
+*   `unextracted_done` — `done` tasks with zero `EXTRACTED_FROM` edges. Impossible through `task_complete` by construction; checked anyway because imports and hand edits exist (beads-imported history is `grandfathered` and exempt).
+*   `counts` — totals per status.
+
 *Example:*
 ```bash
 neurostrata-mcp task validate NeuroStrata
