@@ -9,6 +9,18 @@ to produce these — all are observed behaviour with repro steps.
 
 Severity is my read, adjust as you see fit.
 
+**STATUS UPDATE (later 2026-10-08):** All three data-safety items (BUG-1, BUG-2, BUG-3) are
+**FIXED and verified live** in v1.7.0 (stomped): `neurostrata-mcp status` exists (exit 0
+healthy / 1 down / 2 busy), a second daemon is refused at the lock with a legible message,
+and `backup` is a checkpointed file snapshot that works with or without a daemon (round-trip
+verified on an 8-namespace store) — the engine's `EXPORT DATABASE` turned out to SIGSEGV in
+lbug's planner on *every* store, so the SQL export path is gone entirely. FEATURE-1 and
+FEATURE-2 are also done (the extraction-lock error names both compliance paths; the
+one-daemon-per-store rule is now in README and CLI-readme). Open: BUG-4 (`task_setup`
+rule validation), BUG-5 (import via daemon — runbook: shutdown → import → auto-restart),
+BUG-6/7 (`export-graph` fidelity — use `backup` snapshots as the safety copy instead),
+FEATURE-3 (document `task_validate` categories). Tracked as NeuroStrata tasks.
+
 ---
 
 ## BUG-1 — `daemon` starts on an already-in-use store and SIGSEGVs (HIGH)
