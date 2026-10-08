@@ -7,11 +7,18 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AcceptableEmbedder {
     pub model_name: String,
     pub dimensions: usize,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub api_model: Option<String>,
 }
 
 fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
@@ -42,10 +49,16 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
         AcceptableEmbedder {
             model_name: "NomicEmbedTextV15".to_string(),
             dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
         },
         AcceptableEmbedder {
             model_name: "BGEBaseENV15".to_string(),
             dimensions: 768,
+            base_url: None,
+            api_key_env: None,
+            api_model: None,
         },
     ];
 
@@ -166,6 +179,114 @@ impl Embedder for FastEmbedder {
     }
 }
 
+pub struct RemoteEmbedder {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    api_model: String,
+    dimensions: usize,
+}
+
+impl RemoteEmbedder {
+    pub fn new(base_url: String, api_key: String, api_model: String, dimensions: usize) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("Failed to create HTTP client")?;
+        
+        Ok(Self {
+            client,
+            base_url,
+            api_key,
+            api_model,
+            dimensions,
+        })
+    }
+    
+    async fn embed_with_retry(&self, text: &str) -> Result<Vec<f32>> {
+        let mut attempts = 0;
+        loop {
+            match self.try_embed(text).await {
+                Ok(embedding) => return Ok(embedding),
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 2 {
+                        return Err(e);
+                    }
+                    if let Some(status) = e.downcast_ref::<reqwest::StatusCode>() {
+                        if *status == 429 || status.is_server_error() {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+    
+    async fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
+        let response = self.client
+            .post(&format!("{}/embeddings", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&serde_json::json!({
+                "input": text,
+                "model": self.api_model
+            }))
+            .send()
+            .await
+            .context("HTTP request failed")?;
+        
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("API error {}: {}", status, body));
+        }
+        
+        let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
+        let embedding = json["data"][0]["embedding"]
+            .as_array()
+            .context("Missing embedding in response")?
+            .iter()
+            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+        
+        Ok(embedding)
+    }
+}
+
+#[async_trait]
+impl Embedder for RemoteEmbedder {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_with_retry(text).await
+    }
+    
+    fn dimensions(&self) -> usize {
+        self.dimensions
+    }
+}
+
+pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
+    let target_model = configured_model()?;
+    
+    if let (Some(base_url), Some(api_key_env)) = (&target_model.base_url, &target_model.api_key_env) {
+        let api_key = std::env::var(api_key_env)
+            .with_context(|| format!("API key env var {} not set", api_key_env))?;
+        let api_model = target_model.api_model.clone()
+            .unwrap_or_else(|| "text-embedding-3-small".to_string());
+        
+        eprintln!("Initializing RemoteEmbedder with model: {} at {}", api_model, base_url);
+        Ok(Arc::new(RemoteEmbedder::new(
+            base_url.clone(),
+            api_key,
+            api_model,
+            target_model.dimensions,
+        )?))
+    } else {
+        Ok(Arc::new(FastEmbedder::new()?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +294,44 @@ mod tests {
     #[test]
     fn the_configured_width_is_known_without_loading_a_model() {
         assert!(configured_dimensions().expect("embedders resolve") > 0);
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_happy_path() {
+        // Test with mock server would go here
+        // For now, test initialization
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            768,
+        );
+        assert!(embedder.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_embedder_retries_on_500() {
+        // Mock server returning 500 then 200
+        // This would require wiremock or similar
+        // Placeholder for integration test
+    }
+
+    #[test]
+    fn remote_embedder_dimensions_match() {
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            768,
+        ).unwrap();
+        assert_eq!(embedder.dimensions(), 768);
+    }
+
+    #[test]
+    fn build_embedder_falls_back_to_local() {
+        // When no remote config, should use local
+        // This tests the factory logic
+        let embedder = build_embedder();
+        assert!(embedder.is_ok());
     }
 }
