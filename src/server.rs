@@ -326,6 +326,19 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace", "project_root"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_append_log",
+                        "description": "Episodic Buffer writer: append a timestamped entry to the project's rolling session log, with a Topic Switch marker on tagged turns. Run it silently in the background as you work (the Continuous Backup Protocol).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "content": { "type": "string", "description": "The log entry: what just happened, what changed, what was decided." },
+                                "project_root": { "type": "string", "description": "Absolute path to the project root; the buffer lives at <project_root>/.NeuroStrata/sessions/." },
+                                "tags": { "type": "array", "items": { "type": "string" }, "description": "Topic tags for this turn (e.g. ['auth', 'database']). When present, a Topic Switch marker is injected." }
+                            },
+                            "required": ["content", "project_root"]
+                        }
                     }
                 ]
             });
@@ -480,6 +493,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_task_setup" => {
                             result_text = crate::task::handle_task_setup(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_append_log" => {
+                            result_text = crate::buffer::handle_append_log(arguments).await;
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -2570,6 +2586,7 @@ mod tests {
                 "neurostrata_task_validate",
                 "neurostrata_bootstrap",
                 "neurostrata_task_setup",
+                "neurostrata_append_log",
             ]
         );
         for tool in tools {

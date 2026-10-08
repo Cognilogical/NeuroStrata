@@ -35,14 +35,14 @@ To prevent context bleeding between vastly different projects or languages, Neur
 - **Domain/Project:** Architectural rules tightly bound to a specific codebase's namespace.
 - **Task:** Ephemeral, short-term context tied to an active problem-solving session.
 
-### 8. Git-Atomic Task State (Object Permanence via Beads)
-*Inspired by spatial object permanence.*
-An AI's memory and task state should never decouple from the physical code. NeuroStrata tightly integrates with `bd` (Beads) and Dolt. An agent's active issue state, assignment, and task memory are tied directly to the Git tree. If a developer rolls back a branch or checks out an old commit, the agent's memory and issue state instantly roll back with it, ensuring the AI's worldview always perfectly matches the physical codebase state.
+### 8. Goal-State Permanence (Central Executive)
+*Inspired by object permanence and executive goal maintenance.*
+An AI's memory and task state must never decouple. Goals (tracked work) are Engrams in the same LadybugDB as every other memory — `memory_type: "task"` with a durable, append-only history — so one backup, one restore, and one GraphRAG traversal move knowledge and work state together. A Goal can only be completed through **Knowledge Consolidation**: `neurostrata_task_complete` fails until the work has produced an extracted Engram, and the **Supervisory Attentional System** (pre-push task gate) refuses to ship while Goals remain unfinished. Memory and momentum share one lifecycle.
 
 ### 9. Extended Cognition Workspace (Human-AI Symbiosis via NeuroVault)
 *Inspired by the extended mind thesis.*
 Memory is not locked in a black-box database. Through the NeuroVault and Obsidian integration, the exact same memory nodes the AI uses to structure code are exposed as a visual, navigable markdown graph for human developers. Humans can curate, audit, and organically learn from the same cognitive graph the AI relies on, creating true symbiosis.
 
-### 10. Asynchronous Executive Function (Orchestrator-Worker Pattern)
-*Inspired by the brain's executive control system (frontal lobe).*
-Operating highly intelligent frontier models on trivial code changes is financially and computationally wasteful. NeuroStrata enforces an Orchestrator/Worker divide. A high-intelligence Orchestrator acts as the "executive," routing context, managing the memory graph, and structuring plans, while aggressively offloading physical code execution (file writes, linting, compiling) to a cheaper, narrowly-focused `NeuroStrata-Task` agent.
+### 10. Asynchronous Delegation (Orchestrator-Worker Pattern)
+*Inspired by the brain's division of labor across specialized regions.*
+Operating highly intelligent frontier models on trivial code changes is financially and computationally wasteful. NeuroStrata enforces an Orchestrator/Worker divide. A high-intelligence Orchestrator routes context, manages the memory graph, and structures plans — while the Central Executive tracks the resulting Goals — and aggressively offloads physical code execution (file writes, linting, compiling) to a cheaper, narrowly-focused `NeuroStrata-Task` agent.

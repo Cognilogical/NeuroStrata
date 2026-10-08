@@ -36,3 +36,4 @@ target/
 
 # transient bead gate lock
 .beads.gate.lock
+.neuroplasticity/

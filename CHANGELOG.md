@@ -4,6 +4,67 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.7.0] - 2026-10-08
+
+### Added
+- **Central Executive (task subsystem):** `neurostrata_task_create|claim|update|list|complete|validate` plus `neurostrata_bootstrap` and `neurostrata_task_setup` instructor tools. Goals are LadybugDB memories (`memory_type: "task"`) driven by a hand-rolled 4-state / 8-edge machine; `done` is reachable only through `neurostrata_task_complete`, which requires a consolidated extraction edge (`EXTRACTED_FROM`).
+- **Supervisory Attentional System:** `neurostrata-mcp task gate|validate` and `hooks install` — one pre-push gate hook (exit-code enforcement) with a daemon `/tasks/gate` route and a direct-store fallback. No external task binary required.
+- **Beads migration:** `neurostrata-mcp task import <namespace> --from-beads <path>` — one-shot and idempotent on `bead_id`; closed beads imported as `done` + `grandfathered` past the extraction gate.
+- **Episodic Buffer writer:** `neurostrata_append_log` — timestamped session entries with `### 🔄 Topic Switch` markers, 500KB rollover, retention pruning (`buffer_retention_days`), `episodic_buffer: false` disable, and secret rejection on entry.
+- **Memory vocabulary v2:** `task` memory type and the `EXTRACTED_FROM` relation.
+
+### Changed
+- **Documentation scrub:** Executive-suite naming adopted (Central Executive, Goal, Supervisory Attentional System, Knowledge Consolidation, Action Initiation, Working Memory) across README, AGENTS.md, and the cognitive-architecture docs; CLI-readme documents the new subcommands; changelog backfilled for 1.4.0–1.6.0.
+- **AGENTS.md workflow:** §1/§2 moved from `bd` commands to the task tools; the soft locks now describe the gate and the done-funnel.
+
+### Removed
+- **Beads (`bd`) dependency:** the `.beads/` store, hooks, and Dolt sync are retired — task state lives in LadybugDB and never touches the repository.
+
+---
+
+## [1.6.0] - 2026-10-08
+
+### Added
+- **Prefrontal Cortex (guard module):** behavioral constraint validation for state-mutating actions — semantic rule retrieval from LadybugDB, deterministic rejection, and an optional ephemeral Podman dry-run (`--network=none`, read-only mount, 5s timeout). Exposed as `neurocortex_local_guard_validate` / `neurocortex_learn_behavioral_rule` and the daemon `/validate` route.
+- **Dendritic Bridge:** `RemoteEmbedder` + `build_embedder()` — OpenAI-compatible embedding endpoints declared in `~/.config/neurostrata/embedders.json`, degrading to the local fastembed dendrite when no bridge is declared.
+- **Judgment deduplication:** TypeSafe Jev model integration with a circuit breaker for memory dedup checking.
+
+### Changed
+- README rewritten around the cognitive-architecture naming (SynapticGraph, Engram, Tri-Strata Model, Episodic Buffer, Prefrontal Cortex, Dendritic Bridge).
+
+### Fixed
+- Deleting an absent memory fails loudly instead of returning no-op success.
+
+---
+
+## [1.5.0] - 2026-09-19
+
+### Added
+- **Path-labeled retrieval evidence:** search returns transient evidence paths (`Path [kind]: ...` / `Why: ...`) from bounded directed graph queries; memory vocabulary v1 (`RELATES_TO`, `CONTAINS`, `GOVERNS`).
+
+### Fixed
+- MCP `serverInfo` reports the crate version instead of a hardcoded `1.0.0`.
+- Windows release builds carry the OpenSSL environment setup ported from CI.
+
+---
+
+## [1.4.0] - 2026-09-19
+
+### Added
+- **Doctor & migration toolchain (PRs #21–#28):** repository-relative node identity with `absolute_path` metadata, truthful MCP answers (`get_memory`), GUI daemon client groundwork, ingest-as-a-task background jobs, additive memory correction, and `neurostrata-mcp doctor` for upgrade leftovers.
+
+### Changed
+- Dependency upgrades: tauri 2.11.5 + plugins, root crate to latest, lbug 0.15.3 → 0.20.4, web-ui npm dependencies.
+
+### Fixed
+- Fallible response encoding; secret scanning on MCP entry points; supersede hardening.
+- Store: bounded usage bias, active-result refill, active-only graph export.
+- Ingest keeps blocking filesystem and inference work off the async runtime.
+- Windows: vendored OpenSSL (Strawberry Perl) for lbug link directives; rustls TLS for fastembed/ort prebuilt downloads; intel-mac CI target dropped; CI runs the test suite, not just the build.
+- LanceDB/Qdrant-era leftovers removed; web-ui `no-explicit-any` lint debt cleared.
+
+---
+
 ## [1.3.0] - 2026-05-25
 
 ### Added

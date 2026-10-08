@@ -10,13 +10,14 @@ if [ ! -d ".git" ]; then
 fi
 
 echo ">>> AGENT BOOTING UP..."
-# For Epoch 1 (Failure state): The agent forgets to use bd, forgets to add memory, but creates the file.
+# For Epoch 1 (Failure state): The agent forgets to use the task tools, forgets to add memory, but creates the file.
 # NeuroPlasticity will intercept this failure, and inject a fix into `.neuroplasticity/rules.json`.
 
 # Check if the LLM Meta-Optimizer wrote a rule to fix us!
-if grep -iq "bd" .neuroplasticity/rules.json 2>/dev/null; then
-    echo "Agent read the new rule! Using bd tracker..."
-    bd create "Track task"
+if grep -iq "task" .neuroplasticity/rules.json 2>/dev/null; then
+    echo "Agent read the new rule! Using the task tools..."
+    curl -s -X POST http://127.0.0.1:34343/mcp -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"neurostrata_task_create","arguments":{"namespace":"'"$(basename "$PWD")"'","title":"Track task"}}}'
 fi
 
 echo "Creating hello.txt..."
