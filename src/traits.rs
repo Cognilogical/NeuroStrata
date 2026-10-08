@@ -163,13 +163,15 @@ pub trait VectorStore: Send + Sync {
     /// Increment the access count of a specific memory by its ID.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()>;
 
-    /// Write a portable copy of the whole database into `dir`, which must be
-    /// empty. The engine's own export: parquet per table plus the schema.
+    /// Write a self-contained snapshot of the store into `dir`.
+    ///
+    /// This is a checkpointed file copy, not the engine's EXPORT DATABASE:
+    /// lbug 0.20.4 SIGSEGVs planning EXPORT DATABASE on every store (gdb:
+    /// planExportTableData -> std::__format on a dangling string_view), so the
+    /// SQL export path cannot be used. The store is a single file whose only
+    /// writer is one daemon, so a copy taken right after CHECKPOINT is a
+    /// consistent snapshot.
     async fn export_database(&self, dir: &str) -> Result<()>;
-
-    /// Load a database previously written by `export_database`. Replays the
-    /// exported schema, so it is destructive against a database that has one.
-    async fn import_database(&self, dir: &str) -> Result<()>;
 
     /// Flush everything written so far to durable storage. A long-running
     /// process must call this; writes that only reached the WAL are discarded

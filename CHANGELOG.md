@@ -20,6 +20,10 @@ All notable changes to the NeuroStrata project will be documented in this file.
 ### Removed
 - **Beads (`bd`) dependency:** the `.beads/` store, hooks, and Dolt sync are retired — task state lives in LadybugDB and never touches the repository.
 
+### Fixed
+- **Backup no longer crashes (data safety):** `neurostrata-mcp backup` segfaulted both with and without a daemon — lbug 0.20.4's planner crashes inside `EXPORT DATABASE` on *every* store (gdb: `planExportTableData` → `std::__format` on a dangling string_view). Backups are now checkpointed file snapshots (`ladybug.store` + `manifest.json`), `restore` copies the snapshot before any engine opens it, and the daemon survives `/backup`. Verified round-trip on a live 8-namespace store.
+- **`neurostrata-mcp status`:** read-only preflight (store, daemon, lock) with distinct exit codes for healthy / down / busy — the missing check that made daemon pile-ups possible. A second daemon is refused at the lock with a legible message (verified).
+
 ---
 
 ## [1.6.0] - 2026-10-08

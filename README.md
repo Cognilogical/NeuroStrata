@@ -323,6 +323,8 @@ neurostrata-mcp hooks install    # --force replaces an existing pre-push hook
 
 New projects then call `neurostrata_bootstrap`; existing projects call `neurostrata_task_setup` — both return ordered instructions the agent follows to wire the Central Executive into the repo.
 
+> **Operating rule — one daemon per store.** Every console shares the daemon that serves `127.0.0.1:34343`; never spawn your own. If an MCP connection fails, do **not** start a daemon "just in case" — run `neurostrata-mcp status` first: exit 0 means one is healthy, exit 1 means it is safe to start exactly one, exit 2 means one is still finishing and must be waited out (or `neurostrata-mcp shutdown`). A second daemon is refused at the lock, and `backup` works with or without one.
+
 ### Configuration
 The installer creates a default configuration at `~/.config/neurostrata/config.json`. This holds only the database location, deduplication settings, and the Episodic Buffer retention policy — embedding is configured separately:
 
