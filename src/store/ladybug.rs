@@ -1222,27 +1222,43 @@ impl VectorStore for LadybugStore {
     }
 
     async fn export_database(&self, dir: &str) -> Result<()> {
-        let dir = dir.to_string();
+        let dir = std::path::PathBuf::from(dir);
+        let source = self.local_path.clone();
         self.with_conn(move |conn| {
-            // Checkpoint first so the export cannot miss writes still in the WAL --
-            // which, since replay does not restore rows, would otherwise be lost.
-            conn.query("CHECKPOINT")?;
-            let safe_dir = escape_kuzu_string(&dir);
-            conn.query(&format!("EXPORT DATABASE '{}' (format='parquet')", safe_dir))?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn import_database(&self, dir: &str) -> Result<()> {
-        let dir = dir.to_string();
-        self.with_conn(move |conn| {
-            let safe_dir = escape_kuzu_string(&dir);
-            conn.query(&format!("IMPORT DATABASE '{}'", safe_dir))?;
+            // Checkpoint first so the snapshot cannot miss writes still in the
+            // WAL. The engine's EXPORT DATABASE is not used: it SIGSEGVs in
+            // lbug 0.20.4's planner on every store (planExportTableData ->
+            // std::__format on a dangling string_view).
             conn.query("CHECKPOINT")?;
             Ok(())
         })
-        .await
+        .await?;
+        std::fs::create_dir_all(&dir)?;
+        let target = dir.join("ladybug.store");
+        std::fs::copy(&source, &target)
+            .map_err(|e| anyhow::anyhow!("could not copy {:?} into the snapshot: {}", source, e))?;
+        // A WAL left behind after the checkpoint rides along, so a restore
+        // replays it exactly as the engine would have.
+        let mut wal = source.clone().into_os_string();
+        wal.push(".wal");
+        let wal = std::path::PathBuf::from(wal);
+        if wal.exists() {
+            std::fs::copy(&wal, dir.join("ladybug.store.wal")).map_err(|e| {
+                anyhow::anyhow!("could not copy the write-ahead log into the snapshot: {}", e)
+            })?;
+        }
+        let manifest = serde_json::json!({
+            "format": "neurostrata-snapshot",
+            "version": 1,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "source": source.display().to_string(),
+            "bytes": std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest)?,
+        )?;
+        Ok(())
     }
 
     async fn checkpoint(&self) -> Result<()> {
@@ -1848,6 +1864,26 @@ mod tests {
             "Query execution failed: Cannot start a new write transaction in the system. Only one write transaction at a time is allowed in the system."
         );
         assert!(is_write_collision(&refusal));
+    }
+
+    /// Isolation probe for the EXPORT DATABASE segfault (guinea-pig BUG-3):
+    /// if this dies with SIGSEGV the engine's export is broken on EVERY store,
+    /// not just on one damaged by an incident. A crash here is the diagnosis.
+    #[tokio::test]
+    async fn export_database_survives_a_fresh_store() {
+        let root = std::env::temp_dir().join(format!("lbug-export-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("fresh.lbug");
+        let store = LadybugStore::new(db.to_string_lossy().to_string(), 4).unwrap();
+        store.init("ExportProbe").await.unwrap();
+        let out = root.join("out");
+        store
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("EXPORT snapshot on a fresh store");
+        assert!(out.join("ladybug.store").exists(), "the store file is in the snapshot");
+        assert!(out.join("manifest.json").exists(), "the snapshot carries a manifest");
     }
 
     #[test]

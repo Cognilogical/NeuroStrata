@@ -121,11 +121,18 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Write a portable copy of the database to a directory
+    /// Write a snapshot of the database to a directory (checkpointed file copy)
     Backup {
         /// Directory to write the backup into. Must not already exist
         dir: String,
     },
+
+    /// Report daemon and store state without touching anything
+    ///
+    /// Exit 0: a healthy daemon is serving. Exit 1: no daemon and the lock is
+    /// free -- safe to start one. Exit 2: the lock is held but nothing answers;
+    /// a daemon is busy or finishing, so do not start another.
+    Status,
 
     /// Rebuild a database from a backup, into a file that does not exist yet
     Restore {
@@ -787,6 +794,36 @@ async fn main() -> anyhow::Result<()> {
                 );
                 std::process::exit(1);
             }
+            Commands::Status => {
+                let config = Config::from_default_path()?;
+                let probe = probe_daemon().await;
+                let held = daemon_holds_lock(&config.db_path);
+                let size = std::fs::metadata(&config.db_path).map(|m| m.len()).ok();
+                println!("store: {:?}", config.db_path);
+                match size {
+                    Some(bytes) => println!("store size: {} bytes", bytes),
+                    None => println!("store size: (no file yet)"),
+                }
+                match probe {
+                    DaemonProbe::Responsive => {
+                        println!("daemon: listening on 127.0.0.1:34343, answering");
+                        println!("lock: held");
+                        println!("status: healthy -- one daemon is serving every console");
+                        std::process::exit(0);
+                    }
+                    _ if held => {
+                        println!("daemon: NOT answering, but the store lock is held");
+                        println!("status: busy -- a daemon is still finishing. Do NOT start another; wait, or run neurostrata-mcp shutdown");
+                        std::process::exit(2);
+                    }
+                    _ => {
+                        println!("daemon: not running");
+                        println!("lock: free");
+                        println!("status: down -- safe to start exactly one: neurostrata-mcp daemon");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Commands::Backup { dir } => {
                 // The database is single-writer. When a daemon holds it, ask the
                 // daemon to do the work rather than fighting it for the lock.
@@ -821,10 +858,10 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             Commands::Restore { dir, into } => {
-                // IMPORT DATABASE replays the exported schema, so it only works
-                // against a database that has none. Restoring therefore builds a
-                // new file rather than overwriting a live one -- nothing existing
-                // is dropped, and the switch stays a deliberate step.
+                // A snapshot is a file copy, so restoring means copying it into
+                // place BEFORE any engine opens it -- an open engine maps the
+                // file it was created with, and copying under a live handle is
+                // exactly the memory-unsafety class the backup bug came from.
                 let config = Config::from_default_path()?;
                 let target = into
                     .map(std::path::PathBuf::from)
@@ -840,12 +877,27 @@ async fn main() -> anyhow::Result<()> {
                     std::fs::create_dir_all(parent)?;
                 }
 
+                let snapshot = std::path::Path::new(&dir).join("ladybug.store");
+                if !snapshot.exists() {
+                    eprintln!("{:?} does not look like a snapshot: no ladybug.store inside it.", dir);
+                    std::process::exit(1);
+                }
+                std::fs::copy(&snapshot, &target)?;
+                let mut wal = snapshot.clone().into_os_string();
+                wal.push(".wal");
+                let wal = std::path::PathBuf::from(wal);
+                if wal.exists() {
+                    let mut target_wal = target.clone().into_os_string();
+                    target_wal.push(".wal");
+                    std::fs::copy(&wal, std::path::PathBuf::from(target_wal))?;
+                }
+
+                // Opened only after the copy, to verify the restored store
+                // reads back and to report what it holds.
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     target.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
                 )?);
-                // Deliberately no init() here: the backup carries its own schema.
-                vector_store.import_database(&dir).await?;
 
                 let namespaces = vector_store.list_namespaces().await.unwrap_or_default();
                 println!("Restored {} into {:?}", dir, target);
@@ -1276,6 +1328,19 @@ async fn main() -> anyhow::Result<()> {
                             }
                             println!();
                         }
+                    }
+                    // Reached only through the fallback; the dedicated Status
+                    // arm exits before the store opens. Reported faithfully
+                    // anyway: the daemon is provably not running in this arm.
+                    Commands::Status => {
+                        println!("store: {:?}", config.db_path);
+                        println!("daemon: not running");
+                        println!(
+                            "lock: {}",
+                            if daemon_holds_lock(&config.db_path) { "held" } else { "free" }
+                        );
+                        println!("status: down -- safe to start exactly one: neurostrata-mcp daemon");
+                        std::process::exit(1);
                     }
                     Commands::Namespaces => {
                         let namespaces = vector_store.list_namespaces().await?;

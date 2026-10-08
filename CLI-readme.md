@@ -185,6 +185,37 @@ neurostrata-mcp hooks install --force
 
 ---
 
+### 13. `status`
+Read-only preflight: reports the store, the daemon, and who holds the lock — nothing else. The command to run when an MCP connection fails *before* anyone starts anything.
+```bash
+neurostrata-mcp status
+```
+*Exit codes:*
+*   `0` — a healthy daemon is serving every console.
+*   `1` — no daemon, lock free: safe to start exactly one (`neurostrata-mcp daemon`).
+*   `2` — the lock is held but nothing answers: a daemon is busy or finishing. **Do not start another** — wait, or run `neurostrata-mcp shutdown`.
+
+**One daemon per store; every console shares it; never spawn your own.** A second daemon is refused at the lock (it exits with a message, not a crash), and `status` exists so the refusal is never a surprise.
+
+---
+
+### 14. `backup` / `restore`
+A backup is a **checkpointed file snapshot** of the store: `CHECKPOINT`, then a copy of the store file plus a `manifest.json`. (The engine's `EXPORT DATABASE` is deliberately not used — it crashes in lbug 0.20.4's planner on every store.)
+```bash
+neurostrata-mcp backup <dir>
+neurostrata-mcp restore <dir> --into <new-db-path>
+```
+*   `backup` works with or without a running daemon (with one, the daemon does the work over `/backup`).
+*   `restore` refuses to overwrite an existing file: restore into a new path, check it, then point `db_path` at it.
+
+*Example:*
+```bash
+neurostrata-mcp backup ~/backups/neurostrata-2026-10-08
+neurostrata-mcp restore ~/backups/neurostrata-2026-10-08 --into ~/.config/NeuroStrata/data/db.restored
+```
+
+---
+
 ## 🔒 Safety and Daemon Locks
 
 The CLI binary automatically checks if the daemon is currently active on port `34343` before running any database commands. If the daemon is active, it safely exits with a helpful error message to prevent database file corruption:
