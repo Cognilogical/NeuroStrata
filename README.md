@@ -16,6 +16,8 @@ If you are tired of spending 20 minutes context-loading every new chat, only for
 
 It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by **SynapticGraph**, a biologically-inspired **Dual-Track Bi-Temporal Graph Memory System** written entirely in Rust. It utilizes an embedded LadybugDB vector store and full-text search (BM25 via Tantivy) to ensure your AI remembers exactly *what* to do, *how* to do it, and *why* you built it that way.
 
+That memory is now only the first organ. NeuroStrata is a **complete cognitive architecture** in three parts: **SynapticGraph** and **Engrams** for what the agent knows, a **Prefrontal Cortex** that intercepts state-mutating actions and validates them against your behavioral rules *before* they touch the disk, and a **Dendritic Bridge** that lets external embedding providers deliver signals into the cortex — degrading to a fully local embedder the moment a bridge is not declared.
+
 ---
 
 ## 🌟 Why NeuroStrata Wins: The Zero-Overhead Advantage
@@ -40,6 +42,8 @@ NeuroStrata uses cognitive metaphors to map how software actually evolves. Here 
 | **Eidetic Recall** | **Boot-time Snapshot** | Instant retrieval of the top 5 highest-weighted, active Engrams for a project the exact second a new chat session begins, instantly grounding the agent. |
 | **Tri-Strata Model** | **Namespace Tiers** | Strict partitioning of the database into Global (Company), Domain (Project), and Task (Issue) namespaces to prevent context contamination. |
 | **Episodic Buffer** | **Rolling Log Files** | A silent background log written to `.NeuroStrata/sessions/` capturing all conversational context and architectural pivots so nothing is lost when a chat closes. |
+| **Prefrontal Cortex** | **Behavioral Guard** | A structural executive module that intercepts state-mutating actions (bash, file writes) *before* execution, resolving them against behavioral rules by semantic similarity in LadybugDB, with an optional ephemeral Podman dry-run. |
+| **Dendritic Bridge** | **Remote Embedder** | An external, OpenAI-compatible embedding endpoint that integrates signals from sources outside the cortex, with the local `fastembed` dendrite absorbing every request when no bridge is declared. |
 
 ---
 
@@ -79,12 +83,18 @@ graph TD
         Tier1[("Global Stratum<br/>(Semantic)")]
         Tier2[("Domain Stratum<br/>(Spatial)")]
         Tier3[("Task Stratum<br/>(Working)")]
+        
+        PFC[[🛡️ Prefrontal Cortex<br/>Behavioral Guard]]
+        Dendritic[[🌉 Dendritic Bridge<br/>Embedding Provider]]
     end
     
     LadybugDB[(Embedded LadybugDB<br/>~/.local/share/neurostrata/db)]
     PointerWiki[(Project Files:<br/>docs/architecture/domains/)]
     Obsidian((Obsidian GUI))
     SynapticGraph[[SynapticGraph]]
+    Sandbox[[Ephemeral Podman Sandbox<br/>Network Isolated]]
+    LocalEmbed[[Local fastembed Dendrite]]
+    RemoteAPI((External Embedder<br/>TypeSafe Jev / OpenAI))
     
     Agent <-->|MCP JSON-RPC over stdio| Router
     Router --> Tier1
@@ -100,21 +110,35 @@ graph TD
     
     Obsidian -.->|Reads Local DB directly| LadybugDB
     Obsidian -.->|Reads Local Files directly| PointerWiki
-
+    
+    Agent -->|State-Mutating Action| PFC
+    PFC -->|Verdict: Approve / Reject| Agent
+    PFC -.->|Behavioral Rules| LadybugDB
+    PFC -->|Optional Dry-Run| Sandbox
+    
+    Router -.->|Embedding Requests| Dendritic
+    Dendritic -->|Declared Bridge| RemoteAPI
+    Dendritic -.->|No Bridge Declared| LocalEmbed
+    
     classDef core fill:#1e1e1e,stroke:#00ADD8,stroke-width:2px,color:#fff;
     classDef memory fill:#2d2d2d,stroke:#ff5555,stroke-width:1px,color:#fff;
     classDef engine fill:#3a205e,stroke:#9d4edd,stroke-width:2px,color:#fff;
     classDef tool fill:#1c3d5a,stroke:#3b82f6,stroke-width:1px,color:#fff;
+    classDef guard fill:#3d1f1f,stroke:#ef4444,stroke-width:2px,color:#fff;
     
     class Agent,Router core;
     class Tier1,Tier2,Tier3,LadybugDB,PointerWiki memory;
     class SynapticGraph engine;
     class Obsidian tool;
+    class PFC,Dendritic,Sandbox,LocalEmbed guard;
+    class RemoteAPI tool;
 ```
 
 1. **Global Stratum (Tier 1):** Company-wide constraints and infrastructure mandates (e.g., "Always use `podman` instead of `docker`").
 2. **Domain Stratum (Tier 2):** Project-specific rules and API contracts. Utilizes the SynapticGraph pointer constraint: Engrams are hyper-specific references (`{"file": "docs/...", "lines": "42-49"}`) to physical architecture files.
 3. **Task Stratum (Tier 3):** Ephemeral context for active bug fixes or feature branches.
+4. **Prefrontal Cortex:** Intercepts state-mutating actions on their way *out* of the agent and returns a verdict *before* execution.
+5. **Dendritic Bridge:** Integrates embedding signal from either a declared external endpoint or the local dendrite.
 
 ---
 
@@ -128,13 +152,99 @@ To prevent the loss of critical architectural decisions made during ad-hoc conve
 
 ---
 
+## 🛡️ The Prefrontal Cortex: Behavioral Constraint Validation
+
+A brain that can *remember* a rule and then ignore it has no executive function. The **Prefrontal Cortex** (`src/guard/`) is the organ that closes that loop: it intercepts every state-mutating action an agent proposes — a `bash` command, a file write — and refuses it, with reasons, before a single byte is written.
+
+The naming is not decorative. Recent work on an *artificial prefrontal cortex* for LLM agents describes precisely this structure: a standalone executive module that intercepts jailbreaks, collusion, mutation attempts and long-horizon evasion tactics without contaminating the policy model it defends. Webb, Mondal & Momennejad's MAP architecture reaches the same conclusion from the planning side — modular agentic control improves LLM planning because executive function is best modelled as a *separate* structure rather than an extra prompt.
+
+### How a verdict is reached
+
+1. **Semantic evaluation.** The proposed payload (`action_type` + `payload`) is embedded and vector-searched against the `guard` namespace in LadybugDB, where behavioral rules live as ordinary memories with `memory_type = "guard_rule"`. Matching rules come back ranked by similarity, carrying `rule_class`, `trigger_pattern`, `constraint_text`, `hit_count`, and a `status`.
+2. **Deterministic rejection.** Any non-deprecated rule whose trigger pattern matches the action type or appears in the payload produces an immediate `DeterministicReject`, returning both the violated `constraints` and the human-readable `reasons`. No container is started; the rule alone is decisive. Rules marked `deprecated` are skipped, so retiring a rule never requires deleting it.
+3. **Ephemeral dry-run (optional).** For `bash` and `script` actions the payload is executed for real inside a throwaway container: `podman run --rm --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp -w=/workspace alpine:latest sh -c <payload>`, with a strict **5-second timeout** and a read-only project mount. Podman is the only engine detected — the sandbox does not fall back to Docker. If no engine is present, the Cortex **fails closed** rather than waving the action through.
+4. **Bounded output.** Sandbox `stdout`/`stderr` are truncated to 500 characters. An unbounded log from a failing dry-run would flood the agent's context window and trigger exactly the compaction spiral the Episodic Buffer exists to prevent.
+
+### The verdict vocabulary
+
+| Verdict | Meaning |
+| :--- | :--- |
+| `DeterministicReject` | A stored behavioral rule forbids this action. |
+| `SandboxReject` | The dry-run exited non-zero, errored, or hit the 5s timeout. |
+| `SandboxPassLowFidelity` | The dry-run succeeded in the container. |
+| `SandboxPassHighFidelity` | Semantic evaluation passed with no rule violation and no sandbox requested. |
+| `ApprovedFailOpen` | No check applied to this action type; it proceeds unvalidated. |
+
+Every response also returns `rule_ids_triggered`, so a violation is always attributable to the specific rule that produced it — and `trace_id` carries the action across the whole audit path.
+
+### Hostile-path rejection
+
+Before any container starts, the requested working directory is canonicalised and checked against a forbidden prefix list (`/etc`, `/var/run`, `/root`, `/sys`, `/dev`, `/proc`, `/boot`, and `/` itself). Canonicalisation first means a traversal such as `<project>/../../etc` is resolved before the check, not after.
+
+### Teaching the Cortex
+
+Rules are not hand-written config. Use `neurocortex_learn_behavioral_rule` with a `constraint_text`, a `rule_class`, and a `trigger_pattern`, and the new rule is embedded into the `guard` namespace immediately, where it applies to every future validation. Combined with `neurocortex_local_guard_validate`, the Cortex is a closed loop: rules arrive from experience, and every subsequent state-mutating action is measured against them.
+
+---
+
+## 🌉 The Dendritic Bridge: External Embedding Integration
+
+NeuroStrata's early architecture demanded a long-running embedding endpoint on `localhost:8004` — a foreign process you had to start, keep warm, and remember to shut down. The **Dendritic Bridge** removes that obligation: if a remote provider is declared, signals are integrated through it; if it is not, the cortex simply grows its own local dendrite and nothing is lost.
+
+This mirrors the neuroscientific account of *dendritic integration* (Liu, Ma, Li & Zhou, NeurIPS 2024), where the computational power of a neuron comes not from a single linear synapse but from the **quadratic** combination of many dendritic signals arriving on separate branches. A declared remote endpoint and a local model are two such branches over the same dendrite: the caller cannot tell which one answered, which is precisely the property that makes the degradation invisible.
+
+### Declaring a bridge
+
+Bridges are declared in `~/.config/neurostrata/embedders.json` — a strict JSON array (strict JSON over YAML, per project constraint), written with sensible local defaults on first run:
+
+```json
+[
+  {
+    "model_name": "NomicEmbedTextV15",
+    "dimensions": 768
+  },
+  {
+    "model_name": "text-embedding-3-small",
+    "dimensions": 1536,
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "api_model": "text-embedding-3-small"
+  }
+]
+```
+
+| Field | Role |
+| :--- | :--- |
+| `model_name` | Identity of the entry; also selected by `NEUROSTRATA_MODEL`. |
+| `dimensions` | Vector width, readable *without* loading a model — so `backup`/`restore` work on a fresh, offline machine. |
+| `base_url` | OpenAI-compatible embeddings endpoint. Omit for a purely local cortex. |
+| `api_key_env` | **Name** of the environment variable holding the key, never the key itself. |
+| `api_model` | Model string sent to the remote provider; defaults to `text-embedding-3-small`. |
+
+Any OpenAI-compatible endpoint works — OpenAI, TypeSafe Jev (`https://api.typesafe.ai/v1`, the same provider the plasticity evaluator uses), a local Llama.cpp/Ollama server, or a self-hosted gateway.
+
+### Resolution and graceful degradation
+
+`build_embedder()` reads one rule: **a bridge exists only when both `base_url` and `api_key_env` are declared.** With no bridge declared, embedding falls to the local `fastembed` dendrite (`NomicEmbedTextV15` or `BGEBaseENV15`, 768 dimensions), cached in the shared `~/.cache/neuro/models/fastembed` directory alongside every other Neuro\* tool.
+
+Remote requests carry a 30-second timeout and a single retry after one second of backoff on `429` or a `5xx` — the two failure modes that are genuinely transient. If a bridge *is* declared but its key environment variable is absent, the Cortex reports that fact explicitly instead of silently swapping in a different embedding space. That refusal is deliberate: a quiet fallback to a different-width model would leave every existing Engram in LadybugDB at an incompatible distance, and the damage would surface as mysteriously degraded recall weeks later rather than as a clear error now.
+
+### The law of minimal entropy
+
+Neither organ adds configuration the operator must keep in sync. The Dendritic Bridge derives itself from a single file that the tool writes for you. The Prefrontal Cortex keeps its rules *inside the same LadybugDB namespace mesh* as everything else, so there is no second store to migrate, back up, or reconcile. One database, one configuration surface, no redundant truth.
+
+Together with SynapticGraph and the Engram, the architecture is now complete: **memory** (what the agent knows), **validation** (whether the agent may act on it), and **external integration** (where new signal enters).
+
+---
+
 ## 🚀 Getting Started
 
 NeuroStrata is tool-agnostic. It integrates with the standard `~/.agents/` specification and registers directly into your AI client's configuration (like Claude Desktop or OpenCode).
 
 ### Prerequisites
-1. **Embedder:** An OpenAI-compatible embedding endpoint (e.g., a local Llama.cpp/Ollama on `localhost:8004`, or a hosted provider like OpenAI).
+1. **Embedder:** None required. By default NeuroStrata runs a local `fastembed` model in-process. If you would rather bridge to an external provider (OpenAI, TypeSafe Jev, Llama.cpp/Ollama), declare it in `~/.config/neurostrata/embedders.json` — see **🌉 The Dendritic Bridge**.
 2. **Vector Database:** None! LadybugDB runs entirely embedded within the Rust binary. 
+3. **Container Engine (Prefrontal Cortex, optional):** Podman, if you want sandboxed dry-runs of state-mutating actions. Without it the Cortex still enforces stored behavioral rules but rejects sandbox-dependent checks. 
 
 ### Building from source
 
@@ -165,16 +275,16 @@ cd ~/Documents/neurostrata
 3. Registers the MCP server in your client's local configuration (e.g. `~/.config/opencode/opencode.json`).
 
 ### Configuration
-The installer creates a default configuration at `~/.config/neurostrata/config.json`. Modify this to point to your specific local LLM embedder:
+The installer creates a default configuration at `~/.config/neurostrata/config.json`. This holds only the database location, deduplication settings, and the Episodic Buffer retention policy — embedding is configured separately:
 
 ```json
 {
   "db_path": "~/.local/share/neurostrata/db",
-  "embedder_url": "http://localhost:8004/v1/embeddings",
-  "embedder_api_key": "YOUR_API_KEY_OR_BLANK_FOR_LOCAL",
   "buffer_retention_days": 30
 }
 ```
+
+To use a remote embedding provider, declare the bridge in `~/.config/neurostrata/embedders.json` (see **🌉 The Dendritic Bridge**); with no bridge declared, NeuroStrata embeds locally and requires no configuration at all.
 
 ### Visualizing Memory with Obsidian
 Because NeuroStrata writes standard local files and an embedded LadybugDB database, you can visually curate the AI's memory using Obsidian without running any network servers:
@@ -197,6 +307,14 @@ Once installed, your AI agent automatically gains access to the following tools 
 | `neurostrata_supersede_memory` | Correct a rule. Stores the new text and retires the old one, which keeps its wording as history. |
 | `neurostrata_list_namespaces` | List the namespaces the shared database holds. |
 | `neurostrata_ingest_directory` | Batch-embed an entire architectural documentation folder. |
+
+The **Prefrontal Cortex** is exposed as a separate MCP surface, so an agent can consult or
+train the guard without the memory tools being able to mutate anything:
+
+| Tool Name | Description |
+| :--- | :--- |
+| `neurocortex_local_guard_validate` | Validate a state-mutating action (bash, file writes) *before* it executes. Returns a verdict bucket, the reasons, and the ids of the behavioral rules that triggered. |
+| `neurocortex_learn_behavioral_rule` | Teach the Cortex a new behavioral constraint — `constraint_text`, `rule_class`, and `trigger_pattern` — which applies to every future validation. |
 
 Every tool an agent can reach is additive: none of them destroys a memory. Editing a rule in
 place, deleting one, moving one between namespaces and restoring a backup are **CLI and GUI
@@ -235,3 +353,15 @@ NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications
 
 ## License
 MIT License. See the `LICENSE` file for details. I wrote it, you can use it, keep it, close source it, whatever—just don't sue me!
+
+---
+
+## 📚 References
+
+*Broader cognitive-science grounding is cited inline throughout this document (Liu et al., 2023; Tulving, 1972; O'Keefe & Nadel, 1978; Brooks, 1983). The works below specifically ground the Prefrontal Cortex and the Dendritic Bridge.*
+
+1. **Webb, T., Mondal, S.S., & Momennejad, I. (2025).** A brain-inspired agentic architecture to improve planning with LLMs. *Nature Communications*, 16, 8633. — The MAP (Modular Agentic Planner) architecture, which models executive control as a module inspired by the mammalian prefrontal cortex rather than as additional prompting.
+2. **Liu, C., Ma, J., Li, S., & Zhou, D. (2024).** Dendritic integration inspired artificial neural networks capture data correlation. *NeurIPS 2024*. — Establishes dendritic computation and quadratic integration of multiple signals as the mechanism for capturing data correlation.
+3. **An Artificial Prefrontal Cortex for LLM Agents (2026).** A structural executive module that intercepts jailbreaks, collusion, mutation attempts and long horizon evasion tactics. — The direct architectural antecedent for the behavioral guard described above.
+4. **Farquhar, S., et al. (2024).** Detecting hallucinations in large language models using semantic entropy. *Nature*. — Statistical methods for detecting confabulation, the reason NeuroStrata grounds agents in retrieved pointers rather than in generated prose.
+5. **Stemming Hallucination in Language Models Using a Licensing Oracle (2025).** arXiv:2511.06073. — An architectural approach to hallucination prevention, complementary to the Tri-Strata partitioning used here.
