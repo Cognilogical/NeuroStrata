@@ -1,6 +1,7 @@
 //! Guard module - behavioral constraint validation
 //!
-//! Ported from NeuroCortex: semantic action validation using vector similarity
+//! Provenance: a standalone guard engine folded into NeuroStrata — decision
+//! record in docs/architecture/. Semantic action validation using vector similarity
 //! against stored behavioral rules. Uses LadyBugDB instead of LanceDB.
 
 pub mod models;
