@@ -2,7 +2,9 @@ mod buffer;
 mod config;
 mod daemon;
 mod embed;
+mod events;
 mod guard;
+mod handlers;
 mod ingest_jobs;
 mod judgment;
 mod parser;
@@ -76,6 +78,29 @@ enum Commands {
         /// The memory ID to delete
         id: String,
     },
+
+    /// Archive a memory by ID: tombstone it, keeping its content
+    ///
+    /// Not `delete`. Archiving merges `archived: true` into the row's own
+    /// metadata, so the content, the id and the provenance survive the exact
+    /// moment someone stops trusting it. It goes through the same handler as
+    /// the `neurostrata_archive_memory` tool, so the two cannot disagree
+    /// about what "archived" means.
+    Archive {
+        /// The namespace the memory is in
+        namespace: String,
+
+        /// The memory ID to archive
+        id: String,
+    },
+
+    /// Report what the thalamic bus has done since the daemon started
+    ///
+    /// Reads the running daemon's bus: the pulses are emitted by the daemon
+    /// that owns the store, so a bus built here would count nothing and
+    /// answer with zeros meaning "no daemon" rather than "an idle bus".
+    #[command(name = "bus-metrics")]
+    BusMetrics,
 
     /// Move a memory into another namespace, by ID
     ///
@@ -967,6 +992,151 @@ mod tests {
         }
     }
 
+    /// Task 7's operator surface: both commands exist as spelled here, and
+    /// `archive` takes the namespace and the id in the order the tool surface
+    /// names them -- a swapped pair would archive a row that does not exist
+    /// and report only "no memory with that id".
+    #[test]
+    fn the_archive_and_bus_metrics_commands_parse() {
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "bus-metrics"]).expect("bus-metrics takes no arguments");
+        assert!(
+            matches!(cli.command, Some(Commands::BusMetrics)),
+            "bus-metrics takes no arguments: {:?}",
+            cli.command
+        );
+
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "archive", "MyProj", "mem-1"])
+            .expect("archive takes a namespace and an id");
+        match cli.command {
+            Some(Commands::Archive { namespace, id }) => {
+                assert_eq!(namespace, "MyProj");
+                assert_eq!(id, "mem-1");
+            }
+            other => panic!("expected Archive, got {:?}", other),
+        }
+
+        assert!(
+            Cli::try_parse_from(["neurostrata-mcp", "archive", "MyProj"]).is_err(),
+            "an archive with no id names nothing to archive"
+        );
+    }
+
+    /// Step 4's contract, both halves: with a daemon answering, stdout is that
+    /// daemon's `BusMetrics` JSON and nothing else -- it is what an operator
+    /// pipes into `jq` -- and the command exits 0.
+    ///
+    /// The stub answers with the shared handler's own bytes, so this also holds
+    /// the CLI and the route to one body rather than two shapes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bus_metrics_prints_the_daemons_json_and_exits_zero() {
+        let bus = Arc::new(crate::events::ThalamicBus::new(32));
+        bus.emit(
+            crate::events::ThalamicPulse::Archived {
+                id: "m1".to_string(),
+                namespace: "cli-bus-metrics".to_string(),
+            },
+            &crate::events::RecursionToken::root(),
+        );
+        let body = crate::handlers::handle_bus_metrics(bus).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let expected = body.clone();
+        let stub = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/bus/metrics",
+                axum::routing::post(move || {
+                    let body = expected.clone();
+                    async move { body }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_bus_metrics(true, &addr, &mut out, &mut err).await.unwrap();
+        assert_eq!(code, 0, "a daemon answered: {:?}", String::from_utf8_lossy(&err));
+
+        let printed = String::from_utf8(out).expect("stdout is UTF-8");
+        let snapshot: serde_json::Value = serde_json::from_str(printed.trim())
+            .unwrap_or_else(|e| panic!("stdout must be the metrics JSON itself, not prose about it: {printed} ({e})"));
+        assert_eq!(snapshot["events_emitted"], 1, "one pulse was emitted: {printed}");
+        for field in [
+            "events_emitted",
+            "dispatcher_handled",
+            "subscribers",
+            "queue_depth",
+            "drops_oldest",
+            "subscriber_panics",
+            "subscriber_timeouts",
+            "recursion_blocks",
+        ] {
+            assert!(snapshot.get(field).is_some(), "{field} must be in what the operator reads: {printed}");
+        }
+        assert_eq!(printed.trim(), body.trim(), "stdout is the daemon's body verbatim");
+
+        stub.abort();
+    }
+
+    /// The other half of the same contract: no daemon is not an idle bus, and
+    /// saying so in a stderr caveat while printing zeros to stdout is the
+    /// hazard -- `bus-metrics | jq` cannot see the caveat. So: exit non-zero,
+    /// nothing on stdout, and the refusal names the address it looked at.
+    #[tokio::test]
+    async fn bus_metrics_without_a_daemon_exits_nonzero_and_prints_no_json() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_bus_metrics(false, DAEMON_ADDR, &mut out, &mut err).await.unwrap();
+
+        assert_eq!(code, BUS_METRICS_FAILURE_EXIT, "no daemon is a failure, not an idle bus");
+        assert!(
+            out.is_empty(),
+            "a fabricated zeroed snapshot must never reach stdout: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let said = String::from_utf8(err).expect("stderr is UTF-8");
+        assert!(
+            said.contains(DAEMON_ADDR) && said.contains("cannot read bus metrics"),
+            "the refusal must name the address it could not reach: {said}"
+        );
+    }
+
+    /// A daemon that answered the probe and then went away, or is wedged past
+    /// the timeout, is the same absence to a script: exit 1, no JSON. The
+    /// address is a dead local port, so the POST fails at once -- which is also
+    /// why the request needs a timeout at all, since an unbound port on some
+    /// machines hangs rather than refuses.
+    #[tokio::test]
+    async fn bus_metrics_exits_nonzero_when_the_daemon_never_answers() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = run_bus_metrics(true, &addr, &mut out, &mut err).await.unwrap();
+
+        assert_eq!(code, BUS_METRICS_FAILURE_EXIT, "the daemon never answered");
+        assert!(out.is_empty(), "no JSON is printed for an unreachable daemon: {:?}", String::from_utf8_lossy(&out));
+        let said = String::from_utf8(err).expect("stderr is UTF-8");
+        assert!(said.contains(&addr) && said.contains("cannot read bus metrics"), "{said}");
+    }
+
+    /// The POST is bounded. Untimed it could hang on a port that accepts and
+    /// never replies, which is the behaviour this file documents at the
+    /// readiness wait; there is no way to assert a hang from a test, so the
+    /// bound itself is asserted instead.
+    #[test]
+    fn the_bus_metrics_post_is_bounded() {
+        assert_eq!(
+            BUS_METRICS_TIMEOUT,
+            std::time::Duration::from_secs(10),
+            "the other POSTs in this file use ten seconds; bus-metrics hangs the same way"
+        );
+    }
+
     /// Round 3: a daemon that cannot answer /info predates build verification,
     /// so it is older than any binary that asks -- stale by definition.
     #[test]
@@ -981,6 +1151,110 @@ mod tests {
         assert!(matches!(skew_verdict(Some(&info), (7, 9)), Skew::Stale(_)));
         assert!(matches!(skew_verdict(Some(&info), (6, 8)), Skew::Stale(_)));
     }
+}
+
+/// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
+/// in a refusal an operator has to be able to copy.
+const DAEMON_ADDR: &str = "127.0.0.1:34343";
+
+/// How long `bus-metrics` waits for the daemon's answer. Same ten seconds the
+/// other POSTs in this file use, and for the same reason an unbound port on
+/// this machine hangs rather than refuses: untimed, this command can hang with
+/// no output at all instead of reporting a daemon that is not there.
+const BUS_METRICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The exit code both refusal paths use. Non-zero so `bus-metrics | jq` and any
+/// `set -e` script see the failure rather than reading absence of data as
+/// "the bus is idle".
+const BUS_METRICS_FAILURE_EXIT: i32 = 1;
+
+/// What `bus-metrics` prints on the success path, and nothing else.
+///
+/// Split out from the command arm so the stdout an operator pipes into `jq`
+/// is a thing with a test: it must be the daemon's JSON body, verbatim, with
+/// no banner or caveat wrapped around it. The caveat for a missing daemon
+/// goes to stderr on the other path instead.
+fn print_bus_metrics_to(out: &mut impl std::io::Write, body: &str) -> std::io::Result<()> {
+    writeln!(out, "{}", body)
+}
+
+/// `bus-metrics` with no daemon to ask, as the probe already found out.
+///
+/// No daemon is not "an idle bus": the pulses live in the process that owns the
+/// store, so a bus built here to answer for it would print zeros that a script
+/// cannot distinguish from a real, un-pulsed bus. So this refuses rather than
+/// reporting, and says which address it looked at.
+fn refuse_bus_metrics_to(err: &mut impl std::io::Write, addr: &str) -> std::io::Result<()> {
+    writeln!(
+        err,
+        "no NeuroStrata daemon is running at {} -- cannot read bus metrics",
+        addr
+    )
+}
+
+/// `bus-metrics` when the daemon answered the probe but not the POST: it
+/// stopped listening, or it is wedged past the timeout above. Reported like
+/// any other absence, with the transport's own words kept.
+fn refuse_bus_metrics_unreachable_to(
+    err: &mut impl std::io::Write,
+    addr: &str,
+    cause: &dyn std::fmt::Display,
+) -> std::io::Result<()> {
+    writeln!(
+        err,
+        "no NeuroStrata daemon answered at {} -- cannot read bus metrics: {}",
+        addr,
+        cause
+    )
+}
+
+/// `neurostrata-mcp bus-metrics`, as a function that returns an exit code
+/// instead of taking the process with it.
+///
+/// Both halves of the contract live here so both can be tested: the success
+/// path prints the daemon's `BusMetrics` JSON to `out` and returns 0, and
+/// neither refusal path prints anything to `out`, says why on `err`, and
+/// returns non-zero. `daemon_running` is the caller's earlier probe: it is
+/// what keeps this command from touching the database at all when no daemon
+/// owns it.
+async fn run_bus_metrics(
+    daemon_running: bool,
+    addr: &str,
+    out: &mut impl std::io::Write,
+    err: &mut impl std::io::Write,
+) -> anyhow::Result<i32> {
+    if !daemon_running {
+        refuse_bus_metrics_to(err, addr)?;
+        return Ok(BUS_METRICS_FAILURE_EXIT);
+    }
+
+    let res = match reqwest::Client::new()
+        .post(format!("http://{addr}/bus/metrics"))
+        .timeout(BUS_METRICS_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            refuse_bus_metrics_unreachable_to(err, addr, &e)?;
+            return Ok(BUS_METRICS_FAILURE_EXIT);
+        }
+    };
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // 404 is the expected answer from a daemon older than this route, and
+        // saying so beats reporting an empty body as if the bus had said
+        // nothing at all.
+        writeln!(err, "POST /bus/metrics answered {}: {}", status.as_u16(), body)?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            writeln!(err, "That daemon predates the route. `neurostrata-mcp status` reports a stale daemon by comparing build fingerprints.")?;
+        }
+        return Ok(BUS_METRICS_FAILURE_EXIT);
+    }
+
+    print_bus_metrics_to(out, &body)?;
+    Ok(0)
 }
 
 #[tokio::main]
@@ -1192,6 +1466,24 @@ async fn main() -> anyhow::Result<()> {
                     attempts / 10
                 );
                 std::process::exit(1);
+            }
+            Commands::BusMetrics => {
+                // Answered from the daemon, never from a bus built here: the
+                // pulses are emitted by the daemon that owns the store, so a
+                // local bus reports zeros that read as "an idle bus" rather
+                // than "there is no bus". `probe` was taken before the
+                // database was touched, so this never opens the store.
+                let exit = run_bus_metrics(
+                    daemon_running,
+                    DAEMON_ADDR,
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                )
+                .await?;
+                if exit != 0 {
+                    std::process::exit(exit);
+                }
+                return Ok(());
             }
             Commands::Status => {
                 let config = Config::from_default_path()?;
@@ -1821,6 +2113,33 @@ async fn main() -> anyhow::Result<()> {
                         vector_store.delete(&namespace, &id).await?;
                         println!("Memory deleted successfully.");
                     }
+                    Commands::Archive { namespace, id } => {
+                        // The same handler `neurostrata_archive_memory` calls,
+                        // so the CLI and the tool cannot disagree about what
+                        // "archived" means. It needs a bus to announce the
+                        // tombstone on, and a CLI archive only runs with no
+                        // daemon (a running one holds the database, above) --
+                        // so this bus has no subscribers and the pulse is
+                        // counted by nobody. The write is what was asked for.
+                        let bus = Arc::new(crate::events::ThalamicBus::new(daemon::BUS_CAPACITY));
+                        let arguments = serde_json::json!({ "namespace": namespace, "id": id });
+                        let outcome = crate::handlers::archive_memory::archive_memory(
+                            arguments,
+                            vector_store.clone(),
+                            bus,
+                        )
+                        .await;
+                        // The exit code comes from the variant, not from
+                        // reading the handler's sentence for a prefix: a
+                        // refusal printed on stderr must not report success to
+                        // a script.
+                        if outcome.is_archived() {
+                            println!("{}", outcome);
+                        } else {
+                            eprintln!("{}", outcome);
+                            std::process::exit(1);
+                        }
+                    }
                     Commands::Move { source_namespace, id, target_namespace } => {
                         // One statement that changes the namespace. Copying to the
                         // target and deleting from the source removed the only copy,
@@ -1919,6 +2238,7 @@ async fn main() -> anyhow::Result<()> {
                     | Commands::Restore { .. }
                     | Commands::Task { .. }
                     | Commands::Setup { .. }
+                    | Commands::BusMetrics
                     | Commands::Hooks { .. } => unreachable!(),
                 }
             }

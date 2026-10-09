@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "neurostrata-mcp"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "async-trait",

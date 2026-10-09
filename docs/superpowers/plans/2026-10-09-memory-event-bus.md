@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the Thalamic Bus — a publisher/subscriber system that closes the Continuous Backup Protocol gap, automates the export-freshness gate, and persists guard-event audit rows for the deferred `--causal` export.
+**Goal:** Ship the Thalamic Bus — a publisher/subscriber system that closes the Continuous Backup Protocol gap, ships the SET side of the export-freshness wire (the gate-side consumer is deferred to a follow-up task; see CHANGELOG), and persists guard-event audit rows for the deferred `--causal` export.
 
-**Architecture:** `ThalamicBus` is constructed in `daemon.rs` at startup, held as `Arc<ThalamicBus>`, threaded through `process_mcp_request` as a 5th parameter. Bounded mpsc (cap 10000, drop-oldest) feeds a single dispatcher task that runs each `MemorySubscriber` with a 250ms timeout. `RecursionToken` prevents subscriber-induced loops (default depth 1, upgradeable). Three v1 subscribers: `EpisodicPointerEcho`, `ExportFreshnessDirty`, `GuardEventLog`. Four emit sites: `handle_add_memory`, `handle_supersede_memory`, `handle_task_complete` (extraction path), new `handle_archive_memory`. New daemon endpoints `POST /memory/archive` and `POST /bus/metrics`. Names follow the project's cognitive-anatomy convention (Thalamus = the brain's relay station).
+**Architecture:** `ThalamicBus` is constructed in `daemon.rs` at startup, held as `Arc<ThalamicBus>`, threaded through `process_mcp_request` as a 5th parameter. Bounded `Mutex<VecDeque>` + `Notify` queue (cap 10000, drop-oldest) feeds a single dispatcher task that runs each `MemorySubscriber` with a 250ms timeout. `RecursionToken` prevents subscriber-induced loops (default depth 1; the `upgrade` path is `#[cfg(test)]` in 1.8.0 — the hard 1 is the production ceiling). Three v1 subscribers: `EpisodicPointerEcho`, `ExportFreshnessDirty`, `GuardEventLog`. Four emit sites: `handle_add_memory`, `handle_supersede_memory`, `handle_task_complete` (extraction path), new `handle_archive_memory`. New daemon endpoints `POST /memory/archive` and `POST /bus/metrics`. Names follow the project's cognitive-anatomy convention (Thalamus = the brain's relay station).
 
-**Tech Stack:** Rust (existing toolchain), Tokio (existing), `Arc<ThalamicBus>` threading, `#[non_exhaustive]` enum, `tokio::sync::mpsc` bounded + `tokio::sync::watch` for backpressure events. No new dependencies.
+**Tech Stack:** Rust (existing toolchain), Tokio (existing), `Arc<ThalamicBus>` threading, `#[non_exhaustive]` enum, `Mutex<VecDeque>` + `tokio::sync::Notify` for the bounded queue (not mpsc — drop-oldest's pop cannot be atomic against a receiver parked across `recv().await`; the runtime landed this way in the Task 2 fix round) + `tokio::sync::watch` for backpressure events. No new dependencies.
 
 **Spec:** `docs/superpowers/specs/2026-10-09-memory-event-bus-design.md`
 
@@ -27,9 +27,18 @@ The spec's silent inputs and failure modes most likely to bite a user:
 
 1. **Subscriber panic during a high-throughput `add_memory` burst** — the bus must not fail the write. Drill: a subscriber that panics on every event, while 1000 adds race in.
 2. **Backpressure when the queue fills** — drop-oldest must surface in `bus.metrics()` and `POST /bus/metrics`; the caller must not block. Drill: emit `cap + 50` events with a 1s-sleep subscriber.
-3. **Recursion via the token's upgrade path** — a malicious or buggy subscriber could try to emit under a held token. Drill: explicit `if false && ctx.token.allows_emit() { bus.emit(...) }` is rejected.
+3. **Recursion via the token's upgrade path** — a malicious or buggy subscriber could try to emit under a held token. Drill: Task 2 creates a depth-1 token, attempts `bus.emit(event, &depth1_token)`, asserts the bus drops the event and `recursion_blocks` increments. The check is at the bus boundary (`emit` takes a `&RecursionToken`); the subscriber does not need to call `allows_emit()` itself.
 4. **`Arch::Archived` event with no producer** — easy to ship the bus without a 4th emit site and have a dead variant. Drill: simulate by removing the archive handler and assert the variant is unreached.
 5. **Re-emit idempotency under daemon restart** — without persistence, the bus is in-memory; subscribers re-register on restart but don't replay. Drill: simulate restart, re-emit the same `Created`, assert subscribers are re-fired (acceptable v1 behavior; documented as "no replay").
+
+---
+
+## Pre-task follow-ups (from Task 1 scoped re-review)
+
+These two Minor items are flagged by the Task 1 re-reviewer as "worth landing before Task 2" so Task 2's dispatcher / emit paths don't silently inherit a contract gap or a backpressure ambiguity. Land them BEFORE Task 2's Steps 1–16.
+
+- [x] **Follow-up 1: `src/events/subscriber.rs` `RecursionToken::upgrade` docstring is incomplete.** LANDED: the `upgrade` docstring now states (a) single-use, (b) the parent is mutated, (c) hoist-and-reuse is a misuse; spec line ~113 struck and replaced with the parent-mutated / no-decrement one-liner. Original finding: the CAS-based implementation mutates the parent's depth: a second `upgrade()` on the same parent now returns `None` where it previously succeeded. After `root.upgrade()`, the parent's `allows_emit()` flips from `true` to `false`. Concrete footgun: a caller that hoists one `RecursionToken::root()` into a field and reuses it across emits silently loses emit permission (each blocked emit becomes a drop + `recursion_blocks++`). Update the docstring on `upgrade` to state: (a) the call is single-use, (b) the parent is mutated, (c) hoist-and-reuse is a misuse. Also update the spec's line ~113 ("Bus guarantees the depth counter is decremented even on panic") — the counter is now a *parent* counter that is not decremented; the panic-safety guarantee is satisfied by `upgrade` returning an owned token, not by a decrement path. Strike the "decremented even on panic" line and replace with a one-liner stating the parent is mutated and there is no decrement. **Landed in the pre-task follow-up commit.**
+- [x] **Follow-up 2: `BackpressureEvent::Dropped` is overloaded.** Original finding: the bus's `emit` publishes `BackpressureEvent::Dropped { count: 1 }` for recursion refusals (spec line 87), but the same variant is used for queue-full drops (line 92). Task 8's `POST /bus/metrics` consumer cannot distinguish the two from `Dropped` alone. Two options: (a) add a new `BackpressureEvent::RecursionRefused { token_allows_emit: bool }` variant — clearer separation, one more match arm; (b) keep `Dropped` cause-agnostic and document that callers must correlate against `metrics.recursion_blocks` to disambiguate. The implementer picks. If option (a), update the spec's `BackpressureEvent` enum to add the new variant and document the disambiguation; if option (b), update the spec's emit paragraph (line 87) to say "drop-oldest" specifically. **LANDED as option (a) in the pre-task follow-up commit: new `BackpressureEvent::RecursionRefused { token_allows_emit: bool }` variant; spec emit paragraph (line 87), internals line (92), and error-model table updated (`Dropped` = queue-full only).**
 
 ---
 
@@ -47,8 +56,8 @@ The spec's silent inputs and failure modes most likely to bite a user:
   - `pub trait MemorySubscriber: Send + Sync { fn name(&self) -> &'static str; async fn handle(&self, event: &ThalamicPulse, token: &RecursionToken, ctx: &SubscriberContext) -> Result<(), SubscriberError>; }`
   - `pub struct RecursionToken { depth: AtomicU8 }` with `allows_emit()` and `upgrade()`
   - `pub struct SubscriberContext<'a> { pub store: &'a dyn VectorStore, pub namespace: &'a str, pub ts: i64 }`
-  - `pub enum BackpressureEvent { Dropped { count: u64 }, SubscriberTimeout { name: &'static str }, SubscriberPanic { name: &'static str, payload: String } }`
-  - `pub struct BusMetrics { events_emitted: u64, subscribers: usize, queue_depth: usize, drops_oldest: u64, subscriber_panics: u64, subscriber_timeouts: u64, recursion_blocks: u64 }`
+  - `pub enum BackpressureEvent { Idle, Dropped { count: u64 }, RecursionRefused { token_allows_emit: bool }, SubscriberTimeout { name: &'static str }, SubscriberPanic { name: &'static str, payload: String } }` (`RecursionRefused` added by the pre-task follow-up; `Dropped` is queue-full only; `Idle` is the watch channel's seed — added in the Task 2 fix round so a pre-first-event read is not a false zero-count drop; `SubscriberPanic.payload` is a redacted snippet — first line, control chars stripped, ≤ 200 chars — not the raw panic)
+  - `pub struct BusMetrics { events_emitted: u64, dispatcher_handled: u64, subscribers: usize, queue_depth: usize, drops_oldest: u64, subscriber_panics: u64, subscriber_timeouts: u64, recursion_blocks: u64 }` (`dispatcher_handled` added in the Task 2 fix round to close the invariant `events_emitted == dispatcher_handled + queue_depth + drops_oldest`)
 
 - [ ] **Step 1: Write the failing test for RecursionToken depth**
 
@@ -75,15 +84,24 @@ In `src/events/event.rs` test mod:
 ```rust
 #[test]
 fn thalamic_pulse_variants_construct() {
-    let _ = ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task" };
-    let _ = ThalamicPulse::Superseded { old_id: "a".into(), new_id: "b".into(), namespace: "n".into() };
-    let _ = ThalamicPulse::Archived { id: "x".into(), namespace: "n".into() };
+    // Real assertions, not just `let _ =`. The test must catch a type change
+    // (e.g. `String` -> `Cow`) silently slipping through.
+    let c = ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() };
+    let s = ThalamicPulse::Superseded { old_id: "a".into(), new_id: "b".into(), namespace: "n".into() };
+    let a = ThalamicPulse::Archived { id: "x".into(), namespace: "n".into() };
+    assert!(matches!(c, ThalamicPulse::Created { .. }));
+    assert!(matches!(s, ThalamicPulse::Superseded { .. }));
+    assert!(matches!(a, ThalamicPulse::Archived { .. }));
+    // Field-level checks: the strings are preserved, not silently dropped.
+    match c { ThalamicPulse::Created { id, namespace, kind } => {
+        assert_eq!(id, "x"); assert_eq!(namespace, "n"); assert_eq!(kind, "task");
+    } _ => unreachable!() }
 }
 ```
 
-- [ ] **Step 6: Run, confirm fail** — expect "ThalamicPulse not found".
+- [ ] **Step 6: Run, confirm fail** — expect "ThalamicPulse not found" (compile-time) on the first attempt, then the assertion failures once the type exists.
 
-- [ ] **Step 7: Implement `ThalamicPulse` with `#[non_exhaustive]` and the 3 variants per the spec.**
+- [ ] **Step 7: Implement `ThalamicPulse` with `#[non_exhaustive]` and the 3 variants per the spec (`kind: String`, NOT `&'static str` — emit sites pass `payload.memory_type: String` and would not compile against a `&'static str` field).**
 
 - [ ] **Step 8: Run, confirm pass** — expect PASS.
 
@@ -110,12 +128,13 @@ git commit -m "feat(events): thalamic pulse + subscriber trait + recursion token
 **Interfaces:**
 - Consumes: Task 1's types
 - Produces:
-  - `pub struct ThalamicBus { tx: mpsc::Sender<ThalamicPulse>, subs: Mutex<Vec<Box<dyn MemorySubscriber>>>, metrics: AtomicMetrics, bp_tx: watch::Sender<BackpressureEvent>, capacity: usize }`
-  - `pub fn new(capacity: usize) -> Self` — spawns the dispatcher task on the current runtime
+  - `pub struct ThalamicBus { queue: Arc<Queue>, subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>>, metrics: Arc<AtomicMetrics>, bp_tx: watch::Sender<BackpressureEvent>, capacity: usize, store: Arc<OnceLock<Arc<dyn VectorStore>>> }` where `Queue` is `Mutex<VecDeque<ThalamicPulse>>` + `Notify` (the Task 2 fix round replaced the original mpsc + shared-receiver sketch; see spec Internals for why drop-oldest cannot be atomic against a channel receiver parked across `recv().await`)
+  - `pub fn new(capacity: usize) -> Self` — spawns the dispatcher task on the current runtime; watch channel seeded with `BackpressureEvent::Idle`
+  - `pub fn attach_store(&self, store: Arc<dyn VectorStore>)` — gives the already-running dispatcher the daemon's store for `SubscriberContext`; an inert stand-in (all methods error with "no store attached") serves until then. Consequence of the controller-approved "new() + inert fallback + attach_store" architecture call. Tested in the bus test mod (fix round: reaches-context, keeps-first, errors-before-attach).
   - `pub fn register(&self, sub: Box<dyn MemorySubscriber>) -> SubscriberId`
-  - `pub fn emit(&self, event: ThalamicPulse)` — non-blocking, drop-oldest on full
-  - `pub fn backpressure(&self) -> watch::Receiver<BackpressureEvent>`
-  - `pub fn metrics(&self) -> BusMetrics`
+  - `pub fn emit(&self, event: ThalamicPulse, token: &RecursionToken)` — non-blocking, drop-oldest on full: the push trims the oldest under one std-Mutex critical section (never across an await), counts the trimmed pulse in `drops_oldest` and the arriving one in `events_emitted`; checks `token.allows_emit()` at the boundary (drops + increments `recursion_blocks` + publishes `BackpressureEvent::RecursionRefused { token_allows_emit: false }` if false)
+  - `pub fn backpressure(&self) -> watch::Receiver<BackpressureEvent>` — fresh receivers read `Idle` until the first event (`#[cfg(test)]` in 1.8.0; no production consumer — the gate reads `metrics()`)
+  - `pub fn metrics(&self) -> BusMetrics` — invariant while the dispatcher is between pulses: `events_emitted == dispatcher_handled + queue_depth + drops_oldest`
   - `pub type SubscriberId = usize`
 
 - [ ] **Step 1: Write the failing test: dispatcher runs a registered subscriber**
@@ -128,7 +147,7 @@ async fn dispatcher_invokes_registered_subscriber() {
     let rec = Arc::new(AtomicUsize::new(0));
     let rec2 = rec.clone();
     bus.register(Box::new(CountingSubscriber { counter: rec2 }));
-    bus.emit(ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task" });
+    bus.emit(ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() }, &RecursionToken::root());
     // give dispatcher time
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(rec.load(Acquire), 1, "subscriber ran exactly once");
@@ -138,31 +157,33 @@ Define a tiny `CountingSubscriber` in the test mod that increments the counter o
 
 - [ ] **Step 2: Run, confirm fail** — expect "ThalamicBus not found".
 
-- [ ] **Step 3: Implement `ThalamicBus` with the dispatch loop.** Use `tokio::spawn` to start the dispatcher. Per the spec: bounded mpsc, drop-oldest on full via `try_recv` + `try_send`, single dispatcher task, panic-caught subscribers, 250ms timeout via `tokio::time::timeout`. The `register` method appends to the `subs` Mutex<Vec<...>.
+- [ ] **Step 3: Implement `ThalamicBus` with the dispatch loop.** Use `tokio::spawn` to start the dispatcher. Per the spec: bounded `Mutex<VecDeque>` + `Notify` queue, drop-oldest inside the emit's push (one std-Mutex critical section, never held across an await), single dispatcher task, panic-caught subscribers, 250ms timeout via `tokio::time::timeout`. The `register` method appends to the `subs` Mutex<Vec<...>. (Fix round: the original mpsc + shared-receiver sketch degraded to drop-newest when the receiver was parked holding its guard; the queue redesign is what makes drop-oldest real.)
 
 - [ ] **Step 4: Run, confirm pass** — same command → expect PASS.
 
-- [ ] **Step 5: Write the failing test: drop-oldest when queue is full**
+- [ ] **Step 5: Write the failing test: drop-oldest when queue is full.** The assertion is load-bearing for the *oldest* part: `drops_oldest > 0` alone passes under drop-newest, so the test binds the SlowSubscriber log and asserts the dispatcher saw exactly the newest pulses. Under `#[tokio::test]` (current-thread runtime) the spawned dispatcher is not polled before the five synchronous emits, so the surviving queue is deterministically the last two ids.
 
 ```rust
 #[tokio::test]
 async fn emit_drops_oldest_when_queue_full() {
     let bus = ThalamicBus::new(2);
-    let slow = Arc::new(Mutex::new(Vec::new()));
-    let slow2 = slow.clone();
-    bus.register(Box::new(SlowSubscriber { log: slow2, delay: Duration::from_millis(200) }));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    bus.register(Box::new(SlowSubscriber { log: log2, delay: Duration::from_millis(200) }));
     for i in 0..5 {
-        bus.emit(ThalamicPulse::Archived { id: format!("{i}"), namespace: "n".into() });
+        bus.emit(ThalamicPulse::Archived { id: format!("{i}"), namespace: "n".into() }, &RecursionToken::root());
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let metrics = bus.metrics();
-    assert!(metrics.drops_oldest > 0, "at least one event was dropped: {:?}", metrics);
+    assert_eq!(*log.lock().unwrap(), vec!["3".to_string(), "4".to_string()], "drop-oldest must evict 0,1,2, never the arriving pulse");
+    let m = bus.metrics();
+    assert_eq!(m.drops_oldest, 3);
+    assert_eq!(m.events_emitted, m.dispatcher_handled + m.queue_depth as u64 + m.drops_oldest, "spec invariant");
 }
 ```
 
 - [ ] **Step 6: Run, confirm fail** — expect metrics.drops_oldest to be 0 in the current (no-drop) implementation.
 
-- [ ] **Step 7: Implement drop-oldest** in `emit`: `if let Err(_) = self.tx.try_send(event) { /* queue full */ let _ = self.tx.try_recv(); let _ = self.tx.try_send(event); self.metrics.drops_oldest.fetch_add(1, ...); let _ = self.bp_tx.send(BackpressureEvent::Dropped { count: 1 }); }`
+- [ ] **Step 7: Implement drop-oldest** in `emit`: push under the queue's std `Mutex`, and if the push takes the length over `capacity`, `pop_front()` the oldest in the same critical section — `self.metrics.drops_oldest.fetch_add(1, ...)`, `self.bp_tx.send(BackpressureEvent::Dropped { count })`. `Dropped` is queue-full only (recursion refusals publish `RecursionRefused`, Step 13). Fix-round note: the original sketch shared an `mpsc::Receiver` between the dispatcher and `emit` behind a `tokio::sync::Mutex` so the emit side could `try_recv` the oldest; that failed because the dispatcher's `recv().await` parks *holding* the guard on an empty queue, the pop-side `try_lock` fails, and the retry-Full branch drops the incoming (newest) pulse while counting it as `drops_oldest`. The `Mutex<VecDeque>` + `Notify` queue removes the guard-across-await pattern entirely.
 
 - [ ] **Step 8: Run, confirm pass** — expect PASS.
 
@@ -176,7 +197,7 @@ async fn subscriber_panic_is_caught() {
     let after2 = after.clone();
     bus.register(Box::new(PanicSubscriber));
     bus.register(Box::new(CountingSubscriber2 { counter: after2 }));
-    bus.emit(ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task" });
+    bus.emit(ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() }, &RecursionToken::root());
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(after.load(Acquire), 1, "second subscriber still ran after first panicked");
     let m = bus.metrics();
@@ -190,11 +211,13 @@ async fn subscriber_panic_is_caught() {
 
 - [ ] **Step 12: Run, confirm pass** — expect PASS.
 
-- [ ] **Step 13: Add the `recursion_blocks` counter increment when a subscriber under a held token attempts `bus.emit()` (the emit is dropped, counter increments).** This is the surface Task 1's RecursionToken gates against.
+- [ ] **Step 13: Add the `recursion_blocks` counter increment when a subscriber under a held token attempts `bus.emit()` (the emit is dropped, counter increments, and `BackpressureEvent::RecursionRefused { token_allows_emit: false }` is published on the watch channel — the variant added by pre-task follow-up 2, so a queue-full drop stays distinguishable).** This is the surface Task 1's RecursionToken gates against.
 
-- [ ] **Step 14: Build, run full test suite, confirm green** — `cargo test --release --bin neurostrata-mcp -- --test-threads=1` → expect prior 288 tests + new ones, all pass.
+- [ ] **Step 14: Write a drill test for the recursion guard.** Add `recursion_blocked_under_held_token` to the bus's test mod: register one normal subscriber, then call `bus.emit(event, &RecursionToken::new())` (a depth-1 subscriber-side token, NOT a `root()`). Assert: `metrics.recursion_blocks == 1`; no subscriber invocation happened. This is the "Test the failure path" rule applied: the test must prove the recursion guard actually drops blocked emits.
 
-- [ ] **Step 15: Commit**
+- [ ] **Step 15: Build, run full test suite, confirm green** — `cargo test --release --bin neurostrata-mcp -- --test-threads=1` → expect prior 291 tests + new ones, all pass.
+
+- [ ] **Step 16: Commit**
 
 ```bash
 git add src/events/bus.rs
@@ -211,7 +234,7 @@ git commit -m "feat(events): thalamic bus runtime with bounded mpsc, drop-oldest
 
 **Interfaces:**
 - Consumes: `ThalamicBus` (via `SubscriberContext.store`), `ThalamicPulse::Created`
-- Produces: a line appended to `<project_root>/.NeuroStrata/sessions/<YYYY-MM-DD>.log`. Idempotency: skip if a line with the same id+kind already appears in the file (linear scan, capped at 1000 lines for safety).
+- Produces: a line appended to `<project_root>/.NeuroStrata/sessions/current.md` (the same file `buffer::append_entry` writes to; manual `append_log` calls and automatic echoes land in one place per the union requirement). Honors `buffer::load_config().enabled` — if false, returns `Ok(())` without writing. Idempotency: skip if a `(id, kind)` pair already appears, scanning `current.md` and the newest `session-*.md` (capped at 128 KiB tail per file) so the check survives rollover.
 
 - [ ] **Step 1: Write the failing test: emits a Created event, pointer appears in the buffer file**
 
@@ -219,7 +242,7 @@ In the subscriber's test mod, point `<project_root>` at a tempdir, set up the bu
 
 - [ ] **Step 2: Run, confirm fail** — expect not found.
 
-- [ ] **Step 3: Implement** the subscriber. Use `chrono::Utc::now().format("%Y-%m-%d")` for the filename. Use the existing `episodic_buffer` module (under `src/buffer.rs`) for the write path. Idempotency check: read the file, scan for `<id>\t<kind>`, skip if found.
+- [ ] **Step 3: Implement** the subscriber. **Honor `buffer::load_config().enabled` first** — if false, return `Ok(())` immediately without writing. Use the existing `episodic_buffer` module (under `src/buffer.rs`) for the write path. Idempotency check: read the file, scan for lines whose `{POINTER_LABEL}\t{id}\t{kind}` prefix matches (skip the timestamp/label field, match the id+kind pair), skip if found. The label prefix is the discriminator between subscriber writes and free-text agent notes.
 
 - [ ] **Step 4: Run, confirm pass** — expect PASS.
 
@@ -241,7 +264,7 @@ git commit -m "feat(events): episodic pointer echo subscriber"
 
 **Interfaces:**
 - Consumes: `ThalamicPulse::{Created, Superseded, Archived}`
-- Produces: a per-namespace `dirty: true` flag stored as `metadata.export_freshness_dirty: true` on a sentinel row (or in a new lightweight `freshness_flags` table; pick the storage that matches the rest of the codebase). Read by the export-freshness gate (A4 wire).
+- Produces: a per-namespace `dirty: true` flag stored as `metadata.export_freshness_dirty: true` on a sentinel row (or in a new lightweight `freshness_flags` table; pick the storage that matches the rest of the codebase). (Setter only in 1.8.0; consumer + clear path deferred to a follow-up task — see CHANGELOG.)
 
 - [ ] **Step 1: Write the failing test: Created/Superseded/Archived all set the flag**
 
@@ -317,7 +340,7 @@ In `src/server.rs` test mod, instantiate a test bus with a recording subscriber,
 
 - [ ] **Step 3: Add `bus: Arc<ThalamicBus>` as the 5th parameter to `process_mcp_request`. Update the daemon's call site in `src/daemon.rs` to construct and pass it (defer the actual bus construction to Task 8; for now, take it as a parameter and use it).**
 
-- [ ] **Step 4: In `handle_add_memory`, after the schema-ready write succeeds, call `bus.emit(ThalamicPulse::Created { id, namespace, kind: payload.memory_type })`. Wrap in `let _ = bus.emit(...);` (fire-and-forget).**
+- [ ] **Step 4: In `handle_add_memory`, after the schema-ready write succeeds, call `bus.emit(ThalamicPulse::Created { id, namespace, kind: payload.memory_type }, &RecursionToken::root())`. Wrap in `let _ = bus.emit(...);` (fire-and-forget).**
 
 - [ ] **Step 5: Run, confirm pass** — expect PASS.
 
@@ -398,7 +421,7 @@ In a daemon integration test (or by adding a test in `src/daemon.rs` test mod), 
 
 - [ ] **Step 2: Run, confirm fail** — expect daemon to not yet construct the bus (or to construct with 0 subscribers).
 
-- [ ] **Step 3: At the top of the daemon's startup sequence (after `vector_store` and `embedder` are constructed but before the HTTP server is bound), construct `let bus = Arc::new(ThalamicBus::new(10_000));` and register the 3 v1 subscribers.**
+- [ ] **Step 3: At the top of the daemon's startup sequence (after `vector_store` and `embedder` are constructed but before the HTTP server is bound), construct `let bus = Arc::new(ThalamicBus::new(10_000));` — immediately `bus.attach_store(vector_store.clone());` (the dispatcher starts in `new()` and needs the store for every `SubscriberContext`), then register the 3 v1 subscribers.**
 
 - [ ] **Step 4: Plumb `bus.clone()` into the HTTP server's request handler alongside the existing `vector_store` and `embedder`.**
 
@@ -426,7 +449,7 @@ git commit -m "feat(daemon): construct thalamic bus and register 3 v1 subscriber
 **Files:**
 - Modify: `Cargo.toml` (line 3: `version = "1.7.0"` → `version = "1.8.0"`)
 - Modify: `CHANGELOG.md` (collapse `[Unreleased]` into a new dated `[1.8.0] - 2026-10-09` section; add the bus + subscribers + endpoints entries)
-- Modify: `docs/COGNITIVE_ARCHITECTURE.md` (add glossary entries for `ThalamicBus` and `ThalamicPulse`)
+- Modify: `README.md` (append the `ThalamicBus` and `ThalamicPulse` rows to the canonical Biological Nomenclature table; `docs/COGNITIVE_ARCHITECTURE.md` is a pointer to it — do not duplicate the table)
 
 **Interfaces:** none (documentation + version metadata)
 
@@ -437,18 +460,18 @@ git commit -m "feat(daemon): construct thalamic bus and register 3 v1 subscriber
 - [ ] **Step 3: Add the following `### Added` entries to the `[1.8.0]` section:**
 
 ```
-- **Thalamic Bus (memory-event system):** a publisher/subscriber bus constructed in `daemon.rs` and threaded through `process_mcp_request` as `Arc<ThalamicBus>`. Bounded mpsc (cap 10000, drop-oldest) feeds a single dispatcher task that runs each `MemorySubscriber` with a 250ms timeout and a panic-catcher. `RecursionToken` prevents subscriber-induced loops. New endpoints `POST /memory/archive` and `POST /bus/metrics`. Three v1 subscribers: `EpisodicPointerEcho` (closes the Continuous Backup Protocol gap by writing a pointer to the episodic buffer on every `Created`), `ExportFreshnessDirty` (sets a per-namespace dirty flag consumed by the export-freshness gate, A4 wire), `GuardEventLog` (persists every `guard_validate` call as a `memory_type: "guard_event"` row with a 32-bit payload hash). Four emit sites: `add_memory`, `supersede_memory`, `task_complete` extraction, the new `archive_memory` handler. Names follow the cognitive-anatomy convention — Thalamus is the brain's relay station, which is what a pub-sub bus does.
+- **Thalamic Bus (memory-event system):** a publisher/subscriber bus constructed in `daemon.rs` and threaded through `process_mcp_request` as `Arc<ThalamicBus>`. Bounded queue (cap 10000, drop-oldest) feeds a single dispatcher task that runs each `MemorySubscriber` with a 250ms timeout and a panic-catcher. `RecursionToken` prevents subscriber-induced loops. New endpoints `POST /memory/archive` and `POST /bus/metrics`. Three v1 subscribers: `EpisodicPointerEcho` (closes the Continuous Backup Protocol gap by writing a pointer to the episodic buffer on every `Created`), `ExportFreshnessDirty` (sets a per-namespace dirty flag on every storage mutation; the gate-side consumer and clear path are deferred to a follow-up task, so the export-freshness gate does not yet consult this flag in 1.8.0), `GuardEventLog` (persists every `guard_validate` call as a `memory_type: "guard_event"` row with a 32-bit payload hash). Four emit sites: `add_memory`, `supersede_memory`, `task_complete` extraction, the new `archive_memory` handler. Names follow the cognitive-anatomy convention — Thalamus is the brain's relay station, which is what a pub-sub bus does.
 - **Memory vocabulary v4:** `ThalamicPulse` (the bus event type) and `GuardedActionFired` (the 4th variant for guard audit).
 ```
 
-- [ ] **Step 4: In `docs/COGNITIVE_ARCHITECTURE.md`, find the existing glossary / cognitive-names table and add two new rows:**
+- [ ] **Step 4: Append the two new rows to the canonical `README.md` Biological Nomenclature table (Biological Nomenclature ↔ Engineering Primitives) if they are not already present. Skip this step on replay — `README.md:53-54` is the canonical home; do not duplicate. `docs/COGNITIVE_ARCHITECTURE.md` is a pointer to that table — do NOT duplicate the table there.**
 
 ```
-| **Thalamic Bus** | The pub-sub event system in `src/events/`. Thalamus = the brain's relay station; the bus relays storage events (Created, Superseded, Archived, GuardedActionFired) from emit sites to subscribers. |
-| **Thalamic Pulse** | A single event on the Thalamic Bus. Cognitive name for `ThalamicPulse` (the `#[non_exhaustive]` enum). |
+| **ThalamicBus** | **Pub-Sub Event Bus** | The thalamus is the brain's relay station; this is NeuroStrata's. A bounded, in-process broadcast backbone in `src/events/` carrying memory-lifecycle pulses from emit sites to subscribers. |
+| **ThalamicPulse** | **Event Enum** | A single event travelling on the bus — the `#[non_exhaustive]` `ThalamicPulse` enum. Subscribers reach the store only through their `SubscriberContext`. |
 ```
 
-If the file does not contain a cognitive-names table, add a new section at the end titled "## Cognitive-name glossary" with the entries (and add the 1.7.0 entries for completeness).
+Match the surrounding table's column count and phrasing so the rows read as one table.
 
 - [ ] **Step 5: Build, confirm no warnings** — `cargo build --release` → 0 new warnings (the 11 baseline warnings are tolerated).
 
@@ -457,7 +480,7 @@ If the file does not contain a cognitive-names table, add a new section at the e
 - [ ] **Step 7: Commit**
 
 ```bash
-git add Cargo.toml CHANGELOG.md docs/COGNITIVE_ARCHITECTURE.md
+git add Cargo.toml CHANGELOG.md README.md
 git commit -m "chore(release): 1.8.0 — thalamic bus, cognitive names, 3 v1 subscribers"
 ```
 

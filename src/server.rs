@@ -4,6 +4,7 @@ use serde_json::{self, Value};
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 use crate::guard::{BehavioralRule, GuardValidator, ValidateResponse};
 
 #[derive(Deserialize)]
@@ -71,6 +72,7 @@ pub async fn process_mcp_request(
     store: Arc<dyn VectorStore>,
     ingests: Arc<crate::ingest_jobs::IngestJobs>,
     deduplication_checker: Option<Arc<crate::judgment::DeduplicationChecker>>,
+    bus: Arc<crate::events::ThalamicBus>,
 ) -> Value {
     let id = request.id.clone();
     match request.method.as_str() {
@@ -423,6 +425,18 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name or 'global'. Defaults to 'global'." }
                             }
                         }
+                    },
+                    {
+                        "name": "neurostrata_archive_memory",
+                        "description": "Mark a memory as archived by writing a tombstone beside it. The row keeps its content, id and metadata; archived is merged in rather than replacing what was there. Metadata-only: no retrieval path filters on it yet, so an archived memory still appears in search_memory in 1.8.0.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to archive." },
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') the memory lives in." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
                     }
                 ]
             });
@@ -500,7 +514,7 @@ pub async fn process_mcp_request(
                             result_text = handle_list_namespaces(store.clone()).await;
                         }
                         "neurostrata_add_memory" => {
-                            result_text = handle_add_memory(arguments, emb.clone(), store.clone(), deduplication_checker.clone()).await;
+                            result_text = handle_add_memory(arguments, emb.clone(), store.clone(), deduplication_checker.clone(), bus.clone()).await;
                         }
                         "neurostrata_get_memory" => {
                             result_text = handle_get_memory(arguments, store.clone()).await;
@@ -530,7 +544,7 @@ pub async fn process_mcp_request(
                             result_text = handle_search_memory(arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_supersede_memory" => {
-                            result_text = handle_supersede_memory(arguments, emb.clone(), store.clone()).await;
+                            result_text = handle_supersede_memory(arguments, emb.clone(), store.clone(), bus.clone()).await;
                         }
                         "neurostrata_procedure_perform" => {
                             result_text = crate::tools::procedure::handle_procedure_perform(arguments, store.clone()).await;
@@ -553,6 +567,7 @@ pub async fn process_mcp_request(
                                 emb.clone(),
                                 store.clone(),
                                 deduplication_checker.clone(),
+                                bus.clone(),
                             )
                             .await
                             {
@@ -585,13 +600,16 @@ pub async fn process_mcp_request(
                             result_text = crate::buffer::handle_append_log(arguments).await;
                         }
                         "neurostrata_guard_validate" => {
-                            result_text = handle_guard_validate(arguments, store.clone(), emb.clone()).await;
+                            result_text = handle_guard_validate(arguments, store.clone(), emb.clone(), bus.clone()).await;
                         }
                         "neurostrata_guard_learn" => {
                             result_text = handle_guard_learn(arguments, store.clone(), emb.clone()).await;
                         }
                         "neurostrata_guard_list_rules" => {
                             result_text = handle_guard_list_rules(arguments, store.clone(), emb.clone()).await;
+                        }
+                        "neurostrata_archive_memory" => {
+                            result_text = crate::handlers::archive_memory::handle_archive_memory(arguments, store.clone(), bus.clone()).await;
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -1038,6 +1056,7 @@ async fn handle_add_memory(
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
     deduplication_checker: Option<Arc<crate::judgment::DeduplicationChecker>>,
+    bus: Arc<ThalamicBus>,
 ) -> String {
     let content = match arguments.get("content").and_then(|c| c.as_str()) {
         Some(c) => c,
@@ -1152,7 +1171,18 @@ async fn handle_add_memory(
         )
         .await
         {
-            Ok(_) => {
+            Ok(new_id) => {
+                // Emit site 1. The write is already durable, so the pulse is
+                // fire-and-forget: a bus that cannot take it must not turn a
+                // stored memory into a failed call.
+                bus.emit(
+                    ThalamicPulse::Created {
+                        id: new_id,
+                        namespace: namespace.to_string(),
+                        kind: payload.memory_type.clone(),
+                    },
+                    &RecursionToken::root(),
+                );
                 let mut msg = format!("Successfully added memory for namespace: {}", namespace);
                 if adopted_governs {
                     msg.push_str(" (governs set from the Governs line in your content)");
@@ -1318,6 +1348,7 @@ async fn handle_supersede_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
+    bus: Arc<ThalamicBus>,
 ) -> String {
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
@@ -1583,6 +1614,19 @@ async fn handle_supersede_memory(
             new_id, id, e
         );
     }
+
+    // Emit site 2. After both writes, not after the first: a pulse published
+    // when only the successor existed would tell subscribers the old row was
+    // retired while it was still active. Fire-and-forget -- the move is
+    // durable either way.
+    bus.emit(
+        ThalamicPulse::Superseded {
+            old_id: id.to_string(),
+            new_id: new_id.clone(),
+            namespace: namespace.to_string(),
+        },
+        &RecursionToken::root(),
+    );
 
     let mut report = format!(
         "Superseded {} with {} in namespace {}. The old memory keeps its text and is no longer returned by search; it is still readable by id.",
@@ -2083,6 +2127,7 @@ async fn handle_guard_validate(
     arguments: Value,
     store: Arc<dyn VectorStore>,
     embedder: Arc<dyn Embedder>,
+    bus: Arc<ThalamicBus>,
 ) -> String {
     let action_type = match arguments.get("action_type").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
@@ -2118,14 +2163,64 @@ async fn handle_guard_validate(
         verdict,
         rule_ids_triggered,
     };
+
+    // Emit site 4. The verdict's own `bucket` tag, read back off the serialized
+    // response rather than re-derived from the enum: the audit row then records
+    // exactly what the caller was told, and the two cannot drift apart.
+    //
+    // The payload travels as a digest, never as itself -- a guard call carries
+    // file contents and shell arguments, and this pulse is the thing most
+    // likely to be logged and exported.
     let body = serde_json::to_string_pretty(&response)
         .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {}\"}}", e));
+    if let Ok(value) = serde_json::from_str::<Value>(&body) {
+        let verdict_bucket = value["verdict"]["bucket"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        let rules: Vec<String> = value["rule_ids_triggered"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        bus.emit(
+            ThalamicPulse::GuardedActionFired {
+                trace_id: trace_id.clone(),
+                action_type: action_type.to_string(),
+                payload_hash: fnv1a_32(payload.as_bytes()),
+                verdict: verdict_bucket,
+                rule_ids_triggered: rules,
+                namespace: namespace.clone(),
+            },
+            &RecursionToken::root(),
+        );
+    }
+
     // Prefix the namespace + trace so the caller can audit which rule set
     // produced the verdict without re-parsing the body.
     format!(
         "namespace: {}\ntrace_id: {}\n{}",
         namespace, trace_id, body
     )
+}
+
+/// FNV-1a, 32-bit, over the action payload.
+///
+/// Hand-rolled rather than `std`'s `DefaultHasher` for the reason
+/// `daemon::exe_fingerprint` already states: std's hasher makes no stability
+/// promise across releases, and an audit commitment that silently changes value
+/// between toolchain versions cannot be compared to a row written last week.
+/// A collision costs one audit row's precision, never its existence.
+fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in bytes {
+        hash ^= *b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 /// Teach a new behavioral rule to the guard namespace. Wraps
@@ -2360,6 +2455,7 @@ mod migration_notice_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 
 
     /// A request the proxy could not forward is answered, not dropped. Dropping
@@ -2508,6 +2604,72 @@ mod tests {
         }
     }
 
+    // ── the bus, as the request handlers see it ────────────────────────────────
+
+    /// Records every pulse the dispatcher hands it, in order. The bus has no
+    /// "what did you carry" query by design, so a test that wants to assert on
+    /// a pulse registers this and reads the log.
+    struct PulseRecorder {
+        seen: Arc<std::sync::Mutex<Vec<ThalamicPulse>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::events::MemorySubscriber for PulseRecorder {
+        fn name(&self) -> &'static str {
+            "pulse_recorder"
+        }
+
+        async fn handle(
+            &self,
+            event: &ThalamicPulse,
+            _token: &RecursionToken,
+            _ctx: &crate::events::SubscriberContext<'_>,
+        ) -> Result<(), crate::events::SubscriberError> {
+            self.seen.lock().expect("recorder lock").push(event.clone());
+            Ok(())
+        }
+    }
+
+    /// A bus for a test that only needs the emit site to be callable -- the
+    /// paths that are rejected before any write, where nothing should be
+    /// published and nobody is asserting on it.
+    fn quiet_bus() -> Arc<ThalamicBus> {
+        recording_bus().0
+    }
+
+    /// A bus with one recorder on it, plus the recorder's log.
+    ///
+    /// No store is attached: the recorder never reads `ctx.store`, and an
+    /// attach would only couple these tests to a temp database they do not
+    /// need.
+    fn recording_bus() -> (Arc<ThalamicBus>, Arc<std::sync::Mutex<Vec<ThalamicPulse>>>) {
+        let bus = Arc::new(ThalamicBus::new(64));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        bus.register(Box::new(PulseRecorder { seen: seen.clone() }));
+        (bus, seen)
+    }
+
+    /// Wait for the dispatcher to deliver `at_least` pulses, then hand back
+    /// everything it recorded. Polls rather than sleeping a fixed interval: the
+    /// dispatcher is a background task, so the only question is whether it has
+    /// caught up yet.
+    async fn pulses_seen(
+        seen: &Arc<std::sync::Mutex<Vec<ThalamicPulse>>>,
+        at_least: usize,
+    ) -> Vec<ThalamicPulse> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if seen.lock().expect("recorder lock").len() >= at_least {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the dispatcher delivered the pulses");
+        seen.lock().expect("recorder lock").clone()
+    }
+
     async fn store_with_one_rule(namespace: &str) -> (Arc<dyn VectorStore>, String) {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
@@ -2582,6 +2744,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use docker" }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.starts_with("Superseded"), "got {}", reply);
@@ -2616,6 +2779,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use docker" }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
 
@@ -2632,8 +2796,8 @@ mod tests {
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
         let args = serde_json::json!({ "id": old_id, "namespace": "probe", "content": "second" });
 
-        handle_supersede_memory(args.clone(), emb.clone(), store.clone()).await;
-        let again = handle_supersede_memory(args, emb, store).await;
+        handle_supersede_memory(args.clone(), emb.clone(), store.clone(), quiet_bus()).await;
+        let again = handle_supersede_memory(args, emb, store, quiet_bus()).await;
         assert!(again.contains("already superseded"), "got {}", again);
     }
 
@@ -2648,6 +2812,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "global", "content": "changed" }),
             emb.clone(),
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(refused.contains("ERROR [GLOBAL]"), "got {}", refused);
@@ -2659,6 +2824,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "global", "content": "changed", "allow_global": true }),
             emb,
             store,
+            quiet_bus(),
         )
         .await;
         assert!(allowed.starts_with("Superseded"), "got {}", allowed);
@@ -2674,6 +2840,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "probe", "content": "use ghp_aaaabbbbccccdddd" }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(refused.contains("ERROR [SECURITY]"), "got {}", refused);
@@ -2700,6 +2867,7 @@ mod tests {
             emb,
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("ERROR"), "string metadata should be rejected: {}", reply);
@@ -2721,6 +2889,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "probe", "content": "new rule" }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("legacy-shaped"), "got {}", reply);
@@ -2752,6 +2921,7 @@ mod tests {
             serde_json::json!({ "id": id, "namespace": "probe", "content": "corrected rule" }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.starts_with("Superseded"), "got {}", reply);
@@ -2794,6 +2964,7 @@ mod tests {
             }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.starts_with("Superseded"), "got {}", reply);
@@ -2839,6 +3010,7 @@ mod tests {
             }),
             emb.clone(),
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.starts_with("Superseded"), "got {}", reply);
@@ -2868,6 +3040,7 @@ mod tests {
             }),
             emb.clone(),
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("governs (from your content line)"), "got {}", reply);
@@ -2893,6 +3066,7 @@ mod tests {
             }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("2 conflicting Governs lines"), "got {}", reply);
@@ -2918,6 +3092,7 @@ mod tests {
             }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("Recorded why on the retired memory as superseded_reason"), "got {}", reply);
@@ -2972,6 +3147,7 @@ mod tests {
             }),
             emb.clone(),
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("Replaced metadata: source"), "got {}", reply);
@@ -3001,6 +3177,7 @@ mod tests {
             }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         let (_, new_b) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
@@ -3019,6 +3196,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use podman, v2" }),
             emb.clone(),
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.starts_with("Superseded"), "the correction itself still lands: {}", reply);
@@ -3053,6 +3231,7 @@ mod tests {
             }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("NO reason was recorded"), "got {}", reply);
@@ -3085,6 +3264,7 @@ mod tests {
             serde_json::json!({ "id": id, "namespace": "probe", "content": "sourced rule, v2" }),
             emb,
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(
@@ -3123,6 +3303,7 @@ mod tests {
             serde_json::json!({ "id": old_id, "namespace": "probe", "content": "first correction" }),
             emb.clone(),
             store.clone(),
+            quiet_bus(),
         )
         .await;
         assert!(reply1.starts_with("Superseded"), "first: {}", reply1);
@@ -3153,6 +3334,7 @@ mod tests {
             emb,
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await;
         assert!(reply.contains("ERROR [SECURITY]"), "got {}", reply);
@@ -3395,8 +3577,16 @@ mod tests {
             method: "tools/list".to_string(),
             params: Some(serde_json::json!({})),
         };
-        let response =
-            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None).await;
+        let (bus, _seen) = recording_bus();
+        let response = process_mcp_request(
+            request,
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools/list returns an array");
@@ -3427,6 +3617,7 @@ mod tests {
                 "neurostrata_guard_validate",
                 "neurostrata_guard_learn",
                 "neurostrata_guard_list_rules",
+                "neurostrata_archive_memory",
             ]
         );
         for tool in tools {
@@ -3440,6 +3631,25 @@ mod tests {
             .expect("the correction tool is exposed");
         assert!(supersede["inputSchema"]["properties"]["reason"].is_object(), "supersede takes a reason");
         assert!(supersede["inputSchema"]["properties"]["source"].is_object(), "supersede takes a source");
+        // The tombstone tool's schema is the only thing a client reads before
+        // calling it, so a schema that silently lost a required field would
+        // turn every archive call into a runtime error instead.
+        let archive = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_archive_memory")
+            .expect("the archive tool is exposed");
+        assert!(archive["inputSchema"]["properties"]["id"].is_object(), "archive takes an id");
+        assert!(
+            archive["inputSchema"]["properties"]["namespace"].is_object(),
+            "archive takes a namespace"
+        );
+        let required: Vec<&str> = archive["inputSchema"]["required"]
+            .as_array()
+            .expect("archive declares what it requires")
+            .iter()
+            .map(|v| v.as_str().expect("a required field name"))
+            .collect();
+        assert_eq!(required, vec!["id", "namespace"], "both fields are required");
         // The vocabulary summaries are still appended to their tools.
         let summaries = crate::traits::memory_vocabulary().get("tool_summaries").unwrap().clone();
         assert!(summaries.get("add").is_some());
@@ -3635,6 +3845,368 @@ mod tests {
         assert!(text.contains("\"remaining_fires\": 0"), "{}", text);
     }
 
+    /// Emit site 1: the write that created a memory is the moment subscribers
+/// get told, without anyone remembering to tell them. Asserts the pulse
+/// carries the id the store actually holds -- a `Created` naming some other
+    /// row would send every subscriber to read the wrong memory.
+    #[tokio::test]
+    async fn adding_a_memory_emits_created_naming_the_stored_row() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, seen) = recording_bus();
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+
+        let response = process_mcp_request(
+            JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(1)),
+                method: "tools/call".to_string(),
+                params: Some(serde_json::json!({
+                    "name": "neurostrata_add_memory",
+                    "arguments": {
+                        "content": "checkpoint after every write",
+                        "namespace": "probe",
+                        "memory_type": "rule"
+                    }
+                })),
+            },
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+
+        assert!(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("a text result")
+                .starts_with("Successfully added memory"),
+            "{}",
+            response
+        );
+
+        let pulses = pulses_seen(&seen, 1).await;
+        match &pulses[0] {
+            ThalamicPulse::Created { id, namespace, kind } => {
+                assert_eq!(namespace, "probe");
+                assert_eq!(kind, "rule", "the pulse carries the memory_type");
+                // The id is the store's, not a fresh uuid: the whole point of
+                // the pulse is that a subscriber can read that row back.
+                let stored: Vec<String> = store
+                    .list("probe", None)
+                    .await
+                    .expect("list")
+                    .into_iter()
+                    .map(|r| r.id)
+                    .filter(|row| row == id)
+                    .collect();
+                assert_eq!(stored.len(), 1, "pulse names a row the store holds: {}", id);
+            }
+            other => panic!("expected Created, got {:?}", other),
+        }
+    }
+
+    /// Emit site 2: a correction is two rows moving, and the pulse has to name
+/// both ends of the move. Asserts old_id is the row that was retired and
+/// new_id the row that replaced it -- a `Superseded` with the ends swapped
+/// would send every subscriber down the wrong chain.
+    #[tokio::test]
+    async fn superseding_emits_superseded_naming_both_ends_of_the_move() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let (bus, seen) = recording_bus();
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": old_id,
+                "content": "always use podman, never docker",
+                "namespace": "probe",
+                "reason": "docker is forbidden"
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            bus,
+        )
+        .await;
+        assert!(reply.starts_with(&format!("Superseded {}", old_id)), "{}", reply);
+
+        let pulses = pulses_seen(&seen, 1).await;
+        match &pulses[0] {
+            ThalamicPulse::Superseded { old_id: from, new_id: to, namespace } => {
+                assert_eq!(from, &old_id, "the retired row");
+                assert_eq!(namespace, "probe");
+                assert_ne!(to, from, "the replacement is a different row");
+                // Both ends are real rows the store holds, and the old one
+                // really is retired: the pulse must not describe a move that
+                // did not happen.
+                let (vector, retired) = store
+                    .get("probe", from)
+                    .await
+                    .expect("read")
+                    .expect("the retired row still exists");
+                assert_eq!(vector.len(), 4);
+                assert!(retired.metadata["valid_to"].is_i64(), "the old row is retired");
+                assert_eq!(retired.metadata["superseded_by"], serde_json::json!(to.as_str()));
+                let (_, replacement) = store
+                    .get("probe", to)
+                    .await
+                    .expect("read")
+                    .expect("the replacement");
+                assert_eq!(
+                    replacement.metadata["supersedes"],
+                    serde_json::json!(from.as_str())
+                );
+            }
+            other => panic!("expected Superseded, got {:?}", other),
+        }
+    }
+
+    /// A refused supersede changed nothing, so it publishes nothing. The
+    /// negative half of the contract: an emit that fires on the failure paths
+    /// would have subscribers tracking a move that never landed.
+    #[tokio::test]
+    async fn a_refused_supersede_emits_nothing() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, seen) = recording_bus();
+
+        // No id: refused before any write.
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "namespace": "probe", "content": "x" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            bus,
+        )
+        .await;
+        assert!(reply.starts_with("Missing 'id' parameter"), "{}", reply);
+
+        // The dispatcher is asynchronous, so a pulse in flight would show up
+        // late. Give it the window a refusal must stay silent through.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().expect("recorder lock").is_empty(),
+            "a refused supersede publishes no pulse"
+        );
+    }
+
+    /// Emit site 4: the audit row a verdict earns cannot depend on the caller
+/// remembering to record it, so the verdict itself publishes the pulse.
+    /// Asserts the pulse is joinable to the response the caller received --
+    /// same `trace_id`, same rules -- because an audit row that cannot be tied
+    /// back to its call is a list of hashes.
+    // Multi-threaded because `GuardValidator::new` builds its sandbox evaluator
+    // through `block_in_place`, which a current-thread runtime refuses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guard_verdict_emits_guarded_action_fired_joinable_to_the_response() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, seen) = recording_bus();
+
+        let reply = handle_guard_validate(
+            serde_json::json!({
+                "action_type": "bash",
+                "payload": "rm -rf /tmp/scratch",
+                "namespace": "probe"
+            }),
+            store.clone(),
+            Arc::new(StubEmbedder),
+            bus,
+        )
+        .await;
+        assert!(reply.starts_with("namespace: probe\ntrace_id: "), "{}", reply);
+
+        let pulses = pulses_seen(&seen, 1).await;
+        match &pulses[0] {
+            ThalamicPulse::GuardedActionFired {
+                trace_id,
+                action_type,
+                payload_hash,
+                verdict,
+                rule_ids_triggered,
+                namespace,
+            } => {
+                assert_eq!(namespace, "probe");
+                assert_eq!(action_type, "bash");
+                // The trace_id is the one the caller was handed, so the audit
+                // row joins back to the response rather than to nothing.
+                assert!(
+                    reply.contains(trace_id.as_str()),
+                    "pulse trace_id {} is not in the response:\n{}",
+                    trace_id,
+                    reply
+                );
+                // The verdict is the bucket tag the response itself carries,
+                // verbatim -- not a re-derived or re-labelled copy.
+                let body: Value =
+                    serde_json::from_str(reply.splitn(3, '\n').nth(2).expect("the json body"))
+                        .expect("the body is json");
+                let response_trace = body["trace_id"].as_str().expect("trace in body");
+                assert_eq!(trace_id, response_trace);
+                assert_eq!(
+                    verdict,
+                    &body["verdict"]["bucket"].as_str().expect("a verdict bucket").to_string()
+                );
+                assert_eq!(
+                    rule_ids_triggered,
+                    &body["rule_ids_triggered"]
+                        .as_array()
+                        .expect("a rules array")
+                        .iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_string())
+                        .collect::<Vec<String>>()
+                );
+                // A digest, not a payload: it fits in 32 bits and the raw
+                // command is nowhere in it.
+                assert_ne!(*payload_hash, 0, "a hash of a real payload is not zero");
+                assert!(
+                    !reply.contains(&format!("payload_hash\": \"{payload_hash}")),
+                    "the hash is a number, not a string"
+                );
+            }
+            other => panic!("expected GuardedActionFired, got {:?}", other),
+        }
+    }
+
+    /// The audit commitment is a digest of *the payload*, so two calls with
+    /// different payloads cannot produce the same commitment -- that is the
+    /// whole reason the field exists. Also pins that it is a digest and not a
+    /// copy: nothing reconstructable comes back out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_payload_hash_commits_to_the_payload_and_carries_nothing_else() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, seen) = recording_bus();
+
+        let hash_of = |payload: &'static str| {
+            let store = store.clone();
+            let bus = bus.clone();
+            async move {
+                handle_guard_validate(
+                    serde_json::json!({
+                        "action_type": "bash",
+                        "payload": payload,
+                        "namespace": "probe"
+                    }),
+                    store,
+                    Arc::new(StubEmbedder),
+                    bus,
+                )
+                .await
+            }
+        };
+
+        hash_of("echo one").await;
+        hash_of("echo two").await;
+        hash_of("echo one").await;
+
+        let pulses = pulses_seen(&seen, 3).await;
+        let hashes: Vec<u32> = pulses
+            .iter()
+            .map(|p| match p {
+                ThalamicPulse::GuardedActionFired { payload_hash, .. } => *payload_hash,
+                other => panic!("expected GuardedActionFired, got {:?}", other),
+            })
+            .collect();
+        assert_ne!(hashes[0], hashes[1], "different payloads, different commitments");
+        assert_eq!(hashes[0], hashes[2], "the same payload commits the same way");
+    }
+
+    /// A refused call never reached a verdict, so there is nothing to record.
+    /// The audit trail is a trail of *calls that happened*, and a call the
+    /// handler rejected on its arguments did not validate anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guard_validate_refused_before_the_verdict_emits_nothing() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, seen) = recording_bus();
+
+        let reply = handle_guard_validate(
+            serde_json::json!({ "action_type": "bash", "namespace": "probe" }),
+            store,
+            Arc::new(StubEmbedder),
+            bus,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR: 'payload' is required"), "{}", reply);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().expect("recorder lock").is_empty(),
+            "a refused guard_validate publishes no audit row"
+        );
+    }
+
+    /// Emit site 5 (the `Archived` variant's only producer): a tombstone is a
+/// storage mutation like any other, so it publishes one. Asserts the
+/// tombstone is a *merge* -- archiving must not drop the metadata that was
+/// already there, or the row loses its provenance the moment it is retired.
+    #[tokio::test]
+    async fn archiving_marks_the_row_and_emits_archived_without_dropping_metadata() {
+        let (store, id) = store_with_one_rule("probe").await;
+        // Give the row something worth losing, so "the tombstone is a merge"
+        // is a claim about behaviour rather than a vacuous truth about two
+        // empty objects.
+        let (vector, mut seeded) = store.get("probe", &id).await.unwrap().expect("the rule");
+        seeded.metadata = serde_json::json!({
+            "access_count": 3,
+            "governs": ["src/daemon.rs"],
+            "source": "docs/design-task-subsystem.md",
+        });
+        store.upsert("probe", &id, vector, seeded).await.unwrap();
+
+        let (bus, seen) = recording_bus();
+
+        let reply = crate::handlers::archive_memory::handle_archive_memory(
+            serde_json::json!({ "id": id, "namespace": "probe" }),
+            store.clone(),
+            bus,
+        )
+        .await;
+        assert!(reply.contains("Archived"), "{}", reply);
+
+        let (_, payload) = store.get("probe", &id).await.unwrap().expect("still readable");
+        assert_eq!(payload.metadata["archived"], serde_json::json!(true));
+        assert_eq!(
+            payload.metadata["access_count"],
+            serde_json::json!(3),
+            "the existing metadata survives the tombstone"
+        );
+        assert_eq!(payload.metadata["governs"], serde_json::json!(["src/daemon.rs"]));
+        assert_eq!(
+            payload.metadata["source"],
+            serde_json::json!("docs/design-task-subsystem.md"),
+            "provenance survives too"
+        );
+
+        let pulses = pulses_seen(&seen, 1).await;
+        match &pulses[0] {
+            ThalamicPulse::Archived { id: archived, namespace } => {
+                assert_eq!(archived, &id, "the pulse names the row that was tombstoned");
+                assert_eq!(namespace, "probe");
+            }
+            other => panic!("expected Archived, got {:?}", other),
+        }
+    }
+
+    /// The Archived variant must not be reachable without a producer. The
+    /// negative half of the contract: a handler that publishes on its refusal
+    /// paths would tell subscribers a row was retired that is still active.
+    #[tokio::test]
+    async fn an_archived_id_publishes_nothing() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, seen) = recording_bus();
+
+        let reply = crate::handlers::archive_memory::handle_archive_memory(
+            serde_json::json!({ "id": "no-such-id", "namespace": "probe" }),
+            store,
+            bus,
+        )
+        .await;
+        assert!(reply.contains("No memory with id no-such-id"), "{}", reply);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().expect("recorder lock").is_empty(),
+            "an unknown id publishes no pulse"
+        );
+    }
+
     /// Lock 2 over the wire: a completion with nothing extracted comes back
     /// as a JSON-RPC error carrying the exact section 3.2 body -- never as a
     /// success payload holding an error string.
@@ -3660,8 +4232,16 @@ mod tests {
                 "arguments": { "namespace": "probe", "id": id }
             })),
         };
-        let response =
-            process_mcp_request(request, Arc::new(StubEmbedder), store.clone(), ingests, None).await;
+        let (bus, _seen) = recording_bus();
+        let response = process_mcp_request(
+            request,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests,
+            None,
+            bus,
+        )
+        .await;
 
         assert!(
             response.get("result").is_none(),

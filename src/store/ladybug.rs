@@ -642,10 +642,12 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
     parse_edge_specs(&payload).0
 }
 
-/// Memory types written with a zero vector by directory ingestion. They describe
-/// where something lives, not what it says, so they carry no meaning for a
-/// similarity search.
-const STRUCTURAL_MEMORY_TYPES: [&str; 3] = ["directory", "file", "markdown"];
+/// Memory types written with a zero vector. They describe where something
+/// lives, or record that a machine operation happened, not what it says, so
+/// they carry no meaning for a similarity search: directory ingestion's nodes,
+/// and the thalamic bus's sentinel and audit rows.
+const STRUCTURAL_MEMORY_TYPES: [&str; 5] =
+    ["directory", "file", "markdown", "freshness_flag", "guard_event"];
 
 /// Ranking gain for a memory that carries `metadata.source` (FEATURE-4).
 ///

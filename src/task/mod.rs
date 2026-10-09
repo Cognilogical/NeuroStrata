@@ -921,6 +921,7 @@ pub async fn handle_task_complete(
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
     dedup: Option<Arc<DeduplicationChecker>>,
+    bus: Arc<crate::events::ThalamicBus>,
 ) -> Result<String, String> {
     let id = required_str(&args, "id")?.to_string();
     let namespace_arg = required_str(&args, "namespace")?;
@@ -1019,6 +1020,11 @@ pub async fn handle_task_complete(
     // Path 3: write the extraction inline, through the same add_memory
     // pipeline (embed, secret scan, dedup check, upsert) with the edge stamped
     // on the way in.
+    //
+    // The lesson's id is held here rather than at the write: the pulse that
+    // announces it fires below, after the gate, and a refusal must publish
+    // nothing.
+    let mut inline_lesson: Option<String> = None;
     if !edge {
         if let Some(mem) = &memory {
             if !mem.is_object() {
@@ -1070,7 +1076,7 @@ pub async fn handle_task_complete(
                 location_lines,
                 metadata: meta,
             };
-            crate::server::embed_dedup_and_upsert(
+            let lesson_id = crate::server::embed_dedup_and_upsert(
                 &store,
                 &emb,
                 &namespace,
@@ -1080,11 +1086,33 @@ pub async fn handle_task_complete(
             .await?;
             memories = list_now().await?;
             edge = gate::extraction_exists(&memories, &id);
+            inline_lesson = Some(lesson_id);
         }
     }
 
     if !edge {
         return Err(blocked_message(&id));
+    }
+
+    // Emit site 3. "The task gave way to the lesson" -- the same `Superseded`
+    // a correction uses, because both are a row being replaced by a row that
+    // carries forward what it established. Only this path emits: Path 1 and
+    // Path 2 add an edge to a memory that already existed, and there is no
+    // move to announce.
+    //
+    // After the gate, not before it: the pulse claims the transition landed,
+    // so a Lock 2 refusal above must leave the bus silent rather than send
+    // every subscriber down a chain that does not exist. The ordering is the
+    // invariant -- nothing re-derives it from the adjacent check.
+    if let Some(lesson_id) = inline_lesson {
+        bus.emit(
+            crate::events::ThalamicPulse::Superseded {
+                old_id: id.clone(),
+                new_id: lesson_id,
+                namespace: namespace.clone(),
+            },
+            &crate::events::RecursionToken::root(),
+        );
     }
 
     // With the edge in place the ExtractionRequired guard is satisfied.
@@ -2441,6 +2469,67 @@ pub async fn import_beads(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
+
+    // ── the bus, as the completion path sees it ────────────────────────────────
+
+    /// Records every pulse the dispatcher hands it, so a test can assert on
+    /// what the emit site published rather than on what it returned.
+    struct PulseRecorder {
+        seen: Arc<std::sync::Mutex<Vec<ThalamicPulse>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::events::MemorySubscriber for PulseRecorder {
+        fn name(&self) -> &'static str {
+            "pulse_recorder"
+        }
+
+        async fn handle(
+            &self,
+            event: &ThalamicPulse,
+            _token: &RecursionToken,
+            _ctx: &crate::events::SubscriberContext<'_>,
+        ) -> Result<(), crate::events::SubscriberError> {
+            self.seen.lock().expect("recorder lock").push(event.clone());
+            Ok(())
+        }
+    }
+
+    /// A bus for a test that only needs the emit site to be callable -- the paths
+    /// that are refused before any write, where nothing should be published and
+    /// nobody is asserting on it.
+    fn quiet_bus() -> Arc<ThalamicBus> {
+        recording_bus().0
+    }
+
+    /// A bus with one recorder on it, plus the recorder's log. No store is
+    /// attached: the recorder never reads `ctx.store`.
+    fn recording_bus() -> (Arc<ThalamicBus>, Arc<std::sync::Mutex<Vec<ThalamicPulse>>>) {
+        let bus = Arc::new(ThalamicBus::new(64));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        bus.register(Box::new(PulseRecorder { seen: seen.clone() }));
+        (bus, seen)
+    }
+
+    /// Wait for the dispatcher to deliver `at_least` pulses, then hand back
+    /// everything it recorded.
+    async fn pulses_seen(
+        seen: &Arc<std::sync::Mutex<Vec<ThalamicPulse>>>,
+        at_least: usize,
+    ) -> Vec<ThalamicPulse> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if seen.lock().expect("recorder lock").len() >= at_least {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the dispatcher delivered the pulses");
+        seen.lock().expect("recorder lock").clone()
+    }
 
     /// Deterministic, 4-dimensional (the width temp stores are opened with).
     struct StubEmbedder;
@@ -3483,6 +3572,7 @@ mod tests {
             emb(),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .expect_err("Lock 2 must refuse a completion with nothing extracted");
@@ -3531,6 +3621,7 @@ mod tests {
             emb(),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .expect("the edge already exists");
@@ -3578,6 +3669,7 @@ mod tests {
             Arc::new(FailEmbedder),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .expect("linking must not embed anything");
@@ -3612,6 +3704,7 @@ mod tests {
             emb(),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .expect("the inline extraction writes the edge");
@@ -3636,6 +3729,255 @@ mod tests {
         assert!(written.payload.metadata.get("access_count").is_some());
     }
 
+    /// Emit site 3: closing a task with an inline lesson is "the task gave way
+/// to a lesson", so the pulse names both. Asserts the ends against the
+/// store rather than against the reply, because a `Superseded` whose
+/// `new_id` is the task and whose `old_id` is the lesson would still parse
+/// -- it would just send every subscriber down the wrong chain.
+    #[tokio::test]
+    async fn an_inline_extraction_emits_superseded_from_the_task_to_the_lesson() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        let (bus, seen) = recording_bus();
+
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "reason": "shipped",
+                "memory": { "content": "tasks are memories; done needs an extraction" }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            bus,
+        )
+        .await
+        .expect("the inline extraction writes the edge");
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        let lesson_id = parsed["extracted_memory_ids"][0]
+            .as_str()
+            .expect("the extraction's id")
+            .to_string();
+
+        let pulses = pulses_seen(&seen, 1).await;
+        match &pulses[0] {
+            ThalamicPulse::Superseded { old_id, new_id, namespace } => {
+                assert_eq!(old_id, &id, "the task is the row that gave way");
+                assert_eq!(new_id, &lesson_id, "the lesson is the row that replaced it");
+                assert_eq!(namespace, "MyProj");
+                // The lesson really is a stored row pointing back at the task.
+                let (_, lesson) = store
+                    .get("MyProj", new_id)
+                    .await
+                    .unwrap()
+                    .expect("the lesson is stored");
+                assert_eq!(lesson.metadata["extracted_from"], json!([old_id.as_str()]));
+            }
+            other => panic!("expected Superseded, got {:?}", other),
+        }
+    }
+
+    /// Wraps a real store and hides every extraction-declaring row from
+    /// `list`. `upsert` still lands, so the inline lesson really is written --
+    /// the gate simply cannot see the edge it declared, which is the one
+    /// thing that makes `extraction_exists` disagree with a write that
+    /// succeeded.
+    struct ListHidingStore {
+        inner: Arc<dyn VectorStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for ListHidingStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<()> {
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            self.inner.search(namespace, vector, limit).await
+        }
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+        async fn relink_edges(&self, namespace: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace).await
+        }
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            let rows = self.inner.list(namespace, user_id).await?;
+            Ok(rows
+                .into_iter()
+                .filter(|r| r.payload.metadata.get("extracted_from").is_none())
+                .collect())
+        }
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            self.inner.get(namespace, id).await
+        }
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+        async fn export_graph(&self, include_retired: bool) -> anyhow::Result<serde_json::Value> {
+            self.inner.export_graph(include_retired).await
+        }
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    /// The ordering invariant the emit site carries: a `Superseded` published
+    /// on the inline path claims the task gave way to a lesson. If the Lock 2
+    /// gate then refuses -- the edge the write declared turned out not to be
+    /// there -- the task never reached `done`, and subscribers that tracked the
+    /// pulse would be tracking a move that never landed. The refusal path is
+    /// the only one that must publish nothing at all.
+    ///
+    /// Mutation-proof: restoring the emit above the gate makes the count 1.
+    #[tokio::test]
+    async fn a_lock_2_refusal_after_the_inline_write_emits_nothing() {
+        let real = store_with_namespace("MyProj").await;
+        let id = create_task(&real, "MyProj", "the work", 2).await;
+        claim(&real, &id).await;
+        let store: Arc<dyn VectorStore> = Arc::new(ListHidingStore { inner: real.clone() });
+        let (bus, seen) = recording_bus();
+
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "reason": "shipped",
+                "memory": { "content": "tasks are memories; done needs an extraction" }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            bus.clone(),
+        )
+        .await
+        .expect_err("Lock 2 must refuse when the declared edge is not visible");
+
+        assert!(
+            err.starts_with("BLOCKED (Lock 2)"),
+            "the refusal is the gate's own message: {}",
+            err
+        );
+        assert_eq!(
+            status_of(&real, "MyProj", &id).await,
+            Status::InProgress,
+            "a refused completion changes nothing"
+        );
+        // The write itself did land -- this is the case the pulse would have
+        // lied about, not a path that failed earlier.
+        let lesson_count = real
+            .list("MyProj", None)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.payload.metadata.get("extracted_from").is_some())
+            .count();
+        assert_eq!(lesson_count, 1, "the inline lesson was written");
+
+        assert_eq!(
+            bus.metrics().events_emitted,
+            0,
+            "a refused completion publishes no pulse: {:?}",
+            bus.metrics()
+        );
+        // The dispatcher is asynchronous, so a pulse in flight would show up
+        // late. Give it the window this path must stay silent through.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().expect("recorder lock").is_empty(),
+            "no subscriber is told about a move that never landed"
+        );
+    }
+
+    /// Linking an already-written memory adds the edge but creates no row, so
+    /// there is no "gave way to" to publish. The negative half of the
+    /// contract: an emit here would announce a move for a memory that was
+    /// already there.
+    #[tokio::test]
+    async fn linking_an_existing_memory_emits_nothing() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("an existing memory").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &mem_id,
+                vector,
+                MemoryPayload {
+                    content: "an existing memory".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "access_count": 3 }),
+                },
+            )
+            .await
+            .unwrap();
+        let (bus, seen) = recording_bus();
+
+        handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id, "link_memory_id": mem_id }),
+            emb(),
+            store.clone(),
+            None,
+            bus,
+        )
+        .await
+        .expect("linking must not embed anything");
+
+        // The dispatcher is asynchronous, so a pulse in flight would show up
+        // late. Give it the window this path must stay silent through.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            seen.lock().expect("recorder lock").is_empty(),
+            "binding an existing memory publishes no pulse"
+        );
+    }
+
     #[tokio::test]
     async fn a_secret_in_the_inline_extraction_is_refused_before_any_write() {
         let store = store_with_namespace("MyProj").await;
@@ -3652,6 +3994,7 @@ mod tests {
             emb(),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .expect_err("a secret must not be stored as an extraction");
@@ -3670,6 +4013,7 @@ mod tests {
             emb(),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .unwrap();
@@ -3679,6 +4023,7 @@ mod tests {
             emb(),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .expect_err("done -> done is not in the table");
@@ -3703,6 +4048,7 @@ mod tests {
             emb(),
             store.clone(),
             None,
+            quiet_bus(),
         )
         .await
         .expect("extraction-backed completion");
