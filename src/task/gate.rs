@@ -7,7 +7,7 @@
 //! Design: docs/design-task-subsystem.md sections 4 and 5.3.
 
 use crate::task::machine::Status;
-use crate::traits::{SearchResult, VectorStore};
+use crate::traits::{MemoryPayload, SearchResult, VectorStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -273,6 +273,183 @@ fn content_short(content: &str) -> String {
     content.chars().take(80).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Self-test (Q4.3 of docs/design-wiring-panel.md)
+//
+// The gate self-tests itself so it can prove it is still a gate. The runner
+// does NOT ship project-side (Q4.1 of the wiring panel -- per-file mutation
+// and byte-identical restore was corrupting the guinea pig), but the contract
+// DOES ship as documented convention (Q4.2): every gate SHOULD accept
+// `--self-test`. Core realises it against a synthetic fixture namespace
+// (no embedder, no DB, no daemon): four planted rows, one `evaluate()` pass,
+// diff the produced violation-kind set against an expected set.
+// ---------------------------------------------------------------------------
+
+/// Build a `SearchResult` row from inside the engine. Public visibility via
+/// the engine path so the canonical fixture can be planted the same way the
+/// unit tests plant individual rows.
+fn self_test_row(id: &str, memory_type: &str, content: &str, metadata: Value) -> SearchResult {
+    SearchResult {
+        id: id.to_string(),
+        score: 0.0,
+        payload: MemoryPayload {
+            content: content.to_string(),
+            user_id: "self-test-fixture".to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        },
+        evidence: None,
+    }
+}
+
+fn self_test_task(id: &str, task_meta: Value) -> SearchResult {
+    self_test_row(
+        id,
+        "task",
+        &format!("self-test fixture task {}", id),
+        json!({ "task": task_meta }),
+    )
+}
+
+/// The verdict `task gate --self-test` prints. Both `expected` and `actual`
+/// violation-kind sets plus the diff are kept, so a passing gate and a broken
+/// gate are expressed in the same shape and a CI reporter can pin which rule
+/// drifted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelfTestReport {
+    pub passed: bool,
+    pub expected_kinds: Vec<String>,
+    pub actual_kinds: Vec<String>,
+    pub missing: Vec<String>,
+    pub extra: Vec<String>,
+    pub total_violations: usize,
+    pub counts: Counts,
+}
+
+impl SelfTestReport {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "passed": self.passed,
+            "expected_kinds": self.expected_kinds,
+            "actual_kinds": self.actual_kinds,
+            "missing": self.missing,
+            "extra": self.extra,
+            "total_violations": self.total_violations,
+            "counts": self.counts.to_json(),
+        })
+    }
+}
+
+/// A fixed clock for self-test so the same fixture always rotates the same
+/// way. NOW is well past the P0 rot threshold so the planted rotting P0 task
+/// is reliably 25h old, and the planted in_progress is fresh enough to avoid
+/// the staleness advisory (which lives in `report.stale`, not
+/// `report.violations`).
+const SELF_TEST_NOW: i64 = 1_760_000_000;
+const SELF_TEST_DAY: i64 = 86_400;
+const SELF_TEST_HOUR: i64 = 3600;
+
+/// The canonical self-test fixture: three violating tasks (unextracted done,
+/// claimed in_progress, rotting P0) plus one clean control (a done WITH an
+/// inbound `extracted_from` edge) so the engine proves it is not producing a
+/// violation per row.
+fn self_test_fixture() -> Vec<SearchResult> {
+    fn iso(offset: i64) -> String {
+        chrono::DateTime::from_timestamp(SELF_TEST_NOW - offset, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+    vec![
+        // Violating: done task without an inbound EXTRACTED_FROM edge.
+        self_test_task(
+            "ns-self-done",
+            json!({ "status": "done", "created_at": iso(SELF_TEST_DAY) }),
+        ),
+        // Violating: in_progress, claimed by agent-self, 60s old (under stale).
+        self_test_task(
+            "ns-self-claimed",
+            json!({
+                "status": "in_progress",
+                "assignee": "agent-self",
+                "updated_at": iso(60),
+            }),
+        ),
+        // Violating: P0 open for 25h (rot threshold is 24h).
+        self_test_task(
+            "ns-self-rot",
+            json!({
+                "status": "open",
+                "priority": 0,
+                "created_at": iso(SELF_TEST_DAY + SELF_TEST_HOUR),
+            }),
+        ),
+        // Clean control: done task WITH an inbound extracted_from edge.
+        self_test_task(
+            "ns-self-clean",
+            json!({ "status": "done", "created_at": iso(SELF_TEST_DAY * 3) }),
+        ),
+        self_test_row(
+            "mem-self-lesson",
+            "fact",
+            "self-test clean control's extracted lesson",
+            json!({ "extracted_from": ["ns-self-clean"] }),
+        ),
+    ]
+}
+
+/// Run the gate engine against the canonical self-test fixture and diff the
+/// produced violation-kind set against `expected_kinds`. Used by both the
+/// CLI `--self-test` flag and the in-module unit tests.
+///
+/// `passed` is true iff every expected kind was produced AND no other kind
+/// was produced. Same shape for PASS and FAIL so a CI reporter can pin which
+/// rule drifted.
+pub fn self_test_with(expected_kinds: &[&'static str]) -> SelfTestReport {
+    let fixture = self_test_fixture();
+    let report = evaluate(&fixture, SELF_TEST_NOW);
+    let mut actual: Vec<String> = report
+        .violations
+        .iter()
+        .map(|v| v.kind.to_string())
+        .collect();
+    actual.sort();
+    actual.dedup();
+    let expected: Vec<String> = expected_kinds.iter().map(|s| s.to_string()).collect();
+    let missing: Vec<String> = expected_kinds
+        .iter()
+        .filter(|k| !actual.iter().any(|a| a == **k))
+        .map(|s| s.to_string())
+        .collect();
+    let extra: Vec<String> = actual
+        .iter()
+        .filter(|a| !expected_kinds.iter().any(|e| *e == a.as_str()))
+        .cloned()
+        .collect();
+    SelfTestReport {
+        passed: missing.is_empty() && extra.is_empty(),
+        expected_kinds: expected,
+        actual_kinds: actual,
+        missing,
+        extra,
+        total_violations: report.violations.len(),
+        counts: report.counts,
+    }
+}
+
+/// The canonical self-test invocation: the three blocking rule breaks the
+/// wiring panel prescribes for the gate to recognize itself as a gate.
+pub fn self_test() -> SelfTestReport {
+    self_test_with(&[
+        "done_without_extraction",
+        "in_progress",
+        "p0_open_over_24h",
+    ])
+}
+
 /// Runs the engine against a store: one `list`, no embedder, milliseconds.
 pub async fn run(store: &Arc<dyn VectorStore>, namespace: &str) -> Result<GateReport, String> {
     let memories = store
@@ -496,6 +673,76 @@ mod tests {
         )];
         let report = evaluate(&memories, NOW);
         assert!(report.stale.is_empty());
+    }
+
+    // --- self-test (Q4.3 of docs/design-wiring-panel.md) -----------------
+
+    #[test]
+    fn self_test_passes_against_the_canonical_fixture() {
+        // Three violating tasks + one clean control. Engine must surface
+        // exactly the three blocking kinds and stop counting the clean one.
+        let report = self_test();
+        assert!(
+            report.passed,
+            "self_test must pass against the canonical fixture; missing={:?} extra={:?}",
+            report.missing, report.extra
+        );
+        assert_eq!(report.total_violations, 3, "exactly 3 violations");
+        assert_eq!(report.actual_kinds.len(), 3);
+        assert!(report
+            .actual_kinds
+            .contains(&"done_without_extraction".to_string()));
+        assert!(report.actual_kinds.contains(&"in_progress".to_string()));
+        assert!(report
+            .actual_kinds
+            .contains(&"p0_open_over_24h".to_string()));
+        // Clean control is counted but never violated.
+        assert_eq!(report.counts.total, 4, "fixture plants 4 tasks");
+        assert_eq!(report.counts.done, 2, "ns-self-done + ns-self-clean");
+        assert_eq!(report.counts.in_progress, 1);
+        assert_eq!(report.counts.open, 1);
+    }
+
+    #[test]
+    fn self_test_fails_when_an_expected_kind_is_missing() {
+        // Expect a kind the engine never produces. Missing is the failure mode.
+        let report = self_test_with(&[
+            "done_without_extraction",
+            "in_progress",
+            "p0_open_over_24h",
+            "nonexistent_rule_kind",
+        ]);
+        assert!(!report.passed);
+        assert!(report.extra.is_empty(), "engine produced no extras here");
+        assert_eq!(report.missing, vec!["nonexistent_rule_kind".to_string()]);
+    }
+
+    #[test]
+    fn self_test_fails_when_the_engine_emits_an_unexpected_kind() {
+        // Expect one fewer kind than the engine produces. Extra is the failure mode.
+        // Catches a future "the gate silently added a rule" -- "a gate that
+        // passes its own test is not a gate."
+        let report = self_test_with(&["done_without_extraction", "in_progress"]);
+        assert!(!report.passed);
+        assert!(report.missing.is_empty(), "every expected kind was found");
+        assert!(report
+            .extra
+            .contains(&"p0_open_over_24h".to_string()));
+    }
+
+    #[test]
+    fn self_test_to_json_round_trips_the_pass_fail_shape() {
+        let pass = self_test();
+        let pass_json = pass.to_json();
+        assert_eq!(pass_json["passed"], json!(true));
+        assert_eq!(pass_json["missing"], json!([]));
+        assert_eq!(pass_json["extra"], json!([]));
+        assert_eq!(pass_json["total_violations"], json!(3));
+
+        let fail = self_test_with(&["does", "not", "match"]);
+        let fail_json = fail.to_json();
+        assert_eq!(fail_json["passed"], json!(false));
+        assert!(!fail_json["missing"].as_array().unwrap().is_empty());
     }
 
     #[test]

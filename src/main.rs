@@ -226,6 +226,13 @@ pub(crate) enum TaskCommands {
         /// With violations an unavailable database blocks the push too
         #[arg(long)]
         strict: bool,
+
+        /// Run the engine against an in-memory fixture of planted violations
+        /// (Q4.3 of docs/design-wiring-panel.md) and assert the produced
+        /// violation-kind set matches the canonical three. Metadata-only,
+        /// bypasses the daemon and the lock; `namespace` is ignored.
+        #[arg(long)]
+        self_test: bool,
     },
 
     /// The gate as an advisory report: violations, staleness, counts. Always exits 0
@@ -865,12 +872,42 @@ mod tests {
         .expect("task gate parses");
         match cli.command {
             Some(Commands::Task {
-                action: TaskCommands::Gate { namespace, strict },
+                action:
+                    TaskCommands::Gate {
+                        namespace,
+                        strict,
+                        self_test,
+                    },
             }) => {
                 assert_eq!(namespace, "NeuroStrata");
                 assert!(strict);
+                assert!(!self_test, "--self-test is not set in this invocation");
             }
             other => panic!("expected Task/Gate, got {:?}", other),
+        }
+
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "task",
+            "gate",
+            "NeuroStrata",
+            "--self-test",
+        ])
+        .expect("task gate --self-test parses");
+        match cli.command {
+            Some(Commands::Task {
+                action:
+                    TaskCommands::Gate {
+                        namespace,
+                        strict,
+                        self_test,
+                    },
+            }) => {
+                assert_eq!(namespace, "NeuroStrata");
+                assert!(!strict);
+                assert!(self_test);
+            }
+            other => panic!("expected Task/Gate with --self-test, got {:?}", other),
         }
 
         let cli = Cli::try_parse_from(["neurostrata-mcp", "task", "validate", "MyProj"])
@@ -1290,7 +1327,42 @@ async fn main() -> anyhow::Result<()> {
             Commands::Task { action } => match action {
                 // Read-only, so it never needs the mutating-DB refusal: ask a
                 // live daemon, else open the database metadata-only (5.1).
-                TaskCommands::Gate { namespace, strict } => {
+                TaskCommands::Gate {
+                    namespace,
+                    strict,
+                    self_test,
+                } => {
+                    // Q4.3 of docs/design-wiring-panel.md: the gate self-tests
+                    // itself against a synthetic in-memory fixture so it can
+                    // prove it is still a gate. No daemon, no lock, no DB --
+                    // short-circuit BEFORE any probe or lock check.
+                    if self_test {
+                        let report = crate::task::gate::self_test();
+                        let json = report.to_json();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json).unwrap_or_default()
+                        );
+                        if report.passed {
+                            println!(
+                                "Task gate self-test PASS -- engine produces exactly {:?} ({} violation(s) on {} planted task(s)).",
+                                report.expected_kinds,
+                                report.total_violations,
+                                report.counts.total
+                            );
+                            return Ok(());
+                        } else {
+                            eprintln!(
+                                "Task gate self-test FAIL.\n  expected: {:?}\n  actual:   {:?}\n  missing:  {:?} (rules the gate silently dropped)\n  extra:    {:?} (rules the gate silently added)",
+                                report.expected_kinds,
+                                report.actual_kinds,
+                                report.missing,
+                                report.extra
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+
                     // Both policies print the escape hatch (section 5.1).
                     if std::env::var("NEUROSTRATA_SKIP_GATE")
                         .map(|v| !v.is_empty())
