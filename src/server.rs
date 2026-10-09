@@ -1588,6 +1588,39 @@ pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &
     }
 }
 
+/// What a metadata update did.
+#[derive(Debug, PartialEq)]
+pub(crate) enum MetadataOutcome {
+    Updated,
+    NotFound,
+    /// Written by directory ingestion, so the next ingest would overwrite the
+    /// update. The file is what to change.
+    Ingested,
+}
+
+/// Update metadata on an existing memory without changing its ID or content.
+///
+/// This is the operator's surgical path for fixing metadata issues (like missing
+/// provenance) without creating a new memory ID or breaking existing references.
+pub(crate) async fn set_metadata(
+    store: &dyn VectorStore,
+    namespace: &str,
+    id: &str,
+    new_metadata: serde_json::Value,
+) -> anyhow::Result<MetadataOutcome> {
+    let (vector, mut payload) = match store.get(namespace, id).await? {
+        Some(found) => found,
+        None => return Ok(MetadataOutcome::NotFound),
+    };
+    if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+        return Ok(MetadataOutcome::Ingested);
+    }
+
+    payload.metadata = new_metadata;
+    store.upsert(namespace, id, vector, payload).await?;
+    Ok(MetadataOutcome::Updated)
+}
+
 /// What an operator's edit did.
 #[derive(Debug, PartialEq)]
 pub(crate) enum EditOutcome {
