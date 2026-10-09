@@ -1338,6 +1338,161 @@ pub async fn handle_bootstrap(
 
 // ── the wiring panel (docs/design-wiring-panel.md) ─────────────────────────
 
+/// The scaffolded `scripts/hooks/pre-push` the bootstrap hands a git project.
+///
+/// FINDING-bootstrap-wiring-nudge: the path of least resistance was a CI
+/// workflow because that is where the other guards already lived. Shipping a
+/// runnable hook flips it — an agent extends this file instead of inventing a
+/// workflow. Both invocations are host-agnostic (GitHub, GitLab, Gitea, a bare
+/// repo over SSH), which is the whole reason the hook is the default.
+const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
+# NeuroStrata task gate — scaffolded by neurostrata-bootstrap / task_setup.
+#
+# The hook IS the gate. It runs on every push on ANY git host, so it is the
+# required default; CI is vendor-specific and only a defense-in-depth extra.
+# Install once with:  bash scripts/install-hooks.sh
+
+command -v neurostrata-mcp >/dev/null || exit 0
+[ -n "$NEUROSTRATA_SKIP_GATE" ] && exit 0
+
+NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+
+# ── NeuroStrata gate (required) ────────────────────────────────────────────
+# --strict maps an unavailable database to a blocking exit too, so the exit
+# code below is the gate's verdict: a failed gate fails the push.
+neurostrata-mcp task gate "$NAMESPACE" --strict
+code=$?
+if [ $code -ne 0 ]; then
+    echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
+    exit 1
+fi
+
+# ── project guards (add yours here) ────────────────────────────────────────
+# Add the path of each local guard; it runs before every push on every host.
+# A guard that belongs here does NOT need a CI workflow to be real.
+PROJECT_GATES=(
+    # ./scripts/rules-gate.sh
+)
+
+if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
+    for g in "${PROJECT_GATES[@]}"; do
+        "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
+    done
+fi
+
+exit 0
+"#;
+
+/// The scaffolded `scripts/install-hooks.sh`: tracks the hook in the repo
+/// (so it is reviewable) and installs the executable copy git actually runs.
+const SCAFFOLDED_INSTALL_HOOKS: &str = r#"#!/usr/bin/env bash
+# Install scripts/hooks/pre-push as the hook git runs. Safe to re-run.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+src="$root/scripts/hooks/pre-push"
+
+[ -f "$src" ] || { echo "missing $src — restore it before installing" >&2; exit 1; }
+
+# Non-default hooks dir? Ask git; the config wins over .git/hooks.
+hooks_path="$(git config --get core.hooksPath || true)"
+dest_dir="${hooks_path:-$root/.git/hooks}"
+mkdir -p "$dest_dir"
+
+install -m 0755 "$src" "$dest_dir/pre-push"
+echo "Installed $dest_dir/pre-push"
+
+# Read-back only: report presence, never execute. Running it here would run
+# every project guard in PROJECT_GATES as a side effect of installing.
+if [ -x "$dest_dir/pre-push" ]; then
+    echo "Read-back: $dest_dir/pre-push present"
+else
+    echo "Read-back: $dest_dir/pre-push MISSING or not executable" >&2
+    exit 1
+fi
+echo "Verify: neurostrata_task_setup should report verified.hook_installed: true"
+"#;
+
+/// The directory git actually runs hooks from, resolved the way git resolves
+/// it: `core.hooksPath` at the highest-priority config level that sets it,
+/// else `$GIT_DIR/hooks`.
+///
+/// Same source of truth as the scaffolded installer (`git config --get
+/// core.hooksPath`, SCAFFOLDED_INSTALL_HOOKS). Reading `.git/config` by hand
+/// instead made the two disagree: a `core.hooksPath` in the global config made
+/// the installer write to the global path while this reported unhooked
+/// (FINDING-bootstrap-wiring-nudge fix round 1).
+fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let configured = std::process::Command::new("git")
+        .args(["config", "--get", "core.hooksPath"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|v| !v.is_empty());
+    match configured {
+        // A relative hooksPath is relative to the repo's top-level working
+        // tree, which is `root`; git runs the hook from there.
+        Some(v) => {
+            let p = std::path::Path::new(&v);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                root.join(p)
+            }
+        }
+        None => root.join(".git").join("hooks"),
+    }
+}
+
+/// Whether a NeuroStrata pre-push hook is observable at the path git runs.
+///
+/// Exactly one directory is checked — the resolved hooks dir. When
+/// `core.hooksPath` is set git ignores `$GIT_DIR/hooks` entirely, so a stale
+/// gate left there is not a gate: falling through to it reported `true` for a
+/// project whose hooks moved, i.e. a gate that silently stopped running on
+/// every push (FINDING-bootstrap-wiring-nudge fix round 1).
+fn hook_observable(root: &std::path::Path) -> bool {
+    let hook = git_hooks_dir(root).join("pre-push");
+    std::fs::read_to_string(&hook)
+        .map(|s| s.contains("NeuroStrata task gate"))
+        .unwrap_or(false)
+}
+
+/// The project guards an installed hook actually runs.
+///
+/// `PROJECT_GATES` ships with every entry commented, so a hook file existing
+/// proves nothing about project-pipeline coverage — claiming `client_side:
+/// true` for every pipeline guard on the strength of a hook file alone is
+/// exactly the unverifiable claim this panel exists to eliminate. Count the
+/// live entries instead.
+fn hook_project_guards(hook: &std::path::Path) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(hook) else {
+        return Vec::new();
+    };
+    let mut guards = Vec::new();
+    let mut in_array = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if !in_array {
+            if line.starts_with("PROJECT_GATES=(") {
+                in_array = true;
+            }
+            continue;
+        }
+        if line.starts_with(')') {
+            break;
+        }
+        // A commented entry is an example, not a wired guard.
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        guards.push(line.trim_matches('"').trim().to_string());
+    }
+    guards
+}
+
 /// Read-only verification plus the wiring block, shared by bootstrap and
 /// task_setup. **Git-first, never git-only**: git is named the default
 /// instance, and a non-software project (CMS, media production, research) is
@@ -1346,9 +1501,12 @@ pub async fn handle_bootstrap(
 /// CMSes or render farms.
 fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value) {
     let git = root.join(".git").exists();
-    let hook_installed = std::fs::read_to_string(root.join(".git").join("hooks").join("pre-push"))
-        .map(|s| s.contains("NeuroStrata task gate"))
-        .unwrap_or(false);
+    let hook_installed = git && hook_observable(root);
+    let hook_guards: Vec<String> = if hook_installed {
+        hook_project_guards(&git_hooks_dir(root).join("pre-push"))
+    } else {
+        Vec::new()
+    };
     let export_fresh: Option<bool> = {
         let export = root.join(".NeuroStrata").join("graph").join("graph.json");
         match (
@@ -1403,13 +1561,19 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         if w.runs_in == wiring::RunsIn::ProjectPipeline && resolved.is_none() {
             uncovered.push(w.id);
         }
-        automatic.push(json!({
+        let mut entry = json!({
             "id": w.id,
             "runs_in": w.runs_in.as_str(),
             "blocks": w.blocks,
             "gate_point": resolved,
             "reason": w.reason,
-        }));
+        });
+        // Q5 honesty, the hard version: no per-guard `client_side` flag. Whether the
+        // hook runs a given pipeline guard is read out of the hook body
+        // (`verified.hook_project_guards`) — a flag derived from "a hook file
+        // exists" asserts coverage nobody observed, and PROJECT_GATES ships
+        // empty, so the flag would be true exactly when it is least true.
+        automatic.push(entry);
     }
 
     let reminders: Vec<Value> = wiring::REMINDER_WIRES
@@ -1417,10 +1581,16 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         .map(|r| json!({ "id": r.id, "fires_on": r.fires_on, "text": r.text }))
         .collect();
 
+    // A `git-pre-push` claim with no observable hook is a lie, so it stays
+    // uncovered and the install instruction survives the subtraction.
+    if git && !hook_installed {
+        uncovered.push("task-gate");
+    }
+
     let coverage = json!({
         "core": ["task-close-lock", "claim-exclusivity", "stale-claim-expiry",
                  "zero-action-start", "single-daemon-lock", "rule-honesty"],
-        "git-pre-push": if git { vec!["task-gate"] } else { Vec::<&str>::new() },
+        "git-pre-push": if hook_installed { vec!["task-gate"] } else { Vec::<&str>::new() },
         "project-pipeline": pipeline_ids.clone(),
         "uncovered": uncovered,
     });
@@ -1438,6 +1608,11 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         "status_healthy": true,
         "export_fresh": export_fresh,
         "gate_point_resolved": gate_point.is_some(),
+        // Read out of the installed hook's PROJECT_GATES, not assumed from
+        // the hook's existence: the scaffold ships every entry commented, so
+        // "a hook exists" and "the guard runs on every push" are different
+        // claims and only the second one is worth making.
+        "hook_project_guards": hook_guards,
     });
 
     // Q2: one instruction template, git first and dominant, non-git in the
@@ -1448,7 +1623,16 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         gate_ids.insert(0, "task-gate");
     }
     let resolve_clause = if git {
-        "Git detected -- the default and recommended instance. Run `neurostrata-mcp hooks install` to put the task gate on pre-push, then wire the project-pipeline gates above into your CI so every push and every build runs them. Verify with the `verified` block in this payload."
+        // FINDING-bootstrap-wiring-nudge: this used to end "then wire the
+        // project-pipeline gates above into your CI" — which made CI the
+        // default and silently locked non-GitHub projects out. The hook is
+        // the broader chokepoint (every host, every push, works on a bare
+        // repo); CI is the optional second layer on top of it.
+        if hook_installed {
+            "Git detected -- still the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project -- and the NeuroStrata pre-push hook is already installed at the path git runs -- so the task gate runs on every push; nothing to install, and the scaffolded files are omitted from this instruction rather than written over a working hook. What is left is the project-pipeline gates above: `verified.hook_project_guards` lists the ones the installed hook already runs, and the rest are not yet enforced on a bare `git push`. Extend the installed `pre-push` hook's `PROJECT_GATES` with them -- a guard in the hook runs on every host and needs no CI. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook."
+        } else {
+            "Git detected -- the default and recommended instance, because a git hook is the one chokepoint that works on EVERY git project: run `neurostrata-mcp hooks install` to put the task gate on pre-push (the gate does not move until that hook is installed and runs `task gate --strict`). The `files` field of this instruction carries a runnable `scripts/hooks/pre-push` and `scripts/install-hooks.sh`; write them, install the hook, then extend that hook with the project-pipeline gates above -- they belong in the hook, not in a workflow. CI is optional and vendor-specific: if this project already has GitHub Actions, GitLab CI or similar, re-run the project-pipeline gates there as a defense-in-depth second check; a git project with no CI needs nothing beyond the hook. Verify with the `verified` block in this payload."
+        }
     } else {
         "No git detected. Identify the ONE step every unit of work must pass to leave this project -- a CMS publish action, a render-farm submission, a publish script, a review-approval step. Wire `neurostrata-mcp task gate NAMESPACE --strict` (exit 1 = blocked) and the project-pipeline gates above into that step so nothing ships past an unresolved gate. Record the chosen step: neurostrata_add_memory with memory_type: rule, content naming the gate point -- the next session must not have to re-derive it."
     };
@@ -1466,6 +1650,24 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
             gate_ids.join(", "),
             resolve_clause.replace("NAMESPACE", namespace)
         ),
+        // Scaffolded for git projects that have no hook yet: a runnable hook
+        // and its installer are the path of least resistance, which is the
+        // point. A hooked project gets nothing — writing these files would
+        // overwrite a working gate and tell it to install a second one.
+        "files": if git && !hook_installed {
+            json!([
+                { "path": "scripts/hooks/pre-push",
+                  "content": SCAFFOLDED_PRE_PUSH_HOOK,
+                  "executable": true,
+                  "note": "extend PROJECT_GATES with the project's own guards" },
+                { "path": "scripts/install-hooks.sh",
+                  "content": SCAFFOLDED_INSTALL_HOOKS,
+                  "executable": true,
+                  "note": "run: bash scripts/install-hooks.sh" },
+            ])
+        } else {
+            json!([])
+        },
     });
 
     (wiring_block, verified, wire_instruction)
@@ -2335,7 +2537,6 @@ mod tests {
         parsed["task"]["title"].as_str().expect("title").to_string()
     }
 
-    #[test]
     /// The git branch of the wiring panel (Q2/Q5): the default instance is
     /// named first and dominant, and a verified hook subtracts its own
     /// instruction instead of re-instructing.
@@ -2368,6 +2569,434 @@ mod tests {
         assert_eq!(task_gate["runs_in"], json!("git-pre-push"));
         assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDING-bootstrap-wiring-nudge: the clause must lead with the hook
+    /// (works on any git host) and demote CI to the optional second layer.
+    /// It used to end "wire the project-pipeline gates into your CI", which
+    /// made CI the default and locked out every non-GitHub project.
+    #[test]
+    fn git_clause_leads_with_hooks_and_demotes_ci_to_optional() {
+        let root = std::env::temp_dir().join(format!("ns-clause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+
+        let (_, _, wire_instruction) = wiring_panel(&root, "MyProj");
+        let text = wire_instruction["text"].as_str().unwrap();
+        assert!(text.contains("Git detected"), "{}", text);
+        assert!(text.contains("default and recommended"), "{}", text);
+        // required step: the hook, and it must run the gate
+        assert!(text.contains("hooks install"), "{}", text);
+        assert!(text.contains("--strict"), "{}", text);
+        // the broader-solution principle, stated
+        assert!(text.contains("EVERY git project"), "{}", text);
+        // CI is optional + vendor-specific, not the destination
+        assert!(text.contains("optional and vendor-specific"), "{}", text);
+        assert!(text.contains("defense-in-depth"), "{}", text);
+        assert!(text.contains("needs nothing beyond the hook"), "{}", text);
+        // the regression itself: CI is no longer the thing to wire into
+        assert!(!text.contains("into your CI"), "CI is not the default: {}", text);
+        // and the agent is handed a runnable hook, not a suggestion
+        let files = wire_instruction["files"].as_array().expect("scaffolded files");
+        let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["scripts/hooks/pre-push", "scripts/install-hooks.sh"]);
+        let hook = files[0]["content"].as_str().unwrap();
+        assert!(hook.contains("task gate") && hook.contains("--strict"), "{}", hook);
+        assert!(hook.contains("PROJECT_GATES"), "the hook is the extension point: {}", hook);
+        // vendor-neutral: no CI vendor is named in the runnable files
+        assert!(!hook.contains("github"), "{}", hook);
+        assert!(!files[1]["content"].as_str().unwrap().contains("github"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Q5: a `git-pre-push` claim with no observable hook is a lie. It must
+    /// stay in the must-wire list, never be subtracted as verified.
+    #[test]
+    fn git_pre_push_without_a_hook_stays_in_the_must_wire_list() {
+        let root = std::env::temp_dir().join(format!("ns-nohook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+
+        let (wiring_block, verified, _) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(false));
+        // not covered, and not quietly reported as covered
+        assert_eq!(wiring_block["coverage"]["git-pre-push"], json!([]));
+        assert!(wiring_block["coverage"]["uncovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == "task-gate"), "an unwired pre-push gate is uncovered");
+        // the gate is still advertised at all (git exists)
+        assert!(wiring_block["automatic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["id"] == "task-gate" && w["runs_in"] == "git-pre-push"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The mirror: with the scaffolded hook installed the gate verifies. But a
+    /// hook file existing is NOT a project-pipeline guard running — the
+    /// scaffold ships PROJECT_GATES empty — so the panel must not claim the
+    /// pipeline guards are enforced (fix round 1, Important #1).
+    #[test]
+    fn installed_scaffolded_hook_verifies_the_gate_without_faking_pipeline_coverage() {
+        let root = std::env::temp_dir().join(format!("ns-hooked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+        // install the scaffold exactly as the installer would
+        std::fs::write(root.join(".git").join("hooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK)
+            .unwrap();
+
+        let (wiring_block, verified, _) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(true));
+        assert_eq!(wiring_block["coverage"]["git-pre-push"], json!(["task-gate"]));
+        assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
+        // the honest read: no project guard is wired in that hook
+        assert_eq!(verified["hook_project_guards"], json!([]));
+        // and no per-guard claim of client-side coverage survives
+        assert!(
+            wiring_block["automatic"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|w| w.get("client_side").is_none() && w.get("hook_runs_this").is_none()),
+            "an unobservable coverage flag must not be emitted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A guard the project actually put in PROJECT_GATES is reported as such.
+    #[test]
+    fn guards_wired_into_project_gates_are_reported_from_the_hook_body() {
+        let root = std::env::temp_dir().join(format!("ns-pgates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+        let hook = SCAFFOLDED_PRE_PUSH_HOOK.replace(
+            "    # ./scripts/rules-gate.sh",
+            "    ./scripts/rules-gate.sh\n    ./scripts/typecheck.sh",
+        );
+        std::fs::write(root.join(".git").join("hooks").join("pre-push"), hook).unwrap();
+
+        let (_, verified, _) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(true));
+        assert_eq!(
+            verified["hook_project_guards"],
+            json!(["./scripts/rules-gate.sh", "./scripts/typecheck.sh"])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Important #2: an installed hook subtracts the install instruction AND
+    /// the scaffolded files. Both at once — a hooked project told to install
+    /// a second gate over its working one is the same failure this panel
+    /// exists to prevent.
+    #[test]
+    fn hooked_project_gets_no_scaffold_files_and_no_install_instruction() {
+        let root = std::env::temp_dir().join(format!("ns-hooked-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+        std::fs::write(root.join(".git").join("hooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK)
+            .unwrap();
+
+        let (_, _, wire_instruction) = wiring_panel(&root, "MyProj");
+        assert_eq!(wire_instruction["files"], json!([]), "no scaffold over a live hook");
+        let text = wire_instruction["text"].as_str().unwrap();
+        assert!(!text.contains("hooks install"), "no second install: {}", text);
+        assert!(!text.contains("install-hooks.sh"), "no second install: {}", text);
+        // still actionable: the remaining work is the project guards
+        assert!(text.contains("PROJECT_GATES"), "{}", text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pipeline guard with no hook is CI-only: say so. The bootstrap still
+    /// nudges toward the hook, because that is the broader defense.
+    #[test]
+    fn ci_only_pipeline_guards_report_hook_runs_this_false() {
+        let root = std::env::temp_dir().join(format!("ns-cionly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
+        std::fs::create_dir_all(root.join(".github").join("workflows")).unwrap();
+        std::fs::write(root.join(".github").join("workflows").join("ci.yml"), "on: push").unwrap();
+
+        let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(false));
+        assert_eq!(verified["hook_project_guards"], json!([]));
+        // no hook, so nothing runs on a bare `git push` yet
+        assert!(wiring_block["automatic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["runs_in"] == "project-pipeline")
+            .all(|w| w.get("client_side").is_none() && w.get("hook_runs_this").is_none()));
+        let text = wire_instruction["text"].as_str().unwrap();
+        assert!(text.contains("hooks install"), "still nudged toward the hook: {}", text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A project that moved its hooks dir via core.hooksPath is hooked, not
+    /// unhooked; reporting otherwise would send the agent to wire a second,
+    /// redundant gate. The config is read with `git config`, the same source
+    /// the installer uses, so global and system levels count too.
+    #[cfg(unix)]
+    #[test]
+    fn core_hooks_path_counts_as_observable() {
+        if which_git().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ns-hookspath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git_in(&root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join(".githooks")).unwrap();
+        git_in(&root, &["config", "core.hooksPath", ".githooks"]);
+        std::fs::write(root.join(".githooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+
+        let (_, verified, _) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Important #4: a stale gate left in `$GIT_DIR/hooks` after the project
+    /// relocated its hooks dir is not a gate — git never runs it. Reporting
+    /// it as installed means the push gate silently stopped running.
+    #[cfg(unix)]
+    #[test]
+    fn stale_local_hook_is_not_observable_once_hooks_path_relocates() {
+        if which_git().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ns-stalehook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git_in(&root, &["init", "-q"]);
+        // the gate that used to run
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::write(root.join(".git").join("hooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK)
+            .unwrap();
+        // hooks moved, and nothing was installed at the new location
+        std::fs::create_dir_all(root.join(".githooks")).unwrap();
+        git_in(&root, &["config", "core.hooksPath", ".githooks"]);
+
+        let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(false));
+        assert!(wiring_block["coverage"]["uncovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == "task-gate"), "a gate that never runs is uncovered");
+        // so the project is told to install at the path git actually runs
+        assert!(wire_instruction["text"].as_str().unwrap().contains("hooks install"));
+        assert!(!wire_instruction["files"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Important #3: the resolved hooks dir comes from `git config`, so a
+    /// `core.hooksPath` set at a higher level than the local file is honoured
+    /// exactly as the installer honours it.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_dir_uses_the_same_source_of_truth_as_the_installer() {
+        if which_git().is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("ns-hookspath-src-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git_in(&root, &["init", "-q"]);
+        // the assertions read through the ambient config too (git_hooks_dir
+        // runs plain `git config`), so skip where a personal config would
+        // decide the outcome rather than this repo's.
+        let ambient = std::process::Command::new("git")
+            .args(["config", "--get", "core.hooksPath"])
+            .current_dir(&root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ambient {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+
+        // no hooksPath anywhere -> $GIT_DIR/hooks
+        assert_eq!(git_hooks_dir(&root), root.join(".git").join("hooks"));
+
+        // what `git config --get` reports is what we use, absolute or not
+        git_in(&root, &["config", "core.hooksPath", ".githooks"]);
+        assert_eq!(git_hooks_dir(&root), root.join(".githooks"));
+        let abs = root.join("elsewhere").join("hooks");
+        let abs_arg = abs.display().to_string();
+        git_in(&root, &["config", "core.hooksPath", &abs_arg]);
+        assert_eq!(git_hooks_dir(&root), abs);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Important #5: the installer must not run the hook it installs. A
+    /// project that fills PROJECT_GATES would otherwise run every guard on
+    /// every `install-hooks.sh`.
+    #[test]
+    fn installer_reports_presence_without_executing_the_hook() {
+        assert!(
+            !SCAFFOLDED_INSTALL_HOOKS.contains("$dest_dir/pre-push\" </dev/null"),
+            "the installer must not execute the hook: {}",
+            SCAFFOLDED_INSTALL_HOOKS
+        );
+        // the installed path appears only in the install, the existence test
+        // and echoes -- never as a bare invocation
+        for line in SCAFFOLDED_INSTALL_HOOKS.lines() {
+            let line = line.trim();
+            if !line.contains("$dest_dir/pre-push") {
+                continue;
+            }
+            assert!(
+                line.starts_with("#")
+                    || line.starts_with("echo ")
+                    || line.contains("install -m")
+                    || line.contains("[ -x "),
+                "unexpected execution of the installed hook: {}",
+                line
+            );
+        }
+    }
+
+    /// Non-git: no hook to report, no hook to scaffold, and the gates that
+    /// still need a chokepoint stay uncovered.
+    #[test]
+    fn non_git_projects_get_no_scaffold_and_no_hooks_path() {
+        let root = std::env::temp_dir().join(format!("ns-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
+        assert_eq!(verified["hook_installed"], json!(false));
+        assert_eq!(verified["gate_point_resolved"], json!(false));
+        assert_eq!(wiring_block["coverage"]["git-pre-push"], json!([]));
+        assert_eq!(wire_instruction["files"], json!([]));
+        assert!(!wiring_block["automatic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["runs_in"] == "git-pre-push"), "no git, no git-pre-push category");
+        assert!(wiring_block["coverage"]["uncovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u == "memory-to-repo-drift"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scaffolded hook is a runnable program, not a snippet: a stubbed
+    /// gate decides its exit code. This is the property that flips the path
+    /// of least resistance toward the hook.
+    #[cfg(unix)]
+    #[test]
+    fn scaffolded_pre_push_hook_runs_and_exits_with_the_gate_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+        if which_bash().is_none() || which_git().is_none() {
+            return; // nothing to smoke-test with
+        }
+        let root = std::env::temp_dir().join(format!("ns-hookrun-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        // a git project, so `git rev-parse --show-toplevel` resolves
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let hook = root.join("scripts").join("hooks").join("pre-push");
+        std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+
+        // the installer must be a runnable script too
+        std::fs::write(root.join("scripts").join("install-hooks.sh"), SCAFFOLDED_INSTALL_HOOKS)
+            .unwrap();
+        let syntax = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(root.join("scripts").join("install-hooks.sh"))
+            .status()
+            .unwrap();
+        assert!(syntax.success(), "install-hooks.sh must be valid bash");
+
+        // stub the gate: its exit code is the only variable
+        let stub = root.join("bin").join("neurostrata-mcp");
+        std::fs::write(&stub, "#!/bin/sh\nexit ${STUB_GATE_EXIT:-0}\n").unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+        let path = format!(
+            "{}:{}",
+            root.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let run_gate = |code: i32| {
+            std::process::Command::new("bash")
+                .arg("scripts/hooks/pre-push")
+                .current_dir(&root)
+                .env("PATH", &path)
+                .env("STUB_GATE_EXIT", code.to_string())
+                .output()
+                .unwrap()
+        };
+
+        let clean = run_gate(0);
+        assert!(clean.status.success(), "a passing gate must let the push through");
+        let blocked = run_gate(1);
+        assert_eq!(blocked.status.code(), Some(1), "a failing gate must fail the push");
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("Push blocked"));
+
+        // and the round trip: installing it makes the panel believe it
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::copy(&hook, root.join(".git").join("hooks").join("pre-push")).unwrap();
+        assert!(hook_observable(&root), "the installed scaffold must be observable");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run git in `root`, isolated from the developer's own global/system
+    /// config so a personal `core.hooksPath` cannot change what is asserted.
+    #[cfg(unix)]
+    fn git_in(root: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {:?} failed", args);
+    }
+
+    #[cfg(unix)]
+    fn which_bash() -> Option<String> {
+        std::process::Command::new("bash")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| "bash".to_string())
+    }
+
+    #[cfg(unix)]
+    fn which_git() -> Option<String> {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| "git".to_string())
     }
 
     /// Guinea-pig BUG-4: suggestions follow the counted tree, not manifest
