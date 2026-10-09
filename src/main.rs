@@ -257,6 +257,51 @@ fn classify_probe(reached: bool, refused: bool) -> DaemonProbe {
     }
 }
 
+/// Whether the answering daemon runs the build the binary on disk holds.
+enum Skew {
+    InSync(String),
+    Stale(String),
+}
+
+/// Kept separate from the request so the verdict is testable without a
+/// socket. A daemon that cannot answer /info predates build verification,
+/// so it is strictly older than any binary that asks -- stale by definition.
+fn skew_verdict(info: Option<&serde_json::Value>, own: (u64, u64)) -> Skew {
+    let info = match info {
+        Some(i) => i,
+        None => {
+            return Skew::Stale(
+                "the daemon predates build verification (no /info), so it is older than this binary".to_string(),
+            )
+        }
+    };
+    let hash = info.get("exe_hash").and_then(|v| v.as_u64());
+    let len = info.get("exe_len").and_then(|v| v.as_u64());
+    let version = info.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+    if hash == Some(own.0) && len == Some(own.1) {
+        Skew::InSync(version.to_string())
+    } else {
+        Skew::Stale(format!(
+            "daemon runs a different build (exe hash {:016x}, this binary {:016x}, started at unix {})",
+            hash.unwrap_or(0),
+            own.0,
+            info.get("started_at").and_then(|v| v.as_i64()).unwrap_or(0)
+        ))
+    }
+}
+
+async fn fetch_daemon_info() -> Option<serde_json::Value> {
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:34343/info")
+        .send()
+        .await
+        .ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    res.json::<serde_json::Value>().await.ok()
+}
+
 async fn probe_daemon() -> DaemonProbe {
     match reqwest::Client::new()
         .get("http://127.0.0.1:34343/health")
@@ -841,6 +886,21 @@ mod tests {
             other => panic!("expected Hooks/Install, got {:?}", other),
         }
     }
+
+    /// Round 3: a daemon that cannot answer /info predates build verification,
+    /// so it is older than any binary that asks -- stale by definition.
+    #[test]
+    fn a_daemon_without_build_info_is_stale_by_definition() {
+        assert!(matches!(skew_verdict(None, (1, 2)), Skew::Stale(_)));
+    }
+
+    #[test]
+    fn matching_fingerprints_are_in_sync_and_mismatches_are_stale() {
+        let info = serde_json::json!({ "version": "1.7.0", "exe_hash": 7u64, "exe_len": 8u64, "started_at": 1 });
+        assert!(matches!(skew_verdict(Some(&info), (7, 8)), Skew::InSync(_)));
+        assert!(matches!(skew_verdict(Some(&info), (7, 9)), Skew::Stale(_)));
+        assert!(matches!(skew_verdict(Some(&info), (6, 8)), Skew::Stale(_)));
+    }
 }
 
 #[tokio::main]
@@ -1040,8 +1100,25 @@ async fn main() -> anyhow::Result<()> {
                     DaemonProbe::Responsive => {
                         println!("daemon: listening on 127.0.0.1:34343, answering");
                         println!("lock: held");
-                        println!("status: healthy -- one daemon is serving every console");
-                        std::process::exit(0);
+                        // Runtime skew (round 3): the answering daemon may be
+                        // running an OLDER build than the binary on disk -- the
+                        // guinea pig re-verified a shipped fix through a
+                        // pre-fix daemon and filed a false "still open".
+                        let own = daemon::exe_fingerprint();
+                        match skew_verdict(fetch_daemon_info().await.as_ref(), own) {
+                            Skew::InSync(v) => {
+                                println!("build: in sync with this binary ({}, hash {:016x})", v, own.0);
+                                println!("status: healthy -- one daemon is serving every console");
+                                std::process::exit(0);
+                            }
+                            Skew::Stale(detail) => {
+                                println!("build: STALE -- {}", detail);
+                                println!("skew: every tool and schema you see through the daemon belongs to that older build");
+                                println!("skew: fix: neurostrata-mcp shutdown, then neurostrata-mcp daemon (restart any session holding an old stdio server)");
+                                println!("status: stale -- answering, but not the build on disk");
+                                std::process::exit(3);
+                            }
+                        }
                     }
                     _ if held => {
                         println!("daemon: NOT answering, but the store lock is held");

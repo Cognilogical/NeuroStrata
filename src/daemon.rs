@@ -14,6 +14,37 @@ use tokio::sync::oneshot;
 /// checkpoints is lost if the process is killed, so this bounds the damage.
 const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Who this daemon is: the build it was STARTED from. The fingerprint is
+/// captured once at startup because the file on disk can be replaced under a
+/// running process -- the guinea pig re-verified a shipped fix through a
+/// pre-fix daemon and filed a false "still open" (round 3, BUG-10 follow-up).
+#[derive(Clone, serde::Serialize)]
+pub(crate) struct BuildInfo {
+    version: &'static str,
+    exe_hash: u64,
+    exe_len: u64,
+    pid: u32,
+    started_at: i64,
+}
+
+/// FNV-1a over the current executable, plus its length. Hand-rolled arithmetic
+/// stays stable across builds and toolchains where std's hasher does not, and
+/// the comparison is daemon-startup-time versus the binary on disk now.
+pub(crate) fn exe_fingerprint() -> (u64, u64) {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut len = 0u64;
+    if let Ok(path) = std::env::current_exe() {
+        if let Ok(bytes) = std::fs::read(&path) {
+            len = bytes.len() as u64;
+            for b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    (hash, len)
+}
+
 #[derive(Clone)]
 struct AppState {
     embedder: Arc<dyn Embedder>,
@@ -27,6 +58,8 @@ struct AppState {
     deduplication_checker: Option<Arc<DeduplicationChecker>>,
     /// Guard validator for behavioral constraint checking
     guard_validator: Arc<crate::guard::GuardValidator>,
+    /// The build this process was started from, for /info.
+    build: BuildInfo,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +138,7 @@ pub async fn start_daemon(
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+    let fingerprint = exe_fingerprint();
     let state = AppState {
         embedder,
         vector_store: vector_store.clone(),
@@ -112,10 +146,18 @@ pub async fn start_daemon(
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
         deduplication_checker,
         guard_validator,
+        build: BuildInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            exe_hash: fingerprint.0,
+            exe_len: fingerprint.1,
+            pid: std::process::id(),
+            started_at: chrono::Utc::now().timestamp(),
+        },
     };
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
+        .route("/info", get(handle_info))
         .route("/graph", get(handle_get_graph))
         .route("/ingest", post(handle_ingest))
         .route("/delete", post(handle_delete))
@@ -578,6 +620,20 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
     }
 }
 
+/// Build identity of the daemon answering. `neurostrata-mcp status` compares
+/// it against the installed binary and refuses to call a mismatch "healthy" --
+/// a daemon older than this route cannot be the build on disk, and its tools
+/// and schemas belong to whatever it was started from.
+async fn handle_info(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": state.build.version,
+        "exe_hash": state.build.exe_hash,
+        "exe_len": state.build.exe_len,
+        "pid": state.build.pid,
+        "started_at": state.build.started_at,
+    }))
+}
+
 async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
     // A second caller finds None here; stopping twice is not an error.
     let sender = state.shutdown.lock().ok().and_then(|mut guard| guard.take());
@@ -684,5 +740,13 @@ mod tests {
     fn only_a_closing_console_stops_without_waiting_for_an_ingest() {
         assert_eq!(ingest_wait_budget(ShutdownCause::ConsoleClosing), std::time::Duration::ZERO);
         assert!(ingest_wait_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_exe_fingerprint_is_stable_and_covers_the_file() {
+        let (h1, l1) = super::exe_fingerprint();
+        let (h2, l2) = super::exe_fingerprint();
+        assert_eq!((h1, l1), (h2, l2));
+        assert!(l1 > 0);
     }
 }
