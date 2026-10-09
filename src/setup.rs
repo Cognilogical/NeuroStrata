@@ -167,7 +167,7 @@ fn daemon_unit_template(bin: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={}\n\
+         ExecStart={} daemon\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          Nice=10\n\
