@@ -3693,6 +3693,7 @@ mod tests {
     #[tokio::test]
     async fn a_procedure_round_trips_all_six_fields_through_add_memory() {
         let (store, _) = store_with_one_rule("probe").await;
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
 
         let added = handle_add_memory(
             serde_json::json!({
@@ -3711,6 +3712,7 @@ mod tests {
             Arc::new(StubEmbedder),
             store.clone(),
             None,
+            bus.clone(),
         )
         .await;
         assert!(added.starts_with("Successfully added memory"), "{}", added);
@@ -3773,6 +3775,7 @@ mod tests {
     /// the agent acknowledges it, and the next snapshot shows the spent fire.
     #[tokio::test]
     async fn a_procedure_performed_over_mcp_comes_back_decremented_on_the_strap() {
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
         let (store, _) = store_with_one_rule("probe").await;
         let mut procedure = payload("run the gate before every push");
         procedure.memory_type = "procedure".to_string();
@@ -3812,11 +3815,13 @@ mod tests {
                     store,
                     ingests,
                     None,
+                    bus.clone(),
                 )
                 .await
             }
         };
 
+        let call2 = call.clone();
         let first: Value = serde_json::from_str(
             &call("proc-mcp").await["result"]["content"][0]["text"]
                 .as_str()
@@ -3828,7 +3833,7 @@ mod tests {
         assert_eq!(first["remaining_fires"], serde_json::json!(0));
 
         let second: Value = serde_json::from_str(
-            &call("proc-mcp").await["result"]["content"][0]["text"]
+            &call2("proc-mcp").await["result"]["content"][0]["text"]
                 .as_str()
                 .expect("text")
                 .to_string(),
