@@ -216,11 +216,12 @@ mod tests {
 
     /// The relation-count assertion moved here from the v1 test: v2 declares
     /// exactly four relations, the fourth being the extraction edge. v3 keeps
-    /// them and adds the rule-honesty fields (A6).
+    /// them and adds the rule-honesty fields (A6); v4 adds `procedure` and
+    /// keeps every relation as it was.
     #[test]
-    fn memory_vocabulary_v3_parses_and_has_exact_relations() {
+    fn memory_vocabulary_v4_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 3);
+        assert_eq!(v["vocabulary_version"], 4);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
@@ -253,6 +254,58 @@ mod tests {
         assert_eq!(fields["enforcement"]["enum"], serde_json::json!(["ENFORCED", "PARTIAL", "NOT_ENFORCED"]));
         assert!(fields["source"].is_object());
         assert!(fields["guard"].is_object());
+    }
+
+    /// v4 procedural memory: a non-structural type carrying all six of its
+    /// fields. The trigger enum lives here, in the vocabulary, rather than in
+    /// wiring.rs's closed `fires_on` registry -- a procedure is data an
+    /// operator writes, not code.
+    #[test]
+    fn memory_vocabulary_declares_procedure_with_its_six_fields() {
+        let v = memory_vocabulary();
+        let procedure = &v["memory_types"]["procedure"];
+        assert!(!procedure["structural"].as_bool().unwrap());
+        let fields = procedure["fields"].as_object().unwrap();
+        for field in [
+            "trigger",
+            "remaining_fires",
+            "valid_to",
+            "last_performed_at",
+            "performance_count",
+            "last_episodic_pointer",
+        ] {
+            assert!(fields.contains_key(field), "procedure declares {}", field);
+        }
+        assert_eq!(
+            fields["trigger"]["enum"],
+            json!([
+                "session-start",
+                "before-edit",
+                "after-mutation",
+                "every-n-sessions:N",
+                "every-n-days:N"
+            ])
+        );
+        for nullable in [
+            "remaining_fires",
+            "valid_to",
+            "last_performed_at",
+        ] {
+            assert_eq!(
+                fields[nullable]["type"],
+                json!(["integer", "null"]),
+                "{} is nullable",
+                nullable
+            );
+        }
+        assert_eq!(fields["performance_count"]["type"], json!("integer"));
+        assert_eq!(fields["last_episodic_pointer"]["type"], json!(["string", "null"]));
+        // The memory_type summary is what tools/list shows an agent, so it has
+        // to name the new type.
+        assert!(v["tool_summaries"]["memory_type"]
+            .as_str()
+            .unwrap()
+            .contains("procedure"));
     }
 
     #[test]

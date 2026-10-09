@@ -11,6 +11,7 @@ mod server;
 mod setup;
 mod store;
 mod task;
+mod tools;
 mod traits;
 
 use config::Config;
