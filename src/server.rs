@@ -211,6 +211,31 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_procedure_perform",
+                        "description": "Acknowledge one firing of a 'procedure' memory: stamp last_performed_at, increment performance_count, decrement remaining_fires (its iteration budget), and write the Episodic Buffer entry that last_episodic_pointer names. A procedure past its valid_to answers lapsed:true, one with no fires left answers spent:true, and neither mutates the row.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "Memory id of the procedure." },
+                                "note": { "type": "string", "description": "Optional free-text note for the Episodic Buffer entry." },
+                                "project_root": { "type": "string", "description": "Absolute path to the project root; the Episodic Buffer lives at <project_root>/.NeuroStrata/sessions/. Defaults to the working directory." }
+                            },
+                            "required": ["id"]
+                        },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "performed": { "type": "boolean" },
+                                "lapsed": { "type": "boolean" },
+                                "spent": { "type": "boolean" },
+                                "remaining_fires": { "type": ["integer", "null"] },
+                                "performance_count": { "type": "integer" },
+                                "episodic_pointer": { "type": ["string", "null"] },
+                                "reason": { "type": "string" }
+                            }
+                        }
+                    },
+                    {
                         "name": "neurostrata_task_create",
                         "description": "Create a tracked unit of work. Zero-Action Start: no file edits before a task exists and is claimed by this session.",
                         "inputSchema": {
@@ -506,6 +531,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_supersede_memory" => {
                             result_text = handle_supersede_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_procedure_perform" => {
+                            result_text = crate::tools::procedure::handle_procedure_perform(arguments, store.clone()).await;
                         }
                         "neurostrata_task_create" => {
                             result_text = crate::task::handle_task_create(arguments, emb.clone(), store.clone()).await;
@@ -1203,6 +1231,10 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
     let task_head = crate::task::snapshot_prefix(&all_memories);
 
     let now = chrono::Utc::now().timestamp();
+    // Computed off the pre-truncation list too: a procedure is worth surfacing
+    // whether or not it made the top-5 by access count, and a procedure nobody
+    // has ever performed has the lowest access count of all.
+    let procedures = crate::tools::procedure::procedures_due_strap(&all_memories, now);
     all_memories.retain(|r| {
         match r.payload.metadata.get("valid_to") {
             None => true,
@@ -1222,7 +1254,7 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
         serde_json::to_string_pretty(&all_memories)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
-    let snapshot = format!("{}\n{}", task_head, body);
+    let snapshot = format!("{}\n{}\n{}", task_head, procedures, body);
 
     Ok(match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
@@ -3354,7 +3386,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_nineteen_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_twenty_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -3382,6 +3414,7 @@ mod tests {
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
                 "neurostrata_supersede_memory",
+                "neurostrata_procedure_perform",
                 "neurostrata_task_create",
                 "neurostrata_task_claim",
                 "neurostrata_task_update",
@@ -3419,6 +3452,187 @@ mod tests {
             "summary appended: {}",
             add_desc
         );
+        // v4 procedural memory: the tool carries both halves of its contract,
+        // so a client can read `performed` without a trial firing.
+        let perform = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_procedure_perform")
+            .expect("the procedure tool is exposed");
+        assert_eq!(perform["inputSchema"]["required"], serde_json::json!(["id"]));
+        for field in [
+            "performed",
+            "lapsed",
+            "spent",
+            "remaining_fires",
+            "performance_count",
+            "episodic_pointer",
+            "reason",
+        ] {
+            assert!(
+                perform["outputSchema"]["properties"][field].is_object(),
+                "the reply declares {}",
+                field
+            );
+        }
+    }
+
+    /// Vocabulary v4: `procedure` is an ordinary memory type on the
+    /// add_memory surface, and every one of its six fields survives the round
+    /// trip untouched -- a rehearsal count that does not round-trip is a
+    /// rehearsal count that does not exist.
+    #[tokio::test]
+    async fn a_procedure_round_trips_all_six_fields_through_add_memory() {
+        let (store, _) = store_with_one_rule("probe").await;
+
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "Ritual: run the pre-push gate before every push.",
+                "namespace": "probe",
+                "memory_type": "procedure",
+                "metadata": {
+                    "trigger": "session-start",
+                    "remaining_fires": 5,
+                    "valid_to": null,
+                    "last_performed_at": null,
+                    "performance_count": 0,
+                    "last_episodic_pointer": null
+                }
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+        )
+        .await;
+        assert!(added.starts_with("Successfully added memory"), "{}", added);
+
+        let stored = store
+            .list("probe", None)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| r.payload.memory_type == "procedure")
+            .expect("the procedure is stored");
+        let meta = &stored.payload.metadata;
+        assert_eq!(meta["trigger"], serde_json::json!("session-start"));
+        assert_eq!(meta["remaining_fires"], serde_json::json!(5));
+        assert_eq!(meta["valid_to"], Value::Null);
+        assert_eq!(meta["last_performed_at"], Value::Null);
+        assert_eq!(meta["performance_count"], serde_json::json!(0));
+        assert_eq!(meta["last_episodic_pointer"], Value::Null);
+    }
+
+    /// The strap is wired into the snapshot body, not just implemented: a
+    /// live procedure is surfaced, a lapsed one is not, and neither one has to
+    /// survive the top-5 access-count cut to be seen.
+    #[tokio::test]
+    async fn the_snapshot_carries_the_procedures_due_strap() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let now = chrono::Utc::now().timestamp();
+        let mut live = payload("run the gate before every push");
+        live.memory_type = "procedure".to_string();
+        live.metadata = serde_json::json!({
+            "trigger": "session-start",
+            "remaining_fires": 2,
+            "performance_count": 0
+        });
+        let mut lapsed = payload("an expired ritual");
+        lapsed.memory_type = "procedure".to_string();
+        lapsed.metadata = serde_json::json!({
+            "trigger": "session-start",
+            "valid_to": now - 60
+        });
+        store
+            .upsert("probe", "proc-live", vec![0.1, 0.2, 0.3, 0.4], live)
+            .await
+            .expect("seed the live procedure");
+        store
+            .upsert("probe", "proc-lapsed", vec![0.1, 0.2, 0.3, 0.4], lapsed)
+            .await
+            .expect("seed the lapsed procedure");
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+
+        assert!(text.contains("Procedures due (1):"), "{}", text);
+        assert!(text.contains("proc-live"), "{}", text);
+        assert!(!text.contains("proc-lapsed"), "a lapsed procedure is not due: {}", text);
+    }
+
+    /// The whole v1 loop over one MCP call: a procedure surfaces on the strap,
+    /// the agent acknowledges it, and the next snapshot shows the spent fire.
+    #[tokio::test]
+    async fn a_procedure_performed_over_mcp_comes_back_decremented_on_the_strap() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let mut procedure = payload("run the gate before every push");
+        procedure.memory_type = "procedure".to_string();
+        procedure.metadata = serde_json::json!({
+            "trigger": "session-start",
+            "remaining_fires": 1,
+            "performance_count": 0
+        });
+        store
+            .upsert("probe", "proc-mcp", vec![0.1, 0.2, 0.3, 0.4], procedure)
+            .await
+            .expect("seed the procedure");
+
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        // Scratch root: without an explicit project_root the tool falls back to
+        // the working directory, and a test must not append to the repo's own
+        // Episodic Buffer.
+        let root = std::env::temp_dir().join(format!("ns-procedure-mcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("scratch project root");
+        let call = |id: &str| {
+            let ingests = ingests.clone();
+            let store = store.clone();
+            let arguments = serde_json::json!({ "id": id, "project_root": root.display().to_string() });
+            async move {
+                let request = JsonRpcRequest {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(serde_json::json!(7)),
+                    method: "tools/call".to_string(),
+                    params: Some(serde_json::json!({
+                        "name": "neurostrata_procedure_perform",
+                        "arguments": arguments
+                    })),
+                };
+                process_mcp_request(
+                    request,
+                    Arc::new(StubEmbedder),
+                    store,
+                    ingests,
+                    None,
+                )
+                .await
+            }
+        };
+
+        let first: Value = serde_json::from_str(
+            &call("proc-mcp").await["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .to_string(),
+        )
+        .expect("json");
+        assert_eq!(first["performed"], serde_json::json!(true), "{}", first);
+        assert_eq!(first["remaining_fires"], serde_json::json!(0));
+
+        let second: Value = serde_json::from_str(
+            &call("proc-mcp").await["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .to_string(),
+        )
+        .expect("json");
+        assert_eq!(second["performed"], serde_json::json!(false));
+        assert_eq!(second["spent"], serde_json::json!(true));
+        assert_eq!(second["reason"], serde_json::json!("spent"));
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        assert!(text.contains("\"performance_count\": 1"), "{}", text);
+        assert!(text.contains("\"remaining_fires\": 0"), "{}", text);
     }
 
     /// Lock 2 over the wire: a completion with nothing extracted comes back

@@ -1,5 +1,5 @@
 {
-  "vocabulary_version": 3,
+  "vocabulary_version": 4,
   "relations": {
     "GOVERNS": {
       "direction": "directed",
@@ -86,6 +86,55 @@
     "symbol": {
       "definition": "An extracted code declaration or definition.",
       "structural": false
+    },
+    "procedure": {
+      "definition": "A recurring attentional prompt: a procedure the agent performs on a schedule, after a trigger, or for a bounded number of repetitions. The cognitive sibling of Episodic Buffer; if a runner daemon ever materializes, its anatomical seat is Basal Ganglia.",
+      "structural": false,
+      "fields": {
+        "trigger": {
+          "type": "string",
+          "enum": [
+            "session-start",
+            "before-edit",
+            "after-mutation",
+            "every-n-sessions:N",
+            "every-n-days:N"
+          ],
+          "definition": "When this procedure should fire. `every-n-sessions:N` and `every-n-days:N` carry a numeric parameter (parsed from the string). Distinct from wiring.rs `fires_on` (which is the code-level reminder enum) -- `procedure.trigger` is data-level, written by users; `fires_on` is code, in a closed registry."
+        },
+        "remaining_fires": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "definition": "Iteration budget. null = unbounded. Decremented on each `procedure_perform`; when 0 the procedure is spent (still surfacable, but `procedure_perform` returns `performed: false, reason: 'spent'`)."
+        },
+        "valid_to": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "definition": "Bi-temporal TTL. Reuses the existing `valid_to` semantics from server.rs:1375-1380,1418-1423 (supersede transfers future expiry to replacement). null = no expiry."
+        },
+        "last_performed_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "definition": "Epoch of the last `procedure_perform`. null = never performed."
+        },
+        "performance_count": {
+          "type": "integer",
+          "definition": "Total times this procedure has been performed (lifetime)."
+        },
+        "last_episodic_pointer": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "definition": "Id of the most recent `append_log` entry produced by a `procedure_perform`. null = never performed."
+        }
+      }
     }
   },
   "type_aliases": {
@@ -109,6 +158,6 @@
     "add": "Vocabulary v2: rule/fact/task; metadata governs, contained_by, related_to and extracted_from accept target-ID arrays; custom types remain valid.",
     "search": "Expanded matches add bounded, directed evidence paths; RELATES_TO is undirected; memory_type 'task' is excluded unless include_tasks is true.",
     "ingest": "Vocabulary v2: directory/file/markdown containers and symbols; code_ast remains the stored symbol type.",
-    "memory_type": "Use rule or fact; task for tracked work; structural types are directory/file/markdown/symbol; custom types remain valid; default context."
+    "memory_type": "Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); structural types are directory/file/markdown/symbol; custom types remain valid; default context."
   }
 }

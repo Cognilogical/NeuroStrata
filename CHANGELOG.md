@@ -7,6 +7,7 @@ All notable changes to the NeuroStrata project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Procedural memory (vocabulary v4):** the third leg of the memory triad. `procedure` memory type with `trigger` / `remaining_fires` / `valid_to` / `last_performed_at` / `performance_count` / `last_episodic_pointer` metadata; the `neurostrata_procedure_perform` MCP tool stamps a firing, decrements the iteration budget, and writes the Episodic Buffer entry that `last_episodic_pointer` names (a lapsed procedure answers `lapsed: true`, a spent one `spent: true`, and neither mutates the row); and `get_snapshot` gains a `procedures_due` strap beside the ready-task head, surfacing every procedure not yet lapsed in `next_due` order. No new bus pulse variant, no new wiring wire, no CLI surface — `valid_to` reuses the existing bi-temporal TTL and the episodic entry reuses `neurostrata_append_log`'s writer.
 - **Task rename surface:** `neurostrata_task_update` accepts `title` — it rewrites the task's `content`, re-embeds it (so `search_memory` matches the new wording), and appends `renamed: 'old' -> 'new'` to the task's history. Titles are validated identically on create and rename (non-empty, max 200 characters); the reply gains a `renamed` field. Closes the vocabulary-scrub gap that left stale engine names in live task titles.
 
 ### Changed
