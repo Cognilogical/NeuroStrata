@@ -20,7 +20,7 @@ Success looks like: an operator can `neurostrata_add_memory(memory_type="procedu
 - No new wiring-panel wire (procedure is a memory, not a rule)
 - No generative variant (spawn a task per fire) — captured as v2 candidate
 - No CL1 reasoner integration
-- No 1.8.0 push (procedure rides in 1.9.0 once 1.8.0 ships)
+- No 1.9.0 split — procedure rides in 1.8.0 (owner decision 2026-10-09: drop the v2 candidate backlog; everything ships in one release)
 
 ## Shape
 
