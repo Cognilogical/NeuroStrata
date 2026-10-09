@@ -197,6 +197,9 @@ pub async fn process_mcp_request(
                                 "id": { "type": "string", "description": "The id of the memory being corrected. Get it from a search result or neurostrata_get_memory." },
                                 "namespace": { "type": "string", "description": "The namespace the memory lives in." },
                                 "content": { "type": "string", "description": "The corrected text, written in full. It replaces the old wording rather than being appended to it." },
+                                "governs": { "type": "array", "items": { "type": "string" }, "description": "Replacement structural pointers. Passed = replaces the inherited value wholesale; absent = the old value carries over and the reply names it." },
+                                "related_to": { "type": "array", "items": { "type": "string" }, "description": "Replacement related_to ids. Passed = replaces; absent = carries over and is reported." },
+                                "contained_by": { "type": "array", "items": { "type": "string" }, "description": "Replacement contained_by ids. Passed = replaces; absent = carries over and is reported." },
                                 "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." }
                             },
                             "required": ["id", "namespace", "content"]
@@ -1234,6 +1237,8 @@ async fn handle_supersede_memory(
     // The replacement inherits everything the old row established -- who stored
     // it, what it governs, which files it points at -- because a correction to
     // the text is not a change of subject.
+    let mut replaced: Vec<&str> = Vec::new();
+    let mut carried: Vec<&str> = Vec::new();
     let mut new_payload = old_payload.clone();
     new_payload.content = content.to_string();
     if let Some(obj) = new_payload.metadata.as_object_mut() {
@@ -1249,6 +1254,19 @@ async fn handle_supersede_memory(
         // becoming permanently active.
         if let Some(vt) = future_valid_to {
             obj.insert("valid_to".to_string(), serde_json::json!(vt));
+        }
+        // Guinea-pig BUG-10: a correction must be able to fix a stale
+        // structural pointer. Anything passed explicitly replaces the inherited
+        // value wholesale; anything absent carries over -- and the reply names
+        // every carried value, because "superseded with X" while leaving a
+        // stale pointer is the confident-wrong-answer failure again.
+        for key in ["governs", "related_to", "contained_by"] {
+            if let Some(v) = arguments.get(key) {
+                obj.insert(key.to_string(), v.clone());
+                replaced.push(key);
+            } else if old_payload.metadata.get(key).is_some() {
+                carried.push(key);
+            }
         }
     }
 
@@ -1335,10 +1353,20 @@ async fn handle_supersede_memory(
         );
     }
 
-    format!(
+    let mut report = format!(
         "Superseded {} with {} in namespace {}. The old memory keeps its text and is no longer returned by search; it is still readable by id.",
         id, new_id, namespace
-    )
+    );
+    if !replaced.is_empty() {
+        report.push_str(&format!(" Replaced metadata: {}.", replaced.join(", ")));
+    }
+    if !carried.is_empty() {
+        report.push_str(&format!(
+            " Carried over UNCHANGED from the old memory: {} -- if any of these are now stale, re-run with the corrected value (the content text does not drive metadata).",
+            carried.join(", ")
+        ));
+    }
+    report
 }
 
 async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore>) -> String {
@@ -2278,6 +2306,48 @@ mod tests {
     }
 
     // ── Task 3c: optimistic guard aborts on concurrent change ──────────
+
+    /// Guinea-pig BUG-10: a correction must be able to fix a stale structural
+    /// pointer. Explicit metadata replaces wholesale; absent metadata is
+    /// carried over AND named in the reply -- never silently stale.
+    #[tokio::test]
+    async fn supersede_replaces_structural_metadata_and_reports_what_it_kept() {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let mut meta_payload = payload("stale pointer rule");
+        meta_payload.metadata =
+            serde_json::json!({ "governs": ["gone/file.rs"], "related_to": ["someone"] });
+        let v = StubEmbedder.embed("stale pointer rule").await.unwrap();
+        store.upsert("probe", &id, v, meta_payload).await.unwrap();
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": id,
+                "namespace": "probe",
+                "content": "corrected pointer rule",
+                "governs": ["live/file.rs"]
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+        assert!(reply.contains("Replaced metadata: governs"), "got {}", reply);
+        assert!(
+            reply.contains("Carried over UNCHANGED from the old memory: related_to"),
+            "the carried pointer must be named: {}",
+            reply
+        );
+
+        let (_, new_row) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(new_row.metadata["governs"], serde_json::json!(["live/file.rs"]));
+        assert_eq!(new_row.metadata["related_to"], serde_json::json!(["someone"]));
+    }
 
     /// A concurrent supersede between the first read and the guard re-read
     /// causes the second supersede to detect the change and abort.

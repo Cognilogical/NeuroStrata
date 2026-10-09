@@ -228,12 +228,28 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
 
     // A6 rule honesty: "a rule that no machine checks is a note, not a rule."
     // A rule claiming ENFORCED must name a real wire from the closed registry.
+    // FEATURE-4: every rule carries provenance -- a memory is an assertion
+    // until it says where it came from.
     let known = crate::task::wiring::known_wire_ids();
     for row in memories {
         if row.payload.memory_type != "rule" {
             continue;
         }
         let rule = &row.payload.metadata;
+        let has_source = rule
+            .get("source")
+            .map(|s| !s.is_null() && (s.as_str().map(|x| !x.trim().is_empty()).unwrap_or(true)))
+            .unwrap_or(false);
+        if !has_source {
+            report.violations.push(Violation {
+                id: row.id.clone(),
+                kind: "rule_without_source",
+                detail: format!(
+                    "rule '{}' carries no metadata.source; rules are load-bearing claims and must name their origin (owner quote, doc, commit) with a date.",
+                    content_short(&row.payload.content)
+                ),
+            });
+        }
         if rule.get("enforcement").and_then(|e| e.as_str()) != Some("ENFORCED") {
             continue;
         }
@@ -290,6 +306,24 @@ mod tests {
 
     fn task(id: &str, task_meta: Value) -> SearchResult {
         row(id, "task", &format!("work for {}", id), json!({ "task": task_meta }))
+    }
+
+    /// FEATURE-4: a rule is an assertion until it says where it came from.
+    #[test]
+    fn a_rule_without_provenance_fails_the_gate() {
+        let rows = vec![
+            row("rule-sourced", "rule", "Use podman", json!({ "source": "owner 2026-10-08" })),
+            row("rule-unsourced", "rule", "Use docker-free images", json!({})),
+            row("rule-blank", "rule", "Blank source", json!({ "source": "  " })),
+        ];
+        let report = evaluate(&rows, 0);
+        let hits: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "rule_without_source")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(hits, vec!["rule-unsourced", "rule-blank"]);
     }
 
     /// A6 rule honesty: a rule that claims ENFORCED must name a real wire.
@@ -491,7 +525,12 @@ mod tests {
 
     #[test]
     fn memories_are_never_counted_as_tasks() {
-        let report = evaluate(&[row("mem-1", "rule", "always use podman", json!({}))], NOW);
+        // A provenance-bearing rule (rules carry source since FEATURE-4);
+        // the point of this test is that it still is not a task.
+        let report = evaluate(
+            &[row("mem-1", "rule", "always use podman", json!({ "source": "owner 2026-10-08" }))],
+            NOW,
+        );
         assert!(report.ok());
         assert_eq!(report.counts.total, 0);
     }

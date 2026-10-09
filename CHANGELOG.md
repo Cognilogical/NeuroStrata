@@ -28,6 +28,9 @@ All notable changes to the NeuroStrata project will be documented in this file.
 - **Migration, graph export, and read-only tooling no longer demand a daemon shutdown:** `task import`, `export-graph`, and the read-only trio (`doctor`, `list`, `namespaces`) route through the running daemon (`/tasks/import`, `/graph?all=true`, `/cli/read`) — the lock gates writers, not readers. Daemon-failure errors now lead with `run status — do NOT start a daemon`.
 - **`task_setup` suggests rules worth trusting:** language detection weighs counted source files, not manifest presence (a tooling `package.json` no longer outvotes a Go-majority tree); every suggestion is flagged `heuristic: true` / `verified: false`, carries its `similar_existing` memories, and real overlap lands in `conflicts[]`.
 - **`export-graph` export fidelity:** nodes now carry `metadata` and a `superseded` marker with `superseded_by`; `EXTRACTED_FROM` consolidation edges are exported alongside `RELATES_TO`/`CONTAINS`/`GOVERNS`; `--exclude-superseded` drops retired rows entirely.
+- **`doctor` is scoped and labeled (round 2):** `--namespace <ns>` (refuses unknown names) or all namespaces in deterministic order, with every finding line carrying its `[namespace]` label — an unqualified health line once produced a confident wrong answer about a different project.
+- **`supersede_memory` repairs structural metadata (round 2):** accepts `governs`/`related_to`/`contained_by` and replaces them wholesale; anything omitted carries over unchanged and is **named in the reply** — a correction can no longer silently leave a stale pointer.
+- **Rules carry provenance (round 2):** `task_validate` fails rules with no `metadata.source` (`rule_without_source`); `source` accepts a dated string or `{kind, ref, captured_at}`.
 
 ---
 
