@@ -128,10 +128,11 @@ neurostrata-mcp edit my-rust-project 550e8400-e29b-41d4-a716-446655440000 my-rus
 ### 9. `task gate`
 Runs the Supervisory Attentional System — the Central Executive's enforcement check — over a namespace. This is what the pre-push hook runs.
 ```bash
-neurostrata-mcp task gate <namespace> [--strict]
+neurostrata-mcp task gate <namespace> [--strict] [--self-test]
 ```
 *   `namespace` (Required): The exact project name.
 *   `--strict` (Optional): Treat infrastructure failure (unreachable database) as blocking instead of warning.
+*   `--self-test` (Optional): Run the gate engine against an in-memory fixture of planted violations and assert the produced violation-kind set matches the canonical three (`done_without_extraction`, `in_progress`, `p0_open_over_24h`). Metadata-only, no daemon, no DB, no lock; `namespace` is ignored. Exits `0` on a clean match, `1` with a `missing`/`extra` diff when the engine silently drops or adds a rule. See *the gate contract* below §10.
 
 *Exit codes:*
 *   `0` — clean.
@@ -142,6 +143,13 @@ neurostrata-mcp task gate <namespace> [--strict]
 ```bash
 neurostrata-mcp task gate NeuroStrata --strict
 ```
+
+*The gate self-test* (proves the gate is still a gate):
+```bash
+neurostrata-mcp task gate --self-test NeuroStrata
+```
+A gate that passes its own test is not a gate — running `--self-test` after any change to the violation rules catches silent drift before it ships. Output is both a JSON verdict and a human-readable PASS/FAIL line that names the missing or extra kind. See `docs/design-wiring-panel.md` §Q4 for the split-verdict rationale (core ships the contract; per-gate project-side runners stay project-side because per-file mutation is blast-radius beyond the memory system's remit).
+
 Escape hatch for a wedged database: `NEUROSTRATA_SKIP_GATE=1 git push`.
 
 ---
