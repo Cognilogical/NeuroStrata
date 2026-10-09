@@ -31,6 +31,9 @@ All notable changes to the NeuroStrata project will be documented in this file.
 - **`doctor` is scoped and labeled (round 2):** `--namespace <ns>` (refuses unknown names) or all namespaces in deterministic order, with every finding line carrying its `[namespace]` label — an unqualified health line once produced a confident wrong answer about a different project.
 - **`supersede_memory` repairs structural metadata (round 2):** accepts `governs`/`related_to`/`contained_by` and replaces them wholesale; anything omitted carries over unchanged and is **named in the reply** — a correction can no longer silently leave a stale pointer.
 - **Rules carry provenance (round 2):** `task_validate` fails rules with no `metadata.source` (`rule_without_source`); `source` accepts a dated string or `{kind, ref, captured_at}`.
+- **Runtime skew detection (round 3):** the daemon serves its build identity on `GET /info` (fingerprint captured at startup); `status` compares it against the binary on disk and exits `3` on a mismatch — a fix "missing" from a stale daemon is never again mistaken for a defect. Root cause of the round-3 false "still open".
+- **`supersede_memory` round 3:** accepts `locations` (`add_memory` parity — replaces `refs` wholesale and re-derives `governs`); an unambiguous `Governs:` line in the corrected prose is **honoured** when no parameter speaks (the line is no longer written-but-ignored); conflicting lines are refused, not guessed; the reply names which source set the pointer (parameter | locations | content line | inherited).
+- **Self-contradicting records marked (round 3):** when a memory's prose `Governs:` line disagrees with its authoritative metadata, the rendered record carries a `NOTE` naming both — two contradictory lists never render unmarked again.
 
 ---
 

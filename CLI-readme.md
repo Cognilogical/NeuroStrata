@@ -196,14 +196,15 @@ neurostrata-mcp hooks install --force
 ---
 
 ### 13. `status`
-Read-only preflight: reports the store, the daemon, and who holds the lock — nothing else. The command to run when an MCP connection fails *before* anyone starts anything.
+Read-only preflight: reports the store, the daemon, who holds the lock, and **which build the daemon is running** — nothing else. The command to run when an MCP connection fails *before* anyone starts anything.
 ```bash
 neurostrata-mcp status
 ```
 *Exit codes:*
-*   `0` — a healthy daemon is serving every console.
+*   `0` — a healthy daemon is serving every console, running the same build as this binary.
 *   `1` — no daemon, lock free: safe to start exactly one (`neurostrata-mcp daemon`).
 *   `2` — the lock is held but nothing answers: a daemon is busy or finishing. **Do not start another** — wait, or run `neurostrata-mcp shutdown`.
+*   `3` — **stale build**: the daemon answers, but it was started from an older binary than the one on disk (or predates build verification entirely). Every tool and schema you see through it belongs to that older build — fixes appear to be missing. Restart it: `neurostrata-mcp shutdown`, then `neurostrata-mcp daemon` (and restart any session holding an old stdio server). The daemon reports its build identity on `GET /info`.
 
 **One daemon per store; every console shares it; never spawn your own.** A second daemon is refused at the lock (it exits with a message, not a crash), and `status` exists so the refusal is never a surprise.
 

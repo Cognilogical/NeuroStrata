@@ -200,6 +200,7 @@ pub async fn process_mcp_request(
                                 "governs": { "type": "array", "items": { "type": "string" }, "description": "Replacement structural pointers. Passed = replaces the inherited value wholesale; absent = the old value carries over and the reply names it." },
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Replacement related_to ids. Passed = replaces; absent = carries over and is reported." },
                                 "contained_by": { "type": "array", "items": { "type": "string" }, "description": "Replacement contained_by ids. Passed = replaces; absent = carries over and is reported." },
+                                "locations": { "type": "array", "items": { "type": "object" }, "description": "Replacement anchors: [{path, lines?, symbol?}]. Replaces refs wholesale and re-derives governs from the paths, exactly like add_memory." },
                                 "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." }
                             },
                             "required": ["id", "namespace", "content"]
@@ -841,6 +842,45 @@ pub(crate) fn stamp_locations(metadata: &mut Value, locations: &[Value]) {
     }
 }
 
+/// Every `Governs: [...]` list written in the prose, in order. Metadata is
+/// what machines follow (BUG-10); this parses the prose line so the two can
+/// be compared and reconciled instead of silently contradicting each other
+/// inside one record (guinea-pig "in every option" ask).
+pub(crate) fn content_governs_lines(content: &str) -> Vec<Vec<String>> {
+    content
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Governs:"))
+        .filter_map(|rest| serde_json::from_str::<Vec<String>>(rest.trim()).ok())
+        .collect()
+}
+
+/// The note that marks which list governs when the prose and the metadata
+/// disagree. A record must never render two Governs lists in one block with
+/// nothing marking the authoritative half.
+pub(crate) fn governance_conflict_note(content: &str, metadata: &Value) -> Option<String> {
+    let declared: Vec<String> = content_governs_lines(content).into_iter().flatten().collect();
+    if declared.is_empty() {
+        return None;
+    }
+    let authoritative: Vec<String> = metadata
+        .get("governs")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let agrees = declared.len() == authoritative.len() && declared.iter().all(|d| authoritative.contains(d));
+    if agrees {
+        return None;
+    }
+    Some(format!(
+        "\nNOTE: the prose above lists Governs {:?}, which DISAGREES with the authoritative metadata Governs {:?}. The metadata pointer is what machines follow; fix the prose with supersede (pass a governs parameter to move the pointer).",
+        declared, authoritative
+    ))
+}
+
 /// The lineage stamps every newly written row carries: born now, seen zero
 /// times. Shared with task_complete's inline extraction so a fact written
 /// there is indistinguishable from one written by add_memory.
@@ -980,6 +1020,19 @@ async fn handle_add_memory(
     }
     stamp_new_memory(&mut metadata);
 
+    // Honour an unambiguous Governs line in the prose (guinea-pig Option 2):
+    // a declared pointer that is written but never honoured is the worst of
+    // both worlds. Locations and explicit metadata already wrote governs;
+    // this fills it in only when nothing else did.
+    let mut adopted_governs = false;
+    if metadata.get("governs").map(|g| g.is_null()).unwrap_or(true) {
+        let lists = content_governs_lines(content);
+        if lists.len() == 1 {
+            metadata["governs"] = serde_json::json!(lists[0]);
+            adopted_governs = true;
+        }
+    }
+
     if let Ok(existing_namespaces) = store.list_namespaces().await {
         if !existing_namespaces.contains(&namespace.to_string()) && !create_new_namespace {
             return format!(
@@ -1007,7 +1060,13 @@ async fn handle_add_memory(
         )
         .await
         {
-            Ok(_) => format!("Successfully added memory for namespace: {}", namespace),
+            Ok(_) => {
+                let mut msg = format!("Successfully added memory for namespace: {}", namespace);
+                if adopted_governs {
+                    msg.push_str(" (governs set from the Governs line in your content)");
+                }
+                msg
+            }
             Err(e) => e,
         }
     } else {
@@ -1237,10 +1296,28 @@ async fn handle_supersede_memory(
     // The replacement inherits everything the old row established -- who stored
     // it, what it governs, which files it points at -- because a correction to
     // the text is not a change of subject.
-    let mut replaced: Vec<&str> = Vec::new();
-    let mut carried: Vec<&str> = Vec::new();
+    let mut replaced: Vec<String> = Vec::new();
+    let mut carried: Vec<String> = Vec::new();
     let mut new_payload = old_payload.clone();
     new_payload.content = content.to_string();
+    // Locations follow the same wholesale semantics as the pointers below
+    // (guinea-pig Option 1: a replacement replaces everything).
+    let mut locations_wrote_governs = false;
+    if let Some(locations) = arguments.get("locations").and_then(|l| l.as_array()) {
+        let (first_path, first_lines) = first_location(locations);
+        new_payload.location = first_path;
+        new_payload.location_lines = first_lines;
+        locations_wrote_governs = locations
+            .iter()
+            .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
+            .any(|p| !p.is_empty());
+        stamp_locations(&mut new_payload.metadata, locations);
+        replaced.push("locations".to_string());
+    }
+    // The prose's own "Governs: [...]" lines (guinea-pig Option 2). The old
+    // failure wrote the line and never honoured it -- the worst of both
+    // worlds -- so honour it when nothing else spoke, and name the winner.
+    let content_lists = content_governs_lines(content);
     if let Some(obj) = new_payload.metadata.as_object_mut() {
         obj.remove("valid_to");
         // Do NOT carry over superseded_by from the old row; only supersedes
@@ -1263,9 +1340,22 @@ async fn handle_supersede_memory(
         for key in ["governs", "related_to", "contained_by"] {
             if let Some(v) = arguments.get(key) {
                 obj.insert(key.to_string(), v.clone());
-                replaced.push(key);
+                replaced.push(key.to_string());
+            } else if key == "governs" && locations_wrote_governs {
+                replaced.push("governs (derived from locations)".to_string());
             } else if old_payload.metadata.get(key).is_some() {
-                carried.push(key);
+                carried.push(key.to_string());
+            }
+        }
+        // An unambiguous content line is the author's declaration and wins
+        // over the inherited pointer when no parameter and no locations spoke.
+        // A record must never hold two contradictory Governs lists.
+        if arguments.get("governs").is_none() && !locations_wrote_governs && content_lists.len() == 1 {
+            let declared = serde_json::json!(content_lists[0]);
+            if old_payload.metadata.get("governs") != Some(&declared) {
+                obj.insert("governs".to_string(), declared);
+                carried.retain(|k| k != "governs");
+                replaced.push("governs (from your content line)".to_string());
             }
         }
     }
@@ -1362,8 +1452,29 @@ async fn handle_supersede_memory(
     }
     if !carried.is_empty() {
         report.push_str(&format!(
-            " Carried over UNCHANGED from the old memory: {} -- if any of these are now stale, re-run with the corrected value (the content text does not drive metadata).",
+            " Carried over UNCHANGED from the old memory: {} -- to replace them pass governs/related_to/contained_by/locations, or state one Governs line in the prose.",
             carried.join(", ")
+        ));
+    }
+    let governs_in_play = replaced.iter().any(|k| k.starts_with("governs"))
+        || carried.iter().any(|k| k == "governs")
+        || arguments.get("governs").is_some();
+    if governs_in_play {
+        let source = if arguments.get("governs").is_some() {
+            "the governs parameter"
+        } else if locations_wrote_governs {
+            "the locations parameter"
+        } else if content_lists.len() == 1 {
+            "the Governs line in your content"
+        } else {
+            "the retired memory (carried over)"
+        };
+        report.push_str(&format!(" The governing pointer is now set from {}.", source));
+    }
+    if content_lists.len() > 1 && arguments.get("governs").is_none() && !locations_wrote_governs {
+        report.push_str(&format!(
+            " WARNING: your content carries {} conflicting Governs lines and no governs parameter was passed; the inherited pointer stands and the record still contradicts itself. Re-run with one clean line in the prose and, if the pointer must move, a governs parameter.",
+            content_lists.len()
         ));
     }
     report
@@ -1591,6 +1702,12 @@ fn format_memory(id: &str, payload: &MemoryPayload) -> String {
                 }
             }
         }
+    }
+    // When the prose carries its own Governs line that disagrees with the
+    // metadata pointer, say which half governs instead of rendering two
+    // contradictory lists indistinguishably (guinea-pig BUG-10).
+    if let Some(note) = governance_conflict_note(&payload.content, &payload.metadata) {
+        out.push_str(&note);
     }
     out
 }
@@ -2347,6 +2464,111 @@ mod tests {
         let (_, new_row) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
         assert_eq!(new_row.metadata["governs"], serde_json::json!(["live/file.rs"]));
         assert_eq!(new_row.metadata["related_to"], serde_json::json!(["someone"]));
+    }
+
+    /// Guinea-pig round 3 (Option 1 completion + Option 2): locations replace
+    /// wholesale, an unambiguous content Governs line is honoured, and the
+    /// reply names which source set the governing pointer. Conflicting lines
+    /// are refused rather than guessed.
+    #[tokio::test]
+    async fn supersede_replaces_locations_and_honours_the_content_governs_line() {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // A: locations parameter replaces refs wholesale and derives governs.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut meta_payload = payload("anchored rule");
+        meta_payload.metadata = serde_json::json!({
+            "governs": ["dead/old.go"],
+            "refs": [{ "file": "dead/old.go" }]
+        });
+        let v = StubEmbedder.embed("anchored rule").await.unwrap();
+        store.upsert("probe", &id, v, meta_payload).await.unwrap();
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": id,
+                "namespace": "probe",
+                "content": "anchored rule v2",
+                "locations": [{ "path": "live/new.go", "lines": "1-9" }]
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+        assert!(reply.contains("Replaced metadata: locations"), "got {}", reply);
+        assert!(
+            reply.contains("set from the locations parameter"),
+            "got {}",
+            reply
+        );
+        let (_, row_a) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(row_a.metadata["refs"][0]["file"], serde_json::json!("live/new.go"));
+        let expected = crate::parser::ingest::normalize_node_path("live/new.go");
+        assert_eq!(row_a.metadata["governs"], serde_json::json!([expected]));
+
+        // B: no parameters -- the prose's single Governs line is the author's
+        // declaration and replaces the stale inherited pointer.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut meta_payload = payload("pointer rule");
+        meta_payload.metadata = serde_json::json!({ "governs": ["dead/old.go"] });
+        let v = StubEmbedder.embed("pointer rule").await.unwrap();
+        store.upsert("probe", &id, v, meta_payload).await.unwrap();
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": id,
+                "namespace": "probe",
+                "content": "pointer rule v2\nGoverns: [\"live/new.go\"]"
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("governs (from your content line)"), "got {}", reply);
+        assert!(
+            reply.contains("set from the Governs line in your content"),
+            "got {}",
+            reply
+        );
+        let (_, row_b) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(row_b.metadata["governs"], serde_json::json!(["live/new.go"]));
+
+        // C: two conflicting lines and no parameter -- refuse to guess, say so.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut meta_payload = payload("conflicted rule");
+        meta_payload.metadata = serde_json::json!({ "governs": ["dead/old.go"] });
+        let v = StubEmbedder.embed("conflicted rule").await.unwrap();
+        store.upsert("probe", &id, v, meta_payload).await.unwrap();
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": id,
+                "namespace": "probe",
+                "content": "conflicted rule v2\nGoverns: [\"a.go\"]\nGoverns: [\"b.go\"]"
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("2 conflicting Governs lines"), "got {}", reply);
+        let (_, row_c) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(row_c.metadata["governs"], serde_json::json!(["dead/old.go"]));
+    }
+
+    /// A record must never render two Governs lists with nothing marking the
+    /// authoritative half (guinea-pig "in every option" ask).
+    #[test]
+    fn a_prose_governs_line_that_disagrees_is_marked_in_the_render() {
+        let mut disagreeing = payload("rule text\nGoverns: [\"a.go\"]");
+        disagreeing.metadata = serde_json::json!({ "governs": ["b.go"] });
+        let out = format_memory("ns-1", &disagreeing);
+        assert!(out.contains("DISAGREES with the authoritative metadata"), "got {}", out);
+
+        let mut agreeing = payload("rule text\nGoverns: [\"a.go\"]");
+        agreeing.metadata = serde_json::json!({ "governs": ["a.go"] });
+        assert!(governance_conflict_note(&agreeing.content, &agreeing.metadata).is_none());
     }
 
     /// A concurrent supersede between the first read and the guard re-read
