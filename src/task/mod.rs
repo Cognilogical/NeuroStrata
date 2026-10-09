@@ -3848,8 +3848,8 @@ mod tests {
         async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
             self.inner.list_namespaces().await
         }
-        async fn export_graph(&self, include_retired: bool) -> anyhow::Result<serde_json::Value> {
-            self.inner.export_graph(include_retired).await
+        async fn export_graph(&self, include_retired: bool, include_archived: bool) -> anyhow::Result<serde_json::Value> {
+            self.inner.export_graph(include_retired, include_archived).await
         }
         async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
             self.inner.increment_access_count(namespace, id).await

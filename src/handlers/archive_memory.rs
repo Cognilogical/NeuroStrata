@@ -13,7 +13,7 @@
 //! filter is a follow-up task.
 
 use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
-use crate::traits::VectorStore;
+use crate::traits::{MemoryPayload, VectorStore};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -43,6 +43,23 @@ impl ArchiveOutcome {
     pub fn is_archived(&self) -> bool {
         matches!(self, ArchiveOutcome::Archived { .. })
     }
+}
+
+/// Read-time answer to "was this row tombstoned?". The producer
+/// ([`archive_memory`]) writes `metadata.archived: true`; every read surface
+/// asks this one question of each row before letting it through.
+///
+/// Strict: a row is archived iff `metadata.archived` is the literal JSON
+/// `true`. Anything else -- absent, `false`, a string, a number, a wrong
+/// type, malformed metadata -- reads as not archived. A typo or a wrong-typed
+/// sentinel must not hide a row; the safe reading of an unknown shape is
+/// "this row has not been tombstoned".
+pub fn is_archived(payload: &MemoryPayload) -> bool {
+    payload
+        .metadata
+        .get("archived")
+        .and_then(|v: &serde_json::Value| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// The same verdicts, in the words every existing surface already expects.
@@ -88,6 +105,23 @@ pub async fn archive_memory(
         }
     };
     let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
+
+    // Retiring a row hides it from every future search, so the machine-wide
+    // stratum keeps the same guard the destructive tools carry. The wording
+    // is the contract `handle_supersede_memory` already publishes; any new
+    // retirement-class mutation has to match it rather than invent its own,
+    // so the operator gets one shape of consent across the tool surface.
+    if namespace == "global"
+        && !arguments
+            .get("allow_global")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return ArchiveOutcome::Invalid(
+            "ERROR [GLOBAL]: Refusing to archive a memory in the machine-wide 'global' namespace. Rules there apply to every project on this machine. Pass allow_global=true only if you are certain, or archive the project-local rule instead."
+                .to_string(),
+        );
+    }
 
     let (vector, mut payload) = match store.get(&namespace, &id).await {
         Ok(Some(found)) => found,
@@ -147,6 +181,222 @@ pub async fn handle_archive_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::MemoryPayload;
+    use serde_json::json;
+
+    // ---- allow_global guard parity --------------------------------------
+    //
+    // `handle_supersede_memory` refuses the machine-wide 'global' namespace
+    // without an explicit `allow_global: true`. Archive is the same class of
+    // mutation -- it retires a row from every future read -- so it carries
+    // the same guard. A rule that applies to every project on this machine
+    // deserves a moment of "are you sure?" before it disappears from
+    // recall, no matter which retirement tool the operator reached for.
+
+    /// Seeds a throwaway row in the `global` namespace. The store is fresh
+    /// per call so tests cannot read each other's writes.
+    async fn seed_global_row(tag: &str) -> (std::sync::Arc<dyn crate::traits::VectorStore>, String) {
+        use crate::traits::VectorStore;
+        let dir = std::env::temp_dir().join(format!(
+            "ns-archive-allow-global-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        store.init("global").await.expect("global table exists");
+        let id = uuid::Uuid::new_v4().to_string();
+        let vector = vec![0.1, 0.2, 0.3, 0.4];
+        store
+            .upsert(
+                "global",
+                &id,
+                vector,
+                MemoryPayload {
+                    content: "machine-wide rule".to_string(),
+                    user_id: "system".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .expect("seed global row");
+        (store, id)
+    }
+
+    /// Archiving a row in `global` without an explicit `allow_global: true`
+    /// is refused -- the same gate `handle_supersede_memory` runs. The row
+    /// stays live and no tombstone pulse is emitted.
+    #[tokio::test]
+    async fn archiving_global_without_allow_global_is_refused() {
+        let (store, id) = seed_global_row("refused").await;
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        let outcome = archive_memory(
+            serde_json::json!({ "namespace": "global", "id": id }),
+            store.clone(),
+            bus.clone(),
+        )
+        .await;
+        // The refusal class is `Invalid`, mirroring the supersede pattern's
+        // 400-style error response.
+        assert!(
+            matches!(outcome, ArchiveOutcome::Invalid(_)),
+            "the refusal class is Invalid, not Archived: {outcome:?}"
+        );
+        // The row is unchanged -- no metadata.archived, no pulse.
+        let (_, payload) = store.get("global", &id).await.unwrap().expect("still present");
+        assert!(
+            !crate::handlers::archive_memory::is_archived(&payload),
+            "the row's metadata still says live"
+        );
+    }
+
+    /// `allow_global: true` is the explicit consent the gate demands. With
+    /// it, the archive proceeds and the row's metadata is tombstoned.
+    #[tokio::test]
+    async fn archiving_global_with_allow_global_true_succeeds() {
+        let (store, id) = seed_global_row("succeeds").await;
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        let outcome = archive_memory(
+            serde_json::json!({
+                "namespace": "global",
+                "id": id,
+                "allow_global": true
+            }),
+            store.clone(),
+            bus.clone(),
+        )
+        .await;
+        assert!(outcome.is_archived(), "the archive really lands: {outcome:?}");
+        let (_, payload) = store.get("global", &id).await.unwrap().expect("still present");
+        assert!(crate::handlers::archive_memory::is_archived(&payload));
+    }
+
+    /// Non-global namespaces do not need the flag. The guard is the
+    /// supersede pattern's exact `global && !allow_global` predicate, so a
+    /// project-local row is unaffected.
+    #[tokio::test]
+    async fn archiving_a_project_local_namespace_does_not_need_allow_global() {
+        use crate::traits::VectorStore;
+        let dir = std::env::temp_dir().join(format!(
+            "ns-archive-project-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        store.init("probe").await.expect("probe table exists");
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert(
+                "probe",
+                &id,
+                vec![0.1, 0.2, 0.3, 0.4],
+                MemoryPayload {
+                    content: "project-local rule".to_string(),
+                    user_id: "system".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .expect("seed");
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        let outcome = archive_memory(
+            serde_json::json!({ "namespace": "probe", "id": id }),
+            store.clone(),
+            bus,
+        )
+        .await;
+        assert!(outcome.is_archived(), "project-local archive proceeds without the flag: {outcome:?}");
+    }
+
+    /// The error message is specific: it names the namespace, names the
+    /// flag, and points at the project-local alternative. The supersede
+    /// guard's wording is the contract every retirement-class tool matches.
+    #[tokio::test]
+    async fn the_refusal_message_names_global_and_allow_global() {
+        let (store, id) = seed_global_row("message").await;
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        let outcome = archive_memory(
+            serde_json::json!({ "namespace": "global", "id": id }),
+            store.clone(),
+            bus,
+        )
+        .await;
+        let message = match outcome {
+            ArchiveOutcome::Invalid(m) => m,
+            other => panic!("expected Invalid, got {other:?}"),
+        };
+        assert!(message.contains("global"), "names the namespace: {message}");
+        assert!(message.contains("allow_global"), "names the flag: {message}");
+    }
+
+    /// Read-time filter helper. The tombstone (`metadata.archived: true`) is
+    /// the producer's signal; every read surface asks this one question of
+    /// each row before letting it through.
+    ///
+    /// `metadata.archived == true` is archived. Anything else -- absent,
+    /// false, non-boolean, malformed -- is not. A typo or a wrong-typed
+    /// sentinel must not hide a row from the operator; the safe reading is
+    /// "this row has not been tombstoned".
+    #[test]
+    fn is_archived_is_true_only_for_the_typed_true() {
+        let mut p = payload_fixture();
+        p.metadata = json!({ "archived": true });
+        assert!(is_archived(&p));
+    }
+
+    #[test]
+    fn is_archived_is_false_for_every_other_shape() {
+        for metadata in [
+            json!({}),
+            json!({ "archived": false }),
+            json!({ "archived": null }),
+            json!({ "archived": "true" }),
+            json!({ "archived": 1 }),
+            json!({ "archived": [] }),
+            json!({ "archived": {} }),
+            json!("not-an-object"),
+        ] {
+            let mut p = payload_fixture();
+            p.metadata = metadata.clone();
+            assert!(
+                !is_archived(&p),
+                "a row with `metadata = {metadata}` is not archived"
+            );
+        }
+    }
+
+    /// The producer of the field gets one shape and the reader must agree on
+    /// it: a row that round-tripped through `archive_memory` reads as
+    /// archived through `is_archived`. If the two ever drift, the read
+    /// surface silently shows what the write surface tombstoned.
+    #[test]
+    fn is_archived_round_trips_with_archive_memorys_tombstone() {
+        // Construct a payload with object metadata (the shape archive_memory
+        // requires) and the field it sets.
+        let mut p = payload_fixture();
+        p.metadata = json!({ "archived": true, "archived_at": 1_700_000_000 });
+        assert!(is_archived(&p), "the field archive_memory writes reads as archived");
+    }
+
+    fn payload_fixture() -> MemoryPayload {
+        MemoryPayload {
+            content: "fixture".to_string(),
+            user_id: "test".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        }
+    }
 
     #[test]
     fn only_the_archived_variant_reads_as_success() {

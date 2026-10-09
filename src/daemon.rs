@@ -113,6 +113,9 @@ struct GraphQuery {
     /// `export-graph` writes every namespace and must mean the same thing
     /// with or without a daemon.
     all: Option<bool>,
+    /// Same shape as the CLI's `--include-archived`: tombstoned rows are
+    /// hidden by default and surface when this is `true`.
+    include_archived: Option<bool>,
 }
 
 pub async fn start_daemon(
@@ -419,7 +422,10 @@ async fn handle_get_graph(
     // Wait! VectorStore has export_graph() returning the whole graph!
     let data = state
         .vector_store
-        .export_graph(query.include_superseded.unwrap_or(false))
+        .export_graph(
+            query.include_superseded.unwrap_or(false),
+            query.include_archived.unwrap_or(false),
+        )
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1081,7 +1087,7 @@ mod tests {
         async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
-        async fn export_graph(&self, _include_retired: bool) -> anyhow::Result<serde_json::Value> {
+        async fn export_graph(&self, _include_retired: bool, _include_archived: bool) -> anyhow::Result<serde_json::Value> {
             Ok(serde_json::json!({"nodes": [], "links": []}))
         }
         async fn increment_access_count(&self, _namespace: &str, _id: &str) -> anyhow::Result<()> {

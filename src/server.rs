@@ -1252,6 +1252,19 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
         .await
         .map_err(|_| "Failed to list memories or namespace does not exist.".to_string())?;
 
+    // Default recall hides tombstoned rows. The snapshot is the operator's
+    // daily-start view; an archived row that still shows up there means the
+    // operator cannot trust the snapshot to mean "what is currently live in
+    // this namespace". `include_archived: true` is the audit / second-look
+    // escape hatch.
+    let include_archived = arguments
+        .get("include_archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !include_archived {
+        all_memories.retain(|r| !crate::handlers::archive_memory::is_archived(&r.payload));
+    }
+
     // Counted from the list the snapshot already had to fetch, so this
     // costs nothing beyond the scan.
     let migration = unmigrated_ids_notice(namespace, &all_memories);
@@ -1705,8 +1718,20 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
         if let Ok(vec) = emb.embed(&query).await {
             if let Ok(fetched) = store.search(namespace, vec, fetch).await {
                 let mut results = fetched;
+                // `archive_memory` writes the tombstone; the search surface
+                // honors it by default. The escape hatch (`include_archived:
+                // true`) is for audits, recovery, and any deliberate
+                // second-look -- the operator who needs to find a row that
+                // has been retired from default recall.
+                let include_archived = arguments
+                    .get("include_archived")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if !include_tasks {
                     results.retain(|r| r.payload.memory_type != "task");
+                }
+                if !include_archived {
+                    results.retain(|r| !crate::handlers::archive_memory::is_archived(&r.payload));
                 }
                 results.truncate(5);
                 if results.is_empty() {
@@ -4282,5 +4307,143 @@ mod tests {
             text
         );
         assert!(text.contains("always use podman"), "the body still follows: {}", text);
+    }
+
+    // ---- archived filter across the read surfaces -----------------------
+    //
+    // `archive_memory` writes the tombstone; the read surfaces must now hide
+    // the row by default and surface it through `include_archived: true`. The
+    // filter is the only thing that turns a tombstone into a tomb (otherwise
+    // a retired row keeps showing up in every search until the operator
+    // remembers to also delete it).
+    //
+    // Both reads run off the same `is_archived` helper, so each surface gets
+    // its own pair of tests: a default call that excludes the row and an
+    // `include_archived: true` call that surfaces it. The behavior must be
+    // uniform across surfaces, or the operator cannot predict where a
+    // tombstone will be honored.
+
+    /// `StubEmbedder` produces whole-number vectors (sums of byte values),
+    /// and LadybugDB's `ARRAY_DISTANCE` rejects integer arrays as a binder
+    /// error -- the same landmine the ladybug test comments call out. This
+    /// sibling adds a fractional part so the search path can run. Real
+    /// embedders never produce integers, so the production handler is
+    /// unaffected.
+    struct NoisyEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for NoisyEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let mut v = StubEmbedder.embed(text).await?;
+            v[0] += 0.5;
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    /// Seeds the fixture with one live row and one row tombstoned by
+    /// `archive_memory`. The test owns the bus so the dispatcher's queue is
+    /// drained by the time the read surfaces run. Embeds with `NoisyEmbedder`
+    /// so the search path can actually run.
+    async fn store_with_live_and_archived(
+        namespace: &str,
+    ) -> (Arc<dyn VectorStore>, String, String) {
+        let (store, live_id) = store_with_one_rule(namespace).await;
+
+        let archived_id = uuid::Uuid::new_v4().to_string();
+        let vector = NoisyEmbedder.embed("deprecated rule").await.unwrap();
+        store
+            .upsert(namespace, &archived_id, vector, payload("deprecated rule"))
+            .await
+            .expect("seed the row that will be archived");
+
+        let bus = Arc::new(ThalamicBus::new(16));
+        let outcome = crate::handlers::archive_memory::archive_memory(
+            serde_json::json!({ "namespace": namespace, "id": archived_id }),
+            store.clone(),
+            bus,
+        )
+        .await;
+        assert!(outcome.is_archived(), "the second row really was archived");
+
+        (store, live_id, archived_id)
+    }
+
+    /// `handle_search_memory` hides tombstoned rows by default. The point of
+    /// a tombstone is that it retires the row from the operator's recall, so
+    /// a search that still returns the row defeats the operator's intent.
+    #[tokio::test]
+    async fn search_hides_archived_rows_by_default() {
+        let (store, live_id, archived_id) = store_with_live_and_archived("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "podman" }),
+            Arc::new(NoisyEmbedder),
+            store,
+        )
+        .await;
+        assert!(text.contains(&live_id), "the live row surfaces: {text}");
+        assert!(
+            !text.contains(&archived_id),
+            "the archived row is hidden by default: {text}"
+        );
+    }
+
+    /// `include_archived: true` is the operator's escape hatch -- the row
+    /// stays in the store, so an audit, a recovery, or a deliberate
+    /// second-look has to be able to find it.
+    #[tokio::test]
+    async fn search_includes_archived_rows_when_include_archived_is_true() {
+        let (store, live_id, archived_id) = store_with_live_and_archived("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "query": "podman",
+                "include_archived": true
+            }),
+            Arc::new(NoisyEmbedder),
+            store,
+        )
+        .await;
+        assert!(text.contains(&live_id), "the live row surfaces: {text}");
+        assert!(
+            text.contains(&archived_id),
+            "include_archived surfaces the tombstoned row: {text}"
+        );
+    }
+
+    /// `handle_get_snapshot` hides tombstoned rows by default. The snapshot
+    /// is the operator's daily-start view; an archived row that still shows
+    /// up there means the operator cannot trust the snapshot to mean "what
+    /// is currently live in this namespace".
+    #[tokio::test]
+    async fn snapshot_hides_archived_rows_by_default() {
+        let (store, _live_id, archived_id) = store_with_live_and_archived("probe").await;
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        assert!(
+            !text.contains(&archived_id),
+            "the archived row is hidden by default: {text}"
+        );
+    }
+
+    /// `include_archived: true` on the snapshot surfaces every row, live and
+    /// tombstoned. Used for audits and for an operator verifying what
+    /// `archive_memory` actually did.
+    #[tokio::test]
+    async fn snapshot_includes_archived_rows_when_include_archived_is_true() {
+        let (store, _live_id, archived_id) = store_with_live_and_archived("probe").await;
+        let text = handle_get_snapshot(
+            serde_json::json!({ "namespace": "probe", "include_archived": true }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+        assert!(
+            text.contains(&archived_id),
+            "include_archived surfaces the tombstoned row: {text}"
+        );
     }
 }

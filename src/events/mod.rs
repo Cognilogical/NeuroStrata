@@ -11,7 +11,7 @@
 mod bus;
 mod event;
 mod subscriber;
-mod subscribers;
+pub(crate) mod subscribers;
 
 pub use self::bus::{SubscriberId, ThalamicBus};
 pub use self::event::ThalamicPulse;
@@ -19,4 +19,6 @@ pub use self::subscriber::{
     BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
     SubscriberError,
 };
-pub use self::subscribers::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog};
+pub use self::subscribers::{
+    check_export_freshness, EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog,
+};
