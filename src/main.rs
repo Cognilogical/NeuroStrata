@@ -328,6 +328,22 @@ async fn fetch_daemon_info() -> Option<serde_json::Value> {
     res.json::<serde_json::Value>().await.ok()
 }
 
+/// Read the configured db_path, or None if the config cannot be read.
+/// Used by the proxy mode to locate the lock file before deciding whether
+/// to spawn a competing daemon.
+fn config_db_path() -> Option<String> {
+    Config::from_default_path().ok().map(|c| c.db_path.to_string_lossy().to_string())
+}
+
+/// The daemon creates its lock by appending ".daemon.lock" to the db_path
+/// (see daemon_lock_path in main.rs). with_extension would produce
+/// "db.db.daemon.lock" for a file named "db", which is wrong.
+fn lock_path_for(db_path: &str) -> std::path::PathBuf {
+    let mut os = std::ffi::OsString::from(db_path);
+    os.push(".daemon.lock");
+    std::path::PathBuf::from(os)
+}
+
 async fn probe_daemon() -> DaemonProbe {
     match reqwest::Client::new()
         .get("http://127.0.0.1:34343/health")
@@ -947,6 +963,33 @@ async fn main() -> anyhow::Result<()> {
             server::start_mcp_proxy(server::DaemonOrigin::AlreadyRunning).await?;
             return Ok(());
         } else {
+            // The probe can return Silent (timeout) for a daemon that is alive
+            // but briefly not answering -- a restart window, model load, etc.
+            // If the lock is held, a daemon exists: wait for it instead of
+            // spawning a second one that will fail the lock check and leave
+            // the proxy hung for 30s reporting "could not reach".
+            let lock_held = config_db_path()
+                .map(|p| lock_path_for(&p).exists())
+                .unwrap_or(false);
+
+            if lock_held {
+                eprintln!("NeuroStrata daemon is starting (lock held); waiting for it to answer...");
+                let client = reqwest::Client::new();
+                for _ in 0..1200 { // up to 2 minutes
+                    if client.get("http://127.0.0.1:34343/health")
+                        .timeout(std::time::Duration::from_millis(500))
+                        .send().await.is_ok()
+                    {
+                        eprintln!("Daemon is already running. Starting MCP proxy...");
+                        server::start_mcp_proxy(server::DaemonOrigin::AlreadyRunning).await?;
+                        return Ok(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                eprintln!("A daemon holds the lock but did not answer within 2 minutes. Refusing to spawn a second instance.");
+                std::process::exit(1);
+            }
+
             eprintln!("NeuroStrata MCP Server initializing...");
             
             // Spawn the daemon as a detached process
