@@ -2201,7 +2201,7 @@ mod tests {
     async fn store_with_one_rule(namespace: &str) -> (Arc<dyn VectorStore>, String) {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
         store.init(namespace).await.expect("create the schema");
         let id = uuid::Uuid::new_v4().to_string();
         let vector = StubEmbedder.embed("always use podman").await.unwrap();
@@ -2426,7 +2426,7 @@ mod tests {
     async fn future_expiry_supersede_succeeds_and_transfers_expiry() {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
         store.init("probe").await.expect("create the schema");
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -2464,7 +2464,7 @@ mod tests {
     async fn supersede_replaces_structural_metadata_and_reports_what_it_kept() {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
         store.init("probe").await.expect("create the schema");
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -2507,7 +2507,7 @@ mod tests {
     async fn supersede_replaces_locations_and_honours_the_content_governs_line() {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
         store.init("probe").await.expect("create the schema");
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
 
@@ -2673,7 +2673,7 @@ mod tests {
     async fn snapshot_handler_missing_namespace_is_err() {
         let dir = std::env::temp_dir().join(format!("ns-snap-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
         let result = handle_get_snapshot(serde_json::json!({}), store).await;
         assert!(result.is_err(), "missing namespace should be err");
     }
