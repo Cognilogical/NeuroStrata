@@ -68,6 +68,13 @@ enum Commands {
         /// Leave superseded (retired) memories out of the export entirely
         #[arg(long)]
         exclude_superseded: bool,
+
+        /// Include tombstoned (archived) memories in the export. Archived
+        /// rows are hidden by default; this is the audit / second-look
+        /// escape hatch, the same shape `include_archived` carries on
+        /// search and snapshot.
+        #[arg(long)]
+        include_archived: bool,
     },
 
     /// Delete a memory from a namespace by ID
@@ -1981,6 +1988,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Commands::ExportGraph {
                         out_path,
                         exclude_superseded,
+                        include_archived,
                     } = &other
                     {
                         let default_path = ".NeuroStrata/graph/graph.json".to_string();
@@ -2095,7 +2103,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("Ingestion complete.");
                         }
                     }
-                    Commands::ExportGraph { out_path, exclude_superseded } => {
+                    Commands::ExportGraph { out_path, exclude_superseded, include_archived } => {
                         let default_path = ".NeuroStrata/graph/graph.json".to_string();
                         let target_path = out_path.as_ref().unwrap_or(&default_path);
                         println!("Exporting Memory Graph to {}", target_path);
@@ -2103,9 +2111,25 @@ async fn main() -> anyhow::Result<()> {
                             std::fs::create_dir_all(parent)?;
                         }
                         vector_store.init("global").await?;
+                        // A4 wire: refuse to export a stale graph. The
+                        // `export_freshness_dirty` subscriber writes one
+                        // sentinel row per namespace it sees mutate; this
+                        // reads them and exits 1 if any is still dirty. An
+                        // operator who has confirmed the export is current
+                        // can flip the flag's `dirty` field to false; the
+                        // gate trusts the flag, not its own clock.
+                        if let Err(why) =
+                            crate::events::check_export_freshness(&*vector_store).await
+                        {
+                            eprintln!("{why}");
+                            std::process::exit(1);
+                        }
                         // Superseded rows are exported marked (`superseded`,
                         // `superseded_by`) unless --exclude-superseded drops them.
-                        let graph_data = vector_store.export_graph(!exclude_superseded).await?;
+                        // Tombstoned rows are excluded unless --include-archived
+                        // asks for them; the same default-with-escape-hatch shape
+                        // the search and snapshot read surfaces use.
+                        let graph_data = vector_store.export_graph(!exclude_superseded, include_archived).await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
                     }

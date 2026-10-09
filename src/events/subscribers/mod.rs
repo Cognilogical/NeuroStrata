@@ -11,5 +11,5 @@ mod export_freshness_dirty;
 mod guard_event_log;
 
 pub use self::episodic_pointer_echo::EpisodicPointerEcho;
-pub use self::export_freshness_dirty::ExportFreshnessDirty;
+pub use self::export_freshness_dirty::{check_export_freshness, ExportFreshnessDirty};
 pub use self::guard_event_log::GuardEventLog;

@@ -36,3 +36,5 @@ target/
 .beads.gate.lock
 .neuroplasticity/
 .worktrees/
+
+.superpowers/sdd/

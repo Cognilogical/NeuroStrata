@@ -120,6 +120,49 @@ fn dirty_payload(namespace: &str, reason: &str, ts: i64) -> MemoryPayload {
     }
 }
 
+/// The reader of the flag. The A4 wire.
+///
+/// Walks every namespace the store knows about and refuses if any holds a
+/// `freshness_flag` row with `metadata.dirty == true`. Called from
+/// `neurostrata-mcp export-graph` before the export itself, so an unflushed
+/// namespace turns into a non-zero exit instead of a silently stale graph.
+///
+/// A namespace that has never been mutated has no flag row; that is clean,
+/// not a failure -- the gate is "behind the last export?", not "ever had a
+/// memory?". An operator who has confirmed the export is current can flip
+/// `dirty` to `false` themselves; the gate trusts the flag.
+pub async fn check_export_freshness(store: &dyn VectorStore) -> Result<(), String> {
+    let namespaces = store
+        .list_namespaces()
+        .await
+        .map_err(|e| format!("Failed to list namespaces: {e}"))?;
+    let mut dirty: Vec<String> = Vec::new();
+    for ns in &namespaces {
+        match store.get(ns, &flag_id(ns)).await {
+            Ok(Some((_, payload))) => {
+                if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
+                    dirty.push(ns.clone());
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read freshness flag for {ns}: {e}"
+                ))
+            }
+        }
+    }
+    if dirty.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to export: {} namespace(s) have an unflushed freshness flag: [{}]. Run `export-graph` after the mutations land, or flip each flag's `dirty` field to false once the export is current.",
+            dirty.len(),
+            dirty.join(", ")
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +401,127 @@ mod tests {
         );
         assert_eq!(payload.metadata["dirty"], serde_json::json!(true));
         assert_eq!(bus.metrics().dispatcher_handled, 1, "the pulse reached the subscriber");
+    }
+
+    // ---- A4 gate consumer -----------------------------------------------
+    //
+    // The subscriber above writes the flag; `check_export_freshness` reads it.
+    // It runs from `neurostrata-mcp export-graph` before the export itself, so
+    // an unflushed namespace makes the command refuse (exit 1) instead of
+    // silently shipping a stale graph.
+
+    /// Refuses when any namespace holds a freshness flag with `dirty: true`.
+    /// A namespace that has never seen a mutation has no flag row at all, and
+    /// is treated as clean — the gate is "behind the last export?", not
+    /// "ever had a memory?".
+    #[tokio::test]
+    async fn the_check_refuses_when_any_namespace_has_a_dirty_flag() {
+        let (_dir, store) = scratch("refuses");
+        store.init("a").await.expect("init a");
+        store.init("b").await.expect("init b");
+        store
+            .upsert(
+                "a",
+                &flag_id("a"),
+                vec![0.0; TEST_DIMENSIONS],
+                dirty_payload("a", "created", 1_000),
+            )
+            .await
+            .expect("seed the dirty flag for a");
+
+        let err = check_export_freshness(&store).await.expect_err("the gate refuses");
+        assert!(err.contains("a"), "the error names the dirty namespace: {err}");
+        assert!(
+            !err.contains("b"),
+            "the error does not name a clean namespace: {err}"
+        );
+    }
+
+    /// A clean namespace — no flag row, or a flag row with `dirty: false` —
+    /// does not stop the export.
+    #[tokio::test]
+    async fn the_check_passes_when_no_flag_is_set() {
+        let (_dir, store) = scratch("clean");
+        store.init("only").await.expect("init");
+        check_export_freshness(&store).await.expect("no flag set means nothing to refuse");
+    }
+
+    /// A flag row whose `dirty` field has been flipped to `false` is treated
+    /// as clean. The export-freshness wire is what an operator reads; an
+    /// operator who has confirmed the export is current can flip the flag
+    /// and the gate must believe them.
+    #[tokio::test]
+    async fn the_check_passes_when_flag_exists_but_dirty_is_false() {
+        let (_dir, store) = scratch("manual-clear");
+        store.init("a").await.expect("init a");
+        let mut payload = dirty_payload("a", "created", 1_000);
+        payload.metadata["dirty"] = serde_json::json!(false);
+        store
+            .upsert("a", &flag_id("a"), vec![0.0; TEST_DIMENSIONS], payload)
+            .await
+            .expect("seed the cleared flag");
+
+        check_export_freshness(&store)
+            .await
+            .expect("dirty=false means the gate trusts the operator");
+    }
+
+    /// Multiple dirty namespaces must all be named in the error: a single
+    /// failure point is what makes a gate useful, and a refusal that hides
+    /// the second namespace leaves the operator guessing.
+    #[tokio::test]
+    async fn the_check_lists_every_dirty_namespace_in_the_error() {
+        let (_dir, store) = scratch("multi");
+        store.init("a").await.expect("init a");
+        store.init("b").await.expect("init b");
+        store.init("c").await.expect("init c");
+        store
+            .upsert(
+                "a",
+                &flag_id("a"),
+                vec![0.0; TEST_DIMENSIONS],
+                dirty_payload("a", "created", 1_000),
+            )
+            .await
+            .expect("a dirty");
+        store
+            .upsert(
+                "c",
+                &flag_id("c"),
+                vec![0.0; TEST_DIMENSIONS],
+                dirty_payload("c", "archived", 1_000),
+            )
+            .await
+            .expect("c dirty");
+
+        let err = check_export_freshness(&store).await.expect_err("the gate refuses");
+        assert!(err.contains("a"), "names a: {err}");
+        assert!(err.contains("c"), "names c: {err}");
+        assert!(!err.contains("'b'") && !err.contains(" b "), "does not name b: {err}");
+    }
+
+    /// The `export-graph` CLI runs `check_export_freshness` before
+    /// `vector_store.export_graph`. A failing check turns into a non-zero
+    /// exit, the same shape every other refusal in the CLI already has, so
+    /// the gate surface is uniform rather than bespoke per release.
+    #[tokio::test]
+    async fn the_check_refuses_when_invoked_via_the_cli_shape() {
+        let (_dir, store) = scratch("cli-shape");
+        store.init("a").await.expect("init a");
+        store
+            .upsert(
+                "a",
+                &flag_id("a"),
+                vec![0.0; TEST_DIMENSIONS],
+                dirty_payload("a", "created", 1_000),
+            )
+            .await
+            .expect("dirty");
+
+        // The CLI shape: a Result<(), String> from the gate, mapped to
+        // exit(1) on Err. Asserting the Result suffices; the mapping is a
+        // one-line wrapper at the call site.
+        let gate: Result<(), String> = check_export_freshness(&store).await;
+        assert!(gate.is_err(), "the CLI shape refuses: {gate:?}");
     }
 }

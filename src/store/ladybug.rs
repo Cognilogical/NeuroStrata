@@ -1554,7 +1554,11 @@ impl VectorStore for LadybugStore {
         .await
     }
 
-    async fn export_graph(&self, include_retired: bool) -> Result<serde_json::Value> {
+    async fn export_graph(
+        &self,
+        include_retired: bool,
+        include_archived: bool,
+    ) -> Result<serde_json::Value> {
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().timestamp();
 
@@ -1623,7 +1627,19 @@ impl VectorStore for LadybugStore {
                 if !include_retired && retired {
                     continue;
                 }
-            
+                // The tombstone filter mirrors the read surfaces: by default
+                // an archived row stays out of the export, with the same
+                // escape hatch the operator gets in search/snapshot. Edges
+                // incident on an excluded node are dropped below.
+                let archived = full_metadata
+                    .get("archived")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !include_archived && archived {
+                    retired_ids.insert(id.clone());
+                    continue;
+                }
+
                 nodes.push(serde_json::json!({
                     "id": id,
                     "namespace": namespace,
@@ -2268,7 +2284,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let all = store.export_graph(true).await.unwrap();
+        let all = store.export_graph(true, false).await.unwrap();
         let nodes = all["nodes"].as_array().unwrap();
         let old = nodes.iter().find(|n| n["id"] == "old-rule").unwrap();
         assert_eq!(old["superseded"], true);
@@ -2284,7 +2300,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             "the consolidation edge is part of the graph"
         );
 
-        let active = store.export_graph(false).await.unwrap();
+        let active = store.export_graph(false, false).await.unwrap();
         let ids: Vec<_> = active["nodes"].as_array().unwrap().iter().map(|n| n["id"].clone()).collect();
         assert!(!ids.contains(&json!("old-rule")), "--exclude-superseded drops retired rows");
     }
@@ -3034,7 +3050,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false).await.unwrap();
+        let data = store.export_graph(false, false).await.unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3071,7 +3087,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(true).await.unwrap();
+        let data = store.export_graph(true, false).await.unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3080,6 +3096,91 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .collect();
         assert!(node_ids.contains(&"live-node"), "{:?}", node_ids);
         assert!(node_ids.contains(&"retired-node"), "{:?}", node_ids);
+    }
+
+    // ---- export-graph archived filter -----------------------------------
+    //
+    // The export-graph CLI mirrors the read surfaces: archived rows are
+    // hidden by default, with an explicit `include_archived: true` escape
+    // hatch. The trait gains a second parameter; the SQL filter excludes
+    // rows whose `metadata.archived == true` when the caller does not ask
+    // for them.
+
+    /// A row tombstoned by `archive_memory` (or hand-written with the same
+    /// shape) is excluded from the default export. The export-graph is a
+    /// recall surface for "what is live", not "what was ever true".
+    #[tokio::test]
+    async fn export_graph_excludes_archived_by_default() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "live-row",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "archived-row",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "archived": true })),
+            )
+            .await
+            .unwrap();
+
+        let data = store.export_graph(false, false).await.unwrap();
+        let node_ids: Vec<&str> = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.get("id").and_then(|i| i.as_str()))
+            .collect();
+        assert!(node_ids.contains(&"live-row"), "{:?}", node_ids);
+        assert!(
+            !node_ids.contains(&"archived-row"),
+            "archived rows are excluded by default: {node_ids:?}"
+        );
+    }
+
+    /// `include_archived: true` is the audit / second-look escape hatch --
+    /// every row, live and tombstoned, surfaces.
+    #[tokio::test]
+    async fn export_graph_include_archived_true_shows_all() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "live-row",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "archived-row",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "archived": true })),
+            )
+            .await
+            .unwrap();
+
+        let data = store.export_graph(false, true).await.unwrap();
+        let node_ids: Vec<&str> = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.get("id").and_then(|i| i.as_str()))
+            .collect();
+        assert!(node_ids.contains(&"live-row"), "{:?}", node_ids);
+        assert!(
+            node_ids.contains(&"archived-row"),
+            "include_archived surfaces the tombstoned row: {node_ids:?}"
+        );
     }
 
     // --- Vocabulary validation (parse_edge_specs) tests ---
