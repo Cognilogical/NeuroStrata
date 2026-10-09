@@ -153,7 +153,7 @@ neurostrata-mcp task validate <namespace>
 ```
 
 *Report categories:*
-*   `violations` — what the gate would block a push on: any `in_progress` task, a `done` task without a consolidated extraction, a P0 left `open` beyond 24h, or a rule claiming `ENFORCED` without a real `guard` wire (rule honesty).
+*   `violations` — what the gate would block a push on: any `in_progress` task, a `done` task without a consolidated extraction, a P0 left `open` beyond 24h, or rule dishonesty — a rule claiming `ENFORCED` without a real `guard` wire (`rule_overclaims_enforcement`), or a rule with no `source` provenance (`rule_without_source`).
 *   `stale` — advisory only: `in_progress` with no update in over 60 minutes. Surfaced, never blocking.
 *   `unextracted_done` — `done` tasks with zero `EXTRACTED_FROM` edges. Impossible through `task_complete` by construction; checked anyway because imports and hand edits exist (beads-imported history is `grandfathered` and exempt).
 *   `counts` — totals per status.
@@ -222,6 +222,14 @@ neurostrata-mcp restore <dir> --into <new-db-path>
 ```bash
 neurostrata-mcp backup ~/backups/neurostrata-2026-10-08
 neurostrata-mcp restore ~/backups/neurostrata-2026-10-08 --into ~/.config/NeuroStrata/data/db.restored
+```
+
+---
+
+### 15. `doctor`
+Read-only upgrade-consistency report. Runs with the daemon up. **Scoped and labeled** — `--namespace <ns>` for one project (refuses a name it does not know), omitted = every namespace in deterministic order, with each finding line carrying its `[namespace]` label. Never trust an unlabeled health line.
+```bash
+neurostrata-mcp doctor [--namespace <ns>]
 ```
 
 ---

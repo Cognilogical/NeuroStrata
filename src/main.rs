@@ -109,7 +109,14 @@ enum Commands {
     Shutdown,
 
     /// Report what an upgrade left inconsistent, changing nothing
-    Doctor,
+    /// Report what an upgrade left inconsistent, changing nothing. Scoped and
+    /// labeled: `--namespace <ns>` for one project, omitted = every namespace
+    /// with each finding line carrying its own label (guinea-pig BUG-9).
+    Doctor {
+        /// Limit the report to one namespace (default: all namespaces)
+        #[arg(long)]
+        namespace: Option<String>,
+    },
 
     /// Run an external plugin or helper, explicitly
     ///
@@ -487,12 +494,27 @@ impl ReadSource {
     }
 }
 
-async fn run_doctor(read: &ReadSource) -> anyhow::Result<()> {
+async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()> {
 
                     // Read-only by design: it names what an upgrade left
                     // behind and how to fix it, and touches nothing itself.
-                    let namespaces = read.namespaces().await?;
-                    println!("Namespaces: {:?}\n", namespaces);
+                    // Guinea-pig BUG-9: every result is scoped and labeled.
+                    // Unscoped output is what produced a confident wrong
+                    // answer about a different project's graph.
+                    let mut namespaces = read.namespaces().await?;
+                    namespaces.sort();
+                    if let Some(want) = scope {
+                        if !namespaces.iter().any(|n| n.eq_ignore_ascii_case(want)) {
+                            anyhow::bail!(
+                                "no namespace '{}' here; known: {:?}. Refusing to print unscoped results.",
+                                want, namespaces
+                            );
+                        }
+                        namespaces.retain(|n| n.eq_ignore_ascii_case(want));
+                        println!("Namespace: {:?}\n", namespaces);
+                    } else {
+                        println!("Namespaces (all): {:?}\n", namespaces);
+                    }
 
                     let mut collisions = 0;
                     for (i, a) in namespaces.iter().enumerate() {
@@ -555,9 +577,10 @@ async fn run_doctor(read: &ReadSource) -> anyhow::Result<()> {
                             }
                         }
 
-                        println!("{}: {} memories", ns, memories.len());
+                        println!("[{}] {} memories", ns, memories.len());
                         println!(
-                            "  ingested nodes carrying this namespace in their id: {} of {}",
+                            "  [{}] ingested nodes carrying this namespace in their id: {} of {}",
+                            ns,
                             ingested - unqualified.len(),
                             ingested
                         );
@@ -574,18 +597,20 @@ async fn run_doctor(read: &ReadSource) -> anyhow::Result<()> {
                             println!("    Backup first: re-ingest rewrites every id.");
                         }
                         println!(
-                            "  declared targets that need the older absolute form resolved: {}",
+                            "  [{}] declared targets that need the older absolute form resolved: {}",
+                            ns,
                             resolvable.len()
                         );
                         for target in resolvable.iter().take(3) {
                             println!("    {}", target);
                         }
-                        println!("  declared targets that match nothing ingested: {}", missing.len());
+                        println!("  [{}] declared targets that match nothing ingested: {}", ns, missing.len());
                         for target in missing.iter().take(3) {
                             println!("    {}", target);
                         }
                         println!(
-                            "  memories never counted as read: {} of {}",
+                            "  [{}] memories never counted as read: {} of {}",
+                            ns,
                             never_read,
                             memories.len()
                         );
@@ -781,6 +806,20 @@ mod tests {
                 assert_eq!(from_beads, ".beads/issues.jsonl");
             }
             other => panic!("expected Task/Import, got {:?}", other),
+        }
+
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "doctor", "--namespace", "MyProj"]).expect("doctor parses");
+        match cli.command {
+            Some(Commands::Doctor { namespace }) => {
+                assert_eq!(namespace.as_deref(), Some("MyProj"))
+            }
+            other => panic!("expected Doctor, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "doctor"]).expect("doctor parses unscoped");
+        match cli.command {
+            Some(Commands::Doctor { namespace }) => assert!(namespace.is_none()),
+            other => panic!("expected Doctor, got {:?}", other),
         }
 
         let cli =
@@ -1440,8 +1479,8 @@ async fn main() -> anyhow::Result<()> {
                     // exactly when the daemon is up and least safe to stop.
                     let read = ReadSource::Daemon;
                     match &other {
-                        Commands::Doctor => {
-                            run_doctor(&read).await?;
+                        Commands::Doctor { namespace } => {
+                            run_doctor(&read, namespace.as_deref()).await?;
                             return Ok(());
                         }
                         Commands::Namespaces => {
@@ -1473,8 +1512,8 @@ async fn main() -> anyhow::Result<()> {
                 let read = ReadSource::Direct(vector_store.clone());
 
                 match other {
-                    Commands::Doctor => {
-                        run_doctor(&read).await?;
+                    Commands::Doctor { namespace } => {
+                        run_doctor(&read, namespace.as_deref()).await?;
                     }
                     Commands::Namespaces => {
                         run_namespaces(&read).await?;

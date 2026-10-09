@@ -50,8 +50,11 @@
           "definition": "Whether any machine actually enforces this rule. A rule that no machine checks is a note, not a rule."
         },
         "source": {
-          "type": "string",
-          "definition": "Dated origin of the rule (owner ruling ref + date). Every rule carries one."
+          "type": [
+            "string",
+            "object"
+          ],
+          "definition": "Provenance of the claim: a dated string, or {kind: owner-quote|doc|transcript|commit|derived, ref: <locator>, captured_at: <date>}. Every rule carries one; task_validate fails rules without it."
         },
         "guard": {
           "type": "string",
