@@ -11,12 +11,12 @@
 
 Wire storage mutations as a publisher. v1 has two specific jobs:
 
-1. **Close the Continuous Backup Protocol gap.** Today `neurostrata_append_log` is called manually by the agent each turn. The episodic buffer (`.NeuroStrata/sessions/<date>.log`) is the audit substrate the gate already consults, but writes are best-effort. The v1 pointer-echo subscriber turns this into automatic, fire-and-forget bookkeeping.
-2. **Make the export-freshness gate (A4 wire) actually automatic.** A per-namespace `dirty: true` flag, set on any mutation, replaces the missing-freshness-marker failure mode the panel calls out.
+1. **Close the Continuous Backup Protocol gap.** Today `neurostrata_append_log` is called manually by the agent each turn. The episodic buffer (`.NeuroStrata/sessions/current.md` — the same file `buffer::append_entry` writes to) is the audit substrate the gate already consults, but writes are best-effort. The v1 pointer-echo subscriber turns this into automatic, fire-and-forget bookkeeping; the gate now sees the union of manual `append_log` calls and automatic echoes.
+2. **Make the export-freshness gate (A4 wire) actually automatic.** A per-namespace `dirty: true` flag, set on any mutation, replaces the missing-freshness-marker failure mode the panel calls out (the gate-side consumer lands in a follow-up task; in 1.8.0 the SET side ships but the gate does not yet consult the flag).
 
 A third v1 subscriber — `GuardEventLog` — records every `neurostrata_guard_validate` call. This unlocks the deferred `export-graph --causal` work as a 1-line projection over existing rows.
 
-Success looks like: `add_memory` writes land in the episodic buffer without the agent calling `append_log`. The export-freshness gate's `dirty` flag is current without a separate probe. A future contributor can register a new subscriber in 10 lines and it works.
+Success looks like: `add_memory` writes land in the episodic buffer without the agent calling `append_log`. The export-freshness gate's `dirty` flag is current without a separate probe *(the gate-side consumer is a follow-up task; 1.8.0 ships the SET side)*. A future contributor can register a new subscriber in 10 lines and it works.
 
 ## Non-goals (v1)
 
@@ -48,11 +48,11 @@ The bus is **explicit, owned, threaded**. It is not a global. Construction lives
                       sede     complete  _memory
                        │       │       │
                        └───────┴───────┘
-                                 │ bus.emit(event)
+                                 │ bus.emit(event, &RecursionToken::root())
                                  ▼
               ┌────────────────────────────────────────┐
               │  MemoryEventBus                        │
-              │  • bounded mpsc (cap 10000)            │
+              │  • bounded queue (cap 10000)           │
               │  • single dispatcher task              │
               │  • Vec<Box<dyn MemorySubscriber>>     │
               │  • RecursionToken guard                │
@@ -72,7 +72,7 @@ A subscriber never holds a reference to the bus. It receives the event, the `Rec
 ```rust
 #[non_exhaustive]
 pub enum MemoryEvent {
-    Created    { id: String, namespace: String, kind: &'static str },
+    Created    { id: String, namespace: String, kind: String },
     Superseded { old_id: String, new_id: String, namespace: String },
     Archived   { id: String, namespace: String },
 }
@@ -83,14 +83,15 @@ pub enum MemoryEvent {
 ### `MemoryEventBus` (in `src/events.rs`)
 
 - `pub fn new(capacity: usize) -> Self` — constructs the bus, starts the dispatcher task on the current Tokio runtime.
-- `pub fn register(&mut self, sub: Box<dyn MemorySubscriber>) -> SubscriberId` — appends to the subscriber list. Returns an id for later introspection (`bus.metrics()`).
-- `pub fn emit(&self, event: MemoryEvent)` — non-blocking. Returns nothing; the storage write never waits for downstream.
-- `pub fn backpressure(&self) -> tokio::sync::watch::Receiver<BackpressureEvent>` — exposes the sidecar watch channel for `POST /bus/metrics`.
-- `pub fn metrics(&self) -> BusMetrics` — `events_emitted: u64, subscribers: usize, queue_depth: usize, drops_oldest: u64, subscriber_panics: u64, subscriber_timeouts: u64`.
+- `pub fn attach_store(&self, store: Arc<dyn VectorStore>)` — hands the daemon's store to the (already running) dispatcher, which stamps it into every `SubscriberContext`. Until it is called the dispatcher substitutes an inert stand-in whose methods all return an explicit "no store attached" error, so pulses still flow and a subscriber reading `ctx.store` early fails loudly rather than writing nowhere. The first store wins; a second attach is a logged no-op.
+- `pub fn register(&self, sub: Box<dyn MemorySubscriber>) -> SubscriberId` — appends to the subscriber list. Takes `&self`, not `&mut self`: the daemon shares one `Arc<ThalamicBus>` between its startup sequence and the request handlers, so registration cannot borrow the bus mutably. Returns an id for later introspection (`bus.metrics()`).
+- `pub fn emit(&self, event: ThalamicPulse, token: &RecursionToken)` — non-blocking. Caller passes a token (emit sites use `&RecursionToken::root()` for depth 0; future subscriber-internal calls would pass a depth-1 token). Returns nothing; the storage write never waits for downstream. If the token's `allows_emit()` is false, the bus drops the event, increments `recursion_blocks`, and publishes `BackpressureEvent::RecursionRefused { token_allows_emit: false }` — the recursion guard is enforced at this boundary. The distinct variant keeps a recursion refusal distinguishable from a queue-full drop (`Dropped`) at `POST /bus/metrics`, without correlating either against a counter.
+- `pub fn backpressure(&self) -> tokio::sync::watch::Receiver<BackpressureEvent>` — exposes the sidecar watch channel. `#[cfg(test)]` in 1.8.0: there is no production consumer yet (`POST /bus/metrics` reads `bus.metrics()`, not this channel); the accessor is kept for the tests that assert the seed and the published transitions. The channel is seeded with `BackpressureEvent::Idle`, so a consumer that reads before the bus publishes anything sees "nothing has happened yet" rather than a semantically false zero-count drop.
+- `pub fn metrics(&self) -> BusMetrics` — `events_emitted: u64, dispatcher_handled: u64, subscribers: usize, queue_depth: usize, drops_oldest: u64, subscriber_panics: u64, subscriber_timeouts: u64, recursion_blocks: u64`. `events_emitted` counts every pulse the bus accepted into its queue (including the one that arrived when the queue was full and evicted the oldest); a refused recursion counts zero. `drops_oldest` counts only pulses that entered-or-should-have-entered and were lost to a full queue, `dispatcher_handled` counts pulses the dispatcher finished a full subscriber pass on. Invariant (holds whenever the dispatcher is idle between pulses, since a pulse mid-pass is in neither the queue nor the handled count yet): `events_emitted == dispatcher_handled + queue_depth + drops_oldest`.
 
 Internals:
-- `tokio::sync::mpsc::Sender<MemoryEvent>` with bounded capacity (default 10000). `try_send` — when full, drop the oldest via `try_recv` + `try_send` cycle, increment `drops_oldest`, publish a `BackpressureEvent::Dropped { count }`.
-- Dispatcher task: `while let Some(event) = rx.recv().await { for sub in &self.subscribers { let token = RecursionToken::new(); let timeout = tokio::time::timeout(Duration::from_millis(250), sub.handle(&event, &token, &ctx)); match timeout.await { Ok(Ok(())) => {} Ok(Err(e)) => log subscriber error, increment metric, Ok(Err(panic)) => caught, log, increment metric, Err(_) => timeout, log, increment metric, } } }`
+- A `VecDeque<MemoryEvent>` under a `std::sync::Mutex` with a `tokio::sync::Notify` as the wakeup edge (not an mpsc channel: with a channel the receiver lives in the dispatcher's task and is parked holding its guard across `recv().await` whenever the queue is empty — the common case — so the pop that "makes room" cannot take the lock, and drop-oldest silently degrades to drop-newest). `emit` pushes under the std lock, trims the oldest when the push overflows capacity, and returns — the lock is never held across an await. Overflow evicts the oldest, increments `drops_oldest`, publishes a `BackpressureEvent::Dropped { count }`; `Dropped` is queue-full only, recursion refusals publish `RecursionRefused` (see `emit` above). `Notify::notify_one` stores its permit when the dispatcher is parked-to-empty, so a push between the dispatcher's empty pop and its `notified().await` is never lost.
+- Dispatcher task: `loop { let event = match queue.pop() { Some(e) => e, None => { queue.notified().await; continue } }; for sub in &self.subscribers { let token = RecursionToken::new(); let timeout = tokio::time::timeout(Duration::from_millis(250), sub.handle(&event, &token, &ctx)); match timeout.await { Ok(Ok(())) => {} Ok(Err(e)) => log subscriber error, increment metric, Ok(Err(panic)) => caught, log WARN with the full panic text, publish `SubscriberPanic` with a redacted snippet, increment metric, Err(_) => timeout, log, increment metric, } } dispatcher_handled += 1 }` — a pulse counts as handled after its full subscriber pass, whatever the individual outcomes were.
 - Single dispatcher (not one-task-per-subscriber) for ordering guarantees and backpressure simplicity.
 
 ### `MemorySubscriber` trait (in `src/events.rs`)
@@ -110,18 +111,18 @@ Subscribers opt in by `match` on `event`. Unhandled variants are no-ops (zero-co
 
 - `pub fn allows_emit(&self) -> bool` — false when the dispatcher is inside a subscriber invocation (depth ≥ 1).
 - `pub fn upgrade(&self) -> Option<RecursionToken>` — returns a token that allows emit, or `None` if already at depth ≥ N (default N=1).
-- Bus guarantees the depth counter is decremented even on panic.
+- `upgrade` mutates the caller's token (the deeper slot is reserved on the parent's counter); there is no decrement path. Panic safety does not need one: `upgrade` returns an owned token, so dropping it discards that depth with nothing to release.
 
 ### `SubscriberContext` (in `src/events.rs`)
 
-- `&dyn VectorStore` — for the subscriber that needs to read siblings (e.g., the freshness dirty subscriber computes a hash from the affected namespace).
+- `&dyn VectorStore` — the store handle a subscriber uses to persist or read rows. The v1 `ExportFreshnessDirty` subscriber uses it only to `upsert` its dirty sentinel; it reads no sibling rows and computes no hash (no such consumer exists in 1.8.0).
 - `&str` namespace + ts already on the event.
 
 ### v1 subscribers (in `src/events/subscribers/`)
 
-1. **`EpisodicPointerEcho`** — matches `Created`. Writes one line `<ts> <namespace> <kind> <id>` to the per-project episodic buffer (path resolution: `<project_root>/.NeuroStrata/sessions/<YYYY-MM-DD>.log`). Idempotency key: `(id, kind)`; second emit for the same pair is a no-op. Skips if the agent has already appended a manual `append_log` entry for the same id within the same session (detected via a short-tail line-shape check, not full dedup — pragmatic, not perfect).
+1. **`EpisodicPointerEcho`** — matches `Created`. Writes one line of the form `{POINTER_LABEL}\t{id}\t{kind}\t{namespace}` to the per-project episodic buffer at `<project_root>/.NeuroStrata/sessions/current.md` — the SAME file the existing `buffer::append_entry` writes to, so manual `append_log` calls and automatic echoes land in one place. The v1 path deliberately does not roll the file by date: the union requirement (manual + automatic in one file) plus the existing buffer module's `current.md` contract both pin this. `POINTER_LABEL` is the literal string the subscriber prepends so its own lines are distinguishable from free-text agent notes; the idempotency check matches on `(id, kind)` (fields 1–2 of the tab-separated record). **Honors `buffer::load_config().enabled`** — if an operator sets `episodic_buffer: false` in their config, the subscriber returns `Ok(())` immediately without writing.
 
-2. **`ExportFreshnessDirty`** — matches `Created`, `Superseded`, `Archived`. Sets a `dirty: true` flag in the per-namespace metadata row. The export-freshness gate (A4 wire, per the wiring panel) consults this flag instead of the mtime probe. The flag is cleared on a successful `export-graph` run (new emit event in v2: `Exported { namespace }`).
+2. **`ExportFreshnessDirty`** — matches `Created`, `Superseded`, `Archived`. Sets a `dirty: true` flag in the per-namespace metadata row. The flag is set by every storage mutation; its consumer (export-freshness gate, A4 wire, per the wiring panel) and its clear path are deferred to a follow-up task — the gate does **not** consult this flag in 1.8.0. The flag is cleared on a successful `export-graph` run (new emit event in v2: `Exported { namespace }` — Task 7 wires the clear path; Task 4 ships only the SET side). The sentinel row's `memory_type` is `"freshness_flag"`, which is in `STRUCTURAL_MEMORY_TYPES` (`src/store/ladybug.rs:648` — the const now lists `["directory", "file", "markdown", "freshness_flag"]`) so vector `search_memory` excludes it from user-facing results. The sentinel is namespaced (`id = "export_freshness::{namespace}"`) so two namespaces cannot share one flag; `upsert` MERGEs on id alone, so a second flip updates the first row in place. **The subscriber takes `dimensions` at construction** (the store's embedding width — the sentinel is a row like any other, `Memory.embedding` is a fixed-size `FLOAT[N]`); the DAEMON (Task 8) passes `store.dimensions()` at construction, otherwise the write is silently rejected.
 
 3. **`GuardEventLog`** — listens on a new emit site at the end of `handle_guard_validate` (see Emit Sites). Persists `{trace_id, action_type, payload_hash, verdict, rule_ids_triggered, ts, namespace}` as a `memory_type: "guard_event"` row. The deferred `export-graph --causal` becomes a 1-line filter over these rows. `payload_hash` is a 32-bit hash of the payload bytes (not the payload itself) — keeps the row small and avoids leaking secrets into a system of record.
 
@@ -149,9 +150,10 @@ A `handle_add_memory` call:
 
 | Failure | Behavior |
 |---|---|
-| Subscriber panic | Caught at the dispatcher join point, logged WARN with the panic payload, `subscriber_panics` incremented, daemon continues. |
+| Subscriber panic | Caught at the dispatcher join point, logged WARN with the full panic payload (logs are local), `subscriber_panics` incremented, `BackpressureEvent::SubscriberPanic` published on the watch channel with a **redacted snippet** of the payload — first line only, control characters stripped, capped at 200 chars — because that channel is the audit path `POST /bus/metrics` surfaces and panic text is attacker- or content-influenced (the same reasoning as `GuardEventLog`'s `payload_hash`). Daemon continues. |
 | Subscriber timeout (>250ms) | Logged WARN, `subscriber_timeouts` incremented, daemon continues. Tunable per-subscriber in v2 if needed. |
 | Bus queue full (10000) | Drop-oldest, `drops_oldest` incremented, `BackpressureEvent::Dropped` published. WARN log at the rate of 1 per 1000 drops to avoid log flooding. |
+| `emit` called under a held `RecursionToken` | Pulse dropped at the bus boundary before it reaches the queue, `recursion_blocks` incremented, `BackpressureEvent::RecursionRefused` published. The caller's storage write is untouched. |
 | Bus emit called outside Tokio runtime | Defensive guard returns silently. Should never happen in production — daemon constructs the bus on a runtime. |
 | `handle_archive_memory` HTTP endpoint hit by an agent | Bus emits `Archived`; subscribers may not handle it; that's fine. |
 

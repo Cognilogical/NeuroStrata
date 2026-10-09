@@ -51,6 +51,8 @@ NeuroStrata uses cognitive metaphors to map how software actually evolves. Here 
 | **Knowledge Consolidation** | **Done-Funnel (Lock 2)** | A Goal reaches `done` through exactly one guarded entrance — `neurostrata_task_complete` — which fails until the work has consolidated at least one Engram (an `EXTRACTED_FROM` edge). Experience is not allowed to evaporate. |
 | **Action Initiation** | **Zero-Action Start** | No state-mutating action begins before a Goal exists and is claimed. The session snapshot says it first, every time. |
 | **Working Memory** | **Goal History** | The append-only transition log and notes on each Goal — the Task Stratum made durable. Mid-task checkpoints ("the Breath") land here. |
+| **ThalamicBus** | **Pub-Sub Event Bus** | The thalamus is the brain's relay station; this is NeuroStrata's. A bounded, in-process broadcast backbone in `src/events/` that carries memory-lifecycle pulses (`Created`, `Superseded`, `Archived`, `GuardedActionFired`) from emit sites to subscribers, with drop-oldest backpressure and a recursion token that keeps a subscriber's own writes from re-triggering itself. |
+| **ThalamicPulse** | **Event Enum** | A single event travelling on the bus — the `#[non_exhaustive]` `ThalamicPulse` enum. One pulse carries the ids and namespace subscribers act on (the variant's own fields: a `Superseded` pulse names its successor, not its own id; a `GuardedActionFired` pulse carries a payload hash). Subscribers reach the store only through their `SubscriberContext` — so a subscriber can also be a writer, but never by calling the store directly off the bus. |
 
 ---
 

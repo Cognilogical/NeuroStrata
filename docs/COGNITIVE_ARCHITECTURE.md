@@ -46,3 +46,7 @@ Memory is not locked in a black-box database. Through the NeuroVault and Obsidia
 ### 10. Asynchronous Delegation (Orchestrator-Worker Pattern)
 *Inspired by the brain's division of labor across specialized regions.*
 Operating highly intelligent frontier models on trivial code changes is financially and computationally wasteful. NeuroStrata enforces an Orchestrator/Worker divide. A high-intelligence Orchestrator routes context, manages the memory graph, and structures plans — while the Central Executive tracks the resulting Goals — and aggressively offloads physical code execution (file writes, linting, compiling) to a cheaper, narrowly-focused `NeuroStrata-Task` agent.
+
+## Cognitive-name glossary
+
+See `README.md` § Biological Nomenclature ↔ Engineering Primitives (lines 33-54) for the canonical table — one table, one set of name conventions, no drift. The 1.8.0 additions are the `ThalamicBus` and `ThalamicPulse` rows appended to that table.
