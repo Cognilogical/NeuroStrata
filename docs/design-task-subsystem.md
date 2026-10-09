@@ -321,7 +321,7 @@ neurostrata-mcp hooks install [--force]            # writes .git/hooks/pre-push
    writer — direct open while the daemon runs is already refused elsewhere).
 2. Daemon absent → open `LadybugStore` with `embed::configured_dimensions()`
    (no model load — gate is metadata-only), run the gate engine, exit.
-   Embedded Kuzu cold open is tens of ms; imperceptible inside a `git push`.
+   Embedded LadybugStore cold open is tens of ms; imperceptible inside a `git push`.
 3. Daemon silent/busy → exit 2.
 
 Default policy: exit 2 **warns loudly and allows** the push — an unavailable DB
@@ -427,7 +427,7 @@ enforcement). Idempotency key: `bead_id`; re-runs skip. After import,
   runtime-persisted 4-state record — dependency without the proof.
 - **Temporal/Restate/Camunda/Windmill**: distributed durable-execution for
   distributed long-running services; we have a 4-state row.
-- **Separate tasks table in Kuzu**: splits the memory model; tasks are memories
+- **Separate tasks table in LadybugDB**: splits the memory model; tasks are memories
   with a vocabulary entry, and GraphRAG traversal should reach them unchanged.
 - **`VectorStore` trait extensions (`list_tasks` etc.)**: `list`+filter suffices
   at task volume; trait surface is load-bearing and stays frozen.
