@@ -2212,7 +2212,7 @@ mod tests {
     async fn temp_store() -> Arc<dyn VectorStore> {
         let dir = std::env::temp_dir().join(format!("ns-task-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::new(&dir, 4).expect("open temp database"));
+            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
         store.init("global").await.expect("create the schema");
         store
     }

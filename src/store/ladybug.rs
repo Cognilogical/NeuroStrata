@@ -125,7 +125,45 @@ fn preserve_unclean_wal(local_path: &std::path::Path) {
 }
 
 impl LadybugStore {
+    /// Construct a `LadybugStore` for tests with a small system footprint so
+    /// `cargo test` (parallel by default) does not mmap-reserve 8 TiB per
+    /// open. The defaults are 512 MiB max database size + 64 MiB buffer
+    /// pool; override with `NEUROSTRATA_TEST_MAX_DB_SIZE` /
+    /// `NEUROSTRATA_TEST_BUFFER_POOL_SIZE` env vars when a test fixture
+    /// needs more (or less) room.
+    ///
+    /// 15-ish test sites use temp directories; this keeps every concurrent
+    /// open well under container memory ceilings and ends the open-time
+    /// `Mmap for size 8796093022208 failed` flake (task neurostrata-c8te).
+    pub fn for_testing(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
+        let max_db_size: u64 = std::env::var("NEUROSTRATA_TEST_MAX_DB_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512 * 1024 * 1024);
+        let buffer_pool_size: u64 = std::env::var("NEUROSTRATA_TEST_BUFFER_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024 * 1024);
+        let cfg = SystemConfig::default()
+            .max_db_size(max_db_size)
+            .buffer_pool_size(buffer_pool_size)
+            .throw_on_wal_replay_failure(true);
+        Self::with_system_config(local_path, dimensions, cfg)
+    }
+
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
+        Self::with_system_config(local_path, dimensions, verifying_config())
+    }
+
+    /// Open the database with a custom `SystemConfig`. Production paths go
+    /// through `new`; tests go through `for_testing`. The fallback path
+    /// (WAL verification failure) always uses the hardcoded `unverified_config`
+    /// recovery path; only the *initial* open is parameterized.
+    pub fn with_system_config(
+        local_path: impl Into<PathBuf>,
+        dimensions: usize,
+        initial_config: SystemConfig,
+    ) -> Result<Self> {
         let local_path = local_path.into();
 
         // A WAL present at open time means the last process did not close cleanly:
@@ -136,7 +174,7 @@ impl LadybugStore {
 
         // Open with verification first. Only if the WAL fails to authenticate do we
         // consider replaying it unverified, and never quietly.
-        let db = match Database::new(&local_path, verifying_config()) {
+        let db = match Database::new(&local_path, initial_config) {
             Ok(db) => db,
             Err(e) => {
                 let err_msg = e.to_string();
@@ -1905,7 +1943,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let db = root.join("fresh.lbug");
-        let store = LadybugStore::new(db.to_string_lossy().to_string(), 4).unwrap();
+        let store = LadybugStore::for_testing(db.to_string_lossy().to_string(), 4).unwrap();
         store.init("ExportProbe").await.unwrap();
         let out = root.join("out");
         store
@@ -2142,7 +2180,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
 
     async fn retired_test_store() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-retired-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
         store
     }
@@ -2409,7 +2447,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     /// it -- absolute -- and the file itself.
     async fn store_with_two_declarations() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         let seed = |id: &str, metadata: &str| {
@@ -2478,12 +2516,90 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         assert_eq!(governs_count(&store).await, 2);
     }
 
+    /// Regression guard for task neurostrata-c8te (parallel-test mmap flake):
+    /// `LadybugStore::for_testing` MUST use a small enough max_db_size +
+    /// buffer_pool_size that N parallel opens don't trip the 8 TiB mmap
+    /// reservation the C++ default carries over (DEFAULT_VM_REGION_MAX_SIZE
+    /// = `(uint64_t)1 << 43` on Linux x86_64). 32 threads chosen to exceed
+    /// the flake's worst observed contention.
+    ///
+    /// NOTE on drill: this test cannot drill in this dev box (30 GiB RAM,
+    /// `ulimit -v unlimited`, Linux overcommit_memory=0 — the 8 TiB mmaps
+    /// succeed at the call site). It WILL trip in stricter CI containers
+    /// (GitHub Actions: 7 GiB, ulimit set), which is where the original
+    /// flake surfaced. The fix is verified directly below in a separate
+    /// unit test that asserts the configuration choice.
+    #[test]
+    fn for_testing_does_not_reserve_an_8tib_mmap() {
+        const N: usize = 32;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let b = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let dir = std::env::temp_dir()
+                    .join(format!("ns-mmap-parallel-{}-{}", std::process::id(), i));
+                b.wait();
+                LadybugStore::for_testing(&dir, 4)
+                    .map(|_| ())
+                    .map_err(|e| format!("thread {} failed to open: {}", i, e))
+            }));
+        }
+        for h in handles {
+            match h.join().expect("thread panicked") {
+                Ok(()) => {}
+                Err(e) => panic!("parallel test open failed (regression of c8te): {}", e),
+            }
+        }
+    }
+
+    /// Drill-independent regression for c8te: even on a dev box that allows
+    /// 8 TiB mmaps via overcommit, this test verifies the configuration
+    /// choice directly: `for_testing` MUST keep the `max_db_size` /
+    /// `buffer_pool_size` overrides in its function body. If someone
+    /// drops the overrides, the C++ default (8 TiB on Linux x64) returns
+    /// at the binding level (`lbug_rs.cpp` only forwards the Rust value
+    /// if `!= -1u`/u32::MAX, but the C++ ctor's `SystemConfig()` sets the
+    /// 8 TiB default BEFORE the binding overlay -- so leaving the Rust
+    /// value at `Default::default()` re-enables the 8 TiB).
+    ///
+    /// Scoped to the `for_testing` function body so the assertion does not
+    /// match its own search string (an earlier version of this guard was
+    /// fooled by exactly that -- a self-referential assertion in the test
+    /// code itself).
+    #[test]
+    fn for_testing_uses_small_max_db_size() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/store/ladybug.rs"),
+        )
+        .expect("read self");
+        let start = src
+            .find("pub fn for_testing")
+            .expect("for_testing exists in this file");
+        let end_marker = "Self::with_system_config";
+        let end_rel = src[start..]
+            .find(end_marker)
+            .expect("end of for_testing call found");
+        let body = &src[start..start + end_rel + end_marker.len()];
+        assert!(
+            body.contains(".max_db_size(max_db_size)"),
+            "for_testing must shrink max_db_size below the C++ default \
+             (8 TiB on Linux x64); parallel test opens trip the mmap limit \
+             -- task neurostrata-c8te regression guard"
+        );
+        assert!(
+            body.contains(".buffer_pool_size(buffer_pool_size)"),
+            "for_testing must cap buffer_pool_size for parallel tests"
+        );
+    }
+
     /// A declaration naming something that was never ingested links nothing,
     /// and is not counted as though it had.
     #[tokio::test]
     async fn a_declaration_with_no_node_behind_it_links_nothing() {
         let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         let row = format!(
@@ -2512,7 +2628,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[tokio::test]
     async fn get_reads_back_the_embedding_it_stored() {
         let dir = std::env::temp_dir().join(format!("ns-embed-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         let stored = vec![0.25f32, -1.5, 3.0, 0.0];
@@ -2922,7 +3038,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     /// Build a probe namespace with symbol contained_by file, rule governs file.
     async fn evidence_test_store() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-evidence-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
         // File node (structural, zero vector)
@@ -2970,7 +3086,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[tokio::test]
     async fn relates_to_evidence_is_undirected_and_canonical() {
         let dir = std::env::temp_dir().join(format!("ns-relates-{}", uuid::Uuid::new_v4()));
-        let store = LadybugStore::new(&dir, 4).expect("open temp database");
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.unwrap();
 
         // mem-b must exist before mem-a references it via related_to

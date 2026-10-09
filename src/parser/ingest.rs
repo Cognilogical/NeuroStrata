@@ -793,7 +793,7 @@ mod tests {
     async fn a_missing_root_is_refused_before_anything_is_cleared() {
         let db = std::env::temp_dir().join(format!("ns-missing-root-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::LadybugStore::new(&db, 4).expect("open temp database"));
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
         store.init("probe").await.expect("create the schema");
 
         let node = qualified_id("probe", "src/lib.rs");
@@ -833,7 +833,7 @@ mod tests {
             "ns-producer-consumer-db-{}", uuid::Uuid::new_v4()
         ));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::LadybugStore::new(&db, 4)
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4)
                 .expect("open temp database"));
         store.init("test-ns").await.expect("create the schema");
 
