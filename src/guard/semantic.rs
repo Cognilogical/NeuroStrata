@@ -36,7 +36,7 @@ impl SemanticEvaluator {
             content: rule.constraint_text.clone(),
             user_id: "guard".to_string(),
             memory_type: "guard_rule".to_string(),
-            agent_name: Some("neurocortex".to_string()),
+            agent_name: Some("neurostrata-guard".to_string()),
             location: String::new(),
             location_lines: String::new(),
             metadata: serde_json::json!({
