@@ -4,6 +4,11 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Task rename surface:** `neurostrata_task_update` accepts `title` — it rewrites the task's `content`, re-embeds it (so `search_memory` matches the new wording), and appends `renamed: 'old' -> 'new'` to the task's history. Titles are validated identically on create and rename (non-empty, max 200 characters); the reply gains a `renamed` field. Closes the vocabulary-scrub gap that left stale engine names in live task titles.
+
 ## [1.7.0] - 2026-10-08
 
 ### Added
