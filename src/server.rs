@@ -4,6 +4,8 @@ use serde_json::{self, Value};
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use crate::guard::{BehavioralRule, GuardValidator, ValidateResponse};
+
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
     #[allow(dead_code)]
@@ -343,6 +345,56 @@ pub async fn process_mcp_request(
                             },
                             "required": ["content", "project_root"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_guard_validate",
+                        "description": "Validate an action against stored behavioral rules and (optionally) execute it in a sandboxed Podman exec. Returns a ValidateResponse carrying a ValidateVerdict: DeterministicReject, SandboxReject, SandboxPassHighFidelity, SandboxPassLowFidelity, or ApprovedFailOpen. Wraps src/guard/validator::validate.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Defaults to 'global'." },
+                                "action_type": { "type": "string", "description": "Type of action: 'bash', 'write_file', etc." },
+                                "payload": { "type": "string", "description": "The actual command or file content to validate." },
+                                "cwd": { "type": "string", "description": "Current working directory for sandbox execution. Defaults to empty." },
+                                "use_sandbox": { "type": "boolean", "description": "Whether to execute the action in a sandbox after the semantic check. Defaults to false." }
+                            },
+                            "required": ["action_type", "payload"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_guard_learn",
+                        "description": "Teach a new behavioral rule to the guard namespace. The rule's trigger_pattern is matched against future validated actions; on a match, the action is rejected with the rule's constraint_text. Wraps src/guard/validator::add_rule.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name or 'global'. Defaults to 'global'." },
+                                "rule": {
+                                    "type": "object",
+                                    "description": "The BehavioralRule to store.",
+                                    "properties": {
+                                        "id": { "type": "string", "description": "Stable id for this rule." },
+                                        "version": { "type": "integer", "description": "Rule version (monotonic)." },
+                                        "rule_class": { "type": "string", "description": "Class: 'secret-reject', 'churn-reject', 'constraint-injection', 'safety', etc." },
+                                        "trigger_pattern": { "type": "string", "description": "Lowercase substring or phrase matched against action_type/payload." },
+                                        "constraint_text": { "type": "string", "description": "Human-readable rule statement shown on violation." },
+                                        "hit_count": { "type": "integer", "description": "How many times the rule has triggered. Usually 0 for new rules." },
+                                        "status": { "type": "string", "description": "'active' or 'deprecated'. Defaults to 'active'." }
+                                    },
+                                    "required": ["id", "rule_class", "trigger_pattern", "constraint_text"]
+                                }
+                            },
+                            "required": ["rule"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_guard_list_rules",
+                        "description": "List all behavioral rules stored in the guard namespace. Wraps src/guard/validator::list_rules.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name or 'global'. Defaults to 'global'." }
+                            }
+                        }
                     }
                 ]
             });
@@ -500,6 +552,15 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_append_log" => {
                             result_text = crate::buffer::handle_append_log(arguments).await;
+                        }
+                        "neurostrata_guard_validate" => {
+                            result_text = handle_guard_validate(arguments, store.clone(), emb.clone()).await;
+                        }
+                        "neurostrata_guard_learn" => {
+                            result_text = handle_guard_learn(arguments, store.clone(), emb.clone()).await;
+                        }
+                        "neurostrata_guard_list_rules" => {
+                            result_text = handle_guard_list_rules(arguments, store.clone(), emb.clone()).await;
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -1877,6 +1938,157 @@ fn render_path(ev: &crate::traits::SearchEvidence, orig: &str) -> String {
     parts.join(" ")
 }
 
+// ---------------------------------------------------------------------------
+// Guard / Prefrontal Cortex tools (task neurostrata-fv3j)
+//
+// The src/guard/* module was folded into NeuroStrata as the in-binary
+// replacement for the retired NeuroCortex MCP. These handlers expose the
+// three reads/writes an in-session agent needs without going through the
+// daemon's HTTP /validate surface:
+//   neurostrata_guard_validate    -> wraps validator::validate
+//   neurostrata_guard_learn       -> wraps validator::add_rule
+//   neurostrata_guard_list_rules  -> wraps validator::list_rules
+// Per-call construction (one validator per MCP request) keeps the surface
+// stateless for the proxy; the daemon's prebuilt cache is the hot path.
+// ---------------------------------------------------------------------------
+
+/// Build a `GuardValidator` for the namespace named in the request.
+/// Defaults namespace to "global" so the tool works in the common case
+/// (rules are usually project-agnostic at the prefront-cortex layer) and
+/// surfaces a precise error when required arguments are missing.
+async fn build_guard_validator(
+    arguments: &Value,
+    store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+    what: &str,
+) -> Result<(GuardValidator, String), String> {
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("global");
+    // Validate namespace shape the same way handle_get_memory does, so the
+    // guard surface inherits the same project-vs-path rejection contract.
+    if namespace.contains('/') || namespace.contains('\\') || namespace.is_empty() {
+        return Err(format!(
+            "ERROR [NAMESPACE]: '{}' is not a valid namespace for guard_{}. \
+             Namespaces are exact project names (e.g., 'NeuroStrata') or 'global'.",
+            namespace, what
+        ));
+    }
+    let validator = GuardValidator::new(store, embedder, namespace);
+    Ok((validator, namespace.to_string()))
+}
+
+/// Validate an action against stored behavioral rules and (optionally) the
+/// Podman sandbox. Wraps `GuardValidator::validate`.
+async fn handle_guard_validate(
+    arguments: Value,
+    store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+) -> String {
+    let action_type = match arguments.get("action_type").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return "ERROR: 'action_type' is required for guard_validate.".to_string(),
+    };
+    let payload = match arguments.get("payload").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return "ERROR: 'payload' is required for guard_validate.".to_string(),
+    };
+    let cwd = arguments.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+    let use_sandbox = arguments
+        .get("use_sandbox")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let (validator, namespace) =
+        match build_guard_validator(&arguments, store, embedder, "validate").await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+    let trace_id = format!(
+        "guard-validate-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_millis()
+    );
+    let (verdict, rule_ids_triggered) = validator
+        .validate(action_type, payload, cwd, use_sandbox)
+        .await;
+
+    let response = ValidateResponse {
+        trace_id: trace_id.clone(),
+        verdict,
+        rule_ids_triggered,
+    };
+    let body = serde_json::to_string_pretty(&response)
+        .unwrap_or_else(|e| format!("{{\"error\":\"serialization failed: {}\"}}", e));
+    // Prefix the namespace + trace so the caller can audit which rule set
+    // produced the verdict without re-parsing the body.
+    format!(
+        "namespace: {}\ntrace_id: {}\n{}",
+        namespace, trace_id, body
+    )
+}
+
+/// Teach a new behavioral rule to the guard namespace. Wraps
+/// `GuardValidator::add_rule`.
+async fn handle_guard_learn(
+    arguments: Value,
+    store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+) -> String {
+    let rule_value = match arguments.get("rule").cloned() {
+        Some(v) => v,
+        None => return "ERROR: 'rule' is required for guard_learn.".to_string(),
+    };
+    let rule: BehavioralRule = match serde_json::from_value(rule_value) {
+        Ok(r) => r,
+        Err(e) => return format!("ERROR [RULE SHAPE]: {}; required: id, version, rule_class, trigger_pattern, constraint_text, hit_count, status", e),
+    };
+    let (validator, namespace) =
+        match build_guard_validator(&arguments, store, embedder, "learn").await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+    match validator.add_rule(rule.clone()).await {
+        Ok(()) => serde_json::to_string_pretty(&serde_json::json!({
+            "learned": true,
+            "namespace": namespace,
+            "id": rule.id,
+            "rule_class": rule.rule_class,
+        }))
+        .unwrap_or_else(|e| format!("{{\"error\":\"serialization: {}\"}}", e)),
+        Err(e) => format!("ERROR [LEARN]: {}", e),
+    }
+}
+
+/// List all behavioral rules in the namespace. Wraps
+/// `GuardValidator::list_rules`.
+async fn handle_guard_list_rules(
+    arguments: Value,
+    store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+) -> String {
+    let (validator, namespace) =
+        match build_guard_validator(&arguments, store, embedder, "list_rules").await {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+    match validator.list_rules().await {
+        Ok(rules) => {
+            let body = serde_json::to_string_pretty(&rules)
+                .unwrap_or_else(|e| format!("{{\"error\":\"serialization: {}\"}}", e));
+            format!(
+                "{{\"namespace\":\"{}\",\"count\":{},\"rules\":{}}}",
+                namespace,
+                rules.len(),
+                body
+            )
+        }
+        Err(e) => format!("ERROR [LIST_RULES]: {}", e),
+    }
+}
+
 async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
@@ -2877,8 +3089,9 @@ mod tests {
 
     /// Every tool the surface exposes, in the order tools/list returns them.
     /// Clients pin this list; a silent rename orphans their wiring.
+    /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_fifteen_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_nineteen_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -2915,6 +3128,9 @@ mod tests {
                 "neurostrata_bootstrap",
                 "neurostrata_task_setup",
                 "neurostrata_append_log",
+                "neurostrata_guard_validate",
+                "neurostrata_guard_learn",
+                "neurostrata_guard_list_rules",
             ]
         );
         for tool in tools {
