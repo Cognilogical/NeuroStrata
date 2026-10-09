@@ -466,7 +466,7 @@ fn emit_write_shape_warning(namespace: &str, id: &str, warning: &WriteShapeWarni
 
 /// Exact ID lookup for qualified target resolution.
 fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
-    let safe_id = escape_kuzu_string(id);
+    let safe_id = escape_ladybug_string(id);
     let query = format!(
         "MATCH (b:Memory) WHERE b.id = '{}' RETURN b.id LIMIT 1",
         safe_id
@@ -626,7 +626,7 @@ fn norm_path(edges: &[crate::traits::EvidenceEdge], kind: &crate::traits::Eviden
     }).collect()
 }
 
-fn escape_kuzu_string(s: &str) -> String {
+fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
 
@@ -676,8 +676,8 @@ fn create_missing_edges(conn: &Connection, rel_type: &str, pairs: &[(String, Str
             .map(|(from, to)| {
                 format!(
                     "{{f: '{}', t: '{}'}}",
-                    escape_kuzu_string(from),
-                    escape_kuzu_string(to)
+                    escape_ladybug_string(from),
+                    escape_ladybug_string(to)
                 )
             })
             .collect::<Vec<_>>()
@@ -759,17 +759,17 @@ impl VectorStore for LadybugStore {
         let shape_warnings = write_shape_warnings(&payload);
         self.write_with_deadline("writing a memory", move |conn| {
 
-            let safe_id = escape_kuzu_string(&id);
-            let safe_ns = escape_kuzu_string(&namespace);
-            let safe_content = escape_kuzu_string(&payload.content);
-            let safe_user_id = escape_kuzu_string(&payload.user_id);
-            let safe_memory_type = escape_kuzu_string(&payload.memory_type);
-            let safe_agent_name = escape_kuzu_string(
+            let safe_id = escape_ladybug_string(&id);
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_content = escape_ladybug_string(&payload.content);
+            let safe_user_id = escape_ladybug_string(&payload.user_id);
+            let safe_memory_type = escape_ladybug_string(&payload.memory_type);
+            let safe_agent_name = escape_ladybug_string(
                 payload.agent_name.as_deref().unwrap_or("unknown"),
             );
-            let safe_location = escape_kuzu_string(&payload.location);
-            let safe_location_lines = escape_kuzu_string(&payload.location_lines);
-            let safe_metadata = escape_kuzu_string(&serde_json::to_string(&payload.metadata)?);
+            let safe_location = escape_ladybug_string(&payload.location);
+            let safe_location_lines = escape_ladybug_string(&payload.location_lines);
+            let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);
         
             let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
@@ -826,7 +826,7 @@ impl VectorStore for LadybugStore {
                         }
                     }
                 };
-                let target_safe = escape_kuzu_string(&target);
+                let target_safe = escape_ladybug_string(&target);
                 let (from, to) = if edge.points_at_target {
                     (safe_id.as_str(), target_safe.as_str())
                 } else {
@@ -859,11 +859,11 @@ impl VectorStore for LadybugStore {
     ) -> Result<Vec<SearchResult>> {
         let namespace = namespace.to_string();
         self.with_conn(move |conn| {
-            let safe_ns = escape_kuzu_string(&namespace);
+            let safe_ns = escape_ladybug_string(&namespace);
             let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
             let now = chrono::Utc::now().timestamp();
 
-            // Kuzu has no OFFSET, so we over-fetch with a larger LIMIT and
+            // LadybugDB (the embedder) has no OFFSET, so we over-fetch with a larger LIMIT and
             // filter/trim in Rust. The multiplier bounds cost: at most
             // FETCH_MULTIPLIER * limit rows are scanned from the engine.
             const FETCH_MULTIPLIER: usize = 10;
@@ -957,7 +957,7 @@ impl VectorStore for LadybugStore {
             // label(e) for the relationship name and an outgoing flag for direction.
             if !primary_ids.is_empty() {
                 let id_list = primary_ids.iter()
-                    .map(|id| format!("'{}'", escape_kuzu_string(&id)))
+                    .map(|id| format!("'{}'", escape_ladybug_string(&id)))
                     .collect::<Vec<_>>()
                     .join(", ");
 
@@ -1165,8 +1165,8 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let id = id.to_string();
         self.write_with_deadline("deleting a memory", move |conn| {
-            let safe_ns = escape_kuzu_string(&namespace);
-            let safe_id = escape_kuzu_string(&id);
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
 
             // A silent no-op on a missing id reads as success to the caller
             // (the CLI then reports a deletion that never happened), so
@@ -1211,9 +1211,9 @@ impl VectorStore for LadybugStore {
             // neither namespace, and the row keeps its id, vector and edges.
             let query = format!(
                 "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' AND m.user_id <> 'auto-ingestor' SET m.namespace = '{}'",
-                escape_kuzu_string(&id),
-                escape_kuzu_string(&from),
-                escape_kuzu_string(&to)
+                escape_ladybug_string(&id),
+                escape_ladybug_string(&from),
+                escape_ladybug_string(&to)
             );
             conn.query(&query)?;
             Ok(RelocateOutcome::Moved)
@@ -1362,7 +1362,7 @@ impl VectorStore for LadybugStore {
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
         let namespace = namespace.to_string();
         self.write_with_deadline("clearing the ingested rows", move |conn| {
-            let safe_ns = escape_kuzu_string(&namespace);
+            let safe_ns = escape_ladybug_string(&namespace);
 
             // Every row the ingester owns: the AST symbols and the directory/file
             // nodes too, since ingestion rebuilds the whole structure for a namespace
@@ -1377,10 +1377,10 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let user_id = user_id.map(|v| v.to_string());
         self.with_conn(move |conn| {
-            let safe_ns = escape_kuzu_string(&namespace);
+            let safe_ns = escape_ladybug_string(&namespace);
         
             let query = if let Some(uid) = user_id {
-                format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, escape_kuzu_string(&uid))
+                format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, escape_ladybug_string(&uid))
             } else {
                 format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns)
             };
@@ -1425,8 +1425,8 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let id = id.to_string();
         self.with_conn(move |conn| {
-            let safe_ns = escape_kuzu_string(&namespace);
-            let safe_id = escape_kuzu_string(&id);
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
 
             let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
         
@@ -1675,8 +1675,8 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let id = id.to_string();
         self.write_with_deadline("counting a read", move |conn| {
-            let safe_ns = escape_kuzu_string(&namespace);
-            let safe_id = escape_kuzu_string(&id);
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
 
             let read = format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.metadata",
@@ -1692,7 +1692,7 @@ impl VectorStore for LadybugStore {
                 "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
                 safe_ns,
                 safe_id,
-                escape_kuzu_string(&bump_access_count(&current))
+                escape_ladybug_string(&bump_access_count(&current))
             );
             conn.query(&write)?;
             Ok(())
@@ -1828,13 +1828,13 @@ fn pick_declared_target(namespace: &str, declared: &str, found: &[String]) -> Op
 fn resolve_target_on_write(conn: &Connection, namespace: &str, declared: &str) -> Option<String> {
     let candidates = declared_target_candidates(namespace, declared)
         .iter()
-        .map(|c| format!("'{}'", escape_kuzu_string(c)))
+        .map(|c| format!("'{}'", escape_ladybug_string(c)))
         .collect::<Vec<_>>()
         .join(", ");
     let query = format!(
         "MATCH (b:Memory) WHERE b.id = '{}' OR (b.namespace = '{}' AND b.id IN [{}]) RETURN DISTINCT b.id",
-        escape_kuzu_string(declared),
-        escape_kuzu_string(namespace),
+        escape_ladybug_string(declared),
+        escape_ladybug_string(namespace),
         candidates
     );
     let mut rows = conn.query(&query).ok()?;
@@ -2160,7 +2160,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     }
 
     async fn governs_edges_from(store: &LadybugStore, id: &str) -> usize {
-        let id = escape_kuzu_string(id);
+        let id = escape_ladybug_string(id);
         store
             .with_conn(move |conn| {
                 let mut rows = conn.query(&format!(
@@ -2415,8 +2415,8 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         let seed = |id: &str, metadata: &str| {
             format!(
                 "CREATE (m:Memory {{id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
-                escape_kuzu_string(id),
-                escape_kuzu_string(metadata)
+                escape_ladybug_string(id),
+                escape_ladybug_string(metadata)
             )
         };
         let rows = [
@@ -2488,7 +2488,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
 
         let row = format!(
             "CREATE (m:Memory {{id: 'rule', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
-            escape_kuzu_string(r#"{"governs": ["src/never-ingested.rs"]}"#)
+            escape_ladybug_string(r#"{"governs": ["src/never-ingested.rs"]}"#)
         );
         store
             .with_conn(move |conn| {
@@ -2605,7 +2605,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[tokio::test]
     async fn search_after_saturating_count_does_not_panic() {
         let store = retired_test_store().await;
-        // Non-integer values: Kuzu treats whole-number floats as integers,
+        // Non-integer values: LadybugDB treats whole-number floats as integers,
         // which ARRAY_DISTANCE rejects.
         let v = vec![1.1, 0.0, 0.0, 0.0];
         store

@@ -3,7 +3,7 @@
 NeuroStrata provides a rich, standalone CLI binary (`neurostrata-mcp`) alongside its daemon mode to allow direct manipulation, auditing, and maintenance of the cognitive memory graph.
 
 > [!WARNING]
-> **Database Locks:** Kùzu DB is an embedded database that enforces single-process write access. You **cannot** execute write/modifying CLI commands while the main NeuroStrata daemon is running (e.g., inside an active IDE editor extension). Ensure the daemon is stopped or OpenCode is closed before executing these commands.
+> **Database Locks:** LadybugDB is an embedded graph+vector database that enforces single-process write access. You **cannot** execute write/modifying CLI commands while the main NeuroStrata daemon is running (e.g., inside an active IDE editor extension). Ensure the daemon is stopped or OpenCode is closed before executing these commands.
 
 ---
 
