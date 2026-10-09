@@ -236,10 +236,7 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
             continue;
         }
         let rule = &row.payload.metadata;
-        let has_source = rule
-            .get("source")
-            .map(|s| !s.is_null() && (s.as_str().map(|x| !x.trim().is_empty()).unwrap_or(true)))
-            .unwrap_or(false);
+        let has_source = crate::traits::has_source(rule);
         if !has_source {
             report.violations.push(Violation {
                 id: row.id.clone(),

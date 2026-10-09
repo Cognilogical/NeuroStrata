@@ -151,7 +151,7 @@ prescribed, never shipped.
 | **A2 memory→repo drift** | project-side, core-enabled | core provides the query surface (export/list carries locations); only the project knows its filesystem. Prescribed with reference impl. |
 | **A3 repo→memory drift** | project-side | "dated owner ruling in tracked docs" is un definable generically — for a CMS it is a published policy page, for code a runbook. Core cannot parse it. |
 | **A4 export freshness** | project-side | freshness is a property of a COMMITTED artifact; committing is the project's VCS/pipeline. Warn-only per the doc. |
-| **A5 supersede hygiene** (residual) | project-side | checking the project's exclusion list against the export is project config. |
+| **A5 supersede hygiene** (residual) | project-side | scans the exported JSON for `superseded`/`superseded_by` markers, fails the push if a superseded id is still referenced as live. `export-graph` writes those markers and offers `--exclude-superseded`, so the project ships the predicate, not a hand-maintained list. Checks A–E in [`prescribed-wire-recipes.md`](architecture/prescribed-wire-recipes.md). |
 | **A7 directive preservation** | project-side | verbatim-preservation of rulings requires knowing where rulings live. Core records rulings as memories; protecting repo copies is the project's gate. |
 | **A8 gate rot** | contract in core, runner project-side | see Q4. |
 | R2–R6 | core (shipped/shipping as text) | snapshot injection, done-funnel error text, supersede tool semantics. |

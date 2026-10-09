@@ -647,6 +647,15 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
 /// similarity search.
 const STRUCTURAL_MEMORY_TYPES: [&str; 3] = ["directory", "file", "markdown"];
 
+/// Ranking gain for a memory that carries `metadata.source` (FEATURE-4).
+///
+/// Sized against the usage boost's own scale: at access_count = 1 the usage
+/// gain is 0.05 * ln(2) ~= 0.035, so a single provenance marker buys roughly
+/// two reads' worth of promotion. Enough to settle a tie, small enough that a
+/// memory about a different subject does not surface just because somebody
+/// dated it.
+const SOURCE_RANK_GAIN: f32 = 0.05;
+
 /// Normalize an evidence path for dedup. RELATES_TO edges have their
 /// endpoints sorted lexicographically; GOVERNS/CONTAINS are order-sensitive.
 fn norm_path(edges: &[crate::traits::EvidenceEdge], kind: &crate::traits::EvidenceKind) -> Vec<(String, String, String)> {
@@ -957,10 +966,17 @@ impl VectorStore for LadybugStore {
 
                 // Usage boost: ln(1+n) gives a real gain even at n=1, and the
                 // cap at half distance preserves semantic ranking order.
+                //
+                // FEATURE-4: provenance earns a share of that same capped
+                // budget. It is added *inside* the cap rather than after it --
+                // subtracting from `distance` a term that was never itself
+                // bounded is how a tie-breaker quietly becomes an override and
+                // starts returning the wrong memory for the right reason.
                 let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
                 let n = access_count.max(0) as f32;
                 let gain = 0.05 * (1.0 + n).ln();
-                let capped_gain = gain.min(0.5 * distance);
+                let source_gain = if crate::traits::has_source(&metadata_val) { SOURCE_RANK_GAIN } else { 0.0 };
+                let capped_gain = (gain + source_gain).min(0.5 * distance);
                 let boosted_distance = distance - capped_gain;
 
                 primary_ids.push(id.clone());
@@ -2841,6 +2857,163 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .map(|r| r.id)
             .collect();
         assert_eq!(first, second, "tie order must be deterministic");
+    }
+
+    /// FEATURE-4: on equal semantic distance, the memory that says where it
+    /// came from ranks first. Both rows carry the identical embedding, so
+    /// distance ties exactly and provenance is the only thing that can separate
+    /// them. The query is deliberately off-axis: at distance 0 the cap allows no
+    /// boost at all, and a test that cannot fail is not a test.
+    #[tokio::test]
+    async fn sourced_row_outranks_unsourced_row_at_equal_distance() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "unsourced",
+                vec![0.5; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "sourced",
+                vec![0.5; 4],
+                retired_test_payload("rule", "agent", json!({ "source": "owner 2026-10-09" })),
+            )
+            .await
+            .unwrap();
+
+        let results = store.search("probe", vec![0.25; 4], 10).await.unwrap();
+        let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+
+        assert_eq!(
+            ids.first().map(|s| s.as_str()),
+            Some("sourced"),
+            "sourced memory must win the tie: {:?}",
+            ids
+        );
+        // Both rows sit at the same distance; only the sourced one was promoted.
+        assert!(
+            results[0].score < results[1].score,
+            "sourced row must carry the lower (better) score: {:?}",
+            results.iter().map(|r| (r.id.clone(), r.score)).collect::<Vec<_>>()
+        );
+    }
+
+    /// The cap is the whole contract: a provenance marker settles a tie, it
+    /// does not promote an off-topic memory over an on-topic one. Same boost,
+    /// worse embedding, so raw distance must still decide.
+    #[tokio::test]
+    async fn provenance_never_overrides_a_better_match() {
+        let store = retired_test_store().await;
+        // Query points at [0.9,0.1,0.1,0.1]. The unsourced row sits exactly on
+        // it (distance 0); the sourced row points the other way entirely.
+        // Components are non-zero decimals because the query string is built by
+        // Display on each f32 -- a 0.0 renders as "0" and the literal comes back
+        // from the parser as INT, which ARRAY_DISTANCE refuses outright.
+        store
+            .upsert(
+                "probe",
+                "unsourced-closest",
+                vec![0.9, 0.1, 0.1, 0.1],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "sourced-far",
+                vec![0.1, 0.9, 0.1, 0.1],
+                retired_test_payload("rule", "agent", json!({ "source": "owner 2026-10-09" })),
+            )
+            .await
+            .unwrap();
+
+        let ids: Vec<String> = store
+            .search("probe", vec![0.9, 0.1, 0.1, 0.1], 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        assert_eq!(
+            ids.first().map(|s| s.as_str()),
+            Some("unsourced-closest"),
+            "a closer match wins even when unsourced: {:?}",
+            ids
+        );
+    }
+
+    /// Provenance and usage are separate signals and both still count. A sourced
+    /// row with no reads must beat an unsourced row with none (provenance), and
+    /// a heavily-used unsourced row must still beat a sourced row with none
+    /// (usage is not subordinated to provenance).
+    #[tokio::test]
+    async fn provenance_and_usage_both_apply() {
+        let store = retired_test_store().await;
+        for (id, meta) in [
+            ("plain", json!({})),
+            ("sourced", json!({ "source": "owner 2026-10-09" })),
+            ("used-unsourced", json!({ "access_count": 50 })),
+        ] {
+            store
+                .upsert("probe", id, vec![0.5; 4], retired_test_payload("rule", "agent", meta))
+                .await
+                .unwrap();
+        }
+
+        let scored: Vec<(String, f32)> = store
+            .search("probe", vec![0.25; 4], 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.score))
+            .collect();
+
+        let score_of = |id: &str| scored.iter().find(|(i, _)| i == id).map(|(_, s)| *s).unwrap();
+        assert!(score_of("sourced") < score_of("plain"), "sourced outranks plain: {:?}", scored);
+        assert!(
+            score_of("used-unsourced") < score_of("sourced"),
+            "usage gain is not capped away by provenance: {:?}",
+            scored
+        );
+    }
+
+    /// A blank or null `source` is not provenance. The gate treats it as
+    /// missing, so the ranker must too -- otherwise passing the gate buys no
+    /// ranking advantage and the two stop describing the same field.
+    #[tokio::test]
+    async fn blank_source_is_not_provenance() {
+        let store = retired_test_store().await;
+        for (id, meta) in [
+            ("unsourced", json!({})),
+            ("blank", json!({ "source": "   " })),
+            ("null", json!({ "source": null })),
+        ] {
+            store
+                .upsert("probe", id, vec![0.5; 4], retired_test_payload("rule", "agent", meta))
+                .await
+                .unwrap();
+        }
+
+        let scored: Vec<(String, f32)> = store
+            .search("probe", vec![0.25; 4], 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, r.score))
+            .collect();
+
+        let blank = scored.iter().find(|(i, _)| i == "blank").unwrap().1;
+        let null = scored.iter().find(|(i, _)| i == "null").unwrap().1;
+        let plain = scored.iter().find(|(i, _)| i == "unsourced").unwrap().1;
+        assert_eq!(blank, plain, "a blank source is not provenance: {:?}", scored);
+        assert_eq!(null, plain, "a null source is not provenance: {:?}", scored);
     }
 
     #[tokio::test]

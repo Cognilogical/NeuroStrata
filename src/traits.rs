@@ -32,6 +32,26 @@ pub struct MemoryPayload {
     pub metadata: Value,
 }
 
+/// FEATURE-4: does this memory say where it came from?
+///
+/// A memory is an assertion until it names its origin, so `source` is the
+/// difference between a claim you can audit and one you can only take on
+/// faith. It is deliberately total over every shape the field legitimately
+/// takes: absent, JSON null, and a blank string all read as unsourced, while a
+/// non-empty string ("owner 2026-10-08") or a structured object
+/// ({kind, ref, captured_at}) read as sourced.
+///
+/// The task gate fails rules without one and the search ranker rewards them.
+/// They must agree on that line, so both call this rather than each carrying a
+/// copy -- a gate that demands provenance the ranker cannot see is a rule nobody
+/// can satisfy.
+pub fn has_source(metadata: &Value) -> bool {
+    metadata
+        .get("source")
+        .map(|s| !s.is_null() && (s.as_str().map(|x| !x.trim().is_empty()).unwrap_or(true)))
+        .unwrap_or(false)
+}
+
 /// Represents a search result from the vector database
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchResult {
@@ -192,6 +212,7 @@ pub trait VectorStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// The relation-count assertion moved here from the v1 test: v2 declares
     /// exactly four relations, the fourth being the extraction edge. v3 keeps
@@ -291,5 +312,26 @@ mod tests {
         assert_eq!(json["path"][0]["relation"], "CONTAINS");
         assert_eq!(json["path"][1]["target"], "b");
         assert_eq!(json["explanation"], "explanation");
+    }
+
+    /// The provenance line the gate enforces and the ranker rewards. Every shape
+    /// the field legitimately takes has to land on the right side of it, and a
+    /// blank has to be indistinguishable from absent -- otherwise padding a rule
+    /// with `"source": ""` would satisfy neither.
+    #[test]
+    fn has_source_covers_every_shape_the_field_takes() {
+        for absent in [json!({}), json!({ "kind": "rule" })] {
+            assert!(!has_source(&absent), "absent source is not provenance: {}", absent);
+        }
+        for blank in [json!({ "source": null }), json!({ "source": "" }), json!({ "source": "  " })] {
+            assert!(!has_source(&blank), "blank source is not provenance: {}", blank);
+        }
+        for real in [
+            json!({ "source": "owner 2026-10-08" }),
+            json!({ "source": { "kind": "derived", "ref": "task-wiot", "captured_at": "2026-10-09" } }),
+            json!({ "source": ["a"] }),
+        ] {
+            assert!(has_source(&real), "real source is provenance: {}", real);
+        }
     }
 }
