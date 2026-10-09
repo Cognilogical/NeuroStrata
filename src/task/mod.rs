@@ -88,6 +88,26 @@ fn ns_key(namespace: &str) -> String {
     }
 }
 
+/// Upper bound on a task title. Long enough for a sentence, short enough that
+/// the task stays a one-line label in list output and snapshot headers.
+const MAX_TITLE: usize = 200;
+
+/// Validates a caller-supplied title: present, not blank, not absurdly long.
+fn check_title(title: &str) -> Result<String, String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("ERROR: 'title' cannot be empty or whitespace-only.".to_string());
+    }
+    if trimmed.chars().count() > MAX_TITLE {
+        return Err(format!(
+            "ERROR: 'title' is {} characters; the maximum is {}.",
+            trimmed.chars().count(),
+            MAX_TITLE
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// How many fresh suffixes to try before declaring a collision problem.
 const ID_ATTEMPTS: usize = 64;
@@ -346,9 +366,14 @@ pub async fn handle_task_create(
         Ok(n) => n,
         Err(e) => return e,
     };
-    let title = match required_str(&args, "title") {
-        Ok(t) => t,
-        Err(e) => return e,
+    let title = match arg_str(&args, "title") {
+        Some(t) => match check_title(t) {
+            Ok(v) => v,
+            Err(e) => return e,
+        },
+        None => {
+            return "ERROR: 'title' is required.".to_string();
+        }
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
     if let Err(e) = check_namespace(&namespace) {
@@ -440,7 +465,7 @@ pub async fn handle_task_create(
         &store,
         &emb,
         &namespace,
-        title,
+        &title,
         &user_id,
         agent_name.as_deref(),
         task_meta,
@@ -601,7 +626,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
 
 pub async fn handle_task_update(
     args: Value,
-    _emb: Arc<dyn Embedder>,
+    emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
 ) -> String {
     // The done funnel (section 2): done has exactly one entrance and it is
@@ -636,6 +661,15 @@ pub async fn handle_task_update(
         },
     };
     let note = arg_str(&args, "note").map(|s| s.to_string());
+    // The title is the task's content (section 1.1), so renaming it means
+    // rewriting content AND re-embedding: a title is what search_memory reads.
+    let new_title = match args.get("title") {
+        None => None,
+        Some(_) => match check_title(arg_str(&args, "title").unwrap_or_default()) {
+            Ok(t) => Some(t),
+            Err(e) => return e,
+        },
+    };
     let priority = match args.get("priority") {
         None => None,
         Some(Value::Number(n))
@@ -657,19 +691,28 @@ pub async fn handle_task_update(
 
     if target.is_none()
         && note.is_none()
+        && new_title.is_none()
         && priority.is_none()
         && assignee.is_none()
         && add_labels.is_empty()
         && !has_blocked_by
     {
-        return "ERROR: nothing to update: pass at least one of status, note, priority, assignee, add_labels, blocked_by.".to_string();
+        return "ERROR: nothing to update: pass at least one of title, status, note, priority, assignee, add_labels, blocked_by.".to_string();
     }
 
-    let (mut task, vector) = match load_task(&store, &namespace, &id).await {
+    let (mut task, mut vector) = match load_task(&store, &namespace, &id).await {
         Ok(found) => found,
         Err(e) => return e,
     };
     let from = task.status();
+
+    // A rename is history, not a transition: without a caller's note the
+    // history entry says what the title became, so Working Memory keeps the
+    // old wording recoverable after a vocabulary scrub.
+    let rename_note = new_title.as_ref().filter(|t| **t != task.payload.content).map(|t| {
+        format!("renamed: '{}' -> '{}'", task.payload.content, t)
+    });
+
     let ctx = Ctx {
         reason: note.clone().unwrap_or_default(),
         extraction_edge_exists: false,
@@ -708,8 +751,27 @@ pub async fn handle_task_update(
         },
         // A same-status note (or a plain progress note) is history, not a
         // transition: this is where the Breath prompt lands (section 6.5).
-        _ if note.is_some() => task = annotate(&task, &ctx),
+        _ if note.is_some() || rename_note.is_some() => {
+            let mut hist_ctx = ctx.clone();
+            if note.is_none() {
+                hist_ctx.reason = rename_note.clone().unwrap_or_default();
+            }
+            task = annotate(&task, &hist_ctx);
+        }
         _ => {}
+    }
+
+    // content IS the title (section 1.1), and the vector is the embedded
+    // content: a rename that skipped the re-embed would leave search_memory
+    // matching the old words.
+    if let Some(t) = &new_title {
+        task.payload.content = t.clone();
+        if rename_note.is_some() {
+            match emb.embed(t).await {
+                Ok(v) => vector = v,
+                Err(e) => return format!("ERROR: Failed to embed the task title: {}", e),
+            }
+        }
     }
 
     // Field updates ride on whatever the transition produced.
@@ -748,6 +810,7 @@ pub async fn handle_task_update(
         "namespace": namespace,
         "status": task.status().as_str(),
         "transition": transition,
+        "renamed": rename_note,
         "task": task_summary(&id, &task.payload),
     }))
 }
@@ -2266,6 +2329,12 @@ mod tests {
         Task { id: id.to_string(), payload }.status()
     }
 
+    fn reply_title(reply: &str) -> String {
+        let parsed: Value =
+            serde_json::from_str(reply).unwrap_or_else(|e| panic!("json reply: {} -- {}", reply, e));
+        parsed["task"]["title"].as_str().expect("title").to_string()
+    }
+
     #[test]
     /// The git branch of the wiring panel (Q2/Q5): the default instance is
     /// named first and dominant, and a verified hook subtracts its own
@@ -2485,6 +2554,182 @@ mod tests {
         .await;
         assert!(reply.contains("unknown status 'canceled'"), "{}", reply);
         assert!(reply.contains("done only via neurostrata_task_complete"), "{}", reply);
+    }
+
+    #[tokio::test]
+    async fn task_update_renames_the_title_and_keeps_the_old_wording_in_history() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "Fix Kuzu parallel-test mmap flake", 2).await;
+
+        let reply = handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "title": "Fix LadybugDB parallel-test mmap flake (smaller test buffer pool)",
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert!(
+            parsed["renamed"].as_str().unwrap().starts_with("renamed: 'Fix Kuzu"),
+            "the reply names what it renamed: {}",
+            reply
+        );
+        assert!(parsed["transition"].is_null(), "a rename is not a transition");
+
+        // Persisted: content IS the title (section 1.1).
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(
+            payload.content,
+            "Fix LadybugDB parallel-test mmap flake (smaller test buffer pool)"
+        );
+        assert_eq!(
+            parsed["task"]["title"],
+            json!("Fix LadybugDB parallel-test mmap flake (smaller test buffer pool)"),
+            "the summary carries the new wording"
+        );
+
+        // The scrub is recoverable: history names both wordings.
+        let history = payload.metadata["task"]["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1, "one entry, for the rename");
+        assert_eq!(history[0]["from"], "open");
+        assert_eq!(history[0]["to"], "open", "no state moved");
+        assert!(
+            history[0]["note"].as_str().unwrap().contains("Fix Kuzu")
+                && history[0]["note"].as_str().unwrap().contains("Fix LadybugDB"),
+            "history keeps both titles: {:?}",
+            history[0]["note"]
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_re_embeds_because_the_vector_is_the_embedded_title() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the old words", 2).await;
+
+        // A rename that skipped the re-embed would leave search matching the
+        // old title, so the embedder is on the critical path.
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "title": "the new words" }),
+            Arc::new(FailEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.starts_with("ERROR: Failed to embed the task title"), "{}", reply);
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(
+            payload.content, "the old words",
+            "a failed re-embed must not leave a title nothing can search"
+        );
+
+        // The same call with a working embedder moves the vector too.
+        handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "title": "the new words" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let (vector, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.content, "the new words");
+        let expected = StubEmbedder.embed("the new words").await.unwrap();
+        assert_eq!(vector, expected, "the stored vector is the new title's");
+    }
+
+    #[tokio::test]
+    async fn task_update_refuses_an_empty_title() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        for blank in ["", "   ", "\n\t "] {
+            let reply = handle_task_update(
+                json!({ "namespace": "MyProj", "id": id, "title": blank }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+            assert!(
+                reply.contains("'title' cannot be empty"),
+                "blank title {:?} -> {}",
+                blank,
+                reply
+            );
+        }
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.content, "the work", "a refused rename writes nothing");
+        assert!(payload.metadata["task"]["history"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_create_and_rename_agree_on_the_title_limit() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let too_long = "x".repeat(MAX_TITLE + 1);
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "title": too_long.clone() }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains(&format!("the maximum is {}", MAX_TITLE)), "{}", reply);
+
+        let reply = handle_task_create(
+            json!({ "namespace": "MyProj", "title": too_long }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("the maximum is"), "{}", reply);
+
+        // Exactly at the limit is legal on both paths.
+        let at_limit = "y".repeat(MAX_TITLE);
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "title": at_limit.clone() }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.starts_with("ERROR"), "{}", reply);
+        assert_eq!(reply_title(&reply), at_limit);
+    }
+
+    /// A rename is not a silent rewrite: an unchanged title writes no history.
+    #[tokio::test]
+    async fn renaming_to_the_same_title_is_a_no_op() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "title": "the work" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("\"renamed\": null"), "{}", reply);
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert!(payload.metadata["task"]["history"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn renaming_a_task_that_does_not_exist_answers_like_the_rest_of_the_surface() {
+        let store = store_with_namespace("MyProj").await;
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": "myproj-zzzz", "title": "anything" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            reply.starts_with("ERROR: no task with id 'myproj-zzzz' in namespace 'MyProj'"),
+            "{}",
+            reply
+        );
+        assert!(
+            reply.contains("neurostrata_task_list"),
+            "the same pointer every other miss gives: {}",
+            reply
+        );
     }
 
     #[tokio::test]

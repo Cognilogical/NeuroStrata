@@ -203,6 +203,8 @@ pub async fn process_mcp_request(
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Replacement related_to ids. Passed = replaces; absent = carries over and is reported." },
                                 "contained_by": { "type": "array", "items": { "type": "string" }, "description": "Replacement contained_by ids. Passed = replaces; absent = carries over and is reported." },
                                 "locations": { "type": "array", "items": { "type": "object" }, "description": "Replacement anchors: [{path, lines?, symbol?}]. Replaces refs wholesale and re-derives governs from the paths, exactly like add_memory." },
+                                "reason": { "type": "string", "description": "WHY this memory is being corrected, in one clause. Recorded as superseded_reason on the retired memory, so the history says what was wrong, not merely that something changed. Omit it and the reply says the history will not carry a why." },
+                                "source": { "type": ["string", "object"], "description": "Provenance of the CORRECTED text, with the same semantics add_memory's metadata.source accepts: a dated string, or {kind: owner-quote|doc|transcript|commit|derived, ref, captured_at}. Written to metadata.source on the replacement. Passed = replaces the old provenance; absent = the old one carries over and the reply names it." },
                                 "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." }
                             },
                             "required": ["id", "namespace", "content"]
@@ -242,12 +244,13 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_task_update",
-                        "description": "Update a task: status (open/in_progress/blocked), a note appended to history (the Breath prompt lands here), priority, assignee, labels, or blockers. 'done' is rejected here on purpose: finish with neurostrata_task_complete.",
+                        "description": "Update a task: title (the rename surface: rewrites the task's content and re-embeds it, with the old and new wording appended to history), status (open/in_progress/blocked), a note appended to history (the Breath prompt lands here), priority, assignee, labels, or blockers. 'done' is rejected here on purpose: finish with neurostrata_task_complete.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string", "description": "The task id." },
                                 "namespace": { "type": "string", "description": "The exact project name." },
+                                "title": { "type": "string", "maxLength": 200, "description": "New title; replaces the old one and re-embeds so search matches the new wording. Non-empty, 200 characters max." },
                                 "status": { "type": "string", "enum": ["open", "in_progress", "blocked"], "description": "New state. 'done' is deliberately absent: it is reachable only through neurostrata_task_complete." },
                                 "note": { "type": "string", "description": "Why, in one line. Required for blocked; appended to the task's history in every case." },
                                 "priority": { "type": "integer", "enum": [0, 1, 2, 3, 4], "description": "0 is highest." },
@@ -1297,10 +1300,34 @@ async fn handle_supersede_memory(
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace.".to_string(),
     };
 
+    // WHY the memory is wrong. Whitespace is not a reason: it would satisfy a
+    // presence check while leaving history exactly as mute as before.
+    let reason = arguments
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+
+    // Provenance of the corrected text. Same two shapes metadata.source accepts
+    // (dated string, or {kind, ref, captured_at}); blank and null count as
+    // absent so they cannot masquerade as provenance.
+    let source = match arguments.get("source") {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(Value::String(s.trim().to_string())),
+        Some(v @ Value::Object(_)) if !v.as_object().map(|o| o.is_empty()).unwrap_or(true) => Some(v.clone()),
+        _ => None,
+    };
+
     // Same scanner add_memory uses. A correction is still an insertion, and a
     // secret pasted into one would be just as permanent.
     if let Some(rejection) = crate::secrets::scan_entry_point(content, &serde_json::json!({}), "supersede_memory") {
         return rejection.to_string();
+    }
+    // The reason and the source land in stored metadata; a secret in either is
+    // as permanent as one in the content.
+    for extra in [reason, source.as_ref().and_then(|s| s.as_str())].into_iter().flatten() {
+        if let Some(rejection) = crate::secrets::scan_entry_point(extra, &serde_json::json!({}), "supersede_memory") {
+            return rejection.to_string();
+        }
     }
 
     let namespace = resolve_namespace(&store, namespace).await;
@@ -1379,6 +1406,7 @@ async fn handle_supersede_memory(
     // failure wrote the line and never honoured it -- the worst of both
     // worlds -- so honour it when nothing else spoke, and name the winner.
     let content_lists = content_governs_lines(content);
+    let provenance_missing = source.is_none() && old_payload.metadata.get("source").is_none();
     if let Some(obj) = new_payload.metadata.as_object_mut() {
         obj.remove("valid_to");
         // Do NOT carry over superseded_by from the old row; only supersedes
@@ -1408,6 +1436,20 @@ async fn handle_supersede_memory(
                 carried.push(key.to_string());
             }
         }
+        // A correction asserts new text, so it needs its own provenance: the old
+        // memory's source says where the WRONG wording came from, not where this
+        // one did. Passed source replaces it; absent carries it over (the same
+        // wholesale rule as the pointers) and the reply names what it inherited.
+        if let Some(src) = &source {
+            obj.insert("source".to_string(), src.clone());
+            replaced.push("source".to_string());
+        } else if old_payload.metadata.get("source").is_some() {
+            carried.push("source (the provenance of the text being replaced)".to_string());
+        }
+        // The genuine hole: nothing inherited and nothing passed, so a rule
+        // correction lands with no origin at all. Recorded so the reply can say
+        // so out loud instead of reporting a clean success.
+
         // An unambiguous content line is the author's declaration and wins
         // over the inherited pointer when no parameter and no locations spoke.
         // A record must never hold two contradictory Governs lists.
@@ -1484,6 +1526,12 @@ async fn handle_supersede_memory(
     if let Some(obj) = old_payload.metadata.as_object_mut() {
         obj.insert("valid_to".to_string(), serde_json::json!(now));
         obj.insert("superseded_by".to_string(), serde_json::json!(new_id));
+        // The why lives on the row that became history, beside the pointer to
+        // its successor: reading the retired memory by id answers both "what
+        // did it say" and "why did it stop being true".
+        if let Some(why) = reason {
+            obj.insert("superseded_reason".to_string(), serde_json::json!(why));
+        }
     }
     // Writing the old row back with an empty embedding would have the engine
     // reject it, and the row is deleted before it is re-inserted -- so an empty
@@ -1513,9 +1561,27 @@ async fn handle_supersede_memory(
     }
     if !carried.is_empty() {
         report.push_str(&format!(
-            " Carried over UNCHANGED from the old memory: {} -- to replace them pass governs/related_to/contained_by/locations, or state one Governs line in the prose.",
+            " Carried over UNCHANGED from the old memory: {} -- to replace them pass governs/related_to/contained_by/locations/source, or state one Governs line in the prose.",
             carried.join(", ")
         ));
+    }
+    // The why and the where-from, named whether they were written or not: a
+    // correction that silently drops its reason is the same defect the retired
+    // row used to have.
+    if let Some(why) = reason {
+        report.push_str(&format!(
+            " Recorded why on the retired memory as superseded_reason: {}.",
+            why
+        ));
+    } else {
+        report.push_str(
+            " NO reason was recorded: the retired memory's history will not say why this was corrected. Pass reason: \"...\" on the next correction.",
+        );
+    }
+    if provenance_missing {
+        report.push_str(
+            " The corrected memory carries NO metadata.source (none passed, none inherited); if it is a rule, task_validate reports rule_without_source until you re-supersede with source: \"...\".",
+        );
     }
     let governs_in_play = replaced.iter().any(|k| k.starts_with("governs"))
         || carried.iter().any(|k| k == "governs")
@@ -2802,6 +2868,203 @@ mod tests {
         assert_eq!(row_c.metadata["governs"], serde_json::json!(["dead/old.go"]));
     }
 
+    /// FEATURE-4 (rr66): a correction must be able to say WHY. The why is
+    /// stamped on the row that became history -- beside the pointer to its
+    /// successor -- so reading the retired memory answers "what did it say" AND
+    /// "why did it stop being true".
+    #[tokio::test]
+    async fn the_reason_is_recorded_on_the_retired_memory() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": old_id,
+                "namespace": "probe",
+                "content": "always use podman",
+                "reason": "the blanket rule was wrong for host-network services"
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("Recorded why on the retired memory as superseded_reason"), "got {}", reply);
+        assert!(reply.contains("blanket rule was wrong"), "the reply quotes the why: {}", reply);
+
+        let (_, old) = store.get("probe", &old_id).await.unwrap().expect("history");
+        assert_eq!(
+            old.metadata["superseded_reason"],
+            serde_json::json!("the blanket rule was wrong for host-network services")
+        );
+        assert!(old.metadata["superseded_by"].as_str().is_some(), "the why sits next to the pointer");
+
+        // The live assertion is not a correction record; its lineage lives on
+        // the old row, reachable through the supersedes pointer.
+        let (_, new) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(new.metadata["supersedes"], serde_json::json!(old_id));
+        assert!(
+            new.metadata.get("superseded_reason").is_none(),
+            "the why belongs to history: {:?}",
+            new.metadata
+        );
+    }
+
+    /// The corrected text asserts something new and needs its own origin: the
+    /// old source says where the wrong wording came from, not where this does.
+    #[tokio::test]
+    async fn a_passed_source_replaces_the_provenance_on_the_correction() {
+        let store = crate::store::ladybug::LadybugStore::for_testing(
+            std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4())),
+            4,
+        )
+        .expect("open temp database");
+        let store: Arc<dyn VectorStore> = Arc::new(store);
+        store.init("probe").await.expect("create the schema");
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // A: the dated-string form, replacing the old provenance.
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut old = payload("rule about containers");
+        old.metadata = serde_json::json!({ "source": "hallucinated 2020-01-01" });
+        store
+            .upsert("probe", &id, StubEmbedder.embed("rule about containers").await.unwrap(), old)
+            .await
+            .unwrap();
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": id,
+                "namespace": "probe",
+                "content": "rule about containers, v2",
+                "source": "owner 2026-10-09",
+                "reason": "the old rule was invented"
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("Replaced metadata: source"), "got {}", reply);
+        assert!(!reply.contains("Carried over UNCHANGED from the old memory: source"), "nothing carried: {}", reply);
+        let (_, new_a) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(new_a.metadata["source"], serde_json::json!("owner 2026-10-09"));
+        let (_, old_a) = store.get("probe", &id).await.unwrap().unwrap();
+        assert_eq!(old_a.metadata["source"], serde_json::json!("hallucinated 2020-01-01"), "history keeps its own origin");
+
+        // B: the structured form, with the same semantics add_memory accepts.
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert("probe", &id, StubEmbedder.embed("another rule").await.unwrap(), payload("another rule"))
+            .await
+            .unwrap();
+        let structured = serde_json::json!({
+            "kind": "commit",
+            "ref": "abc1234",
+            "captured_at": "2026-10-09"
+        });
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": id,
+                "namespace": "probe",
+                "content": "another rule, v2",
+                "source": structured
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        let (_, new_b) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(new_b.metadata["source"], structured);
+    }
+
+    /// Regression drill (rr66): the omission paths. A superseded-without-a-why
+    /// and a rule corrected without provenance are both reported out loud --
+    /// neither writes a half-record and calls it success.
+    #[tokio::test]
+    async fn a_correction_without_a_reason_or_source_says_so() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": old_id, "namespace": "probe", "content": "always use podman, v2" }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "the correction itself still lands: {}", reply);
+        assert!(reply.contains("NO reason was recorded"), "the missing why is named: {}", reply);
+        assert!(reply.contains("NO metadata.source"), "the missing provenance is named: {}", reply);
+        assert!(reply.contains("rule_without_source"), "and what it costs: {}", reply);
+
+        let (_, old) = store.get("probe", &old_id).await.unwrap().unwrap();
+        assert!(
+            old.metadata.get("superseded_reason").is_none(),
+            "nothing written for a reason that was never given: {:?}",
+            old.metadata
+        );
+        let (_, new) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert!(new.metadata.get("source").is_none(), "and no invented provenance");
+    }
+
+    /// Whitespace is not a reason and a blank source is not provenance: both
+    /// take the omission path rather than satisfying a presence check with noise.
+    #[tokio::test]
+    async fn a_blank_reason_and_source_are_treated_as_omissions() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": old_id,
+                "namespace": "probe",
+                "content": "always use podman, v3",
+                "reason": "   ",
+                "source": ""
+            }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(reply.contains("NO reason was recorded"), "got {}", reply);
+        assert!(reply.contains("NO metadata.source"), "got {}", reply);
+        let (_, old) = store.get("probe", &old_id).await.unwrap().unwrap();
+        assert!(old.metadata.get("superseded_reason").is_none(), "no blank why stored");
+    }
+
+    /// Provenance omitted but inherited: the old origin carries over, and the
+    /// reply names what it inherited so nobody reads "superseded" as "re-sourced".
+    #[tokio::test]
+    async fn an_omitted_source_carries_the_old_provenance_over_and_says_so() {
+        let store = crate::store::ladybug::LadybugStore::for_testing(
+            std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4())),
+            4,
+        )
+        .expect("open temp database");
+        let store: Arc<dyn VectorStore> = Arc::new(store);
+        store.init("probe").await.expect("create the schema");
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut old = payload("sourced rule");
+        old.metadata = serde_json::json!({ "source": "owner 2026-10-08", "governs": ["a.rs"] });
+        store
+            .upsert("probe", &id, StubEmbedder.embed("sourced rule").await.unwrap(), old)
+            .await
+            .unwrap();
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": id, "namespace": "probe", "content": "sourced rule, v2" }),
+            emb,
+            store.clone(),
+        )
+        .await;
+        assert!(
+            reply.contains("Carried over UNCHANGED from the old memory: governs, source"),
+            "got {}",
+            reply
+        );
+        assert!(!reply.contains("NO metadata.source"), "inherited provenance is not absent: {}", reply);
+        let (_, new) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        assert_eq!(new.metadata["source"], serde_json::json!("owner 2026-10-08"));
+    }
+
     /// A record must never render two Governs lists with nothing marking the
     /// authoritative half (guinea-pig "in every option" ask).
     #[test]
@@ -3136,6 +3399,14 @@ mod tests {
         for tool in tools {
             assert!(tool["inputSchema"].is_object(), "{} needs an input schema", tool["name"]);
         }
+        // rr66: the correction surface can say WHY and WHERE FROM. If these
+        // vanish from the schema, provenance on corrections dies silently.
+        let supersede = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_supersede_memory")
+            .expect("the correction tool is exposed");
+        assert!(supersede["inputSchema"]["properties"]["reason"].is_object(), "supersede takes a reason");
+        assert!(supersede["inputSchema"]["properties"]["source"].is_object(), "supersede takes a source");
         // The vocabulary summaries are still appended to their tools.
         let summaries = crate::traits::memory_vocabulary().get("tool_summaries").unwrap().clone();
         assert!(summaries.get("add").is_some());

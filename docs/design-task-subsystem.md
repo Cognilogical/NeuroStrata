@@ -179,6 +179,7 @@ transition open→in_progress. Error if claimed by another live session.
 ```json
 { "properties": {
     "id": {"type":"string"}, "namespace": {"type":"string"},
+    "title": {"type":"string","maxLength":200,"description":"New title. Rewrites content, re-embeds, appends 'renamed: old -> new' to history."},
     "status": {"type":"string","enum":["open","in_progress","blocked"]},
     "note": {"type":"string","description":"Appended to history. The Breath prompt lands here."},
     "priority": {"type":"integer"}, "assignee": {"type":"string"},
