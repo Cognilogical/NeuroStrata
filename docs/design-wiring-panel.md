@@ -2,6 +2,12 @@
 
 Status: implemented (ship-now scope, task neurostrata-majk). Answers the guinea pig's GATES-TO-PRESCRIBE ask (source document since removed; findings archived in task memories). Constraint honored: git-first, never git-only. Rule in force: never hand a project a reminder where a machine will do.
 
+> **Recipes:** [`docs/architecture/prescribed-wire-recipes.md`](architecture/prescribed-wire-recipes.md)
+> documents each `project-pipeline` wire a project implements itself — A2, A3,
+> A4, A5-residual, A7, plus the A8 `gate-self-test` harness — with rationale,
+> shape, keywest.health reference impls, and acceptance criteria. Start there
+> when wiring a project up; this document stays the design of record.
+
 ---
 
 ## Q1 — The `wiring` block schema
@@ -238,6 +244,7 @@ the agent can report the verified set without executing it.
 - `task gate --self-test` (Q4.3) + gate-contract doc section.
 - Prescribed-wire recipes for A2/A3/A4/A5-residual/A7, pointing at the
   guinea-pig reference implementations (docs page, not code).
+  **Done:** [`docs/architecture/prescribed-wire-recipes.md`](architecture/prescribed-wire-recipes.md).
 - `task_validate` named-category exposure (already filed per findings).
 
 **Killed** (complexity without benefit):
