@@ -162,6 +162,7 @@ pub async fn start_daemon(
         .route("/ingest", post(handle_ingest))
         .route("/delete", post(handle_delete))
         .route("/edit", post(handle_edit))
+        .route("/set-metadata", post(handle_set_metadata))
         .route("/validate", post(handle_validate))
         .route("/mcp", post(handle_mcp))
         .route("/backup", post(handle_backup))
@@ -547,6 +548,35 @@ async fn handle_edit(
         Ok(crate::server::EditOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
         Err(e) => {
             eprintln!("edit of {} in {} failed: {}", req.id, old_namespace, e);
+            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetMetadataReq {
+    namespace: String,
+    id: String,
+    metadata: serde_json::Value,
+}
+
+async fn handle_set_metadata(
+    State(state): State<AppState>,
+    Json(req): Json<SetMetadataReq>,
+) -> Result<&'static str, axum::http::StatusCode> {
+    let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    match crate::server::set_metadata(
+        &*state.vector_store,
+        &namespace,
+        &req.id,
+        req.metadata,
+    )
+    .await
+    {
+        Ok(crate::server::MetadataOutcome::Updated) | Ok(crate::server::MetadataOutcome::NotFound) => Ok("OK"),
+        Ok(crate::server::MetadataOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
+        Err(e) => {
+            eprintln!("set-metadata of {} in {} failed: {}", req.id, namespace, e);
             Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
         }
     }

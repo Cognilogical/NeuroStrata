@@ -174,6 +174,19 @@ enum Commands {
         location: String,
     },
 
+    /// Update metadata on an existing memory without changing its ID
+    #[command(name = "set-metadata")]
+    SetMetadata {
+        /// The target namespace
+        namespace: String,
+
+        /// The memory ID to update
+        id: String,
+
+        /// The new metadata as a JSON object string
+        metadata: String,
+    },
+
     /// Task subsystem: the gate behind the pre-push hook (section 5)
     Task {
         #[command(subcommand)]
@@ -1716,6 +1729,31 @@ async fn main() -> anyhow::Result<()> {
                             crate::server::EditOutcome::Ingested => {
                                 eprintln!(
                                     "{} was written by directory ingestion, so the next ingest would overwrite an edit. Change the file and ingest again instead.",
+                                    id
+                                );
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    Commands::SetMetadata { namespace, id, metadata } => {
+                        let new_metadata: serde_json::Value = serde_json::from_str(&metadata)
+                            .map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
+                        match crate::server::set_metadata(
+                            &*vector_store,
+                            &namespace,
+                            &id,
+                            new_metadata,
+                        )
+                        .await?
+                        {
+                            crate::server::MetadataOutcome::Updated => println!("Successfully updated metadata for memory {}", id),
+                            crate::server::MetadataOutcome::NotFound => {
+                                eprintln!("No memory with id {} in namespace {}.", id, namespace);
+                                std::process::exit(1);
+                            }
+                            crate::server::MetadataOutcome::Ingested => {
+                                eprintln!(
+                                    "{} was written by directory ingestion and cannot be updated.",
                                     id
                                 );
                                 std::process::exit(1);
