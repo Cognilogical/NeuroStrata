@@ -8,6 +8,7 @@ mod judgment;
 mod parser;
 mod secrets;
 mod server;
+mod setup;
 mod store;
 mod task;
 mod traits;
@@ -19,6 +20,7 @@ use store::LadybugStore;
 use crate::traits::{Embedder, VectorStore};
 use embed::build_embedder;
 use clap::{Parser, Subcommand};
+use anyhow::Context;
 
 #[derive(Parser, Debug)]
 #[command(name = "neurostrata-mcp")]
@@ -191,6 +193,17 @@ enum Commands {
     Task {
         #[command(subcommand)]
         action: TaskCommands,
+    },
+
+    /// Install NeuroStrata as a managed service on this system.
+    /// Cross-platform: Linux uses systemd (user-level), macOS uses launchd,
+    /// Windows uses NSSM/SCM. Installs the daemon + the backup timer.
+    /// Idempotent — safe to re-run.
+    Setup {
+        /// Path to the NeuroStrata project root (where scripts/backup.sh lives).
+        /// Defaults to current directory.
+        #[arg(long)]
+        repo_path: Option<std::path::PathBuf>,
     },
 
     /// Git hook management: installs the one hook that exists
@@ -1490,6 +1503,28 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
             },
+            Commands::Setup { repo_path } => {
+                let repo = match repo_path {
+                    Some(p) => p,
+                    None => std::env::current_dir().with_context(|| "cannot determine current_dir")?,
+                };
+                match setup::run_setup(&repo) {
+                    Ok(report) => {
+                        if report.verified {
+                            println!("Setup complete. Daemon healthy.");
+                        } else if report.daemon_installed {
+                            println!("Setup complete. Daemon installed but did not become healthy — see notes above.");
+                        } else {
+                            println!("Setup complete (manual steps required for this platform).");
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("setup failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             Commands::Hooks { action } => match action {
                 HooksCommands::Install { force } => {
                     let root = git_toplevel()
@@ -1767,6 +1802,7 @@ async fn main() -> anyhow::Result<()> {
                     | Commands::Backup { .. }
                     | Commands::Restore { .. }
                     | Commands::Task { .. }
+                    | Commands::Setup { .. }
                     | Commands::Hooks { .. } => unreachable!(),
                 }
             }
