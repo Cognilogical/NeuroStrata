@@ -214,7 +214,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_procedure_perform",
-                        "description": "Acknowledge one firing of a 'procedure' memory: stamp last_performed_at, increment performance_count, decrement remaining_fires (its iteration budget), and write the Episodic Buffer entry that last_episodic_pointer names. A procedure past its valid_to answers lapsed:true, one with no fires left answers spent:true, and neither mutates the row.",
+                        "description": "Acknowledge one firing of a 'procedure' memory: stamp last_performed_at, increment performance_count, decrement remaining_fires (its iteration budget), and write the Episodic Buffer entry that last_episodic_pointer names. A procedure past its valid_to answers lapsed:true, one with no fires left answers spent:true, and neither mutates the row. CREATE A PROCEDURE FIRST via `neurostrata_add_memory` with `memory_type: \"procedure\"` (fields: trigger, remaining_fires, valid_to, performance_count, last_performed_at, last_episodic_pointer) — this tool only stamps; it does not insert.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {

@@ -32,6 +32,15 @@ Memory architecture is the single most important aspect of this system. It is NO
 - **CRITICAL RESTRICTION**: NEVER use `bd remember` to store memories. That tool is deprecated for agent use. You MUST use the dedicated `neurostrata_add_memory` tool.
 - **Lock 1 (Pre-Push Hook):** The Supervisory Attentional System gates `git push` (`neurostrata-mcp task gate --strict`, installed via `neurostrata-mcp hooks install`). If a push is blocked, resolve the reported Goal violations — complete with extraction, unclaim, or unblock — before retrying.
 - **Lock 2 (Checklist Abstraction):** Completing a Goal (`working` → `done`) must be accompanied by an architectural summary via `neurostrata_add_memory`. The Central Executive enforces this: `neurostrata_task_complete` fails until a memory has been extracted from the work.
+
+## 3a. Task vs Procedure (do not confuse)
+NeuroStrata has two distinct work-related concepts:
+- A `task` is a unit of work that FINISHES — it must reach `done` via `neurostrata_task_complete` (Lock 2). Each cycle of a recurring pattern = one new task.
+- A `procedure` is a knowing-how routine with a finite rehearsal budget — it is FIRED (not finished) by `neurostrata_procedure_perform`, which stamps `last_performed_at`, increments `performance_count`, decrements `remaining_fires`, and writes one Episodic Buffer entry. A lapsed/spent procedure answers accordingly and does not mutate the row.
+
+**How to create a procedure** (no `procedure_create` tool exists): `neurostrata_add_memory` with `memory_type: "procedure"` and metadata fields `trigger` (`session-start` | `before-edit` | `after-mutation` | `every-n-sessions:N` | `every-n-days:N`), `remaining_fires`, `valid_to`, `performance_count`, `last_performed_at`, `last_episodic_pointer`. Then stamp each firing with `neurostrata_procedure_perform`.
+
+**Do not ask for `task_type: "recurring"`** — the enum is `task | bug | feature | epic`. The rejection error itself points at this section.
 - **Lock 3 (The "Breath" Prompt):** If a task takes more than 3-5 steps, the agent must pause, summarize the current state, and record it on the Goal (`neurostrata_task_update` note — its Working Memory history) before proceeding.
 - **Continuous Backup Protocol:** Silently use `neurostrata_append_log` to maintain a running log of the conversation. Pass tags (e.g., "auth, database") when a topic switch occurs.
 - **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** You are strictly BLOCKED from using `write`, `edit`, or `bash` (except for task-tracking commands) on a new task until you have FIRST executed `neurostrata_get_snapshot` to fetch the architectural rules for this project, OR `neurostrata_search_memory` using nouns/keywords from the user's prompt. You suffer from the "Unknown Unknowns" bias: you do not know when you are missing a constraint. Therefore, you must NEVER assume you know the architectural constraints of a codebase just because you read the code. The memory database is the ultimate ground truth. **You MUST call the memory tools as your very first action on every new task.**
