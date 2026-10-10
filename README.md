@@ -332,18 +332,29 @@ Both take `--check` / `-CheckOnly` to report the toolchain and build nothing. Th
 
 ### Installation
 
-Clone the repository and run the automated installer. The installer uses a pre-compiled native binary, sets up global symlinks, and patches the client's configuration automatically—**no Rust toolchain required**.
+**1. From a release tarball (no toolchain required).** Download the platform asset attached to the [latest release](https://github.com/Cognilogical/NeuroStrata/releases/latest), extract it, and put `neurostrata-mcp` (or `neurostrata-mcp.exe` on Windows) on your `PATH`:
 
 ```bash
-git clone https://github.com/Cognilogical/NeuroStrata.git ~/Documents/neurostrata
-cd ~/Documents/neurostrata
-./install.sh
+# Linux (amd64)
+curl -L -o neurostrata-mcp.tar.gz https://github.com/Cognilogical/NeuroStrata/releases/latest/download/neurostrata-mcp-linux-amd64.tar.gz
+tar -xzf neurostrata-mcp.tar.gz
+sudo mv dist/linux/neurostrata-mcp /usr/local/bin/
+```
+
+Assets cover `linux-amd64`, `linux-arm64`, `darwin-arm64`, and `windows-amd64`, plus a `SHA256SUMS` file. Intel Mac (x86_64-apple-darwin) is dropped — the upstream ONNX Runtime prebuilts no longer cover it.
+
+**2. From source.** If you have a Rust toolchain and want the bleeding edge:
+
+```bash
+git clone https://github.com/Cognilogical/NeuroStrata.git
+cd NeuroStrata
+cargo install --path . --locked           # installs to ~/.cargo/bin/neurostrata-mcp
 ```
 
 **What the installer does:**
-1. Installs the Rust `neurostrata-mcp` binary to `~/.local/bin/neurostrata-mcp`.
-2. Links the universal `SKILL.md` to `~/.agents/skills/neurostrata`.
-3. Registers the MCP server in your client's local configuration (e.g. `~/.config/opencode/opencode.json`).
+1. Installs the Rust `neurostrata-mcp` binary to `~/.cargo/bin/neurostrata-mcp` (or `/usr/local/bin/` if you moved it there from the tarball).
+2. The repo carries a `SKILL.md` at the root; an OpenCode client picks it up from `~/.config/opencode/opencode.json`.
+3. The MCP server registers itself with the client the first time it runs.
 
 **Per-project, enable the Supervisory Attentional System** — one command per checkout writes the pre-push gate that keeps unfinished Goals from leaving the machine:
 
