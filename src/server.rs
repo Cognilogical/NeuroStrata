@@ -113,7 +113,7 @@ pub async fn process_mcp_request(
                                 "content": { "type": "string", "description": "The text of the memory to save." },
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
                                 "project_root": { "type": "string", "description": "The absolute path to the project root directory where the agent is currently working." },
-                                "memory_type": { "type": "string", "description": "Type of memory: 'rule', 'preference', 'bootstrap', 'persona', or 'context'. Defaults to 'context'." },
+                                "memory_type": { "type": "string", "description": "Type of memory. Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); structural types are directory/file/markdown/symbol; custom types remain valid. Defaults to 'context'. (This description is overlaid at runtime from src/schemas/memory-vocabulary.v3.json tool_summaries.memory_type; if it has drifted from the shipped vocab, the overlay wins, but the static value should stay in sync so the source is not misleading.)" },
                                 "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY if you are absolutely certain this is a brand new project namespace that doesn't exist yet." },
                                 "user_id": { "type": "string", "description": "The user making the request." },
                                 "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
@@ -3781,6 +3781,23 @@ mod tests {
                 field
             );
         }
+        // vocabulary v4: an agent reading `tools/list` must see `procedure` in
+        // the memory_type description, otherwise the type effectively doesn't
+        // exist as far as the surface is concerned. The patch at
+        // process_mcp_request -> "tools/list" overlays the shipped vocab's
+        // summary on top of the hardcoded value at server.rs:116; this
+        // assertion catches any drift that leaves the overlay stale.
+        let add_memory = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_add_memory")
+            .expect("the add tool is exposed");
+        let mem_type_desc = add_memory["inputSchema"]["properties"]["memory_type"]["description"]
+            .as_str()
+            .expect("memory_type has a description");
+        assert!(
+            mem_type_desc.contains("procedure"),
+            "memory_type description must mention `procedure` (vocab v4): {mem_type_desc:?}"
+        );
     }
 
     /// Vocabulary v4: `procedure` is an ordinary memory type on the
