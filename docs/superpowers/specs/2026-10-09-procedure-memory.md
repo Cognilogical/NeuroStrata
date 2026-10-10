@@ -6,6 +6,8 @@
 **Task:** neurostrata-9nzd (in_progress)
 **Path:** architectural (per superpowers:brainstorming HARD-GATE ratchet; K3 architect produced the shape via independent noodle; conversational design approval was the answer to "on the procedure lets capture the details and get it implemented if we have everything we need")
 
+> **Shipped (1.8.0):** `memory_type: "procedure"`, `neurostrata_procedure_perform`, the `procedures_due` strap in `get_snapshot`, and the v1 simplification (no spawned task per fire, simple "what's not lapsed" surface). The "v2 candidate" markers below are stale — owner directive 2026-10-09 dropped the v2 backlog and the procedure ride shipped in 1.8.0. See [`CHANGELOG.md`](../../../CHANGELOG.md) for the resolved-state list.
+
 ---
 
 ## Intent
