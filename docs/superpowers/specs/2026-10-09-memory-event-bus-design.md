@@ -3,7 +3,9 @@
 **Date:** 2026-10-09
 **Author:** BOSUN session
 **Path:** architectural (per `superpowers:brainstorming` ratchet)
-**Status:** design approved (conversational); pending user review of this written spec
+**Status:** design approved; shipped in 1.8.0 with all described features including the deferred ones
+
+> **Shipped (1.8.0):** the ThalamicBus + all three v1 subscribers, the four emit sites, the export-freshness gate consumer (this spec marked it "deferred to a follow-up task" at the time — it shipped in the same release, per owner directive 2026-10-09 to drop the v2 candidate backlog), and the `archive_memory` `allow_global` parity. See [`CHANGELOG.md`](../../../CHANGELOG.md) for the resolved-state list. The "follow-up task" / "v2 candidate" references below are stale.
 
 ---
 

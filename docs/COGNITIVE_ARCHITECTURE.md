@@ -47,6 +47,18 @@ Memory is not locked in a black-box database. Through the NeuroVault and Obsidia
 *Inspired by the brain's division of labor across specialized regions.*
 Operating highly intelligent frontier models on trivial code changes is financially and computationally wasteful. NeuroStrata enforces an Orchestrator/Worker divide. A high-intelligence Orchestrator routes context, manages the memory graph, and structures plans — while the Central Executive tracks the resulting Goals — and aggressively offloads physical code execution (file writes, linting, compiling) to a cheaper, narrowly-focused `NeuroStrata-Task` agent.
 
+### 11. Thalamic Relay (Pub-Sub Event Bus)
+*Inspired by the thalamus as the brain's central relay between cortex and sub-cortical structures.*
+Memory writes are announcements, not requests. Every storage mutation emits a typed pulse on the **Thalamic Bus** — `Created`, `Superseded`, `Archived`, `GuardedActionFired` — and bookkeeping subscribers (`EpisodicPointerEcho`, `ExportFreshnessDirty`, `GuardEventLog`) react because the write happened, not because an agent remembered to do it. A bounded queue with drop-oldest backpressure, a 250ms per-subscriber timeout, and a `RecursionToken` keep the system honest under load and prevent a subscriber's own writes from re-triggering itself. The relay carries four emit sites: `add_memory`, `supersede_memory`, `task_complete` knowledge-consolidation, and `archive_memory`.
+
+### 12. Procedural Memory (Knowing-How with Rehearsal)
+*Inspired by the basal ganglia and procedural learning.*
+Knowing-that is only two-thirds of memory. NeuroStrata's third leg carries `memory_type: "procedure"` Engrams with `trigger`, `remaining_fires` (the iteration budget), `valid_to` (decay with disuse), and `last_performed_at`/`performance_count` (strengthened by rehearsal). `neurostrata_procedure_perform` stamps one firing, decrements the budget, and points back to the Episodic Buffer entry that records the act; `get_snapshot`'s `procedures_due` strap surfaces what is still live. A procedure that has spent every fire or lapsed past `valid_to` answers accordingly and stops being surfaced.
+
+### 13. Tombstone-Aware Retrieval
+*Inspired by clean recall: a retired memory is one the operator has stopped trusting, and recall surfaces should respect that.*
+Tombstones are not deletes: the row keeps its content, its id, and its provenance, and `metadata.archived: true` is *merged* in beside them. The shared read-time helper `crate::handlers::archive_memory::is_archived(payload)` is strict on the field shape (literal `true` only), so a typo never hides a row. Every read surface — `search_memory`, `get_snapshot`, `export-graph` — honors the tombstone by default; the uniform `include_archived: true` escape hatch exists for audits and deliberate second-looks.
+
 ## Cognitive-name glossary
 
-See `README.md` § Biological Nomenclature ↔ Engineering Primitives (lines 33-54) for the canonical table — one table, one set of name conventions, no drift. The 1.8.0 additions are the `ThalamicBus` and `ThalamicPulse` rows appended to that table.
+See `README.md` § Biological Nomenclature ↔ Engineering Primitives for the canonical table — one table, one set of name conventions, no drift. The 1.8.0 additions appended to that table are the `ThalamicBus`, `ThalamicPulse`, `ExportFreshnessDirty`, `GuardEventLog`, `EpisodicPointerEcho`, `RecursionToken`, and `Procedural Memory` rows.

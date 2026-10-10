@@ -54,14 +54,21 @@ neurostrata-mcp ingest ./src my-rust-project ./custom_schema.json
 
 ### 4. `export-graph`
 Exports the entire relational memory graph (nodes, relationships, and metadata) as a standardized JSON structure. Used to drive visual graph renders like the web UI or NeuroVault.
+
+**1.8.0 — refuses when any namespace's `freshness_flag` row has `metadata.dirty: true`** (the export-freshness gate). The error names every dirty namespace so the operator sees the whole backlog. An operator who has confirmed the export is current flips the field to `false` and re-runs.
+
+**1.8.0 — tombstoned (`metadata.archived: true`) rows are excluded by default.** Pass `--include-archived` to surface them.
 ```bash
-neurostrata-mcp export-graph [output_json_path]
+neurostrata-mcp export-graph [output_json_path] [--exclude-superseded] [--include-archived]
 ```
 *   `output_json_path` (Optional): Defaults to `.NeuroStrata/graph/graph.json`.
+*   `--exclude-superseded`: drop superseded rows entirely instead of carrying them marked.
+*   `--include-archived`: include tombstoned rows in the export (off by default).
 
 *Example:*
 ```bash
 neurostrata-mcp export-graph ./graph_export.json
+neurostrata-mcp export-graph ./graph_export.json --include-archived
 ```
 
 ---
@@ -239,6 +246,23 @@ neurostrata-mcp restore ~/backups/neurostrata-2026-10-08 --into ~/.config/NeuroS
 Read-only upgrade-consistency report. Runs with the daemon up. **Scoped and labeled** — `--namespace <ns>` for one project (refuses a name it does not know), omitted = every namespace in deterministic order, with each finding line carrying its `[namespace]` label. Never trust an unlabeled health line.
 ```bash
 neurostrata-mcp doctor [--namespace <ns>]
+```
+
+---
+
+### 16. `archive` *(1.8.0)*
+Tombstones a memory by id — writes `archived: true` (and `archived_at`) beside the existing metadata, without deleting content. The same handler the `neurostrata_archive_memory` MCP tool calls. The CLI archive runs without the daemon (a running daemon holds the DB lock), so it builds its own ThalamicBus with no listeners — the pulse is counted by nobody, but the write still happens. Refuses the `global` namespace without `--allow-global`.
+```bash
+neurostrata-mcp archive <namespace> <id> [--allow-global]
+```
+Exit codes: `0` on `Archived`, `1` on any other `ArchiveOutcome` (`Invalid`, `NotFound`, `Failed`).
+
+---
+
+### 17. `bus-metrics` *(1.8.0)*
+Reads the Thalamic Bus counters (`POST /bus/metrics`) with an explicit timeout, independent of the CLI's global one. Useful when the dispatcher's queue depth is the operator's leading indicator — a sustained `dropped` count means the dispatcher is falling behind the write rate.
+```bash
+neurostrata-mcp bus-metrics
 ```
 
 ---
