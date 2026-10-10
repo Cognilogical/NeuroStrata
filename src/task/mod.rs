@@ -397,10 +397,18 @@ pub async fn handle_task_create(
         None => "task".to_string(),
         Some(t) if ["task", "bug", "feature", "epic"].contains(&t) => t.to_string(),
         Some(t) => {
+            // An agent that asks for a `recurring` task (or any other value
+            // outside the enum) is asking the wrong question: tasks must
+            // reach `done`, so a never-closing type would break the lifecycle
+            // invariant. Recurring / scheduled work is a *procedure* memory
+            // — created via `neurostrata_add_memory` with `memory_type:
+            // "procedure"`, stamped via `neurostrata_procedure_perform`.
+            // Point the agent at the right path on the very first failure;
+            // the other discovery surfaces (the schema enum, the lane doc)
+            // are downstream of this signpost.
             return format!(
-                "ERROR: unknown task_type '{}'. Valid types: task, bug, feature, epic.",
-                t
-            )
+                "ERROR: unknown task_type '{t}'. Valid types: task, bug, feature, epic. (Recurring or scheduled patterns are not tasks: create a procedure via `neurostrata_add_memory` with `memory_type: \"procedure\"`, then stamp each firing with `neurostrata_procedure_perform`.)",
+            );
         }
     };
     let priority = match args.get("priority") {
@@ -1255,6 +1263,25 @@ to history. The task record IS Tier-3 task memory -- recover a session with
 ## 4. Memory
 Architectural rules, decisions, and fixes -> `neurostrata_add_memory`.
 Pre-flight every new task with `neurostrata_get_snapshot` first.
+
+## 5. Task vs procedure (do not confuse)
+A `task` is a unit of work that finishes (it must reach `done` via
+`neurostrata_task_complete` -- Lock 2). A `procedure` is a knowing-how
+routine with a finite rehearsal budget; it is fired (not finished) by
+`neurostrata_procedure_perform`, which decrements `remaining_fires` and
+writes one Episodic Buffer entry per firing.
+- Use a TASK for: work that completes once (or a recurring pattern where
+  each cycle is a new task). One cycle = one task, created fresh.
+- Use a PROCEDURE for: a finite-budget rehearsal or a recurring prompt
+  the agent should acknowledge on a trigger (`session-start`, `before-edit`,
+  `after-mutation`, `every-n-sessions:N`, `every-n-days:N`).
+- Procedure creation path (there is no `procedure_create` tool):
+  `neurostrata_add_memory` with `memory_type: "procedure"` and metadata
+  fields `trigger` / `remaining_fires` / `valid_to` / `performance_count` /
+  `last_performed_at` / `last_episodic_pointer`. Then stamp each firing with
+  `neurostrata_procedure_perform`.
+- `task_create` rejects `task_type: "recurring"` -- the rejection error
+  itself points at this section.
 "#,
         ns = namespace
     )
@@ -3155,6 +3182,36 @@ mod tests {
         );
     }
 
+    /// An agent that asks for `task_type: "recurring"` (or any non-task/bug/
+    /// feature/epic value) is asking the wrong question: tasks must reach
+    /// `done`, a recurring pattern is not a single work item. The error is
+    /// the cheapest discovery surface to fix — every other agent that hits
+    /// this dead end learns nothing without it.
+    #[tokio::test]
+    async fn task_create_rejects_unknown_task_type_with_a_procedure_signpost() {
+        let store = store_with_namespace("MyProj").await;
+        let reply = handle_task_create(
+            json!({
+                "namespace": "MyProj",
+                "title": "monthly GSC measurement",
+                "task_type": "recurring"
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(reply.starts_with("ERROR: unknown task_type 'recurring'"), "{}", reply);
+        // The signpost: this is where agents cross over to procedure memory.
+        assert!(
+            reply.contains("procedure") || reply.contains("neurostrata_procedure_perform"),
+            "the rejection must point at the procedure path: {reply}"
+        );
+        assert!(
+            reply.contains("neurostrata_add_memory"),
+            "the rejection must name the creation tool: {reply}"
+        );
+    }
+
     #[tokio::test]
     async fn task_create_writes_a_task_with_the_design_record_shape() {
         let store = store_with_namespace("MyProj").await;
@@ -4260,7 +4317,20 @@ mod tests {
         let files = parsed["files"].as_array().unwrap();
         assert_eq!(files[0]["path"], json!("AGENTS.md"));
         assert_eq!(files[0]["overwrite"], json!(false));
-        assert!(files[0]["content"].as_str().unwrap().contains("Zero-Action Start"));
+        let agents_md = files[0]["content"].as_str().unwrap();
+        assert!(agents_md.contains("Zero-Action Start"));
+        // The bootstrap-generated AGENTS.md must teach the agent the task vs
+        // procedure distinction up front -- the rejection error is the
+        // backstop, but every agent that reads AGENTS.md on a fresh project
+        // gets the right path before ever needing it.
+        assert!(
+            agents_md.contains("procedure") && agents_md.contains("neurostrata_procedure_perform"),
+            "AGENTS.md must point at the procedure path: {agents_md}"
+        );
+        assert!(
+            agents_md.contains("neurostrata_add_memory") && agents_md.contains("memory_type"),
+            "AGENTS.md must name the creation path: {agents_md}"
+        );
         assert_eq!(files[1]["path"], json!(".NeuroStrata/docs/.gitkeep"));
 
         let instructions = parsed["instructions"].as_array().unwrap();
