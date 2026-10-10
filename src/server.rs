@@ -2622,11 +2622,83 @@ mod tests {
             for (i, b) in text.bytes().enumerate() {
                 v[i % 4] += b as f32;
             }
+            // LadybugDB's `ARRAY_DISTANCE` rejects whole-number float arrays
+            // as a binder error: the engine parses the literal as INTEGER[] when
+            // every element is an integer, and the array-distance signature is
+            // FLOAT[]/DOUBLE[]. Real embedders never produce integers, so
+            // production is unaffected; the stub was a foot-gun only test
+            // code could step on. A constant per-element fraction makes the vector
+            // a non-integer FLOAT[] deterministically, and the offset is the
+            // same for the row written and the query read so the round-trip
+            // and the equality assertions still hold.
+            for (i, x) in v.iter_mut().enumerate() {
+                *x += (i as f32 + 1.0) * 0.001;
+            }
             Ok(v)
         }
         fn dimensions(&self) -> usize {
             4
         }
+    }
+
+    /// The stub's vector is accepted by `ARRAY_DISTANCE`: at least one element
+    /// carries a fractional part, so LadybugDB parses the literal as
+    /// `FLOAT[]` rather than `INTEGER[]`. The pre-fix stub summed to integer
+    /// values and broke the search path silently.
+    #[test]
+    fn stub_embedder_outputs_a_non_integer_float_vector() {
+        let v = futures::executor::block_on(StubEmbedder.embed("podman")).unwrap();
+        assert!(
+            v.iter().any(|x| x.fract() != 0.0),
+            "at least one element must be a non-integer float for ARRAY_DISTANCE: {v:?}"
+        );
+    }
+
+    /// A round-trip through the store preserves the fractional part, so a
+    /// vector-comparison assertion across the kept-prefix path keeps working
+    /// after the offset is added.
+    #[tokio::test]
+    async fn stub_embedder_vector_round_trips_through_the_store() {
+        use crate::traits::VectorStore;
+        let dir = std::env::temp_dir().join(format!(
+            "ns-stub-roundtrip-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        store.init("probe").await.expect("init");
+        let id = uuid::Uuid::new_v4().to_string();
+        let in_vector = StubEmbedder.embed("always use podman").await.unwrap();
+        store
+            .upsert(
+                "probe",
+                &id,
+                in_vector.clone(),
+                payload("always use podman"),
+            )
+            .await
+            .expect("seed");
+        let (out_vector, _) = store.get("probe", &id).await.unwrap().expect("round-tripped");
+        assert_eq!(in_vector, out_vector, "the fractional part survives the round-trip");
+    }
+
+    /// `handle_search_memory` with `StubEmbedder` (no `NoisyEmbedder`
+    /// workaround) succeeds: the search path is no longer a landmine that
+    /// every test had to step around.
+    #[tokio::test]
+    async fn handle_search_memory_runs_with_stub_embedder() {
+        let (store, _live_id) = store_with_one_rule("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "podman" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert_ne!(
+            text, "Failed to search database.",
+            "the search path no longer hits ARRAY_DISTANCE's integer-array binder error: {text}"
+        );
     }
 
     // ── the bus, as the request handlers see it ────────────────────────────────
@@ -4323,37 +4395,16 @@ mod tests {
     // uniform across surfaces, or the operator cannot predict where a
     // tombstone will be honored.
 
-    /// `StubEmbedder` produces whole-number vectors (sums of byte values),
-    /// and LadybugDB's `ARRAY_DISTANCE` rejects integer arrays as a binder
-    /// error -- the same landmine the ladybug test comments call out. This
-    /// sibling adds a fractional part so the search path can run. Real
-    /// embedders never produce integers, so the production handler is
-    /// unaffected.
-    struct NoisyEmbedder;
-
-    #[async_trait::async_trait]
-    impl Embedder for NoisyEmbedder {
-        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-            let mut v = StubEmbedder.embed(text).await?;
-            v[0] += 0.5;
-            Ok(v)
-        }
-        fn dimensions(&self) -> usize {
-            4
-        }
-    }
-
     /// Seeds the fixture with one live row and one row tombstoned by
     /// `archive_memory`. The test owns the bus so the dispatcher's queue is
-    /// drained by the time the read surfaces run. Embeds with `NoisyEmbedder`
-    /// so the search path can actually run.
+    /// drained by the time the read surfaces run.
     async fn store_with_live_and_archived(
         namespace: &str,
     ) -> (Arc<dyn VectorStore>, String, String) {
         let (store, live_id) = store_with_one_rule(namespace).await;
 
         let archived_id = uuid::Uuid::new_v4().to_string();
-        let vector = NoisyEmbedder.embed("deprecated rule").await.unwrap();
+        let vector = StubEmbedder.embed("deprecated rule").await.unwrap();
         store
             .upsert(namespace, &archived_id, vector, payload("deprecated rule"))
             .await
@@ -4379,7 +4430,7 @@ mod tests {
         let (store, live_id, archived_id) = store_with_live_and_archived("probe").await;
         let text = handle_search_memory(
             serde_json::json!({ "namespace": "probe", "query": "podman" }),
-            Arc::new(NoisyEmbedder),
+            Arc::new(StubEmbedder),
             store,
         )
         .await;
@@ -4402,7 +4453,7 @@ mod tests {
                 "query": "podman",
                 "include_archived": true
             }),
-            Arc::new(NoisyEmbedder),
+            Arc::new(StubEmbedder),
             store,
         )
         .await;
