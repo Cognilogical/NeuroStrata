@@ -565,6 +565,22 @@ fn cli_ingest_root(dir: &str) -> String {
 
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
 
+/// Mark a freshly-written hook file as executable. Git on POSIX runs a hook
+/// only when the mode bit is set; on Windows it uses the filename
+/// (`.git/hooks/<name>` without an extension, executed through Git Bash)
+/// rather than POSIX permissions, so the helper is a no-op there. Gating
+/// the Unix-only `PermissionsExt` import keeps the Windows build green.
+#[cfg(unix)]
+fn set_hook_executable(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+}
+
+#[cfg(not(unix))]
+fn set_hook_executable(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
 fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
     use std::io::Write;
@@ -794,6 +810,38 @@ mod tests {
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
         let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
         assert!(parsed.is_err(), "a typo must never reach std::process::Command");
+    }
+
+    /// `set_hook_executable` is the only place the binary uses
+    /// `std::os::unix::fs::PermissionsExt` -- the Windows build gates that
+    /// branch out entirely, but the helper must compile and run on every
+    /// target so a single call site replaces the inline block. On Unix the
+    /// hook gets the executable bit; on Windows, git runs the hook via the
+    /// filename (`.git/hooks/<name>` without an extension, executed through
+    /// Git Bash) rather than POSIX permissions, so the helper is a no-op.
+    #[test]
+    fn set_hook_executable_marks_the_file_executable_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ns-set-hook-exec-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pre-push");
+        std::fs::write(&path, "#!/bin/sh\necho ok\n").unwrap();
+        // Pre-condition: the file is not executable yet (umask-dependent, but
+        // explicitly clear the bit so the assertion below is exact rather than
+        // umask-dependent).
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        set_hook_executable(&path).expect("the chmod lands");
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o111,
+            0o111,
+            "the executable bits are set for owner+group+other: {:o}",
+            perms.mode()
+        );
     }
 
     #[test]
@@ -1972,10 +2020,7 @@ async fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                     std::fs::write(&target, PRE_PUSH_HOOK)?;
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
-                    }
+                    set_hook_executable(&target)?;
                     println!("Installed the NeuroStrata task gate at {}.", target.display());
                     return Ok(());
                 }
