@@ -7,6 +7,7 @@
 //! lifecycle enforcement land in follow-up slices.
 
 pub mod cli;
+pub mod import;
 pub mod manifest;
 pub mod mesh_service;
 pub mod record;

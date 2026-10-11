@@ -620,10 +620,18 @@ pub async fn process_mcp_request(
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
                         // store, no bus, no daemon dependency), so it owns
-                        // its own name mapping in the mesh module.
+                        // its own name mapping in the mesh module. Slice 4
+                        // exception: pull is the consume path — it replays
+                        // validated committed mesh records into the store
+                        // through the traits, so it takes store + embedder
+                        // and lives in crate::synaptic_mesh::import.
                         mesh_name if mesh_name.starts_with("neurostrata_synaptic_mesh_") => {
-                            result_text =
-                                crate::synaptic_mesh::handle_mesh_tool_call(mesh_name, &arguments);
+                            if mesh_name == "neurostrata_synaptic_mesh_pull" {
+                                result_text = crate::synaptic_mesh::import::handle_mesh_pull(&arguments, store.clone(), emb.clone()).await;
+                            } else {
+                                result_text =
+                                    crate::synaptic_mesh::handle_mesh_tool_call(mesh_name, &arguments);
+                            }
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
