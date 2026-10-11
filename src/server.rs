@@ -1286,6 +1286,9 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
     if !include_archived {
         all_memories.retain(|r| !crate::handlers::archive_memory::is_archived(&r.payload));
     }
+    // Conflicting mesh rows are suppressed from the snapshot's effective
+    // view too (same rationale as search_memory).
+    all_memories.retain(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload));
 
     // Counted from the list the snapshot already had to fetch, so this
     // costs nothing beyond the scan.
@@ -1755,6 +1758,13 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
                 if !include_archived {
                     results.retain(|r| !crate::handlers::archive_memory::is_archived(&r.payload));
                 }
+                // Conflicting mesh rows are suppressed from the effective
+                // view (spec §"Concurrent merge policy"): the local accepted
+                // projection may be stale, and the incoming variant is
+                // preserved in the conflict overlay for a human to resolve.
+                // Honesty: a conflicting row still carries
+                // `metadata.mesh.conflict` if it ever surfaces another way.
+                results.retain(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload));
                 results.truncate(5);
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
