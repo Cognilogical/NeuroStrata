@@ -46,6 +46,17 @@ NeuroStrata has two distinct work-related concepts:
 - **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** You are strictly BLOCKED from using `write`, `edit`, or `bash` (except for task-tracking commands) on a new task until you have FIRST executed `neurostrata_get_snapshot` to fetch the architectural rules for this project, OR `neurostrata_search_memory` using nouns/keywords from the user's prompt. You suffer from the "Unknown Unknowns" bias: you do not know when you are missing a constraint. Therefore, you must NEVER assume you know the architectural constraints of a codebase just because you read the code. The memory database is the ultimate ground truth. **You MUST call the memory tools as your very first action on every new task.**
 - **Retrieval Protocol (MANDATORY):** Every time you start a new session, or if a user asks about previous system design, YOU MUST proactively use `neurostrata_search_memory` or grep `.NeuroStrata/sessions/*` (if local fallback is needed) to retrieve the context before answering or coding.
 
+## 3b. SynapticMesh (inter-instance memory — honesty rules)
+
+When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh status` tells you), some memory mutations are additionally mirrored to the team mesh. The rules an agent must not bend:
+
+- **What is shared vs not:** `rule`/`fact`/`procedure` *definitions* cross the mesh only when they carry `eligibility: shareable` — and procedure definitions travel WITHOUT their runtime counters (`remaining_fires`, `performance_count`, `last_performed_at`, `last_episodic_pointer` are strictly local; a shared record carrying any of them is refused on receipt). Tasks, `structural` rows, embeddings, and private rows never travel.
+- **Private rows are sovereign:** never edit, overwrite, or "refresh" a row that carries mesh provenance you did not write, and never import over a private row that owns an id. Conflicts between mesh variants are preserved, never silently resolved — if `mesh status` reports unresolved conflicts, stop synthesizing over that id and say so.
+- **Honesty rules for the mesh surfaces:**
+  - **Explicit-zero status lines:** when there is nothing pending/unresolved, `mesh status` and sync replies say `0`/`no pending`, never noise or silence — a blank field is a lie an operator cannot debug.
+  - **Fail-soft everywhere:** a rejected/unreachable mesh remote queues work locally and reports one flattened line; it never blocks the source push, never exits the hook non-zero, never blocks a local query.
+  - **Never force-push the mesh:** the mesh repo is `--ff-only` pull discipline and regular pushes only. Divergent history is an operator decision; an agent who force-pushes has deleted a teammate's accepted record. Recovery is print-only (`mesh recover`), never `reset --hard`.
+
 ## 4. Bootstrapping & Ingestion
 - **Docs:** If `.NeuroStrata/docs/` is missing, call `neurostrata_bootstrap` (new project) or `neurostrata_task_setup` (existing project) and follow the returned instructions — they carry the AGENTS.md template and the first mandatory Goal.
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.

@@ -19,6 +19,9 @@ pub mod tools;
 pub mod outbox;
 pub mod worker;
 
+#[cfg(test)]
+mod acceptance;
+
 pub use cli::{handle_synaptic_mesh_command, MeshContext, SynapticMeshCommands};
 pub use mesh_service::{
     conventional_base_root, handle_mesh_tool_call, resolve_node_id, MeshService,
