@@ -12,6 +12,7 @@ mod secrets;
 mod server;
 mod setup;
 mod store;
+mod synaptic_mesh;
 mod task;
 mod tools;
 mod traits;
