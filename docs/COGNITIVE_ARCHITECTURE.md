@@ -59,6 +59,24 @@ Knowing-that is only two-thirds of memory. NeuroStrata's third leg carries `memo
 *Inspired by clean recall: a retired memory is one the operator has stopped trusting, and recall surfaces should respect that.*
 Tombstones are not deletes: the row keeps its content, its id, and its provenance, and `metadata.archived: true` is *merged* in beside them. The shared read-time helper `crate::handlers::archive_memory::is_archived(payload)` is strict on the field shape (literal `true` only), so a typo never hides a row. Every read surface — `search_memory`, `get_snapshot`, `export-graph` — honors the tombstone by default; the uniform `include_archived: true` escape hatch exists for audits and deliberate second-looks.
 
+### 14. SynapticMesh — the inter-instance synaptic layer
+
+*Inspired by connected brains: the same knowledge should ignite in whichever instance needs it, without one machine's regulator becoming another machine's single point of failure.*
+
+Everything in §1–13 is one machine's mind. SynapticMesh is the *inter-instance* complement: memories (`rule`, `fact`) and knowing-how (procedure **definitions** — never runtime counters, never embeddings) travel between daemons on different machines using plain git as transport. Each node's daemon-owner keeps a git checkout of the team mesh at `~/.NeuroStrata/synaptic-mesh/<mesh_id>/`; a durable WAL outbox is drained by the mesh-worker into `synaptic-mesh-record/v1` files; publish is `git push`, receive is `git fetch` + a validated replay pass that applies records into the local store with mesh provenance, while the effective local view stays private-records + accepted-shared-records, lifecycle- and conflict-aware. Network absence never fails a query.
+
+The locks and invariants, in the same spirit as the Prefrontal Cortex's locks:
+
+- **Sharing boundary:** only `rule`/`fact`/`procedure` definitions cross; `structural`, tasks, embeddings, counters, and the bus's own rows are strictly local. Opt-in by default (`require_record_eligibility`); imported procedures land `untrusted` and fire only after local promotion.
+- **Idempotence everywhere:** the record's `update_id` (= the outbox's `stable_op_id`) is the dedup key. A crash before the cursor advance replays and skips by update_id; the cursor never advances past an unresolved conflict.
+- **No silent drops:** hostile checkout contents (traversal, symlinks, exec bits, garbage, unknown schema) are ignored and *named*; concurrent same-id conflicts are preserved as named variants in a conflicts dir with an unresolved overlay surfaced by `mesh status` — integration pauses loudly, never silently merges, never silently resolves.
+- **Private rows are sovereign:** a row without mesh provenance is never overwritten, never deleted — even where a shared record carries the same id.
+- **Convergence discipline:** pushes are normal git pushes; pulls are `--ff-only` (divergent history is an operator decision); sync hooks are fail-soft one-liners that never block a source push.
+
+Open gaps, documented in `src/synaptic_mesh/acceptance.rs`: *old-epoch quarantine is not yet enforced* (`origin_mesh_epoch` is recorded but never compared on import), and *oversized JSON has no size cap*. The permanence disclosure is direct: the mesh is a permanent record; tombstones suppress from search, but erasure requires a coordinated `filter-repo` history rewrite plus an epoch bump, and an uncooperative peer's clone cannot be forced to forget.
+
+Design provenance: **Anthropic/Kimi verdict** (`docs/design-mesh-verdict-kimi.md`) — identified the breaking C-flush merge-conflict, recommended the git-checkout-per-mesh approach (D); **OpenAI/Astra verdict** (`docs/design-mesh-verdict-openai.md`) — supplied the durable-outbox, merge table, sharing-boundary, and trust-model refinements. Full spec: `docs/superpowers/specs/2026-10-10-synaptic-mesh-design.md`.
+
 ## Cognitive-name glossary
 
 See `README.md` § Biological Nomenclature ↔ Engineering Primitives for the canonical table — one table, one set of name conventions, no drift. The 1.8.0 additions appended to that table are the `ThalamicBus`, `ThalamicPulse`, `ExportFreshnessDirty`, `GuardEventLog`, `EpisodicPointerEcho`, `RecursionToken`, and `Procedural Memory` rows.
