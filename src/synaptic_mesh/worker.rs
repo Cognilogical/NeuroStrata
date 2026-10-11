@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::manifest::Trust;
-use super::outbox::{is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED};
+use super::outbox::{
+    is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED,
+};
 use super::record::{
     Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
 };
@@ -62,9 +64,16 @@ enum ApplyOutcome {
 /// An I/O error mid-batch aborts *before* the commit and before any
 /// mark-committed, so nothing is half-acknowledged: the files already written
 /// are idempotently re-applied on the next drain.
-pub fn drain_once(outbox: &Outbox, mesh: &MeshStorage, node_id: &str) -> Result<DrainReport, String> {
+pub fn drain_once(
+    outbox: &Outbox,
+    mesh: &MeshStorage,
+    node_id: &str,
+) -> Result<DrainReport, String> {
     let entries = outbox.pending()?;
-    let mut report = DrainReport { pending_seen: entries.len(), ..DrainReport::default() };
+    let mut report = DrainReport {
+        pending_seen: entries.len(),
+        ..DrainReport::default()
+    };
     if entries.is_empty() {
         return Ok(report);
     }
@@ -137,7 +146,11 @@ fn apply_one(
         Err(_) => return Ok(ApplyOutcome::Skipped),
     };
     let superseded_by = match entry.op.as_str() {
-        OP_SUPERSEDED => match entry.superseded_by.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
+        OP_SUPERSEDED => match entry
+            .superseded_by
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
             Some(target) => Some(target),
             None => return Ok(ApplyOutcome::Skipped),
         },
@@ -195,7 +208,10 @@ fn build_record(
     let mut relationships: Vec<Relationship> = Vec::new();
     if let Some(supersedes) = entry.metadata.get("supersedes").and_then(|v| v.as_str()) {
         if let Ok(target) = Uuid::parse_str(supersedes) {
-            relationships.push(Relationship { kind: "supersedes".to_string(), target });
+            relationships.push(Relationship {
+                kind: "supersedes".to_string(),
+                target,
+            });
         }
     }
 
@@ -229,7 +245,10 @@ fn build_record(
 /// structural pointers, access counts — stays local.
 fn projected_metadata(metadata: &Value) -> Value {
     let mut out = serde_json::Map::new();
-    let eligibility = metadata.get("eligibility").and_then(|v| v.as_str()).unwrap_or("private");
+    let eligibility = metadata
+        .get("eligibility")
+        .and_then(|v| v.as_str())
+        .unwrap_or("private");
     out.insert("eligibility".to_string(), json!(eligibility));
     if let Some(source) = metadata.get("source") {
         out.insert("source".to_string(), source.clone());
@@ -283,8 +302,15 @@ fn archived_at(entry: &OutboxEntry) -> Option<DateTime<Utc>> {
 /// The on-disk path for a record: `<root>/<namespace>/memories/<id>.json`, or
 /// `procedures/<id>.json` for procedures.
 fn record_path(mesh: &MeshStorage, record: &MeshRecord) -> PathBuf {
-    let subdir = if record.memory_type == "procedure" { "procedures" } else { "memories" };
-    mesh.root().join(&record.namespace).join(subdir).join(format!("{}.json", record.id))
+    let subdir = if record.memory_type == "procedure" {
+        "procedures"
+    } else {
+        "memories"
+    };
+    mesh.root()
+        .join(&record.namespace)
+        .join(subdir)
+        .join(format!("{}.json", record.id))
 }
 
 /// Atomically write a record: pretty JSON + newline to a tmp file, then
@@ -309,6 +335,13 @@ fn write_record(path: &Path, record: &MeshRecord) -> Result<(), String> {
 /// corrupt file — a corrupt file is overwritten by the fresh write (recovery),
 /// never left to block the drain forever.
 fn load_existing(path: &Path) -> Result<Option<MeshRecord>, String> {
+    // A directory where a record file belongs is not an error here: treat it
+    // as absent so the apply proceeds and the tmp->rename below fails loudly
+    // (the fault-injection test leans on exactly that ordering) instead of
+    // blocking the drain at the read stage.
+    if path.is_dir() {
+        return Ok(None);
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -341,14 +374,8 @@ mod tests {
     /// A fresh mesh checkout + its outbox, under one scratch base.
     fn fixture(tag: &str, remote: Option<&str>) -> (MeshStorage, Outbox) {
         let base = scratch(tag);
-        let mesh = MeshStorage::init(
-            &base,
-            "node-fixture",
-            "team",
-            &["ns".to_string()],
-            remote,
-        )
-        .unwrap();
+        let mesh =
+            MeshStorage::init(&base, "node-fixture", "team", &["ns".to_string()], remote).unwrap();
         let outbox = Outbox::open(&outbox_dir_for(mesh.root())).unwrap();
         (mesh, outbox)
     }
@@ -360,8 +387,38 @@ mod tests {
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();
-        assert!(out.status.success(), "git rev-list failed: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).unwrap().trim().parse().unwrap()
+        assert!(
+            out.status.success(),
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// `git_count` for the fault test: counts every commit on all refs, `0`
+    /// when the checkout has no commit yet (a file-step failure MUST leave
+    /// the checkout exactly where the fixture started, possibly with no HEAD).
+    fn git_count_or_zero(root: &Path) -> usize {
+        let out = Command::new("git")
+            .args(["rev-list", "--count", "--all"])
+            .current_dir(root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
     }
 
     /// A `created` entry for a shareable `rule`.
@@ -395,9 +452,14 @@ mod tests {
         assert_eq!(report.skipped, 0);
         assert!(report.committed);
 
-        let path = mesh.root().join("ns").join("memories").join(format!("{id}.json"));
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
         let text = std::fs::read_to_string(&path).expect("the record file must exist");
-        let record: MeshRecord = serde_json::from_str(&text).expect("the file parses as MeshRecord");
+        let record: MeshRecord =
+            serde_json::from_str(&text).expect("the file parses as MeshRecord");
         assert_eq!(record.schema_version, MESH_RECORD_SCHEMA_VERSION);
         assert_eq!(record.id, id);
         assert_eq!(record.namespace, "ns");
@@ -416,7 +478,9 @@ mod tests {
     fn a_second_drain_is_a_no_op() {
         let (mesh, outbox) = fixture("second-drain", None);
         let id = Uuid::new_v4();
-        outbox.append(&created(&id.to_string(), shareable_metadata())).unwrap();
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
 
         drain_once(&outbox, &mesh, "node-author").unwrap();
         let second = drain_once(&outbox, &mesh, "node-author").unwrap();
@@ -430,15 +494,24 @@ mod tests {
     fn a_pending_entry_applies_on_the_next_drain_after_a_crash() {
         let (mesh, outbox) = fixture("crash-before-drain", None);
         let id = Uuid::new_v4();
-        outbox.append(&created(&id.to_string(), shareable_metadata())).unwrap();
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
 
         // Simulate "crash before the drain ever ran": nothing drained, and the
         // mesh file must not exist yet.
-        let path = mesh.root().join("ns").join("memories").join(format!("{id}.json"));
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
         assert!(!path.exists(), "the mesh has not exported yet");
 
         drain_once(&outbox, &mesh, "node-author").unwrap();
-        assert!(path.exists(), "the next drain applies the pending entry — nothing lost");
+        assert!(
+            path.exists(),
+            "the next drain applies the pending entry — nothing lost"
+        );
     }
 
     #[test]
@@ -457,8 +530,14 @@ mod tests {
         outbox.append(&entry).unwrap();
         let retry = drain_once(&outbox, &mesh, "node-author").unwrap();
         assert_eq!(retry.applied, 0);
-        assert_eq!(retry.already_applied, 1, "the retry recognises the same update_id");
-        assert!(!retry.committed, "byte-identical output must not be a second commit");
+        assert_eq!(
+            retry.already_applied, 1,
+            "the retry recognises the same update_id"
+        );
+        assert!(
+            !retry.committed,
+            "byte-identical output must not be a second commit"
+        );
         assert_eq!(git_count(mesh.root()), 1, "no duplicate commit");
     }
 
@@ -466,7 +545,9 @@ mod tests {
     fn a_batch_produces_one_git_commit() {
         let (mesh, outbox) = fixture("batch", None);
         for _ in 0..3 {
-            outbox.append(&created(&Uuid::new_v4().to_string(), shareable_metadata())).unwrap();
+            outbox
+                .append(&created(&Uuid::new_v4().to_string(), shareable_metadata()))
+                .unwrap();
         }
         let report = drain_once(&outbox, &mesh, "node-author").unwrap();
         assert_eq!(report.applied, 3);
@@ -495,9 +576,17 @@ mod tests {
         assert_eq!(report.applied, 0);
         assert!(!report.committed);
 
-        let path = mesh.root().join("ns").join("memories").join(format!("{id}.json"));
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
         assert!(!path.exists(), "the imported row must not be re-exported");
-        assert_eq!(outbox.pending().unwrap().len(), 0, "the skip is consumed, not retried");
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            0,
+            "the skip is consumed, not retried"
+        );
     }
 
     #[test]
@@ -525,16 +614,27 @@ mod tests {
         outbox.append(&entry).unwrap();
 
         drain_once(&outbox, &mesh, "node-author").unwrap();
-        let path = mesh.root().join("ns").join("procedures").join(format!("{id}.json"));
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("procedures")
+            .join(format!("{id}.json"));
         let text = std::fs::read_to_string(&path).expect("the definition file exists");
         let record: MeshRecord = serde_json::from_str(&text).unwrap();
 
         assert_eq!(record.memory_type, "procedure");
         let def = record.content;
         assert_eq!(def["trigger"], json!("before-edit"));
-        assert_eq!(def["remaining_fires_initial"], json!(5), "the initial budget is the definition's");
+        assert_eq!(
+            def["remaining_fires_initial"],
+            json!(5),
+            "the initial budget is the definition's"
+        );
         assert_eq!(def["valid_to"], json!(1_800_000_000_i64));
-        assert_eq!(def["rehearsal_script"], json!("when editing, run the formatter"));
+        assert_eq!(
+            def["rehearsal_script"],
+            json!("when editing, run the formatter")
+        );
 
         // The runtime counters never leave the node — in the definition object
         // OR anywhere in the serialised record.
@@ -542,20 +642,35 @@ mod tests {
         assert!(def.get("performance_count").is_none());
         assert!(def.get("last_performed_at").is_none());
         assert!(def.get("last_episodic_pointer").is_none());
-        assert!(!text.contains("performance_count"), "counters must not leak: {text}");
-        assert!(!text.contains("last_performed_at"), "counters must not leak: {text}");
+        assert!(
+            !text.contains("performance_count"),
+            "counters must not leak: {text}"
+        );
+        assert!(
+            !text.contains("last_performed_at"),
+            "counters must not leak: {text}"
+        );
     }
 
     #[test]
     fn an_unreachable_remote_does_not_stop_the_drain() {
-        let (mesh, outbox) = fixture("unreachable", Some("https://unreachable.invalid/team/mesh.git"));
+        let (mesh, outbox) = fixture(
+            "unreachable",
+            Some("https://unreachable.invalid/team/mesh.git"),
+        );
         let id = Uuid::new_v4();
-        outbox.append(&created(&id.to_string(), shareable_metadata())).unwrap();
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
 
         let report = drain_once(&outbox, &mesh, "node-author").unwrap();
         assert_eq!(report.applied, 1, "the worker never touches the network");
         assert!(report.committed);
-        let path = mesh.root().join("ns").join("memories").join(format!("{id}.json"));
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
         assert!(path.exists());
     }
 
@@ -564,15 +679,30 @@ mod tests {
         let (mesh, outbox) = fixture("eligibility", None);
 
         let shareable_id = Uuid::new_v4();
-        outbox.append(&created(&shareable_id.to_string(), json!({ "eligibility": "shareable" }))).unwrap();
+        outbox
+            .append(&created(
+                &shareable_id.to_string(),
+                json!({ "eligibility": "shareable" }),
+            ))
+            .unwrap();
         let private_id = Uuid::new_v4();
-        outbox.append(&created(&private_id.to_string(), json!({ "eligibility": "private" }))).unwrap();
+        outbox
+            .append(&created(
+                &private_id.to_string(),
+                json!({ "eligibility": "private" }),
+            ))
+            .unwrap();
         let absent_id = Uuid::new_v4();
-        outbox.append(&created(&absent_id.to_string(), json!({}))).unwrap();
+        outbox
+            .append(&created(&absent_id.to_string(), json!({})))
+            .unwrap();
 
         let report = drain_once(&outbox, &mesh, "node-author").unwrap();
         assert_eq!(report.applied, 1, "only the shareable record is written");
-        assert_eq!(report.skipped, 2, "private and absent-eligibility are skipped");
+        assert_eq!(
+            report.skipped, 2,
+            "private and absent-eligibility are skipped"
+        );
         assert!(report.committed);
 
         let dir = mesh.root().join("ns").join("memories");
@@ -600,8 +730,13 @@ mod tests {
         outbox.append(&entry).unwrap();
 
         drain_once(&outbox, &mesh, "node-author").unwrap();
-        let path = mesh.root().join("ns").join("memories").join(format!("{old_id}.json"));
-        let record: MeshRecord = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{old_id}.json"));
+        let record: MeshRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(record.lifecycle.state, LifecycleState::Superseded);
         assert_eq!(record.lifecycle.superseded_by, Some(new_id));
     }
@@ -624,10 +759,75 @@ mod tests {
         outbox.append(&entry).unwrap();
 
         drain_once(&outbox, &mesh, "node-author").unwrap();
-        let path = mesh.root().join("ns").join("memories").join(format!("{id}.json"));
-        let record: MeshRecord = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let record: MeshRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(record.lifecycle.state, LifecycleState::Archived);
         assert!(record.lifecycle.archived_at.is_some());
+    }
+
+    #[test]
+    fn a_file_rename_fault_keeps_the_entry_pending_until_the_fault_clears() {
+        let (mesh, outbox) = fixture("rename-fault", None);
+        let id = Uuid::new_v4();
+        let entry = created(&id.to_string(), shareable_metadata());
+        outbox.append(&entry).unwrap();
+        let before = git_count_or_zero(mesh.root());
+
+        // Fault: pre-create the record's target path as a DIRECTORY, so the
+        // tmp->rename step of the file write fails (rename(2) cannot replace
+        // a directory with a file). Everything before the rename succeeds:
+        // the entry is read, classified, the tmp JSON is written.
+        let dir = mesh.root().join("ns").join("memories");
+        let target = dir.join(format!("{id}.json"));
+        std::fs::create_dir_all(&target).unwrap();
+
+        let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
+        assert!(
+            err.contains("rename"),
+            "the failure must be the tmp->rename step, not an earlier stage: {err}"
+        );
+
+        // Ordering — the WAL compaction must NOT have run: the entry stays
+        // pending, and no git commit was authored for a batch that failed.
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "mark_committed must not be reached"
+        );
+        assert_eq!(
+            git_count_or_zero(mesh.root()),
+            before,
+            "no commit when the file step fails"
+        );
+        assert!(!target.is_file(), "the record file never landed");
+
+        // The fault clears: the next drain applies cleanly — the pending
+        // entry is replayed, exactly one mesh file exists, exactly one commit.
+        std::fs::remove_dir(&target).unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.committed);
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            0,
+            "the drain consumed the entry"
+        );
+        assert_eq!(
+            git_count(mesh.root()),
+            before + 1,
+            "exactly one commit was authored"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "exactly one file in the dir"
+        );
+        assert!(target.is_file());
     }
 
     #[test]
@@ -636,7 +836,9 @@ mod tests {
         let id = Uuid::new_v4();
 
         // Create, then archive the same record.
-        outbox.append(&created(&id.to_string(), shareable_metadata())).unwrap();
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
 
         let archive = OutboxEntry {
@@ -653,8 +855,13 @@ mod tests {
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
 
-        let path = mesh.root().join("ns").join("memories").join(format!("{id}.json"));
-        let record: MeshRecord = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let record: MeshRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(record.lifecycle.state, LifecycleState::Archived);
         assert_eq!(
             record.lifecycle.created_at,
@@ -662,6 +869,9 @@ mod tests {
             "created_at does not drift across a lifecycle transition"
         );
         assert_eq!(record.lifecycle.created_by, "node-author");
-        assert_eq!(record.origin_mesh_epoch, 1, "origin epoch is preserved across transitions");
+        assert_eq!(
+            record.origin_mesh_epoch, 1,
+            "origin epoch is preserved across transitions"
+        );
     }
 }
