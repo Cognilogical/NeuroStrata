@@ -50,6 +50,14 @@ pub struct MeshPolicy {
     /// Whether the team has agreed to unattended mesh-repo compaction.
     /// Defaults to false — compaction is an explicit operator action.
     pub auto_compact: bool,
+    /// Consented cadence, in seconds, for the daemon's *periodic* mesh pull
+    /// (spec §"Triggers": "optionally consented periodic fetch at turn
+    /// boundary"). `None` (the default) means NO scheduled pulls: the daemon
+    /// only pulls on session start (best-effort, 5s timeout) and on explicit
+    /// `mesh pull` / pull-before-push. The field is serde-default so older
+    /// manifests without it stay readable (slice 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pull_interval_secs: Option<u64>,
 }
 
 /// Trust level for a record, especially a procedure. The trust spec mirrors
@@ -81,6 +89,7 @@ impl Default for MeshPolicy {
             imported_procedures_trust: Trust::Untrusted,
             allow_history_purge: false,
             auto_compact: false,
+            auto_pull_interval_secs: None,
         }
     }
 }
@@ -135,6 +144,32 @@ mod tests {
         assert_eq!(p.imported_procedures_trust, Trust::Untrusted);
         assert!(!p.allow_history_purge);
         assert!(!p.auto_compact);
+        // Periodic FETCH is a consented trigger (spec §"Triggers"): absent
+        // consent the daemon must not schedule pulls on its own.
+        assert_eq!(p.auto_pull_interval_secs, None);
+    }
+
+    #[test]
+    fn auto_pull_interval_is_serde_default_and_optional() {
+        // An OLD manifest (no field) deserializes fine, and a manifest WITH
+        // the field round-trips it — slice 8 daemons reading slice 7
+        // manifests and vice versa must both hold.
+        let old = r#"{
+            "require_record_eligibility": true,
+            "imported_procedures_trust": "untrusted",
+            "allow_history_purge": false,
+            "auto_compact": false
+        }"#;
+        let policy: MeshPolicy = serde_json::from_str(old).expect("old policy parses");
+        assert_eq!(policy, MeshPolicy::default(), "missing field == default");
+
+        let consented = MeshPolicy {
+            auto_pull_interval_secs: Some(600),
+            ..MeshPolicy::default()
+        };
+        let json = serde_json::to_string(&consented).expect("serializes");
+        let back: MeshPolicy = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back.auto_pull_interval_secs, Some(600));
     }
 
     #[test]
