@@ -22,6 +22,10 @@ The 1.8.0 release layers two more organs on top of that base: a **Thalamic Bus**
 
 ---
 
+## 🆕 What's New in 1.9.0
+
+**SynapticMesh — team sharing over plain git.** Every shareable memory your agents learn can travel to teammates' agents on other machines: a durable outbox + mesh-worker publishes wire-format records into a per-mesh git repo; pulls are validated *before* they touch the store — lifecycle merge table, conflicts preserved (integration pauses loudly rather than dropping either side), private rows sovereign, procedure definitions travel **without** their runtime counters, imported procedures are untrusted until promoted. Full walkthrough in the [🕸️ SynapticMesh (Mesh Sharing for Teams)](#-synapticmesh-mesh-sharing-for-teams) section below.
+
 ## 🆕 What's New in 1.8.0
 
 * **Thalamic Bus (`src/events/`).** A bounded pub-sub backbone constructed in the daemon and threaded through `process_mcp_request`. Every memory mutation — `add`, `supersede`, `archive`, `task_complete` extraction — emits a typed `ThalamicPulse` (`Created`, `Superseded`, `Archived`, `GuardedActionFired`). Three subscribers run on the dispatcher: `EpisodicPointerEcho` writes the Continuous Backup Protocol line for every `Created`; `ExportFreshnessDirty` flips a per-namespace `freshness_flag` sentinel row on every mutation; `GuardEventLog` persists every `guard_validate` verdict as an audit row. Drop-oldest backpressure, 250ms per-subscriber timeout, panic-catcher, `RecursionToken` to keep a subscriber's own writes from re-triggering itself.
