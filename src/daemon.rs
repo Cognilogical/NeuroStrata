@@ -261,9 +261,7 @@ fn wire_mesh_publish(
             embedder,
         ));
     } else {
-        tracing::debug!(
-            "mesh policy has no auto_pull_interval_secs — no periodic pull scheduled"
-        );
+        tracing::debug!("mesh policy has no auto_pull_interval_secs — no periodic pull scheduled");
     }
 }
 
@@ -310,9 +308,7 @@ async fn session_start_mesh_pull(
     vector_store: Arc<dyn VectorStore>,
     embedder: Arc<dyn Embedder>,
 ) {
-    if let Some(report) =
-        pull_mesh_once(&project_root, &vector_store, &embedder).await
-    {
+    if let Some(report) = pull_mesh_once(&project_root, &vector_store, &embedder).await {
         eprintln!("mesh session-start pull: {report}");
         if report.starts_with("error:") {
             tracing::warn!("mesh session-start pull failed (non-blocking): {report}");
@@ -326,7 +322,12 @@ async fn session_start_mesh_pull(
 /// (immediately-due) interval tick is consumed, one throttled pull per
 /// cadence tick, every failure a log line. The cadence comes from the mesh
 /// manifest's `policy.auto_pull_interval_secs` — the "consented" part.
-async fn periodic_mesh_pull(project_root: PathBuf, interval: std::time::Duration, vector_store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>) {
+async fn periodic_mesh_pull(
+    project_root: PathBuf,
+    interval: std::time::Duration,
+    vector_store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await; // tokio intervals fire immediately; the startup pull already ran
@@ -354,7 +355,9 @@ fn auto_pull_interval(mesh_dir: &Path) -> Option<std::time::Duration> {
     }
 }
 
-fn auto_pull_interval_for_policy(policy: &crate::synaptic_mesh::manifest::MeshPolicy) -> Option<std::time::Duration> {
+fn auto_pull_interval_for_policy(
+    policy: &crate::synaptic_mesh::manifest::MeshPolicy,
+) -> Option<std::time::Duration> {
     policy
         .auto_pull_interval_secs
         .map(|secs| std::time::Duration::from_secs(secs.max(60)))
