@@ -44,7 +44,10 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::conflict::{self, ConflictKind};
-use super::record::{LifecycleState, MeshRecord, MESH_RECORD_SCHEMA_VERSION};
+use super::manifest::Trust;
+use super::record::{
+    Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
+};
 use super::storage::MeshStorage;
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
 
@@ -94,6 +97,11 @@ pub struct ApplyReport {
     pub conflicted: usize,
     /// The ids registered as unresolved conflicts this pass.
     pub conflicted_ids: Vec<String>,
+    /// `archive + content edit` combinations applied this pass — the edited
+    /// content was kept but the record stayed archived. Reported (spec
+    /// §"Concurrent merge policy": "report combination"), never resolved by
+    /// timestamp.
+    pub combinations: Vec<String>,
 }
 
 /// Where the accepted-head cursor lives for a mesh checkout: a sibling
@@ -232,10 +240,7 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
         out.push_str(&format!(" ids {}", report.applied_ids.join(", ")));
     }
     if !report.conflicted_ids.is_empty() {
-        out.push_str(&format!(
-            " conflicted {}",
-            report.conflicted_ids.join(", ")
-        ));
+        out.push_str(&format!(" conflicted {}", report.conflicted_ids.join(", ")));
     }
     if report.full_tree {
         out.push_str(" (full-tree reconciliation — no usable accepted-head cursor)");
@@ -250,8 +255,13 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
     if report.ignored.len() > 5 {
         out.push_str(&format!("\n  … {} more ignored", report.ignored.len() - 5));
     }
+    for line in report.combinations.iter() {
+        out.push_str(&format!("\n  combined: {line}"));
+    }
     if report.conflicted > 0 {
-        out.push_str("\n  (integration paused at conflicting ids — resolve in the mesh, then pull again)");
+        out.push_str(
+            "\n  (integration paused at conflicting ids — resolve in the mesh, then pull again)",
+        );
     }
     out
 }
@@ -317,6 +327,7 @@ pub async fn apply_changed(
         applied_ids: Vec::new(),
         conflicted: 0,
         conflicted_ids: Vec::new(),
+        combinations: Vec::new(),
     };
 
     // Divergence detection (documented cursor strategy, §"Concurrent merge
@@ -355,12 +366,25 @@ pub async fn apply_changed(
                 continue;
             }
         };
-        match apply_one(root, &mesh_id, &candidate, record, store.clone(), emb.clone(), concurrent)
-            .await
+        match apply_one(
+            root,
+            &mesh_id,
+            &candidate,
+            record,
+            store.clone(),
+            emb.clone(),
+            concurrent,
+        )
+        .await
         {
             Disposition::Applied => {
                 report.applied += 1;
                 report.applied_ids.push(candidate.file_stem.clone());
+            }
+            Disposition::AppliedCombination(reason) => {
+                report.applied += 1;
+                report.applied_ids.push(candidate.file_stem.clone());
+                report.combinations.push(format!("{rel}: {reason}"));
             }
             Disposition::Skipped => report.skipped_update_id += 1,
             Disposition::Ignored(reason) => {
@@ -667,6 +691,9 @@ pub fn mesh_update_id_of(metadata: &Value) -> Option<String> {
 #[derive(Debug, Clone, PartialEq)]
 enum Disposition {
     Applied,
+    /// `archive + edit` combination applied (edited content kept, record
+    /// archived). Carries the reported combination reason.
+    AppliedCombination(String),
     Skipped,
     Ignored(String),
     /// Unresolved concurrent conflict: the candidate was preserved in the
@@ -698,18 +725,23 @@ enum MergeDecision {
     Refuse(String),
     /// Unresolved concurrent merge: preserve the candidate, suppress the id.
     Conflict(&'static str),
-    /// Resolved (a replacement is authoritative) but the losing candidate is
-    /// preserved in the overlay for audit; nothing is suppressed.
-    PreserveVariant(&'static str),
+    /// `supersede + content edit`: the replacement is authoritative, but the
+    /// losing edit is preserved as a NEW record referencing the retired id —
+    /// never dropped (spec §"Concurrent merge policy").
+    SupersedeWinsPreserveEdit,
 }
 
 /// Classify one candidate against the current (mesh-owned) row.
 ///
 /// `local_state`/`local_superseded_by`/`local_content` describe the row the
 /// replay already accepted; `cand` is the incoming committed record.
-/// `concurrent` is true only on the full-tree reconciliation path (the
-/// spec's "divergent ancestry / rewritten history" trigger) — see the caller
-/// in [`apply_changed`] for why the diff path is never concurrent.
+/// `concurrent` is true only when the two versions are genuinely divergent
+/// (the spec's "divergent ancestry" trigger) — see the caller in
+/// [`apply_changed`] for why the diff path is never concurrent.
+///
+/// The retirement rules (tombstone wins, superseded wins, no reactivation)
+/// key off [`LifecycleState::is_terminal`] and [`LifecycleState::can_transition_to`],
+/// which are the single gate every applied lifecycle change passes through.
 fn classify_merge(
     local_state: LifecycleState,
     local_superseded_by: Option<Uuid>,
@@ -722,17 +754,23 @@ fn classify_merge(
     let cand_sup = cand.lifecycle.superseded_by;
     let content_changed = local_content != content_text(cand);
 
-    match local_state {
-        // Tombstone is terminal: it always wins, and the deleted content is
-        // never re-served (nor retained in a conflict artifact).
-        Tombstoned => match cand_state {
+    // Tombstone is terminal: deletion wins over every stale update, and the
+    // deleted content is never re-served nor retained in a conflict artifact.
+    if local_state.is_terminal() {
+        return match cand_state {
             Tombstoned => MergeDecision::Skip,
-            _ => MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string()),
-        },
-        // Superseded is a retired id: it never reactivates. A stale restore
-        // or edit is rejected; a second, different replacement is an
-        // unresolved conflict (never picked by timestamp).
-        Superseded => match cand_state {
+            _ => {
+                MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string())
+            }
+        };
+    }
+
+    // A retired (superseded) id never reactivates — can_transition_to refuses
+    // every superseded -> live hop. The merge table's supersede rows branch
+    // from this one gate.
+    if local_state == Superseded {
+        return match cand_state {
+            // Tombstone wins even over a retired id.
             Tombstoned => MergeDecision::Apply,
             Superseded => {
                 if cand_sup != local_superseded_by {
@@ -741,54 +779,61 @@ fn classify_merge(
                     MergeDecision::Skip
                 }
             }
-            Active if content_changed => {
-                MergeDecision::PreserveVariant("supersede + edit; replacement authoritative")
-            }
+            // supersede + content edit: replacement authoritative; the losing
+            // edit is preserved as a new record (handled by the caller).
+            Active if content_changed => MergeDecision::SupersedeWinsPreserveEdit,
+            // restore (or archive) of a retired id is refused, never stomped.
             _ => MergeDecision::Refuse("superseded; rejected stale restore".to_string()),
-        },
-        Active => match cand_state {
-            Tombstoned => MergeDecision::Apply,
-            Superseded => MergeDecision::Apply,
-            Active => {
-                if content_changed {
-                    if concurrent {
-                        MergeDecision::Conflict("incompatible content edits")
-                    } else {
-                        MergeDecision::Apply
-                    }
-                } else {
-                    MergeDecision::Skip
-                }
-            }
-            Archived => {
-                if content_changed {
-                    MergeDecision::ApplyCombination(
-                        "archive + edit; edited content stays archived",
-                    )
-                } else if concurrent {
-                    MergeDecision::Conflict("restore + archive")
-                } else {
-                    MergeDecision::Apply
-                }
-            }
-        },
-        Archived => match cand_state {
-            Tombstoned => MergeDecision::Apply,
-            Superseded => MergeDecision::Apply,
-            Active => {
-                if content_changed {
-                    MergeDecision::ApplyCombination(
-                        "archive + edit; edited content stays archived",
-                    )
-                } else if concurrent {
-                    MergeDecision::Conflict("restore + archive")
-                } else {
-                    MergeDecision::Apply
-                }
-            }
-            Archived => MergeDecision::Skip,
-        },
+        };
     }
+
+    // Incoming tombstone always wins over a live row.
+    if cand_state == Tombstoned {
+        return MergeDecision::Apply;
+    }
+
+    // Live -> superseded is always legal.
+    if cand_state == Superseded {
+        // supersede + content edit (reverse direction): the incoming
+        // supersession is authoritative, the local edit is preserved as a new
+        // record.
+        if local_state == Active && content_changed {
+            return MergeDecision::SupersedeWinsPreserveEdit;
+        }
+        return MergeDecision::Apply;
+    }
+
+    // Both live (active/archived): gate the state change through the spec
+    // transition table, then overlay the merge-table combinations.
+    if cand_state != local_state {
+        if content_changed {
+            return MergeDecision::ApplyCombination(
+                "archive + edit; edited content stays archived",
+            );
+        }
+        // Same content, one side archived and the other restored: the spec's
+        // "restore + archive" pair — unresolved only when concurrent.
+        if concurrent {
+            return MergeDecision::Conflict("restore + archive");
+        }
+        // The single gate every applied lifecycle change passes through.
+        return if local_state.can_transition_to(cand_state) {
+            MergeDecision::Apply
+        } else {
+            MergeDecision::Refuse(format!("illegal transition {local_state} -> {cand_state}"))
+        };
+    }
+
+    // Same live state: a content change is a forward edit (apply) or, when
+    // the two versions diverged, an incompatible-edit conflict.
+    if content_changed {
+        return if concurrent {
+            MergeDecision::Conflict("incompatible content edits")
+        } else {
+            MergeDecision::Apply
+        };
+    }
+    MergeDecision::Skip
 }
 
 /// The current lifecycle state of a mesh-owned row, read from its
@@ -811,10 +856,18 @@ fn local_mesh_state(metadata: &Value) -> Option<(LifecycleState, Option<Uuid>)> 
         .get("superseded_by")
         .and_then(Value::as_str)
         .and_then(|u| Uuid::parse_str(u).ok());
-    if metadata.get("tombstoned").and_then(Value::as_bool).unwrap_or(false) {
+    if metadata
+        .get("tombstoned")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Some((LifecycleState::Tombstoned, superseded_by));
     }
-    if metadata.get("archived").and_then(Value::as_bool).unwrap_or(false) {
+    if metadata
+        .get("archived")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Some((LifecycleState::Archived, superseded_by));
     }
     if superseded_by.is_some() {
@@ -882,7 +935,10 @@ fn apply_lifecycle_markers(
             );
         }
         LifecycleState::Superseded => {
-            metadata.insert("superseded_by".to_string(), json!(superseded_by.map(|u| u.to_string())));
+            metadata.insert(
+                "superseded_by".to_string(),
+                json!(superseded_by.map(|u| u.to_string())),
+            );
         }
         _ => {}
     }
@@ -925,7 +981,9 @@ async fn annotate_conflicting(
         location_lines: payload.location_lines.clone(),
         metadata: Value::Object(metadata),
     };
-    store.upsert(namespace, id, vector.to_vec(), new_payload).await
+    store
+        .upsert(namespace, id, vector.to_vec(), new_payload)
+        .await
 }
 
 /// How a candidate should be materialised into a row.
@@ -975,8 +1033,7 @@ async fn apply_one(
             }
             // Mesh-owned row at another revision: gate the transition.
             Some(_) => {
-                let Some((local_state, local_superseded_by)) =
-                    local_mesh_state(&payload.metadata)
+                let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata)
                 else {
                     return Disposition::Ignored(format!(
                         "mesh row {id} has unreadable lifecycle provenance"
@@ -1020,27 +1077,21 @@ async fn apply_one(
                         }
                         return Disposition::Conflicted(id);
                     }
-                    MergeDecision::PreserveVariant(reason) => {
-                        // Replacement authoritative: keep the superseded row
-                        // as-is; preserve the losing candidate for audit.
-                        if let Err(e) = conflict::register_conflict(
+                    MergeDecision::SupersedeWinsPreserveEdit => {
+                        return preserve_superseded_edit(
                             root,
-                            &namespace,
+                            mesh_id,
                             &id,
-                            &record.update_id.to_string(),
-                            reason,
-                            ConflictKind::Preserved,
+                            &namespace,
+                            local_state,
+                            &payload,
                             &record,
-                        ) {
-                            return Disposition::Ignored(format!(
-                                "variant preserve failed for {id}: {e}"
-                            ));
-                        }
-                        return Disposition::Ignored(format!(
-                            "{id}: {reason} (edit candidate preserved)"
-                        ));
+                            store,
+                            emb,
+                        )
+                        .await;
                     }
-                    MergeDecision::ApplyCombination(_reason) => {
+                    MergeDecision::ApplyCombination(reason) => {
                         // Edited content stays archived. The edited content
                         // is whichever side is ACTIVE (they edited; we
                         // archived, or vice-versa).
@@ -1049,7 +1100,7 @@ async fn apply_one(
                         } else {
                             payload.content.clone()
                         };
-                        return apply_effective(
+                        return match apply_effective(
                             root,
                             mesh_id,
                             &id,
@@ -1059,7 +1110,13 @@ async fn apply_one(
                             emb,
                             ApplyShape::ArchivedCombination { edited },
                         )
-                        .await;
+                        .await
+                        {
+                            Disposition::Applied => {
+                                Disposition::AppliedCombination(reason.to_string())
+                            }
+                            other => other,
+                        };
                     }
                     MergeDecision::Apply => {}
                 }
@@ -1161,6 +1218,125 @@ async fn apply_effective(
     // row is no longer suppressed).
     let _ = conflict::clear_conflict(root, namespace, id);
     Disposition::Applied
+}
+
+/// `supersede + content edit` (spec §"Concurrent merge policy"): the
+/// replacement is authoritative — X ends (or stays) superseded — and the
+/// losing edit becomes a NEW record referencing X, never dropped.
+///
+/// Direction A (`local_state == Superseded`, candidate is the edit): X stays
+/// superseded as-is and the candidate becomes the new record. Direction B
+/// (local is the edit, candidate supersedes): the supersession applies to X
+/// and the local edit becomes the new record.
+async fn preserve_superseded_edit(
+    root: &Path,
+    mesh_id: &str,
+    id: &str,
+    namespace: &str,
+    local_state: LifecycleState,
+    local_payload: &MemoryPayload,
+    cand: &MeshRecord,
+    store: std::sync::Arc<dyn VectorStore>,
+    emb: std::sync::Arc<dyn Embedder>,
+) -> Disposition {
+    // Which side holds the edit, and must the incoming supersession apply?
+    let (content, memory_type, created_by, source_rels, apply_supersession) =
+        if local_state == LifecycleState::Superseded {
+            // The incoming candidate is the edit; X is already superseded.
+            (
+                cand.content.clone(),
+                cand.memory_type.clone(),
+                cand.lifecycle.created_by.clone(),
+                cand.relationships.clone(),
+                false,
+            )
+        } else {
+            // The local row is the edit; apply the incoming supersession.
+            (
+                json!({ "text": local_payload.content.clone() }),
+                local_payload.memory_type.clone(),
+                local_origin(local_payload),
+                Vec::new(),
+                true,
+            )
+        };
+
+    if apply_supersession {
+        match apply_effective(
+            root,
+            mesh_id,
+            id,
+            namespace,
+            cand,
+            store.clone(),
+            emb.clone(),
+            ApplyShape::AsCandidate,
+        )
+        .await
+        {
+            Disposition::Applied => {}
+            other => return other,
+        }
+    }
+
+    // The new record references the retired id (spec: `relationships:
+    // [{kind: "references", target: original_id}]`), surfaced in metadata
+    // too so the linkage is visible on the store row.
+    let mut rels = source_rels;
+    if let Ok(original_id) = Uuid::parse_str(id) {
+        rels.push(Relationship {
+            kind: "references".to_string(),
+            target: original_id,
+        });
+    }
+    let new_record = MeshRecord {
+        schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+        id: Uuid::new_v4(),
+        namespace: namespace.to_string(),
+        memory_type,
+        lifecycle: Lifecycle {
+            state: LifecycleState::Active,
+            created_at: chrono::Utc::now(),
+            created_by,
+            superseded_by: None,
+            archived_at: None,
+            tombstoned_at: None,
+        },
+        content,
+        metadata: json!({
+            "eligibility": "shareable",
+            "trust": "untrusted",
+            "references": [id],
+        }),
+        relationships: rels,
+        update_id: Uuid::new_v4(),
+        origin_mesh_epoch: cand.origin_mesh_epoch,
+        trust: Trust::Untrusted,
+    };
+    let new_id = new_record.id.to_string();
+    apply_effective(
+        root,
+        mesh_id,
+        &new_id,
+        namespace,
+        &new_record,
+        store,
+        emb,
+        ApplyShape::AsCandidate,
+    )
+    .await
+}
+
+/// The origin node of an already-applied row (its `metadata.mesh.origin`),
+/// used as the `created_by` of a preserved-edit record.
+fn local_origin(payload: &MemoryPayload) -> String {
+    payload
+        .metadata
+        .get("mesh")
+        .and_then(|m| m.get("origin"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
@@ -1987,6 +2163,464 @@ mod tests {
         assert!(
             out.starts_with("no mesh joined"),
             "canonical no-mesh answer required, got: {out}"
+        );
+    }
+
+    // ---- slice 6: lifecycle gate + concurrent merge table ----------------
+    //
+    // The merge table is `docs/…/2026-10-10-synaptic-mesh-design.md`
+    // §"Concurrent merge policy". Every row gets a test; classify_merge is a
+    // pure function so the table is exercised directly, and the lifecycle
+    // gate (tombstone wins / retired ids never reactivate / supersede
+    // authoritative) is additionally proven end-to-end through apply_changed.
+
+    /// Build a [`MeshRecord`] directly for the pure-function table tests.
+    fn record_at(
+        id: Uuid,
+        state: LifecycleState,
+        superseded_by: Option<Uuid>,
+        text: &str,
+    ) -> MeshRecord {
+        MeshRecord {
+            schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+            id,
+            namespace: "probe".to_string(),
+            memory_type: "rule".to_string(),
+            lifecycle: Lifecycle {
+                state,
+                created_at: chrono::Utc::now(),
+                created_by: "node-peer-1".to_string(),
+                superseded_by,
+                archived_at: None,
+                tombstoned_at: None,
+            },
+            content: json!({ "text": text }),
+            metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            relationships: vec![],
+            update_id: Uuid::new_v4(),
+            origin_mesh_epoch: 1,
+            trust: Trust::Untrusted,
+        }
+    }
+
+    /// Build a record JSON with an explicit lifecycle state + `superseded_by`,
+    /// for committing through the mesh in the end-to-end tests.
+    fn record_with_state(id: Uuid, state: &str, superseded_by: Option<Uuid>, text: &str) -> Value {
+        json!({
+            "schema_version": "synaptic-mesh-record/v1",
+            "id": id.to_string(),
+            "namespace": "probe",
+            "memory_type": "rule",
+            "lifecycle": {
+                "state": state,
+                "created_at": "2026-10-11T00:00:00Z",
+                "created_by": "node-peer-1",
+                "superseded_by": superseded_by.map(|u| json!(u.to_string())).unwrap_or(Value::Null),
+                "archived_at": Value::Null,
+                "tombstoned_at": Value::Null
+            },
+            "content": {"text": text},
+            "metadata": {"eligibility": "shareable", "trust": "untrusted"},
+            "relationships": [],
+            "update_id": Uuid::new_v4().to_string(),
+            "origin_mesh_epoch": 1,
+            "trust": "untrusted"
+        })
+    }
+
+    /// Row 1 — `archive + content edit`: edited content stays archived; the
+    /// combination is reported, never resolved by timestamp.
+    #[test]
+    fn merge_table_row_archive_plus_edit_keeps_edited_content_archived() {
+        let id = Uuid::new_v4();
+        let cand = record_at(id, LifecycleState::Archived, None, "edited content");
+        assert_eq!(
+            classify_merge(LifecycleState::Active, None, "original", &cand, true),
+            MergeDecision::ApplyCombination("archive + edit; edited content stays archived")
+        );
+        // The reverse direction (we archived, they edited) resolves the same.
+        let cand2 = record_at(id, LifecycleState::Active, None, "edited content");
+        assert_eq!(
+            classify_merge(LifecycleState::Archived, None, "original", &cand2, true),
+            MergeDecision::ApplyCombination("archive + edit; edited content stays archived")
+        );
+    }
+
+    /// Row 2 — `restore + archive`: unresolved; keep inactive pending explicit
+    /// resolution.
+    #[test]
+    fn merge_table_row_restore_plus_archive_is_unresolved() {
+        let id = Uuid::new_v4();
+        let cand = record_at(id, LifecycleState::Archived, None, "same content");
+        assert_eq!(
+            classify_merge(LifecycleState::Active, None, "same content", &cand, true),
+            MergeDecision::Conflict("restore + archive")
+        );
+        let cand2 = record_at(id, LifecycleState::Active, None, "same content");
+        assert_eq!(
+            classify_merge(LifecycleState::Archived, None, "same content", &cand2, true),
+            MergeDecision::Conflict("restore + archive")
+        );
+        // Non-concurrent (linear) restore/archive is a plain forward apply.
+        assert_eq!(
+            classify_merge(LifecycleState::Active, None, "same content", &cand, false),
+            MergeDecision::Apply
+        );
+    }
+
+    /// Row 3 — `supersede + stale restore`: superseded wins; the restore is
+    /// refused and reported, never stomped.
+    #[test]
+    fn merge_table_row_supersede_beats_stale_restore() {
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+        let cand = record_at(id, LifecycleState::Active, None, "original");
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Superseded,
+                Some(replacement),
+                "original",
+                &cand,
+                true
+            ),
+            MergeDecision::Refuse("superseded; rejected stale restore".to_string())
+        );
+    }
+
+    /// Row 4 — `supersede + content edit`: replacement authoritative; the edit
+    /// is preserved as a new record referencing the retired id.
+    #[test]
+    fn merge_table_row_supersede_plus_edit_preserves_edit_as_new_record() {
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+        // Direction A: we superseded, the candidate is the edit.
+        let cand = record_at(id, LifecycleState::Active, None, "edited content");
+        assert_eq!(
+            classify_merge(
+                LifecycleState::Superseded,
+                Some(replacement),
+                "original",
+                &cand,
+                true
+            ),
+            MergeDecision::SupersedeWinsPreserveEdit
+        );
+        // Direction B: we edited, the candidate is the supersession.
+        let cand2 = record_at(
+            id,
+            LifecycleState::Superseded,
+            Some(replacement),
+            "original",
+        );
+        assert_eq!(
+            classify_merge(LifecycleState::Active, None, "edited content", &cand2, true),
+            MergeDecision::SupersedeWinsPreserveEdit
+        );
+    }
+
+    /// Row 5 — `two different replacements` (X→Y vs X→Z): unresolved; never
+    /// pick by timestamp; preserve both candidates.
+    #[test]
+    fn merge_table_row_two_different_replacements_is_unresolved() {
+        let id = Uuid::new_v4();
+        let y = Uuid::new_v4();
+        let z = Uuid::new_v4();
+        let cand = record_at(id, LifecycleState::Superseded, Some(z), "original");
+        assert_eq!(
+            classify_merge(LifecycleState::Superseded, Some(y), "original", &cand, true),
+            MergeDecision::Conflict("two different replacements")
+        );
+        // The same replacement is idempotent, not a conflict.
+        let same = record_at(id, LifecycleState::Superseded, Some(y), "original");
+        assert_eq!(
+            classify_merge(LifecycleState::Superseded, Some(y), "original", &same, true),
+            MergeDecision::Skip
+        );
+    }
+
+    /// Row 6 — `incompatible content edits`: unresolved when concurrent;
+    /// preserve both versions.
+    #[test]
+    fn merge_table_row_incompatible_content_edits_is_unresolved() {
+        let id = Uuid::new_v4();
+        let cand = record_at(id, LifecycleState::Active, None, "their edit");
+        assert_eq!(
+            classify_merge(LifecycleState::Active, None, "our edit", &cand, true),
+            MergeDecision::Conflict("incompatible content edits")
+        );
+        // A non-concurrent (linear) edit is a plain forward apply.
+        assert_eq!(
+            classify_merge(LifecycleState::Active, None, "our edit", &cand, false),
+            MergeDecision::Apply
+        );
+    }
+
+    /// Row 7 — `tombstone + edit/restore`: tombstone wins; never serve
+    /// deleted content.
+    #[test]
+    fn merge_table_row_tombstone_always_wins() {
+        let id = Uuid::new_v4();
+        let edit = record_at(id, LifecycleState::Active, None, "edited after delete");
+        assert_eq!(
+            classify_merge(LifecycleState::Tombstoned, None, "", &edit, true),
+            MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string())
+        );
+        let restore = record_at(id, LifecycleState::Archived, None, "original");
+        assert_eq!(
+            classify_merge(LifecycleState::Tombstoned, None, "", &restore, false),
+            MergeDecision::Refuse("tombstone wins; deleted content is never served".to_string())
+        );
+        // An incoming tombstone over a live row applies.
+        let tomb = record_at(id, LifecycleState::Tombstoned, None, "original");
+        assert_eq!(
+            classify_merge(LifecycleState::Active, None, "original", &tomb, true),
+            MergeDecision::Apply
+        );
+        assert_eq!(
+            classify_merge(LifecycleState::Archived, None, "original", &tomb, false),
+            MergeDecision::Apply
+        );
+    }
+
+    /// Retired ids (superseded/tombstoned) never reactivate — the gate refuses
+    /// any superseded/tombstoned -> live hop.
+    #[test]
+    fn retired_id_reactivation_is_refused() {
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+        let active = record_at(id, LifecycleState::Active, None, "original");
+        assert!(
+            matches!(
+                classify_merge(
+                    LifecycleState::Superseded,
+                    Some(replacement),
+                    "original",
+                    &active,
+                    false
+                ),
+                MergeDecision::Refuse(_)
+            ),
+            "superseded -> active refused"
+        );
+        let archived = record_at(id, LifecycleState::Archived, None, "original");
+        assert!(
+            matches!(
+                classify_merge(
+                    LifecycleState::Superseded,
+                    Some(replacement),
+                    "original",
+                    &archived,
+                    false
+                ),
+                MergeDecision::Refuse(_)
+            ),
+            "superseded -> archived refused"
+        );
+        assert!(
+            matches!(
+                classify_merge(LifecycleState::Tombstoned, None, "original", &active, false),
+                MergeDecision::Refuse(_)
+            ),
+            "tombstoned -> active refused"
+        );
+    }
+
+    /// End-to-end: a tombstone always wins and a retired id never resurrects —
+    /// the resurrection candidate is refused and reported, never stomped.
+    #[tokio::test]
+    async fn tombstone_never_resurrects_end_to_end() {
+        let (_base, mesh) = mesh_with_commit("tombstone-e2e");
+        let id = Uuid::new_v4();
+        let served = ["probe".to_string()];
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&record_with_state(id, "active", None, "original")).unwrap(),
+        );
+        let store = fresh_store("tombstone-e2e").await;
+        assert_eq!(
+            apply_changed(&mesh, &served, store.clone(), emb())
+                .await
+                .unwrap()
+                .applied,
+            1
+        );
+
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&record_with_state(id, "tombstoned", None, "original")).unwrap(),
+        );
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(second.applied, 1, "tombstone applies: {second:?}");
+        let (_, row) = store.get("probe", &id.to_string()).await.unwrap().unwrap();
+        assert_eq!(row.metadata["tombstoned"], json!(true));
+
+        // Resurrection attempt.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&record_with_state(id, "active", None, "zombie")).unwrap(),
+        );
+        let third = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(third.applied, 0, "resurrection never applies: {third:?}");
+        assert!(
+            third.ignored.iter().any(|i| i.contains("tombstone")),
+            "refused and reported: {:?}",
+            third.ignored
+        );
+        let (_, row) = store.get("probe", &id.to_string()).await.unwrap().unwrap();
+        assert_eq!(row.metadata["tombstoned"], json!(true), "still tombstoned");
+        assert_eq!(row.content, "original", "deleted content never re-served");
+    }
+
+    /// End-to-end: `supersede + content edit` keeps the replacement
+    /// authoritative AND preserves the losing edit as a NEW record referencing
+    /// the retired id — never dropped.
+    #[tokio::test]
+    async fn supersede_plus_edit_preserves_edit_as_new_record_end_to_end() {
+        let (_base, mesh) = mesh_with_commit("supersede-edit-e2e");
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+        let served = ["probe".to_string()];
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&record_with_state(
+                id,
+                "superseded",
+                Some(replacement),
+                "original",
+            ))
+            .unwrap(),
+        );
+        let store = fresh_store("supersede-edit-e2e").await;
+        assert_eq!(
+            apply_changed(&mesh, &served, store.clone(), emb())
+                .await
+                .unwrap()
+                .applied,
+            1
+        );
+
+        // The peer's concurrent edit arrives.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&record_with_state(id, "active", None, "edited content"))
+                .unwrap(),
+        );
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(
+            second.applied, 1,
+            "the edit is preserved as a new record: {second:?}"
+        );
+
+        // X stays superseded.
+        let (_, x) = store.get("probe", &id.to_string()).await.unwrap().unwrap();
+        assert_eq!(x.metadata["mesh"]["lifecycle_state"], json!("superseded"));
+
+        // A new record Z exists with the edited content, referencing X.
+        let all = store.list("probe", None).await.unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "X superseded + preserved edit Z: {:?}",
+            all.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+        );
+        let z = all
+            .iter()
+            .find(|r| r.id != id.to_string())
+            .expect("the preserved edit record");
+        assert_eq!(z.payload.content, "edited content");
+        assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
+    }
+
+    /// No silent drop: an unresolved conflict keeps the accepted projection,
+    /// preserves the candidate durably outside the checkout, does NOT advance
+    /// the cursor (re-presented next pull), and never applies the losing
+    /// candidate.
+    #[tokio::test]
+    async fn conflict_is_never_silently_dropped() {
+        let (_base, mesh) = mesh_with_commit("conflict-nodrop");
+        let id = Uuid::new_v4();
+        let served = ["probe".to_string()];
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&simple_rule(id, "original")).unwrap(),
+        );
+        let store = fresh_store("conflict-nodrop").await;
+        assert_eq!(
+            apply_changed(&mesh, &served, store.clone(), emb())
+                .await
+                .unwrap()
+                .applied,
+            1
+        );
+
+        // Divergent edit: lose the cursor → full-tree → concurrent.
+        std::fs::remove_file(cursor_file(mesh.root())).unwrap();
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&simple_rule(id, "their edit")).unwrap(),
+        );
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(second.conflicted, 1, "conflict detected: {second:?}");
+        assert!(second.conflicted_ids.contains(&id.to_string()));
+
+        // Cursor NOT advanced past an unresolved conflict.
+        let head = current_head(mesh.root()).unwrap().unwrap();
+        assert_ne!(
+            load_cursor(mesh.root(), &mesh_id_str(&mesh)),
+            Some(head),
+            "cursor must not advance past an unresolved conflict"
+        );
+
+        // Re-presentation is idempotent: still conflicted, never applied.
+        let third = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(third.conflicted, 1, "still conflicted: {third:?}");
+        assert_eq!(third.applied, 0, "the conflict is never silently applied");
+
+        // The accepted projection is preserved, marked, and the candidate is
+        // durably preserved outside the checkout.
+        let (_, row) = store.get("probe", &id.to_string()).await.unwrap().unwrap();
+        assert_eq!(row.content, "original", "accepted projection preserved");
+        assert!(
+            crate::synaptic_mesh::conflict::is_conflicting(&row),
+            "still suppressed"
+        );
+        let variant = crate::synaptic_mesh::conflict::conflicts_dir_for(mesh.root())
+            .join("probe")
+            .join(format!("{id}.json"));
+        assert!(
+            variant.exists(),
+            "variant preserved durably outside the checkout"
         );
     }
 }
