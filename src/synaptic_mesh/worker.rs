@@ -41,6 +41,15 @@ pub struct DrainReport {
     /// non-shareable type, not eligible under policy, an unknown op, or a
     /// non-UUID id.
     pub skipped: usize,
+    /// Entries skipped because their capture-time epoch predates the mesh
+    /// manifest's CURRENT epoch — a pre-purge entry re-presenting into a new
+    /// epoch. Unlike `skipped` (consumed as a decision), these stay PENDING:
+    /// the worker neither writes their file nor marks them committed, so the
+    /// operator can inspect the old outbox (spec §"Deletion & erasure").
+    pub quarantined: usize,
+    /// One flattened line per quarantined entry, naming the entry's epoch and
+    /// the current manifest epoch — the operator-facing surface.
+    pub quarantined_entries: Vec<String>,
     /// Entries whose target file already carried the same `update_id` — an
     /// idempotent retry after a crash between the file rename and the
     /// mark-committed step. Not a write, not a skip, and never a second commit.
@@ -51,11 +60,13 @@ pub struct DrainReport {
 
 /// The outcome of applying one entry. Skip reasons are a decision, never an
 /// error; I/O failures are an error and abort the drain so the entries stay
-/// pending for the next attempt.
+/// pending for the next attempt. A quarantine carries the flattened reason
+/// line and, unlike a skip, leaves the entry pending.
 enum ApplyOutcome {
     Applied,
     AlreadyApplied,
     Skipped,
+    Quarantined(String),
 }
 
 /// Drain the outbox once. One batched `git commit` per call, authored as
@@ -84,14 +95,26 @@ pub fn drain_once(
 
     for entry in &entries {
         match apply_one(entry, mesh, node_id, &policy, epoch)? {
-            ApplyOutcome::Applied => report.applied += 1,
-            ApplyOutcome::AlreadyApplied => report.already_applied += 1,
-            ApplyOutcome::Skipped => report.skipped += 1,
+            ApplyOutcome::Applied => {
+                report.applied += 1;
+                committed_ids.push(entry.stable_op_id);
+            }
+            ApplyOutcome::AlreadyApplied => {
+                report.already_applied += 1;
+                committed_ids.push(entry.stable_op_id);
+            }
+            ApplyOutcome::Skipped => {
+                report.skipped += 1;
+                committed_ids.push(entry.stable_op_id);
+            }
+            // A quarantine is NOT a consume: the entry stays pending (never
+            // pushed onto `committed_ids`) so the operator inspects it rather
+            // than the drain silently dropping it on every tick.
+            ApplyOutcome::Quarantined(line) => {
+                report.quarantined += 1;
+                report.quarantined_entries.push(line);
+            }
         }
-        // Every consumed entry — applied, already-applied, or skipped — is
-        // marked committed. A skip is a *decision*, not a retry; leaving it
-        // pending would loop the same no-op forever.
-        committed_ids.push(entry.stable_op_id);
     }
 
     // ONE commit per drain, not per record. Author = node_id (the same node
@@ -120,6 +143,19 @@ fn apply_one(
     policy: &super::manifest::MeshPolicy,
     epoch: u32,
 ) -> Result<ApplyOutcome, String> {
+    // ---- publish-side epoch quarantine (spec §"Deletion & erasure") ----
+    // A record captured in an older epoch than the mesh's current one is from
+    // a pre-purge outbox and must not be replayed into the new epoch. This is
+    // the publish-side twin of `import::epoch_gate`: the entry is skipped AND
+    // left pending (quarantined) rather than consumed, so the operator can
+    // inspect the old outbox. It is checked FIRST — an old-epoch entry is
+    // quarantined whatever its other classifications would say.
+    if entry.epoch < epoch {
+        return Ok(ApplyOutcome::Quarantined(format!(
+            "{}: old-epoch entry (epoch {} < manifest epoch {}); quarantined, not replayed",
+            entry.id, entry.epoch, epoch
+        )));
+    }
     // ---- classification: a skip is a decision, never an error ----
     // Feedback guard: a row that already carries a `mesh` provenance marker was
     // imported FROM the mesh (slice 4 writes it) and must never be re-exported.
@@ -433,11 +469,28 @@ mod tests {
             metadata,
             superseded_by: None,
             ts: 1_700_000_000,
+            epoch: 1,
         }
     }
 
     fn shareable_metadata() -> serde_json::Value {
         json!({ "eligibility": "shareable", "source": "owner 2026-10-11" })
+    }
+
+    /// Rewrite the on-disk manifest to a new `epoch`, commit it (the local
+    /// half of an epoch migration), and reopen the mesh so its cached manifest
+    /// reflects the new epoch. Mirrors `import.rs`'s test helper.
+    fn reopen_with_epoch(mesh: &MeshStorage, epoch: u32) -> MeshStorage {
+        let mut manifest = mesh.manifest().clone();
+        manifest.epoch = epoch;
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(
+            mesh.root().join(super::super::storage::MANIFEST_FILE_NAME),
+            format!("{json}\n"),
+        )
+        .unwrap();
+        mesh.commit_all("epoch migration", "node-fixture").unwrap();
+        MeshStorage::open(mesh.root()).unwrap()
     }
 
     #[test]
@@ -610,6 +663,7 @@ mod tests {
             }),
             superseded_by: None,
             ts: 1_700_000_000,
+            epoch: 1,
         };
         outbox.append(&entry).unwrap();
 
@@ -726,6 +780,7 @@ mod tests {
             metadata: shareable_metadata(),
             superseded_by: Some(new_id.to_string()),
             ts: 1_700_000_000,
+            epoch: 1,
         };
         outbox.append(&entry).unwrap();
 
@@ -755,6 +810,7 @@ mod tests {
             metadata: json!({ "eligibility": "shareable", "archived_at": 1_700_000_000_i64 }),
             superseded_by: None,
             ts: 1_700_000_000,
+            epoch: 1,
         };
         outbox.append(&entry).unwrap();
 
@@ -854,6 +910,7 @@ mod tests {
             metadata: json!({ "eligibility": "shareable", "archived_at": 1_700_000_100_i64 }),
             superseded_by: None,
             ts: 1_700_000_100,
+            epoch: 1,
         };
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
@@ -875,6 +932,114 @@ mod tests {
         assert_eq!(
             record.origin_mesh_epoch, 1,
             "origin epoch is preserved across transitions"
+        );
+    }
+
+    // ---- slice F4: publish-side epoch quarantine ---------------------------
+    //
+    // Spec §"Deletion & erasure": the mesh-worker must refuse to publish a
+    // record born in an older epoch than the mesh's current one — the
+    // publish-side twin of `import::epoch_gate`. A stale entry is quarantined
+    // (named, left pending) rather than drained into the new epoch; a
+    // current-epoch entry drains exactly as it always has.
+
+    /// An entry captured at epoch 1, drained after a migration to epoch 2, is
+    /// quarantined: no file write, a named report line, and the entry STAYS
+    /// pending for operator inspection (never consumed).
+    #[test]
+    fn a_stale_epoch_entry_is_quarantined_named_and_stays_pending() {
+        let (mesh, outbox) = fixture("stale-epoch", None);
+        let id = Uuid::new_v4();
+        let entry = created(&id.to_string(), shareable_metadata()); // epoch 1
+        outbox.append(&entry).unwrap();
+
+        // Migrate: manifest epoch 1 -> 2 (the filter-repo purge).
+        let mesh = reopen_with_epoch(&mesh, 2);
+
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 0, "the stale entry must not publish");
+        assert_eq!(report.quarantined, 1, "one entry quarantined: {report:?}");
+        assert!(!report.committed, "no commit for a quarantined entry");
+        assert_eq!(report.quarantined_entries.len(), 1, "one named line");
+        let line = &report.quarantined_entries[0];
+        assert!(
+            line.contains("epoch 1") && line.contains("manifest epoch 2"),
+            "names both epochs: {line}"
+        );
+        assert!(line.contains(&id.to_string()), "names the entry: {line}");
+
+        // The file was never written.
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        assert!(!path.exists(), "no record file for a quarantined entry");
+
+        // The entry stays pending — NOT consumed — for operator inspection.
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "the quarantined entry stays pending"
+        );
+    }
+
+    /// An entry captured at the CURRENT epoch drains after a migration — the
+    /// publish gate only quarantines OLDER epochs, never current ones.
+    #[test]
+    fn a_current_epoch_entry_drains_after_an_epoch_migration() {
+        let (mesh, outbox) = fixture("current-epoch", None);
+        let mesh = reopen_with_epoch(&mesh, 2); // migrate FIRST
+        let id = Uuid::new_v4();
+        let mut entry = created(&id.to_string(), shareable_metadata());
+        entry.epoch = 2; // born after the migration
+        outbox.append(&entry).unwrap();
+
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 1, "current-epoch entry drains: {report:?}");
+        assert_eq!(report.quarantined, 0, "nothing quarantined: {report:?}");
+        assert!(report.committed);
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let record: MeshRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            record.origin_mesh_epoch, 2,
+            "stamped with the current epoch"
+        );
+    }
+
+    /// A mixed batch drains the current-epoch entry (committing it) while the
+    /// stale entry is quarantined and LEFT PENDING — the commit step must
+    /// never consume a quarantined entry.
+    #[test]
+    fn a_mixed_batch_quarantines_stale_and_drains_current() {
+        let (mesh, outbox) = fixture("mixed-epoch", None);
+        let stale_id = Uuid::new_v4();
+        let current_id = Uuid::new_v4();
+        let stale = created(&stale_id.to_string(), shareable_metadata()); // epoch 1
+        outbox.append(&stale).unwrap();
+        let mut current = created(&current_id.to_string(), shareable_metadata());
+        current.epoch = 2; // born post-migration
+        outbox.append(&current).unwrap();
+
+        let mesh = reopen_with_epoch(&mesh, 2);
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(
+            report.applied, 1,
+            "only the current entry drains: {report:?}"
+        );
+        assert_eq!(report.quarantined, 1, "the stale entry is quarantined");
+        assert!(report.committed, "the current entry commits");
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "only the stale entry remains pending");
+        assert_eq!(
+            pending[0].stable_op_id, stale.stable_op_id,
+            "the quarantined entry is the one left pending"
         );
     }
 }

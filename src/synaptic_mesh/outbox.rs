@@ -149,6 +149,16 @@ pub struct OutboxEntry {
     /// Dispatcher timestamp (epoch seconds) stamped when the pulse was handled.
     /// The worker uses it as the `created_at`/`archived_at` anchor.
     pub ts: i64,
+    /// The mesh manifest epoch stamped at capture time (when the subscriber
+    /// appended this entry). The worker compares it against the manifest's
+    /// CURRENT epoch at drain time: an entry born in an older epoch is
+    /// quarantined (left pending for operator inspection) rather than replayed
+    /// into the new epoch (spec §"Deletion & erasure"). `#[serde(default)]`
+    /// reads a WAL line written before this field existed as `0` — an epoch
+    /// lower than any real manifest epoch, so such a legacy entry is
+    /// quarantined rather than auto-replayed at an unknown birth epoch.
+    #[serde(default)]
+    pub epoch: u32,
 }
 
 /// Serialises `append` and `mark_committed` so a compaction can never lose an
@@ -309,6 +319,7 @@ mod tests {
             metadata: serde_json::json!({}),
             superseded_by: None,
             ts: 1_700_000_000,
+            epoch: 1,
         }
     }
 
