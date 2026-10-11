@@ -17,7 +17,9 @@
 use crate::events::{
     MemorySubscriber, RecursionToken, SubscriberContext, SubscriberError, ThalamicPulse,
 };
-use crate::synaptic_mesh::outbox::{is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED};
+use crate::synaptic_mesh::outbox::{
+    is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED,
+};
 use crate::traits::MemoryPayload;
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -35,7 +37,10 @@ impl MeshOutbox {
     /// drain loop. Err (rather than panic) when the outbox cannot open, so the
     /// daemon can log and continue without a mesh subscriber.
     pub fn new(outbox_dir: impl Into<PathBuf>, wake: Arc<Notify>) -> Result<Self, String> {
-        Ok(Self { outbox: Outbox::open(&outbox_dir.into())?, wake })
+        Ok(Self {
+            outbox: Outbox::open(&outbox_dir.into())?,
+            wake,
+        })
     }
 }
 
@@ -55,12 +60,18 @@ impl MemorySubscriber for MeshOutbox {
         match event {
             ThalamicPulse::Created { id, namespace, .. } => {
                 if let Some(payload) = self.read(ctx, namespace, id).await? {
-                    if let Some(entry) = self.entry(OP_CREATED, id, namespace, payload, None, ctx.ts) {
+                    if let Some(entry) =
+                        self.entry(OP_CREATED, id, namespace, payload, None, ctx.ts)
+                    {
                         entries.push(entry);
                     }
                 }
             }
-            ThalamicPulse::Superseded { old_id, new_id, namespace } => {
+            ThalamicPulse::Superseded {
+                old_id,
+                new_id,
+                namespace,
+            } => {
                 // A supersede is two durable facts: the old row retired, and a
                 // replacement row that was never announced by its own `Created`
                 // pulse (the supersede handler writes it directly). Capture both.
@@ -77,14 +88,18 @@ impl MemorySubscriber for MeshOutbox {
                     }
                 }
                 if let Some(payload) = self.read(ctx, namespace, new_id).await? {
-                    if let Some(entry) = self.entry(OP_CREATED, new_id, namespace, payload, None, ctx.ts) {
+                    if let Some(entry) =
+                        self.entry(OP_CREATED, new_id, namespace, payload, None, ctx.ts)
+                    {
                         entries.push(entry);
                     }
                 }
             }
             ThalamicPulse::Archived { id, namespace } => {
                 if let Some(payload) = self.read(ctx, namespace, id).await? {
-                    if let Some(entry) = self.entry(OP_ARCHIVED, id, namespace, payload, None, ctx.ts) {
+                    if let Some(entry) =
+                        self.entry(OP_ARCHIVED, id, namespace, payload, None, ctx.ts)
+                    {
                         entries.push(entry);
                     }
                 }
@@ -113,7 +128,11 @@ impl MeshOutbox {
         namespace: &str,
         id: &str,
     ) -> Result<Option<MemoryPayload>, SubscriberError> {
-        Ok(ctx.store.get(namespace, id).await?.map(|(_, payload)| payload))
+        Ok(ctx
+            .store
+            .get(namespace, id)
+            .await?
+            .map(|(_, payload)| payload))
     }
 
     /// Build one outbox entry from a captured payload. Non-shareable types
@@ -128,6 +147,17 @@ impl MeshOutbox {
         superseded_by: Option<String>,
         ts: i64,
     ) -> Option<OutboxEntry> {
+        // Structural rows are strictly local (spec §"Sharing boundary"),
+        // mirroring the exclusion `server::set_metadata` applies: AST-ingest
+        // rows (whatever their declared `memory_type`) and `::`-qualified
+        // structural ids never enter the outbox. A `procedure_perform` firing
+        // needs no guard here — the bus carries no pulse for it at all (see
+        // the finding documented in the tests).
+        if payload.user_id == "auto-ingestor"
+            || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+        {
+            return None;
+        }
         if !is_shareable_memory_type(&payload.memory_type) {
             return None;
         }
@@ -172,9 +202,13 @@ mod tests {
     }
 
     fn payload(memory_type: &str, metadata: serde_json::Value) -> MemoryPayload {
+        payload_as("system", memory_type, metadata)
+    }
+
+    fn payload_as(user_id: &str, memory_type: &str, metadata: serde_json::Value) -> MemoryPayload {
         MemoryPayload {
             content: "the text".to_string(),
-            user_id: "system".to_string(),
+            user_id: user_id.to_string(),
             memory_type: memory_type.to_string(),
             agent_name: None,
             location: String::new(),
@@ -184,14 +218,21 @@ mod tests {
     }
 
     /// A bus carrying a real store and the outbox subscriber over `outbox_dir`.
-    async fn wired(tag: &str, outbox_dir: PathBuf, wake: Arc<Notify>) -> (ThalamicBus, Arc<LadybugStore>) {
+    async fn wired(
+        tag: &str,
+        outbox_dir: PathBuf,
+        wake: Arc<Notify>,
+    ) -> (ThalamicBus, Arc<LadybugStore>) {
         let dir = scratch(tag);
-        let store = LadybugStore::for_testing(dir.join("db.lbug"), TEST_DIMENSIONS).expect("open temp store");
+        let store = LadybugStore::for_testing(dir.join("db.lbug"), TEST_DIMENSIONS)
+            .expect("open temp store");
         store.init("ns").await.expect("ns table");
         let store = Arc::new(store);
         let bus = ThalamicBus::new(16);
         bus.attach_store(store.clone());
-        bus.register(Box::new(MeshOutbox::new(outbox_dir, wake).expect("outbox opens")));
+        bus.register(Box::new(
+            MeshOutbox::new(outbox_dir, wake).expect("outbox opens"),
+        ));
         (bus, store)
     }
 
@@ -204,12 +245,21 @@ mod tests {
 
         let id = uuid::Uuid::new_v4().to_string();
         store
-            .upsert("ns", &id, vec![0.0; TEST_DIMENSIONS], payload("rule", serde_json::json!({ "eligibility": "shareable" })))
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload("rule", serde_json::json!({ "eligibility": "shareable" })),
+            )
             .await
             .unwrap();
 
         bus.emit(
-            ThalamicPulse::Created { id: id.clone(), namespace: "ns".to_string(), kind: "rule".to_string() },
+            ThalamicPulse::Created {
+                id: id.clone(),
+                namespace: "ns".to_string(),
+                kind: "rule".to_string(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(DISPATCH_WAIT).await;
@@ -221,7 +271,10 @@ mod tests {
         assert_eq!(pending[0].id, id);
         assert_eq!(pending[0].memory_type, "rule");
         assert_eq!(pending[0].content, "the text");
-        assert_eq!(pending[0].metadata["eligibility"], serde_json::json!("shareable"));
+        assert_eq!(
+            pending[0].metadata["eligibility"],
+            serde_json::json!("shareable")
+        );
     }
 
     #[tokio::test]
@@ -233,18 +286,30 @@ mod tests {
 
         let id = uuid::Uuid::new_v4().to_string();
         store
-            .upsert("ns", &id, vec![0.0; TEST_DIMENSIONS], payload("task", serde_json::json!({})))
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload("task", serde_json::json!({})),
+            )
             .await
             .unwrap();
 
         bus.emit(
-            ThalamicPulse::Created { id, namespace: "ns".to_string(), kind: "task".to_string() },
+            ThalamicPulse::Created {
+                id,
+                namespace: "ns".to_string(),
+                kind: "task".to_string(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(DISPATCH_WAIT).await;
 
         let outbox = Outbox::open(&outbox_dir).unwrap();
-        assert!(outbox.pending().unwrap().is_empty(), "a task mutation is not shareable");
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a task mutation is not shareable"
+        );
     }
 
     #[tokio::test]
@@ -257,24 +322,43 @@ mod tests {
         let old_id = uuid::Uuid::new_v4().to_string();
         let new_id = uuid::Uuid::new_v4().to_string();
         for (id, metadata) in [
-            (&old_id, serde_json::json!({ "eligibility": "shareable", "superseded_by": new_id })),
-            (&new_id, serde_json::json!({ "eligibility": "shareable", "supersedes": old_id })),
+            (
+                &old_id,
+                serde_json::json!({ "eligibility": "shareable", "superseded_by": new_id }),
+            ),
+            (
+                &new_id,
+                serde_json::json!({ "eligibility": "shareable", "supersedes": old_id }),
+            ),
         ] {
             store
-                .upsert("ns", id, vec![0.0; TEST_DIMENSIONS], payload("rule", metadata))
+                .upsert(
+                    "ns",
+                    id,
+                    vec![0.0; TEST_DIMENSIONS],
+                    payload("rule", metadata),
+                )
                 .await
                 .unwrap();
         }
 
         bus.emit(
-            ThalamicPulse::Superseded { old_id: old_id.clone(), new_id: new_id.clone(), namespace: "ns".to_string() },
+            ThalamicPulse::Superseded {
+                old_id: old_id.clone(),
+                new_id: new_id.clone(),
+                namespace: "ns".to_string(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(DISPATCH_WAIT).await;
 
         let outbox = Outbox::open(&outbox_dir).unwrap();
         let pending = outbox.pending().unwrap();
-        assert_eq!(pending.len(), 2, "the retire + the replacement are both captured");
+        assert_eq!(
+            pending.len(),
+            2,
+            "the retire + the replacement are both captured"
+        );
         assert_eq!(pending[0].op, OP_SUPERSEDED);
         assert_eq!(pending[0].id, old_id);
         assert_eq!(pending[0].superseded_by.as_deref(), Some(new_id.as_str()));
@@ -291,12 +375,23 @@ mod tests {
 
         let id = uuid::Uuid::new_v4().to_string();
         store
-            .upsert("ns", &id, vec![0.0; TEST_DIMENSIONS], payload("fact", serde_json::json!({ "eligibility": "shareable", "archived": true })))
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload(
+                    "fact",
+                    serde_json::json!({ "eligibility": "shareable", "archived": true }),
+                ),
+            )
             .await
             .unwrap();
 
         bus.emit(
-            ThalamicPulse::Archived { id: id.clone(), namespace: "ns".to_string() },
+            ThalamicPulse::Archived {
+                id: id.clone(),
+                namespace: "ns".to_string(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(DISPATCH_WAIT).await;
@@ -306,6 +401,126 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].op, OP_ARCHIVED);
         assert_eq!(pending[0].id, id);
+    }
+
+    /// Structural rows (`user_id: "auto-ingestor"`) never enter the outbox,
+    /// mirroring the exclusion `server::set_metadata` already applies at the
+    /// metadata path — an ingest-adjacent row is strictly local, whatever its
+    /// `memory_type` says.
+    #[tokio::test]
+    async fn a_structural_auto_ingest_row_is_not_captured() {
+        let dir = scratch("structural-auto-ingest");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("structural-ingest-db", outbox_dir.clone(), wake).await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload_as("auto-ingestor", "rule", serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+
+        bus.emit(
+            ThalamicPulse::Created {
+                id,
+                namespace: "ns".to_string(),
+                kind: "rule".to_string(),
+            },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "an auto-ingestor row is strictly local"
+        );
+    }
+
+    /// Structural rows (`::`-qualified source ids from the AST ingest) never
+    /// enter the outbox, same mirror as above.
+    #[tokio::test]
+    async fn a_structural_namespaced_row_is_not_captured() {
+        let dir = scratch("structural-namespaced");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("structural-ns-db", outbox_dir.clone(), wake).await;
+
+        let id = format!("src::{}", uuid::Uuid::new_v4());
+        store
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload_as("system", "rule", serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+
+        bus.emit(
+            ThalamicPulse::Created {
+                id,
+                namespace: "ns".to_string(),
+                kind: "rule".to_string(),
+            },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a `::`-qualified id is strictly local"
+        );
+    }
+
+    /// A procedure's DEFINITION is shareable and its add pulse is captured.
+    /// A `procedure_perform` firing has no pulse at all — `ThalamicPulse` has
+    /// no such variant (`event.rs`), a perform stamps the row in place and
+    /// announces nothing — so there is no perform-side exclusion to add: the
+    /// only procedure traffic a bus subscriber can ever see is a definition
+    /// add/update.
+    #[tokio::test]
+    async fn a_procedure_definition_add_pulse_is_captured_perform_never_pulses() {
+        let dir = scratch("procedure-def");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("procedure-def-db", outbox_dir.clone(), wake).await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload_as(
+                    "system",
+                    "procedure",
+                    serde_json::json!({ "eligibility": "shareable", "trigger": "before-edit", "remaining_fires": 5 }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        bus.emit(
+            ThalamicPulse::Created {
+                id: id.clone(),
+                namespace: "ns".to_string(),
+                kind: "procedure".to_string(),
+            },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "a procedure definition is shareable");
+        assert_eq!(pending[0].memory_type, "procedure");
     }
 
     /// The subscriber's outbox directory is a sibling of the mesh checkout, so

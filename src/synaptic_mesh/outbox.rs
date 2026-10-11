@@ -55,15 +55,31 @@
 //!
 //! ### The one residual gap (documented, not hidden)
 //!
-//! A crash *between* the store commit (1) and the WAL append (2) — before the
-//! subscriber's `sync_all` lands — leaves the memory durable in LadybugDB but
-//! absent from the outbox. That narrow window is the price of teeing the bus
-//! after the mutation instead of inside it, and it is the exact gap the spec's
-//! §"Crash recovery" accepts under "at-least-once, never exactly-once": the
-//! memory is never lost (LadybugDB holds it), only its *mesh projection* can
-//! lag by one pulse, and the next mutation of that record re-emits it. A
-//! full store→mesh reconciliation (spec §"Cursor and full-tree
-//! reconciliation") is slice 4's pull/replay concern, not this publish path.
+//! The accepted loss window is wider than "a crash between the store commit
+//! (1) and the WAL append (2)". It has two natural portions, one per
+//! component on the tee path:
+//!
+//! * The bus itself is lossy by design: the queue is bounded and
+//!   drop-oldest (`bus.rs`, `Queue::push` trims the front when full) and each
+//!   subscriber runs under a `250ms` timeout (`SUBSCRIBER_TIMEOUT`) after
+//!   which it is abandoned. So a pulse can vanish **before the WAL append
+//!   (2) ever runs even in a perfectly healthy daemon** — a busy bus
+//!   overflowing the queue, or a slow subscriber eating its timeout — with
+//!   nothing crashing at all.
+//! * A crash *between* (1) and (2) — before the append's `sync_all` lands —
+//!   leaves the same state: the memory durable in LadybugDB but absent from
+//!   the outbox.
+//!
+//! Both are the price of teeing the bus *after* the store mutation instead of
+//! inside it, and both are covered the same way, by reconstruction rather
+//! than by this code: the next mutation of a record re-emits it as a
+//! **full-row re-snapshot** (the entry carries the whole payload), and slice
+//! 4's **pull/replay** path is the standing full store→mesh reconciliation
+//! (spec §"Cursor and full-tree reconciliation"). What is accepted is
+//! therefore at-least-once *between peers* and only eventually consistent
+//! locally: the memory is never lost, but its mesh projection may lag until
+//! one of those two cover events arrives. This is an accepted property of
+//! the design, not a guarantee the publish path can code its way out of.
 //!
 //! ### Concurrency
 //!
@@ -167,7 +183,9 @@ impl Outbox {
             .append(true)
             .open(&wal)
             .map_err(|e| format!("outbox WAL {} could not be opened: {e}", wal.display()))?;
-        Ok(Self { dir: dir.to_path_buf() })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+        })
     }
 
     /// Append one entry durably: a single JSONL line followed by a newline,
@@ -175,8 +193,11 @@ impl Outbox {
     /// it. The trailing newline is the commit marker — `pending` drops a
     /// fragment without one as an incomplete (non-durable) append.
     pub fn append(&self, entry: &OutboxEntry) -> Result<(), String> {
-        let _guard = OUTBOX_LOCK.lock().map_err(|_| "outbox lock poisoned".to_string())?;
-        let mut line = serde_json::to_string(entry).map_err(|e| format!("outbox entry could not be serialised: {e}"))?;
+        let _guard = OUTBOX_LOCK
+            .lock()
+            .map_err(|_| "outbox lock poisoned".to_string())?;
+        let mut line = serde_json::to_string(entry)
+            .map_err(|e| format!("outbox entry could not be serialised: {e}"))?;
         line.push('\n');
         let wal = self.dir.join(OUTBOX_FILE_NAME);
         let mut file = std::fs::OpenOptions::new()
@@ -200,7 +221,12 @@ impl Outbox {
         let bytes = match std::fs::read(&wal) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("outbox WAL {} could not be read: {e}", wal.display())),
+            Err(e) => {
+                return Err(format!(
+                    "outbox WAL {} could not be read: {e}",
+                    wal.display()
+                ))
+            }
         };
         let text = String::from_utf8_lossy(&bytes);
         let mut segments: Vec<&str> = text.split('\n').collect();
@@ -228,7 +254,9 @@ impl Outbox {
         if ids.is_empty() {
             return Ok(());
         }
-        let _guard = OUTBOX_LOCK.lock().map_err(|_| "outbox lock poisoned".to_string())?;
+        let _guard = OUTBOX_LOCK
+            .lock()
+            .map_err(|_| "outbox lock poisoned".to_string())?;
         let remaining: Vec<OutboxEntry> = self
             .pending()?
             .into_iter()
@@ -249,8 +277,7 @@ impl Outbox {
             file.sync_all()
                 .map_err(|e| format!("outbox compaction sync failed: {e}"))?;
         }
-        std::fs::rename(&tmp, &wal)
-            .map_err(|e| format!("outbox compaction rename failed: {e}"))?;
+        std::fs::rename(&tmp, &wal).map_err(|e| format!("outbox compaction rename failed: {e}"))?;
         Ok(())
     }
 }
@@ -290,7 +317,10 @@ mod tests {
         let mesh_dir = PathBuf::from("/base/some-mesh-id");
         let outbox = outbox_dir_for(&mesh_dir);
         assert_eq!(outbox, PathBuf::from("/base/some-mesh-id.outbox"));
-        assert!(!outbox.starts_with(&mesh_dir), "the outbox must live OUTSIDE the git repo");
+        assert!(
+            !outbox.starts_with(&mesh_dir),
+            "the outbox must live OUTSIDE the git repo"
+        );
     }
 
     #[test]
@@ -303,7 +333,11 @@ mod tests {
         outbox.append(&b).unwrap();
 
         let pending = outbox.pending().unwrap();
-        assert_eq!(pending, vec![a.clone(), b.clone()], "entries come back in append order");
+        assert_eq!(
+            pending,
+            vec![a.clone(), b.clone()],
+            "entries come back in append order"
+        );
         assert_eq!(outbox.pending().unwrap().len(), 2);
     }
 
@@ -325,7 +359,11 @@ mod tests {
             .unwrap();
 
         let pending = outbox.pending().unwrap();
-        assert_eq!(pending, vec![a], "the fragment is dropped, not read as corrupt");
+        assert_eq!(
+            pending,
+            vec![a],
+            "the fragment is dropped, not read as corrupt"
+        );
     }
 
     #[test]
@@ -339,8 +377,14 @@ mod tests {
         outbox.append(&b).unwrap();
         outbox.append(&c).unwrap();
 
-        outbox.mark_committed(&[a.stable_op_id, c.stable_op_id]).unwrap();
-        assert_eq!(outbox.pending().unwrap(), vec![b.clone()], "b survives, a and c are gone");
+        outbox
+            .mark_committed(&[a.stable_op_id, c.stable_op_id])
+            .unwrap();
+        assert_eq!(
+            outbox.pending().unwrap(),
+            vec![b.clone()],
+            "b survives, a and c are gone"
+        );
     }
 
     #[test]
@@ -357,7 +401,11 @@ mod tests {
         outbox.append(&b).unwrap();
         outbox.mark_committed(&[a.stable_op_id]).unwrap(); // a is already gone: no-op
 
-        assert_eq!(outbox.pending().unwrap(), vec![b], "a committed, b retained");
+        assert_eq!(
+            outbox.pending().unwrap(),
+            vec![b],
+            "a committed, b retained"
+        );
     }
 
     #[test]
@@ -365,7 +413,16 @@ mod tests {
         for t in ["rule", "fact", "procedure"] {
             assert!(is_shareable_memory_type(t), "{t} is shareable");
         }
-        for t in ["task", "directory", "file", "markdown", "symbol", "guard_event", "freshness_flag", "context"] {
+        for t in [
+            "task",
+            "directory",
+            "file",
+            "markdown",
+            "symbol",
+            "guard_event",
+            "freshness_flag",
+            "context",
+        ] {
             assert!(!is_shareable_memory_type(t), "{t} is NOT shareable");
         }
     }
