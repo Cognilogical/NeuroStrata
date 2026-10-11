@@ -80,6 +80,24 @@ impl std::fmt::Display for LifecycleState {
     }
 }
 
+impl std::str::FromStr for LifecycleState {
+    type Err = String;
+
+    /// The wire form is lowercase (see [`Display`]); an unknown token is an
+    /// error so a future state never silently reads as "active". Import uses
+    /// this to turn a stored `metadata.mesh.lifecycle_state` back into the
+    /// enum before gating a candidate transition.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(LifecycleState::Active),
+            "archived" => Ok(LifecycleState::Archived),
+            "superseded" => Ok(LifecycleState::Superseded),
+            "tombstoned" => Ok(LifecycleState::Tombstoned),
+            other => Err(format!("unknown lifecycle state {other:?}")),
+        }
+    }
+}
+
 /// A typed edge between two records. Today: `supersedes` (terminal) and
 /// `references` (non-terminal link).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
