@@ -1116,6 +1116,123 @@ mod tests {
         );
     }
 
+    /// e2e pin for the PULL TRIGGER side of the conflict loop (slice 7):
+    /// the seam test above pins the import side; this one drives the pull
+    /// trigger path with the same registered conflict and pins that the
+    /// round trip through pull leaves the overlay's truth intact — status
+    /// still counts the conflict, the import cursor is never touched, and
+    /// nothing panics on the way.
+    #[test]
+    fn pull_trigger_with_a_live_conflict_keeps_cursor_and_conflict_report() {
+        let remote_dir = scratch("pt-remote");
+        let bare = remote_dir.join("trigger-mesh.git");
+        let out = std::process::Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&bare)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git init --bare");
+        assert!(out.status.success());
+        let base = scratch("pt-base");
+        let project = scratch("pt-proj");
+        let init = handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_init",
+            &json!({
+                "name": "trigger-team",
+                "namespace": ["alpha"],
+                "remote": bare.display().to_string(),
+                "project_root": project,
+                "node_id": "pt-node"
+            }),
+            &base,
+        );
+        assert!(init.contains("mesh created"), "init reply: {init}");
+        let svc = MeshService::new(project.clone());
+        let (mesh_id, dir, _) = svc
+            .read_pointer(&project)
+            .expect("pointer readable")
+            .expect("pointer written");
+
+        // The accepted-head cursor has daemon state BEFORE the trigger.
+        let seeded = "0123456789abcdef0123456789abcdef01234567".to_string();
+        crate::synaptic_mesh::import::write_cursor(&dir, &mesh_id, &seeded).expect("seed cursor");
+        assert_eq!(
+            load_cursor(&dir, &mesh_id),
+            Some(seeded.clone()),
+            "cursor seeded"
+        );
+
+        // The conflict fixture is the seam fixture, verbatim pattern.
+        let id = Uuid::new_v4();
+        let record: crate::synaptic_mesh::record::MeshRecord = serde_json::from_value(json!({
+            "schema_version": "synaptic-mesh-record/v1",
+            "id": id.to_string(),
+            "namespace": "alpha",
+            "memory_type": "rule",
+            "lifecycle": {
+                "state": "active",
+                "created_at": "2026-10-11T00:00:00Z",
+                "created_by": "node-peer-1",
+                "superseded_by": null,
+                "archived_at": null,
+                "tombstoned_at": null
+            },
+            "content": {"text": "incoming replacement"},
+            "metadata": {"eligibility": "shareable", "trust": "untrusted"},
+            "relationships": [],
+            "update_id": Uuid::new_v4().to_string(),
+            "origin_mesh_epoch": 1,
+            "trust": "untrusted"
+        }))
+        .expect("record fixture");
+        conflict::register_conflict(
+            &dir,
+            "alpha",
+            &id.to_string(),
+            "u-trigger-1",
+            "two different replacements",
+            conflict::ConflictKind::Unresolved,
+            &record,
+        )
+        .expect("register");
+
+        // The trigger: the full tool-call path into `svc.pull` with the
+        // conflicted mesh's pointer. The remote has no refs yet, so the
+        // pull answers the empty state — but the trigger still runs.
+        let pull = handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_pull",
+            &json!({"project_root": project}),
+            &base,
+        );
+        assert!(
+            pull.contains("nothing on the remote yet"),
+            "empty-remote pull reply: {pull}"
+        );
+
+        // Cursor unmoved.
+        assert_eq!(
+            load_cursor(&dir, &mesh_id),
+            Some(seeded.clone()),
+            "the pull trigger never touches the accepted-head cursor"
+        );
+
+        // Status through the SAME tool surface still counts the conflict.
+        let status = handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_status",
+            &json!({"project_root": project}),
+            &base,
+        );
+        assert!(
+            status.contains("conflicts: 1 unresolved"),
+            "conflict survives the pull trigger: {status}"
+        );
+        assert!(
+            status.contains("0123456"),
+            "status still reads the seeded cursor head: {status}"
+        );
+    }
+
     #[test]
     fn status_counts_wal_pending_and_their_oldest_age_per_namespace() {
         let base = scratch("st-wal");

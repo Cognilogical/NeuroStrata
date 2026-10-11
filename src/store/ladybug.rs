@@ -3192,6 +3192,60 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         );
     }
 
+    // ---- export-graph conflict suppression --------------------------------
+    //
+    // A row marked under an unresolved conflict overlay is suppressed from
+    // the effective view (spec §"Concurrent merge policy") the same way an
+    // archived row is — except there is NO escape hatch for it: even
+    // `include_archived: true` must never serve an unresolved conflict.
+
+    /// Sensitivity note: this suppression site (the
+    /// `is_conflicting_metadata` filter in `export_graph`) shipped before
+    /// any test pinned it — the integration checker found that removing
+    /// the filter leaves every suite green (a mutation-green site). This
+    /// fixture is the pin: one conflicting row + one clean row, exported
+    /// with `include_archived: true` so the audit hatch is wide open. The
+    /// conflicting row stays out; the clean row is untouched by it.
+    #[tokio::test]
+    async fn export_graph_suppresses_conflicting_rows_even_with_include_archived() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "clean-row",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "conflict-row",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "mesh": { "conflict": true } })),
+            )
+            .await
+            .unwrap();
+
+        let data = store.export_graph(false, true).await.unwrap();
+        let node_ids: Vec<&str> = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.get("id").and_then(|i| i.as_str()))
+            .collect();
+        assert!(
+            !node_ids.contains(&"conflict-row"),
+            "unresolved conflict rows leave the effective view even with \
+             include_archived: {node_ids:?}"
+        );
+        assert!(
+            node_ids.contains(&"clean-row"),
+            "the suppression is per-row, never a blanket export loss: {node_ids:?}"
+        );
+    }
+
     // --- Vocabulary validation (parse_edge_specs) tests ---
 
     #[test]
