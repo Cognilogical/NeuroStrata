@@ -1,0 +1,320 @@
+//! `MeshOutbox` — tees shareable memory mutations into the durable outbox.
+//!
+//! The Thalamic Bus hands a pulse to this subscriber *after* the store commit,
+//! so this is the durable write-ahead step of the publish path: it reads the
+//! mutated memory back from the store, snapshots it into a self-contained
+//! [`OutboxEntry`], and appends it to the JSONL WAL. It **never writes a mesh
+//! file and never commits** — the worker does that. Its one side effect beyond
+//! the WAL is a `notify_one` on a shared `Notify`, waking the drain loop so a
+//! mutation is exported promptly rather than only on the next 5s tick.
+//!
+//! It captures only the shareable types (`rule`, `fact`, `procedure`) — tasks,
+//! structural rows and the bus's own sentinel rows are strictly local. The
+//! `eligibility` and foreign-origin (`metadata.mesh`) gates are deliberately
+//! NOT applied here: those are the worker's publish decision, evaluated against
+//! the mesh manifest's policy, and a subscriber has no manifest.
+
+use crate::events::{
+    MemorySubscriber, RecursionToken, SubscriberContext, SubscriberError, ThalamicPulse,
+};
+use crate::synaptic_mesh::outbox::{is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED};
+use crate::traits::MemoryPayload;
+use async_trait::async_trait;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+/// Tees shareable mutations into the outbox and wakes the worker.
+pub struct MeshOutbox {
+    outbox: Outbox,
+    wake: Arc<Notify>,
+}
+
+impl MeshOutbox {
+    /// Open the outbox over `outbox_dir` and share `wake` with the daemon's
+    /// drain loop. Err (rather than panic) when the outbox cannot open, so the
+    /// daemon can log and continue without a mesh subscriber.
+    pub fn new(outbox_dir: impl Into<PathBuf>, wake: Arc<Notify>) -> Result<Self, String> {
+        Ok(Self { outbox: Outbox::open(&outbox_dir.into())?, wake })
+    }
+}
+
+#[async_trait]
+impl MemorySubscriber for MeshOutbox {
+    fn name(&self) -> &'static str {
+        "mesh_outbox"
+    }
+
+    async fn handle(
+        &self,
+        event: &ThalamicPulse,
+        _token: &RecursionToken,
+        ctx: &SubscriberContext<'_>,
+    ) -> Result<(), SubscriberError> {
+        let mut entries: Vec<OutboxEntry> = Vec::new();
+        match event {
+            ThalamicPulse::Created { id, namespace, .. } => {
+                if let Some(payload) = self.read(ctx, namespace, id).await? {
+                    if let Some(entry) = self.entry(OP_CREATED, id, namespace, payload, None, ctx.ts) {
+                        entries.push(entry);
+                    }
+                }
+            }
+            ThalamicPulse::Superseded { old_id, new_id, namespace } => {
+                // A supersede is two durable facts: the old row retired, and a
+                // replacement row that was never announced by its own `Created`
+                // pulse (the supersede handler writes it directly). Capture both.
+                if let Some(payload) = self.read(ctx, namespace, old_id).await? {
+                    if let Some(entry) = self.entry(
+                        OP_SUPERSEDED,
+                        old_id,
+                        namespace,
+                        payload,
+                        Some(new_id.clone()),
+                        ctx.ts,
+                    ) {
+                        entries.push(entry);
+                    }
+                }
+                if let Some(payload) = self.read(ctx, namespace, new_id).await? {
+                    if let Some(entry) = self.entry(OP_CREATED, new_id, namespace, payload, None, ctx.ts) {
+                        entries.push(entry);
+                    }
+                }
+            }
+            ThalamicPulse::Archived { id, namespace } => {
+                if let Some(payload) = self.read(ctx, namespace, id).await? {
+                    if let Some(entry) = self.entry(OP_ARCHIVED, id, namespace, payload, None, ctx.ts) {
+                        entries.push(entry);
+                    }
+                }
+            }
+            // A guard verdict is not a shareable memory mutation.
+            ThalamicPulse::GuardedActionFired { .. } => return Ok(()),
+        };
+
+        if entries.is_empty() {
+            return Ok(());
+        }
+        for entry in entries {
+            self.outbox.append(&entry).map_err(anyhow::Error::msg)?;
+        }
+        self.wake.notify_one();
+        Ok(())
+    }
+}
+
+impl MeshOutbox {
+    /// Read one memory back off the store. `Ok(None)` when it was deleted
+    /// concurrently — nothing to export, not an error.
+    async fn read(
+        &self,
+        ctx: &SubscriberContext<'_>,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<MemoryPayload>, SubscriberError> {
+        Ok(ctx.store.get(namespace, id).await?.map(|(_, payload)| payload))
+    }
+
+    /// Build one outbox entry from a captured payload. Non-shareable types
+    /// collapse to `None` (a no-op, not an error); the worker still re-checks
+    /// the type as a second line of defence.
+    fn entry(
+        &self,
+        op: &str,
+        id: &str,
+        namespace: &str,
+        payload: MemoryPayload,
+        superseded_by: Option<String>,
+        ts: i64,
+    ) -> Option<OutboxEntry> {
+        if !is_shareable_memory_type(&payload.memory_type) {
+            return None;
+        }
+        Some(OutboxEntry {
+            stable_op_id: uuid::Uuid::new_v4(),
+            op: op.to_string(),
+            id: id.to_string(),
+            namespace: namespace.to_string(),
+            memory_type: payload.memory_type,
+            content: payload.content,
+            metadata: payload.metadata,
+            superseded_by,
+            ts,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{RecursionToken, ThalamicBus};
+    use crate::store::LadybugStore;
+    use crate::synaptic_mesh::outbox::outbox_dir_for;
+    use crate::traits::VectorStore;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    const TEST_DIMENSIONS: usize = 4;
+    /// Long enough for the dispatcher to pop the queue and run the subscriber.
+    const DISPATCH_WAIT: Duration = Duration::from_millis(100);
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neurostrata-mesh-outbox-sub-{}-{}-{}",
+            std::process::id(),
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn payload(memory_type: &str, metadata: serde_json::Value) -> MemoryPayload {
+        MemoryPayload {
+            content: "the text".to_string(),
+            user_id: "system".to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        }
+    }
+
+    /// A bus carrying a real store and the outbox subscriber over `outbox_dir`.
+    async fn wired(tag: &str, outbox_dir: PathBuf, wake: Arc<Notify>) -> (ThalamicBus, Arc<LadybugStore>) {
+        let dir = scratch(tag);
+        let store = LadybugStore::for_testing(dir.join("db.lbug"), TEST_DIMENSIONS).expect("open temp store");
+        store.init("ns").await.expect("ns table");
+        let store = Arc::new(store);
+        let bus = ThalamicBus::new(16);
+        bus.attach_store(store.clone());
+        bus.register(Box::new(MeshOutbox::new(outbox_dir, wake).expect("outbox opens")));
+        (bus, store)
+    }
+
+    #[tokio::test]
+    async fn a_shareable_created_pulse_writes_an_outbox_entry() {
+        let dir = scratch("created");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("created-db", outbox_dir.clone(), wake.clone()).await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert("ns", &id, vec![0.0; TEST_DIMENSIONS], payload("rule", serde_json::json!({ "eligibility": "shareable" })))
+            .await
+            .unwrap();
+
+        bus.emit(
+            ThalamicPulse::Created { id: id.clone(), namespace: "ns".to_string(), kind: "rule".to_string() },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "one entry per Created");
+        assert_eq!(pending[0].op, OP_CREATED);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].memory_type, "rule");
+        assert_eq!(pending[0].content, "the text");
+        assert_eq!(pending[0].metadata["eligibility"], serde_json::json!("shareable"));
+    }
+
+    #[tokio::test]
+    async fn a_non_shareable_type_is_not_captured() {
+        let dir = scratch("nonshareable");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("nonshareable-db", outbox_dir.clone(), wake).await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert("ns", &id, vec![0.0; TEST_DIMENSIONS], payload("task", serde_json::json!({})))
+            .await
+            .unwrap();
+
+        bus.emit(
+            ThalamicPulse::Created { id, namespace: "ns".to_string(), kind: "task".to_string() },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        assert!(outbox.pending().unwrap().is_empty(), "a task mutation is not shareable");
+    }
+
+    #[tokio::test]
+    async fn a_superseded_pulse_captures_both_rows() {
+        let dir = scratch("superseded");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("superseded-db", outbox_dir.clone(), wake).await;
+
+        let old_id = uuid::Uuid::new_v4().to_string();
+        let new_id = uuid::Uuid::new_v4().to_string();
+        for (id, metadata) in [
+            (&old_id, serde_json::json!({ "eligibility": "shareable", "superseded_by": new_id })),
+            (&new_id, serde_json::json!({ "eligibility": "shareable", "supersedes": old_id })),
+        ] {
+            store
+                .upsert("ns", id, vec![0.0; TEST_DIMENSIONS], payload("rule", metadata))
+                .await
+                .unwrap();
+        }
+
+        bus.emit(
+            ThalamicPulse::Superseded { old_id: old_id.clone(), new_id: new_id.clone(), namespace: "ns".to_string() },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 2, "the retire + the replacement are both captured");
+        assert_eq!(pending[0].op, OP_SUPERSEDED);
+        assert_eq!(pending[0].id, old_id);
+        assert_eq!(pending[0].superseded_by.as_deref(), Some(new_id.as_str()));
+        assert_eq!(pending[1].op, OP_CREATED);
+        assert_eq!(pending[1].id, new_id);
+    }
+
+    #[tokio::test]
+    async fn an_archived_pulse_captures_the_tombstone() {
+        let dir = scratch("archived");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("archived-db", outbox_dir.clone(), wake).await;
+
+        let id = uuid::Uuid::new_v4().to_string();
+        store
+            .upsert("ns", &id, vec![0.0; TEST_DIMENSIONS], payload("fact", serde_json::json!({ "eligibility": "shareable", "archived": true })))
+            .await
+            .unwrap();
+
+        bus.emit(
+            ThalamicPulse::Archived { id: id.clone(), namespace: "ns".to_string() },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].op, OP_ARCHIVED);
+        assert_eq!(pending[0].id, id);
+    }
+
+    /// The subscriber's outbox directory is a sibling of the mesh checkout, so
+    /// it can never be staged into the mesh repo. Guarded here, at the
+    /// boundary the daemon wires.
+    #[test]
+    fn the_outbox_dir_is_outside_the_mesh_repo() {
+        let dir = PathBuf::from("/base/mesh-id");
+        let outbox = outbox_dir_for(&dir);
+        assert!(!outbox.starts_with(&dir));
+    }
+}

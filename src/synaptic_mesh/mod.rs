@@ -3,8 +3,9 @@
 //!
 //! Slice 1 landed the on-disk schemas (manifest, record); slice 2 landed the
 //! daemon-owned storage (git checkout per mesh), the CLI dispatch surface,
-//! and the MCP tool schemas. The outbox, mesh-worker, pull/replay, and
-//! lifecycle enforcement land in follow-up slices.
+//! and the MCP tool schemas. Slice 3 lands the publish path: the durable
+//! outbox and the mesh-worker that drains it. Pull/replay, lifecycle
+//! enforcement, and conflict resolution land in follow-up slices.
 
 pub mod cli;
 pub mod manifest;
@@ -13,6 +14,8 @@ pub mod record;
 pub mod storage;
 pub mod storage_api;
 pub mod tools;
+pub mod outbox;
+pub mod worker;
 
 pub use cli::{handle_synaptic_mesh_command, MeshContext, SynapticMeshCommands};
 pub use mesh_service::{

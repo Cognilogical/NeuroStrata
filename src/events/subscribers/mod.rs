@@ -9,7 +9,9 @@
 mod episodic_pointer_echo;
 mod export_freshness_dirty;
 mod guard_event_log;
+pub mod mesh_outbox;
 
 pub use self::episodic_pointer_echo::EpisodicPointerEcho;
 pub use self::export_freshness_dirty::{check_export_freshness, ExportFreshnessDirty};
 pub use self::guard_event_log::GuardEventLog;
+pub use self::mesh_outbox::MeshOutbox;
