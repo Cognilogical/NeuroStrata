@@ -4596,4 +4596,67 @@ mod tests {
             "include_archived surfaces the tombstoned row: {text}"
         );
     }
+
+    // ---- conflict suppression across the read surfaces ------------------
+    //
+    // A conflicting mesh row (`metadata.mesh.conflict == true`) is suppressed
+    // from search/snapshot even under `include_archived: true` — an unresolved
+    // conflict is never served until it is resolved, unlike a tombstone, which
+    // has an audit escape hatch. Search and snapshot both ask the one shared
+    // helper (`synaptic_mesh::conflict::is_conflicting`).
+
+    /// Seeds one live row plus one row marked `metadata.mesh.conflict = true`.
+    async fn store_with_live_and_conflicting(
+        namespace: &str,
+    ) -> (Arc<dyn VectorStore>, String, String) {
+        let (store, live_id) = store_with_one_rule(namespace).await;
+
+        let conflicting_id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload("always use podman, conflicting edit");
+        p.metadata = serde_json::json!({
+            "mesh": { "conflict": true, "conflict_reason": "incompatible content edits" }
+        });
+        let vector = StubEmbedder.embed("always use podman, conflicting edit").await.unwrap();
+        store
+            .upsert(namespace, &conflicting_id, vector, p)
+            .await
+            .expect("seed the conflicting row");
+
+        (store, live_id, conflicting_id)
+    }
+
+    #[tokio::test]
+    async fn search_hides_conflicting_rows_even_with_include_archived() {
+        let (store, live_id, conflicting_id) = store_with_live_and_conflicting("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "query": "podman",
+                "include_archived": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(text.contains(&live_id), "the live row surfaces: {text}");
+        assert!(
+            !text.contains(&conflicting_id),
+            "the conflicting row is suppressed from search: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_hides_conflicting_rows_even_with_include_archived() {
+        let (store, _live_id, conflicting_id) = store_with_live_and_conflicting("probe").await;
+        let text = handle_get_snapshot(
+            serde_json::json!({ "namespace": "probe", "include_archived": true }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+        assert!(
+            !text.contains(&conflicting_id),
+            "the conflicting row is never served, even under include_archived: {text}"
+        );
+    }
 }

@@ -105,6 +105,12 @@ impl Overlay {
     }
 
     /// The ids in `namespace` registered as *unresolved* (suppressible).
+    ///
+    /// The live suppression signal reads the row's `metadata.mesh.conflict`
+    /// marker (via [`is_conflicting_metadata`]) rather than this set, because
+    /// the store read paths carry no `mesh_dir`. This remains the overlay's
+    /// own query for `status_lines`/future read sites that do resolve the dir.
+    #[allow(dead_code)]
     pub fn unresolved_ids(&self, namespace: &str) -> HashSet<String> {
         self.conflicts
             .iter()
@@ -157,8 +163,12 @@ pub fn save_overlay(mesh_dir: &Path, overlay: &Overlay) -> anyhow::Result<()> {
         ),
     )
     .with_context(|| format!("overlay tmp could not be written at {}", tmp.display()))?;
-    std::fs::rename(&tmp, &file)
-        .with_context(|| format!("overlay could not be moved into place at {}", file.display()))?;
+    std::fs::rename(&tmp, &file).with_context(|| {
+        format!(
+            "overlay could not be moved into place at {}",
+            file.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -179,9 +189,8 @@ pub fn register_conflict(
     let variant_rel = format!("{namespace}/{id}.json");
     let variant_abs = dir.join(&variant_rel);
     if let Some(parent) = variant_abs.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("variant dir could not be created at {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("variant dir could not be created at {}", parent.display()))?;
     }
     std::fs::write(
         &variant_abs,
@@ -190,7 +199,12 @@ pub fn register_conflict(
             serde_json::to_string(candidate).context("candidate variant serialization")?
         ),
     )
-    .with_context(|| format!("candidate variant could not be written to {}", variant_abs.display()))?;
+    .with_context(|| {
+        format!(
+            "candidate variant could not be written to {}",
+            variant_abs.display()
+        )
+    })?;
 
     let mut overlay = load_overlay(mesh_dir);
     overlay
@@ -222,22 +236,30 @@ pub fn clear_conflict(mesh_dir: &Path, namespace: &str, id: &str) -> anyhow::Res
     save_overlay(mesh_dir, &overlay)
 }
 
-/// The one shared read-path question: is this row's id under an unresolved
-/// conflict overlay? Strict, like `is_archived`: only the literal JSON
-/// `metadata.mesh.conflict == true` reads as conflicting; anything else —
-/// absent, `false`, wrong type — is not.
-pub fn is_conflicting(payload: &MemoryPayload) -> bool {
-    payload
-        .metadata
+/// The one shared read-path question, core: is this metadata marked under an
+/// unresolved conflict overlay? Strict, like `is_archived`: only the literal
+/// JSON `metadata.mesh.conflict == true` reads as conflicting; anything else —
+/// absent, `false`, wrong type — is not. `is_conflicting` (the row-shaped
+/// wrapper) and the store's `export_graph` both call this so the three read
+/// surfaces can never disagree.
+pub fn is_conflicting_metadata(metadata: &serde_json::Value) -> bool {
+    metadata
         .get("mesh")
         .and_then(|m| m.get("conflict"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
 
+/// Row-shaped convenience for the server read sites (`search_memory`,
+/// `get_snapshot`).
+pub fn is_conflicting(payload: &MemoryPayload) -> bool {
+    is_conflicting_metadata(&payload.metadata)
+}
+
 /// Status lines for the `mesh status` surface (wired by the orchestrator at
 /// merge — slice 6 exports it, slice 7 owns `mesh_service::status_report`).
 /// Never fails: a missing/corrupt overlay yields an empty report.
+#[allow(dead_code)] // slice-7 seam: mesh_service::status_report wires it
 pub fn status_lines(mesh_dir: &Path) -> Vec<String> {
     let overlay = load_overlay(mesh_dir);
     let unresolved: Vec<&ConflictEntry> = overlay
@@ -256,7 +278,7 @@ pub fn status_lines(mesh_dir: &Path) -> Vec<String> {
     }
     lines.push(format!(
         "conflicts: {} unresolved{}",
-        unresolved.len(),
+        overlay.unresolved_count(),
         if preserved.is_empty() {
             String::new()
         } else {
@@ -264,7 +286,10 @@ pub fn status_lines(mesh_dir: &Path) -> Vec<String> {
         }
     ));
     for e in unresolved {
-        lines.push(format!("  {}/{}: {} (variant {})", e.namespace, e.id, e.reason, e.variant_file));
+        lines.push(format!(
+            "  {}/{}: {} (variant {})",
+            e.namespace, e.id, e.reason, e.variant_file
+        ));
     }
     for e in preserved {
         lines.push(format!(
@@ -329,7 +354,10 @@ mod tests {
             dir,
             Path::new("/tmp/neurostrata/synaptic-mesh/abc-123.conflicts")
         );
-        assert!(!dir.starts_with(mesh_dir), "must not nest inside the checkout");
+        assert!(
+            !dir.starts_with(mesh_dir),
+            "must not nest inside the checkout"
+        );
     }
 
     /// Registering a conflict durably preserves the variant, records the id,
@@ -353,7 +381,9 @@ mod tests {
         .unwrap();
 
         // Variant file exists, byte-parseable as the candidate.
-        let variant_path = conflicts_dir_for(&mesh_dir).join("probe").join(format!("{id}.json"));
+        let variant_path = conflicts_dir_for(&mesh_dir)
+            .join("probe")
+            .join(format!("{id}.json"));
         let saved: MeshRecord =
             serde_json::from_str(&std::fs::read_to_string(&variant_path).unwrap()).unwrap();
         assert_eq!(saved, cand, "variant preserved byte-for-byte");
@@ -370,7 +400,9 @@ mod tests {
             "lines: {lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains(&id.to_string()) && l.contains("incompatible")),
+            lines
+                .iter()
+                .any(|l| l.contains(&id.to_string()) && l.contains("incompatible")),
             "lines: {lines:?}"
         );
     }
@@ -397,7 +429,11 @@ mod tests {
             .unwrap();
         }
         let overlay = load_overlay(&mesh_dir);
-        assert_eq!(overlay.conflicts.len(), 1, "one entry after three registers");
+        assert_eq!(
+            overlay.conflicts.len(),
+            1,
+            "one entry after three registers"
+        );
         assert_eq!(overlay.unresolved_count(), 1);
     }
 

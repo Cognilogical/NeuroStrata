@@ -1639,6 +1639,15 @@ impl VectorStore for LadybugStore {
                     retired_ids.insert(id.clone());
                     continue;
                 }
+                // Conflicting mesh rows are suppressed from the effective view
+                // (spec §"Concurrent merge policy"): the same shared helper the
+                // search/snapshot read paths ask, so the three surfaces can
+                // never disagree. No escape hatch — an unresolved conflict is
+                // never served until it is resolved.
+                if crate::synaptic_mesh::conflict::is_conflicting_metadata(&full_metadata) {
+                    retired_ids.insert(id.clone());
+                    continue;
+                }
 
                 nodes.push(serde_json::json!({
                     "id": id,
