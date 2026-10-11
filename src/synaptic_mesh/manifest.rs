@@ -102,14 +102,11 @@ mod tests {
             epoch: 1,
             namespaces: vec!["stripe-api".to_string()],
             policy: MeshPolicy::default(),
-            remote: Some(
-                "https://github.com/team-cognilogical/mesh-stripe-api.git".to_string(),
-            ),
+            remote: Some("https://github.com/team-cognilogical/mesh-stripe-api.git".to_string()),
         };
 
         let json = serde_json::to_string(&manifest).expect("serialize manifest");
-        let restored: MeshManifest =
-            serde_json::from_str(&json).expect("deserialize manifest");
+        let restored: MeshManifest = serde_json::from_str(&json).expect("deserialize manifest");
 
         assert_eq!(
             restored, manifest,
@@ -131,7 +128,10 @@ mod tests {
         // require explicit eligibility, default procedures to untrusted, and
         // refuse history rewriting and auto-compaction by default.
         let p = MeshPolicy::default();
-        assert!(p.require_record_eligibility, "records must default to private");
+        assert!(
+            p.require_record_eligibility,
+            "records must default to private"
+        );
         assert_eq!(p.imported_procedures_trust, Trust::Untrusted);
         assert!(!p.allow_history_purge);
         assert!(!p.auto_compact);

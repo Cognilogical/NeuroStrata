@@ -51,8 +51,9 @@ pub enum SynapticMeshCommands {
 /// so those values have to arrive through a parameter — reading the process
 /// cwd or an environment variable inside the handler would make the advertised
 /// schema a lie and make the handler untestable off-machine. The call site
-/// (see `neurostrata-3h37`) resolves the defaults: cwd, `~/.NeuroStrata/
-/// synaptic-mesh`, and the configured node id.
+/// resolves the defaults: cwd, `~/.NeuroStrata/synaptic-mesh` (computed in
+/// `mesh_service::conventional_base_root` — deliberately NOT a method here,
+/// so no handler path can reach for it), and the configured node id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshContext {
     /// Project whose `.NeuroStrata/synaptic-mesh-ref` this session reads.
@@ -61,18 +62,6 @@ pub struct MeshContext {
     pub base_root: std::path::PathBuf,
     /// Identity stamped on every record this node publishes.
     pub node_id: String,
-}
-
-impl MeshContext {
-    /// The conventional mesh root: `~/.NeuroStrata/synaptic-mesh`
-    /// (spec §"Storage layout"). A convenience for call sites; the handler
-    /// only ever reads the field.
-    pub fn default_base_root() -> std::path::PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        home.join(".NeuroStrata").join("synaptic-mesh")
-    }
 }
 
 /// The pointer file a project carries to name its mesh.
