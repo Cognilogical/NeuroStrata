@@ -308,6 +308,26 @@ Together with SynapticGraph, the Engram, and the Central Executive, the architec
 
 ---
 
+## 🕸️ SynapticMesh (Mesh Sharing for Teams)
+
+*The inter-instance layer: memory travels BETWEEN agents on different machines over plain git.*
+
+Everything above is one machine's brain. **SynapticMesh** is what happens when a team wants its people's agents to hold the *same* memories: each daemon keeps a durable outbox (`WAL`) of its shareable mutations, a mesh-worker drains it into wire-format record files (`synaptic-mesh-record/v1`; rules, facts, and procedure definitions — never embeddings, never runtime counters, never tasks), and a git checkout per mesh (`~/.NeuroStrata/synaptic-mesh/<mesh_id>/`) is the whole transport. Sharing is a `git push`; receiving is a `git fetch` + validated replay (schema, namespace, id/filename match, lifecycle merge table, conflicts preserved — integration pauses loudly rather than silently dropping either side). Private rows on the receiving machine are never stomped, and a record id a private row already owns stays private.
+
+**Quickstart:**
+
+```bash
+neurostrata-mcp synaptic-mesh init platform-team --remote git@your.host:team/mesh.git
+neurostrata-mcp synaptic-mesh join /path/to/teammates-mesh-checkout   # second machine
+neurostrata-mcp synaptic-mesh status    # mesh id, namespace sync state, outbox, heads, health
+neurostrata-mcp synaptic-mesh pull && neurostrata-mcp synaptic-mesh push  # or manual whenever
+```
+(Expose the same verbs to your agent as MCP tools: `neurostrata_synaptic_mesh_{init,join,status,push,pull,leave}`. The project tree itself never touches the ledger — a one-line pointer file, `<project>/.NeuroStrata/synaptic-mesh-ref`, names the mesh repo, and the daemon manages the rest outside the project. `sync-enqueue` exists as a hidden pull-then-push target for optional project-side pre-push hooks and is fail-soft: a rejected push never blocks your source push.)
+
+**Permanence disclosure (also printed by `mesh join` / `mesh status`):** *the mesh is a permanent record shared with the team.* Archives/tombstones suppress content from search on every honest node, but the content lives in git history and every teammate's clone. Full erasure requires a coordinated history rewrite (`git filter-repo` per file) that every peer must consent to and then bump the mesh epoch — and a decentralized mesh cannot force an uncooperative peer's clone to forget anything. Share accordingly.
+
+---
+
 ## 🚀 Getting Started
 
 NeuroStrata is tool-agnostic. It integrates with the standard `~/.agents/` specification and registers directly into your AI client's configuration (like Claude Desktop or OpenCode).
