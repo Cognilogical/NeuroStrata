@@ -8,6 +8,7 @@
 //! enforcement, and conflict resolution land in follow-up slices.
 
 pub mod cli;
+pub mod conflict;
 pub mod import;
 pub mod manifest;
 pub mod mesh_service;

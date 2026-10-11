@@ -1287,6 +1287,9 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
     if !include_archived {
         all_memories.retain(|r| !crate::handlers::archive_memory::is_archived(&r.payload));
     }
+    // Conflicting mesh rows are suppressed from the snapshot's effective
+    // view too (same rationale as search_memory).
+    all_memories.retain(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload));
 
     // Counted from the list the snapshot already had to fetch, so this
     // costs nothing beyond the scan.
@@ -1756,6 +1759,13 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
                 if !include_archived {
                     results.retain(|r| !crate::handlers::archive_memory::is_archived(&r.payload));
                 }
+                // Conflicting mesh rows are suppressed from the effective
+                // view (spec §"Concurrent merge policy"): the local accepted
+                // projection may be stale, and the incoming variant is
+                // preserved in the conflict overlay for a human to resolve.
+                // Honesty: a conflicting row still carries
+                // `metadata.mesh.conflict` if it ever surfaces another way.
+                results.retain(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload));
                 results.truncate(5);
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
@@ -4585,6 +4595,69 @@ mod tests {
         assert!(
             text.contains(&archived_id),
             "include_archived surfaces the tombstoned row: {text}"
+        );
+    }
+
+    // ---- conflict suppression across the read surfaces ------------------
+    //
+    // A conflicting mesh row (`metadata.mesh.conflict == true`) is suppressed
+    // from search/snapshot even under `include_archived: true` — an unresolved
+    // conflict is never served until it is resolved, unlike a tombstone, which
+    // has an audit escape hatch. Search and snapshot both ask the one shared
+    // helper (`synaptic_mesh::conflict::is_conflicting`).
+
+    /// Seeds one live row plus one row marked `metadata.mesh.conflict = true`.
+    async fn store_with_live_and_conflicting(
+        namespace: &str,
+    ) -> (Arc<dyn VectorStore>, String, String) {
+        let (store, live_id) = store_with_one_rule(namespace).await;
+
+        let conflicting_id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload("always use podman, conflicting edit");
+        p.metadata = serde_json::json!({
+            "mesh": { "conflict": true, "conflict_reason": "incompatible content edits" }
+        });
+        let vector = StubEmbedder.embed("always use podman, conflicting edit").await.unwrap();
+        store
+            .upsert(namespace, &conflicting_id, vector, p)
+            .await
+            .expect("seed the conflicting row");
+
+        (store, live_id, conflicting_id)
+    }
+
+    #[tokio::test]
+    async fn search_hides_conflicting_rows_even_with_include_archived() {
+        let (store, live_id, conflicting_id) = store_with_live_and_conflicting("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "query": "podman",
+                "include_archived": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(text.contains(&live_id), "the live row surfaces: {text}");
+        assert!(
+            !text.contains(&conflicting_id),
+            "the conflicting row is suppressed from search: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_hides_conflicting_rows_even_with_include_archived() {
+        let (store, _live_id, conflicting_id) = store_with_live_and_conflicting("probe").await;
+        let text = handle_get_snapshot(
+            serde_json::json!({ "namespace": "probe", "include_archived": true }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+        assert!(
+            !text.contains(&conflicting_id),
+            "the conflicting row is never served, even under include_archived: {text}"
         );
     }
 }
