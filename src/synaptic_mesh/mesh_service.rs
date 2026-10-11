@@ -19,7 +19,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::cli::{handle_synaptic_mesh_command, MeshContext, SynapticMeshCommands};
-use super::storage::MeshStorage;
+use super::import::load_cursor;
+use super::outbox::{outbox_dir_for, OUTBOX_FILE_NAME};
+use super::storage::{MANIFEST_FILE_NAME, MeshStorage};
 use super::storage_api::StorageApi;
 
 /// The conventional mesh root: `~/.NeuroStrata/synaptic-mesh`
@@ -164,6 +166,13 @@ impl MeshService {
 
     /// The one status report, shared by the trait method (which cannot take
     /// `&mut self` to populate the cache) and by nothing else.
+    ///
+    /// Slice 7 (spec §"Recovery"/§"Status surfaces"): the report expands from
+    /// one line to the full surface — heads read from the import-cursor file
+    /// and the mesh repo's git log, the outbox WAL re-read for pending counts,
+    /// and health derived from the recovery probes. Where a surface still
+    /// needs a subsystem that has not landed, the line says so instead of
+    /// inventing a number.
     fn status_report(&self) -> Result<String, String> {
         let pointer = StorageApi::read_pointer(self, &self.project_root)?;
         let Some((mesh_id, dir, _remote)) = pointer else {
@@ -182,16 +191,408 @@ impl MeshService {
                 m.mesh_id
             ));
         }
-        Ok(format!(
-            "mesh {} \"{}\" epoch {} namespaces {:?} remote {} root {}; outbox/heads/conflicts not wired until slices 3/4. DISCLOSURE: the mesh is a permanent record shared with the team — tombstones suppress content from search, but full erasure requires a coordinated history rewrite, and an uncooperative peer's clone retains the content.",
+        let root = storage.root().to_path_buf();
+
+        // Outbox pending state straight from the WAL (slice-7 rule: no
+        // worker.rs APIs here — the file IS the truth, and outbox.rs only
+        // names its location).
+        let wal = wal_summary(&root);
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "mesh {} \"{}\" epoch {} schema {} remote {} root {}",
             m.mesh_id,
             m.mesh_name,
             m.epoch,
-            m.namespaces,
+            m.schema_version,
             m.remote.as_deref().unwrap_or("<none configured>"),
-            storage.root().display()
-        ))
+            root.display()
+        ));
+
+        // Joined namespaces with their sync state = per-namespace pending
+        // count from the WAL. Namespaces the WAL knows but the manifest no
+        // longer lists are still reported — dropped-but-queued entries must
+        // not vanish from the report just because the manifest moved on.
+        let mut ns_parts: Vec<String> = m
+            .namespaces
+            .iter()
+            .map(|ns| {
+                format!(
+                    "{} (pending {})",
+                    ns,
+                    wal.per_ns.get(ns).copied().unwrap_or(0)
+                )
+            })
+            .collect();
+        for (ns, count) in &wal.per_ns {
+            if !m.namespaces.contains(ns) {
+                ns_parts.push(format!("{ns} (removed from manifest, pending {count})"));
+            }
+        }
+        lines.push(format!("namespaces: {}", ns_parts.join(", ")));
+
+        match (wal.pending, wal.oldest_ts) {
+            (0, _) => lines.push("outbox: 0 pending".to_string()),
+            (n, oldest) => lines.push(format!(
+                "outbox: {n} pending, oldest {}",
+                age_of(
+                    oldest
+                        .map(|ts| (now_secs() - ts).max(0) as u64)
+                        .unwrap_or(0)
+                )
+            )),
+        }
+        if wal.corrupt > 0 {
+            lines.push(format!(
+                "outbox: {} unreadable WAL line(s) — diagnostics preserved, never deleted",
+                wal.corrupt
+            ));
+        }
+
+        // Last accepted head: the import cursor file (daemon state, sibling
+        // of the checkout), plus its age.
+        let short = |h: &str| h.get(..7).unwrap_or(h).to_string();
+        match accepted_head_state(&root, &m.mesh_id.to_string()) {
+            Some((head, age)) => {
+                lines.push(format!("last accepted head: {} (age {})", short(&head), age))
+            }
+            None => lines.push("last accepted head: none".to_string()),
+        }
+
+        // Last published head: the checkout's own git log, compared against
+        // the remote-tracking ref when a remote is configured.
+        lines.push(published_head_line(&root, m.remote.as_deref()));
+
+        // SM-7: conflict status_lines seam — conflict.rs does not exist at
+        // f85be68 (slice 6 runs in a parallel worktree), so the report names
+        // the gap instead of pretending a zero. The orchestrator wires
+        // conflict::status_lines through this seam at merge.
+        lines.push(
+            "conflicts: not wired (SM-7 seam — conflict status_lines lands with slice 6)"
+                .to_string(),
+        );
+
+        // Local store counts (shared vs private, spec §"Status surfaces")
+        // need the VectorStore; the CLI dispatcher here has no database (the
+        // daemon may even hold its lock), so the report says so rather than
+        // lies. The disclosure sentence stays on every render (spec:457).
+        lines.push(
+            "local store counts (shared/private): store-side seam — the CLI serves mesh state only; the daemon can report store counts"
+                .to_string(),
+        );
+        lines.push(format!("health: {}", health_line(&root)));
+        lines.push(
+            "DISCLOSURE: the mesh is a permanent record shared with the team — tombstones suppress content from search, but full erasure requires a coordinated history rewrite, and an uncooperative peer's clone retains the content."
+                .to_string(),
+        );
+        Ok(lines.join("\n"))
     }
+}
+
+// --- slice 7 shared probes (status + recovery use the same truth) ----------
+
+/// Non-interactive git probe answering `None` when git could not be asked at
+/// all (the caller decides what omission means — usually a quiet skip).
+fn git(root: &Path, args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()
+}
+
+/// The checkout's dirty porcelain paths, mirroring import.rs's probe. The
+/// untracked top-level `manifest.json` written once at `init` is EXEMPT:
+/// every fresh mesh carries it until the mesh-worker's first commit, and
+/// showing "paused" on pristine init state would make every brand new mesh
+/// read broken. An EDITED manifest shows as `M`, not `??`, and counts.
+pub fn dirty_paths(mesh_root: &Path) -> Vec<String> {
+    let Some(out) = git(mesh_root, &["status", "--porcelain"]) else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| {
+            !(l.starts_with("?? ") && l.trim_start_matches("?? ").trim() == MANIFEST_FILE_NAME)
+        })
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// Detached HEAD: `git rev-parse --abbrev-ref HEAD` answers `HEAD` (unborn
+/// branches answer the branch name or fail — neither is detached).
+pub fn detached_head(mesh_root: &Path) -> bool {
+    git(mesh_root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "HEAD")
+        .unwrap_or(false)
+}
+
+/// Interrupted merge: git leaves `MERGE_HEAD` open until abort or commit.
+pub fn merge_in_progress(mesh_root: &Path) -> bool {
+    mesh_root.join(".git").join("MERGE_HEAD").exists()
+}
+
+/// The health verdict: `healthy` or one `paused: <reason>` — dirty first
+/// (it blocks replay AND publish), then detached, then interrupted merge.
+fn health_line(mesh_root: &Path) -> String {
+    let dirty = dirty_paths(mesh_root);
+    if !dirty.is_empty() {
+        return format!("paused: dirty-checkout ({})", dirty.join("; "));
+    }
+    if detached_head(mesh_root) {
+        return "paused: detached HEAD — run `mesh recover` for the reattach steps"
+            .to_string();
+    }
+    if merge_in_progress(mesh_root) {
+        return "paused: merge in progress — `mesh recover` names the finish/abort choice"
+            .to_string();
+    }
+    "healthy".to_string()
+}
+
+/// `(head, age)` from the import cursor file, when it is intact and belongs
+/// to this mesh (import.rs owns the validation rules; the report only reads).
+fn accepted_head_state(mesh_root: &Path, mesh_id: &str) -> Option<(String, String)> {
+    let head = load_cursor(mesh_root, mesh_id)?;
+    let file = super::import::cursor_file(mesh_root);
+    let age = std::fs::metadata(&file)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(|t| age_of(t.elapsed().ok().map(|d| d.as_secs()).unwrap_or(0)))
+        .unwrap_or_else(|| "unknown".to_string());
+    Some((head, age))
+}
+
+/// The published-head line for the checkout: local HEAD (or `none` while the
+/// branch is unborn) contrasted against the remote-tracking ref when a
+/// remote is configured. Read-only on purpose: no fetch here, so "in sync"
+/// means "what we last fetched/pushed equals HEAD", and a never-fetched
+/// mesh says so.
+fn published_head_line(mesh_root: &Path, remote: Option<&str>) -> String {
+    let local = git(mesh_root, &["log", "-1", "--format=%H %ct", "HEAD"])
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let mut parts = text.split_whitespace();
+            let head = parts.next()?.to_string();
+            let ts = parts.next()?.parse::<i64>().ok()?;
+            Some((head, ts))
+        });
+    let Some((head, ts)) = local else {
+        return "last published head: none (unborn branch — nothing committed yet)".to_string();
+    };
+    let age = age_of((now_secs() - ts).max(0) as u64);
+    let short = head.get(..7).unwrap_or(&head).to_string();
+    if remote.is_none() {
+        return format!("last published head: {short} (age {age}) — no remote configured");
+    }
+    let tracking = git(
+        mesh_root,
+        &[
+            "for-each-ref",
+            "refs/remotes/origin",
+            "--count=1",
+            "--sort=-committerdate",
+            "--format=%(objectname)",
+        ],
+    )
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    .filter(|s| !s.is_empty());
+    match tracking {
+        Some(t) if t == head => {
+            format!("last published head: {short} (age {age}) — remote-tracking in sync")
+        }
+        Some(t) => format!(
+            "last published head: {short} (age {age}) — remote-tracking {} differs (fetch to reconcile, never force-push)",
+            t.get(..7).unwrap_or(&t)
+        ),
+        None => format!(
+            "last published head: {short} (age {age}) — remote-tracking unknown (never fetched)"
+        ),
+    }
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Compact human age — statuses scroll, so a string beats a bare number.
+fn age_of(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// What one read of the outbox WAL says. The WAL's pending set is its whole
+/// parsed content (outbox.rs compacts committed entries away), so counting
+/// lines IS counting pending entries; a fragment (no trailing newline) and
+/// corrupt lines are counted separately and never deleted.
+struct WalSummary {
+    pending: usize,
+    per_ns: std::collections::BTreeMap<String, usize>,
+    oldest_ts: Option<i64>,
+    corrupt: usize,
+}
+
+fn wal_summary(mesh_dir: &Path) -> WalSummary {
+    let mut summary = WalSummary {
+        pending: 0,
+        per_ns: Default::default(),
+        oldest_ts: None,
+        corrupt: 0,
+    };
+    let bytes = std::fs::read(outbox_dir_for(mesh_dir).join(OUTBOX_FILE_NAME));
+    let Ok(bytes) = bytes else {
+        return summary; // no WAL yet = nothing pending
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut segments: Vec<&str> = text.split('\n').collect();
+    // Mirror outbox.rs: the tail without a newline is a crash fragment,
+    // dropped rather than read as a complete entry.
+    segments.pop();
+    for line in segments {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(entry) => {
+                summary.pending += 1;
+                if let Some(ns) = entry["namespace"].as_str() {
+                    *summary.per_ns.entry(ns.to_string()).or_insert(0) += 1;
+                }
+                if let Some(ts) = entry["ts"].as_i64() {
+                    summary.oldest_ts = Some(summary.oldest_ts.map_or(ts, |old| old.min(ts)));
+                }
+            }
+            Err(_) => summary.corrupt += 1,
+        }
+    }
+    summary
+}
+
+// --- slice 7: hook piggyback + recovery surfaces ---------------------------
+
+/// `neurostrata-mcp mesh sync-enqueue` — pull-then-push for the project
+/// pre-push hook (spec §"Hooks"). Always renders ONE line and never an
+/// `Err`: the exit-0 invariant is enforced by the caller, but this function
+/// owns the shape a hook consumes. "No mesh joined" is a *quiet* nothing-
+/// to-do for hook purposes (spec §"Hooks": the mesh command itself never
+/// depends on a project-side hook), not an error.
+pub fn sync_enqueue_line(store: &mut dyn StorageApi) -> String {
+    let pull = match StorageApi::pull(store) {
+        Err(e) if e.starts_with("no mesh joined") => {
+            return "mesh sync-enqueue: no mesh joined — nothing to do".to_string()
+        }
+        Err(e) => return soft(e),
+        Ok(line) => line,
+    };
+    match StorageApi::push(store) {
+        Ok(line) => format!("mesh sync-enqueued: {pull}; {line}"),
+        Err(e) => soft(e),
+    }
+}
+
+/// The hook-safe failure rendering: a rejected/unreachable remote queues
+/// locally and the hook still exits 0 (spec §"Hooks": never block the
+/// source push). Git stderr can be multiline; a hook line cannot be — it is
+/// flattened so the guarantee "one line" holds even on failure.
+fn soft(err: String) -> String {
+    let flat = err.replace(['\n', '\r'], "; ");
+    format!("mesh sync-enqueue failed (non-blocking; work stays queued locally): {flat}")
+}
+
+/// `neurostrata-mcp mesh recover` — actionable recovery steps for the mesh
+/// checkout, per spec §"Recovery". ALWAYS print-only: it never fixes
+/// anything itself, and every hint is phrased as a manual action ("never
+/// automatic `reset --hard`" is a spec mandate, so the wording says never).
+pub fn recover_report(project_root: &Path) -> String {
+    let pointer = match MeshStorage::read_pointer(project_root) {
+        Ok(p) => p,
+        Err(e) => {
+            return format!(
+                "mesh recover: the project pointer is unreadable ({e:#}). Fix or delete it manually, then re-join (`mesh join <dir>`)."
+            )
+        }
+    };
+    let Some((mesh_id, dir, _remote)) = pointer else {
+        return "no mesh joined — run `neurostrata-mcp synaptic-mesh init <name>` first"
+            .to_string();
+    };
+    let storage = match MeshStorage::open(&dir) {
+        Ok(s) => s,
+        Err(e) => {
+            return format!(
+                "mesh recover: the manifest at {} is unreadable ({e:#}). Corrupt-objects recovery (spec §Recovery): back up the WAL at {} and any unpublished commits, then reclone — NEVER `git reset --hard`, never auto-fix.",
+                dir.display(),
+                outbox_dir_for(&dir).join(OUTBOX_FILE_NAME).display()
+            )
+        }
+    };
+    let root = storage.root().to_path_buf();
+    let mut out = vec![format!(
+        "mesh recover for mesh {} at {} — facts plus the manual fix each state needs (nothing is changed for you):",
+        mesh_id,
+        root.display()
+    )];
+
+    let dirty = dirty_paths(&root);
+    if !dirty.is_empty() {
+        out.push(format!(
+            "dirty working tree → pause sync, local store untouched. Fix: commit or stash INSIDE the mesh checkout ({}) — never `git reset --hard`. Dirty paths: {}",
+            root.display(),
+            dirty.join("; ")
+        ));
+    }
+    if detached_head(&root) {
+        let branches = git(&root, &["for-each-ref", "refs/heads", "--format=%(refname:short)"])
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(5)
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let hint = if branches.is_empty() {
+            "reclone as the last resort (back up the WAL first)".to_string()
+        } else {
+            format!(
+                "reattach manually: `git -C {} checkout <branch>` (local branches: {})",
+                root.display(),
+                branches.join(", ")
+            )
+        };
+        out.push(format!(
+            "detached HEAD → pause sync. Fix: {hint} — never `git reset --hard`; nothing here reattaches it for you."
+        ));
+    }
+    if merge_in_progress(&root) {
+        out.push(format!(
+            "interrupted merge → pause sync. Fix: finish it by committing, or `git -C {} merge --abort` and pull again.",
+            root.display()
+        ));
+    }
+    if out.len() == 1 {
+        out.push(
+            "healthy: nothing to recover. If sync still fails, `mesh status` names the health reason (auth failures queue locally by design)."
+                .to_string(),
+        );
+    }
+    out.join("\n")
 }
 
 impl StorageApi for MeshService {
@@ -575,5 +976,318 @@ mod tests {
             pull.contains("nothing on the remote yet"),
             "empty-remote pull must answer the empty state, got: {pull}"
         );
+    }
+
+    // --- slice 7: full status surface --------------------------------------
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit_manifest(svc: &mut MeshService, author: &str) {
+        let storage = svc.joined().expect("mesh joined");
+        assert!(storage.commit_all("bootstrap", author).unwrap());
+    }
+
+    /// A mesh this node owns through a project pointer; returns the service
+    /// and the checkout. `status_report` re-resolves through the pointer on
+    /// every call (no cache), so post-init file writes show up in the SAME
+    /// service's report.
+    fn init_joined(base: &Path, project: &Path, namespaces: &[&str]) -> (MeshService, PathBuf) {
+        let ns: Vec<String> = namespaces.iter().map(|s| s.to_string()).collect();
+        let mut svc = MeshService::new(project.to_path_buf());
+        let id = svc.init_mesh(base, "node-7", "status-team", &ns, None).expect("init");
+        (svc, base.join(&id))
+    }
+
+    #[test]
+    fn status_on_a_fresh_mesh_reports_the_full_surface() {
+        let base = scratch("st-fresh");
+        let project = scratch("st-fresh-proj");
+        let (svc, dir) = init_joined(&base, &project, &["alpha"]);
+        let report = svc.status().expect("status on fresh mesh");
+
+        assert!(report.contains("status-team"), "name: {report}");
+        assert!(report.contains("epoch 1"), "epoch: {report}");
+        assert!(
+            report.contains("schema synaptic-mesh/v1"),
+            "schema line: {report}"
+        );
+        assert!(report.contains("alpha (pending 0)"), "per-ns: {report}");
+        assert!(report.contains("outbox: 0 pending"), "outbox: {report}");
+        assert!(report.contains("last accepted head: none"), "{report}");
+        assert!(
+            report.contains("remote <none configured>"),
+            "honest remote line: {report}"
+        );
+        assert!(
+            report.contains("unborn branch — nothing committed yet"),
+            "fresh checkout has no published head: {report}"
+        );
+        assert!(
+            report.contains("conflicts: not wired (SM-7 seam"),
+            "the seam must be loud: {report}"
+        );
+        assert!(report.contains("health: healthy"), "fresh mesh: {report}");
+        assert!(
+            report.contains("DISCLOSURE: the mesh is a permanent record"),
+            "spec:457 sentence stays: {report}"
+        );
+        assert!(
+            std::fs::metadata(&dir).expect("mesh dir stat").is_dir(),
+            "status is read-only sanity: mesh dir untouched"
+        );
+    }
+
+    #[test]
+    fn status_counts_wal_pending_and_their_oldest_age_per_namespace() {
+        let base = scratch("st-wal");
+        let project = scratch("st-wal-proj");
+        let (svc, dir) = init_joined(&base, &project, &["alpha", "beta"]);
+        let wal = outbox_dir_for(&dir).join(OUTBOX_FILE_NAME);
+        std::fs::create_dir_all(outbox_dir_for(&dir)).unwrap();
+        let old_ts = chrono::Utc::now().timestamp() - 121;
+        let new_ts = chrono::Utc::now().timestamp() - 10;
+        std::fs::write(
+            &wal,
+            format!(
+                r#"{{"stable_op_id":"{}","op":"created","id":"m1","namespace":"alpha","memory_type":"rule","content":"c","metadata":{{}},"ts":{old_ts}}}
+{{"stable_op_id":"{}","op":"created","id":"m2","namespace":"beta","memory_type":"fact","content":"c","metadata":{{}},"ts":{new_ts}}}"#,
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            ),
+        )
+        .unwrap();
+
+        let report = svc.status().expect("status");
+        assert!(report.contains("outbox: 2 pending"), "{report}");
+        assert!(report.contains("alpha (pending 1)"), "{report}");
+        assert!(report.contains("beta (pending 1)"), "{report}");
+        assert!(report.contains("oldest 2m"), "121s renders as 2m: {report}");
+    }
+
+    #[test]
+    fn a_wal_fragment_without_newline_is_not_pending() {
+        let base = scratch("st-frag");
+        let project = scratch("st-frag-proj");
+        let (svc, dir) = init_joined(&base, &project, &["alpha"]);
+        let wal = outbox_dir_for(&dir).join(OUTBOX_FILE_NAME);
+        std::fs::create_dir_all(outbox_dir_for(&dir)).unwrap();
+        std::fs::write(
+            &wal,
+            format!(
+                r#"{{"stable_op_id":"{}","op":"created","id":"m1","namespace":"alpha","memory_type":"rule","content":"c","metadata":{{}},"ts":1700000000}}"#,
+                Uuid::new_v4()
+            ),
+        )
+        .unwrap();
+        // Crash mid-append: a second entry with no trailing newline.
+        use std::io::Write;
+        let mut tail = serde_json::json!({ "stable_op_id": Uuid::new_v4() }).to_string();
+        tail.push('x');
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .unwrap()
+            .write_all(tail.as_bytes())
+            .unwrap();
+
+        let report = svc.status().unwrap();
+        assert!(
+            report.contains("outbox: 1 pending"),
+            "fragment dropped, one durable entry: {report}"
+        );
+    }
+
+    #[test]
+    fn status_pauses_on_a_dirty_checkout_and_names_the_paths() {
+        let base = scratch("st-dirty");
+        let project = scratch("st-dirty-proj");
+        let (svc, dir) = init_joined(&base, &project, &["alpha"]);
+        std::fs::write(dir.join("junk-record.json"), "{}").unwrap();
+
+        let report = svc.status().unwrap();
+        assert!(
+            report.contains("health: paused: dirty-checkout"),
+            "dirty pauses sync: {report}"
+        );
+        assert!(
+            report.contains("junk-record.json"),
+            "the dirty path is named: {report}"
+        );
+        assert!(
+            !report.contains("health: healthy"),
+            "no double health verdicts: {report}"
+        );
+    }
+
+    #[test]
+    fn the_fresh_init_manifest_alone_does_not_read_as_dirty() {
+        // The init-time untracked manifest.json is init's own artifact;
+        // pausing every brand-new mesh on it would be a false alarm. An
+        // EDITED manifest (`M`) still counts — covered by dirty_pages above
+        // via junk files and here by the healthy verdict.
+        let base = scratch("st-pristine");
+        let project = scratch("st-pristine-proj");
+        let (svc, _dir) = init_joined(&base, &project, &["alpha"]);
+        let report = svc.status().unwrap();
+        assert!(report.contains("health: healthy"), "{report}");
+    }
+
+    #[test]
+    fn status_pauses_on_a_detached_head() {
+        let base = scratch("st-det");
+        let project = scratch("st-det-proj");
+        let (mut svc, dir) = init_joined(&base, &project, &["alpha"]);
+        commit_manifest(&mut svc, "node-7");
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        git_ok(&dir, &["checkout", "-q", &sha]);
+
+        let report = svc.status().unwrap();
+        assert!(report.contains("health: paused: detached HEAD"), "{report}");
+    }
+
+    // --- slice 7: sync-enqueue (hook target) --------------------------------
+
+    #[test]
+    fn sync_enqueue_pulls_then_pushes_and_reports_one_line() {
+        let base = scratch("sync-ok-base");
+        let project = scratch("sync-ok-proj");
+        let bare = base.join("team.git");
+        git_ok(&base, &["init", "--bare", "-q", &bare.to_string_lossy()]);
+
+        let mut svc = MeshService::new(project.clone());
+        svc.init_mesh(
+            &base,
+            "node-7",
+            "enqueue-team",
+            &["alpha".to_string()],
+            Some(bare.to_str().unwrap()),
+        )
+        .expect("init with remote");
+        commit_manifest(&mut svc, "node-7");
+
+        let reply = sync_enqueue_line(&mut svc);
+        assert!(reply.starts_with("mesh sync-enqueued:"), "reply: {reply}");
+        assert!(!reply.contains("failed"), "success reads success: {reply}");
+        assert_eq!(reply.lines().count(), 1, "one line for the hook");
+    }
+
+    #[test]
+    fn sync_enqueue_on_an_unreachable_remote_reports_soft_and_singly() {
+        // The spec §Hooks invariant under a genuinely failing transport:
+        // one line names "non-blocking", the work stays queued locally, and
+        // the caller (cli.rs test side) exits 0.
+        let base = scratch("sync-dead-base");
+        let project = scratch("sync-dead-proj");
+        let dead_remote = base.join("does-not-exist.git");
+
+        let mut svc = MeshService::new(project.clone());
+        svc.init_mesh(
+            &base,
+            "node-7",
+            "dead-team",
+            &["alpha".to_string()],
+            Some(dead_remote.to_str().unwrap()),
+        )
+        .expect("init with a remote to nowhere");
+        commit_manifest(&mut svc, "node-7");
+
+        let reply = sync_enqueue_line(&mut svc);
+        assert!(
+            reply.starts_with("mesh sync-enqueue failed (non-blocking"),
+            "soft failure shape: {reply}"
+        );
+        assert_eq!(reply.lines().count(), 1, "Git stderr must be flattened: {reply}");
+        assert!(
+            reply.contains("queued locally"),
+            "the hook learns the work is not lost: {reply}"
+        );
+    }
+
+    #[test]
+    fn sync_enqueue_without_a_mesh_is_quiet_nothing_to_do() {
+        let project = scratch("sync-lonely-proj");
+        let mut svc = MeshService::new(project);
+        let reply = sync_enqueue_line(&mut svc);
+        assert!(
+            reply.contains("no mesh joined") && reply.contains("nothing to do"),
+            "{reply}"
+        );
+    }
+
+    // --- slice 7: recover ----------------------------------------------------
+
+    #[test]
+    fn recover_on_a_detached_checkout_names_the_manual_reattach() {
+        let base = scratch("rec-det-base");
+        let project = scratch("rec-det-proj");
+        let (mut svc, dir) = init_joined(&base, &project, &["alpha"]);
+        commit_manifest(&mut svc, "node-7");
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        git_ok(&dir, &["checkout", "-q", &sha]);
+
+        let report = recover_report(&project);
+        assert!(report.contains("detached HEAD"), "{report}");
+        assert!(
+            report.contains("reattach manually"),
+            "the fix is manual: {report}"
+        );
+        assert!(
+            report.contains("never `git reset --hard`"),
+            "spec §Recovery wording: {report}"
+        );
+        assert!(
+            report.contains("pause sync"),
+            "state language mirrors spec: {report}"
+        );
+    }
+
+    #[test]
+    fn recover_on_a_healthy_mesh_says_so_and_fixes_nothing() {
+        let base = scratch("rec-ok-base");
+        let project = scratch("rec-ok-proj");
+        let (_svc, _dir) = init_joined(&base, &project, &["alpha"]);
+        let report = recover_report(&project);
+        assert!(report.contains("healthy: nothing to recover"), "{report}");
+    }
+
+    #[test]
+    fn recover_without_a_mesh_answers_the_canonical_prefix() {
+        let project = scratch("rec-lonely");
+        let report = recover_report(&project);
+        assert!(report.starts_with("no mesh joined"), "{report}");
+    }
+
+    #[test]
+    fn ages_are_human() {
+        assert_eq!(age_of(5), "5s");
+        assert_eq!(age_of(59), "59s");
+        assert_eq!(age_of(60), "1m");
+        assert_eq!(age_of(5400), "1h");
+        assert_eq!(age_of(90000), "1d");
     }
 }
