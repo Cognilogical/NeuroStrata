@@ -1228,6 +1228,13 @@ async fn apply_effective(
 /// superseded as-is and the candidate becomes the new record. Direction B
 /// (local is the edit, candidate supersedes): the supersession applies to X
 /// and the local edit becomes the new record.
+///
+/// Direction B's preserved-edit record used to rebuild content as a
+/// `{"text": <string>}` wrapper and write a fixed metadata literal, which
+/// string-in-stringed a procedure definition and dropped the row's own
+/// metadata and relationships. Fixed 2026-10-11 (slice-6b): the preserved
+/// record now carries the row's structured content, merged metadata and
+/// reconstructed relationships — see [`preserved_edit_record`].
 async fn preserve_superseded_edit(
     root: &Path,
     mesh_id: &str,
@@ -1240,7 +1247,11 @@ async fn preserve_superseded_edit(
     emb: std::sync::Arc<dyn Embedder>,
 ) -> Disposition {
     // Which side holds the edit, and must the incoming supersession apply?
-    let (content, memory_type, created_by, source_rels, apply_supersession) =
+    // `source_metadata` is the metadata the new record inherits from the
+    // losing edit's side (candidate metadata for direction A, the existing
+    // row's for direction B), merged with the gate fields rather than
+    // replaced by a fixed literal (slice-6b, 2026-10-11).
+    let (content, memory_type, created_by, source_rels, source_metadata, apply_supersession) =
         if local_state == LifecycleState::Superseded {
             // The incoming candidate is the edit; X is already superseded.
             (
@@ -1248,15 +1259,20 @@ async fn preserve_superseded_edit(
                 cand.memory_type.clone(),
                 cand.lifecycle.created_by.clone(),
                 cand.relationships.clone(),
+                cand.metadata.clone(),
                 false,
             )
         } else {
             // The local row is the edit; apply the incoming supersession.
+            // Carry the row's own structured content, metadata and
+            // relationships rather than a lossy `{"text": ...}` wrapper and
+            // an empty relationship list.
             (
-                json!({ "text": local_payload.content.clone() }),
+                local_content_value(local_payload),
                 local_payload.memory_type.clone(),
                 local_origin(local_payload),
-                Vec::new(),
+                local_relationships(local_payload),
+                local_payload.metadata.clone(),
                 true,
             )
         };
@@ -1279,40 +1295,16 @@ async fn preserve_superseded_edit(
         }
     }
 
-    // The new record references the retired id (spec: `relationships:
-    // [{kind: "references", target: original_id}]`), surfaced in metadata
-    // too so the linkage is visible on the store row.
-    let mut rels = source_rels;
-    if let Ok(original_id) = Uuid::parse_str(id) {
-        rels.push(Relationship {
-            kind: "references".to_string(),
-            target: original_id,
-        });
-    }
-    let new_record = MeshRecord {
-        schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
-        id: Uuid::new_v4(),
-        namespace: namespace.to_string(),
-        memory_type,
-        lifecycle: Lifecycle {
-            state: LifecycleState::Active,
-            created_at: chrono::Utc::now(),
-            created_by,
-            superseded_by: None,
-            archived_at: None,
-            tombstoned_at: None,
-        },
+    let new_record = preserved_edit_record(
+        namespace,
+        id,
         content,
-        metadata: json!({
-            "eligibility": "shareable",
-            "trust": "untrusted",
-            "references": [id],
-        }),
-        relationships: rels,
-        update_id: Uuid::new_v4(),
-        origin_mesh_epoch: cand.origin_mesh_epoch,
-        trust: Trust::Untrusted,
-    };
+        memory_type,
+        created_by,
+        source_rels,
+        source_metadata,
+        cand.origin_mesh_epoch,
+    );
     let new_id = new_record.id.to_string();
     apply_effective(
         root,
@@ -1337,6 +1329,103 @@ fn local_origin(payload: &MemoryPayload) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// The local row's content, preserved as its structured `Value` rather than a
+/// `{"text": ...}` wrapper. The store flattens content to text at apply time
+/// ([`content_text`]: the `text` field, else the serialized content), so a
+/// structured definition (a procedure's trigger/valid_to/rehearsal_script)
+/// lives in `payload.content` as its JSON serialization. Re-parsing it keeps
+/// the structure intact (slice-6b, 2026-10-11); plain text stays wrapped.
+fn local_content_value(payload: &MemoryPayload) -> Value {
+    match serde_json::from_str::<Value>(&payload.content) {
+        Ok(value) if value.is_object() => value,
+        _ => json!({ "text": payload.content.clone() }),
+    }
+}
+
+/// The existing row's mesh relationships, reconstructed from its metadata.
+/// Mesh `relationships` are not stored in the graph store; only these metadata
+/// fields survive the apply — `references` (array) mirrors `references` links
+/// and `supersedes` (string) mirrors a `supersedes` link, matching
+/// [`super::worker::build_record`]'s read of `metadata.supersedes`.
+fn local_relationships(payload: &MemoryPayload) -> Vec<Relationship> {
+    let mut rels = Vec::new();
+    if let Some(arr) = payload.metadata.get("references").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(target) = item.as_str().and_then(|s| Uuid::parse_str(s).ok()) {
+                rels.push(Relationship {
+                    kind: "references".to_string(),
+                    target,
+                });
+            }
+        }
+    }
+    if let Some(target) = payload
+        .metadata
+        .get("supersedes")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())
+    {
+        rels.push(Relationship {
+            kind: "supersedes".to_string(),
+            target,
+        });
+    }
+    rels
+}
+
+/// Build the preserved-edit record for `supersede + content edit` (pure).
+/// The losing edit's own content/type/creator/relationships/metadata are
+/// carried forward; the record references the retired `original_id`
+/// (`relationships: [{kind: "references", target: original_id}]`, spec
+/// §"Concurrent merge policy"), surfaced in metadata too so the linkage is
+/// visible on the store row. Only `eligibility`, `trust` and `references` are
+/// (re)set on the metadata — every other key the edit carried survives.
+fn preserved_edit_record(
+    namespace: &str,
+    original_id: &str,
+    content: Value,
+    memory_type: String,
+    created_by: String,
+    source_rels: Vec<Relationship>,
+    source_metadata: Value,
+    origin_mesh_epoch: u32,
+) -> MeshRecord {
+    let mut rels = source_rels;
+    if let Ok(original_id) = Uuid::parse_str(original_id) {
+        rels.push(Relationship {
+            kind: "references".to_string(),
+            target: original_id,
+        });
+    }
+    let mut metadata = match source_metadata.as_object() {
+        Some(map) => map.clone(),
+        None => serde_json::Map::new(),
+    };
+    metadata.insert("eligibility".to_string(), json!("shareable"));
+    metadata.insert("trust".to_string(), json!("untrusted"));
+    metadata.insert("references".to_string(), json!([original_id]));
+    MeshRecord {
+        schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+        id: Uuid::new_v4(),
+        namespace: namespace.to_string(),
+        memory_type,
+        lifecycle: Lifecycle {
+            state: LifecycleState::Active,
+            created_at: chrono::Utc::now(),
+            created_by,
+            superseded_by: None,
+            archived_at: None,
+            tombstoned_at: None,
+        },
+        content,
+        metadata: Value::Object(metadata),
+        relationships: rels,
+        update_id: Uuid::new_v4(),
+        origin_mesh_epoch,
+        trust: Trust::Untrusted,
+    }
 }
 
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
@@ -2550,6 +2639,228 @@ mod tests {
             .expect("the preserved edit record");
         assert_eq!(z.payload.content, "edited content");
         assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
+    }
+
+    /// Direction B (`local is the edit, candidate supersedes`) preserves the
+    /// local procedure row's structured definition: content stays an object
+    /// with its trigger/valid_to/rehearsal_script keys intact, not a
+    /// `{"text": ...}` string wrapper, and the row's own metadata tags and a
+    /// references link survive (slice-6b fix).
+    #[tokio::test]
+    async fn direction_b_preserves_procedure_definition_structure() {
+        let root = scratch("dirb-proc");
+        let mesh_id = "mesh-dirb".to_string();
+        let namespace = "probe".to_string();
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+
+        // The local row: a procedure whose definition rides in content as its
+        // JSON serialization (the apply path stores `content_text`), plus tags
+        // and a references relationship entry in metadata.
+        let definition = json!({
+            "trigger": "session-start",
+            "remaining_fires_initial": 5,
+            "valid_to": "2027-01-01T00:00:00Z",
+            "rehearsal_script": { "steps": ["read spec", "act"] },
+        });
+        let referenced = Uuid::new_v4();
+        let local_payload = MemoryPayload {
+            content: definition.to_string(),
+            user_id: "node-local".to_string(),
+            memory_type: "procedure".to_string(),
+            agent_name: Some("node-local".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "tags": ["mesh", "procedure"],
+                "references": [referenced.to_string()],
+                "mesh": {
+                    "update_id": Uuid::new_v4().to_string(),
+                    "origin": "node-local",
+                    "lifecycle_state": "active",
+                },
+            }),
+        };
+
+        // The incoming supersession: the authoritative replacement.
+        let cand = MeshRecord {
+            schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+            id,
+            namespace: namespace.clone(),
+            memory_type: "procedure".to_string(),
+            lifecycle: Lifecycle {
+                state: LifecycleState::Superseded,
+                created_at: chrono::Utc::now(),
+                created_by: "node-peer-1".to_string(),
+                superseded_by: Some(replacement),
+                archived_at: None,
+                tombstoned_at: None,
+            },
+            content: json!({
+                "trigger": "every-n-days:7",
+                "remaining_fires_initial": 1,
+                "valid_to": Value::Null,
+                "rehearsal_script": "the replacement",
+            }),
+            metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            relationships: vec![],
+            update_id: Uuid::new_v4(),
+            origin_mesh_epoch: 1,
+            trust: Trust::Untrusted,
+        };
+
+        let store = fresh_store("dirb-proc").await;
+        store.init(&namespace).await.unwrap();
+        let disposition = preserve_superseded_edit(
+            &root,
+            &mesh_id,
+            &id.to_string(),
+            &namespace,
+            LifecycleState::Active,
+            &local_payload,
+            &cand,
+            store.clone(),
+            emb(),
+        )
+        .await;
+        assert!(
+            matches!(disposition, Disposition::Applied),
+            "{disposition:?}"
+        );
+
+        // The preserved edit is a NEW row whose content is the structured
+        // definition, not a string wrapper.
+        let all = store.list(&namespace, None).await.unwrap();
+        assert_eq!(all.len(), 2, "superseded X + preserved edit Z");
+        let z = all
+            .iter()
+            .find(|r| r.id != id.to_string())
+            .expect("the preserved edit record");
+        let content_value: Value = serde_json::from_str(&z.payload.content).unwrap();
+        assert!(
+            content_value.is_object(),
+            "definition not string-wrapped: {content_value}"
+        );
+        assert_eq!(content_value["trigger"], json!("session-start"));
+        assert_eq!(content_value["valid_to"], json!("2027-01-01T00:00:00Z"));
+        assert_eq!(
+            content_value["rehearsal_script"]["steps"],
+            json!(["read spec", "act"])
+        );
+
+        // Original tags survive; the references link lands in metadata.
+        assert_eq!(z.payload.metadata["tags"], json!(["mesh", "procedure"]));
+        assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
+
+        // The typed relationships carry the row's own references link forward
+        // AND append the spec's references -> original_id link.
+        let rebuilt = preserved_edit_record(
+            &namespace,
+            &id.to_string(),
+            local_content_value(&local_payload),
+            local_payload.memory_type.clone(),
+            local_origin(&local_payload),
+            local_relationships(&local_payload),
+            local_payload.metadata.clone(),
+            cand.origin_mesh_epoch,
+        );
+        assert!(
+            rebuilt.relationships.contains(&Relationship {
+                kind: "references".to_string(),
+                target: id,
+            }),
+            "references original_id link: {:?}",
+            rebuilt.relationships
+        );
+        assert!(
+            rebuilt.relationships.contains(&Relationship {
+                kind: "references".to_string(),
+                target: referenced,
+            }),
+            "carried references link: {:?}",
+            rebuilt.relationships
+        );
+    }
+
+    /// Direction B merges the local row's metadata with the gate fields
+    /// instead of a fixed literal: a pre-existing key (`custom_key`) survives
+    /// alongside `references`, `trust` and `eligibility`.
+    #[tokio::test]
+    async fn direction_b_metadata_merge_does_not_clobber_row_keys() {
+        let root = scratch("dirb-meta");
+        let mesh_id = "mesh-dirb".to_string();
+        let namespace = "probe".to_string();
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+
+        let local_payload = MemoryPayload {
+            content: "the local edit".to_string(),
+            user_id: "node-local".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: Some("node-local".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "custom_key": "custom_value",
+                "mesh": {
+                    "update_id": Uuid::new_v4().to_string(),
+                    "origin": "node-local",
+                    "lifecycle_state": "active",
+                },
+            }),
+        };
+
+        let cand = MeshRecord {
+            schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+            id,
+            namespace: namespace.clone(),
+            memory_type: "rule".to_string(),
+            lifecycle: Lifecycle {
+                state: LifecycleState::Superseded,
+                created_at: chrono::Utc::now(),
+                created_by: "node-peer-1".to_string(),
+                superseded_by: Some(replacement),
+                archived_at: None,
+                tombstoned_at: None,
+            },
+            content: json!({ "text": "the replacement" }),
+            metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            relationships: vec![],
+            update_id: Uuid::new_v4(),
+            origin_mesh_epoch: 1,
+            trust: Trust::Untrusted,
+        };
+
+        let store = fresh_store("dirb-meta").await;
+        store.init(&namespace).await.unwrap();
+        let disposition = preserve_superseded_edit(
+            &root,
+            &mesh_id,
+            &id.to_string(),
+            &namespace,
+            LifecycleState::Active,
+            &local_payload,
+            &cand,
+            store.clone(),
+            emb(),
+        )
+        .await;
+        assert!(
+            matches!(disposition, Disposition::Applied),
+            "{disposition:?}"
+        );
+
+        let all = store.list(&namespace, None).await.unwrap();
+        let z = all
+            .iter()
+            .find(|r| r.id != id.to_string())
+            .expect("the preserved edit record");
+
+        // The pre-existing key survives; the gate fields are present.
+        assert_eq!(z.payload.metadata["custom_key"], json!("custom_value"));
+        assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
+        assert_eq!(z.payload.metadata["trust"], json!("untrusted"));
+        assert_eq!(z.payload.metadata["eligibility"], json!("shareable"));
     }
 
     /// No silent drop: an unresolved conflict keeps the accepted projection,
