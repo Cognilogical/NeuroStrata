@@ -245,6 +245,18 @@ enum Commands {
         #[command(subcommand)]
         action: HooksCommands,
     },
+
+    /// Share what your agents learn with the team's agents (SynapticMesh)
+    ///
+    /// The mesh is a standalone git repo the daemon owns; the project keeps
+    /// only a pointer. Nothing here touches the LadybugDB, so the command
+    /// runs without a daemon and without the store lock. `mesh` is the
+    /// documented short alias.
+    #[command(name = "synaptic-mesh", alias = "mesh")]
+    SynapticMesh {
+        #[command(subcommand)]
+        action: crate::synaptic_mesh::SynapticMeshCommands,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -1078,6 +1090,56 @@ mod tests {
         );
     }
 
+    /// The SynapticMesh surface parses under its brand and its alias, and
+    /// `init` carries every field the spec's onboarding needs. A rename that
+    /// silently drops the alias orphans teammate docs the same way a tool
+    /// rename orphans client wiring.
+    #[test]
+    fn the_synaptic_mesh_commands_parse_under_brand_and_alias() {
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "synaptic-mesh",
+            "init",
+            "platform-team",
+            "--namespace",
+            "proj-a",
+            "--namespace",
+            "proj-b",
+            "--remote",
+            "git@example:mesh.git",
+        ])
+        .expect("synaptic-mesh init with flags");
+        match cli.command {
+            Some(Commands::SynapticMesh {
+                action:
+                    crate::synaptic_mesh::SynapticMeshCommands::Init {
+                        name,
+                        namespace,
+                        remote,
+                    },
+            }) => {
+                assert_eq!(name, "platform-team");
+                assert_eq!(namespace, vec!["proj-a".to_string(), "proj-b".to_string()]);
+                assert_eq!(remote.as_deref(), Some("git@example:mesh.git"));
+            }
+            other => panic!("expected SynapticMesh/Init, got {:?}", other),
+        }
+
+        // The documented short alias must resolve to the same command.
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "mesh", "status"])
+            .expect("mesh status parses via the short alias");
+        assert!(
+            matches!(
+                cli.command,
+                Some(Commands::SynapticMesh {
+                    action: crate::synaptic_mesh::SynapticMeshCommands::Status
+                })
+            ),
+            "alias broken: {:?}",
+            cli.command
+        );
+    }
+
     /// Step 4's contract, both halves: with a daemon answering, stdout is that
     /// daemon's `BusMetrics` JSON and nothing else -- it is what an operator
     /// pipes into `jq` -- and the command exits 0.
@@ -1441,6 +1503,21 @@ async fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 }
+            }
+            Commands::SynapticMesh { action } => {
+                // Also never touches the database: the mesh is a standalone
+                // git repo the daemon owns. Call-site ambient resolution is
+                // legal HERE (cwd is what a CLI means by "this project"),
+                // which is exactly why it is resolved now and threaded,
+                // never sniffed inside the handler.
+                let project_root = std::env::current_dir()?;
+                let ctx = crate::synaptic_mesh::MeshContext {
+                    project_root: project_root.clone(),
+                    base_root: crate::synaptic_mesh::conventional_base_root(),
+                    node_id: crate::synaptic_mesh::resolve_node_id(),
+                };
+                let mut svc = crate::synaptic_mesh::MeshService::new(project_root);
+                println!("{}", crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc));
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;
@@ -2304,6 +2381,7 @@ async fn main() -> anyhow::Result<()> {
                     Commands::Daemon
                     | Commands::Shutdown
                     | Commands::Run { .. }
+                    | Commands::SynapticMesh { .. }
                     | Commands::Backup { .. }
                     | Commands::Restore { .. }
                     | Commands::Task { .. }

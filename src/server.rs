@@ -440,6 +440,12 @@ pub async fn process_mcp_request(
                     }
                 ]
             });
+            // SynapticMesh surface: the schemas live with the module so the
+            // CLI, the adapter, and this list cannot drift into three
+            // different shapes of the same promise.
+            if let Some(tools) = result.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                tools.extend(crate::synaptic_mesh::synaptic_mesh_tool_definitions());
+            }
             // Append vocabulary summaries to tool descriptions from the shipped schema.
             {
                 let vocab = crate::traits::memory_vocabulary();
@@ -610,6 +616,13 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_archive_memory" => {
                             result_text = crate::handlers::archive_memory::handle_archive_memory(arguments, store.clone(), bus.clone()).await;
+                        }
+                        // SynapticMesh: the handler is a pure string-in/
+                        // string-out dispatch (filesystem + git only; no
+                        // store, no bus, no daemon dependency), so it owns
+                        // its own name mapping in the mesh module.
+                        mesh_name if mesh_name.starts_with("neurostrata_synaptic_mesh_") => {
+                            result_text = crate::synaptic_mesh::handle_mesh_tool_call(mesh_name, &arguments);
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -3665,7 +3678,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_twenty_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_twenty_seven_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -3715,6 +3728,15 @@ mod tests {
                 "neurostrata_guard_learn",
                 "neurostrata_guard_list_rules",
                 "neurostrata_archive_memory",
+                // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
+                // _definitions())` — this order IS the append order, so it
+                // pins where the mesh module's list enters the surface.
+                "neurostrata_synaptic_mesh_init",
+                "neurostrata_synaptic_mesh_join",
+                "neurostrata_synaptic_mesh_push",
+                "neurostrata_synaptic_mesh_pull",
+                "neurostrata_synaptic_mesh_leave",
+                "neurostrata_synaptic_mesh_status",
             ]
         );
         for tool in tools {

@@ -8,16 +8,15 @@
 
 pub mod cli;
 pub mod manifest;
+pub mod mesh_service;
 pub mod record;
 pub mod storage;
 pub mod storage_api;
 pub mod tools;
 
 pub use cli::{handle_synaptic_mesh_command, MeshContext, SynapticMeshCommands};
-pub use manifest::{MeshManifest, MeshPolicy, Trust, MESH_MANIFEST_SCHEMA_VERSION};
-pub use record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
-};
-pub use storage::MeshStorage;
-pub use storage_api::StorageApi;
+pub use mesh_service::{conventional_base_root, handle_mesh_tool_call, resolve_node_id, MeshService};
 pub use tools::synaptic_mesh_tool_definitions;
+// manifest/record/storage/storage_api types are reached through their module
+// paths by internal consumers (`storage::MeshStorage`, `super::manifest::…`);
+// re-exporting names no external caller uses yet is noise, not surface.
