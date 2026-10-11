@@ -1066,6 +1066,14 @@ pub async fn handle_task_complete(
             // metadata it is given, so the completion handoff does no less. A
             // dropped key here is a dropped source: the gate would reject the
             // rule one call later for provenance the caller declared.
+            // `metadata: null` is treated as absent (lenient), DELIBERATELY:
+            // on the completion path the whole `memory` itself is optional,
+            // so a caller leaving it out and one passing null mean the same
+            // thing. add_memory's strict null rejection guards only the
+            // explicit-tool path there; a wrong-typed metadata (string,
+            // array, scalars) still errors below, mirroring add_memory.
+            // Do NOT "fix" this arm to reject null without moving the
+            // memory-optional framing with it.
             let mut meta = match mem.get("metadata") {
                 None | Some(Value::Null) => json!({}),
                 Some(m) if m.is_object() => m.clone(),
@@ -3869,6 +3877,53 @@ mod tests {
             lesson.metadata["extracted_from"],
             json!([id.as_str()]),
             "the EXTRACTED_FROM edge is guaranteed and not re-created"
+        );
+    }
+
+    /// Pinned contract: a wrong-typed `extracted_from` under the caller's
+    /// inline metadata is REJECTED, mirroring add_memory's wording -- the
+    /// call errors naming the malformed key, nothing is written (a refusal
+    /// publishes nothing), and the task stays claimed rather than completing
+    /// or falling through to the generic Lock-2 block after a write. Locks
+    /// the `Some(_)` arm of the inline extracted_from match: without it, the
+    /// string "x" would be persisted verbatim and the same call would fail
+    /// only after the row landed, with the wrong message.
+    #[tokio::test]
+    async fn path_3_inline_memory_rejects_malformed_extracted_from() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let before = store.list("MyProj", None).await.unwrap().len();
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "reason": "shipped",
+                "memory": {
+                    "content": "a lesson whose edge is malformed",
+                    "metadata": { "extracted_from": "x" }
+                }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("a non-array extracted_from must be rejected");
+
+        assert!(
+            err.contains("malformed 'extracted_from'")
+                && err.contains("must be an array of task ids"),
+            "the rejection must name the malformed key, not the generic Lock-2 block: {err}"
+        );
+        let after = store.list("MyProj", None).await.unwrap();
+        assert_eq!(after.len(), before, "the intended memory was NOT created");
+        assert_eq!(
+            status_of(&store, "MyProj", &id).await,
+            Status::InProgress,
+            "the task did NOT complete to done"
         );
     }
 
