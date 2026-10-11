@@ -40,8 +40,11 @@ pub struct MeshRecord {
     /// diff uses `(id, update_id)` as the identity tuple; a record at the
     /// same `update_id` is a no-op.
     pub update_id: Uuid,
-    /// The mesh epoch when this record was first published. Used to refuse
-    /// publication of records born in an older epoch than the current one.
+    /// The mesh epoch when this record was first published. Two gates compare
+    /// it against the mesh manifest's current epoch: `import::epoch_gate`
+    /// refuses to *replay* a record born in an older epoch, and the
+    /// mesh-worker's `drain_once` refuses to *publish* an outbox entry born in
+    /// an older epoch (quarantined, not replayed into the new epoch).
     pub origin_mesh_epoch: u32,
     /// Local trust flag. Mirrors the spec's trust model.
     pub trust: super::manifest::Trust,

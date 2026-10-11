@@ -16,33 +16,29 @@
 //! | 1. two offline nodes, same-id lifecycle conflicts — variants preserved, never silently dropped | HERE (`same_id_conflict_across_two_nodes_preserves_variants`) + unit-level merge table in `import.rs::{merge_table_row_*, conflict_is_never_silently_dropped}` |
 //! | 2. lifecycle change crosses nodes within one sync cycle | HERE (`archived_on_a_gone_from_b_within_one_sync_cycle` — worker→path→commit→push→clone→pull→import→store) + single-node `import.rs::tombstone_never_resurrects_end_to_end`, `worker.rs::{an_archived_entry_records_the_lifecycle_and_tombstone, a_superseded_entry_records_the_lifecycle_and_successor}` |
 //! | 3. malformed/forged inputs fail safely | ALREADY PINNED in `import.rs::traversal_symlink_executable_and_garbage_are_ignored_and_store_untouched` (traversal names, symlinks, exec bits, garbage JSON — store untouched), `import.rs::unknown_schema_version_is_ignored_and_named`, `storage.rs::open_refuses_unknown_schema_version` (manifest schema), `import.rs::retired_id_reactivation_is_refused` |
-//! | 4. old-epoch offline peers cannot resurrect purged identities | **OPEN GAP — NOT ENFORCED** (see below) |
+//! | 4. old-epoch offline peers cannot resurrect purged identities | HERE (`old_epoch_peer_records_refused_on_pull_and_stale_outbox_quarantined`) + import-side `import.rs::{epoch_older_refused_named, epoch_equal_applies, epoch_future_refused}` + publish-side `worker.rs::{a_stale_epoch_entry_is_quarantined_named_and_stays_pending, a_current_epoch_entry_drains_after_an_epoch_migration, a_mixed_batch_quarantines_stale_and_drains_current}` |
 //! | 5. full-tree recovery preserves private rows + procedure consumption state | HERE (`full_tree_recovery_preserves_private_rows_and_procedure_state_in_one_pass`) + `import.rs::private_row_with_same_id_is_never_stomped`, `import.rs::reapply_advances_zero_and_crash_replay_never_duplicates`, `worker.rs::a_procedure_record_omits_the_runtime_counters` |
 //! | 6. missing hooks / credential failure / dirty checkout / rejected push / daemon restart | ALREADY PINNED: `mesh_service.rs::{sync_enqueue_on_an_unreachable_remote_reports_soft_and_singly, status_pauses_on_a_dirty_checkout_and_names_the_paths, recover_*}`, `import.rs::dirty_checkout_refuses_full_tree_pass`, `worker.rs::an_unreachable_remote_does_not_stop_the_drain`, `storage.rs::push_without_remote_errors`, `worker.rs::{a_file_rename_fault_keeps_the_entry_pending_until_the_fault_clears, a_crash_between_rename_and_mark_committed_retries_idempotently, a_foreign_origin_row_is_skipped_never_re_exported}` |
 //! | 7/8. year-scale data + latency thresholds | out of scope for this suite (no enforcement exists to test against; recorded durably in the spec) |
 //!
-//! # Open gaps documented, not invented around (spec scenario 4 + oversized JSON)
+//! # Former open gaps, now enforced
 //!
-//! * **Old-epoch quarantine is NOT enforced.** `origin_mesh_epoch` is
-//!   *recorded*: the mesh-worker stamps `manifest.epoch` into every record
-//!   at publish time (`worker.rs::drain_once` → `build_record`), and import
-//!   copies it into the applied row's provenance
-//!   (`import.rs::mesh_provenance`). But nothing COMPARES
-//!   `candidate.origin_mesh_epoch` against the current `manifest.epoch` on
-//!   import, so an old-epoch peer's record currently applies verbatim
-//!   instead of being quarantined. `manifest.rs`'s doc comment ("tampering
-//!   … is detected by the `origin_mesh_epoch` check on every record") names
-//!   a check that does not yet exist. The `filter-repo` purge = epoch
-//!   migration story stays unenforced on v1; do not treat history rewrites
-//!   as safe until this lands.
-//! * **Oversized JSON has no size cap.** `validate_record` bounds nothing
-//!   by byte size; an arbitrarily large record that parses cleanly is
-//!   applied. The spec scenario "malformed or oversized JSON … fail safely"
-//!   is only half-pinned (the unparseable half).
+//! Two gaps the map above used to carry are now closed:
+//!
+//! * **Old-epoch quarantine** — enforced on BOTH sides now. Import side
+//!   (`import::epoch_gate`, F3): an old-epoch record is refused and named in
+//!   the ignore report, never replayed into the new epoch. Publish side (F4):
+//!   the mesh-worker compares each outbox entry's capture-time `epoch` against
+//!   the manifest's current `epoch` and quarantines an older entry (skips the
+//!   file write AND leaves it pending) rather than draining it into the new
+//!   epoch.
+//! * **Oversized JSON cap** — `MAX_RECORD_BYTES` (1 MiB) is enforced in
+//!   `validate_record` BEFORE parse (F3); an oversized record is ignored with
+//!   a named reason, never applied.
 //!
 //! In-file map purpose: so the NEXT acceptance pass knows exactly what is
-//! new here versus cross-referenced, and treats the gaps as gaps — not as
-//! licenses to invent enforcement inside a test suite.
+//! new here versus cross-referenced, and treats any remaining gap as a gap —
+//! not as a license to invent enforcement inside a test suite.
 
 #[cfg(test)]
 mod tests {
@@ -174,6 +170,7 @@ mod tests {
             metadata,
             superseded_by: None,
             ts: 1_700_000_000,
+            epoch: 1,
         }
     }
 
@@ -698,6 +695,113 @@ mod tests {
             !contains_counter_key(&proc_row.metadata),
             "recovery must not introduce runtime counters: {:?}",
             proc_row.metadata
+        );
+    }
+
+    // ---- scenario 4: old-epoch quarantine, both sides ------------------------
+
+    /// Rewrite the on-disk manifest to a new `epoch`, commit it (the local
+    /// half of an epoch migration), and reopen the mesh so its cached manifest
+    /// reflects the new epoch. The manifest-edit trick this suite uses for
+    /// epoch-bump fixtures (no real `filter-repo` history rewrite needed to
+    /// exercise the gate).
+    fn reopen_with_epoch(mesh: &MeshStorage, epoch: u32) -> MeshStorage {
+        let mut manifest = mesh.manifest().clone();
+        manifest.epoch = epoch;
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(
+            mesh.root().join(super::super::storage::MANIFEST_FILE_NAME),
+            format!("{json}\n"),
+        )
+        .unwrap();
+        mesh.commit_all("epoch migration", "node-a").unwrap();
+        MeshStorage::open(mesh.root()).unwrap()
+    }
+
+    /// Spec §"Acceptance evidence" 4 — an old-epoch peer's records are refused
+    /// on import (named, store untouched) AND its stale outbox entries are
+    /// quarantined on publish. Two halves, one epoch migration:
+    ///
+    /// 1. B publishes record S at epoch 1 and pushes; A pulls it (ff).
+    /// 2. B captures a second record T into its outbox at epoch 1 but does
+    ///    NOT drain it (the WAL keeps it pending).
+    /// 3. A migrates to epoch 2 (manifest edit + commit + push); B pulls the
+    ///    migration (ff).
+    /// 4. A's apply refuses S — born epoch 1, manifest epoch 2 — named in the
+    ///    ignore report, A's store untouched.
+    /// 5. B's drain quarantines T — born epoch 1, manifest epoch 2 — skipped,
+    ///    named, and left pending (not consumed).
+    #[tokio::test]
+    async fn old_epoch_peer_records_refused_on_pull_and_stale_outbox_quarantined() {
+        let base = scratch("acc-old-epoch");
+        let (a, b) = joined_pair(&base, "old-epoch");
+        let b_out = Outbox::open(&outbox_dir_for(b.root())).unwrap();
+        let s_id = Uuid::new_v4();
+        let t_id = Uuid::new_v4();
+
+        // 1. B publishes S at epoch 1 and pushes; A pulls it.
+        let s = entry(
+            OP_CREATED,
+            &s_id.to_string(),
+            "pre-purge identity",
+            shareable_meta("node-b 2026-10-11"),
+            "rule",
+        );
+        publish(&b, &b_out, "node-b", s);
+        a.pull().unwrap();
+
+        // 2. B captures T at epoch 1 but leaves it pending (no drain).
+        let t = entry(
+            OP_CREATED,
+            &t_id.to_string(),
+            "stale outbox record",
+            shareable_meta("node-b 2026-10-11"),
+            "rule",
+        );
+        b_out.append(&t).unwrap();
+
+        // 3. A migrates to epoch 2 (manifest edit + commit + push); B pulls.
+        let a = reopen_with_epoch(&a, 2);
+        a.push().unwrap();
+        b.pull().unwrap();
+        let b = MeshStorage::open(b.root()).unwrap(); // reflect the migrated manifest
+
+        // 4. A's import refuses S (epoch 1 < epoch 2): named, store untouched.
+        let a_store = fresh_store("acc-old-epoch-a").await;
+        let report = apply_pass(&a, &a_store).await;
+        assert_eq!(report.applied, 0, "old-epoch record refused: {report:?}");
+        assert_eq!(row_count(&a_store, NS).await, 0, "A's store untouched");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("old-epoch"),
+            "the refusal names the old epoch: {joined}"
+        );
+        assert!(
+            joined.contains("origin_mesh_epoch 1") && joined.contains("manifest epoch 2"),
+            "both epochs are named: {joined}"
+        );
+
+        // 5. B's drain quarantines T (epoch 1 < epoch 2): skipped, named, pending.
+        let drain = super::super::worker::drain_once(&b_out, &b, "node-b").unwrap();
+        assert_eq!(
+            drain.applied, 0,
+            "the stale entry must not publish: {drain:?}"
+        );
+        assert_eq!(drain.quarantined, 1, "one entry quarantined: {drain:?}");
+        assert!(!drain.committed, "no commit for a quarantined entry");
+        let line = &drain.quarantined_entries[0];
+        assert!(
+            line.contains("epoch 1") && line.contains("manifest epoch 2"),
+            "the publish skip names both epochs: {line}"
+        );
+        assert!(
+            line.contains(&t_id.to_string()),
+            "the publish skip names the entry: {line}"
+        );
+        assert_eq!(
+            b_out.pending().unwrap().len(),
+            1,
+            "the stale entry stays pending for operator inspection"
         );
     }
 }

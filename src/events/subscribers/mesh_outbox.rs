@@ -30,16 +30,27 @@ use tokio::sync::Notify;
 pub struct MeshOutbox {
     outbox: Outbox,
     wake: Arc<Notify>,
+    /// The mesh manifest epoch at wiring time, stamped into every captured
+    /// entry so the worker can quarantine a pre-purge entry at drain time
+    /// (publish-side epoch gate). An epoch migration is an operator re-init
+    /// that rewires the daemon, so wiring-time resolution is the same
+    /// freshness contract the drain loop's per-tick reopen implies.
+    epoch: u32,
 }
 
 impl MeshOutbox {
     /// Open the outbox over `outbox_dir` and share `wake` with the daemon's
     /// drain loop. Err (rather than panic) when the outbox cannot open, so the
     /// daemon can log and continue without a mesh subscriber.
-    pub fn new(outbox_dir: impl Into<PathBuf>, wake: Arc<Notify>) -> Result<Self, String> {
+    pub fn new(
+        outbox_dir: impl Into<PathBuf>,
+        wake: Arc<Notify>,
+        epoch: u32,
+    ) -> Result<Self, String> {
         Ok(Self {
             outbox: Outbox::open(&outbox_dir.into())?,
             wake,
+            epoch,
         })
     }
 }
@@ -171,6 +182,7 @@ impl MeshOutbox {
             metadata: payload.metadata,
             superseded_by,
             ts,
+            epoch: self.epoch,
         })
     }
 }
@@ -231,7 +243,7 @@ mod tests {
         let bus = ThalamicBus::new(16);
         bus.attach_store(store.clone());
         bus.register(Box::new(
-            MeshOutbox::new(outbox_dir, wake).expect("outbox opens"),
+            MeshOutbox::new(outbox_dir, wake, 1).expect("outbox opens"),
         ));
         (bus, store)
     }
@@ -271,6 +283,10 @@ mod tests {
         assert_eq!(pending[0].id, id);
         assert_eq!(pending[0].memory_type, "rule");
         assert_eq!(pending[0].content, "the text");
+        assert_eq!(
+            pending[0].epoch, 1,
+            "the entry carries its capture-time epoch"
+        );
         assert_eq!(
             pending[0].metadata["eligibility"],
             serde_json::json!("shareable")

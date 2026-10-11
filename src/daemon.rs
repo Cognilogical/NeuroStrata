@@ -231,7 +231,17 @@ fn wire_mesh_publish(
 
     let outbox_dir = crate::synaptic_mesh::outbox::outbox_dir_for(&mesh_dir);
     let wake = Arc::new(tokio::sync::Notify::new());
-    match crate::events::subscribers::MeshOutbox::new(outbox_dir.clone(), wake.clone()) {
+    // The publish-side epoch gate needs the manifest epoch at wiring time: the
+    // subscriber stamps it into every captured entry so the worker can
+    // quarantine a pre-purge entry at drain time.
+    let epoch = match crate::synaptic_mesh::storage::MeshStorage::open(&mesh_dir) {
+        Ok(m) => m.manifest().epoch,
+        Err(e) => {
+            tracing::warn!("mesh manifest unreadable; mesh outbox disabled: {e}");
+            return;
+        }
+    };
+    match crate::events::subscribers::MeshOutbox::new(outbox_dir.clone(), wake.clone(), epoch) {
         Ok(sub) => {
             bus.register(Box::new(sub));
         }
@@ -414,10 +424,14 @@ fn drain_mesh_once(project_root: &std::path::Path) {
             tracing::debug!(
                 applied = report.applied,
                 skipped = report.skipped,
+                quarantined = report.quarantined,
                 already_applied = report.already_applied,
                 committed = report.committed,
                 "mesh outbox drained"
             );
+            for line in &report.quarantined_entries {
+                tracing::warn!(entry = %line, "mesh outbox entry quarantined (old epoch)");
+            }
         }
         Ok(_) => {}
         Err(e) => tracing::warn!("mesh drain failed: {e}"),
