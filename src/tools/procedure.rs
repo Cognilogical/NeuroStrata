@@ -50,9 +50,7 @@ pub(crate) fn is_lapsed(metadata: &Value, now: i64) -> bool {
 /// The iteration budget. `None` is unbounded — and so is a value that is not
 /// an integer, because an unreadable budget must not refuse every firing.
 fn remaining_fires(metadata: &Value) -> Option<i64> {
-    metadata
-        .get("remaining_fires")
-        .and_then(|v| v.as_i64())
+    metadata.get("remaining_fires").and_then(|v| v.as_i64())
 }
 
 /// Lifetime rehearsal count.
@@ -65,9 +63,7 @@ fn performance_count(metadata: &Value) -> i64 {
 
 /// Epoch of the last acknowledged firing.
 fn last_performed_at(metadata: &Value) -> Option<i64> {
-    metadata
-        .get("last_performed_at")
-        .and_then(|v| v.as_i64())
+    metadata.get("last_performed_at").and_then(|v| v.as_i64())
 }
 
 /// Back-reference to the newest Episodic Buffer entry this procedure produced.
@@ -76,6 +72,14 @@ fn last_episodic_pointer(metadata: &Value) -> Option<String> {
         .get("last_episodic_pointer")
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+/// Whether the fire gate blocks this row. Only the imported state
+/// (`trust == "untrusted"`) refuses a firing; a local record carrying `trusted`,
+/// `promoted`, or no trust key at all is executable. Anything unreadable also
+/// fires, because an unreadable field must not brick a live procedure.
+fn is_untrusted(metadata: &Value) -> bool {
+    metadata.get("trust").and_then(|v| v.as_str()) == Some("untrusted")
 }
 
 /// When this procedure is next owed.
@@ -250,6 +254,29 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
     let count = performance_count(&metadata);
     let pointer_before = last_episodic_pointer(&metadata);
 
+    // The trust gate runs before lapse and before every mutation: an
+    // imported procedure is visible in search, but this node does not
+    // execute it until a local operator has explicitly approved it
+    // (design §Trust model). Like a lapse, the refusal is a statement
+    // about the row, not an event that changes it — so the reply still
+    // reports the row's own counters, and nothing is written.
+    if is_untrusted(&metadata) {
+        return reply(
+            false,
+            false,
+            false,
+            budget,
+            count,
+            pointer_before,
+            "untrusted: this procedure was imported from a peer and cannot fire \
+             on this node until it is locally promoted — rewrite the row's FULL \
+             metadata via set-metadata with trust set to \"promoted\" (set-metadata \
+             REPLACES the metadata object rather than merging, so pass the complete \
+             object including trigger, remaining_fires, and every other key you \
+             want to keep, with trust: \"promoted\")",
+        );
+    }
+
     if is_lapsed(&metadata, now) {
         return reply(false, true, false, budget, count, pointer_before, "lapsed");
     }
@@ -422,7 +449,14 @@ mod tests {
     #[tokio::test]
     async fn performing_a_procedure_stamps_counts_and_spends_one_fire() {
         let store = empty_store("probe").await;
-        seed(&store, "probe", "proc-1", "procedure", procedure_metadata(json!(3))).await;
+        seed(
+            &store,
+            "probe",
+            "proc-1",
+            "procedure",
+            procedure_metadata(json!(3)),
+        )
+        .await;
         let root = scratch("perform");
 
         let reply: Value = serde_json::from_str(
@@ -458,8 +492,13 @@ mod tests {
         if crate::buffer::load_config().enabled {
             let pointer = pointer.expect("an enabled buffer leaves a pointer");
             assert_eq!(reply["episodic_pointer"], json!(pointer));
-            let text = std::fs::read_to_string(root.join(".NeuroStrata/sessions/current.md")).unwrap();
-            assert!(text.contains(pointer), "the entry is findable by its id: {}", text);
+            let text =
+                std::fs::read_to_string(root.join(".NeuroStrata/sessions/current.md")).unwrap();
+            assert!(
+                text.contains(pointer),
+                "the entry is findable by its id: {}",
+                text
+            );
             assert!(text.contains("gate is green"), "and carries the note");
         } else {
             assert!(pointer.is_none(), "a disabled buffer writes no pointer");
@@ -472,7 +511,14 @@ mod tests {
     #[tokio::test]
     async fn a_budget_of_three_is_spent_after_three_firings_and_then_refused() {
         let store = empty_store("probe").await;
-        seed(&store, "probe", "proc-budget", "procedure", procedure_metadata(json!(3))).await;
+        seed(
+            &store,
+            "probe",
+            "proc-budget",
+            "procedure",
+            procedure_metadata(json!(3)),
+        )
+        .await;
         let root = scratch("budget");
 
         let mut budgets = Vec::new();
@@ -505,7 +551,11 @@ mod tests {
 
         let meta = stored(&store, "probe", "proc-budget").await.metadata;
         assert_eq!(meta["remaining_fires"], json!(0));
-        assert_eq!(meta["performance_count"], json!(3), "the refusal is not a fourth performance");
+        assert_eq!(
+            meta["performance_count"],
+            json!(3),
+            "the refusal is not a fourth performance"
+        );
     }
 
     /// An unbounded budget stays unbounded: no key is invented and an explicit
@@ -513,7 +563,14 @@ mod tests {
     #[tokio::test]
     async fn an_unbounded_budget_never_runs_out() {
         let store = empty_store("probe").await;
-        seed(&store, "probe", "proc-null", "procedure", procedure_metadata(Value::Null)).await;
+        seed(
+            &store,
+            "probe",
+            "proc-null",
+            "procedure",
+            procedure_metadata(Value::Null),
+        )
+        .await;
         let root = scratch("unbounded");
 
         for _ in 0..3 {
@@ -568,6 +625,172 @@ mod tests {
         );
     }
 
+    // ── trust: imported procedures must be promoted before they fire ────────
+
+    /// An imported row (`trust: "untrusted"`) is visible but not executable:
+    /// the fire is refused before any mutation, the counters keep the values
+    /// the row was found with, and the row itself is untouched.
+    #[tokio::test]
+    async fn untrusted_imported_procedure_cannot_fire() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-import",
+            "procedure",
+            json!({ "trust": "untrusted", "trigger": "session-start", "remaining_fires": 3 }),
+        )
+        .await;
+        let before = stored(&store, "probe", "proc-import").await;
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-import", "project_root": scratch("import").display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(reply["performed"], json!(false), "{}", reply);
+        assert_eq!(reply["lapsed"], json!(false));
+        assert_eq!(reply["spent"], json!(false));
+        // The reply reports the row's own numbers rather than zeros.
+        assert_eq!(reply["remaining_fires"], json!(3));
+        assert_eq!(reply["performance_count"], json!(0));
+
+        let after = stored(&store, "probe", "proc-import").await;
+        assert_eq!(after.metadata, before.metadata, "the row is untouched");
+        assert!(
+            after.metadata.get("last_performed_at").is_none(),
+            "no stamp: refusal is not a rehearsal"
+        );
+    }
+
+    /// Promotion is the explicit local approval: once `trust` reads
+    /// "promoted", the procedure fires exactly like a local one.
+    #[tokio::test]
+    async fn promoted_procedure_fires() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-promoted",
+            "procedure",
+            json!({ "trust": "promoted", "trigger": "session-start", "remaining_fires": 2 }),
+        )
+        .await;
+        let root = scratch("promoted");
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-promoted", "project_root": root.display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(reply["performed"], json!(true), "{}", reply);
+        assert_eq!(reply["remaining_fires"], json!(1));
+        assert_eq!(reply["performance_count"], json!(1));
+
+        let meta = stored(&store, "probe", "proc-promoted").await.metadata;
+        assert_eq!(meta["remaining_fires"], json!(1));
+        assert!(meta["last_performed_at"].is_i64(), "stamped like any fire");
+    }
+
+    /// `trusted` is also a fireable trust level (the design's third name for
+    /// a locally-approved row).
+    #[tokio::test]
+    async fn trusted_procedure_fires() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-trusted",
+            "procedure",
+            json!({ "trust": "trusted", "trigger": "session-start", "remaining_fires": 2 }),
+        )
+        .await;
+        let root = scratch("trusted");
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-trusted", "project_root": root.display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(reply["performed"], json!(true), "{}", reply);
+        assert_eq!(reply["remaining_fires"], json!(1));
+    }
+
+    /// Regression lock: a local procedure with no trust key at all fires
+    /// exactly as it did before the gate existed.
+    #[tokio::test]
+    async fn absent_trust_fires_unchanged() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-local",
+            "procedure",
+            procedure_metadata(json!(3)),
+        )
+        .await;
+        let root = scratch("local");
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-local", "project_root": root.display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(reply["performed"], json!(true), "{}", reply);
+        assert_eq!(reply["remaining_fires"], json!(2));
+
+        let meta = stored(&store, "probe", "proc-local").await.metadata;
+        assert_eq!(meta["remaining_fires"], json!(2));
+        assert_eq!(meta["performance_count"], json!(1));
+        assert!(
+            meta.get("trust").is_none(),
+            "firing must not invent a trust key on a local row"
+        );
+    }
+
+    /// The refusal has to teach the fix: it names the trust state, the
+    /// promotion verb, and the target value — and says plainly that
+    /// set-metadata replaces the metadata object, so the full object has to
+    /// be written back with trust set to "promoted".
+    #[tokio::test]
+    async fn refusal_message_names_promotion_path() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-msg",
+            "procedure",
+            json!({ "trust": "untrusted", "trigger": "session-start", "remaining_fires": 3 }),
+        )
+        .await;
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(json!({ "id": "proc-msg" }), store.clone()).await,
+        )
+        .expect("json");
+        let reason = reply["reason"].as_str().unwrap();
+        assert!(reason.contains("untrusted"), "{}", reason);
+        assert!(reason.contains("set-metadata"), "{}", reason);
+        assert!(reason.contains("promoted"), "{}", reason);
+        assert!(
+            reason.to_lowercase().contains("replac"),
+            "the message must warn that set-metadata replaces the metadata object: {}",
+            reason
+        );
+    }
+
     /// A future `valid_to` is a live deadline, not a lapse -- the same
     /// distinction supersede makes when it refuses to retire a row early.
     #[tokio::test]
@@ -602,7 +825,14 @@ mod tests {
     #[tokio::test]
     async fn a_non_procedure_row_is_refused_by_its_actual_type() {
         let store = empty_store("probe").await;
-        seed(&store, "probe", "rule-1", "rule", json!({ "enforcement": "ENFORCED" })).await;
+        seed(
+            &store,
+            "probe",
+            "rule-1",
+            "rule",
+            json!({ "enforcement": "ENFORCED" }),
+        )
+        .await;
         let before = stored(&store, "probe", "rule-1").await;
 
         let reply: Value = serde_json::from_str(
@@ -623,7 +853,14 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_id_is_not_found() {
         let store = empty_store("probe").await;
-        seed(&store, "probe", "proc-1", "procedure", procedure_metadata(json!(1))).await;
+        seed(
+            &store,
+            "probe",
+            "proc-1",
+            "procedure",
+            procedure_metadata(json!(1)),
+        )
+        .await;
 
         let reply: Value = serde_json::from_str(
             &handle_procedure_perform(json!({ "id": "nope" }), store.clone()).await,
@@ -632,10 +869,9 @@ mod tests {
         assert_eq!(reply["performed"], json!(false));
         assert_eq!(reply["reason"], json!("not found"));
 
-        let no_id: Value = serde_json::from_str(
-            &handle_procedure_perform(json!({}), store.clone()).await,
-        )
-        .expect("json");
+        let no_id: Value =
+            serde_json::from_str(&handle_procedure_perform(json!({}), store.clone()).await)
+                .expect("json");
         assert_eq!(no_id["performed"], json!(false));
         assert!(
             no_id["reason"].as_str().unwrap().contains("missing 'id'"),
@@ -650,7 +886,14 @@ mod tests {
     async fn a_procedure_is_found_outside_the_namespace_the_caller_thought_of() {
         let store = empty_store("probe").await;
         store.init("other").await.expect("schema");
-        seed(&store, "other", "proc-far", "procedure", procedure_metadata(json!(1))).await;
+        seed(
+            &store,
+            "other",
+            "proc-far",
+            "procedure",
+            procedure_metadata(json!(1)),
+        )
+        .await;
         let root = scratch("far");
 
         let reply: Value = serde_json::from_str(
@@ -674,9 +917,18 @@ mod tests {
     fn lapse_reads_valid_to_the_way_the_snapshot_filter_does() {
         let now = 1_000_000;
         assert!(!is_lapsed(&json!({}), now), "absent never lapses");
-        assert!(!is_lapsed(&json!({ "valid_to": null }), now), "null never lapses");
-        assert!(!is_lapsed(&json!({ "valid_to": now + 1 }), now), "future is live");
-        assert!(is_lapsed(&json!({ "valid_to": now }), now), "the instant itself lapses");
+        assert!(
+            !is_lapsed(&json!({ "valid_to": null }), now),
+            "null never lapses"
+        );
+        assert!(
+            !is_lapsed(&json!({ "valid_to": now + 1 }), now),
+            "future is live"
+        );
+        assert!(
+            is_lapsed(&json!({ "valid_to": now }), now),
+            "the instant itself lapses"
+        );
         assert!(is_lapsed(&json!({ "valid_to": now - 1 }), now));
         // An unreadable expiry reads as long expired rather than as never,
         // matching the snapshot's `unwrap_or(0) > now` filter.
@@ -688,18 +940,28 @@ mod tests {
         let now = 1_000_000;
         let day = 86_400;
         assert_eq!(next_due(&json!({ "trigger": "session-start" }), now), now);
-        assert_eq!(next_due(&json!({}), now), now, "an absent trigger still fires");
+        assert_eq!(
+            next_due(&json!({}), now),
+            now,
+            "an absent trigger still fires"
+        );
         assert_eq!(
             next_due(&json!({ "trigger": "every-n-days:7" }), now),
             now,
             "never performed: owed now, not in seven days"
         );
         assert_eq!(
-            next_due(&json!({ "trigger": "every-n-days:7", "last_performed_at": now - day }), now),
+            next_due(
+                &json!({ "trigger": "every-n-days:7", "last_performed_at": now - day }),
+                now
+            ),
             now + 6 * day
         );
         assert_eq!(
-            next_due(&json!({ "trigger": "every-n-days:x", "last_performed_at": now - day }), now),
+            next_due(
+                &json!({ "trigger": "every-n-days:x", "last_performed_at": now - day }),
+                now
+            ),
             now,
             "an unparseable cadence falls back to v1's always-due"
         );
@@ -755,7 +1017,11 @@ mod tests {
 
         let due = procedures_due(&memories, now);
         let ids: Vec<&str> = due.iter().map(|r| r["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["proc-now", "proc-later"], "lapsed and non-procedures drop out");
+        assert_eq!(
+            ids,
+            vec!["proc-now", "proc-later"],
+            "lapsed and non-procedures drop out"
+        );
 
         let first = &due[0];
         assert_eq!(first["content"], json!("do proc-now"));
