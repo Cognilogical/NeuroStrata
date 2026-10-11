@@ -622,7 +622,8 @@ pub async fn process_mcp_request(
                         // store, no bus, no daemon dependency), so it owns
                         // its own name mapping in the mesh module.
                         mesh_name if mesh_name.starts_with("neurostrata_synaptic_mesh_") => {
-                            result_text = crate::synaptic_mesh::handle_mesh_tool_call(mesh_name, &arguments);
+                            result_text =
+                                crate::synaptic_mesh::handle_mesh_tool_call(mesh_name, &arguments);
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -3672,6 +3673,47 @@ mod tests {
         let suffix = suffix_result.expect("should get a suffix");
         // The short path has node "a" — the long path has "origin-long"
         assert!(suffix.contains("\"a\""), "should use the shorter path that fits");
+    }
+
+    /// The mesh dispatch arm is the only production route from the wire to
+    /// the mesh module. Mutation-probe evidence (checker-free, integration
+    /// round): with the prefix sabotaged, the ENTIRE suite stayed green —
+    /// this test is what makes that arm load-bearing. It asserts ROUTING,
+    /// not mesh behaviour (the unit tests own behaviour): a mesh tool name
+    /// must NOT fall through to the "Unknown tool" handler.
+    #[tokio::test]
+    async fn a_mesh_tool_routes_through_the_wire_surface() {
+        let scratch = std::env::temp_dir().join(format!(
+            "ns-mcp-mesh-route-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_synaptic_mesh_status",
+                "arguments": { "project_root": scratch.display().to_string() }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("content text");
+        assert!(
+            !text.contains("Unknown tool"),
+            "mesh status must route past the fallthrough: {text}"
+        );
+        assert!(
+            text.starts_with("no mesh joined") || text.contains("mesh"),
+            "expected the canonical no-mesh answer, got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// Every tool the surface exposes, in the order tools/list returns them.
