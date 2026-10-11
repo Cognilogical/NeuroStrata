@@ -922,8 +922,12 @@ pub(crate) fn blocked_message(id: &str) -> String {
 /// Q2 -- the Lock 2 enforcement point. Success requires at least one inbound
 /// EXTRACTED_FROM edge *after* the call, checked in the design's order:
 /// pre-existing edge, `link_memory_id` re-upsert (no re-embed), inline
-/// `memory` through the add_memory pipeline. Failure is `Err`, which the
-/// dispatcher turns into a JSON-RPC -32603 -- never a success payload.
+/// `memory` through the add_memory pipeline. The inline `memory` accepts an
+/// optional `metadata` object and persists it exactly as add_memory would
+/// (caller keys verbatim; `extracted_from` stamped with this task if absent;
+/// non-object metadata rejected) -- a dropped `source` here is a
+/// `rule_without_source` gate violation one call later. Failure is `Err`,
+/// which the dispatcher turns into a JSON-RPC -32603 -- never a success payload.
 pub async fn handle_task_complete(
     args: Value,
     emb: Arc<dyn Embedder>,
@@ -1058,7 +1062,34 @@ pub async fn handle_task_complete(
                 .to_string();
             let user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
             let agent_name = arg_str(&args, "agent_name").map(|s| s.to_string());
-            let mut meta = json!({ "extracted_from": [id.as_str()] });
+            // The caller's metadata is the base; add_memory persists the
+            // metadata it is given, so the completion handoff does no less. A
+            // dropped key here is a dropped source: the gate would reject the
+            // rule one call later for provenance the caller declared.
+            let mut meta = match mem.get("metadata") {
+                None | Some(Value::Null) => json!({}),
+                Some(m) if m.is_object() => m.clone(),
+                Some(_) => {
+                    return Err(
+                        "ERROR: 'memory.metadata' must be a JSON object (key-value map), not a string, array, or null.".to_string()
+                    )
+                }
+            };
+            if !meta
+                .get("extracted_from")
+                .and_then(|v| v.as_array())
+                .map_or(false, |arr| arr.iter().any(|t| t.as_str() == Some(id.as_str())))
+            {
+                match meta.get_mut("extracted_from") {
+                    None => meta["extracted_from"] = json!([id.as_str()]),
+                    Some(Value::Array(arr)) => arr.push(json!(id.as_str())),
+                    Some(_) => {
+                        return Err(
+                            "ERROR: memory metadata has a malformed 'extracted_from' (it must be an array of task ids).".to_string()
+                        )
+                    }
+                }
+            }
             let mut location = String::new();
             let mut location_lines = String::new();
             if let Some(locations) = mem.get("locations").and_then(|l| l.as_array()) {
@@ -1251,7 +1282,9 @@ NeuroStrata, not in the repo.
 ## 2. Session completion (all three, in order)
 1. `neurostrata_task_complete` on every claimed task. It is the only entrance
    to `done`, and it forces extraction: pass `memory.content` (what did this
-   task teach? what rule does it prove?) or `link_memory_id`.
+   task teach? what rule does it prove?) or `link_memory_id`. An inline
+   `memory.metadata` is persisted exactly as add_memory persists one -- pass
+   `source` there for a rule that must carry provenance.
 2. `neurostrata-mcp task gate {ns}` must exit 0.
 3. `git pull --rebase` then `git push` (the pre-push hook runs the gate).
 
@@ -3784,6 +3817,92 @@ mod tests {
         // The inline write also carries the pipeline's own stamps.
         assert!(written.payload.metadata.get("valid_from").is_some(), "valid_from comes from the pipeline");
         assert!(written.payload.metadata.get("access_count").is_some());
+    }
+
+    /// Pinned contract: the inline `memory` handoff persists `memory.metadata`
+    /// exactly as add_memory would -- the caller's keys land verbatim (on top
+    /// of the pipeline stamps), with the EXTRACTED_FROM edge guaranteed. This
+    /// is the Source-necessity argument: a rule the funnel writes must carry
+    /// the source its caller declared, or the gate the funnel feeds rejects
+    /// it one call later.
+    #[tokio::test]
+    async fn path_3_inline_memory_persists_caller_metadata_verbatim() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let requested_source = json!({
+            "kind": "task",
+            "ref": id.as_str(),
+            "captured_at": "2026-10-11"
+        });
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": {
+                    "content": "the lesson the task taught",
+                    "memory_type": "rule",
+                    "metadata": {
+                        "extracted_from": [id.as_str()],
+                        "source": requested_source.clone(),
+                    }
+                }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("the inline extraction writes the edge");
+
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        let lesson_id = parsed["extracted_memory_ids"][0].as_str().unwrap().to_string();
+        let (_, lesson) = store.get("MyProj", &lesson_id).await.unwrap().unwrap();
+        assert_eq!(lesson.memory_type, "rule", "the caller's memory_type lands");
+        assert_eq!(
+            lesson.metadata["source"], requested_source,
+            "the caller's metadata.source must persist exactly as add_memory would persist it"
+        );
+        assert_eq!(
+            lesson.metadata["extracted_from"],
+            json!([id.as_str()]),
+            "the EXTRACTED_FROM edge is guaranteed and not re-created"
+        );
+    }
+
+    /// Regression lock: without `memory.metadata`, the inline write today is
+    /// exactly what it stays -- extracted_from only, plus the pipeline stamps,
+    /// no invention.
+    #[tokio::test]
+    async fn path_3_inline_memory_without_metadata_behaves_as_today() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": { "content": "metadata-less lesson" }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("the inline extraction writes the edge");
+
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        let lesson_id = parsed["extracted_memory_ids"][0].as_str().unwrap().to_string();
+        let (_, lesson) = store.get("MyProj", &lesson_id).await.unwrap().unwrap();
+        assert_eq!(lesson.memory_type, "fact");
+        assert_eq!(lesson.metadata["extracted_from"], json!([id.as_str()]));
+        assert!(lesson.metadata.get("source").is_none());
+        assert!(lesson.metadata.get("valid_from").is_some(), "pipeline stamp");
+        assert!(lesson.metadata.get("access_count").is_some(), "pipeline stamp");
     }
 
     /// Emit site 3: closing a task with an inline lesson is "the task gave way

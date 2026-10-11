@@ -318,6 +318,7 @@ pub async fn process_mcp_request(
                                     "properties": {
                                         "content": { "type": "string", "description": "What did you learn? What rule does this task prove?" },
                                         "memory_type": { "type": "string", "description": "Defaults to 'fact'." },
+                                        "metadata": { "type": "object", "description": "Optional key-value map persisted exactly as neurostrata_add_memory persists one (e.g. source {kind, ref, captured_at} for a Source-necessary rule); extracted_from is stamped with this task if absent." },
                                         "locations": { "type": "array", "items": { "type": "object" }, "description": "The same location anchors neurostrata_add_memory accepts." }
                                     },
                                     "required": ["content"]
