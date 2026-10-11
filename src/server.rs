@@ -440,6 +440,12 @@ pub async fn process_mcp_request(
                     }
                 ]
             });
+            // SynapticMesh surface: the schemas live with the module so the
+            // CLI, the adapter, and this list cannot drift into three
+            // different shapes of the same promise.
+            if let Some(tools) = result.get_mut("tools").and_then(|t| t.as_array_mut()) {
+                tools.extend(crate::synaptic_mesh::synaptic_mesh_tool_definitions());
+            }
             // Append vocabulary summaries to tool descriptions from the shipped schema.
             {
                 let vocab = crate::traits::memory_vocabulary();
@@ -610,6 +616,14 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_archive_memory" => {
                             result_text = crate::handlers::archive_memory::handle_archive_memory(arguments, store.clone(), bus.clone()).await;
+                        }
+                        // SynapticMesh: the handler is a pure string-in/
+                        // string-out dispatch (filesystem + git only; no
+                        // store, no bus, no daemon dependency), so it owns
+                        // its own name mapping in the mesh module.
+                        mesh_name if mesh_name.starts_with("neurostrata_synaptic_mesh_") => {
+                            result_text =
+                                crate::synaptic_mesh::handle_mesh_tool_call(mesh_name, &arguments);
                         }
                         _ => {
                             result_text = format!("Unknown tool: {}", name);
@@ -3661,11 +3675,52 @@ mod tests {
         assert!(suffix.contains("\"a\""), "should use the shorter path that fits");
     }
 
+    /// The mesh dispatch arm is the only production route from the wire to
+    /// the mesh module. Mutation-probe evidence (checker-free, integration
+    /// round): with the prefix sabotaged, the ENTIRE suite stayed green —
+    /// this test is what makes that arm load-bearing. It asserts ROUTING,
+    /// not mesh behaviour (the unit tests own behaviour): a mesh tool name
+    /// must NOT fall through to the "Unknown tool" handler.
+    #[tokio::test]
+    async fn a_mesh_tool_routes_through_the_wire_surface() {
+        let scratch = std::env::temp_dir().join(format!(
+            "ns-mcp-mesh-route-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_synaptic_mesh_status",
+                "arguments": { "project_root": scratch.display().to_string() }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("content text");
+        assert!(
+            !text.contains("Unknown tool"),
+            "mesh status must route past the fallthrough: {text}"
+        );
+        assert!(
+            text.starts_with("no mesh joined") || text.contains("mesh"),
+            "expected the canonical no-mesh answer, got: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// Every tool the surface exposes, in the order tools/list returns them.
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_twenty_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_twenty_seven_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -3715,6 +3770,15 @@ mod tests {
                 "neurostrata_guard_learn",
                 "neurostrata_guard_list_rules",
                 "neurostrata_archive_memory",
+                // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
+                // _definitions())` — this order IS the append order, so it
+                // pins where the mesh module's list enters the surface.
+                "neurostrata_synaptic_mesh_init",
+                "neurostrata_synaptic_mesh_join",
+                "neurostrata_synaptic_mesh_push",
+                "neurostrata_synaptic_mesh_pull",
+                "neurostrata_synaptic_mesh_leave",
+                "neurostrata_synaptic_mesh_status",
             ]
         );
         for tool in tools {
