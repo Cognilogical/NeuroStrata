@@ -43,6 +43,20 @@ pub enum SynapticMeshCommands {
 
     /// Leave the mesh: drop this project's pointer. Records stay on disk.
     Leave,
+
+    /// [internal hook target] Pull-then-push in one non-interactive,
+    /// fail-soft call for the project-side pre-push hook (spec §Hooks).
+    /// ALWAYS one line and the CLI never exits non-zero: a hook must never
+    /// block the source push. Manual push/pull remains first-class — this
+    /// command is only the hook's target, and manual wiring is documented
+    /// at `PRE_PUSH_HOOK` in main.rs.
+    #[command(hide = true)]
+    SyncEnqueue,
+
+    /// Print the mesh checkout's recovery states (dirty tree, detached
+    /// HEAD, interrupted merge) with the manual fix for each. Reads only —
+    /// never auto-fixes, never `reset --hard` (spec §Recovery).
+    Recover,
 }
 
 /// Everything the handler needs to know about *where* it is running.
@@ -113,6 +127,12 @@ pub fn handle_synaptic_mesh_command(
                 format!("left mesh — pointer removed at {}", pointer.display())
             })
         }
+        // The hook target renders its own single line — the value IS the
+        // reply, never collapsed and never an Err (exit-0 rule).
+        SynapticMeshCommands::SyncEnqueue => super::mesh_service::sync_enqueue_line(store),
+        // Recovery is print-only: it reads the checkout, names each paused
+        // state, and hands back the manual fix.
+        SynapticMeshCommands::Recover => super::mesh_service::recover_report(&ctx.project_root),
     }
 }
 
@@ -156,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_all_six_subcommands() {
+    fn cli_parses_all_subcommands() {
         assert_eq!(
             parse(&["h", "init", "team"]),
             SynapticMeshCommands::Init {
@@ -193,6 +213,8 @@ mod tests {
         assert_eq!(parse(&["h", "pull"]), SynapticMeshCommands::Pull);
         assert_eq!(parse(&["h", "status"]), SynapticMeshCommands::Status);
         assert_eq!(parse(&["h", "leave"]), SynapticMeshCommands::Leave);
+        assert_eq!(parse(&["h", "sync-enqueue"]), SynapticMeshCommands::SyncEnqueue);
+        assert_eq!(parse(&["h", "recover"]), SynapticMeshCommands::Recover);
     }
 
     #[derive(Default, Debug)]
@@ -204,6 +226,10 @@ mod tests {
         push_err: Option<String>,
         status_err: Option<String>,
         pull_err: Option<String>,
+        /// Ok-answers for pull/push (the mock defaults to failing with the
+        /// no-mesh error; these let a test speak the success arms too).
+        pull_ok: Option<String>,
+        push_ok: Option<String>,
         /// Every trait method called, in order — makes "which calls happened"
         /// assertable without one field per method.
         calls: Vec<String>,
@@ -263,9 +289,17 @@ mod tests {
             Err(self.status_err.clone().unwrap_or_else(|| no_mesh_err()))
         }
         fn push(&mut self) -> Result<String, String> {
+            if let Some(line) = self.push_ok.clone() {
+                self.calls.push("push:ok".into());
+                return Ok(line);
+            }
             Err(self.push_err.clone().unwrap_or_else(no_mesh_err))
         }
         fn pull(&mut self) -> Result<String, String> {
+            self.calls.push("pull".into());
+            if let Some(line) = self.pull_ok.clone() {
+                return Ok(line);
+            }
             Err(self.pull_err.clone().unwrap_or_else(no_mesh_err))
         }
     }
@@ -274,6 +308,58 @@ mod tests {
     /// NOT equal the CLI's canonical message — the collapse is the contract.
     fn no_mesh_err() -> String {
         format!("{NO_MESH_PREFIX} (no pointer at /proj/.NeuroStrata)")
+    }
+
+    #[test]
+    fn sync_enqueue_pulls_before_pushing_and_renders_one_line() {
+        let mut store = MockMesh {
+            pull_ok: Some("pulled mesh x".to_string()),
+            push_ok: Some("pushed mesh x".to_string()),
+            ..Default::default()
+        };
+        let reply =
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store);
+        assert_eq!(
+            reply,
+            "mesh sync-enqueued: pulled mesh x; pushed mesh x",
+            "one line, pull result first: {reply}"
+        );
+        assert_eq!(store.calls, vec!["pull", "push:ok"], "pull-before-push order");
+    }
+
+    #[test]
+    fn sync_enqueue_quiets_no_mesh_into_a_soft_nothing_to_do() {
+        // Mock pulls fail with the storage-layer no-mesh error by default.
+        let mut store = MockMesh::default();
+        let reply =
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store);
+        assert!(
+            reply.contains("no mesh joined") && reply.contains("nothing to do"),
+            "hook sees a quiet success, not an error: {reply}"
+        );
+        assert!(!store.calls.contains(&"push:ok".to_string()), "no push attempted");
+    }
+
+    #[test]
+    fn sync_enqueue_renders_push_failure_as_one_blocking_free_line() {
+        // An unreachable/rejecting remote: the hook STILL gets one line and
+        // the CLI still exits 0 — never blocks the source push (spec §Hooks).
+        let mut store = MockMesh {
+            pull_ok: Some("pulled mesh x".to_string()),
+            push_err: Some("git push failed: connection refused by unreachable remote".into()),
+            ..Default::default()
+        };
+        let reply =
+            handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store);
+        assert!(
+            reply.starts_with("mesh sync-enqueue failed (non-blocking"),
+            "fatal shape for a hook: {reply}"
+        );
+        assert_eq!(reply.lines().count(), 1, "exactly one line");
+        assert!(
+            reply.contains("connection refused"),
+            "the failure detail survives for the log: {reply}"
+        );
     }
 
     #[test]

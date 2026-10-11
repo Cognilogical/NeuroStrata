@@ -482,6 +482,16 @@ fn daemon_busy(probe: DaemonProbe, lock_held: bool) -> bool {
 /// in the repo, so there is nothing to commit, sync, or rebuild. Blocks only
 /// on exit 1 -- an unavailable database (exit 2) passes here; `task gate
 /// --strict` maps its own infra failure to exit 1 instead of 2 (section 5.1).
+///
+/// Mesh piggyback (spec §"Hooks"), slice 7 decision: the mesh enqueue is
+/// deliberately NOT installed into this hook. Hooks are unreliable (spec:
+/// not inherited by clones, conflict with hook managers), rewriting this
+/// const would not retrofit already-installed hooks, and the gate stays
+/// single-purpose. `neurostrata-mcp mesh sync-enqueue` (hidden CLI,
+/// pull-then-push, one line, always exit 0) is the hook TARGET for sites
+/// that opt in; manual wiring line, if wanted:
+///   printf '\nneurostrata-mcp mesh sync-enqueue >/dev/null 2>&1 || true\n' >> .git/hooks/pre-push
+/// Manual push/pull remains first-class either way.
 const PRE_PUSH_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata task gate. One hook is the whole enforcement surface:
 # tasks live in LadybugDB, never in the repo, so there is nothing to
@@ -1520,6 +1530,15 @@ async fn main() -> anyhow::Result<()> {
                 let reply =
                     crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc);
                 println!("{}", reply);
+                // Hook piggyback contract (spec §Hooks): the hook target
+                // ALWAYS exits 0, even when its reply carries a failure —
+                // a hook must never block the source push. The generic
+                // fallthrough also exits 0, but the invariant is stated
+                // (and enforced) explicitly here so a later refactor cannot
+                // silently gate a hook on mesh state.
+                if matches!(action, crate::synaptic_mesh::SynapticMeshCommands::SyncEnqueue) {
+                    return Ok(());
+                }
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;

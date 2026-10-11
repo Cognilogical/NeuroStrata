@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -208,12 +208,17 @@ pub(crate) fn daemon_bus(
 const MESH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// If the served project is joined to a mesh, register the mesh-outbox
-/// subscriber and spawn the drain loop. No mesh → nothing is registered, so
+/// subscriber and spawn the drain loop plus the session-start/periodic pull
+/// triggers. No mesh → nothing is registered, so
 /// the bus stays at its three v1 subscribers (the daemon tests assert exactly
 /// three). The mesh is resolved through the project-side pointer — the same
 /// path `MeshService` uses — so "joined" means the same thing here as at the
 /// CLI. This is the *only* daemon-side touch the mesh publish path needs.
-fn wire_mesh_publish(bus: &Arc<ThalamicBus>) {
+fn wire_mesh_publish(
+    bus: &Arc<ThalamicBus>,
+    vector_store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+) {
     let project_root = resolve_project_root();
     let mesh_dir = match crate::synaptic_mesh::storage::MeshStorage::read_pointer(&project_root) {
         Ok(Some((_mesh_id, dir, _remote))) => dir,
@@ -235,7 +240,124 @@ fn wire_mesh_publish(bus: &Arc<ThalamicBus>) {
             return;
         }
     }
-    tokio::spawn(mesh_drain_loop(project_root, wake));
+    tokio::spawn(mesh_drain_loop(project_root.clone(), wake));
+
+    // Session start (spec §Triggers): ONE best-effort pull + validation,
+    // never blocking startup beyond a 5s timeout and never crashing it.
+    tokio::spawn(session_start_mesh_pull(
+        project_root.clone(),
+        vector_store.clone(),
+        embedder.clone(),
+    ));
+
+    // Consented periodic fetch (spec §Triggers: "optionally consented
+    // periodic fetch"): only runs when the mesh manifest's policy opts in
+    // (`policy.auto_pull_interval_secs`), never on a bare timer otherwise.
+    if let Some(interval) = auto_pull_interval(&mesh_dir) {
+        tokio::spawn(periodic_mesh_pull(
+            project_root,
+            interval,
+            vector_store,
+            embedder,
+        ));
+    } else {
+        tracing::debug!(
+            "mesh policy has no auto_pull_interval_secs — no periodic pull scheduled"
+        );
+    }
+}
+
+/// The 5s ceiling spec §Triggers puts on a session-start pull: fail-soft
+/// both over time (timeout) and on outcome (errors logged, never propagated).
+const MESH_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One throttled (≤5s) best-effort pull for the given project: resolves the
+/// pointer, runs the slice-4 import/replay, and reports — errors that would
+/// wedge startup become log lines. Returns the report (or `None` on
+/// timeout) so the caller decides the logging level.
+async fn pull_mesh_once(
+    project_root: &Path,
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn Embedder>,
+) -> Option<String> {
+    let arguments = serde_json::json!({ "project_root": project_root.display().to_string() });
+    match tokio::time::timeout(
+        MESH_PULL_TIMEOUT,
+        crate::synaptic_mesh::import::handle_mesh_pull(
+            &arguments,
+            vector_store.clone(),
+            embedder.clone(),
+        ),
+    )
+    .await
+    {
+        Ok(report) => Some(report),
+        Err(_) => {
+            tracing::warn!(
+                "mesh pull timed out after 5s; session start is unaffected — try `neurostrata-mcp mesh pull`"
+            );
+            None
+        }
+    }
+}
+
+/// The session-start trigger body: run the throttled pull once and record
+/// the outcome in the daemon log (and stderr, which the daemon runner
+/// surfaces). Never panics, never blocks the caller — it only ever runs on
+/// its own spawned task.
+async fn session_start_mesh_pull(
+    project_root: PathBuf,
+    vector_store: Arc<dyn VectorStore>,
+    embedder: Arc<dyn Embedder>,
+) {
+    if let Some(report) =
+        pull_mesh_once(&project_root, &vector_store, &embedder).await
+    {
+        eprintln!("mesh session-start pull: {report}");
+        if report.starts_with("error:") {
+            tracing::warn!("mesh session-start pull failed (non-blocking): {report}");
+        } else {
+            tracing::info!("mesh session-start pull: {report}");
+        }
+    }
+}
+
+/// The consented periodic fetch loop (spec §Triggers): after the first
+/// (immediately-due) interval tick is consumed, one throttled pull per
+/// cadence tick, every failure a log line. The cadence comes from the mesh
+/// manifest's `policy.auto_pull_interval_secs` — the "consented" part.
+async fn periodic_mesh_pull(project_root: PathBuf, interval: std::time::Duration, vector_store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await; // tokio intervals fire immediately; the startup pull already ran
+    loop {
+        ticker.tick().await;
+        if let Some(report) = pull_mesh_once(&project_root, &vector_store, &embedder).await {
+            if report.starts_with("error:") {
+                tracing::warn!("mesh periodic pull failed (non-blocking): {report}");
+            } else {
+                tracing::info!("mesh periodic pull: {report}");
+            }
+        }
+    }
+}
+
+/// The consent gate: a policy-set cadence, clamped to a 60s floor so a
+/// mistyped 0/1 cannot hot-loop the remote. `None` = no consent, no loop.
+fn auto_pull_interval(mesh_dir: &Path) -> Option<std::time::Duration> {
+    match crate::synaptic_mesh::storage::MeshStorage::open(mesh_dir) {
+        Ok(storage) => auto_pull_interval_for_policy(&storage.manifest().policy),
+        Err(e) => {
+            tracing::warn!("mesh manifest unreadable; periodic pull not scheduled: {e}");
+            None
+        }
+    }
+}
+
+fn auto_pull_interval_for_policy(policy: &crate::synaptic_mesh::manifest::MeshPolicy) -> Option<std::time::Duration> {
+    policy
+        .auto_pull_interval_secs
+        .map(|secs| std::time::Duration::from_secs(secs.max(60)))
 }
 
 /// The drain loop: once per interval, or as soon as a subscriber appends an
@@ -346,7 +468,9 @@ pub(crate) async fn start_daemon_on(
     // The mesh publish path, wired only when this project has joined a mesh.
     // Must run after the bus exists (so the subscriber can register) and
     // before the HTTP server binds (so no request can miss an emitted pulse).
-    wire_mesh_publish(&bus);
+    // The store + embedder thread through for the session-start/periodic
+    // pull triggers (spec §Triggers): fail-soft, timeout-capped spawns.
+    wire_mesh_publish(&bus, vector_store.clone(), embedder.clone());
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -1634,5 +1758,57 @@ mod tests {
 
         client.post(format!("{base}/shutdown")).send().await.unwrap();
         daemon.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_start_pull_without_a_mesh_is_a_quiet_nothing_to_do() {
+        // Fail-soft (spec §Triggers): no pointer, no panic, no hang — the
+        // pull answers "no mesh joined" and session start moves on.
+        let project = std::env::temp_dir().join(format!(
+            "ns-dmn-pull-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&project).unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(RecordingStore::default());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder { dimensions: 8 });
+        let report = pull_mesh_once(&project, &store, &embedder).await;
+        assert!(
+            report
+                .as_ref()
+                .is_some_and(|r| r.contains("no mesh joined")),
+            "no-pointer pull is a fail-soft report: {report:?}"
+        );
+        std::fs::remove_dir_all(&project).unwrap();
+    }
+
+    #[test]
+    fn periodic_pull_requires_explicit_consent_and_is_floored() {
+        use crate::synaptic_mesh::manifest::MeshPolicy;
+        // No consent in the policy → no scheduled loop at all (spec
+        // §Triggers: the periodic fetch is a consented trigger, never a
+        // timer the daemon invented).
+        let consentless = MeshPolicy::default();
+        assert!(auto_pull_interval_for_policy(&consentless).is_none());
+
+        // Consent at 600s → 10 minutes exactly.
+        let consented = MeshPolicy {
+            auto_pull_interval_secs: Some(600),
+            ..MeshPolicy::default()
+        };
+        assert_eq!(
+            auto_pull_interval_for_policy(&consented),
+            Some(std::time::Duration::from_secs(600))
+        );
+
+        // A mistyped 0/1 cannot hot-loop the remote: 60s floor.
+        let typo = MeshPolicy {
+            auto_pull_interval_secs: Some(1),
+            ..MeshPolicy::default()
+        };
+        assert_eq!(
+            auto_pull_interval_for_policy(&typo),
+            Some(std::time::Duration::from_secs(60))
+        );
     }
 }
