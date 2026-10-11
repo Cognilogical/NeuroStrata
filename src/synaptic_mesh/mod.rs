@@ -15,7 +15,9 @@ pub mod storage_api;
 pub mod tools;
 
 pub use cli::{handle_synaptic_mesh_command, MeshContext, SynapticMeshCommands};
-pub use mesh_service::{conventional_base_root, handle_mesh_tool_call, resolve_node_id, MeshService};
+pub use mesh_service::{
+    conventional_base_root, handle_mesh_tool_call, resolve_node_id, MeshService,
+};
 pub use tools::synaptic_mesh_tool_definitions;
 // manifest/record/storage/storage_api types are reached through their module
 // paths by internal consumers (`storage::MeshStorage`, `super::manifest::…`);

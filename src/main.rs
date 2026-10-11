@@ -1517,7 +1517,9 @@ async fn main() -> anyhow::Result<()> {
                     node_id: crate::synaptic_mesh::resolve_node_id(),
                 };
                 let mut svc = crate::synaptic_mesh::MeshService::new(project_root);
-                println!("{}", crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc));
+                let reply =
+                    crate::synaptic_mesh::handle_synaptic_mesh_command(&action, &ctx, &mut svc);
+                println!("{}", reply);
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;
