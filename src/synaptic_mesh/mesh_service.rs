@@ -19,6 +19,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::cli::{handle_synaptic_mesh_command, MeshContext, SynapticMeshCommands};
+use super::conflict;
 use super::import::load_cursor;
 use super::outbox::{outbox_dir_for, OUTBOX_FILE_NAME};
 use super::storage::{MeshStorage, MANIFEST_FILE_NAME};
@@ -265,14 +266,16 @@ impl MeshService {
         // the remote-tracking ref when a remote is configured.
         lines.push(published_head_line(&root, m.remote.as_deref()));
 
-        // SM-7: conflict status_lines seam — conflict.rs does not exist at
-        // f85be68 (slice 6 runs in a parallel worktree), so the report names
-        // the gap instead of pretending a zero. The orchestrator wires
-        // conflict::status_lines through this seam at merge.
-        lines.push(
-            "conflicts: not wired (SM-7 seam — conflict status_lines lands with slice 6)"
-                .to_string(),
-        );
+        // The conflict overlay's truth (slice 6, wired at integration): an
+        // empty status_lines means nothing is registered — render an
+        // explicit zero, because a silently absent line can be misread as
+        // "no conflicts" by whoever never learned to look for it.
+        let conflict_lines = conflict::status_lines(&root);
+        if conflict_lines.is_empty() {
+            lines.push("conflicts: 0 unresolved".to_string());
+        } else {
+            lines.extend(conflict_lines);
+        }
 
         // Local store counts (shared vs private, spec §"Status surfaces")
         // need the VectorStore; the CLI dispatcher here has no database (the
@@ -1042,8 +1045,8 @@ mod tests {
             "fresh checkout has no published head: {report}"
         );
         assert!(
-            report.contains("conflicts: not wired (SM-7 seam"),
-            "the seam must be loud: {report}"
+            report.contains("conflicts: 0 unresolved"),
+            "clean mesh states zero explicitly — silence is not an answer: {report}"
         );
         assert!(report.contains("health: healthy"), "fresh mesh: {report}");
         assert!(
@@ -1053,6 +1056,63 @@ mod tests {
         assert!(
             std::fs::metadata(&dir).expect("mesh dir stat").is_dir(),
             "status is read-only sanity: mesh dir untouched"
+        );
+    }
+
+    /// End-to-end pin for the wired seam: a conflict registered in the
+    /// overlay must surface through `status()` — the count AND the per-entry
+    /// detail. This is what a teammate reads when a namespace's integration
+    /// is paused, so the line cannot lie in either direction: the fresh-mesh
+    /// test pins the explicit zero, this test pins the non-zero.
+    #[test]
+    fn status_surfaces_registered_conflicts_through_the_seam() {
+        let base = scratch("st-conf");
+        let project = scratch("st-conf-proj");
+        let (svc, dir) = init_joined(&base, &project, &["alpha"]);
+        let id = Uuid::new_v4();
+        let record: crate::synaptic_mesh::record::MeshRecord = serde_json::from_value(json!({
+            "schema_version": "synaptic-mesh-record/v1",
+            "id": id.to_string(),
+            "namespace": "alpha",
+            "memory_type": "rule",
+            "lifecycle": {
+                "state": "active",
+                "created_at": "2026-10-11T00:00:00Z",
+                "created_by": "node-peer-1",
+                "superseded_by": null,
+                "archived_at": null,
+                "tombstoned_at": null
+            },
+            "content": {"text": "incoming replacement"},
+            "metadata": {"eligibility": "shareable", "trust": "untrusted"},
+            "relationships": [],
+            "update_id": Uuid::new_v4().to_string(),
+            "origin_mesh_epoch": 1,
+            "trust": "untrusted"
+        }))
+        .expect("record fixture");
+        conflict::register_conflict(
+            &dir,
+            "alpha",
+            &id.to_string(),
+            "u-seam-1",
+            "two different replacements",
+            conflict::ConflictKind::Unresolved,
+            &record,
+        )
+        .expect("register");
+        let report = svc.status().expect("status with a conflict");
+        assert!(
+            report.contains("conflicts: 1 unresolved"),
+            "seam must surface the count: {report}"
+        );
+        assert!(
+            report.contains("two different replacements"),
+            "seam must surface the reason: {report}"
+        );
+        assert!(
+            !report.contains("conflicts: 0 unresolved"),
+            "a registered conflict is never reported as zero: {report}"
         );
     }
 
