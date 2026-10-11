@@ -1536,7 +1536,10 @@ async fn main() -> anyhow::Result<()> {
                 // fallthrough also exits 0, but the invariant is stated
                 // (and enforced) explicitly here so a later refactor cannot
                 // silently gate a hook on mesh state.
-                if matches!(action, crate::synaptic_mesh::SynapticMeshCommands::SyncEnqueue) {
+                if matches!(
+                    action,
+                    crate::synaptic_mesh::SynapticMeshCommands::SyncEnqueue
+                ) {
                     return Ok(());
                 }
             }

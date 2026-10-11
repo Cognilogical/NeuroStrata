@@ -213,7 +213,10 @@ mod tests {
         assert_eq!(parse(&["h", "pull"]), SynapticMeshCommands::Pull);
         assert_eq!(parse(&["h", "status"]), SynapticMeshCommands::Status);
         assert_eq!(parse(&["h", "leave"]), SynapticMeshCommands::Leave);
-        assert_eq!(parse(&["h", "sync-enqueue"]), SynapticMeshCommands::SyncEnqueue);
+        assert_eq!(
+            parse(&["h", "sync-enqueue"]),
+            SynapticMeshCommands::SyncEnqueue
+        );
         assert_eq!(parse(&["h", "recover"]), SynapticMeshCommands::Recover);
     }
 
@@ -320,11 +323,14 @@ mod tests {
         let reply =
             handle_synaptic_mesh_command(&SynapticMeshCommands::SyncEnqueue, &ctx(), &mut store);
         assert_eq!(
-            reply,
-            "mesh sync-enqueued: pulled mesh x; pushed mesh x",
+            reply, "mesh sync-enqueued: pulled mesh x; pushed mesh x",
             "one line, pull result first: {reply}"
         );
-        assert_eq!(store.calls, vec!["pull", "push:ok"], "pull-before-push order");
+        assert_eq!(
+            store.calls,
+            vec!["pull", "push:ok"],
+            "pull-before-push order"
+        );
     }
 
     #[test]
@@ -337,7 +343,10 @@ mod tests {
             reply.contains("no mesh joined") && reply.contains("nothing to do"),
             "hook sees a quiet success, not an error: {reply}"
         );
-        assert!(!store.calls.contains(&"push:ok".to_string()), "no push attempted");
+        assert!(
+            !store.calls.contains(&"push:ok".to_string()),
+            "no push attempted"
+        );
     }
 
     #[test]

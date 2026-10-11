@@ -21,7 +21,7 @@ use uuid::Uuid;
 use super::cli::{handle_synaptic_mesh_command, MeshContext, SynapticMeshCommands};
 use super::import::load_cursor;
 use super::outbox::{outbox_dir_for, OUTBOX_FILE_NAME};
-use super::storage::{MANIFEST_FILE_NAME, MeshStorage};
+use super::storage::{MeshStorage, MANIFEST_FILE_NAME};
 use super::storage_api::StorageApi;
 
 /// The conventional mesh root: `~/.NeuroStrata/synaptic-mesh`
@@ -253,9 +253,11 @@ impl MeshService {
         // of the checkout), plus its age.
         let short = |h: &str| h.get(..7).unwrap_or(h).to_string();
         match accepted_head_state(&root, &m.mesh_id.to_string()) {
-            Some((head, age)) => {
-                lines.push(format!("last accepted head: {} (age {})", short(&head), age))
-            }
+            Some((head, age)) => lines.push(format!(
+                "last accepted head: {} (age {})",
+                short(&head),
+                age
+            )),
             None => lines.push("last accepted head: none".to_string()),
         }
 
@@ -343,8 +345,7 @@ fn health_line(mesh_root: &Path) -> String {
         return format!("paused: dirty-checkout ({})", dirty.join("; "));
     }
     if detached_head(mesh_root) {
-        return "paused: detached HEAD — run `mesh recover` for the reattach steps"
-            .to_string();
+        return "paused: detached HEAD — run `mesh recover` for the reattach steps".to_string();
     }
     if merge_in_progress(mesh_root) {
         return "paused: merge in progress — `mesh recover` names the finish/abort choice"
@@ -555,18 +556,21 @@ pub fn recover_report(project_root: &Path) -> String {
         ));
     }
     if detached_head(&root) {
-        let branches = git(&root, &["for-each-ref", "refs/heads", "--format=%(refname:short)"])
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .take(5)
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let branches = git(
+            &root,
+            &["for-each-ref", "refs/heads", "--format=%(refname:short)"],
+        )
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .take(5)
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
         let hint = if branches.is_empty() {
             "reclone as the last resort (back up the WAL first)".to_string()
         } else {
@@ -1007,7 +1011,9 @@ mod tests {
     fn init_joined(base: &Path, project: &Path, namespaces: &[&str]) -> (MeshService, PathBuf) {
         let ns: Vec<String> = namespaces.iter().map(|s| s.to_string()).collect();
         let mut svc = MeshService::new(project.to_path_buf());
-        let id = svc.init_mesh(base, "node-7", "status-team", &ns, None).expect("init");
+        let id = svc
+            .init_mesh(base, "node-7", "status-team", &ns, None)
+            .expect("init");
         (svc, base.join(&id))
     }
 
@@ -1059,11 +1065,15 @@ mod tests {
         std::fs::create_dir_all(outbox_dir_for(&dir)).unwrap();
         let old_ts = chrono::Utc::now().timestamp() - 121;
         let new_ts = chrono::Utc::now().timestamp() - 10;
+        // Written the way outbox.rs appends (every line newline-terminated):
+        // the last line's \n matters — wal_summary drops the would-be tail
+        // fragment otherwise, and the beta entry would vanish from the count.
         std::fs::write(
             &wal,
             format!(
                 r#"{{"stable_op_id":"{}","op":"created","id":"m1","namespace":"alpha","memory_type":"rule","content":"c","metadata":{{}},"ts":{old_ts}}}
-{{"stable_op_id":"{}","op":"created","id":"m2","namespace":"beta","memory_type":"fact","content":"c","metadata":{{}},"ts":{new_ts}}}"#,
+{{"stable_op_id":"{}","op":"created","id":"m2","namespace":"beta","memory_type":"fact","content":"c","metadata":{{}},"ts":{new_ts}}}
+"#,
                 Uuid::new_v4(),
                 Uuid::new_v4()
             ),
@@ -1087,8 +1097,10 @@ mod tests {
         std::fs::write(
             &wal,
             format!(
-                r#"{{"stable_op_id":"{}","op":"created","id":"m1","namespace":"alpha","memory_type":"rule","content":"c","metadata":{{}},"ts":1700000000}}"#,
-                Uuid::new_v4()
+                // Entry terminated with \n, exactly as outbox.rs appends it.
+                r#"{{"stable_op_id":"{}","op":"created","id":"m1","namespace":"alpha","memory_type":"rule","content":"c","metadata":{{}},"ts":1700000000}}
+"#
+                , Uuid::new_v4()
             ),
         )
         .unwrap();
@@ -1215,7 +1227,11 @@ mod tests {
             reply.starts_with("mesh sync-enqueue failed (non-blocking"),
             "soft failure shape: {reply}"
         );
-        assert_eq!(reply.lines().count(), 1, "Git stderr must be flattened: {reply}");
+        assert_eq!(
+            reply.lines().count(),
+            1,
+            "Git stderr must be flattened: {reply}"
+        );
         assert!(
             reply.contains("queued locally"),
             "the hook learns the work is not lost: {reply}"
@@ -1263,6 +1279,38 @@ mod tests {
         assert!(
             report.contains("pause sync"),
             "state language mirrors spec: {report}"
+        );
+    }
+
+    #[test]
+    fn recover_on_a_dirty_checkout_names_the_paths_and_the_manual_fix() {
+        let base = scratch("rec-dirty-base");
+        let project = scratch("rec-dirty-proj");
+        let (_svc, dir) = init_joined(&base, &project, &["alpha"]);
+        std::fs::write(dir.join("junk-record.json"), "{}").unwrap();
+
+        let report = recover_report(&project);
+        assert!(report.contains("dirty working tree"), "{report}");
+        assert!(
+            report.contains("junk-record.json"),
+            "the dirty path is named: {report}"
+        );
+        assert!(
+            report.contains("commit or stash"),
+            "the fix is a manual commit/stash: {report}"
+        );
+        assert!(
+            report.contains("never `git reset --hard`"),
+            "spec §Recovery: never automatic reset --hard: {report}"
+        );
+        assert!(
+            report.contains("pause sync, local store untouched"),
+            "state language mirrors spec: {report}"
+        );
+        // Plus a read-back to prove nothing got fixed: the junk file survived.
+        assert!(
+            dir.join("junk-record.json").exists(),
+            "recover is print-only — it never removes the dirty file"
         );
     }
 
