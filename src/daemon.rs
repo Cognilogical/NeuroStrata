@@ -204,6 +204,101 @@ pub(crate) fn daemon_bus(
     build_thalamic_bus(vector_store, dimensions, resolve_project_root())
 }
 
+/// How often the mesh-worker drains the outbox when no mutation wakes it first.
+const MESH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// If the served project is joined to a mesh, register the mesh-outbox
+/// subscriber and spawn the drain loop. No mesh → nothing is registered, so
+/// the bus stays at its three v1 subscribers (the daemon tests assert exactly
+/// three). The mesh is resolved through the project-side pointer — the same
+/// path `MeshService` uses — so "joined" means the same thing here as at the
+/// CLI. This is the *only* daemon-side touch the mesh publish path needs.
+fn wire_mesh_publish(bus: &Arc<ThalamicBus>) {
+    let project_root = resolve_project_root();
+    let mesh_dir = match crate::synaptic_mesh::storage::MeshStorage::read_pointer(&project_root) {
+        Ok(Some((_mesh_id, dir, _remote))) => dir,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("mesh pointer unreadable; mesh outbox disabled: {e}");
+            return;
+        }
+    };
+
+    let outbox_dir = crate::synaptic_mesh::outbox::outbox_dir_for(&mesh_dir);
+    let wake = Arc::new(tokio::sync::Notify::new());
+    match crate::events::subscribers::MeshOutbox::new(outbox_dir.clone(), wake.clone()) {
+        Ok(sub) => {
+            bus.register(Box::new(sub));
+        }
+        Err(e) => {
+            tracing::warn!("mesh outbox could not open {}; disabled: {e}", outbox_dir.display());
+            return;
+        }
+    }
+    tokio::spawn(mesh_drain_loop(project_root, wake));
+}
+
+/// The drain loop: once per interval, or as soon as a subscriber appends an
+/// entry (the `Notify` edge). A drain is synchronous git + file I/O, so it is
+/// called directly rather than awaited — the mesh repo is tiny and the
+/// interval is seconds, so it never meaningfully blocks the executor.
+async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>) {
+    let mut interval = tokio::time::interval(MESH_DRAIN_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = wake.notified() => {}
+        }
+        drain_mesh_once(&project_root);
+    }
+}
+
+/// One drain of the served project's mesh. Re-resolves the pointer each tick
+/// so a leave/rejoin during a session is picked up; every failure is a logged
+/// no-op, never a daemon crash.
+fn drain_mesh_once(project_root: &std::path::Path) {
+    use crate::synaptic_mesh::{
+        mesh_service::resolve_node_id,
+        outbox::{outbox_dir_for, Outbox},
+        storage::MeshStorage,
+        worker::drain_once,
+    };
+
+    let mesh_dir = match MeshStorage::read_pointer(project_root) {
+        Ok(Some((_mesh_id, dir, _remote))) => dir,
+        _ => return,
+    };
+    let node_id = resolve_node_id();
+    let mesh = match MeshStorage::open(&mesh_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("mesh drain skipped: {e}");
+            return;
+        }
+    };
+    let outbox = match Outbox::open(&outbox_dir_for(&mesh_dir)) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("mesh drain skipped: {e}");
+            return;
+        }
+    };
+    match drain_once(&outbox, &mesh, &node_id) {
+        Ok(report) if report.pending_seen > 0 => {
+            tracing::debug!(
+                applied = report.applied,
+                skipped = report.skipped,
+                already_applied = report.already_applied,
+                committed = report.committed,
+                "mesh outbox drained"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("mesh drain failed: {e}"),
+    }
+}
+
 pub(crate) async fn start_daemon_on(
     bind_addr: String,
     embedder: Arc<dyn Embedder>,
@@ -247,6 +342,11 @@ pub(crate) async fn start_daemon_on(
     // embedder's width is read here because `embedder` moves into the
     // state below.
     let bus = daemon_bus(vector_store.clone(), embedder.dimensions());
+
+    // The mesh publish path, wired only when this project has joined a mesh.
+    // Must run after the bus exists (so the subscriber can register) and
+    // before the HTTP server binds (so no request can miss an emitted pulse).
+    wire_mesh_publish(&bus);
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
