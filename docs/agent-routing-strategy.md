@@ -108,3 +108,32 @@ on main. Remaining slices 2–6 pre-scoped:
 Verification loop: every worker/craftsman delivery goes to `checker-free`
 (gates + claims-vs-source) before merge. Risky surfaces (outbox = durability,
 mesh-worker = concurrency) escalate review beyond the free reviewer.
+
+## 5. Seat starvation (learned 2026-10-11)
+
+The 2026-10-10/11 SynapticMesh fan-out ran through a real seat-starvation
+episode. Recorded so the next crunch inherits the countermeasures instead of
+rediscovering them:
+
+- **The paid Go pool is a single point of failure.** A billing/wallet wall
+  disabled 8 of 15 seats overnight. Any fleet whose free capacity rides one
+  provider wallet has one wallet's failure domain. Route as if the wallet
+  can disappear at any moment: keep two donor seat families per critical
+  lane (design, build, verify) if the fleet allows it.
+- **Free primaries rate-limit intermittently, not permanently.** The honest
+  response is NOT to promote a paid model permanently "because it's there";
+  it is queue-and-continue: when the primary returns, the fee switch flips
+  back. Paid-second-line is a fallback, not a routing upgrade.
+- **Checkpoint-WIP-on-death saved every unit that died mid-flight.** Subagent
+  prompts that pin the worktree + commit hash + task id + next action let any
+  successor resume exactly at the hand-off point instead of re-grepping the
+  whole repo. Mandate state snapshots in every hand-off (the task's Breath
+  note is the right place to write them).
+- **Checker-session truncation → narrowed decisive-item continuations.** When
+  a free reviewer dies after listing its findings, re-dispatch a NARROWED
+  continuation: the verdict artifacts + the remaining decisive items only,
+  never "re-review everything". Truncated breadth recovered this way cost
+  ~1 rerun, not a from-scratch re-verification.
+- **Identifier discipline: never cite hashes from memory.** A worker quoting  a commit sha it last glanced at entangles the whole review loop with a
+  wrong-parent rebase. The pre-push chain caught it, but the cheap invariant
+  is: `git rev-parse` immediately before citing, cut-paste, never recall.

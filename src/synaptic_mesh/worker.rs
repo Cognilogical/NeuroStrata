@@ -788,7 +788,10 @@ mod tests {
 
         let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
         assert!(
-            err.contains("rename"),
+            err.contains("record rename"),
+            // The fixture tag "rename-fault" lives in the path, so a loose
+            // `contains("rename")` would also pass a READ-stage failure;
+            // only the tmp->rename step's message says "record rename".
             "the failure must be the tmp->rename step, not an earlier stage: {err}"
         );
 
