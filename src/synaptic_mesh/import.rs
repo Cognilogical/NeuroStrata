@@ -70,6 +70,12 @@ const RUNTIME_COUNTER_KEYS: [&str; 4] = [
     "last_episodic_pointer",
 ];
 
+/// Conservative per-record byte cap, enforced BEFORE parse (spec §"Import
+/// validation": "bounds"). A candidate larger than this is ignored — never
+/// parsed, never applied — so an oversized JSON blob cannot force the daemon
+/// to materialize an arbitrarily large record.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// What one replay pass did.
 #[derive(Debug, Clone)]
 pub struct ApplyReport {
@@ -297,6 +303,7 @@ pub async fn apply_changed(
 ) -> anyhow::Result<ApplyReport> {
     let root = mesh.root();
     let mesh_id = mesh.manifest().mesh_id.to_string();
+    let manifest_epoch = mesh.manifest().epoch;
 
     // ONCE per pass, before ANY candidate read: the whole tree is refused
     // when the checkout is dirty (spec §Recovery: "pause sync, do not touch
@@ -366,6 +373,10 @@ pub async fn apply_changed(
                 continue;
             }
         };
+        if let Err(reason) = epoch_gate(record.origin_mesh_epoch, manifest_epoch) {
+            report.ignored.push(format!("{rel}: {reason}"));
+            continue;
+        }
         match apply_one(
             root,
             &mesh_id,
@@ -607,6 +618,13 @@ pub fn validate_record(
     served: &[String],
     raw: &str,
 ) -> Result<MeshRecord, String> {
+    if raw.len() > MAX_RECORD_BYTES {
+        return Err(format!(
+            "record is {} bytes, over the {}-byte per-record cap (MAX_RECORD_BYTES)",
+            raw.len(),
+            MAX_RECORD_BYTES
+        ));
+    }
     let record: MeshRecord =
         serde_json::from_str(raw).map_err(|e| format!("unparseable MeshRecord ({e})"))?;
     if record.schema_version != MESH_RECORD_SCHEMA_VERSION {
@@ -650,6 +668,30 @@ pub fn validate_record(
         );
     }
     Ok(record)
+}
+
+/// The epoch gate (spec §"Deletion & erasure" / §"Import validation"): a
+/// record's `origin_mesh_epoch` is compared against the mesh manifest's
+/// current `epoch` at apply time.
+///
+/// - older → quarantine: the record was born before a coordinated history
+///   rewrite (a `filter-repo` purge) and must not be replayed into the new
+///   epoch. Refused, named in the ignore report — NOT a conflict.
+/// - equal → apply (today's behavior).
+/// - newer → refused: a single-epoch model cannot produce a record from the
+///   future, so a validator refuses what it does not understand rather than
+///   silently accepting it.
+pub fn epoch_gate(candidate_epoch: u32, manifest_epoch: u32) -> Result<(), String> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match candidate_epoch.cmp(&manifest_epoch) {
+        Equal => Ok(()),
+        Less => Err(format!(
+            "old-epoch record (origin_mesh_epoch {candidate_epoch} < manifest epoch {manifest_epoch}); quarantined, not replayed"
+        )),
+        Greater => Err(format!(
+            "future-epoch record (origin_mesh_epoch {candidate_epoch} > manifest epoch {manifest_epoch}); refused, not understood"
+        )),
+    }
 }
 
 /// Does this JSON anywhere (objects recursively) carry a runtime counter
@@ -1528,6 +1570,23 @@ mod tests {
         mesh.manifest().mesh_id.to_string()
     }
 
+    /// Rewrite the on-disk manifest to a new `epoch`, commit it (the local
+    /// half of an epoch migration), and reopen the mesh so its cached
+    /// manifest reflects the new epoch.
+    fn reopen_with_epoch(mesh: &MeshStorage, epoch: u32) -> MeshStorage {
+        let mut manifest = mesh.manifest().clone();
+        manifest.epoch = epoch;
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(
+            mesh.root().join(super::super::storage::MANIFEST_FILE_NAME),
+            format!("{json}\n"),
+        )
+        .unwrap();
+        mesh.commit_all("epoch migration", "node-import-test")
+            .unwrap();
+        MeshStorage::open(mesh.root()).unwrap()
+    }
+
     fn lifecycle_json(state: &str, archived_at: Option<chrono::DateTime<chrono::Utc>>) -> Value {
         json!({
             "state": state,
@@ -1825,6 +1884,155 @@ mod tests {
         assert!(
             joined.contains("synaptic-mesh-record/v1"),
             "the supported version is named: {joined}"
+        );
+    }
+
+    // ---- slice F3: old-epoch quarantine + oversized-JSON cap ---------------
+    //
+    // Spec §"Deletion & erasure" / §"Import validation": the manifest epoch is
+    // the purge mechanism's only teeth. A record whose `origin_mesh_epoch`
+    // predates the manifest's current epoch is from a pre-purge peer and is
+    // quarantined (a named ignore), never replayed. Equal epochs apply as
+    // today; a future epoch is refused explicitly (a validator rejects what it
+    // does not understand). Oversized records are capped before parse.
+
+    /// An old-epoch record (origin_mesh_epoch 1, manifest epoch 2 after a
+    /// migration) is refused and NAMED in the ignore report — quarantined,
+    /// not replayed into the new epoch.
+    #[tokio::test]
+    async fn epoch_older_refused_named() {
+        let (_base, mesh) = mesh_with_commit("epoch-older");
+        let mesh = reopen_with_epoch(&mesh, 2);
+        let id = Uuid::new_v4();
+        // A record born in the pre-migration epoch (origin_mesh_epoch 1).
+        let value = simple_rule(id, "published before the purge");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("epoch-older").await;
+
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.applied, 0,
+            "old-epoch record never applies: {report:?}"
+        );
+        assert_eq!(row_count(&store, "probe").await, 0, "store untouched");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("old-epoch"),
+            "the refusal names the old epoch: {joined}"
+        );
+        assert!(
+            joined.contains("origin_mesh_epoch 1") && joined.contains("manifest epoch 2"),
+            "both epochs are named: {joined}"
+        );
+    }
+
+    /// An equal-epoch record applies as it always has — byte-identical
+    /// behavior to the pre-gate flow.
+    #[tokio::test]
+    async fn epoch_equal_applies() {
+        let (_base, mesh) = mesh_with_commit("epoch-equal");
+        let id = Uuid::new_v4();
+        let value = simple_rule(id, "same epoch as the manifest");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("epoch-equal").await;
+
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "equal epoch applies: {report:?}");
+        assert!(report.ignored.is_empty(), "nothing ignored: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(payload.content, "same epoch as the manifest");
+    }
+
+    /// A future-epoch record (origin_mesh_epoch 2, manifest epoch 1) is
+    /// refused with an explicit "future epoch" reason — never silently
+    /// accepted.
+    #[tokio::test]
+    async fn epoch_future_refused() {
+        let (_base, mesh) = mesh_with_commit("epoch-future");
+        let id = Uuid::new_v4();
+        let mut value = simple_rule(id, "from a future epoch");
+        value["origin_mesh_epoch"] = json!(2);
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("epoch-future").await;
+
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.applied, 0,
+            "future-epoch record never applies: {report:?}"
+        );
+        assert_eq!(row_count(&store, "probe").await, 0, "store untouched");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("future-epoch"),
+            "the refusal names the future epoch: {joined}"
+        );
+        assert!(
+            joined.contains("origin_mesh_epoch 2") && joined.contains("manifest epoch 1"),
+            "both epochs are named: {joined}"
+        );
+    }
+
+    /// A record larger than `MAX_RECORD_BYTES` is ignored BEFORE parse, with
+    /// a reason naming the cap — an oversized JSON blob never applies.
+    #[tokio::test]
+    async fn oversized_record_ignored_named() {
+        let (_base, mesh) = mesh_with_commit("oversized");
+        let id = Uuid::new_v4();
+        let big_text = "x".repeat(MAX_RECORD_BYTES + 1);
+        let value = simple_rule(id, &big_text);
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("oversized").await;
+
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.applied, 0,
+            "oversized record never applies: {report:?}"
+        );
+        assert_eq!(row_count(&store, "probe").await, 0, "store untouched");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("per-record cap"),
+            "the reason names the cap: {joined}"
+        );
+        assert!(
+            joined.contains(&MAX_RECORD_BYTES.to_string()),
+            "the cap value is named: {joined}"
         );
     }
 

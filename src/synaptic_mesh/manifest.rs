@@ -25,6 +25,11 @@ pub struct MeshManifest {
     pub mesh_name: String,
     pub created_at: DateTime<Utc>,
     pub created_by: String,
+    /// Coordinated-rewrite counter (spec §"Deletion & erasure": a purge is an
+    /// epoch migration). Increments on every coordinated history rewrite; at
+    /// import, each record's `origin_mesh_epoch` is compared against this and
+    /// a record from an older epoch is quarantined rather than replayed into
+    /// the new epoch (`super::import::epoch_gate`).
     pub epoch: u32,
     pub namespaces: Vec<String>,
     pub policy: MeshPolicy,
@@ -32,8 +37,7 @@ pub struct MeshManifest {
 }
 
 /// The team's sharing policy. Every field is enforced by the mesh-worker at
-/// publish time; tampering with the file post-init is detected by the
-/// `origin_mesh_epoch` check on every record.
+/// publish time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshPolicy {
     /// If true, records without an explicit `eligibility: shareable` are
