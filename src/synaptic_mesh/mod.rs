@@ -7,8 +7,8 @@
 
 pub mod manifest;
 pub mod record;
+pub mod storage;
 
 pub use manifest::{MeshManifest, MeshPolicy, Trust, MESH_MANIFEST_SCHEMA_VERSION};
-pub use record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
-};
+pub use record::{Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION};
+pub use storage::MeshStorage;
