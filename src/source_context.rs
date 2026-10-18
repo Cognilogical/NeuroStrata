@@ -98,6 +98,51 @@ pub(crate) fn export_absolute_path(
         .into_owned()
 }
 
+/// Select the destination for a graph export without creating any directories.
+pub(crate) fn resolve_graph_output_path(
+    out_path: Option<&Path>,
+    source_id: Option<&str>,
+    contexts: &HashMap<String, PathBuf>,
+    project_root_env: Option<&Path>,
+    invocation_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(source_id) = source_id {
+        let marker = contexts.get(source_id).ok_or_else(|| {
+            anyhow::anyhow!("unknown source ID '{source_id}'; bind it with project-context bind")
+        })?;
+        if !is_valid_marker_directory(marker) {
+            anyhow::bail!("source ID '{source_id}' is bound to an invalid .NeuroStrata marker");
+        }
+        return Ok(out_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| marker.join("graph/graph.json")));
+    }
+
+    if let Some(out_path) = out_path {
+        return Ok(out_path.to_path_buf());
+    }
+
+    if let Some(project_root) = project_root_env {
+        let marker = project_root.join(".NeuroStrata");
+        if !is_valid_marker_directory(&marker) {
+            anyhow::bail!(
+                "NEUROSTRATA_PROJECT_ROOT does not contain a valid .NeuroStrata marker: {}",
+                project_root.display()
+            );
+        }
+        return Ok(marker.join("graph/graph.json"));
+    }
+
+    for ancestor in invocation_dir.ancestors() {
+        let marker = ancestor.join(".NeuroStrata");
+        if is_valid_marker_directory(&marker) {
+            return Ok(marker.join("graph/graph.json"));
+        }
+    }
+
+    anyhow::bail!("no .NeuroStrata marker found; pass --source-id or an explicit output path")
+}
+
 fn is_valid_marker_directory(marker: &Path) -> bool {
     if !marker.is_absolute()
         || marker.file_name().and_then(|name| name.to_str()) != Some(".NeuroStrata")
@@ -169,6 +214,128 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         fs::canonicalize(root).unwrap()
+    }
+
+    #[test]
+    fn resolve_graph_output_path_explicit_output_path_overrides_destination_only() {
+        let invocation = temp_root("explicit-output");
+        let output = invocation.join("exports/graph.json");
+
+        assert_eq!(
+            resolve_graph_output_path(Some(&output), None, &HashMap::new(), None, &invocation)
+                .unwrap(),
+            output
+        );
+
+        let error = resolve_graph_output_path(
+            Some(&output),
+            Some("unknown"),
+            &HashMap::new(),
+            None,
+            &invocation,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown source ID"));
+    }
+
+    #[test]
+    fn resolve_graph_output_path_source_id_selects_registered_marker_for_default_output() {
+        let root = temp_root("source-output");
+        let marker = project(&root.join("selected"));
+        let contexts = HashMap::from([("source-a".to_string(), marker.clone())]);
+
+        assert_eq!(
+            resolve_graph_output_path(None, Some("source-a"), &contexts, None, &root).unwrap(),
+            marker.join("graph/graph.json")
+        );
+
+        let error =
+            resolve_graph_output_path(None, Some("unknown"), &contexts, None, &root).unwrap_err();
+        assert!(error.to_string().contains("unknown source ID"));
+    }
+
+    #[test]
+    fn resolve_graph_output_path_project_root_environment_selects_its_existing_marker() {
+        let configured = temp_root("project-root-env-configured");
+        let marker = project(&configured);
+        let invocation = temp_root("project-root-env-invocation");
+        project(&invocation);
+
+        assert_eq!(
+            resolve_graph_output_path(None, None, &HashMap::new(), Some(&configured), &invocation)
+                .unwrap(),
+            marker.join("graph/graph.json")
+        );
+    }
+
+    #[test]
+    fn resolve_graph_output_path_invalid_project_root_environment_fails_without_cwd_fallback() {
+        let configured = temp_root("invalid-project-root-env");
+        let cwd_root = temp_root("invalid-project-root-cwd");
+        let cwd_marker = project(&cwd_root);
+        let error =
+            resolve_graph_output_path(None, None, &HashMap::new(), Some(&configured), &cwd_marker)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("NEUROSTRATA_PROJECT_ROOT"));
+        assert!(!cwd_marker.join("graph").exists());
+    }
+
+    #[test]
+    fn resolve_graph_output_path_discovers_nearest_parent_marker_from_invocation_directory() {
+        let root = temp_root("nearest-marker");
+        project(&root);
+        let nearest_marker = project(&root.join("nested"));
+        let invocation = root.join("nested/work");
+        fs::create_dir_all(&invocation).unwrap();
+
+        assert_eq!(
+            resolve_graph_output_path(None, None, &HashMap::new(), None, &invocation).unwrap(),
+            nearest_marker.join("graph/graph.json")
+        );
+    }
+
+    #[test]
+    fn resolve_graph_output_path_source_id_output_is_independent_of_invocation_directory() {
+        let root = temp_root("independent-source-output");
+        let marker = project(&root.join("selected"));
+        let unrelated = temp_root("unrelated-invocation");
+        let contexts = HashMap::from([("source-a".to_string(), marker.clone())]);
+
+        let canonical =
+            resolve_graph_output_path(None, Some("source-a"), &contexts, None, &root).unwrap();
+        let from_unrelated =
+            resolve_graph_output_path(None, Some("source-a"), &contexts, None, &unrelated).unwrap();
+
+        assert_eq!(canonical, marker.join("graph/graph.json"));
+        assert_eq!(from_unrelated, canonical);
+    }
+
+    #[test]
+    fn resolve_graph_output_path_missing_context_never_falls_back_to_cwd_output_tree() {
+        let invocation = temp_root("missing-output-context");
+        let error =
+            resolve_graph_output_path(None, None, &HashMap::new(), None, &invocation).unwrap_err();
+
+        assert!(error.to_string().contains("--source-id"));
+        assert!(error.to_string().contains("explicit output path"));
+        assert!(!invocation.join(".NeuroStrata").exists());
+    }
+
+    #[test]
+    fn resolve_graph_output_path_checks_explicit_source_id_with_output_path() {
+        let invocation = temp_root("invalid-source-with-output");
+        let output = invocation.join("graph.json");
+        let error = resolve_graph_output_path(
+            Some(&output),
+            Some("unknown"),
+            &HashMap::new(),
+            None,
+            &invocation,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown source ID"));
     }
 
     fn relative_to_current_dir(path: &Path) -> PathBuf {

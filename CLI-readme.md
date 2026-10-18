@@ -59,16 +59,37 @@ Exports the entire relational memory graph (nodes, relationships, and metadata) 
 
 **1.8.0 — tombstoned (`metadata.archived: true`) rows are excluded by default.** Pass `--include-archived` to surface them.
 ```bash
-neurostrata-mcp export-graph [output_json_path] [--exclude-superseded] [--include-archived]
+neurostrata-mcp project-context bind <source-id> <marker-path>
+neurostrata-mcp project-context list
+neurostrata-mcp project-context unbind <source-id>
+
+neurostrata-mcp export-graph [output_json_path] [--source-id <id>] [--exclude-superseded] [--include-archived]
 ```
-*   `output_json_path` (Optional): Defaults to `.NeuroStrata/graph/graph.json`.
+*   `project-context bind`: associate a stable source ID with an existing
+    `.NeuroStrata` marker; `list` shows bindings and `unbind` removes one.
+*   `output_json_path` (Optional): use this exact destination, independent of
+    marker discovery. When combined with `--source-id`, the source ID must
+    still be registered and valid.
+*   `--source-id`: select a registered marker for the default destination
+    `<marker>/graph/graph.json`. Without it, an existing marker is discovered
+    by searching the invocation directory and its parents.
+*   `NEUROSTRATA_PROJECT_ROOT`: when set, require and use that project's
+    existing `.NeuroStrata` marker instead of searching invocation parents.
+    An invalid configured root is an error; Core does not fall back to the
+    current directory or create a marker tree.
 *   `--exclude-superseded`: drop superseded rows entirely instead of carrying them marked.
 *   `--include-archived`: include tombstoned rows in the export (off by default).
+
+Core is VCS-agnostic and does not inspect Git. Export destination selection
+does not rebase node locations: each graph node resolves from its own source
+identity and registered marker.
 
 *Example:*
 ```bash
 neurostrata-mcp export-graph ./graph_export.json
 neurostrata-mcp export-graph ./graph_export.json --include-archived
+neurostrata-mcp project-context bind source-a /work/project-a/.NeuroStrata
+neurostrata-mcp export-graph --source-id source-a
 ```
 
 ---
