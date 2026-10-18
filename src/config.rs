@@ -74,6 +74,9 @@ pub struct Config {
 
     #[serde(default)]
     pub project_contexts: HashMap<String, PathBuf>,
+
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl Config {
@@ -100,6 +103,7 @@ impl Config {
                     .join("ladybug.db"),
                 deduplication: DeduplicationConfig::default(),
                 project_contexts: HashMap::new(),
+                extra: HashMap::new(),
             };
 
             if let Some(parent) = config_path.parent() {
@@ -282,6 +286,28 @@ mod tests {
     }
 
     #[test]
+    fn bind_and_save_preserves_unknown_top_level_config_fields() {
+        let root = temp_dir("unknown-fields");
+        let marker = root.join("project/.NeuroStrata");
+        fs::create_dir_all(&marker).unwrap();
+        let config_path = write_config_with(
+            &root,
+            r#"{"db_path":"custom.db","future_extension":{"enabled":true,"options":[1,"two"]}}"#,
+        );
+        let mut config = Config::load_from(&config_path).unwrap();
+
+        config.bind_project_context("source", &marker).unwrap();
+        config.save_to(&config_path).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            saved["future_extension"],
+            serde_json::json!({"enabled": true, "options": [1, "two"]})
+        );
+    }
+
+    #[test]
     fn invalid_bind_or_unbind_leaves_config_bytes_unchanged() {
         let root = temp_dir("unchanged");
         let config_path = write_config(&root);
@@ -344,6 +370,7 @@ mod tests {
             db_path: PathBuf::from("test.db"),
             deduplication: DeduplicationConfig::default(),
             project_contexts: HashMap::new(),
+            extra: HashMap::new(),
         };
 
         config.save_to(&config_path).unwrap();
