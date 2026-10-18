@@ -124,7 +124,8 @@ pub async fn process_mcp_request(
                                         "properties": {
                                             "path": { "type": "string", "description": "File path (e.g. docs/architecture.md)" },
                                             "lines": { "type": "string", "description": "Line numbers (e.g. 42-49)" },
-                                            "symbol": { "type": "string", "description": "Code symbol (e.g. startSync())" }
+                                            "symbol": { "type": "string", "description": "Code symbol (e.g. startSync())" },
+                                            "source_context": { "type": "object", "description": "Optional opaque provenance from a configured source provider (for example, revision/worktree identity). Core stores and exports it without assuming Git or interpreting provider fields." }
                                         }
                                     },
                                     "description": "An array of file paths, line numbers, and symbols this memory governs. Memories MUST reference the specific documents they belong to."
@@ -204,7 +205,7 @@ pub async fn process_mcp_request(
                                 "governs": { "type": "array", "items": { "type": "string" }, "description": "Replacement structural pointers. Passed = replaces the inherited value wholesale; absent = the old value carries over and the reply names it." },
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Replacement related_to ids. Passed = replaces; absent = carries over and is reported." },
                                 "contained_by": { "type": "array", "items": { "type": "string" }, "description": "Replacement contained_by ids. Passed = replaces; absent = carries over and is reported." },
-                                "locations": { "type": "array", "items": { "type": "object" }, "description": "Replacement anchors: [{path, lines?, symbol?}]. Replaces refs wholesale and re-derives governs from the paths, exactly like add_memory." },
+                                "locations": { "type": "array", "items": { "type": "object" }, "description": "Replacement anchors: [{path, lines?, symbol?, source_context?}]. source_context is opaque provenance from a configured provider; Core does not assume Git. Replaces refs wholesale and re-derives governs from the paths, exactly like add_memory." },
                                 "reason": { "type": "string", "description": "WHY this memory is being corrected, in one clause. Recorded as superseded_reason on the retired memory, so the history says what was wrong, not merely that something changed. Omit it and the reply says the history will not carry a why." },
                                 "source": { "type": ["string", "object"], "description": "Provenance of the CORRECTED text, with the same semantics add_memory's metadata.source accepts: a dated string, or {kind: owner-quote|doc|transcript|commit|derived, ref, captured_at}. Written to metadata.source on the replacement. Passed = replaces the old provenance; absent = the old one carries over and the reply names it." },
                                 "allow_global": { "type": "boolean", "description": "Required to supersede anything in the machine-wide 'global' namespace, whose rules apply to every project on this machine." }
@@ -946,6 +947,9 @@ pub(crate) fn stamp_locations(metadata: &mut Value, locations: &[Value]) {
         if let Some(sym) = loc.get("symbol").and_then(|s| s.as_str()) {
             ref_obj.insert("symbol".to_string(), serde_json::json!(sym));
         }
+        if let Some(context) = loc.get("source_context").filter(|v| v.is_object()) {
+            ref_obj.insert("source_context".to_string(), context.clone());
+        }
         serde_json::Value::Object(ref_obj)
     }).collect();
     obj.insert("refs".to_string(), serde_json::Value::Array(refs));
@@ -1033,7 +1037,7 @@ pub(crate) async fn embed_dedup_and_upsert(
     namespace: &str,
     payload: &MemoryPayload,
     dedup: Option<&Arc<crate::judgment::DeduplicationChecker>>,
-) -> Result<String, String> {
+) -> Result<crate::traits::UpsertReport, String> {
     store.init(namespace).await.map_err(|_| "Failed to initialize table.".to_string())?;
     let vector = emb.embed(&payload.content).await.map_err(|_| "Failed to generate embedding.".to_string())?;
     // Check for duplicates if deduplication is enabled
@@ -1062,8 +1066,7 @@ pub(crate) async fn embed_dedup_and_upsert(
 
     let new_id = uuid::Uuid::new_v4().to_string();
     store.upsert(namespace, &new_id, vector, payload.clone()).await
-        .map_err(|_| "Failed to store memory in database.".to_string())?;
-    Ok(new_id)
+        .map_err(|_| "Failed to store memory in database.".to_string())
 }
 
 // A memory is durable only once checkpointed -- WAL replay restores the catalog
@@ -1194,21 +1197,38 @@ async fn handle_add_memory(
         )
         .await
         {
-            Ok(new_id) => {
+            Ok(report) => {
                 // Emit site 1. The write is already durable, so the pulse is
                 // fire-and-forget: a bus that cannot take it must not turn a
                 // stored memory into a failed call.
                 bus.emit(
                     ThalamicPulse::Created {
-                        id: new_id,
+                        id: report.id.clone(),
                         namespace: namespace.to_string(),
                         kind: payload.memory_type.clone(),
                     },
                     &RecursionToken::root(),
                 );
                 let mut msg = format!("Successfully added memory for namespace: {}", namespace);
+                msg.push_str(&format!("\nMemory ID: {}", report.id));
                 if adopted_governs {
                     msg.push_str(" (governs set from the Governs line in your content)");
+                }
+                for edge in &report.deferred_edges {
+                    let status = match &edge.resolution {
+                        crate::traits::TargetResolution::Missing => "missing".to_string(),
+                        crate::traits::TargetResolution::Ambiguous(candidates) => {
+                            format!("ambiguous; candidates: {:?}", candidates)
+                        }
+                        crate::traits::TargetResolution::Failed(reason) => {
+                            format!("lookup/materialization failed: {}", reason)
+                        }
+                        crate::traits::TargetResolution::Resolved(_) => "resolved".to_string(),
+                    };
+                    msg.push_str(&format!(
+                        "\nDeferred {} edge[{}] to '{}' ({})",
+                        edge.rel_type, edge.declaration_index, edge.declared_target, status
+                    ));
                 }
                 msg
             }
@@ -1502,6 +1522,9 @@ async fn handle_supersede_memory(
             .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
             .any(|p| !p.is_empty());
         stamp_locations(&mut new_payload.metadata, locations);
+        if let Some(metadata) = new_payload.metadata.as_object_mut() {
+            metadata.remove("absolute_path");
+        }
         replaced.push("locations".to_string());
     }
     // The prose's own "Governs: [...]" lines (guinea-pig Option 2). The old
@@ -1575,9 +1598,10 @@ async fn handle_supersede_memory(
     // Write the replacement BEFORE retiring the original. If the second write
     // fails the namespace holds both versions, which is visible and repairable;
     // the other order would leave the rule retired with no successor.
-    if let Err(e) = store.upsert(namespace, &new_id, vector, new_payload).await {
-        return format!("Failed to store the replacement, nothing was changed: {}", e);
-    }
+    let replacement_report = match store.upsert(namespace, &new_id, vector, new_payload).await {
+        Ok(report) => report,
+        Err(e) => return format!("Failed to store the replacement, nothing was changed: {}", e),
+    };
 
     // Optimistic guard: re-read the old row and verify it still has no valid_to
     // (i.e. state unchanged since the first read). Concurrent corrections can
@@ -1673,6 +1697,12 @@ async fn handle_supersede_memory(
     );
     if !replaced.is_empty() {
         report.push_str(&format!(" Replaced metadata: {}.", replaced.join(", ")));
+    }
+    for edge in &replacement_report.deferred_edges {
+        report.push_str(&format!(
+            " Deferred {} edge[{}] to '{}' because target was not materialized.",
+            edge.rel_type, edge.declaration_index, edge.declared_target
+        ));
     }
     if !carried.is_empty() {
         report.push_str(&format!(
@@ -2515,6 +2545,30 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 
+    #[test]
+    fn locations_preserve_opaque_source_context_without_interpreting_it() {
+        let mut metadata = serde_json::json!({});
+        let context = serde_json::json!({
+            "provider": "git",
+            "revision_scope": "branch:feature-x",
+            "worktree_id": "opaque-worktree"
+        });
+        stamp_locations(
+            &mut metadata,
+            &[serde_json::json!({
+                "path": "src/lib.rs",
+                "source_context": context
+            })],
+        );
+
+        assert_eq!(metadata["refs"][0]["file"], "src/lib.rs");
+        assert_eq!(metadata["refs"][0]["source_context"]["provider"], "git");
+        assert_eq!(
+            metadata["refs"][0]["source_context"]["revision_scope"],
+            "branch:feature-x"
+        );
+        assert_eq!(metadata["governs"][0], "src/lib.rs");
+    }
 
     /// A request the proxy could not forward is answered, not dropped. Dropping
     /// it left the client waiting on an id that never came back: a hang with no
@@ -2898,6 +2952,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn superseding_with_replacement_locations_drops_stale_absolute_path() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let (vector, mut old) = store.get("probe", &old_id).await.unwrap().unwrap();
+        old.metadata["absolute_path"] = serde_json::json!("/old/root/missing.rs");
+        store.upsert("probe", &old_id, vector, old).await.unwrap();
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": old_id,
+                "namespace": "probe",
+                "content": "replacement source rule",
+                "locations": [{ "path": "docs/new-source.md" }]
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+
+        let (_, replacement) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .expect("replacement exists");
+        assert_eq!(replacement.location, "docs/new-source.md");
+        assert!(replacement.metadata.get("absolute_path").is_none());
+    }
+
     /// The defect that made editing useless: the row kept the vector of text it
     /// no longer contained, so search matched the wording we replaced.
     #[tokio::test]
@@ -2980,6 +3064,28 @@ mod tests {
     }
 
     // ── Task 3a: non-object metadata rejection ─────────────────────────
+
+    #[tokio::test]
+    async fn add_memory_returns_id_and_structured_deferred_edge_details() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "rule with a not-yet-ingested target",
+                "namespace": "probe",
+                "metadata": { "governs": ["src/not-ingested.rs"] }
+            }),
+            Arc::new(StubEmbedder),
+            store,
+            None,
+            quiet_bus(),
+        )
+        .await;
+
+        assert!(reply.contains("Memory ID:"), "{}", reply);
+        assert!(reply.contains("Deferred GOVERNS edge[0]"), "{}", reply);
+        assert!(reply.contains("src/not-ingested.rs"), "{}", reply);
+        assert!(reply.contains("missing"), "{}", reply);
+    }
 
     #[tokio::test]
     async fn non_object_metadata_on_add_is_rejected() {

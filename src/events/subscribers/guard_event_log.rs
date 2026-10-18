@@ -109,6 +109,7 @@ impl MemorySubscriber for GuardEventLog {
                 ),
             )
             .await
+            .map(|_| ())
     }
 }
 

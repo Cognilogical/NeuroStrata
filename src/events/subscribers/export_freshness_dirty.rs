@@ -88,6 +88,7 @@ impl MemorySubscriber for ExportFreshnessDirty {
         ctx.store
             .upsert(namespace, &flag_id(namespace), vec![0.0; self.dimensions], dirty_payload(namespace, reason, ctx.ts))
             .await
+            .map(|_| ())
     }
 }
 

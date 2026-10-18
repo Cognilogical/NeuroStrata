@@ -1026,6 +1026,7 @@ async fn annotate_conflicting(
     store
         .upsert(namespace, id, vector.to_vec(), new_payload)
         .await
+        .map(|_| ())
 }
 
 /// How a candidate should be materialised into a row.

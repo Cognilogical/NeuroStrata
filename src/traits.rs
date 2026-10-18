@@ -115,6 +115,28 @@ pub trait Embedder: Send + Sync {
     fn dimensions(&self) -> usize;
 }
 
+#[derive(Debug, Clone)]
+pub enum TargetResolution {
+    Resolved(String),
+    Missing,
+    Ambiguous(Vec<String>),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeResolutionStatus {
+    pub rel_type: String,
+    pub declared_target: String,
+    pub declaration_index: usize,
+    pub resolution: TargetResolution,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertReport {
+    pub id: String,
+    pub deferred_edges: Vec<EdgeResolutionStatus>,
+}
+
 /// The core interface for vector storage and retrieval.
 /// By making this a trait, we can swap between Embedded Qdrant,
 /// Remote Qdrant, LadybugDB, or SQLite-VSS.
@@ -130,7 +152,7 @@ pub trait VectorStore: Send + Sync {
         id: &str,
         vector: Vec<f32>,
         payload: MemoryPayload,
-    ) -> Result<()>;
+    ) -> Result<UpsertReport>;
 
     /// Search for the closest memories to a given vector.
     async fn search(
