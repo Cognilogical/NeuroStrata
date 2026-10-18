@@ -1591,8 +1591,11 @@ impl VectorStore for LadybugStore {
         &self,
         include_retired: bool,
         include_archived: bool,
+        project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+        anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
     ) -> Result<serde_json::Value> {
-        let anchor_root = configured_anchor_root();
+        let project_contexts = project_contexts.clone();
+        let anchor_override = anchor_override.cloned();
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().timestamp();
 
@@ -1634,10 +1637,12 @@ impl VectorStore for LadybugStore {
                     retired_ids.insert(id.clone());
                 }
 
-                absolute_path = export_absolute_path(
+                absolute_path = crate::source_context::export_absolute_path(
                     &location,
                     &absolute_path,
-                    anchor_root.as_deref(),
+                    &full_metadata,
+                    &project_contexts,
+                    anchor_override.as_ref(),
                 );
 
                 if !include_retired && retired {
@@ -1958,33 +1963,6 @@ fn resolve_target_on_write(
     pick_declared_target(namespace, declared, &found)
 }
 
-/// Resolve an explicitly configured project root without assuming a VCS.
-/// An absent setting means export must not derive paths from its ambient CWD.
-fn configured_anchor_root() -> Option<std::path::PathBuf> {
-    std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
-        .filter(|root| !root.is_empty())
-        .map(std::path::PathBuf::from)
-}
-
-fn export_absolute_path(
-    location: &str,
-    stored_absolute_path: &str,
-    anchor_root: Option<&std::path::Path>,
-) -> String {
-    let location_path = std::path::Path::new(location);
-    if location_path.is_absolute() {
-        return location.to_string();
-    }
-    if let Some(root) = anchor_root.filter(|_| !location.is_empty()) {
-        let candidate = root.join(location_path);
-        return dunce::canonicalize(&candidate)
-            .unwrap_or(candidate)
-            .to_string_lossy()
-            .into_owned();
-    }
-    stored_absolute_path.to_string()
-}
-
 /// Fails a future that outstays its deadline, with a message that says what was
 /// waiting and admits the work may still be running.
 async fn bounded<T>(
@@ -2299,6 +2277,65 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         }
     }
 
+    #[tokio::test]
+    async fn export_graph_resolves_each_node_by_its_source_identity() {
+        let store = retired_test_store().await;
+        let root = std::env::temp_dir().join(format!("ns-export-context-{}", uuid::Uuid::new_v4()));
+        let root_a = root.join("project-a");
+        let root_b = root.join("project-b");
+        let marker_a = root_a.join(".NeuroStrata");
+        let marker_b = root_b.join(".NeuroStrata");
+        std::fs::create_dir_all(&marker_a).unwrap();
+        std::fs::create_dir_all(&marker_b).unwrap();
+        let contexts = std::collections::HashMap::from([
+            ("source-a".to_string(), marker_a),
+            ("source-b".to_string(), marker_b),
+        ]);
+
+        for (id, source_id) in [("node-a", "source-a"), ("node-b", "source-b")] {
+            let mut payload = retired_test_payload(
+                "file",
+                "agent",
+                json!({
+                    "absolute_path": format!("/stored/{source_id}/src/lib.rs"),
+                    "refs": [{
+                        "file": "src/lib.rs",
+                        "source_context": { "source_id": source_id, "provider": "kept" },
+                        "provider_data": { "opaque": true }
+                    }]
+                }),
+            );
+            payload.location = "src/lib.rs".to_string();
+            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+        }
+
+        let graph = store
+            .export_graph(false, false, &contexts, None)
+            .await
+            .unwrap();
+        for (id, expected_root) in [("node-a", root_a), ("node-b", root_b)] {
+            let node = graph["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["id"] == id)
+                .unwrap();
+            assert_eq!(
+                node["absolute_path"],
+                expected_root.join("src/lib.rs").to_string_lossy().as_ref()
+            );
+            assert_eq!(node["metadata"]["refs"][0]["provider_data"]["opaque"], true);
+            assert_eq!(
+                node["metadata"]["refs"][0]["source_context"]["source_id"],
+                if id == "node-a" {
+                    "source-a"
+                } else {
+                    "source-b"
+                }
+            );
+        }
+    }
+
     async fn governs_edges_from(store: &LadybugStore, id: &str) -> usize {
         let id = escape_ladybug_string(id);
         store
@@ -2352,7 +2389,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let all = store.export_graph(true, false).await.unwrap();
+        let all = store.export_graph(true, false, &std::collections::HashMap::new(), None).await.unwrap();
         let nodes = all["nodes"].as_array().unwrap();
         let old = nodes.iter().find(|n| n["id"] == "old-rule").unwrap();
         assert_eq!(old["superseded"], true);
@@ -2368,7 +2405,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             "the consolidation edge is part of the graph"
         );
 
-        let active = store.export_graph(false, false).await.unwrap();
+        let active = store.export_graph(false, false, &std::collections::HashMap::new(), None).await.unwrap();
         let ids: Vec<_> = active["nodes"].as_array().unwrap().iter().map(|n| n["id"].clone()).collect();
         assert!(!ids.contains(&json!("old-rule")), "--exclude-superseded drops retired rows");
     }
@@ -2486,22 +2523,6 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             report.deferred_edges[0].resolution,
             crate::traits::TargetResolution::Missing
         ));
-    }
-
-    #[test]
-    fn export_rebases_relative_locations_only_to_an_explicit_anchor_root() {
-        assert_eq!(
-            export_absolute_path(
-                "src/lib.rs",
-                "/transient/worktree/src/lib.rs",
-                Some(std::path::Path::new("/canonical/project")),
-            ),
-            "/canonical/project/src/lib.rs"
-        );
-        assert_eq!(
-            export_absolute_path("src/lib.rs", "/stored/project/src/lib.rs", None),
-            "/stored/project/src/lib.rs"
-        );
     }
 
     /// Ingestion qualifies node ids, and a rule names the file the way a human
@@ -3164,7 +3185,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false, false).await.unwrap();
+        let data = store.export_graph(false, false, &std::collections::HashMap::new(), None).await.unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3201,7 +3222,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(true, false).await.unwrap();
+        let data = store.export_graph(true, false, &std::collections::HashMap::new(), None).await.unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3245,7 +3266,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false, false).await.unwrap();
+        let data = store.export_graph(false, false, &std::collections::HashMap::new(), None).await.unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3283,7 +3304,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false, true).await.unwrap();
+        let data = store.export_graph(false, true, &std::collections::HashMap::new(), None).await.unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3333,7 +3354,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false, true).await.unwrap();
+        let data = store.export_graph(false, true, &std::collections::HashMap::new(), None).await.unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()

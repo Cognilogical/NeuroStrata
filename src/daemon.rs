@@ -116,6 +116,9 @@ struct GraphQuery {
     /// Same shape as the CLI's `--include-archived`: tombstoned rows are
     /// hidden by default and surface when this is `true`.
     include_archived: Option<bool>,
+    /// Optional, source-scoped compatibility override from the CLI.
+    anchor_root: Option<String>,
+    source_id: Option<String>,
 }
 
 pub async fn start_daemon(
@@ -656,6 +659,13 @@ async fn handle_get_graph(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let requested = query.namespace.unwrap_or_else(|| "global".to_string());
     let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
+    let config = crate::config::Config::from_default_path()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let anchor_root = query.anchor_root.as_deref().map(Path::new);
+    let anchor_override = crate::source_context::scoped_anchor_override(
+        anchor_root,
+        query.source_id.as_deref(),
+    );
     
     // Using export_graph here temporarily or implement native LadybugDB querying here
     // For now, let's just use export_graph (which gets everything) and filter by namespace
@@ -666,6 +676,8 @@ async fn handle_get_graph(
         .export_graph(
             query.include_superseded.unwrap_or(false),
             query.include_archived.unwrap_or(false),
+            &config.project_contexts,
+            anchor_override.as_ref(),
         )
         .await
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -1331,7 +1343,13 @@ mod tests {
         async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
-        async fn export_graph(&self, _include_retired: bool, _include_archived: bool) -> anyhow::Result<serde_json::Value> {
+        async fn export_graph(
+            &self,
+            _include_retired: bool,
+            _include_archived: bool,
+            _project_contexts: &std::collections::HashMap<String, PathBuf>,
+            _anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
             Ok(serde_json::json!({"nodes": [], "links": []}))
         }
         async fn increment_access_count(&self, _namespace: &str, _id: &str) -> anyhow::Result<()> {

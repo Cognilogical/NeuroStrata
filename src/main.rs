@@ -10,6 +10,7 @@ mod judgment;
 mod parser;
 mod secrets;
 mod server;
+mod source_context;
 mod setup;
 mod store;
 mod synaptic_mesh;
@@ -2335,13 +2336,27 @@ async fn main() -> anyhow::Result<()> {
                     {
                         let default_path = ".NeuroStrata/graph/graph.json".to_string();
                         let target_path = out_path.as_ref().unwrap_or(&default_path);
-                        let res = reqwest::Client::new()
-                            .get(format!(
-                                "http://127.0.0.1:34343/graph?include_superseded={}&all=true",
-                                !exclude_superseded
-                            ))
-                            .send()
-                            .await?;
+                        let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
+                            .map(std::path::PathBuf::from);
+                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
+                        let anchor_override = crate::source_context::scoped_anchor_override(
+                            anchor_root.as_deref(),
+                            source_id.as_deref(),
+                        );
+                        let mut url = reqwest::Url::parse("http://127.0.0.1:34343/graph")?;
+                        {
+                            let mut query = url.query_pairs_mut();
+                            query
+                                .append_pair("include_superseded", &(!exclude_superseded).to_string())
+                                .append_pair("include_archived", &include_archived.to_string())
+                                .append_pair("all", "true");
+                            if let Some(anchor) = anchor_override.as_ref() {
+                                query
+                                    .append_pair("anchor_root", &anchor.project_root.to_string_lossy())
+                                    .append_pair("source_id", &anchor.source_id);
+                            }
+                        }
+                        let res = reqwest::Client::new().get(url).send().await?;
                         let status = res.status();
                         let body = res.text().await.unwrap_or_default();
                         if !status.is_success() {
@@ -2471,7 +2486,21 @@ async fn main() -> anyhow::Result<()> {
                         // Tombstoned rows are excluded unless --include-archived
                         // asks for them; the same default-with-escape-hatch shape
                         // the search and snapshot read surfaces use.
-                        let graph_data = vector_store.export_graph(!exclude_superseded, include_archived).await?;
+                        let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
+                            .map(std::path::PathBuf::from);
+                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
+                        let anchor_override = crate::source_context::scoped_anchor_override(
+                            anchor_root.as_deref(),
+                            source_id.as_deref(),
+                        );
+                        let graph_data = vector_store
+                            .export_graph(
+                                !exclude_superseded,
+                                include_archived,
+                                &config.project_contexts,
+                                anchor_override.as_ref(),
+                            )
+                            .await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
                     }
