@@ -15,6 +15,9 @@ pub(crate) fn scoped_anchor_override(
     source_id: Option<&str>,
 ) -> Option<ScopedAnchorOverride> {
     let root = anchor_root.filter(|root| !root.as_os_str().is_empty())?;
+    if !root.is_absolute() {
+        return None;
+    }
     let Some(source_id) = source_id.filter(|id| !id.trim().is_empty()) else {
         static WARN_UNSCOPED_ANCHOR: Once = Once::new();
         WARN_UNSCOPED_ANCHOR.call_once(|| {
@@ -25,7 +28,7 @@ pub(crate) fn scoped_anchor_override(
         return None;
     };
 
-    if !root.join(".NeuroStrata").is_dir() {
+    if !is_valid_marker_directory(&root.join(".NeuroStrata")) {
         return None;
     }
 
@@ -77,7 +80,7 @@ pub(crate) fn export_absolute_path(
         .map(|anchor| anchor.project_root.as_path())
         .or_else(|| {
             let marker = project_contexts.get(source_id)?;
-            if !marker.is_dir() {
+            if !is_valid_marker_directory(marker) {
                 return None;
             }
             marker.parent()
@@ -93,6 +96,23 @@ pub(crate) fn export_absolute_path(
         .join(normalized_location)
         .to_string_lossy()
         .into_owned()
+}
+
+fn is_valid_marker_directory(marker: &Path) -> bool {
+    if !marker.is_absolute()
+        || marker.file_name().and_then(|name| name.to_str()) != Some(".NeuroStrata")
+    {
+        return false;
+    }
+    let Ok(metadata) = std::fs::metadata(marker) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    std::fs::canonicalize(marker)
+        .map(|canonical| canonical.as_path() == marker)
+        .unwrap_or(false)
 }
 
 fn is_absolute_location(location: &str, path: &Path) -> bool {
@@ -139,7 +159,7 @@ mod tests {
     fn project(root: &Path) -> PathBuf {
         let marker = root.join(".NeuroStrata");
         fs::create_dir_all(&marker).unwrap();
-        marker
+        fs::canonicalize(marker).unwrap()
     }
 
     fn temp_root(label: &str) -> PathBuf {
@@ -148,7 +168,32 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&root).unwrap();
-        root
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn relative_to_current_dir(path: &Path) -> PathBuf {
+        let current = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let target = fs::canonicalize(path).unwrap();
+        let current_components: Vec<_> = current.components().collect();
+        let target_components: Vec<_> = target.components().collect();
+        let shared = current_components
+            .iter()
+            .zip(&target_components)
+            .take_while(|(left, right)| left == right)
+            .count();
+
+        let mut relative = PathBuf::new();
+        for component in &current_components[shared..] {
+            if matches!(component, Component::Normal(_)) {
+                relative.push("..");
+            }
+        }
+        for component in &target_components[shared..] {
+            if let Component::Normal(part) = component {
+                relative.push(part);
+            }
+        }
+        relative
     }
 
     fn refs(location: &str, source_ids: &[&str]) -> serde_json::Value {
@@ -168,6 +213,7 @@ mod tests {
         let root_b = temp.join("project-b");
         let marker_a = project(&root_a);
         let marker_b = project(&root_b);
+        let root_b = marker_b.parent().unwrap().to_path_buf();
         let contexts = HashMap::from([
             ("source-a".to_string(), marker_a),
             ("source-b".to_string(), marker_b),
@@ -223,6 +269,69 @@ mod tests {
             export_absolute_path("", "/stored/empty", &known, &contexts, None),
             "/stored/empty",
             "an empty location must not resolve to the project root"
+        );
+    }
+
+    #[test]
+    fn preserves_stored_path_for_relative_registry_marker() {
+        let temp = temp_root("relative-registry");
+        let marker = project(&temp.join("project"));
+        let relative_marker = relative_to_current_dir(&marker);
+        assert!(!relative_marker.is_absolute());
+        let contexts = HashMap::from([("source".to_string(), relative_marker)]);
+
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/stored/lib.rs",
+                &refs("src/lib.rs", &["source"]),
+                &contexts,
+                None
+            ),
+            "/stored/lib.rs"
+        );
+    }
+
+    #[test]
+    fn preserves_stored_path_for_noncanonical_registry_marker() {
+        let temp = temp_root("noncanonical-registry");
+        let project_root = temp.join("project");
+        let marker = project(&project_root);
+        fs::create_dir_all(project_root.join("nested")).unwrap();
+        let noncanonical = project_root.join("nested/../.NeuroStrata");
+        assert!(noncanonical.is_dir());
+        assert_ne!(fs::canonicalize(&noncanonical).unwrap(), noncanonical);
+        let contexts = HashMap::from([("source".to_string(), noncanonical)]);
+
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/stored/lib.rs",
+                &refs("src/lib.rs", &["source"]),
+                &contexts,
+                None
+            ),
+            "/stored/lib.rs"
+        );
+        assert!(marker.is_dir());
+    }
+
+    #[test]
+    fn preserves_stored_path_for_registry_directory_without_marker_name() {
+        let temp = temp_root("wrong-registry-name");
+        let wrong_marker = temp.join(".NeuroStrata-copy");
+        fs::create_dir_all(&wrong_marker).unwrap();
+        let contexts = HashMap::from([("source".to_string(), wrong_marker)]);
+
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/stored/lib.rs",
+                &refs("src/lib.rs", &["source"]),
+                &contexts,
+                None
+            ),
+            "/stored/lib.rs"
         );
     }
 
@@ -318,6 +427,7 @@ mod tests {
         let root_b = temp.join("project-b");
         let marker_a = project(&root_a);
         let marker_b = project(&root_b);
+        let root_b = marker_b.parent().unwrap().to_path_buf();
         let contexts = HashMap::from([
             ("source-a".to_string(), marker_a),
             ("source-b".to_string(), marker_b),
@@ -357,5 +467,16 @@ mod tests {
 
         assert!(scoped_anchor_override(Some(&root), None).is_none());
         assert!(scoped_anchor_override(Some(&root), Some("  ")).is_none());
+    }
+
+    #[test]
+    fn scoped_environment_override_rejects_relative_roots() {
+        let temp = temp_root("relative-override");
+        let absolute_root = temp.join("project");
+        project(&absolute_root);
+        let relative_root = relative_to_current_dir(&absolute_root);
+        assert!(!relative_root.is_absolute());
+
+        assert!(scoped_anchor_override(Some(&relative_root), Some("source")).is_none());
     }
 }
