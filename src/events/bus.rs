@@ -231,7 +231,14 @@ impl ThalamicBus {
             ),
         }
 
-        Self { queue, subs, metrics, bp_tx, capacity, store }
+        Self {
+            queue,
+            subs,
+            metrics,
+            bp_tx,
+            capacity,
+            store,
+        }
     }
 
     /// Hand the daemon's store to the dispatcher, which stamps it into every
@@ -261,7 +268,9 @@ impl ThalamicBus {
     /// capacity is what `drops_oldest` counts.
     pub fn emit(&self, event: ThalamicPulse, token: &RecursionToken) {
         if !token.allows_emit() {
-            self.metrics.recursion_blocks.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .recursion_blocks
+                .fetch_add(1, Ordering::Relaxed);
             let _ = self.bp_tx.send(BackpressureEvent::RecursionRefused {
                 token_allows_emit: false,
             });
@@ -302,7 +311,11 @@ impl ThalamicBus {
         BusMetrics {
             events_emitted: self.metrics.events_emitted.load(Ordering::Relaxed),
             dispatcher_handled: self.metrics.dispatcher_handled.load(Ordering::Relaxed),
-            subscribers: self.subs.lock().expect("subscriber registry lock poisoned").len(),
+            subscribers: self
+                .subs
+                .lock()
+                .expect("subscriber registry lock poisoned")
+                .len(),
             queue_depth: self.queue.len(),
             drops_oldest: self.metrics.drops_oldest.load(Ordering::Relaxed),
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
@@ -388,12 +401,20 @@ async fn dispatch(
 
         let namespace = namespace_of(&event);
         let ts = chrono::Utc::now().timestamp();
-        let store: Arc<dyn VectorStore> =
-            store.get().cloned().unwrap_or_else(|| Arc::new(StoreNotAttached));
-        let ctx = SubscriberContext { store: store.as_ref(), namespace, ts };
+        let store: Arc<dyn VectorStore> = store
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(StoreNotAttached));
+        let ctx = SubscriberContext {
+            store: store.as_ref(),
+            namespace,
+            ts,
+        };
 
-        let registered: Vec<Arc<dyn MemorySubscriber>> =
-            subs.lock().expect("subscriber registry lock poisoned").clone();
+        let registered: Vec<Arc<dyn MemorySubscriber>> = subs
+            .lock()
+            .expect("subscriber registry lock poisoned")
+            .clone();
         for sub in registered.iter() {
             // A fresh depth-1 token per subscriber: the token exists to refuse
             // a subscriber emitting from inside its own invocation.
@@ -507,10 +528,16 @@ mod tests {
         let bus = ThalamicBus::new(2);
         let log = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        bus.register(Box::new(SlowSubscriber { log: log2, delay: Duration::from_millis(200) }));
+        bus.register(Box::new(SlowSubscriber {
+            log: log2,
+            delay: Duration::from_millis(200),
+        }));
         for i in 0..5 {
             bus.emit(
-                ThalamicPulse::Archived { id: format!("{i}"), namespace: "n".into() },
+                ThalamicPulse::Archived {
+                    id: format!("{i}"),
+                    namespace: "n".into(),
+                },
                 &RecursionToken::root(),
             );
         }
@@ -580,10 +607,17 @@ mod tests {
         let bus = ThalamicBus::new(16);
         let bp = bus.backpressure();
         bus.register(Box::new(TextPanicSubscriber {
-            text: format!("boom\t\u{7}{}\nSECOND LINE of a stack trace", "y".repeat(1000)),
+            text: format!(
+                "boom\t\u{7}{}\nSECOND LINE of a stack trace",
+                "y".repeat(1000)
+            ),
         }));
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -592,10 +626,19 @@ mod tests {
         let BackpressureEvent::SubscriberPanic { payload, .. } = &received else {
             panic!("expected SubscriberPanic on the watch channel, got {received:?}");
         };
-        assert!(payload.starts_with("boom"), "the first line survives: {payload}");
-        assert!(!payload.contains('\t') && !payload.contains('\u{7}'), "control chars stripped");
+        assert!(
+            payload.starts_with("boom"),
+            "the first line survives: {payload}"
+        );
+        assert!(
+            !payload.contains('\t') && !payload.contains('\u{7}'),
+            "control chars stripped"
+        );
         assert!(!payload.contains('\n'), "only the first line may travel");
-        assert!(!payload.contains("SECOND LINE"), "stack-trace context must not leak");
+        assert!(
+            !payload.contains("SECOND LINE"),
+            "stack-trace context must not leak"
+        );
         assert!(
             payload.chars().count() <= 200,
             "payload capped at 200 chars including the ellipsis, got {}",
@@ -617,7 +660,11 @@ mod tests {
         bus.register(Box::new(PanicSubscriber));
         bus.register(Box::new(CountingSubscriber2 { counter: after2 }));
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -643,18 +690,36 @@ mod tests {
         let bp = bus.backpressure();
 
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::new(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let m = bus.metrics();
-        assert_eq!(m.recursion_blocks, 1, "blocked emit must count a recursion block: {:?}", m);
-        assert_eq!(m.events_emitted, 0, "blocked emit must not enter the queue: {:?}", m);
-        assert_eq!(ran.load(Ordering::Acquire), 0, "no subscriber may see a blocked pulse");
+        assert_eq!(
+            m.recursion_blocks, 1,
+            "blocked emit must count a recursion block: {:?}",
+            m
+        );
+        assert_eq!(
+            m.events_emitted, 0,
+            "blocked emit must not enter the queue: {:?}",
+            m
+        );
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            0,
+            "no subscriber may see a blocked pulse"
+        );
         assert_eq!(
             *bp.borrow(),
-            BackpressureEvent::RecursionRefused { token_allows_emit: false },
+            BackpressureEvent::RecursionRefused {
+                token_allows_emit: false
+            },
             "the refusal must be distinguishable from a queue-full drop"
         );
     }
@@ -688,19 +753,29 @@ mod tests {
         let bus = ThalamicBus::new(16);
         let ran = Arc::new(AtomicUsize::new(0));
         let ran2 = ran.clone();
-        bus.register(Box::new(Sleeper { delay: Duration::from_millis(500) }));
+        bus.register(Box::new(Sleeper {
+            delay: Duration::from_millis(500),
+        }));
         bus.register(Box::new(CountingSubscriber { counter: ran2 }));
         let bp = bus.backpressure();
 
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         // Past the 250ms budget, before the sleeper's own 500ms would end.
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         let m = bus.metrics();
-        assert_eq!(m.subscriber_timeouts, 1, "slow subscriber must be abandoned once: {:?}", m);
+        assert_eq!(
+            m.subscriber_timeouts, 1,
+            "slow subscriber must be abandoned once: {:?}",
+            m
+        );
         assert_eq!(
             ran.load(Ordering::Acquire),
             1,
@@ -720,12 +795,20 @@ mod tests {
         let rec2 = rec.clone();
         bus.register(Box::new(CountingSubscriber { counter: rec2 }));
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         // give dispatcher time
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(rec.load(Ordering::Acquire), 1, "subscriber ran exactly once");
+        assert_eq!(
+            rec.load(Ordering::Acquire),
+            1,
+            "subscriber ran exactly once"
+        );
     }
 
     /// Minor #9: the watch channel's seed must say "nothing happened", not
@@ -865,16 +948,35 @@ mod tests {
         bus.attach_store(Arc::new(RecordingStore { gets: gets.clone() }));
         let oks = Arc::new(AtomicUsize::new(0));
         let errs = Arc::new(AtomicUsize::new(0));
-        bus.register(Box::new(StoreProbingSubscriber { oks: oks.clone(), errs: errs.clone() }));
+        bus.register(Box::new(StoreProbingSubscriber {
+            oks: oks.clone(),
+            errs: errs.clone(),
+        }));
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(oks.load(Ordering::Acquire), 1, "the attached store must answer the probe");
-        assert_eq!(errs.load(Ordering::Acquire), 0, "the stand-in must not be in the context");
-        assert_eq!(gets.load(Ordering::Acquire), 1, "the call reached the attached instance");
+        assert_eq!(
+            oks.load(Ordering::Acquire),
+            1,
+            "the attached store must answer the probe"
+        );
+        assert_eq!(
+            errs.load(Ordering::Acquire),
+            0,
+            "the stand-in must not be in the context"
+        );
+        assert_eq!(
+            gets.load(Ordering::Acquire),
+            1,
+            "the call reached the attached instance"
+        );
     }
 
     /// A double attach must not swap implementations under live subscribers:
@@ -887,19 +989,38 @@ mod tests {
         let bus = ThalamicBus::new(16);
         let first = Arc::new(AtomicUsize::new(0));
         let second = Arc::new(AtomicUsize::new(0));
-        bus.attach_store(Arc::new(RecordingStore { gets: first.clone() }));
-        bus.attach_store(Arc::new(RecordingStore { gets: second.clone() }));
+        bus.attach_store(Arc::new(RecordingStore {
+            gets: first.clone(),
+        }));
+        bus.attach_store(Arc::new(RecordingStore {
+            gets: second.clone(),
+        }));
         let oks = Arc::new(AtomicUsize::new(0));
         let errs = Arc::new(AtomicUsize::new(0));
-        bus.register(Box::new(StoreProbingSubscriber { oks: oks.clone(), errs: errs.clone() }));
+        bus.register(Box::new(StoreProbingSubscriber {
+            oks: oks.clone(),
+            errs: errs.clone(),
+        }));
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(first.load(Ordering::Acquire), 1, "the first attach is the store in ctx.store");
-        assert_eq!(second.load(Ordering::Acquire), 0, "the second attach must be a no-op");
+        assert_eq!(
+            first.load(Ordering::Acquire),
+            1,
+            "the first attach is the store in ctx.store"
+        );
+        assert_eq!(
+            second.load(Ordering::Acquire),
+            0,
+            "the second attach must be a no-op"
+        );
         assert_eq!(oks.load(Ordering::Acquire), 1);
     }
 
@@ -911,15 +1032,30 @@ mod tests {
         let bus = ThalamicBus::new(16);
         let oks = Arc::new(AtomicUsize::new(0));
         let errs = Arc::new(AtomicUsize::new(0));
-        bus.register(Box::new(StoreProbingSubscriber { oks: oks.clone(), errs: errs.clone() }));
+        bus.register(Box::new(StoreProbingSubscriber {
+            oks: oks.clone(),
+            errs: errs.clone(),
+        }));
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(errs.load(Ordering::Acquire), 1, "the stand-in must answer explicitly");
-        assert_eq!(oks.load(Ordering::Acquire), 0, "nothing may read through an unattached store");
+        assert_eq!(
+            errs.load(Ordering::Acquire),
+            1,
+            "the stand-in must answer explicitly"
+        );
+        assert_eq!(
+            oks.load(Ordering::Acquire),
+            0,
+            "nothing may read through an unattached store"
+        );
         // The pulse itself still flowed -- metrics stay truthful.
         let m = bus.metrics();
         assert_eq!(m.events_emitted, 1);
@@ -934,7 +1070,11 @@ mod tests {
         let bus = ThalamicBus::new(0);
         let bp = bus.backpressure();
         bus.emit(
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() },
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
             &RecursionToken::root(),
         );
         let m = bus.metrics();

@@ -135,7 +135,13 @@ fn audit_payload(
     ts: i64,
 ) -> MemoryPayload {
     MemoryPayload {
-        content: audit_line(action_type, verdict, trace_id, rule_ids_triggered, payload_hash),
+        content: audit_line(
+            action_type,
+            verdict,
+            trace_id,
+            rule_ids_triggered,
+            payload_hash,
+        ),
         user_id: SYSTEM_USER_ID.to_string(),
         memory_type: GUARD_EVENT_TYPE.to_string(),
         agent_name: Some("thalamic_bus".to_string()),
@@ -168,8 +174,11 @@ fn audit_line(
     rule_ids_triggered: &[String],
     payload_hash: u32,
 ) -> String {
-    let rules =
-        if rule_ids_triggered.is_empty() { "none".to_string() } else { rule_ids_triggered.join(",") };
+    let rules = if rule_ids_triggered.is_empty() {
+        "none".to_string()
+    } else {
+        rule_ids_triggered.join(",")
+    };
     format!(
         "guard_validate [{verdict}] {action_type}: trace {trace_id}, payload_hash {payload_hash}, rules {rules}"
     )
@@ -228,7 +237,10 @@ mod tests {
     async fn wired(tag: &str, namespaces: &[&str]) -> (PathBuf, ThalamicBus, Arc<LadybugStore>) {
         let (dir, store) = scratch(tag);
         for namespace in namespaces {
-            store.init(namespace).await.expect("the namespace's table exists");
+            store
+                .init(namespace)
+                .await
+                .expect("the namespace's table exists");
         }
         let store = Arc::new(store);
         let bus = ThalamicBus::new(16);
@@ -305,20 +317,44 @@ mod tests {
     async fn a_guard_verdict_persists_an_audit_row() {
         let (_dir, bus, store) = wired("row", &["guarded"]).await;
 
-        bus.emit(guarded("guarded", "guard-validate-1-2"), &RecursionToken::root());
+        bus.emit(
+            guarded("guarded", "guard-validate-1-2"),
+            &RecursionToken::root(),
+        );
         tokio::time::sleep(DISPATCH_WAIT).await;
 
         let rows = await_rows(&store, "guarded", 1).await;
         let row = &rows[0];
-        assert_eq!(row.memory_type, GUARD_EVENT_TYPE, "the row is an audit record, not a memory");
-        assert_eq!(row.metadata["trace_id"], serde_json::json!("guard-validate-1-2"), "the row joins back to the validator's own trace id");
+        assert_eq!(
+            row.memory_type, GUARD_EVENT_TYPE,
+            "the row is an audit record, not a memory"
+        );
+        assert_eq!(
+            row.metadata["trace_id"],
+            serde_json::json!("guard-validate-1-2"),
+            "the row joins back to the validator's own trace id"
+        );
         assert_eq!(row.metadata["action_type"], serde_json::json!("shell"));
         assert_eq!(row.metadata["verdict"], serde_json::json!("deny"));
-        assert_eq!(row.metadata["rule_ids_triggered"], serde_json::json!(["rule.no-rm-rf"]));
+        assert_eq!(
+            row.metadata["rule_ids_triggered"],
+            serde_json::json!(["rule.no-rm-rf"])
+        );
         assert_eq!(row.metadata["namespace"], serde_json::json!("guarded"));
-        assert_eq!(row.metadata["payload_hash"].as_u64(), Some(0xDEAD_BEEF_u64), "the payload is present as a digest");
-        assert!(row.metadata["ts"].as_i64().expect("the call is stamped") > 0, "the row carries the dispatcher's timestamp");
-        assert_eq!(bus.metrics().dispatcher_handled, 1, "the pulse reached the subscriber");
+        assert_eq!(
+            row.metadata["payload_hash"].as_u64(),
+            Some(0xDEAD_BEEF_u64),
+            "the payload is present as a digest"
+        );
+        assert!(
+            row.metadata["ts"].as_i64().expect("the call is stamped") > 0,
+            "the row carries the dispatcher's timestamp"
+        );
+        assert_eq!(
+            bus.metrics().dispatcher_handled,
+            1,
+            "the pulse reached the subscriber"
+        );
     }
 
     /// Step 6's drill. Two calls sharing a `trace_id` are still two calls, and
@@ -330,17 +366,35 @@ mod tests {
     async fn two_calls_on_one_trace_id_are_two_rows() {
         let (_dir, bus, store) = wired("drill", &["retried"]).await;
 
-        bus.emit(guarded("retried", "guard-validate-9-9"), &RecursionToken::root());
+        bus.emit(
+            guarded("retried", "guard-validate-9-9"),
+            &RecursionToken::root(),
+        );
         tokio::time::sleep(DISPATCH_WAIT).await;
-        bus.emit(guarded("retried", "guard-validate-9-9"), &RecursionToken::root());
+        bus.emit(
+            guarded("retried", "guard-validate-9-9"),
+            &RecursionToken::root(),
+        );
         tokio::time::sleep(DISPATCH_WAIT).await;
 
         let rows = await_rows(&store, "retried", 2).await;
         for row in &rows {
-            assert_eq!(row.metadata["trace_id"], serde_json::json!("guard-validate-9-9"), "both rows carry the shared trace id");
-            assert_eq!(row.metadata["payload_hash"].as_u64(), Some(0xDEAD_BEEF_u64), "the identical digest is recorded twice, not merged");
+            assert_eq!(
+                row.metadata["trace_id"],
+                serde_json::json!("guard-validate-9-9"),
+                "both rows carry the shared trace id"
+            );
+            assert_eq!(
+                row.metadata["payload_hash"].as_u64(),
+                Some(0xDEAD_BEEF_u64),
+                "the identical digest is recorded twice, not merged"
+            );
         }
-        assert_eq!(bus.metrics().dispatcher_handled, 2, "both pulses reached the subscriber");
+        assert_eq!(
+            bus.metrics().dispatcher_handled,
+            2,
+            "both pulses reached the subscriber"
+        );
     }
 
     /// The row records the payload's *digest*, and the digest is 32 bits. Two
@@ -382,7 +436,11 @@ mod tests {
             Some(u32::MAX as u64),
             "the full 32-bit range round-trips -- a u64 field would still hold this, so the width is pinned by the pulse's type, not by this value"
         );
-        assert_eq!(row.metadata["rule_ids_triggered"], serde_json::json!([]), "an allow names no rule");
+        assert_eq!(
+            row.metadata["rule_ids_triggered"],
+            serde_json::json!([]),
+            "an allow names no rule"
+        );
         assert_eq!(row.metadata["verdict"], serde_json::json!("allow"));
 
         let whole_row = format!("{} {}", row.content, row.metadata);
@@ -400,7 +458,10 @@ mod tests {
     async fn a_storage_mutation_writes_no_audit_row() {
         let (_dir, bus, store) = wired("ignored", &["ignored"]).await;
 
-        bus.emit(guarded("ignored", "guard-validate-1-1"), &RecursionToken::root());
+        bus.emit(
+            guarded("ignored", "guard-validate-1-1"),
+            &RecursionToken::root(),
+        );
         await_rows(&store, "ignored", 1).await;
 
         bus.emit(
@@ -414,7 +475,11 @@ mod tests {
         await_handled(&bus, 2).await;
 
         let rows = audit_rows(&store, "ignored").await;
-        assert_eq!(rows.len(), 1, "the Created pulse reached the subscriber and wrote nothing");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the Created pulse reached the subscriber and wrote nothing"
+        );
         assert_eq!(
             rows[0].metadata["trace_id"],
             serde_json::json!("guard-validate-1-1"),

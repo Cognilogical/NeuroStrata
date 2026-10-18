@@ -117,8 +117,8 @@ pub async fn process_mcp_request(
                                 "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY if you are absolutely certain this is a brand new project namespace that doesn't exist yet." },
                                 "user_id": { "type": "string", "description": "The user making the request." },
                                 "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
-                                "locations": { 
-                                    "type": "array", 
+                                "locations": {
+                                    "type": "array",
                                     "items": {
                                         "type": "object",
                                         "properties": {
@@ -462,8 +462,12 @@ pub async fn process_mcp_request(
                                     _ => None,
                                 };
                                 if let Some(key) = key {
-                                    if let Some(summary) = summaries.get(key).and_then(|s| s.as_str()) {
-                                        if let Some(old_desc) = tool.get("description").and_then(|d| d.as_str()) {
+                                    if let Some(summary) =
+                                        summaries.get(key).and_then(|s| s.as_str())
+                                    {
+                                        if let Some(old_desc) =
+                                            tool.get("description").and_then(|d| d.as_str())
+                                        {
                                             let new_desc = format!("{} {}", old_desc, summary);
                                             tool["description"] = serde_json::json!(new_desc);
                                         }
@@ -473,13 +477,17 @@ pub async fn process_mcp_request(
                         }
                     }
                     // Replace memory_type property description in add_memory.
-                    if let Some(mem_type_desc) = vocab.get("tool_summaries")
+                    if let Some(mem_type_desc) = vocab
+                        .get("tool_summaries")
                         .and_then(|s| s.get("memory_type"))
                         .and_then(|s| s.as_str())
                     {
                         for tool in tools.iter_mut() {
-                            if tool.get("name").and_then(|n| n.as_str()) == Some("neurostrata_add_memory") {
-                                if let Some(d) = tool.get_mut("inputSchema")
+                            if tool.get("name").and_then(|n| n.as_str())
+                                == Some("neurostrata_add_memory")
+                            {
+                                if let Some(d) = tool
+                                    .get_mut("inputSchema")
                                     .and_then(|s| s.get_mut("properties"))
                                     .and_then(|p| p.get_mut("memory_type"))
                                     .and_then(|mt| mt.get_mut("description"))
@@ -522,7 +530,14 @@ pub async fn process_mcp_request(
                             result_text = handle_list_namespaces(store.clone()).await;
                         }
                         "neurostrata_add_memory" => {
-                            result_text = handle_add_memory(arguments, emb.clone(), store.clone(), deduplication_checker.clone(), bus.clone()).await;
+                            result_text = handle_add_memory(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                                deduplication_checker.clone(),
+                                bus.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_get_memory" => {
                             result_text = handle_get_memory(arguments, store.clone()).await;
@@ -546,28 +561,57 @@ pub async fn process_mcp_request(
                             }
                         }
                         "neurostrata_ingest_directory" => {
-                            result_text = handle_ingest_directory(arguments, emb.clone(), store.clone(), ingests.clone()).await;
+                            result_text = handle_ingest_directory(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                                ingests.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_search_memory" => {
-                            result_text = handle_search_memory(arguments, emb.clone(), store.clone()).await;
+                            result_text =
+                                handle_search_memory(arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_supersede_memory" => {
-                            result_text = handle_supersede_memory(arguments, emb.clone(), store.clone(), bus.clone()).await;
+                            result_text = handle_supersede_memory(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                                bus.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_procedure_perform" => {
-                            result_text = crate::tools::procedure::handle_procedure_perform(arguments, store.clone()).await;
+                            result_text = crate::tools::procedure::handle_procedure_perform(
+                                arguments,
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_task_create" => {
-                            result_text = crate::task::handle_task_create(arguments, emb.clone(), store.clone()).await;
+                            result_text = crate::task::handle_task_create(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_task_claim" => {
-                            result_text = crate::task::handle_task_claim(arguments, store.clone()).await;
+                            result_text =
+                                crate::task::handle_task_claim(arguments, store.clone()).await;
                         }
                         "neurostrata_task_update" => {
-                            result_text = crate::task::handle_task_update(arguments, emb.clone(), store.clone()).await;
+                            result_text = crate::task::handle_task_update(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_task_list" => {
-                            result_text = crate::task::handle_task_list(arguments, store.clone()).await;
+                            result_text =
+                                crate::task::handle_task_list(arguments, store.clone()).await;
                         }
                         "neurostrata_task_complete" => {
                             match crate::task::handle_task_complete(
@@ -596,28 +640,53 @@ pub async fn process_mcp_request(
                             }
                         }
                         "neurostrata_task_validate" => {
-                            result_text = crate::task::handle_task_validate(arguments, store.clone()).await;
+                            result_text =
+                                crate::task::handle_task_validate(arguments, store.clone()).await;
                         }
                         "neurostrata_bootstrap" => {
-                            result_text = crate::task::handle_bootstrap(arguments, emb.clone(), store.clone()).await;
+                            result_text = crate::task::handle_bootstrap(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_task_setup" => {
-                            result_text = crate::task::handle_task_setup(arguments, emb.clone(), store.clone()).await;
+                            result_text = crate::task::handle_task_setup(
+                                arguments,
+                                emb.clone(),
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_append_log" => {
                             result_text = crate::buffer::handle_append_log(arguments).await;
                         }
                         "neurostrata_guard_validate" => {
-                            result_text = handle_guard_validate(arguments, store.clone(), emb.clone(), bus.clone()).await;
+                            result_text = handle_guard_validate(
+                                arguments,
+                                store.clone(),
+                                emb.clone(),
+                                bus.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_guard_learn" => {
-                            result_text = handle_guard_learn(arguments, store.clone(), emb.clone()).await;
+                            result_text =
+                                handle_guard_learn(arguments, store.clone(), emb.clone()).await;
                         }
                         "neurostrata_guard_list_rules" => {
-                            result_text = handle_guard_list_rules(arguments, store.clone(), emb.clone()).await;
+                            result_text =
+                                handle_guard_list_rules(arguments, store.clone(), emb.clone())
+                                    .await;
                         }
                         "neurostrata_archive_memory" => {
-                            result_text = crate::handlers::archive_memory::handle_archive_memory(arguments, store.clone(), bus.clone()).await;
+                            result_text = crate::handlers::archive_memory::handle_archive_memory(
+                                arguments,
+                                store.clone(),
+                                bus.clone(),
+                            )
+                            .await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -629,10 +698,16 @@ pub async fn process_mcp_request(
                         // and lives in crate::synaptic_mesh::import.
                         mesh_name if mesh_name.starts_with("neurostrata_synaptic_mesh_") => {
                             if mesh_name == "neurostrata_synaptic_mesh_pull" {
-                                result_text = crate::synaptic_mesh::import::handle_mesh_pull(&arguments, store.clone(), emb.clone()).await;
+                                result_text = crate::synaptic_mesh::import::handle_mesh_pull(
+                                    &arguments,
+                                    store.clone(),
+                                    emb.clone(),
+                                )
+                                .await;
                             } else {
-                                result_text =
-                                    crate::synaptic_mesh::handle_mesh_tool_call(mesh_name, &arguments);
+                                result_text = crate::synaptic_mesh::handle_mesh_tool_call(
+                                    mesh_name, &arguments,
+                                );
                             }
                         }
                         _ => {
@@ -661,7 +736,7 @@ pub async fn process_mcp_request(
                 })
             })
         }
-        _ => serde_json::json!({})
+        _ => serde_json::json!({}),
     }
 }
 
@@ -749,7 +824,10 @@ fn failure_line(id: Option<Value>, code: i64, message: &str) -> Option<String> {
         Ok(line) => Some(line),
         Err(e) => {
             // Encoding failure must surface, not vanish via .ok().
-            eprintln!("CRITICAL: could not encode error response ({}): {}", message, e);
+            eprintln!(
+                "CRITICAL: could not encode error response ({}): {}",
+                message, e
+            );
             None
         }
     }
@@ -830,7 +908,10 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 
             let still_starting = should_wait_for_startup(
                 daemon_has_answered,
-                attempt.as_ref().err().is_some_and(reqwest::Error::is_connect),
+                attempt
+                    .as_ref()
+                    .err()
+                    .is_some_and(reqwest::Error::is_connect),
                 waiting_since.elapsed(),
                 daemon_startup_budget(),
             );
@@ -861,7 +942,11 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
                             &mut writer,
                             id,
                             INTERNAL_ERROR,
-                            format!("The NeuroStrata daemon answered {}: {}", status, text.trim()),
+                            format!(
+                                "The NeuroStrata daemon answered {}: {}",
+                                status,
+                                text.trim()
+                            ),
                         )
                         .await?;
                     }
@@ -902,8 +987,6 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
     Ok(())
 }
 
-
-
 async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
     if let Ok(namespaces) = store.list_namespaces().await {
         format!("Existing namespaces: {:?}", namespaces)
@@ -918,8 +1001,16 @@ async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
 pub(crate) fn first_location(locations: &[Value]) -> (String, String) {
     match locations.first() {
         Some(first) => (
-            first.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string(),
-            first.get("lines").and_then(|l| l.as_str()).unwrap_or("").to_string(),
+            first
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string(),
+            first
+                .get("lines")
+                .and_then(|l| l.as_str())
+                .unwrap_or("")
+                .to_string(),
         ),
         None => (String::new(), String::new()),
     }
@@ -936,22 +1027,25 @@ pub(crate) fn stamp_locations(metadata: &mut Value, locations: &[Value]) {
         Some(obj) => obj,
         None => return,
     };
-    let refs: Vec<serde_json::Value> = locations.iter().map(|loc| {
-        let mut ref_obj = serde_json::Map::new();
-        if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
-            ref_obj.insert("file".to_string(), serde_json::json!(path));
-        }
-        if let Some(lines) = loc.get("lines").and_then(|l| l.as_str()) {
-            ref_obj.insert("lines".to_string(), serde_json::json!(lines));
-        }
-        if let Some(sym) = loc.get("symbol").and_then(|s| s.as_str()) {
-            ref_obj.insert("symbol".to_string(), serde_json::json!(sym));
-        }
-        if let Some(context) = loc.get("source_context").filter(|v| v.is_object()) {
-            ref_obj.insert("source_context".to_string(), context.clone());
-        }
-        serde_json::Value::Object(ref_obj)
-    }).collect();
+    let refs: Vec<serde_json::Value> = locations
+        .iter()
+        .map(|loc| {
+            let mut ref_obj = serde_json::Map::new();
+            if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
+                ref_obj.insert("file".to_string(), serde_json::json!(path));
+            }
+            if let Some(lines) = loc.get("lines").and_then(|l| l.as_str()) {
+                ref_obj.insert("lines".to_string(), serde_json::json!(lines));
+            }
+            if let Some(sym) = loc.get("symbol").and_then(|s| s.as_str()) {
+                ref_obj.insert("symbol".to_string(), serde_json::json!(sym));
+            }
+            if let Some(context) = loc.get("source_context").filter(|v| v.is_object()) {
+                ref_obj.insert("source_context".to_string(), context.clone());
+            }
+            serde_json::Value::Object(ref_obj)
+        })
+        .collect();
     obj.insert("refs".to_string(), serde_json::Value::Array(refs));
 
     // A rule that names files governs them. This is the edge that makes an
@@ -995,7 +1089,10 @@ pub(crate) fn content_governs_lines(content: &str) -> Vec<Vec<String>> {
 /// disagree. A record must never render two Governs lists in one block with
 /// nothing marking the authoritative half.
 pub(crate) fn governance_conflict_note(content: &str, metadata: &Value) -> Option<String> {
-    let declared: Vec<String> = content_governs_lines(content).into_iter().flatten().collect();
+    let declared: Vec<String> = content_governs_lines(content)
+        .into_iter()
+        .flatten()
+        .collect();
     if declared.is_empty() {
         return None;
     }
@@ -1008,7 +1105,8 @@ pub(crate) fn governance_conflict_note(content: &str, metadata: &Value) -> Optio
                 .collect()
         })
         .unwrap_or_default();
-    let agrees = declared.len() == authoritative.len() && declared.iter().all(|d| authoritative.contains(d));
+    let agrees =
+        declared.len() == authoritative.len() && declared.iter().all(|d| authoritative.contains(d));
     if agrees {
         return None;
     }
@@ -1023,7 +1121,10 @@ pub(crate) fn governance_conflict_note(content: &str, metadata: &Value) -> Optio
 /// there is indistinguishable from one written by add_memory.
 pub(crate) fn stamp_new_memory(metadata: &mut Value) {
     if let Some(meta_obj) = metadata.as_object_mut() {
-        meta_obj.insert("valid_from".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
+        meta_obj.insert(
+            "valid_from".to_string(),
+            serde_json::json!(chrono::Utc::now().timestamp()),
+        );
         meta_obj.insert("access_count".to_string(), serde_json::json!(0));
     }
 }
@@ -1038,16 +1139,19 @@ pub(crate) async fn embed_dedup_and_upsert(
     payload: &MemoryPayload,
     dedup: Option<&Arc<crate::judgment::DeduplicationChecker>>,
 ) -> Result<crate::traits::UpsertReport, String> {
-    store.init(namespace).await.map_err(|_| "Failed to initialize table.".to_string())?;
-    let vector = emb.embed(&payload.content).await.map_err(|_| "Failed to generate embedding.".to_string())?;
+    store
+        .init(namespace)
+        .await
+        .map_err(|_| "Failed to initialize table.".to_string())?;
+    let vector = emb
+        .embed(&payload.content)
+        .await
+        .map_err(|_| "Failed to generate embedding.".to_string())?;
     // Check for duplicates if deduplication is enabled
     if let Some(checker) = dedup {
         if let Ok(candidates) = store.search(namespace, vector.clone(), 5).await {
             // Filter to only high-similarity candidates
-            let similar: Vec<_> = candidates
-                .into_iter()
-                .filter(|c| c.score >= 0.85)
-                .collect();
+            let similar: Vec<_> = candidates.into_iter().filter(|c| c.score >= 0.85).collect();
 
             if !similar.is_empty() {
                 // Ask the judgment provider if this is a duplicate
@@ -1065,7 +1169,9 @@ pub(crate) async fn embed_dedup_and_upsert(
     }
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    store.upsert(namespace, &new_id, vector, payload.clone()).await
+    store
+        .upsert(namespace, &new_id, vector, payload.clone())
+        .await
         .map_err(|_| "Failed to store memory in database.".to_string())
 }
 
@@ -1104,7 +1210,10 @@ async fn handle_add_memory(
         if let Some(project_root) = arguments.get("project_root").and_then(|r| r.as_str()) {
             let ns_dir = std::path::Path::new(project_root).join(".NeuroStrata");
             if !tokio::fs::try_exists(&ns_dir).await.unwrap_or(false) {
-                let create_new_namespace = arguments.get("create_new_namespace").and_then(|v| v.as_bool()).unwrap_or(false);
+                let create_new_namespace = arguments
+                    .get("create_new_namespace")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if !create_new_namespace {
                     return format!("ERROR: No .NeuroStrata directory found at {}. This indicates the project does not have a designated context/namespace yet. Do NOT guess the namespace. Ask the user if they want to initialize this directory as a new context, and if so, call this tool again with create_new_namespace=true.", project_root);
                 } else {
@@ -1116,18 +1225,33 @@ async fn handle_add_memory(
         }
     }
 
-    let memory_type = arguments.get("memory_type").and_then(|m| m.as_str()).unwrap_or("context");
-    let create_new_namespace = arguments.get("create_new_namespace").and_then(|v| v.as_bool()).unwrap_or(false);
-    let user_id = arguments.get("user_id").and_then(|u| u.as_str()).unwrap_or("unknown");
+    let memory_type = arguments
+        .get("memory_type")
+        .and_then(|m| m.as_str())
+        .unwrap_or("context");
+    let create_new_namespace = arguments
+        .get("create_new_namespace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let user_id = arguments
+        .get("user_id")
+        .and_then(|u| u.as_str())
+        .unwrap_or("unknown");
     if user_id == "auto-ingestor" {
         // Directory ingestion deletes every row owned by this user_id before it
         // rebuilds, so a memory stored under it would vanish on the next ingest.
         return "ERROR: 'auto-ingestor' is reserved for directory ingestion, and memories stored under it are deleted by the next ingest. Please use a different user_id.".to_string();
     }
-    let agent_name = arguments.get("agent_name").and_then(|a| a.as_str()).map(|s| s.to_string());
+    let agent_name = arguments
+        .get("agent_name")
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_string());
     let mut location = "".to_string();
     let mut location_lines = "".to_string();
-    let mut metadata = arguments.get("metadata").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let mut metadata = arguments
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
 
     // Validate metadata shape: must be a JSON object. Legacy scalar/string
     // metadata silently produced success with no lineage stamps on supersede.
@@ -1139,7 +1263,7 @@ async fn handle_add_memory(
     if let Some(rejection) = crate::secrets::scan_entry_point(content, &metadata, "add_memory") {
         return rejection.to_string();
     }
-    
+
     if let Some(locations) = arguments.get("locations").and_then(|l| l.as_array()) {
         let (first_path, first_lines) = first_location(locations);
         location = first_path;
@@ -1177,7 +1301,7 @@ async fn handle_add_memory(
                 namespace, existing_namespaces
             );
         }
-        
+
         let payload = MemoryPayload {
             content: content.to_string(),
             user_id: user_id.to_string(),
@@ -1252,7 +1376,10 @@ async fn handle_add_memory(
 /// something to attempt. Migrating means stopping the daemon, which is the
 /// human's transport and would end the session's own connection; an agent that
 /// shelled out to do it would be going around the surface it was given.
-fn unmigrated_ids_notice(namespace: &str, memories: &[crate::traits::SearchResult]) -> Option<String> {
+fn unmigrated_ids_notice(
+    namespace: &str,
+    memories: &[crate::traits::SearchResult],
+) -> Option<String> {
     let ingested: Vec<&crate::traits::SearchResult> = memories
         .iter()
         .filter(|m| m.payload.user_id == "auto-ingestor")
@@ -1282,7 +1409,10 @@ fn unmigrated_ids_notice(namespace: &str, memories: &[crate::traits::SearchResul
     ))
 }
 
-async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> Result<String, String> {
+async fn handle_get_snapshot(
+    arguments: Value,
+    store: Arc<dyn VectorStore>,
+) -> Result<String, String> {
     let namespace = arguments
         .get("namespace")
         .and_then(|n| n.as_str())
@@ -1324,15 +1454,23 @@ async fn handle_get_snapshot(arguments: Value, store: Arc<dyn VectorStore>) -> R
     // whether or not it made the top-5 by access count, and a procedure nobody
     // has ever performed has the lowest access count of all.
     let procedures = crate::tools::procedure::procedures_due_strap(&all_memories, now);
-    all_memories.retain(|r| {
-        match r.payload.metadata.get("valid_to") {
-            None => true,
-            Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
-        }
+    all_memories.retain(|r| match r.payload.metadata.get("valid_to") {
+        None => true,
+        Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
     });
     all_memories.sort_by(|a, b| {
-        let a_count = a.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let b_count = b.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let a_count = a
+            .payload
+            .metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let b_count = b
+            .payload
+            .metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         b_count.cmp(&a_count)
     });
     all_memories.truncate(5);
@@ -1411,11 +1549,15 @@ async fn handle_supersede_memory(
 ) -> String {
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
-        None => return "Missing 'id' parameter: supersede needs the memory it replaces.".to_string(),
+        None => {
+            return "Missing 'id' parameter: supersede needs the memory it replaces.".to_string()
+        }
     };
     let content = match arguments.get("content").and_then(|c| c.as_str()) {
         Some(c) => c,
-        None => return "Missing 'content' parameter: supersede needs the corrected text.".to_string(),
+        None => {
+            return "Missing 'content' parameter: supersede needs the corrected text.".to_string()
+        }
     };
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
         Some(n) => n,
@@ -1435,19 +1577,28 @@ async fn handle_supersede_memory(
     // absent so they cannot masquerade as provenance.
     let source = match arguments.get("source") {
         Some(Value::String(s)) if !s.trim().is_empty() => Some(Value::String(s.trim().to_string())),
-        Some(v @ Value::Object(_)) if !v.as_object().map(|o| o.is_empty()).unwrap_or(true) => Some(v.clone()),
+        Some(v @ Value::Object(_)) if !v.as_object().map(|o| o.is_empty()).unwrap_or(true) => {
+            Some(v.clone())
+        }
         _ => None,
     };
 
     // Same scanner add_memory uses. A correction is still an insertion, and a
     // secret pasted into one would be just as permanent.
-    if let Some(rejection) = crate::secrets::scan_entry_point(content, &serde_json::json!({}), "supersede_memory") {
+    if let Some(rejection) =
+        crate::secrets::scan_entry_point(content, &serde_json::json!({}), "supersede_memory")
+    {
         return rejection.to_string();
     }
     // The reason and the source land in stored metadata; a secret in either is
     // as permanent as one in the content.
-    for extra in [reason, source.as_ref().and_then(|s| s.as_str())].into_iter().flatten() {
-        if let Some(rejection) = crate::secrets::scan_entry_point(extra, &serde_json::json!({}), "supersede_memory") {
+    for extra in [reason, source.as_ref().and_then(|s| s.as_str())]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(rejection) =
+            crate::secrets::scan_entry_point(extra, &serde_json::json!({}), "supersede_memory")
+        {
             return rejection.to_string();
         }
     }
@@ -1457,7 +1608,12 @@ async fn handle_supersede_memory(
 
     // Retiring a row hides it from every future search, so the machine-wide
     // stratum keeps the same guard the destructive tools carry.
-    if namespace == "global" && !arguments.get("allow_global").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if namespace == "global"
+        && !arguments
+            .get("allow_global")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
         return "ERROR [GLOBAL]: Refusing to supersede a memory in the machine-wide 'global' namespace. Rules there apply to every project on this machine. Pass allow_global=true only if you are certain, or supersede the project-local rule instead.".to_string();
     }
 
@@ -1578,7 +1734,10 @@ async fn handle_supersede_memory(
         // An unambiguous content line is the author's declaration and wins
         // over the inherited pointer when no parameter and no locations spoke.
         // A record must never hold two contradictory Governs lists.
-        if arguments.get("governs").is_none() && !locations_wrote_governs && content_lists.len() == 1 {
+        if arguments.get("governs").is_none()
+            && !locations_wrote_governs
+            && content_lists.len() == 1
+        {
             let declared = serde_json::json!(content_lists[0]);
             if old_payload.metadata.get("governs") != Some(&declared) {
                 obj.insert("governs".to_string(), declared);
@@ -1592,7 +1751,12 @@ async fn handle_supersede_memory(
         Ok(v) => v,
         // The whole point of superseding rather than editing: the new text gets
         // its own embedding, so search stops matching the words we replaced.
-        Err(e) => return format!("Failed to embed the new content, nothing was changed: {}", e),
+        Err(e) => {
+            return format!(
+                "Failed to embed the new content, nothing was changed: {}",
+                e
+            )
+        }
     };
 
     // Write the replacement BEFORE retiring the original. If the second write
@@ -1600,7 +1764,12 @@ async fn handle_supersede_memory(
     // the other order would leave the rule retired with no successor.
     let replacement_report = match store.upsert(namespace, &new_id, vector, new_payload).await {
         Ok(report) => report,
-        Err(e) => return format!("Failed to store the replacement, nothing was changed: {}", e),
+        Err(e) => {
+            return format!(
+                "Failed to store the replacement, nothing was changed: {}",
+                e
+            )
+        }
     };
 
     // Optimistic guard: re-read the old row and verify it still has no valid_to
@@ -1741,7 +1910,10 @@ async fn handle_supersede_memory(
         } else {
             "the retired memory (carried over)"
         };
-        report.push_str(&format!(" The governing pointer is now set from {}.", source));
+        report.push_str(&format!(
+            " The governing pointer is now set from {}.",
+            source
+        ));
     }
     if content_lists.len() > 1 && arguments.get("governs").is_none() && !locations_wrote_governs {
         report.push_str(&format!(
@@ -1752,7 +1924,11 @@ async fn handle_supersede_memory(
     report
 }
 
-async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: Arc<dyn VectorStore>) -> String {
+async fn handle_search_memory(
+    arguments: Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
     let query = match arguments.get("query").and_then(|q| q.as_str()) {
         Some(q) => q,
         None => return "Missing 'query' parameter.".to_string(),
@@ -1767,7 +1943,10 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
     // Task rows are backlog chatter, not recall material: excluded unless the
     // caller asks for them (section 1.1). The over-fetch keeps a full page
     // after the filter, then trims back to the promised five.
-    let include_tasks = arguments.get("include_tasks").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_tasks = arguments
+        .get("include_tasks")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let fetch = if include_tasks { 5 } else { 15 };
 
     if let Ok(_) = store.init(namespace).await {
@@ -1805,7 +1984,9 @@ async fn handle_search_memory(arguments: Value, emb: Arc<dyn Embedder>, store: A
                         let ns_clone = namespace.to_string();
                         let id_clone = res.id.clone();
                         tokio::spawn(async move {
-                            let _ = store_clone.increment_access_count(&ns_clone, &id_clone).await;
+                            let _ = store_clone
+                                .increment_access_count(&ns_clone, &id_clone)
+                                .await;
                         });
                     }
 
@@ -1859,7 +2040,11 @@ pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &
                     let mut best = candidates[0].clone();
                     let mut best_len = 0usize;
                     for candidate in &candidates {
-                        let held = store.list(candidate, None).await.map(|m| m.len()).unwrap_or(0);
+                        let held = store
+                            .list(candidate, None)
+                            .await
+                            .map(|m| m.len())
+                            .unwrap_or(0);
                         if held > best_len {
                             best_len = held;
                             best = candidate.clone();
@@ -1903,7 +2088,8 @@ pub(crate) async fn set_metadata(
         Some(found) => found,
         None => return Ok(MetadataOutcome::NotFound),
     };
-    if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+    if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+    {
         return Ok(MetadataOutcome::Ingested);
     }
 
@@ -1940,7 +2126,9 @@ pub(crate) async fn edit_memory(
     location: &str,
 ) -> anyhow::Result<EditOutcome> {
     // Secret scan on the manual edit path: an edit is as permanent as an add.
-    if let Some(rejection) = crate::secrets::scan_entry_point(content, &serde_json::json!({}), "edit_memory") {
+    if let Some(rejection) =
+        crate::secrets::scan_entry_point(content, &serde_json::json!({}), "edit_memory")
+    {
         return Err(anyhow::anyhow!("{}", rejection));
     }
 
@@ -1948,7 +2136,8 @@ pub(crate) async fn edit_memory(
         Some(found) => found,
         None => return Ok(EditOutcome::NotFound),
     };
-    if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+    if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+    {
         return Ok(EditOutcome::Ingested);
     }
 
@@ -1979,10 +2168,18 @@ fn render_anchor(anchor: &Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if let Some(lines) = anchor.get("lines").and_then(|v| v.as_str()).filter(|l| !l.is_empty()) {
+    if let Some(lines) = anchor
+        .get("lines")
+        .and_then(|v| v.as_str())
+        .filter(|l| !l.is_empty())
+    {
         out.push_str(&format!(":{}", lines));
     }
-    if let Some(symbol) = anchor.get("symbol").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(symbol) = anchor
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!(" ({})", symbol));
     }
     out
@@ -2076,9 +2273,13 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
             crate::traits::EvidenceKind::OneHop => {
                 // Recover originating primary: endpoint other than result.id
                 let orig = ev.path.iter().find_map(|e| {
-                    if e.target == result.id { Some(e.source.as_str()) }
-                    else if e.source == result.id { Some(e.target.as_str()) }
-                    else { None }
+                    if e.target == result.id {
+                        Some(e.source.as_str())
+                    } else if e.source == result.id {
+                        Some(e.target.as_str())
+                    } else {
+                        None
+                    }
                 });
                 let orig = match orig {
                     Some(o) => o,
@@ -2091,12 +2292,17 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                     }
                 }
                 let rendered_path = render_path(ev, orig);
-                format!("\nPath [one_hop]: {}\nWhy: This memory is one graph hop from a direct match.", rendered_path)
+                format!(
+                    "\nPath [one_hop]: {}\nWhy: This memory is one graph hop from a direct match.",
+                    rendered_path
+                )
             }
             crate::traits::EvidenceKind::Governs2hop => {
                 // Two hops: first edge + second edge (GOVERNS).
                 // Originating primary: first-edge endpoint other than second-edge target.
-                if ev.path.len() < 2 { continue; }
+                if ev.path.len() < 2 {
+                    continue;
+                }
                 let first = &ev.path[0];
                 let second = &ev.path[1];
                 // Validate connectivity: first edge's endpoint == second edge's source or target
@@ -2141,28 +2347,25 @@ fn render_path(ev: &crate::traits::SearchEvidence, orig: &str) -> String {
     let mut current = orig;
 
     for edge in &ev.path {
-        let (next, arrow, rel) = if ev.kind == crate::traits::EvidenceKind::OneHop
-            && edge.relation == "RELATES_TO"
-        {
-            // RELATES_TO is undirected; use --RELATES_TO-- literal
-            let next = if edge.source == current { &edge.target } else { &edge.source };
-            (next.as_str(), " --RELATES_TO-- ", &edge.relation)
-        } else if edge.source == current {
-            // Forward: source -> target
-            (edge.target.as_str(), " -", &edge.relation)
-        } else if edge.target == current {
-            // Reverse: target <- source
-            (edge.source.as_str(), " <-", &edge.relation)
-        } else {
-            continue;
-        };
-        parts.push(format!(
-            "\"{}\"{}{}- \"{}\"",
-            current,
-            arrow,
-            rel,
-            next
-        ));
+        let (next, arrow, rel) =
+            if ev.kind == crate::traits::EvidenceKind::OneHop && edge.relation == "RELATES_TO" {
+                // RELATES_TO is undirected; use --RELATES_TO-- literal
+                let next = if edge.source == current {
+                    &edge.target
+                } else {
+                    &edge.source
+                };
+                (next.as_str(), " --RELATES_TO-- ", &edge.relation)
+            } else if edge.source == current {
+                // Forward: source -> target
+                (edge.target.as_str(), " -", &edge.relation)
+            } else if edge.target == current {
+                // Reverse: target <- source
+                (edge.source.as_str(), " <-", &edge.relation)
+            } else {
+                continue;
+            };
+        parts.push(format!("\"{}\"{}{}- \"{}\"", current, arrow, rel, next));
         current = next;
     }
     parts.join(" ")
@@ -2289,10 +2492,7 @@ async fn handle_guard_validate(
 
     // Prefix the namespace + trace so the caller can audit which rule set
     // produced the verdict without re-parsing the body.
-    format!(
-        "namespace: {}\ntrace_id: {}\n{}",
-        namespace, trace_id, body
-    )
+    format!("namespace: {}\ntrace_id: {}\n{}", namespace, trace_id, body)
 }
 
 /// FNV-1a, 32-bit, over the action payload.
@@ -2373,7 +2573,10 @@ async fn handle_guard_list_rules(
 async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match arguments.get("id").and_then(|v| v.as_str()) {
         Some(i) => i,
-        None => return "Missing 'id' parameter. Ids are returned by neurostrata_search_memory.".to_string(),
+        None => {
+            return "Missing 'id' parameter. Ids are returned by neurostrata_search_memory."
+                .to_string()
+        }
     };
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n,
@@ -2575,8 +2778,12 @@ mod tests {
     /// error anywhere.
     #[test]
     fn a_request_that_cannot_be_forwarded_is_answered() {
-        let line = failure_line(Some(serde_json::json!(7)), INTERNAL_ERROR, "daemon unreachable")
-            .expect("a request carrying an id gets a reply");
+        let line = failure_line(
+            Some(serde_json::json!(7)),
+            INTERNAL_ERROR,
+            "daemon unreachable",
+        )
+        .expect("a request carrying an id gets a reply");
         let parsed: Value = serde_json::from_str(&line).expect("valid JSON-RPC");
 
         assert_eq!(parsed["id"], serde_json::json!(7));
@@ -2658,7 +2865,7 @@ mod tests {
         assert_eq!(namespace_from(&existing, "SomethingElse"), "SomethingElse");
     }
 
-                                    #[test]
+    #[test]
     fn a_formatted_memory_carries_its_anchors() {
         let mut p = payload("checkpoint every write");
         p.location = "src/store/ladybug.rs".to_string();
@@ -2683,7 +2890,11 @@ mod tests {
 
         let out = format_memory("abc-123", &p);
 
-        assert!(out.contains("src/parser/ingest.rs:133-160 (ingest_directory)"), "{}", out);
+        assert!(
+            out.contains("src/parser/ingest.rs:133-160 (ingest_directory)"),
+            "{}",
+            out
+        );
         assert!(out.contains("src/store/ladybug.rs"), "{}", out);
     }
 
@@ -2766,8 +2977,15 @@ mod tests {
             )
             .await
             .expect("seed");
-        let (out_vector, _) = store.get("probe", &id).await.unwrap().expect("round-tripped");
-        assert_eq!(in_vector, out_vector, "the fractional part survives the round-trip");
+        let (out_vector, _) = store
+            .get("probe", &id)
+            .await
+            .unwrap()
+            .expect("round-tripped");
+        assert_eq!(
+            in_vector, out_vector,
+            "the fractional part survives the round-trip"
+        );
     }
 
     /// `handle_search_memory` with `StubEmbedder` (no `NoisyEmbedder`
@@ -2856,8 +3074,9 @@ mod tests {
 
     async fn store_with_one_rule(namespace: &str) -> (Arc<dyn VectorStore>, String) {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
         store.init(namespace).await.expect("create the schema");
         let id = uuid::Uuid::new_v4().to_string();
         let vector = StubEmbedder.embed("always use podman").await.unwrap();
@@ -2885,10 +3104,17 @@ mod tests {
         .expect("edit");
 
         assert_eq!(outcome, EditOutcome::Edited);
-        let (_, edited) = store.get("other", &id).await.unwrap().expect("the memory is in its new namespace");
+        let (_, edited) = store
+            .get("other", &id)
+            .await
+            .unwrap()
+            .expect("the memory is in its new namespace");
         assert_eq!(edited.content, "always use podman, pinned");
         assert_eq!(edited.location, "docs/tools.md");
-        assert!(store.get("probe", &id).await.unwrap().is_none(), "and nowhere else");
+        assert!(
+            store.get("probe", &id).await.unwrap().is_none(),
+            "and nowhere else"
+        );
     }
 
     #[tokio::test]
@@ -2896,14 +3122,29 @@ mod tests {
         let (store, _) = store_with_one_rule("probe").await;
         let mut node = payload("Path: src/a.rs");
         node.user_id = "auto-ingestor".to_string();
-        store.upsert("probe", "probe::src/a.rs", vec![0.0; 4], node).await.unwrap();
-
-        let outcome = edit_memory(&*store, &StubEmbedder, "probe", "probe::src/a.rs", "probe", "hand-written", "")
+        store
+            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], node)
             .await
-            .expect("edit");
+            .unwrap();
+
+        let outcome = edit_memory(
+            &*store,
+            &StubEmbedder,
+            "probe",
+            "probe::src/a.rs",
+            "probe",
+            "hand-written",
+            "",
+        )
+        .await
+        .expect("edit");
 
         assert_eq!(outcome, EditOutcome::Ingested);
-        let (_, kept) = store.get("probe", "probe::src/a.rs").await.unwrap().expect("still there");
+        let (_, kept) = store
+            .get("probe", "probe::src/a.rs")
+            .await
+            .unwrap()
+            .expect("still there");
         assert_eq!(kept.content, "Path: src/a.rs", "and unchanged");
     }
 
@@ -2933,10 +3174,20 @@ mod tests {
         .await;
         assert!(reply.starts_with("Superseded"), "got {}", reply);
 
-        let (_, old) = store.get("probe", &old_id).await.unwrap().expect("still readable by id");
-        assert_eq!(old.content, "always use podman", "history keeps its own wording");
+        let (_, old) = store
+            .get("probe", &old_id)
+            .await
+            .unwrap()
+            .expect("still readable by id");
+        assert_eq!(
+            old.content, "always use podman",
+            "history keeps its own wording"
+        );
         assert!(old.metadata["valid_to"].as_i64().is_some(), "retired");
-        assert_eq!(old.metadata["superseded_by"], serde_json::json!(new_id_from(&reply)));
+        assert_eq!(
+            old.metadata["superseded_by"],
+            serde_json::json!(new_id_from(&reply))
+        );
 
         let (_, new) = store
             .get("probe", &new_id_from(&reply))
@@ -2947,7 +3198,10 @@ mod tests {
         assert_eq!(new.metadata["supersedes"], serde_json::json!(old_id));
         assert!(new.metadata["valid_from"].as_i64().is_some());
         assert!(
-            new.metadata.get("valid_to").map(|v| v.is_null()).unwrap_or(true),
+            new.metadata
+                .get("valid_to")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
             "the replacement is current, not history"
         );
     }
@@ -2998,9 +3252,19 @@ mod tests {
         .await;
 
         let (old_vector, _) = store.get("probe", &old_id).await.unwrap().unwrap();
-        let (new_vector, _) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert_ne!(old_vector, new_vector, "the correction carries its own embedding");
-        assert_eq!(new_vector, StubEmbedder.embed("always use docker").await.unwrap());
+        let (new_vector, _) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            old_vector, new_vector,
+            "the correction carries its own embedding"
+        );
+        assert_eq!(
+            new_vector,
+            StubEmbedder.embed("always use docker").await.unwrap()
+        );
     }
 
     /// History is not a chain to rewrite: correct the current row instead.
@@ -3032,7 +3296,10 @@ mod tests {
         assert!(refused.contains("ERROR [GLOBAL]"), "got {}", refused);
 
         let (_, untouched) = store.get("global", &old_id).await.unwrap().unwrap();
-        assert!(untouched.metadata.get("valid_to").is_none(), "nothing was retired");
+        assert!(
+            untouched.metadata.get("valid_to").is_none(),
+            "nothing was retired"
+        );
 
         let allowed = handle_supersede_memory(
             serde_json::json!({ "id": old_id, "namespace": "global", "content": "changed", "allow_global": true }),
@@ -3060,7 +3327,10 @@ mod tests {
         assert!(refused.contains("ERROR [SECURITY]"), "got {}", refused);
 
         let (_, untouched) = store.get("probe", &old_id).await.unwrap().unwrap();
-        assert!(untouched.metadata.get("valid_to").is_none(), "nothing was retired");
+        assert!(
+            untouched.metadata.get("valid_to").is_none(),
+            "nothing was retired"
+        );
     }
 
     // ── Task 3a: non-object metadata rejection ─────────────────────────
@@ -3106,7 +3376,11 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(reply.contains("ERROR"), "string metadata should be rejected: {}", reply);
+        assert!(
+            reply.contains("ERROR"),
+            "string metadata should be rejected: {}",
+            reply
+        );
         assert!(reply.contains("metadata"), "{}", reply);
     }
 
@@ -3132,7 +3406,10 @@ mod tests {
 
         // Original still active — no silent no-op with no lineage stamps.
         let (_, still) = store.get("probe", &old_id).await.unwrap().unwrap();
-        assert!(still.metadata.get("valid_to").is_none(), "must not be retired");
+        assert!(
+            still.metadata.get("valid_to").is_none(),
+            "must not be retired"
+        );
     }
 
     // ── Task 3b: future valid_to transfers to replacement ──────────────
@@ -3140,8 +3417,9 @@ mod tests {
     #[tokio::test]
     async fn future_expiry_supersede_succeeds_and_transfers_expiry() {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
         store.init("probe").await.expect("create the schema");
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -3163,7 +3441,11 @@ mod tests {
         assert!(reply.starts_with("Superseded"), "got {}", reply);
 
         // Replacement inherits the future expiry.
-        let (_, new_row) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        let (_, new_row) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             new_row.metadata.get("valid_to").and_then(|v| v.as_i64()),
             Some(future_ts),
@@ -3179,8 +3461,9 @@ mod tests {
     #[tokio::test]
     async fn supersede_replaces_structural_metadata_and_reports_what_it_kept() {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
         store.init("probe").await.expect("create the schema");
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -3204,16 +3487,30 @@ mod tests {
         )
         .await;
         assert!(reply.starts_with("Superseded"), "got {}", reply);
-        assert!(reply.contains("Replaced metadata: governs"), "got {}", reply);
+        assert!(
+            reply.contains("Replaced metadata: governs"),
+            "got {}",
+            reply
+        );
         assert!(
             reply.contains("Carried over UNCHANGED from the old memory: related_to"),
             "the carried pointer must be named: {}",
             reply
         );
 
-        let (_, new_row) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert_eq!(new_row.metadata["governs"], serde_json::json!(["live/file.rs"]));
-        assert_eq!(new_row.metadata["related_to"], serde_json::json!(["someone"]));
+        let (_, new_row) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new_row.metadata["governs"],
+            serde_json::json!(["live/file.rs"])
+        );
+        assert_eq!(
+            new_row.metadata["related_to"],
+            serde_json::json!(["someone"])
+        );
     }
 
     /// Guinea-pig round 3 (Option 1 completion + Option 2): locations replace
@@ -3223,8 +3520,9 @@ mod tests {
     #[tokio::test]
     async fn supersede_replaces_locations_and_honours_the_content_governs_line() {
         let dir = std::env::temp_dir().join(format!("ns-supersede-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
         store.init("probe").await.expect("create the schema");
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
 
@@ -3250,14 +3548,25 @@ mod tests {
         )
         .await;
         assert!(reply.starts_with("Superseded"), "got {}", reply);
-        assert!(reply.contains("Replaced metadata: locations"), "got {}", reply);
+        assert!(
+            reply.contains("Replaced metadata: locations"),
+            "got {}",
+            reply
+        );
         assert!(
             reply.contains("set from the locations parameter"),
             "got {}",
             reply
         );
-        let (_, row_a) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert_eq!(row_a.metadata["refs"][0]["file"], serde_json::json!("live/new.go"));
+        let (_, row_a) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row_a.metadata["refs"][0]["file"],
+            serde_json::json!("live/new.go")
+        );
         let expected = crate::parser::ingest::normalize_node_path("live/new.go");
         assert_eq!(row_a.metadata["governs"], serde_json::json!([expected]));
 
@@ -3279,14 +3588,25 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(reply.contains("governs (from your content line)"), "got {}", reply);
+        assert!(
+            reply.contains("governs (from your content line)"),
+            "got {}",
+            reply
+        );
         assert!(
             reply.contains("set from the Governs line in your content"),
             "got {}",
             reply
         );
-        let (_, row_b) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert_eq!(row_b.metadata["governs"], serde_json::json!(["live/new.go"]));
+        let (_, row_b) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row_b.metadata["governs"],
+            serde_json::json!(["live/new.go"])
+        );
 
         // C: two conflicting lines and no parameter -- refuse to guess, say so.
         let id = uuid::Uuid::new_v4().to_string();
@@ -3305,9 +3625,20 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(reply.contains("2 conflicting Governs lines"), "got {}", reply);
-        let (_, row_c) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert_eq!(row_c.metadata["governs"], serde_json::json!(["dead/old.go"]));
+        assert!(
+            reply.contains("2 conflicting Governs lines"),
+            "got {}",
+            reply
+        );
+        let (_, row_c) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row_c.metadata["governs"],
+            serde_json::json!(["dead/old.go"])
+        );
     }
 
     /// FEATURE-4 (rr66): a correction must be able to say WHY. The why is
@@ -3331,19 +3662,34 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(reply.contains("Recorded why on the retired memory as superseded_reason"), "got {}", reply);
-        assert!(reply.contains("blanket rule was wrong"), "the reply quotes the why: {}", reply);
+        assert!(
+            reply.contains("Recorded why on the retired memory as superseded_reason"),
+            "got {}",
+            reply
+        );
+        assert!(
+            reply.contains("blanket rule was wrong"),
+            "the reply quotes the why: {}",
+            reply
+        );
 
         let (_, old) = store.get("probe", &old_id).await.unwrap().expect("history");
         assert_eq!(
             old.metadata["superseded_reason"],
             serde_json::json!("the blanket rule was wrong for host-network services")
         );
-        assert!(old.metadata["superseded_by"].as_str().is_some(), "the why sits next to the pointer");
+        assert!(
+            old.metadata["superseded_by"].as_str().is_some(),
+            "the why sits next to the pointer"
+        );
 
         // The live assertion is not a correction record; its lineage lives on
         // the old row, reachable through the supersedes pointer.
-        let (_, new) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        let (_, new) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(new.metadata["supersedes"], serde_json::json!(old_id));
         assert!(
             new.metadata.get("superseded_reason").is_none(),
@@ -3370,7 +3716,12 @@ mod tests {
         let mut old = payload("rule about containers");
         old.metadata = serde_json::json!({ "source": "hallucinated 2020-01-01" });
         store
-            .upsert("probe", &id, StubEmbedder.embed("rule about containers").await.unwrap(), old)
+            .upsert(
+                "probe",
+                &id,
+                StubEmbedder.embed("rule about containers").await.unwrap(),
+                old,
+            )
             .await
             .unwrap();
         let reply = handle_supersede_memory(
@@ -3387,16 +3738,36 @@ mod tests {
         )
         .await;
         assert!(reply.contains("Replaced metadata: source"), "got {}", reply);
-        assert!(!reply.contains("Carried over UNCHANGED from the old memory: source"), "nothing carried: {}", reply);
-        let (_, new_a) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert_eq!(new_a.metadata["source"], serde_json::json!("owner 2026-10-09"));
+        assert!(
+            !reply.contains("Carried over UNCHANGED from the old memory: source"),
+            "nothing carried: {}",
+            reply
+        );
+        let (_, new_a) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new_a.metadata["source"],
+            serde_json::json!("owner 2026-10-09")
+        );
         let (_, old_a) = store.get("probe", &id).await.unwrap().unwrap();
-        assert_eq!(old_a.metadata["source"], serde_json::json!("hallucinated 2020-01-01"), "history keeps its own origin");
+        assert_eq!(
+            old_a.metadata["source"],
+            serde_json::json!("hallucinated 2020-01-01"),
+            "history keeps its own origin"
+        );
 
         // B: the structured form, with the same semantics add_memory accepts.
         let id = uuid::Uuid::new_v4().to_string();
         store
-            .upsert("probe", &id, StubEmbedder.embed("another rule").await.unwrap(), payload("another rule"))
+            .upsert(
+                "probe",
+                &id,
+                StubEmbedder.embed("another rule").await.unwrap(),
+                payload("another rule"),
+            )
             .await
             .unwrap();
         let structured = serde_json::json!({
@@ -3416,7 +3787,11 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        let (_, new_b) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
+        let (_, new_b) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(new_b.metadata["source"], structured);
     }
 
@@ -3435,10 +3810,26 @@ mod tests {
             quiet_bus(),
         )
         .await;
-        assert!(reply.starts_with("Superseded"), "the correction itself still lands: {}", reply);
-        assert!(reply.contains("NO reason was recorded"), "the missing why is named: {}", reply);
-        assert!(reply.contains("NO metadata.source"), "the missing provenance is named: {}", reply);
-        assert!(reply.contains("rule_without_source"), "and what it costs: {}", reply);
+        assert!(
+            reply.starts_with("Superseded"),
+            "the correction itself still lands: {}",
+            reply
+        );
+        assert!(
+            reply.contains("NO reason was recorded"),
+            "the missing why is named: {}",
+            reply
+        );
+        assert!(
+            reply.contains("NO metadata.source"),
+            "the missing provenance is named: {}",
+            reply
+        );
+        assert!(
+            reply.contains("rule_without_source"),
+            "and what it costs: {}",
+            reply
+        );
 
         let (_, old) = store.get("probe", &old_id).await.unwrap().unwrap();
         assert!(
@@ -3446,8 +3837,15 @@ mod tests {
             "nothing written for a reason that was never given: {:?}",
             old.metadata
         );
-        let (_, new) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert!(new.metadata.get("source").is_none(), "and no invented provenance");
+        let (_, new) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            new.metadata.get("source").is_none(),
+            "and no invented provenance"
+        );
     }
 
     /// Whitespace is not a reason and a blank source is not provenance: both
@@ -3473,7 +3871,10 @@ mod tests {
         assert!(reply.contains("NO reason was recorded"), "got {}", reply);
         assert!(reply.contains("NO metadata.source"), "got {}", reply);
         let (_, old) = store.get("probe", &old_id).await.unwrap().unwrap();
-        assert!(old.metadata.get("superseded_reason").is_none(), "no blank why stored");
+        assert!(
+            old.metadata.get("superseded_reason").is_none(),
+            "no blank why stored"
+        );
     }
 
     /// Provenance omitted but inherited: the old origin carries over, and the
@@ -3491,7 +3892,12 @@ mod tests {
         let mut old = payload("sourced rule");
         old.metadata = serde_json::json!({ "source": "owner 2026-10-08", "governs": ["a.rs"] });
         store
-            .upsert("probe", &id, StubEmbedder.embed("sourced rule").await.unwrap(), old)
+            .upsert(
+                "probe",
+                &id,
+                StubEmbedder.embed("sourced rule").await.unwrap(),
+                old,
+            )
             .await
             .unwrap();
 
@@ -3508,9 +3914,20 @@ mod tests {
             "got {}",
             reply
         );
-        assert!(!reply.contains("NO metadata.source"), "inherited provenance is not absent: {}", reply);
-        let (_, new) = store.get("probe", &new_id_from(&reply)).await.unwrap().unwrap();
-        assert_eq!(new.metadata["source"], serde_json::json!("owner 2026-10-08"));
+        assert!(
+            !reply.contains("NO metadata.source"),
+            "inherited provenance is not absent: {}",
+            reply
+        );
+        let (_, new) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new.metadata["source"],
+            serde_json::json!("owner 2026-10-08")
+        );
     }
 
     /// A record must never render two Governs lists with nothing marking the
@@ -3520,7 +3937,11 @@ mod tests {
         let mut disagreeing = payload("rule text\nGoverns: [\"a.go\"]");
         disagreeing.metadata = serde_json::json!({ "governs": ["b.go"] });
         let out = format_memory("ns-1", &disagreeing);
-        assert!(out.contains("DISAGREES with the authoritative metadata"), "got {}", out);
+        assert!(
+            out.contains("DISAGREES with the authoritative metadata"),
+            "got {}",
+            out
+        );
 
         let mut agreeing = payload("rule text\nGoverns: [\"a.go\"]");
         agreeing.metadata = serde_json::json!({ "governs": ["a.go"] });
@@ -3549,7 +3970,10 @@ mod tests {
         // guard would also catch a concurrent race. For a true race test,
         // we verify the re-read detects valid_to.
         let (_, retired) = store.get("probe", &old_id).await.unwrap().unwrap();
-        assert!(retired.metadata.get("valid_to").is_some(), "first supersede retired the row");
+        assert!(
+            retired.metadata.get("valid_to").is_some(),
+            "first supersede retired the row"
+        );
     }
 
     // ── Secret rejection on add prevents store write ────────────────────
@@ -3584,21 +4008,22 @@ mod tests {
     #[tokio::test]
     async fn snapshot_handler_returns_ok_for_normal_data() {
         let (store, _) = store_with_one_rule("probe").await;
-        let result = handle_get_snapshot(
-            serde_json::json!({ "namespace": "probe" }),
-            store,
-        )
-        .await;
+        let result = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store).await;
         assert!(result.is_ok(), "snapshot should succeed: {:?}", result);
         let text = result.unwrap();
-        assert!(text.contains("always use podman"), "should contain the rule: {}", text);
+        assert!(
+            text.contains("always use podman"),
+            "should contain the rule: {}",
+            text
+        );
     }
 
     #[tokio::test]
     async fn snapshot_handler_missing_namespace_is_err() {
         let dir = std::env::temp_dir().join(format!("ns-snap-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
         let result = handle_get_snapshot(serde_json::json!({}), store).await;
         assert!(result.is_err(), "missing namespace should be err");
     }
@@ -3607,7 +4032,12 @@ mod tests {
 
     use crate::traits::{EvidenceEdge, EvidenceKind, SearchEvidence};
 
-    fn search_result_with_evidence(id: &str, memory_type: &str, content: &str, evidence: Option<Vec<SearchEvidence>>) -> SearchResult {
+    fn search_result_with_evidence(
+        id: &str,
+        memory_type: &str,
+        content: &str,
+        evidence: Option<Vec<SearchEvidence>>,
+    ) -> SearchResult {
         SearchResult {
             id: id.to_string(),
             score: if evidence.is_some() { 10.0 } else { 0.0 },
@@ -3627,41 +4057,63 @@ mod tests {
     #[test]
     fn search_direct_match_text_is_byte_identical() {
         let r = search_result_with_evidence(
-            "probe::src/a.rs::run", "code_ast", "symbol",
+            "probe::src/a.rs::run",
+            "code_ast",
+            "symbol",
             Some(vec![SearchEvidence {
-                kind: EvidenceKind::DirectMatch, path: vec![],
+                kind: EvidenceKind::DirectMatch,
+                path: vec![],
                 explanation: "This memory matched the query vector.".into(),
             }]),
         );
         let text = render_search_results(&[r]);
-        let expected = format_memory("probe::src/a.rs::run",
+        let expected = format_memory(
+            "probe::src/a.rs::run",
             &MemoryPayload {
-                content: "symbol".into(), user_id: "u".into(),
-                memory_type: "code_ast".into(), agent_name: None,
-                location: String::new(), location_lines: String::new(),
+                content: "symbol".into(),
+                user_id: "u".into(),
+                memory_type: "code_ast".into(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
                 metadata: serde_json::json!({}),
-            });
-        assert_eq!(text, expected, "direct match should produce byte-identical output to format_memory");
+            },
+        );
+        assert_eq!(
+            text, expected,
+            "direct match should produce byte-identical output to format_memory"
+        );
     }
 
     #[test]
     fn get_memory_text_is_unchanged_by_search_evidence() {
         let p = MemoryPayload {
-            content: "rule text".into(), user_id: "u".into(),
-            memory_type: "rule".into(), agent_name: None,
-            location: String::new(), location_lines: String::new(),
+            content: "rule text".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: serde_json::json!({}),
         };
         let text = format_memory("rule-1", &p);
-        assert!(!text.contains("Path"), "get output should not contain evidence paths");
-        assert!(!text.contains("Why:"), "get output should not contain evidence explanations");
+        assert!(
+            !text.contains("Path"),
+            "get output should not contain evidence paths"
+        );
+        assert!(
+            !text.contains("Why:"),
+            "get output should not contain evidence explanations"
+        );
     }
 
     #[test]
     fn search_evidence_respects_per_result_byte_budget() {
         // Very short budget: 10 bytes. Evidence suffix is much longer.
         let r = search_result_with_evidence(
-            "probe::src/a.rs", "file", "file",
+            "probe::src/a.rs",
+            "file",
+            "file",
             Some(vec![SearchEvidence {
                 kind: EvidenceKind::OneHop,
                 path: vec![EvidenceEdge {
@@ -3679,7 +4131,9 @@ mod tests {
     #[test]
     fn search_evidence_respects_total_added_byte_budget() {
         let r1 = search_result_with_evidence(
-            "probe::src/a.rs", "file", "file",
+            "probe::src/a.rs",
+            "file",
+            "file",
             Some(vec![SearchEvidence {
                 kind: EvidenceKind::OneHop,
                 path: vec![EvidenceEdge {
@@ -3695,34 +4149,44 @@ mod tests {
         assert!(text.len() <= 2048);
 
         // Many results with evidence should still respect the total budget
-        let results: Vec<_> = (0..20).map(|i| {
-            search_result_with_evidence(
-                &format!("mem-{}", i), "rule", "content",
-                Some(vec![SearchEvidence {
-                    kind: EvidenceKind::OneHop,
-                    path: vec![EvidenceEdge {
-                        source: "probe::src/a.rs::run".into(),
-                        relation: "CONTAINS".into(),
-                        target: format!("mem-{}", i),
-                    }],
-                    explanation: "This memory is one graph hop from a direct match.".into(),
-                }]),
-            )
-        }).collect();
+        let results: Vec<_> = (0..20)
+            .map(|i| {
+                search_result_with_evidence(
+                    &format!("mem-{}", i),
+                    "rule",
+                    "content",
+                    Some(vec![SearchEvidence {
+                        kind: EvidenceKind::OneHop,
+                        path: vec![EvidenceEdge {
+                            source: "probe::src/a.rs::run".into(),
+                            relation: "CONTAINS".into(),
+                            target: format!("mem-{}", i),
+                        }],
+                        explanation: "This memory is one graph hop from a direct match.".into(),
+                    }]),
+                )
+            })
+            .collect();
         let text = render_search_results(&results);
         // Account for varying ID lengths ("mem-0" vs "mem-19") and separators.
-        let max_per_result_len = results.iter()
+        let max_per_result_len = results
+            .iter()
             .map(|r| format_memory(&r.id, &r.payload).len())
-            .max().unwrap();
+            .max()
+            .unwrap();
         let separator_overhead = (results.len() - 1) * 2; // "\n\n" between results
-        assert!(text.len() <= max_per_result_len * 20 + separator_overhead + 2048,
-            "total response should respect budget");
+        assert!(
+            text.len() <= max_per_result_len * 20 + separator_overhead + 2048,
+            "total response should respect budget"
+        );
     }
 
     #[test]
     fn search_evidence_never_truncates_or_splits_ids() {
         let r = search_result_with_evidence(
-            "probe::src/a.rs", "file", "file",
+            "probe::src/a.rs",
+            "file",
+            "file",
             Some(vec![SearchEvidence {
                 kind: EvidenceKind::OneHop,
                 path: vec![EvidenceEdge {
@@ -3734,9 +4198,18 @@ mod tests {
             }]),
         );
         let text = render_search_results(&[r]);
-        assert!(text.contains("probe::src/a.rs::run"), "full source ID must appear");
-        assert!(text.contains("probe::src/a.rs"), "full target ID must appear");
-        assert!(!text.contains("\"probe::src/a.\""), "no truncated ID in path quotes");
+        assert!(
+            text.contains("probe::src/a.rs::run"),
+            "full source ID must appear"
+        );
+        assert!(
+            text.contains("probe::src/a.rs"),
+            "full target ID must appear"
+        );
+        assert!(
+            !text.contains("\"probe::src/a.\""),
+            "no truncated ID in path quotes"
+        );
     }
 
     #[test]
@@ -3744,7 +4217,9 @@ mod tests {
         // Newlines in IDs would break the one-line-per-path rule.
         // In practice IDs don't contain newlines, but the renderer must not crash.
         let r = search_result_with_evidence(
-            "normal-id", "file", "file",
+            "normal-id",
+            "file",
+            "file",
             Some(vec![SearchEvidence {
                 kind: EvidenceKind::OneHop,
                 path: vec![EvidenceEdge {
@@ -3766,7 +4241,9 @@ mod tests {
         let long_path: Vec<EvidenceEdge> = {
             let mut edges = Vec::new();
             edges.push(EvidenceEdge {
-                source: "origin-long".into(), relation: "RELATES_TO".into(), target: "long-id-0".into(),
+                source: "origin-long".into(),
+                relation: "RELATES_TO".into(),
+                target: "long-id-0".into(),
             });
             for i in 0..18 {
                 edges.push(EvidenceEdge {
@@ -3777,27 +4254,42 @@ mod tests {
             }
             // Last edge ends at target-id (terminal check requires this)
             edges.push(EvidenceEdge {
-                source: "long-id-18".into(), relation: "RELATES_TO".into(), target: "target-id".into(),
+                source: "long-id-18".into(),
+                relation: "RELATES_TO".into(),
+                target: "target-id".into(),
             });
             edges
         };
         // Short path that fits: single edge from primary to result.id
         let short_path = vec![EvidenceEdge {
-            source: "a".into(), relation: "CONTAINS".into(), target: "target-id".into(),
+            source: "a".into(),
+            relation: "CONTAINS".into(),
+            target: "target-id".into(),
         }];
         let r = search_result_with_evidence(
-            "target-id", "rule", "rule",
+            "target-id",
+            "rule",
+            "rule",
             Some(vec![
-                SearchEvidence { kind: EvidenceKind::OneHop, path: long_path,
-                    explanation: "long".into() },
-                SearchEvidence { kind: EvidenceKind::OneHop, path: short_path,
-                    explanation: "short".into() },
+                SearchEvidence {
+                    kind: EvidenceKind::OneHop,
+                    path: long_path,
+                    explanation: "long".into(),
+                },
+                SearchEvidence {
+                    kind: EvidenceKind::OneHop,
+                    path: short_path,
+                    explanation: "short".into(),
+                },
             ]),
         );
         let suffix_result = render_evidence_suffix(&r, 200);
         let suffix = suffix_result.expect("should get a suffix");
         // The short path has node "a" — the long path has "origin-long"
-        assert!(suffix.contains("\"a\""), "should use the shorter path that fits");
+        assert!(
+            suffix.contains("\"a\""),
+            "should use the shorter path that fits"
+        );
     }
 
     /// The mesh dispatch arm is the only production route from the wire to
@@ -3808,10 +4300,8 @@ mod tests {
     /// must NOT fall through to the "Unknown tool" handler.
     #[tokio::test]
     async fn a_mesh_tool_routes_through_the_wire_surface() {
-        let scratch = std::env::temp_dir().join(format!(
-            "ns-mcp-mesh-route-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("ns-mcp-mesh-route-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -3855,15 +4345,8 @@ mod tests {
             params: Some(serde_json::json!({})),
         };
         let (bus, _seen) = recording_bus();
-        let response = process_mcp_request(
-            request,
-            Arc::new(StubEmbedder),
-            store,
-            ingests,
-            None,
-            bus,
-        )
-        .await;
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
         let tools = response["result"]["tools"]
             .as_array()
             .expect("tools/list returns an array");
@@ -3907,7 +4390,11 @@ mod tests {
             ]
         );
         for tool in tools {
-            assert!(tool["inputSchema"].is_object(), "{} needs an input schema", tool["name"]);
+            assert!(
+                tool["inputSchema"].is_object(),
+                "{} needs an input schema",
+                tool["name"]
+            );
         }
         // rr66: the correction surface can say WHY and WHERE FROM. If these
         // vanish from the schema, provenance on corrections dies silently.
@@ -3915,8 +4402,14 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "neurostrata_supersede_memory")
             .expect("the correction tool is exposed");
-        assert!(supersede["inputSchema"]["properties"]["reason"].is_object(), "supersede takes a reason");
-        assert!(supersede["inputSchema"]["properties"]["source"].is_object(), "supersede takes a source");
+        assert!(
+            supersede["inputSchema"]["properties"]["reason"].is_object(),
+            "supersede takes a reason"
+        );
+        assert!(
+            supersede["inputSchema"]["properties"]["source"].is_object(),
+            "supersede takes a source"
+        );
         // The tombstone tool's schema is the only thing a client reads before
         // calling it, so a schema that silently lost a required field would
         // turn every archive call into a runtime error instead.
@@ -3924,7 +4417,10 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "neurostrata_archive_memory")
             .expect("the archive tool is exposed");
-        assert!(archive["inputSchema"]["properties"]["id"].is_object(), "archive takes an id");
+        assert!(
+            archive["inputSchema"]["properties"]["id"].is_object(),
+            "archive takes an id"
+        );
         assert!(
             archive["inputSchema"]["properties"]["namespace"].is_object(),
             "archive takes a namespace"
@@ -3935,9 +4431,16 @@ mod tests {
             .iter()
             .map(|v| v.as_str().expect("a required field name"))
             .collect();
-        assert_eq!(required, vec!["id", "namespace"], "both fields are required");
+        assert_eq!(
+            required,
+            vec!["id", "namespace"],
+            "both fields are required"
+        );
         // The vocabulary summaries are still appended to their tools.
-        let summaries = crate::traits::memory_vocabulary().get("tool_summaries").unwrap().clone();
+        let summaries = crate::traits::memory_vocabulary()
+            .get("tool_summaries")
+            .unwrap()
+            .clone();
         assert!(summaries.get("add").is_some());
         assert!(summaries.get("search").is_some());
         assert!(summaries.get("ingest").is_some());
@@ -3954,7 +4457,10 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "neurostrata_procedure_perform")
             .expect("the procedure tool is exposed");
-        assert_eq!(perform["inputSchema"]["required"], serde_json::json!(["id"]));
+        assert_eq!(
+            perform["inputSchema"]["required"],
+            serde_json::json!(["id"])
+        );
         for field in [
             "performed",
             "lapsed",
@@ -4071,7 +4577,11 @@ mod tests {
 
         assert!(text.contains("Procedures due (1):"), "{}", text);
         assert!(text.contains("proc-live"), "{}", text);
-        assert!(!text.contains("proc-lapsed"), "a lapsed procedure is not due: {}", text);
+        assert!(
+            !text.contains("proc-lapsed"),
+            "a lapsed procedure is not due: {}",
+            text
+        );
     }
 
     /// The whole v1 loop over one MCP call: a procedure surfaces on the strap,
@@ -4101,7 +4611,8 @@ mod tests {
         let call = |id: &str| {
             let ingests = ingests.clone();
             let store = store.clone();
-            let arguments = serde_json::json!({ "id": id, "project_root": root.display().to_string() });
+            let arguments =
+                serde_json::json!({ "id": id, "project_root": root.display().to_string() });
             async move {
                 let request = JsonRpcRequest {
                     jsonrpc: "2.0".to_string(),
@@ -4154,8 +4665,8 @@ mod tests {
     }
 
     /// Emit site 1: the write that created a memory is the moment subscribers
-/// get told, without anyone remembering to tell them. Asserts the pulse
-/// carries the id the store actually holds -- a `Created` naming some other
+    /// get told, without anyone remembering to tell them. Asserts the pulse
+    /// carries the id the store actually holds -- a `Created` naming some other
     /// row would send every subscriber to read the wrong memory.
     #[tokio::test]
     async fn adding_a_memory_emits_created_naming_the_stored_row() {
@@ -4196,7 +4707,11 @@ mod tests {
 
         let pulses = pulses_seen(&seen, 1).await;
         match &pulses[0] {
-            ThalamicPulse::Created { id, namespace, kind } => {
+            ThalamicPulse::Created {
+                id,
+                namespace,
+                kind,
+            } => {
                 assert_eq!(namespace, "probe");
                 assert_eq!(kind, "rule", "the pulse carries the memory_type");
                 // The id is the store's, not a fresh uuid: the whole point of
@@ -4216,9 +4731,9 @@ mod tests {
     }
 
     /// Emit site 2: a correction is two rows moving, and the pulse has to name
-/// both ends of the move. Asserts old_id is the row that was retired and
-/// new_id the row that replaced it -- a `Superseded` with the ends swapped
-/// would send every subscriber down the wrong chain.
+    /// both ends of the move. Asserts old_id is the row that was retired and
+    /// new_id the row that replaced it -- a `Superseded` with the ends swapped
+    /// would send every subscriber down the wrong chain.
     #[tokio::test]
     async fn superseding_emits_superseded_naming_both_ends_of_the_move() {
         let (store, old_id) = store_with_one_rule("probe").await;
@@ -4236,11 +4751,19 @@ mod tests {
             bus,
         )
         .await;
-        assert!(reply.starts_with(&format!("Superseded {}", old_id)), "{}", reply);
+        assert!(
+            reply.starts_with(&format!("Superseded {}", old_id)),
+            "{}",
+            reply
+        );
 
         let pulses = pulses_seen(&seen, 1).await;
         match &pulses[0] {
-            ThalamicPulse::Superseded { old_id: from, new_id: to, namespace } => {
+            ThalamicPulse::Superseded {
+                old_id: from,
+                new_id: to,
+                namespace,
+            } => {
                 assert_eq!(from, &old_id, "the retired row");
                 assert_eq!(namespace, "probe");
                 assert_ne!(to, from, "the replacement is a different row");
@@ -4253,8 +4776,14 @@ mod tests {
                     .expect("read")
                     .expect("the retired row still exists");
                 assert_eq!(vector.len(), 4);
-                assert!(retired.metadata["valid_to"].is_i64(), "the old row is retired");
-                assert_eq!(retired.metadata["superseded_by"], serde_json::json!(to.as_str()));
+                assert!(
+                    retired.metadata["valid_to"].is_i64(),
+                    "the old row is retired"
+                );
+                assert_eq!(
+                    retired.metadata["superseded_by"],
+                    serde_json::json!(to.as_str())
+                );
                 let (_, replacement) = store
                     .get("probe", to)
                     .await
@@ -4297,7 +4826,7 @@ mod tests {
     }
 
     /// Emit site 4: the audit row a verdict earns cannot depend on the caller
-/// remembering to record it, so the verdict itself publishes the pulse.
+    /// remembering to record it, so the verdict itself publishes the pulse.
     /// Asserts the pulse is joinable to the response the caller received --
     /// same `trace_id`, same rules -- because an audit row that cannot be tied
     /// back to its call is a list of hashes.
@@ -4319,7 +4848,11 @@ mod tests {
             bus,
         )
         .await;
-        assert!(reply.starts_with("namespace: probe\ntrace_id: "), "{}", reply);
+        assert!(
+            reply.starts_with("namespace: probe\ntrace_id: "),
+            "{}",
+            reply
+        );
 
         let pulses = pulses_seen(&seen, 1).await;
         match &pulses[0] {
@@ -4350,7 +4883,10 @@ mod tests {
                 assert_eq!(trace_id, response_trace);
                 assert_eq!(
                     verdict,
-                    &body["verdict"]["bucket"].as_str().expect("a verdict bucket").to_string()
+                    &body["verdict"]["bucket"]
+                        .as_str()
+                        .expect("a verdict bucket")
+                        .to_string()
                 );
                 assert_eq!(
                     rule_ids_triggered,
@@ -4412,8 +4948,14 @@ mod tests {
                 other => panic!("expected GuardedActionFired, got {:?}", other),
             })
             .collect();
-        assert_ne!(hashes[0], hashes[1], "different payloads, different commitments");
-        assert_eq!(hashes[0], hashes[2], "the same payload commits the same way");
+        assert_ne!(
+            hashes[0], hashes[1],
+            "different payloads, different commitments"
+        );
+        assert_eq!(
+            hashes[0], hashes[2],
+            "the same payload commits the same way"
+        );
     }
 
     /// A refused call never reached a verdict, so there is nothing to record.
@@ -4431,7 +4973,11 @@ mod tests {
             bus,
         )
         .await;
-        assert!(reply.starts_with("ERROR: 'payload' is required"), "{}", reply);
+        assert!(
+            reply.starts_with("ERROR: 'payload' is required"),
+            "{}",
+            reply
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
@@ -4441,9 +4987,9 @@ mod tests {
     }
 
     /// Emit site 5 (the `Archived` variant's only producer): a tombstone is a
-/// storage mutation like any other, so it publishes one. Asserts the
-/// tombstone is a *merge* -- archiving must not drop the metadata that was
-/// already there, or the row loses its provenance the moment it is retired.
+    /// storage mutation like any other, so it publishes one. Asserts the
+    /// tombstone is a *merge* -- archiving must not drop the metadata that was
+    /// already there, or the row loses its provenance the moment it is retired.
     #[tokio::test]
     async fn archiving_marks_the_row_and_emits_archived_without_dropping_metadata() {
         let (store, id) = store_with_one_rule("probe").await;
@@ -4468,14 +5014,21 @@ mod tests {
         .await;
         assert!(reply.contains("Archived"), "{}", reply);
 
-        let (_, payload) = store.get("probe", &id).await.unwrap().expect("still readable");
+        let (_, payload) = store
+            .get("probe", &id)
+            .await
+            .unwrap()
+            .expect("still readable");
         assert_eq!(payload.metadata["archived"], serde_json::json!(true));
         assert_eq!(
             payload.metadata["access_count"],
             serde_json::json!(3),
             "the existing metadata survives the tombstone"
         );
-        assert_eq!(payload.metadata["governs"], serde_json::json!(["src/daemon.rs"]));
+        assert_eq!(
+            payload.metadata["governs"],
+            serde_json::json!(["src/daemon.rs"])
+        );
         assert_eq!(
             payload.metadata["source"],
             serde_json::json!("docs/design-task-subsystem.md"),
@@ -4484,7 +5037,10 @@ mod tests {
 
         let pulses = pulses_seen(&seen, 1).await;
         match &pulses[0] {
-            ThalamicPulse::Archived { id: archived, namespace } => {
+            ThalamicPulse::Archived {
+                id: archived,
+                namespace,
+            } => {
                 assert_eq!(archived, &id, "the pulse names the row that was tombstoned");
                 assert_eq!(namespace, "probe");
             }
@@ -4584,7 +5140,11 @@ mod tests {
             "{}",
             text
         );
-        assert!(text.contains("always use podman"), "the body still follows: {}", text);
+        assert!(
+            text.contains("always use podman"),
+            "the body still follows: {}",
+            text
+        );
     }
 
     // ---- archived filter across the read surfaces -----------------------
@@ -4723,7 +5283,10 @@ mod tests {
         p.metadata = serde_json::json!({
             "mesh": { "conflict": true, "conflict_reason": "incompatible content edits" }
         });
-        let vector = StubEmbedder.embed("always use podman, conflicting edit").await.unwrap();
+        let vector = StubEmbedder
+            .embed("always use podman, conflicting edit")
+            .await
+            .unwrap();
         store
             .upsert(namespace, &conflicting_id, vector, p)
             .await

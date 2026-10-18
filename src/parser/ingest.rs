@@ -1,10 +1,10 @@
-use crate::parser::schema::ParserSchema;
 use crate::parser::get_language;
-use crate::traits::{Embedder, VectorStore, MemoryPayload};
+use crate::parser::schema::ParserSchema;
+use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use ignore::WalkBuilder;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
@@ -35,7 +35,10 @@ fn truncate_for_embedding(body: &str) -> String {
         return body.to_string();
     }
     let cut: String = body.chars().take(MAX_SYMBOL_CHARS).collect();
-    format!("{}\n... (truncated at {} characters)", cut, MAX_SYMBOL_CHARS)
+    format!(
+        "{}\n... (truncated at {} characters)",
+        cut, MAX_SYMBOL_CHARS
+    )
 }
 
 /// Node ids are paths, and a memory written by an agent names a file the way a
@@ -181,9 +184,25 @@ fn run_producer(
     namespace: String,
 ) -> anyhow::Result<()> {
     let skipped_dirs = [
-        "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
-        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt", "__pycache__",
-        ".fastembed_cache", ".idea", ".vscode", "coverage"
+        "node_modules",
+        "target",
+        "vendor",
+        ".venv",
+        "venv",
+        "env",
+        ".env",
+        "dist",
+        "build",
+        "out",
+        ".dolt",
+        ".git",
+        ".next",
+        ".nuxt",
+        "__pycache__",
+        ".fastembed_cache",
+        ".idea",
+        ".vscode",
+        "coverage",
     ];
 
     let walker = WalkBuilder::new(&dir_path).build();
@@ -210,7 +229,10 @@ fn run_producer(
             let skip_pattern = format!("/{}/", skip_dir);
             let skip_start = format!("{}/", skip_dir);
             let skip_exact = format!("./{}", skip_dir);
-            if path_str.contains(&skip_pattern) || path_str.starts_with(&skip_start) || path_str == skip_exact {
+            if path_str.contains(&skip_pattern)
+                || path_str.starts_with(&skip_start)
+                || path_str == skip_exact
+            {
                 should_skip = true;
                 break;
             }
@@ -222,7 +244,11 @@ fn run_producer(
         let abs_path = if path.is_absolute() {
             path.to_string_lossy().to_string()
         } else {
-            std::env::current_dir().unwrap_or_default().join(path).to_string_lossy().to_string()
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(path)
+                .to_string_lossy()
+                .to_string()
         };
 
         let node_path = node_id_for(&dir_path, path);
@@ -261,13 +287,16 @@ fn run_producer(
         let node_id = qualified_id(&namespace, &node_path);
 
         // If the consumer has dropped (e.g. it errored), stop walking.
-        if tx.try_send(IngestItem::NodeUpsert {
-            node_id,
-            node_path: node_path.clone(),
-            contained_by,
-            mem_type: mem_type.to_string(),
-            abs_path,
-        }).is_err() {
+        if tx
+            .try_send(IngestItem::NodeUpsert {
+                node_id,
+                node_path: node_path.clone(),
+                contained_by,
+                mem_type: mem_type.to_string(),
+                abs_path,
+            })
+            .is_err()
+        {
             return Ok(());
         }
 
@@ -342,12 +371,15 @@ fn run_producer(
 
                     if !pending.is_empty() {
                         let path_display = path.display().to_string();
-                        if tx.try_send(IngestItem::ParsedSymbols {
-                            node_path,
-                            lang_name: lang_name.clone(),
-                            symbols: pending,
-                            path_display,
-                        }).is_err() {
+                        if tx
+                            .try_send(IngestItem::ParsedSymbols {
+                                node_path,
+                                lang_name: lang_name.clone(),
+                                symbols: pending,
+                                path_display,
+                            })
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }
@@ -399,7 +431,10 @@ async fn run_consumer(
                     agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                 };
 
-                if let Err(e) = vector_store.upsert(namespace, &node_id, zero_vector.clone(), payload).await {
+                if let Err(e) = vector_store
+                    .upsert(namespace, &node_id, zero_vector.clone(), payload)
+                    .await
+                {
                     eprintln!("Failed to upsert graph node {}: {}", node_id, e);
                 }
             }
@@ -413,7 +448,12 @@ async fn run_consumer(
                 for symbol in symbols {
                     let summary = format!(
                         "{} {} in {}\nlines {}-{}\n\n{}",
-                        symbol.kind, symbol.name, node_path, symbol.start_line, symbol.end_line, symbol.body
+                        symbol.kind,
+                        symbol.name,
+                        node_path,
+                        symbol.start_line,
+                        symbol.end_line,
+                        symbol.body
                     );
                     let id = qualified_id(
                         namespace,
@@ -430,9 +470,12 @@ async fn run_consumer(
                         "contained_by".to_string(),
                         serde_json::json!([qualified_id(namespace, &node_path)]),
                     );
-                    metadata.insert("refs".to_string(), serde_json::json!([
-                        { "file": node_path.clone(), "lines": lines.clone() }
-                    ]));
+                    metadata.insert(
+                        "refs".to_string(),
+                        serde_json::json!([
+                            { "file": node_path.clone(), "lines": lines.clone() }
+                        ]),
+                    );
 
                     let payload = MemoryPayload {
                         content: summary.clone(),
@@ -446,13 +489,22 @@ async fn run_consumer(
 
                     match embedder.embed(&summary).await {
                         Ok(embedding) => {
-                            if let Err(e) = vector_store.upsert(namespace, &id, embedding, payload).await {
-                                eprintln!("Failed to store symbol {} from {}: {}", symbol.name, path_display, e);
+                            if let Err(e) = vector_store
+                                .upsert(namespace, &id, embedding, payload)
+                                .await
+                            {
+                                eprintln!(
+                                    "Failed to store symbol {} from {}: {}",
+                                    symbol.name, path_display, e
+                                );
                             } else {
                                 symbols_stored += 1;
                             }
                         }
-                        Err(e) => eprintln!("Failed to embed symbol {} from {}: {}", symbol.name, path_display, e),
+                        Err(e) => eprintln!(
+                            "Failed to embed symbol {} from {}: {}",
+                            symbol.name, path_display, e
+                        ),
                     }
                 }
 
@@ -491,10 +543,13 @@ pub async fn ingest_directory(
 
     // Rebuild this namespace's ingested rows from scratch. Failing here is fatal:
     // ingesting on top of a stale tree would leave rows for files that no longer exist.
-    vector_store
-        .clear_ingested(namespace)
-        .await
-        .map_err(|e| anyhow::anyhow!("Refusing to ingest: could not clear the previous ingest of namespace {}: {}", namespace, e))?;
+    vector_store.clear_ingested(namespace).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing to ingest: could not clear the previous ingest of namespace {}: {}",
+            namespace,
+            e
+        )
+    })?;
 
     let ext_to_lang = build_ext_map(schema);
     let zero_vector = vec![0.0; embedder.dimensions()];
@@ -507,14 +562,26 @@ pub async fn ingest_directory(
     // The blocking producer walks the filesystem and parses files on a
     // blocking thread, streaming owned results through the channel.
     let producer = tokio::task::spawn_blocking(move || {
-        run_producer(dir_path_owned, ext_to_lang, schema_clone, tx, namespace_owned)
+        run_producer(
+            dir_path_owned,
+            ext_to_lang,
+            schema_clone,
+            tx,
+            namespace_owned,
+        )
     });
 
     // The async consumer embeds and stores each item on the async runtime.
     let observer_clone = observer.clone();
     let consumer_result = run_consumer(
-        rx, embedder, vector_store.clone(), namespace, observer_clone, zero_vector,
-    ).await;
+        rx,
+        embedder,
+        vector_store.clone(),
+        namespace,
+        observer_clone,
+        zero_vector,
+    )
+    .await;
 
     let producer_result = producer.await;
 
@@ -543,14 +610,16 @@ pub async fn ingest_directory(
             e
         )
     })?;
-    println!("Relinked {} declared edges in namespace {}", linked, namespace);
+    println!(
+        "Relinked {} declared edges in namespace {}",
+        linked, namespace
+    );
     if let Some(observer) = &observer {
         observer.relinked(linked);
     }
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -584,7 +653,8 @@ mod tests {
     /// get_language() had no arm for, so those files silently produced nothing.
     #[test]
     fn every_language_in_the_shipped_schema_has_a_grammar() {
-        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
         for lang in schema.languages.keys() {
             assert!(
                 get_language(lang).is_some(),
@@ -597,10 +667,16 @@ mod tests {
     /// And the reverse gap: a grammar nothing can reach, because no extension maps to it.
     #[test]
     fn every_shipped_extension_resolves_to_a_grammar() {
-        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
         let map = build_ext_map(&schema);
         for (ext, lang) in &map {
-            assert!(get_language(lang).is_some(), "extension '{}' maps to '{}', which has no grammar", ext, lang);
+            assert!(
+                get_language(lang).is_some(),
+                "extension '{}' maps to '{}', which has no grammar",
+                ext,
+                lang
+            );
         }
         assert_eq!(map.get(&normalize_ext("rs")), Some(&"rust".to_string()));
         assert_eq!(map.get(&normalize_ext("tsx")), Some(&"tsx".to_string()));
@@ -656,7 +732,9 @@ mod tests {
     /// parent of the project used to win over the ingest root.
     #[test]
     fn a_node_id_does_not_depend_on_the_working_directory() {
-        let root = std::env::current_dir().expect("working directory").join("sub");
+        let root = std::env::current_dir()
+            .expect("working directory")
+            .join("sub");
         assert_eq!(node_id_for(&root, &root.join("a.rs")), "a.rs");
     }
 
@@ -687,7 +765,7 @@ mod tests {
         assert_eq!(normalize_node_path("src/"), "src");
     }
 
-        /// The whole point: two projects both have a `src`, the Memory table has a
+    /// The whole point: two projects both have a `src`, the Memory table has a
     /// single-column primary key, and the database is shared. Without the
     /// namespace in the id the second project ingested takes the first's node.
     /// doctor reports migration state from this, so a wrong answer either hides
@@ -749,7 +827,7 @@ mod tests {
         assert_eq!(index.resolve("src/main.rs"), None);
     }
 
-#[test]
+    #[test]
     fn symbol_ids_are_stable_and_distinguish_repeated_names() {
         let a = symbol_id("src/lib.rs", "functions", "main", 12);
         assert_eq!(a, symbol_id("src/lib.rs", "functions", "main", 12));
@@ -806,15 +884,34 @@ mod tests {
             location_lines: String::new(),
             metadata: serde_json::json!({}),
         };
-        store.upsert("probe", &node, vec![0.0; 4], previous).await.expect("seed a previous ingest");
+        store
+            .upsert("probe", &node, vec![0.0; 4], previous)
+            .await
+            .expect("seed a previous ingest");
 
         let missing = std::env::temp_dir().join(format!("ns-no-such-dir-{}", uuid::Uuid::new_v4()));
-        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
-        let outcome = ingest_directory(&missing, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None).await;
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let outcome = ingest_directory(
+            &missing,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "probe",
+            None,
+        )
+        .await;
 
-        assert!(outcome.is_err(), "a root that does not exist is an error, not an empty ingest");
         assert!(
-            store.get("probe", &node).await.expect("read back").is_some(),
+            outcome.is_err(),
+            "a root that does not exist is an error, not an empty ingest"
+        );
+        assert!(
+            store
+                .get("probe", &node)
+                .await
+                .expect("read back")
+                .is_some(),
             "and the previous ingest is still there"
         );
     }
@@ -822,23 +919,19 @@ mod tests {
     #[tokio::test]
     async fn producer_consumer_streams_items_to_store() {
         // Create a temp directory with a parseable file.
-        let tmp = std::env::temp_dir().join(format!(
-            "ns-producer-consumer-{}", uuid::Uuid::new_v4()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("ns-producer-consumer-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).expect("create temp dir");
-        std::fs::write(tmp.join("hello.rs"), "fn main() {}")
-            .expect("write test file");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write test file");
 
-        let db = std::env::temp_dir().join(format!(
-            "ns-producer-consumer-db-{}", uuid::Uuid::new_v4()
-        ));
+        let db =
+            std::env::temp_dir().join(format!("ns-producer-consumer-db-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::LadybugStore::for_testing(&db, 4)
-                .expect("open temp database"));
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
         store.init("test-ns").await.expect("create the schema");
 
-        let schema = ParserSchema::load(include_str!("../schema.json"))
-            .expect("shipped schema parses");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
         let outcome = ingest_directory(
             &tmp,
             &schema,
@@ -849,11 +942,7 @@ mod tests {
         )
         .await;
 
-        assert!(
-            outcome.is_ok(),
-            "ingestion succeeded: {:?}",
-            outcome.err()
-        );
+        assert!(outcome.is_ok(), "ingestion succeeded: {:?}", outcome.err());
 
         // The file node should exist.
         let file_id = qualified_id("test-ns", "hello.rs");

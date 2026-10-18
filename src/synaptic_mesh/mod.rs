@@ -12,11 +12,11 @@ pub mod conflict;
 pub mod import;
 pub mod manifest;
 pub mod mesh_service;
+pub mod outbox;
 pub mod record;
 pub mod storage;
 pub mod storage_api;
 pub mod tools;
-pub mod outbox;
 pub mod worker;
 
 #[cfg(test)]

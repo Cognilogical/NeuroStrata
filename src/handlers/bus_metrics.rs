@@ -18,7 +18,8 @@ use std::sync::Arc;
 /// The serialization cannot fail in practice -- `BusMetrics` is eight integers
 /// -- so an `expect` here is a statement about that, not a swallowed error.
 pub async fn handle_bus_metrics(bus: Arc<ThalamicBus>) -> String {
-    serde_json::to_string(&bus.metrics()).expect("BusMetrics is eight integers and always serializes")
+    serde_json::to_string(&bus.metrics())
+        .expect("BusMetrics is eight integers and always serializes")
 }
 
 #[cfg(test)]
@@ -43,8 +44,8 @@ mod tests {
         }
 
         let body = handle_bus_metrics(bus.clone()).await;
-        let snapshot: serde_json::Value =
-            serde_json::from_str(&body).expect("the body is the metrics object, not prose about it");
+        let snapshot: serde_json::Value = serde_json::from_str(&body)
+            .expect("the body is the metrics object, not prose about it");
         assert_eq!(
             snapshot["events_emitted"], 2,
             "two pulses went in, two must be counted: {body}"

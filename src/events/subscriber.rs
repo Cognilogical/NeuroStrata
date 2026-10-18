@@ -41,14 +41,18 @@ impl RecursionToken {
     /// request handler making the original write, not a subscriber reacting to
     /// one. Cleared to emit.
     pub fn root() -> Self {
-        Self { depth: AtomicU8::new(0) }
+        Self {
+            depth: AtomicU8::new(0),
+        }
     }
 
     /// The token the dispatcher hands to a subscriber it is about to invoke:
     /// depth 1, because emitting from inside a subscriber is the recursion this
     /// token exists to refuse.
     pub fn new() -> Self {
-        Self { depth: AtomicU8::new(1) }
+        Self {
+            depth: AtomicU8::new(1),
+        }
     }
 
     /// Whether a token at this depth is cleared to emit.
@@ -87,7 +91,11 @@ impl RecursionToken {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(Self { depth: AtomicU8::new(current + 1) }),
+                Ok(_) => {
+                    return Some(Self {
+                        depth: AtomicU8::new(current + 1),
+                    })
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -199,15 +207,26 @@ mod tests {
         let t = RecursionToken::new();
         assert!(!t.allows_emit(), "fresh token must block emit");
         let upgraded = t.upgrade();
-        assert!(upgraded.is_none(), "depth-1 token cannot be upgraded further");
+        assert!(
+            upgraded.is_none(),
+            "depth-1 token cannot be upgraded further"
+        );
     }
 
     #[test]
     fn recursion_token_root_allows_emit() {
         let root = RecursionToken::root();
         assert!(root.allows_emit(), "depth-0 token must permit emit");
-        let t = root.upgrade().expect("depth-0 token can be upgraded to depth 1");
-        assert!(!t.allows_emit(), "upgraded token sits at depth 1 and blocks emit");
-        assert!(t.upgrade().is_none(), "depth-1 token cannot be upgraded further");
+        let t = root
+            .upgrade()
+            .expect("depth-0 token can be upgraded to depth 1");
+        assert!(
+            !t.allows_emit(),
+            "upgraded token sits at depth 1 and blocks emit"
+        );
+        assert!(
+            t.upgrade().is_none(),
+            "depth-1 token cannot be upgraded further"
+        );
     }
 }

@@ -6,8 +6,8 @@
 //! for now; the dispatch and templates are structured so the other
 //! platforms are straightforward to add.
 
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 /// Result of a successful setup run.
 pub struct SetupReport {
@@ -24,7 +24,8 @@ pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
     if !script_path.exists() {
         anyhow::bail!(
             "backup script not found at {}. Run from the NeuroStrata project root, \
-             or pass --repo-path <project>.", script_path.display()
+             or pass --repo-path <project>.",
+            script_path.display()
         );
     }
 
@@ -108,8 +109,7 @@ fn run_setup_linux(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
 
 #[cfg(target_os = "linux")]
 fn unit_dir_linux() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     let mut p = PathBuf::from(home);
     p.push(".config");
     p.push("systemd");
@@ -125,7 +125,11 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
         .status()
         .with_context(|| format!("systemctl --user {}", args.join(" ")))?;
     if !status.success() {
-        anyhow::bail!("systemctl --user {} exited with {:?}", args.join(" "), status.code());
+        anyhow::bail!(
+            "systemctl --user {} exited with {:?}",
+            args.join(" "),
+            status.code()
+        );
     }
     Ok(())
 }
@@ -233,7 +237,11 @@ fn run_setup_macos(_bin: &Path, _script: &Path, _repo: &Path) -> Result<SetupRep
     println!("  3. Load the agent:");
     println!("       launchctl load -w ~/Library/LaunchAgents/dev.neurostrata.daemon.plist");
     println!("  4. For backups, add StartCalendarInterval to the same plist or a separate one.");
-    Ok(SetupReport { daemon_installed: false, backup_installed: false, verified: false })
+    Ok(SetupReport {
+        daemon_installed: false,
+        backup_installed: false,
+        verified: false,
+    })
 }
 
 // ── Windows (NSSM / SCM) ───────────────────────────────────────────────────
@@ -244,12 +252,25 @@ fn run_setup_windows(_bin: &Path, _script: &Path, _repo: &Path) -> Result<SetupR
     println!("  Option A — NSSM (recommended):");
     println!("    1. Install NSSM (https://nssm.cc/) and put nssm.exe on PATH.");
     println!("    2. Register the daemon:");
-    println!("         nssm install NeuroStrata \"{}\" daemon", _bin.display());
-    println!("         nssm set NeuroStrata AppDirectory \"{}\"", _repo.display());
+    println!(
+        "         nssm install NeuroStrata \"{}\" daemon",
+        _bin.display()
+    );
+    println!(
+        "         nssm set NeuroStrata AppDirectory \"{}\"",
+        _repo.display()
+    );
     println!("         nssm set NeuroStrata Start SERVICE_AUTO_START");
     println!("         nssm start NeuroStrata");
     println!("    3. For backups, use Task Scheduler:");
-    println!("         schtasks /create /tn NeuroStrataBackup /tr \"{}\" /sc daily /st 12:00", _script.display());
+    println!(
+        "         schtasks /create /tn NeuroStrataBackup /tr \"{}\" /sc daily /st 12:00",
+        _script.display()
+    );
     println!("  Option B — SCM directly (no NSSM): more work; NSSM is simpler.");
-    Ok(SetupReport { daemon_installed: false, backup_installed: false, verified: false })
+    Ok(SetupReport {
+        daemon_installed: false,
+        backup_installed: false,
+        verified: false,
+    })
 }

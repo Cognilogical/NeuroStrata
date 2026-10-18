@@ -1,9 +1,9 @@
 use crate::guard::models::ValidateVerdict;
-use tracing::{info, warn};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::{info, warn};
 
 pub struct SandboxEvaluator {
     engine: String, // "podman" or "docker"
@@ -42,21 +42,37 @@ impl SandboxEvaluator {
         }
 
         // Validate and canonicalize cwd to prevent host path exfiltration
-        let canonical_cwd = std::fs::canonicalize(cwd).map_err(|_| anyhow::anyhow!("Invalid cwd path"))?;
+        let canonical_cwd =
+            std::fs::canonicalize(cwd).map_err(|_| anyhow::anyhow!("Invalid cwd path"))?;
         let cwd_str = canonical_cwd.to_string_lossy().to_string();
 
-        let forbidden_prefixes = ["/etc", "/var/run", "/root", "/sys", "/dev", "/proc", "/boot"];
-        if cwd_str == "/" || forbidden_prefixes.iter().any(|prefix| cwd_str.starts_with(prefix)) {
+        let forbidden_prefixes = [
+            "/etc", "/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
+        ];
+        if cwd_str == "/"
+            || forbidden_prefixes
+                .iter()
+                .any(|prefix| cwd_str.starts_with(prefix))
+        {
             return Ok(ValidateVerdict::DeterministicReject {
-                reasons: vec![format!("Security violation: Attempted to mount forbidden host path {}", cwd_str)],
-                constraints: vec!["Never attempt to interact with or mount sensitive host system paths.".to_string()],
+                reasons: vec![format!(
+                    "Security violation: Attempted to mount forbidden host path {}",
+                    cwd_str
+                )],
+                constraints: vec![
+                    "Never attempt to interact with or mount sensitive host system paths."
+                        .to_string(),
+                ],
             });
         }
 
         // We only sandbox bash or known script commands for now
         if action_type != "bash" && action_type != "script" {
             return Ok(ValidateVerdict::DeterministicReject {
-                reasons: vec![format!("Sandbox evaluation not supported for action_type: {}", action_type)],
+                reasons: vec![format!(
+                    "Sandbox evaluation not supported for action_type: {}",
+                    action_type
+                )],
                 constraints: vec![],
             });
         }
@@ -99,10 +115,18 @@ impl SandboxEvaluator {
 
                 // Truncate logs to prevent LLM context overflow which causes death spirals and compaction errors
                 if stdout.len() > 500 {
-                    stdout = format!("...[TRUNCATED {} chars]...\n{}", stdout.len() - 500, &stdout[stdout.len() - 500..]);
+                    stdout = format!(
+                        "...[TRUNCATED {} chars]...\n{}",
+                        stdout.len() - 500,
+                        &stdout[stdout.len() - 500..]
+                    );
                 }
                 if stderr.len() > 500 {
-                    stderr = format!("...[TRUNCATED {} chars]...\n{}", stderr.len() - 500, &stderr[stderr.len() - 500..]);
+                    stderr = format!(
+                        "...[TRUNCATED {} chars]...\n{}",
+                        stderr.len() - 500,
+                        &stderr[stderr.len() - 500..]
+                    );
                 }
 
                 if output.status.success() {

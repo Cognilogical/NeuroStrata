@@ -16,9 +16,17 @@ pub enum ThalamicPulse {
     ///
     /// `String` rather than `&'static str`: the kind is read out of a stored
     /// record and travels with it, so it has the same lifetime as the pulse.
-    Created { id: String, namespace: String, kind: String },
+    Created {
+        id: String,
+        namespace: String,
+        kind: String,
+    },
     /// `old_id` gave way to `new_id`. Both are still stored; nothing was deleted.
-    Superseded { old_id: String, new_id: String, namespace: String },
+    Superseded {
+        old_id: String,
+        new_id: String,
+        namespace: String,
+    },
     /// A producer tombstoned a memory. It is archived, not destroyed.
     Archived { id: String, namespace: String },
     /// `neurostrata_guard_validate` returned a verdict. Nothing was stored and
@@ -57,14 +65,20 @@ mod tests {
     fn thalamic_pulse_variants_construct() {
         // Real assertions, not just `let _ =`. The test must catch a type change
         // (e.g. `String` -> `Cow`) silently slipping through.
-        let c =
-            ThalamicPulse::Created { id: "x".into(), namespace: "n".into(), kind: "task".into() };
+        let c = ThalamicPulse::Created {
+            id: "x".into(),
+            namespace: "n".into(),
+            kind: "task".into(),
+        };
         let s = ThalamicPulse::Superseded {
             old_id: "a".into(),
             new_id: "b".into(),
             namespace: "n".into(),
         };
-        let a = ThalamicPulse::Archived { id: "x".into(), namespace: "n".into() };
+        let a = ThalamicPulse::Archived {
+            id: "x".into(),
+            namespace: "n".into(),
+        };
         let g = ThalamicPulse::GuardedActionFired {
             trace_id: "t".into(),
             action_type: "shell".into(),
@@ -79,7 +93,11 @@ mod tests {
         assert!(matches!(g, ThalamicPulse::GuardedActionFired { .. }));
         // Field-level checks: the strings are preserved, not silently dropped.
         match c {
-            ThalamicPulse::Created { id, namespace, kind } => {
+            ThalamicPulse::Created {
+                id,
+                namespace,
+                kind,
+            } => {
                 assert_eq!(id, "x");
                 assert_eq!(namespace, "n");
                 assert_eq!(kind, "task");
@@ -87,7 +105,11 @@ mod tests {
             _ => unreachable!(),
         }
         match s {
-            ThalamicPulse::Superseded { old_id, new_id, namespace } => {
+            ThalamicPulse::Superseded {
+                old_id,
+                new_id,
+                namespace,
+            } => {
                 assert_eq!(old_id, "a");
                 assert_eq!(new_id, "b");
                 assert_eq!(namespace, "n");

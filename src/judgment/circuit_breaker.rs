@@ -6,9 +6,9 @@ use super::CircuitBreakerConfig;
 /// Circuit breaker states
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CircuitState {
-    Closed,    // Normal operation
-    Open,      // Failing, reject requests
-    HalfOpen,  // Testing if service recovered
+    Closed,   // Normal operation
+    Open,     // Failing, reject requests
+    HalfOpen, // Testing if service recovered
 }
 
 /// Circuit breaker to protect against cascading failures.
@@ -40,7 +40,7 @@ impl CircuitBreaker {
             .as_secs();
 
         let state = self.state.lock().unwrap();
-        
+
         match *state {
             CircuitState::Closed => true,
             CircuitState::Open => {
@@ -83,12 +83,12 @@ impl CircuitBreaker {
             // Calculate exponential backoff
             let backoff_duration = self.calculate_backoff(failures);
             let backoff_until = now + backoff_duration.as_secs();
-            
+
             self.backoff_until.store(backoff_until, Ordering::SeqCst);
-            
+
             let mut state = self.state.lock().unwrap();
             *state = CircuitState::Open;
-            
+
             tracing::warn!(
                 failures = failures,
                 backoff_secs = backoff_duration.as_secs(),
@@ -100,9 +100,9 @@ impl CircuitBreaker {
     /// Calculate exponential backoff duration.
     fn calculate_backoff(&self, failures: u32) -> Duration {
         let exponent = (failures - self.config.failure_threshold) as f64;
-        let backoff_ms = (self.config.initial_backoff_ms as f64)
-            * self.config.backoff_multiplier.powf(exponent);
-        
+        let backoff_ms =
+            (self.config.initial_backoff_ms as f64) * self.config.backoff_multiplier.powf(exponent);
+
         let backoff_ms = backoff_ms.min(self.config.max_backoff_ms as f64);
         Duration::from_millis(backoff_ms as u64)
     }

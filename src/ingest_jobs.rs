@@ -87,7 +87,8 @@ impl IngestObserver for ProgressReporter {
     }
 
     fn relinked(&self, edges: usize) {
-        self.tx.send_modify(|progress| progress.relinked_edges = Some(edges));
+        self.tx
+            .send_modify(|progress| progress.relinked_edges = Some(edges));
     }
 }
 
@@ -348,13 +349,19 @@ mod tests {
         jobs.insert("ns".to_string(), rx);
 
         assert!(
-            attach_to_running(&jobs, "ns", "/projects/a").unwrap().is_some(),
+            attach_to_running(&jobs, "ns", "/projects/a")
+                .unwrap()
+                .is_some(),
             "the same directory waits on the walk already running"
         );
-        let refused = attach_to_running(&jobs, "ns", "/projects/b").unwrap_err().to_string();
+        let refused = attach_to_running(&jobs, "ns", "/projects/b")
+            .unwrap_err()
+            .to_string();
         assert!(refused.contains("/projects/a"), "{}", refused);
         assert!(
-            attach_to_running(&jobs, "other", "/projects/b").unwrap().is_none(),
+            attach_to_running(&jobs, "other", "/projects/b")
+                .unwrap()
+                .is_none(),
             "another namespace starts its own"
         );
     }

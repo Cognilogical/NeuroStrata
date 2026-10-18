@@ -9,5 +9,5 @@ pub mod sandbox;
 pub mod semantic;
 pub mod validator;
 
-pub use models::{ValidateRequest, ValidateResponse, ValidateVerdict, BehavioralRule};
+pub use models::{BehavioralRule, ValidateRequest, ValidateResponse, ValidateVerdict};
 pub use validator::GuardValidator;

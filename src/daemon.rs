@@ -1,7 +1,5 @@
 use crate::config::DeduplicationConfig;
-use crate::events::{
-    EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus,
-};
+use crate::events::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
 use axum::{
@@ -129,7 +127,13 @@ pub async fn start_daemon(
     // The port the MCP proxy and CLI hardcode; changing it changes the wire
     // contract, so production never does. Tests pass an ephemeral address to
     // `start_daemon_on` directly.
-    start_daemon_on("127.0.0.1:34343".to_string(), embedder, vector_store, deduplication_config).await
+    start_daemon_on(
+        "127.0.0.1:34343".to_string(),
+        embedder,
+        vector_store,
+        deduplication_config,
+    )
+    .await
 }
 
 /// The pulse queue's bound. Ten thousand mutations is minutes of headroom at
@@ -249,7 +253,10 @@ fn wire_mesh_publish(
             bus.register(Box::new(sub));
         }
         Err(e) => {
-            tracing::warn!("mesh outbox could not open {}; disabled: {e}", outbox_dir.display());
+            tracing::warn!(
+                "mesh outbox could not open {}; disabled: {e}",
+                outbox_dir.display()
+            );
             return;
         }
     }
@@ -464,7 +471,9 @@ pub(crate) async fn start_daemon_on(
                 }
             }
         } else {
-            tracing::debug!("Deduplication config present but no judgment API key - feature disabled");
+            tracing::debug!(
+                "Deduplication config present but no judgment API key - feature disabled"
+            );
             None
         }
     } else {
@@ -662,11 +671,9 @@ async fn handle_get_graph(
     let config = crate::config::Config::from_default_path()
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let anchor_root = query.anchor_root.as_deref().map(Path::new);
-    let anchor_override = crate::source_context::scoped_anchor_override(
-        anchor_root,
-        query.source_id.as_deref(),
-    );
-    
+    let anchor_override =
+        crate::source_context::scoped_anchor_override(anchor_root, query.source_id.as_deref());
+
     // Using export_graph here temporarily or implement native LadybugDB querying here
     // For now, let's just use export_graph (which gets everything) and filter by namespace
     // In a real refactor, we would add get_graph_by_namespace to VectorStore.
@@ -685,7 +692,7 @@ async fn handle_get_graph(
     if query.all.unwrap_or(false) {
         return Ok(Json(data));
     }
-    
+
     // We can just return it all and let the client filter, or we can filter it here.
     // The Tauri backend did: "MATCH (n:Memory) WHERE n.namespace = 'global' OR n.namespace = '{ns}'"
     // Let's filter it.
@@ -812,31 +819,33 @@ async fn handle_cli_read(
     State(state): State<AppState>,
     Json(req): Json<ReadReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let value = match req.op.as_str() {
-        "namespaces" => {
-            let namespaces = state
-                .vector_store
-                .list_namespaces()
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            serde_json::json!({ "namespaces": namespaces })
-        }
-        "list" => {
-            let ns = req.namespace.unwrap_or_default();
-            let rows = state
-                .vector_store
-                .list(&ns, None)
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            serde_json::json!({ "rows": rows })
-        }
-        other => {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("unknown read op '{}': expected 'namespaces' or 'list'", other),
-            ))
-        }
-    };
+    let value =
+        match req.op.as_str() {
+            "namespaces" => {
+                let namespaces =
+                    state.vector_store.list_namespaces().await.map_err(|e| {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    })?;
+                serde_json::json!({ "namespaces": namespaces })
+            }
+            "list" => {
+                let ns = req.namespace.unwrap_or_default();
+                let rows =
+                    state.vector_store.list(&ns, None).await.map_err(|e| {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    })?;
+                serde_json::json!({ "rows": rows })
+            }
+            other => {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!(
+                        "unknown read op '{}': expected 'namespaces' or 'list'",
+                        other
+                    ),
+                ))
+            }
+        };
     Ok(value.to_string())
 }
 
@@ -885,7 +894,9 @@ async fn handle_delete(
     // caller could not tell a write conflict from a missing id, and neither
     // could the log (bead neurostrata-3fi.6.5).
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    state.vector_store.delete(&namespace, &req.id)
+    state
+        .vector_store
+        .delete(&namespace, &req.id)
         .await
         .map_err(|e| {
             eprintln!("delete of {} in {} failed: {}", req.id, req.namespace, e);
@@ -920,7 +931,9 @@ async fn handle_memory_archive(
     )
     .await;
     let status = match &outcome {
-        crate::handlers::archive_memory::ArchiveOutcome::Archived { .. } => axum::http::StatusCode::OK,
+        crate::handlers::archive_memory::ArchiveOutcome::Archived { .. } => {
+            axum::http::StatusCode::OK
+        }
         crate::handlers::archive_memory::ArchiveOutcome::NotFound { .. } => {
             axum::http::StatusCode::NOT_FOUND
         }
@@ -941,8 +954,10 @@ async fn handle_edit(
     // The operator's repair path: an in-place rewrite that keeps the id and
     // keeps no history. Agents get neurostrata_supersede_memory instead, which
     // is additive. Editing stays here, behind a human, because it destroys.
-    let old_namespace = crate::server::resolve_namespace(&state.vector_store, &req.old_namespace).await;
-    let new_namespace = crate::server::resolve_namespace(&state.vector_store, &req.new_namespace).await;
+    let old_namespace =
+        crate::server::resolve_namespace(&state.vector_store, &req.old_namespace).await;
+    let new_namespace =
+        crate::server::resolve_namespace(&state.vector_store, &req.new_namespace).await;
     match crate::server::edit_memory(
         &*state.vector_store,
         &*state.embedder,
@@ -954,7 +969,9 @@ async fn handle_edit(
     )
     .await
     {
-        Ok(crate::server::EditOutcome::Edited) | Ok(crate::server::EditOutcome::NotFound) => Ok("OK"),
+        Ok(crate::server::EditOutcome::Edited) | Ok(crate::server::EditOutcome::NotFound) => {
+            Ok("OK")
+        }
         // The next ingest of that namespace would overwrite the edit.
         Ok(crate::server::EditOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
         Err(e) => {
@@ -976,15 +993,10 @@ async fn handle_set_metadata(
     Json(req): Json<SetMetadataReq>,
 ) -> Result<&'static str, axum::http::StatusCode> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
-    match crate::server::set_metadata(
-        &*state.vector_store,
-        &namespace,
-        &req.id,
-        req.metadata,
-    )
-    .await
+    match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata).await
     {
-        Ok(crate::server::MetadataOutcome::Updated) | Ok(crate::server::MetadataOutcome::NotFound) => Ok("OK"),
+        Ok(crate::server::MetadataOutcome::Updated)
+        | Ok(crate::server::MetadataOutcome::NotFound) => Ok("OK"),
         Ok(crate::server::MetadataOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
         Err(e) => {
             eprintln!("set-metadata of {} in {} failed: {}", req.id, namespace, e);
@@ -1010,7 +1022,9 @@ async fn handle_mcp(
         .await;
         Json(response)
     } else {
-        Json(serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}))
+        Json(
+            serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}),
+        )
     }
 }
 
@@ -1043,10 +1057,11 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
 
     #[cfg(unix)]
     let os_signal = async {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => return std::future::pending::<ShutdownCause>().await,
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return std::future::pending::<ShutdownCause>().await,
+            };
         term.recv().await;
         eprintln!("Received SIGTERM, shutting down.");
         ShutdownCause::Requested
@@ -1097,7 +1112,11 @@ async fn handle_bus_metrics(State(state): State<AppState>) -> impl axum::respons
 
 async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
     // A second caller finds None here; stopping twice is not an error.
-    let sender = state.shutdown.lock().ok().and_then(|mut guard| guard.take());
+    let sender = state
+        .shutdown
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
     match sender {
         Some(tx) => {
             let _ = tx.send(());
@@ -1113,12 +1132,17 @@ async fn handle_validate(
 ) -> Result<Json<crate::guard::ValidateResponse>, (axum::http::StatusCode, String)> {
     // Use sandbox if podman is available
     let use_sandbox = true;
-    
+
     let (verdict, rule_ids) = state
         .guard_validator
-        .validate(&request.action_type, &request.payload, &request.cwd, use_sandbox)
+        .validate(
+            &request.action_type,
+            &request.payload,
+            &request.cwd,
+            use_sandbox,
+        )
         .await;
-    
+
     Ok(Json(crate::guard::ValidateResponse {
         trace_id: request.trace_id,
         verdict,
@@ -1188,7 +1212,11 @@ mod tests {
     fn repeated_failures_back_off_but_never_give_up_for_long() {
         let waits: Vec<u64> = (1..=8).map(|n| checkpoint_backoff(n).as_secs()).collect();
 
-        assert!(waits.windows(2).all(|w| w[1] >= w[0]), "{:?} should not shrink", waits);
+        assert!(
+            waits.windows(2).all(|w| w[1] >= w[0]),
+            "{:?} should not shrink",
+            waits
+        );
         assert!(
             waits.iter().all(|w| *w <= 30),
             "a lull must never be missed by more than half a minute: {:?}",
@@ -1199,17 +1227,25 @@ mod tests {
 
     #[test]
     fn a_closing_console_gets_less_time_than_windows_allows() {
-        assert!(final_checkpoint_budget(ShutdownCause::ConsoleClosing) < std::time::Duration::from_secs(5));
+        assert!(
+            final_checkpoint_budget(ShutdownCause::ConsoleClosing)
+                < std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]
     fn an_explicit_stop_waits_out_a_busy_engine() {
-        assert!(final_checkpoint_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(30));
+        assert!(
+            final_checkpoint_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
     fn only_a_closing_console_stops_without_waiting_for_an_ingest() {
-        assert_eq!(ingest_wait_budget(ShutdownCause::ConsoleClosing), std::time::Duration::ZERO);
+        assert_eq!(
+            ingest_wait_budget(ShutdownCause::ConsoleClosing),
+            std::time::Duration::ZERO
+        );
         assert!(ingest_wait_budget(ShutdownCause::Requested) >= std::time::Duration::from_secs(60));
     }
 
@@ -1251,25 +1287,32 @@ mod tests {
 
     impl RecordingStore {
         fn upserts(&self) -> Vec<(String, String, usize, String)> {
-            self.upserts.lock().expect("recording store poisoned").clone()
+            self.upserts
+                .lock()
+                .expect("recording store poisoned")
+                .clone()
         }
 
         fn holding(namespace: &str, id: &str, memory_type: &str) -> Self {
             let store = RecordingStore::default();
-            store.seeded.lock().expect("recording store poisoned").push((
-                namespace.to_string(),
-                id.to_string(),
-                vec![0.0; 8],
-                MemoryPayload {
-                    content: "a row worth tombstoning".to_string(),
-                    memory_type: memory_type.to_string(),
-                    location: String::new(),
-                    user_id: "test".to_string(),
-                    agent_name: None,
-                    location_lines: String::new(),
-                    metadata: serde_json::json!({ "origin": "seed" }),
-                },
-            ));
+            store
+                .seeded
+                .lock()
+                .expect("recording store poisoned")
+                .push((
+                    namespace.to_string(),
+                    id.to_string(),
+                    vec![0.0; 8],
+                    MemoryPayload {
+                        content: "a row worth tombstoning".to_string(),
+                        memory_type: memory_type.to_string(),
+                        location: String::new(),
+                        user_id: "test".to_string(),
+                        agent_name: None,
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({ "origin": "seed" }),
+                    },
+                ));
             store
         }
     }
@@ -1289,7 +1332,12 @@ mod tests {
             self.upserts
                 .lock()
                 .expect("recording store poisoned")
-                .push((namespace.to_string(), id.to_string(), vector.len(), payload.memory_type));
+                .push((
+                    namespace.to_string(),
+                    id.to_string(),
+                    vector.len(),
+                    payload.memory_type,
+                ));
             Ok(crate::traits::UpsertReport {
                 id: id.to_string(),
                 deferred_edges: Vec::new(),
@@ -1394,7 +1442,10 @@ mod tests {
 
         // Step 1's subject: exactly the three v1 subscribers are registered.
         let m = bus.metrics();
-        assert_eq!(m.subscribers, 3, "the daemon bus must carry the three v1 subscribers: {m:?}");
+        assert_eq!(
+            m.subscribers, 3,
+            "the daemon bus must carry the three v1 subscribers: {m:?}"
+        );
 
         bus.emit(
             ThalamicPulse::Created {
@@ -1421,7 +1472,11 @@ mod tests {
         // pulses emitted.
         let deadline = Instant::now() + Duration::from_secs(5);
         while bus.metrics().dispatcher_handled < 2 {
-            assert!(Instant::now() < deadline, "the dispatcher stalled: {:?}", bus.metrics());
+            assert!(
+                Instant::now() < deadline,
+                "the dispatcher stalled: {:?}",
+                bus.metrics()
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -1482,14 +1537,20 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fn echoed(root: &std::path::Path) -> Option<String> {
             std::fs::read_to_string(
-                root.join(".NeuroStrata").join("sessions").join("current.md"),
+                root.join(".NeuroStrata")
+                    .join("sessions")
+                    .join("current.md"),
             )
             .ok()
         }
         async fn dispatched(bus: &Arc<ThalamicBus>, pulses: u64) {
             let deadline = Instant::now() + Duration::from_secs(5);
             while bus.metrics().dispatcher_handled < pulses {
-                assert!(Instant::now() < deadline, "the dispatcher stalled: {:?}", bus.metrics());
+                assert!(
+                    Instant::now() < deadline,
+                    "the dispatcher stalled: {:?}",
+                    bus.metrics()
+                );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -1510,7 +1571,10 @@ mod tests {
         dispatched(&bus, 1).await;
 
         let text_a = echoed(&root_a).expect("the pointer lands under the configured root");
-        assert!(text_a.contains("c2-a"), "the echo carries the pulse id: {text_a}");
+        assert!(
+            text_a.contains("c2-a"),
+            "the echo carries the pulse id: {text_a}"
+        );
         if let Some(cwd_text) = echoed(&std::env::current_dir().unwrap()) {
             assert!(
                 !cwd_text.contains("c2-a"),
@@ -1535,7 +1599,10 @@ mod tests {
         dispatched(&bus, 1).await;
 
         let text_b = echoed(&root_b).expect("re-pointing the env var re-anchors the echo");
-        assert!(text_b.contains("c2-b"), "the echo carries the pulse id: {text_b}");
+        assert!(
+            text_b.contains("c2-b"),
+            "the echo carries the pulse id: {text_b}"
+        );
         assert!(
             !echoed(&root_a).unwrap().contains("c2-b"),
             "the old root never sees pulses emitted after it stopped being configured"
@@ -1614,7 +1681,11 @@ mod tests {
         }
         assert!(serving, "daemon never started serving on {addr}");
 
-        let response = client.post(format!("{base}/bus/metrics")).send().await.unwrap();
+        let response = client
+            .post(format!("{base}/bus/metrics"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = response.text().await.unwrap();
         assert!(
@@ -1624,7 +1695,11 @@ mod tests {
 
         // Stop it over the same path the CLI uses, and require the shutdown
         // to finish cleanly rather than leaving the task running to test end.
-        client.post(format!("{base}/shutdown")).send().await.unwrap();
+        client
+            .post(format!("{base}/shutdown"))
+            .send()
+            .await
+            .unwrap();
         daemon.await.unwrap().unwrap();
     }
 
@@ -1634,7 +1709,11 @@ mod tests {
     /// are the ones production registers.
     async fn spawn_test_daemon_with(
         store: Arc<RecordingStore>,
-    ) -> (String, reqwest::Client, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    ) -> (
+        String,
+        reqwest::Client,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap().to_string();
         drop(probe);
@@ -1668,7 +1747,11 @@ mod tests {
         (base, client, daemon)
     }
 
-    async fn spawn_test_daemon() -> (String, reqwest::Client, tokio::task::JoinHandle<anyhow::Result<()>>) {
+    async fn spawn_test_daemon() -> (
+        String,
+        reqwest::Client,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
         spawn_test_daemon_with(Arc::new(RecordingStore::default())).await
     }
 
@@ -1718,19 +1801,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-                            archived.status(),
-                            axum::http::StatusCode::OK,
-                            "the one status the route may answer for a row it really tombstoned"
-                        );
+            archived.status(),
+            axum::http::StatusCode::OK,
+            "the one status the route may answer for a row it really tombstoned"
+        );
         let body = archived.text().await.unwrap();
         assert!(
             body.contains("Archived m1 in namespace bus-test"),
             "the route must answer with the handler's success sentence, got: {body}"
         );
         assert!(
-            store.upserts().iter().any(|(ns, id, _, kind)| {
-                ns == "bus-test" && id == "m1" && kind == "fact"
-            }),
+            store
+                .upserts()
+                .iter()
+                .any(|(ns, id, _, kind)| { ns == "bus-test" && id == "m1" && kind == "fact" }),
             "the tombstone must be written back over the row itself: {:?}",
             store.upserts()
         );
@@ -1738,7 +1822,14 @@ mod tests {
         // The pulse is the half that only the handler does: the route has to
         // have gone through it, or the daemon's bus would still be at zero.
         let metrics: serde_json::Value = serde_json::from_str(
-            &client.post(format!("{base}/bus/metrics")).send().await.unwrap().text().await.unwrap(),
+            &client
+                .post(format!("{base}/bus/metrics"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
         )
         .expect("bus metrics body is JSON");
         assert!(
@@ -1746,7 +1837,11 @@ mod tests {
             "the Archived pulse must have been emitted by the handler the route calls: {metrics}"
         );
 
-        client.post(format!("{base}/shutdown")).send().await.unwrap();
+        client
+            .post(format!("{base}/shutdown"))
+            .send()
+            .await
+            .unwrap();
         daemon.await.unwrap().unwrap();
     }
 
@@ -1759,7 +1854,11 @@ mod tests {
     async fn the_bus_metrics_route_answers_in_the_shared_handlers_shape() {
         let (base, client, daemon) = spawn_test_daemon().await;
 
-        let response = client.post(format!("{base}/bus/metrics")).send().await.unwrap();
+        let response = client
+            .post(format!("{base}/bus/metrics"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         assert_eq!(
             response
@@ -1794,7 +1893,11 @@ mod tests {
             "and the route still reads the daemon's own wired bus: {body}"
         );
 
-        client.post(format!("{base}/shutdown")).send().await.unwrap();
+        client
+            .post(format!("{base}/shutdown"))
+            .send()
+            .await
+            .unwrap();
         daemon.await.unwrap().unwrap();
     }
 

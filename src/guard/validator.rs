@@ -3,9 +3,9 @@
 //! Combines behavioral rule matching with optional sandbox execution
 //! to provide comprehensive action validation.
 
-use crate::guard::models::{ValidateVerdict, BehavioralRule};
-use crate::guard::semantic::SemanticEvaluator;
+use crate::guard::models::{BehavioralRule, ValidateVerdict};
 use crate::guard::sandbox::SandboxEvaluator;
+use crate::guard::semantic::SemanticEvaluator;
 use crate::traits::{Embedder, VectorStore};
 use std::sync::Arc;
 use tracing::info;
@@ -17,14 +17,10 @@ pub struct GuardValidator {
 }
 
 impl GuardValidator {
-    pub fn new(
-        store: Arc<dyn VectorStore>,
-        embedder: Arc<dyn Embedder>,
-        namespace: &str,
-    ) -> Self {
+    pub fn new(store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>, namespace: &str) -> Self {
         let semantic = SemanticEvaluator::new(store, embedder, namespace);
         let sandbox = SandboxEvaluator::new();
-        
+
         Self {
             semantic,
             sandbox: tokio::task::block_in_place(|| {
@@ -51,7 +47,10 @@ impl GuardValidator {
         cwd: &str,
         use_sandbox: bool,
     ) -> (ValidateVerdict, Vec<String>) {
-        info!("Validating action: {} in namespace: {}", action_type, self.namespace);
+        info!(
+            "Validating action: {} in namespace: {}",
+            action_type, self.namespace
+        );
 
         // Step 1: Semantic evaluation - find matching behavioral rules
         let matching_rules = match self.semantic.evaluate(payload).await {
@@ -94,9 +93,9 @@ impl GuardValidator {
         // Step 3: Optional sandbox execution
         if use_sandbox {
             info!("Executing sandbox evaluation for action: {}", action_type);
-            
+
             let sandbox_result = self.sandbox.evaluate(action_type, payload, cwd).await;
-            
+
             match sandbox_result {
                 Ok(verdict) => {
                     // Extract constraints from rules for context
@@ -169,9 +168,18 @@ mod tests {
     #[tokio::test]
     async fn test_matches_trigger() {
         // Test pattern matching
-        assert!(GuardValidator::matches_trigger("bash", "bash", "echo hello"));
-        assert!(GuardValidator::matches_trigger("rm -rf", "bash", "rm -rf /"));
-        assert!(!GuardValidator::matches_trigger("bash", "write_file", "content"));
+        assert!(GuardValidator::matches_trigger(
+            "bash",
+            "bash",
+            "echo hello"
+        ));
+        assert!(GuardValidator::matches_trigger(
+            "rm -rf", "bash", "rm -rf /"
+        ));
+        assert!(!GuardValidator::matches_trigger(
+            "bash",
+            "write_file",
+            "content"
+        ));
     }
-
 }

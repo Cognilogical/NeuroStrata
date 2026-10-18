@@ -1,10 +1,10 @@
 //! Semantic evaluator using LadyBugDB for vector search
-//! 
+//!
 //! Validates actions against behavioral rules stored as memories in the 'guard' namespace.
 //! Each rule is embedded and stored with memory_type="guard_rule".
 
 use crate::guard::models::BehavioralRule;
-use crate::traits::{Embedder, VectorStore, MemoryPayload};
+use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
@@ -15,11 +15,7 @@ pub struct SemanticEvaluator {
 }
 
 impl SemanticEvaluator {
-    pub fn new(
-        store: Arc<dyn VectorStore>,
-        embedder: Arc<dyn Embedder>,
-        namespace: &str,
-    ) -> Self {
+    pub fn new(store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>, namespace: &str) -> Self {
         Self {
             store,
             embedder,
@@ -58,16 +54,20 @@ impl SemanticEvaluator {
     }
 
     /// Find matching rules for a given payload using vector similarity
-    pub async fn match_constraints(&self, payload: &str, limit: usize) -> Result<Vec<BehavioralRule>> {
+    pub async fn match_constraints(
+        &self,
+        payload: &str,
+        limit: usize,
+    ) -> Result<Vec<BehavioralRule>> {
         let vector = self.embedder.embed(payload).await?;
-        
+
         let search_results = self.store.search(&self.namespace, vector, limit).await?;
 
         let rules = search_results
             .into_iter()
             .filter_map(|result| {
                 let metadata = &result.payload.metadata;
-                
+
                 // Extract rule fields from metadata
                 let id = metadata.get("id")?.as_str()?.to_string();
                 let version = metadata.get("version")?.as_u64()? as u32;
@@ -109,4 +109,3 @@ mod tests {
         // Requires mock VectorStore and Embedder
     }
 }
-

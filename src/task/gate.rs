@@ -440,11 +440,7 @@ pub fn self_test_with(expected_kinds: &[&'static str]) -> SelfTestReport {
 /// The canonical self-test invocation: the three blocking rule breaks the
 /// wiring panel prescribes for the gate to recognize itself as a gate.
 pub fn self_test() -> SelfTestReport {
-    self_test_with(&[
-        "done_without_extraction",
-        "in_progress",
-        "p0_open_over_24h",
-    ])
+    self_test_with(&["done_without_extraction", "in_progress", "p0_open_over_24h"])
 }
 
 /// Runs the engine against a store: one `list`, no embedder, milliseconds.
@@ -479,16 +475,36 @@ mod tests {
     }
 
     fn task(id: &str, task_meta: Value) -> SearchResult {
-        row(id, "task", &format!("work for {}", id), json!({ "task": task_meta }))
+        row(
+            id,
+            "task",
+            &format!("work for {}", id),
+            json!({ "task": task_meta }),
+        )
     }
 
     /// FEATURE-4: a rule is an assertion until it says where it came from.
     #[test]
     fn a_rule_without_provenance_fails_the_gate() {
         let rows = vec![
-            row("rule-sourced", "rule", "Use podman", json!({ "source": "owner 2026-10-08" })),
-            row("rule-unsourced", "rule", "Use docker-free images", json!({})),
-            row("rule-blank", "rule", "Blank source", json!({ "source": "  " })),
+            row(
+                "rule-sourced",
+                "rule",
+                "Use podman",
+                json!({ "source": "owner 2026-10-08" }),
+            ),
+            row(
+                "rule-unsourced",
+                "rule",
+                "Use docker-free images",
+                json!({}),
+            ),
+            row(
+                "rule-blank",
+                "rule",
+                "Blank source",
+                json!({ "source": "  " }),
+            ),
         ];
         let report = evaluate(&rows, 0);
         let hits: Vec<&str> = report
@@ -530,13 +546,12 @@ mod tests {
             ),
         ];
         let report = evaluate(&rows, 0);
-        let kinds: Vec<&str> = report
-            .violations
-            .iter()
-            .map(|v| v.kind)
-            .collect();
+        let kinds: Vec<&str> = report.violations.iter().map(|v| v.kind).collect();
         assert_eq!(
-            kinds.iter().filter(|k| **k == "rule_overclaims_enforcement").count(),
+            kinds
+                .iter()
+                .filter(|k| **k == "rule_overclaims_enforcement")
+                .count(),
             2,
             "rule-1 (null guard) and rule-3 (dangling guard); rule-2 and rule-4 are honest"
         );
@@ -573,10 +588,24 @@ mod tests {
     #[test]
     fn a_clean_namespace_passes() {
         let memories = vec![
-            task("ns-aaaa", json!({ "status": "open", "priority": 0, "created_at": iso(DAY - HOUR) })),
-            task("ns-bbbb", json!({ "status": "blocked", "created_at": iso(DAY * 3) })),
-            task("ns-cccc", json!({ "status": "done", "created_at": iso(DAY * 3) })),
-            row("mem-1", "fact", "the lesson", json!({ "extracted_from": ["ns-cccc"] })),
+            task(
+                "ns-aaaa",
+                json!({ "status": "open", "priority": 0, "created_at": iso(DAY - HOUR) }),
+            ),
+            task(
+                "ns-bbbb",
+                json!({ "status": "blocked", "created_at": iso(DAY * 3) }),
+            ),
+            task(
+                "ns-cccc",
+                json!({ "status": "done", "created_at": iso(DAY * 3) }),
+            ),
+            row(
+                "mem-1",
+                "fact",
+                "the lesson",
+                json!({ "extracted_from": ["ns-cccc"] }),
+            ),
         ];
         let report = evaluate(&memories, NOW);
         assert!(report.ok(), "{:?}", report.violations);
@@ -589,7 +618,10 @@ mod tests {
     #[test]
     fn done_without_an_extraction_edge_blocks() {
         let memories = vec![
-            task("ns-aaaa", json!({ "status": "done", "created_at": iso(DAY) })),
+            task(
+                "ns-aaaa",
+                json!({ "status": "done", "created_at": iso(DAY) }),
+            ),
             row("mem-1", "fact", "the lesson", json!({})),
         ];
         let report = evaluate(&memories, NOW);
@@ -602,8 +634,16 @@ mod tests {
     #[test]
     fn an_inbound_extraction_edge_clears_the_done_rule() {
         let memories = vec![
-            task("ns-aaaa", json!({ "status": "done", "created_at": iso(DAY) })),
-            row("mem-1", "fact", "the lesson", json!({ "extracted_from": ["ns-aaaa"] })),
+            task(
+                "ns-aaaa",
+                json!({ "status": "done", "created_at": iso(DAY) }),
+            ),
+            row(
+                "mem-1",
+                "fact",
+                "the lesson",
+                json!({ "extracted_from": ["ns-aaaa"] }),
+            ),
         ];
         let report = evaluate(&memories, NOW);
         assert!(report.ok(), "{:?}", report.violations);
@@ -624,13 +664,22 @@ mod tests {
 
     #[test]
     fn a_p0_open_past_24h_blocks_but_fresh_p0_and_old_p1_do_not() {
-        let fresh_p0 = task("ns-p0f", json!({ "status": "open", "priority": 0, "created_at": iso(HOUR) }));
-        let old_p1 = task("ns-p1o", json!({ "status": "open", "priority": 1, "created_at": iso(DAY * 2) }));
+        let fresh_p0 = task(
+            "ns-p0f",
+            json!({ "status": "open", "priority": 0, "created_at": iso(HOUR) }),
+        );
+        let old_p1 = task(
+            "ns-p1o",
+            json!({ "status": "open", "priority": 1, "created_at": iso(DAY * 2) }),
+        );
 
         let report = evaluate(&[fresh_p0.clone(), old_p1.clone()], NOW);
         assert!(report.ok(), "neither should block: {:?}", report.violations);
 
-        let old_p0 = task("ns-p0o", json!({ "status": "open", "priority": 0, "created_at": iso(DAY + HOUR) }));
+        let old_p0 = task(
+            "ns-p0o",
+            json!({ "status": "open", "priority": 0, "created_at": iso(DAY + HOUR) }),
+        );
         let report = evaluate(&[fresh_p0, old_p1, old_p0], NOW);
         assert!(!report.ok());
         assert_eq!(report.violations.len(), 1);
@@ -642,7 +691,11 @@ mod tests {
     fn a_p0_open_past_24h_without_timestamps_does_not_block() {
         let no_clock = task("ns-p0x", json!({ "status": "open", "priority": 0 }));
         let report = evaluate(&[no_clock], NOW);
-        assert!(report.ok(), "absence of data is not a violation: {:?}", report.violations);
+        assert!(
+            report.ok(),
+            "absence of data is not a violation: {:?}",
+            report.violations
+        );
     }
 
     #[test]
@@ -652,12 +705,19 @@ mod tests {
             json!({ "status": "in_progress", "assignee": "agent-a", "updated_at": iso(DAY) }),
         )];
         let report = evaluate(&memories, NOW);
-        assert_eq!(report.violations.len(), 1, "in_progress itself still blocks");
+        assert_eq!(
+            report.violations.len(),
+            1,
+            "in_progress itself still blocks"
+        );
         assert_eq!(report.violations[0].kind, "in_progress");
         assert_eq!(report.stale.len(), 1, "and the staleness is reported apart");
         assert_eq!(report.stale[0].kind, "stale_in_progress");
         assert!(
-            !report.violations.iter().any(|v| v.kind == "stale_in_progress"),
+            !report
+                .violations
+                .iter()
+                .any(|v| v.kind == "stale_in_progress"),
             "stale is never a blocking kind"
         );
     }
@@ -722,9 +782,7 @@ mod tests {
         let report = self_test_with(&["done_without_extraction", "in_progress"]);
         assert!(!report.passed);
         assert!(report.missing.is_empty(), "every expected kind was found");
-        assert!(report
-            .extra
-            .contains(&"p0_open_over_24h".to_string()));
+        assert!(report.extra.contains(&"p0_open_over_24h".to_string()));
     }
 
     #[test]
@@ -745,7 +803,10 @@ mod tests {
     #[test]
     fn the_json_bodies_carry_the_shape_the_surfaces_declare() {
         let memories = vec![
-            task("ns-aaaa", json!({ "status": "in_progress", "assignee": "a" })),
+            task(
+                "ns-aaaa",
+                json!({ "status": "in_progress", "assignee": "a" }),
+            ),
             task("ns-bbbb", json!({ "status": "done" })),
             task("ns-cccc", json!({ "status": "open", "priority": 2 })),
         ];
@@ -754,7 +815,10 @@ mod tests {
         let gate = report.gate_json();
         assert_eq!(gate["ok"], json!(false));
         assert!(gate["violations"].as_array().unwrap().len() >= 2);
-        assert!(gate.get("stale").is_none(), "the gate body carries violations only");
+        assert!(
+            gate.get("stale").is_none(),
+            "the gate body carries violations only"
+        );
 
         let validate = report.validate_json();
         assert!(validate.get("violations").is_some());
@@ -772,7 +836,12 @@ mod tests {
         // A provenance-bearing rule (rules carry source since FEATURE-4);
         // the point of this test is that it still is not a task.
         let report = evaluate(
-            &[row("mem-1", "rule", "always use podman", json!({ "source": "owner 2026-10-08" }))],
+            &[row(
+                "mem-1",
+                "rule",
+                "always use podman",
+                json!({ "source": "owner 2026-10-08" }),
+            )],
             NOW,
         );
         assert!(report.ok());
