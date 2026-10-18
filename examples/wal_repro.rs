@@ -42,7 +42,9 @@ fn embedding_literal(seed: usize) -> String {
 /// the write and the read side, to separate "the record bytes are wrong" from
 /// "the checksum framing rejects them".
 fn checksums_enabled() -> bool {
-    std::env::var("LBUG_TEST_CHECKSUMS").map(|v| v != "0").unwrap_or(true)
+    std::env::var("LBUG_TEST_CHECKSUMS")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 fn write(dir: &str) -> anyhow::Result<()> {
@@ -69,7 +71,11 @@ fn write(dir: &str) -> anyhow::Result<()> {
     println!("wrote {} rows, {} visible before abort", ROWS, visible);
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        println!("  {:?} {} bytes", entry.file_name(), entry.metadata()?.len());
+        println!(
+            "  {:?} {} bytes",
+            entry.file_name(),
+            entry.metadata()?.len()
+        );
     }
 
     // No clean close, no checkpoint: exactly what a killed process leaves behind.
@@ -106,7 +112,11 @@ fn read(dir: &str, strict: bool) -> anyhow::Result<()> {
     }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        println!("  {:?} {} bytes", entry.file_name(), entry.metadata()?.len());
+        println!(
+            "  {:?} {} bytes",
+            entry.file_name(),
+            entry.metadata()?.len()
+        );
     }
     Ok(())
 }

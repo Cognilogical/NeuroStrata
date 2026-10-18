@@ -12,7 +12,7 @@ pub mod wiring;
 
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
-use machine::{apply, annotate, Ctx, Status, Task};
+use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -206,7 +206,11 @@ fn is_ready(payload: &MemoryPayload, statuses: &HashMap<String, Status>) -> bool
 /// The base record every tool returns alongside its own fields.
 pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
     let task = payload.metadata.get("task");
-    let field = |key: &str| task.and_then(|t| t.get(key)).cloned().unwrap_or(Value::Null);
+    let field = |key: &str| {
+        task.and_then(|t| t.get(key))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let status = task
         .and_then(|t| t.get("status"))
         .and_then(|s| s.as_str())
@@ -414,12 +418,12 @@ pub async fn handle_task_create(
     };
     let priority = match args.get("priority") {
         None => 2,
-        Some(Value::Number(n))
-            if n.as_i64().map(|p| (0..=4).contains(&p)).unwrap_or(false) =>
-        {
+        Some(Value::Number(n)) if n.as_i64().map(|p| (0..=4).contains(&p)).unwrap_or(false) => {
             n.as_i64().unwrap_or(2)
         }
-        Some(_) => return "ERROR: 'priority' must be an integer from 0 to 4 (0 is highest).".to_string(),
+        Some(_) => {
+            return "ERROR: 'priority' must be an integer from 0 to 4 (0 is highest).".to_string()
+        }
     };
     let labels = match string_list(&args, "labels") {
         Ok(v) => v,
@@ -507,9 +511,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         return e;
     }
 
-    let assignee = arg_str(&args, "assignee")
-        .unwrap_or("unknown")
-        .to_string();
+    let assignee = arg_str(&args, "assignee").unwrap_or("unknown").to_string();
     let session = arg_str(&args, "session_id").unwrap_or("").to_string();
 
     let (mut task, vector) = match load_task(&store, &namespace, &id).await {
@@ -589,10 +591,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 obj.remove("assignee");
                 obj.remove("session_id");
             }
-            note = format!(
-                "claim (took over a stale claim by {})",
-                holder_assignee
-            );
+            note = format!("claim (took over a stale claim by {})", holder_assignee);
         }
         Status::Open => {}
         Status::Blocked | Status::Done => {
@@ -681,8 +680,9 @@ pub async fn handle_task_update(
     };
     let priority = match args.get("priority") {
         None => None,
-        Some(Value::Number(n))
-            if n.as_i64().map(|p| (0..=4).contains(&p)).unwrap_or(false) => n.as_i64(),
+        Some(Value::Number(n)) if n.as_i64().map(|p| (0..=4).contains(&p)).unwrap_or(false) => {
+            n.as_i64()
+        }
         Some(_) => {
             return "ERROR: 'priority' must be an integer from 0 to 4 (0 is highest).".to_string()
         }
@@ -718,9 +718,10 @@ pub async fn handle_task_update(
     // A rename is history, not a transition: without a caller's note the
     // history entry says what the title became, so Working Memory keeps the
     // old wording recoverable after a vocabulary scrub.
-    let rename_note = new_title.as_ref().filter(|t| **t != task.payload.content).map(|t| {
-        format!("renamed: '{}' -> '{}'", task.payload.content, t)
-    });
+    let rename_note = new_title
+        .as_ref()
+        .filter(|t| **t != task.payload.content)
+        .map(|t| format!("renamed: '{}' -> '{}'", task.payload.content, t));
 
     let ctx = Ctx {
         reason: note.clone().unwrap_or_default(),
@@ -849,7 +850,10 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         },
     };
     let assignee_filter = arg_str(&args, "assignee").map(|s| s.to_string());
-    let include_done = args.get("include_done").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_done = args
+        .get("include_done")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let ready_only = args.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let memories = match store.list(&namespace, None).await {
@@ -882,13 +886,15 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         });
     }
     if ready_only {
-        tasks.retain(|m| {
-            gate::task_status(m) == Status::Open && is_ready(&m.payload, &statuses)
-        });
+        tasks.retain(|m| gate::task_status(m) == Status::Open && is_ready(&m.payload, &statuses));
     }
 
     // Highest priority first; ties keep the list deterministic by id.
-    tasks.sort_by(|a, b| priority_of(&a.payload).cmp(&priority_of(&b.payload)).then_with(|| a.id.cmp(&b.id)));
+    tasks.sort_by(|a, b| {
+        priority_of(&a.payload)
+            .cmp(&priority_of(&b.payload))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     let summaries: Vec<Value> = tasks
         .iter()
@@ -980,19 +986,16 @@ pub async fn handle_task_complete(
                     id
                 ));
             }
-            let (existing_vector, mut payload) =
-                match store.get(&namespace, link_id).await {
-                    Ok(Some(found)) => found,
-                    Ok(None) => {
-                        return Err(format!(
-                            "ERROR: no memory with id '{}' in namespace '{}' to link.",
-                            link_id, namespace
-                        ))
-                    }
-                    Err(e) => {
-                        return Err(format!("ERROR: could not read memory '{}': {}", link_id, e))
-                    }
-                };
+            let (existing_vector, mut payload) = match store.get(&namespace, link_id).await {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    return Err(format!(
+                        "ERROR: no memory with id '{}' in namespace '{}' to link.",
+                        link_id, namespace
+                    ))
+                }
+                Err(e) => return Err(format!("ERROR: could not read memory '{}': {}", link_id, e)),
+            };
             if !payload.metadata.is_object() {
                 return Err(format!(
                     "ERROR: memory '{}' has legacy-shaped metadata (not a JSON object) and cannot be linked. Re-add it with object metadata first.",
@@ -1022,7 +1025,10 @@ pub async fn handle_task_complete(
                 .upsert(&namespace, link_id, existing_vector, payload)
                 .await
                 .map_err(|e| {
-                    format!("Failed to link memory '{}' to task '{}': {}", link_id, id, e)
+                    format!(
+                        "Failed to link memory '{}' to task '{}': {}",
+                        link_id, id, e
+                    )
                 })?;
             // Verified after the write: the rule is an edge *after the call*.
             memories = list_now().await?;
@@ -1087,7 +1093,9 @@ pub async fn handle_task_complete(
             if !meta
                 .get("extracted_from")
                 .and_then(|v| v.as_array())
-                .map_or(false, |arr| arr.iter().any(|t| t.as_str() == Some(id.as_str())))
+                .map_or(false, |arr| {
+                    arr.iter().any(|t| t.as_str() == Some(id.as_str()))
+                })
             {
                 match meta.get_mut("extracted_from") {
                     None => meta["extracted_from"] = json!([id.as_str()]),
@@ -1378,7 +1386,9 @@ pub async fn handle_bootstrap(
 
     let mut instructions: Vec<Value> = Vec::new();
     let mut step = 1;
-    instructions.push(json!({ "step": step, "kind": "action", "action": "write_file", "path": "AGENTS.md" }));
+    instructions.push(
+        json!({ "step": step, "kind": "action", "action": "write_file", "path": "AGENTS.md" }),
+    );
     step += 1;
     if !hook_installed {
         instructions.push(json!({ "step": step, "kind": "action", "action": "run", "cmd": "neurostrata-mcp hooks install" }));
@@ -1411,7 +1421,18 @@ pub async fn handle_bootstrap(
             "description".to_string(),
             json!("No git detected. Find the ONE step every unit of work must pass to leave this project (CMS publish, render submission, publish script, review approval), wire `neurostrata-mcp task gate <ns> --strict` into it, and record the choice with neurostrata_add_memory (memory_type: rule)."),
         );
-        match store_new_task(&store, &emb, &namespace, gp_title, "unknown", Some("neurostrata-bootstrap"), gp_meta, Map::new()).await {
+        match store_new_task(
+            &store,
+            &emb,
+            &namespace,
+            gp_title,
+            "unknown",
+            Some("neurostrata-bootstrap"),
+            gp_meta,
+            Map::new(),
+        )
+        .await
+        {
             Ok((id, _)) => tasks_created.push(json!({ "id": id, "title": gp_title })),
             Err(e) => return e,
         }
@@ -1641,9 +1662,7 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
             continue; // the default instance only exists where git exists
         }
         let resolved = match w.runs_in {
-            wiring::RunsIn::Core => {
-                Some("neurostrata core (tool, error path, lock)".to_string())
-            }
+            wiring::RunsIn::Core => Some("neurostrata core (tool, error path, lock)".to_string()),
             wiring::RunsIn::GitPrePush => gate_point.clone(),
             wiring::RunsIn::ProjectPipeline => {
                 pipeline_ids.push(w.id);
@@ -1794,15 +1813,21 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
 
     // The git config, reached directly (normal checkout) or through .git's
     // gitdir pointer (worktree), where remotes live in the main config.
-    let config = std::fs::read_to_string(root.join(".git").join("config")).ok().or_else(|| {
-        let gitfile = std::fs::read_to_string(root.join(".git")).ok()?;
-        let gitdir_line = gitfile.lines().find_map(|l| l.strip_prefix("gitdir:"))?;
-        let gitdir = std::path::PathBuf::from(gitdir_line.trim());
-        let gitdir = if gitdir.is_absolute() { gitdir } else { root.join(gitdir) };
-        // <main>/.git/worktrees/<name> -> <main>/.git/config
-        let base = gitdir.parent()?.parent()?;
-        std::fs::read_to_string(base.join("config")).ok()
-    });
+    let config = std::fs::read_to_string(root.join(".git").join("config"))
+        .ok()
+        .or_else(|| {
+            let gitfile = std::fs::read_to_string(root.join(".git")).ok()?;
+            let gitdir_line = gitfile.lines().find_map(|l| l.strip_prefix("gitdir:"))?;
+            let gitdir = std::path::PathBuf::from(gitdir_line.trim());
+            let gitdir = if gitdir.is_absolute() {
+                gitdir
+            } else {
+                root.join(gitdir)
+            };
+            // <main>/.git/worktrees/<name> -> <main>/.git/config
+            let base = gitdir.parent()?.parent()?;
+            std::fs::read_to_string(base.join("config")).ok()
+        });
     if let Some(config) = config {
         let mut current_remote: Option<String> = None;
         let mut remotes: Vec<(String, String)> = Vec::new();
@@ -1850,7 +1875,8 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
 
     // Weigh the tree, not the manifests (guinea-pig BUG-4). The `ignore`
     // walker respects .gitignore, so vendored and generated trees stay out.
-    let mut counts: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
     for entry in ignore::WalkBuilder::new(root)
         .hidden(true)
         .max_depth(Some(6))
@@ -2059,7 +2085,14 @@ async fn new_setup_task(
         task_meta.insert("description".to_string(), json!(d));
     }
     store_new_task(
-        store, emb, namespace, title, "unknown", None, task_meta, Map::new(),
+        store,
+        emb,
+        namespace,
+        title,
+        "unknown",
+        None,
+        task_meta,
+        Map::new(),
     )
     .await
 }
@@ -2108,7 +2141,8 @@ pub async fn handle_task_setup(
         "neurostrata-mcp hooks install"
     };
     if scan.legacy_hook || !hook_installed {
-        instructions.push(json!({ "step": step, "kind": "action", "action": "run", "cmd": hook_cmd }));
+        instructions
+            .push(json!({ "step": step, "kind": "action", "action": "run", "cmd": hook_cmd }));
         step += 1;
     }
 
@@ -2431,10 +2465,22 @@ pub async fn import_beads(
             labels,
             deps,
             closed: value.get("status").and_then(|v| v.as_str()) == Some("closed"),
-            close_reason: value.get("close_reason").and_then(|v| v.as_str()).map(String::from),
-            created_at: value.get("created_at").and_then(|v| v.as_str()).map(String::from),
-            updated_at: value.get("updated_at").and_then(|v| v.as_str()).map(String::from),
-            created_by: value.get("created_by").and_then(|v| v.as_str()).map(String::from),
+            close_reason: value
+                .get("close_reason")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            created_at: value
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            updated_at: value
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            created_by: value
+                .get("created_by")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         });
     }
 
@@ -2634,8 +2680,9 @@ mod tests {
     /// a schema-less store is an error, not an empty result.
     async fn temp_store() -> Arc<dyn VectorStore> {
         let dir = std::env::temp_dir().join(format!("ns-task-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
         store.init("global").await.expect("create the schema");
         store
     }
@@ -2679,19 +2726,27 @@ mod tests {
     ) -> String {
         let args = json!({ "namespace": namespace, "title": title, "priority": priority });
         let reply = handle_task_create(args, emb(), store.clone()).await;
-        let parsed: Value =
-            serde_json::from_str(&reply).unwrap_or_else(|e| panic!("create failed: {} -- {}", reply, e));
+        let parsed: Value = serde_json::from_str(&reply)
+            .unwrap_or_else(|e| panic!("create failed: {} -- {}", reply, e));
         parsed["id"].as_str().expect("id").to_string()
     }
 
     async fn status_of(store: &Arc<dyn VectorStore>, namespace: &str, id: &str) -> Status {
-        let (_, payload) = store.get(namespace, id).await.unwrap().expect("task exists");
-        Task { id: id.to_string(), payload }.status()
+        let (_, payload) = store
+            .get(namespace, id)
+            .await
+            .unwrap()
+            .expect("task exists");
+        Task {
+            id: id.to_string(),
+            payload,
+        }
+        .status()
     }
 
     fn reply_title(reply: &str) -> String {
-        let parsed: Value =
-            serde_json::from_str(reply).unwrap_or_else(|e| panic!("json reply: {} -- {}", reply, e));
+        let parsed: Value = serde_json::from_str(reply)
+            .unwrap_or_else(|e| panic!("json reply: {} -- {}", reply, e));
         parsed["task"]["title"].as_str().expect("title").to_string()
     }
 
@@ -2754,14 +2809,31 @@ mod tests {
         assert!(text.contains("defense-in-depth"), "{}", text);
         assert!(text.contains("needs nothing beyond the hook"), "{}", text);
         // the regression itself: CI is no longer the thing to wire into
-        assert!(!text.contains("into your CI"), "CI is not the default: {}", text);
+        assert!(
+            !text.contains("into your CI"),
+            "CI is not the default: {}",
+            text
+        );
         // and the agent is handed a runnable hook, not a suggestion
-        let files = wire_instruction["files"].as_array().expect("scaffolded files");
+        let files = wire_instruction["files"]
+            .as_array()
+            .expect("scaffolded files");
         let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
-        assert_eq!(paths, vec!["scripts/hooks/pre-push", "scripts/install-hooks.sh"]);
+        assert_eq!(
+            paths,
+            vec!["scripts/hooks/pre-push", "scripts/install-hooks.sh"]
+        );
         let hook = files[0]["content"].as_str().unwrap();
-        assert!(hook.contains("task gate") && hook.contains("--strict"), "{}", hook);
-        assert!(hook.contains("PROJECT_GATES"), "the hook is the extension point: {}", hook);
+        assert!(
+            hook.contains("task gate") && hook.contains("--strict"),
+            "{}",
+            hook
+        );
+        assert!(
+            hook.contains("PROJECT_GATES"),
+            "the hook is the extension point: {}",
+            hook
+        );
         // vendor-neutral: no CI vendor is named in the runnable files
         assert!(!hook.contains("github"), "{}", hook);
         assert!(!files[1]["content"].as_str().unwrap().contains("github"));
@@ -2781,11 +2853,14 @@ mod tests {
         assert_eq!(verified["hook_installed"], json!(false));
         // not covered, and not quietly reported as covered
         assert_eq!(wiring_block["coverage"]["git-pre-push"], json!([]));
-        assert!(wiring_block["coverage"]["uncovered"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|u| u == "task-gate"), "an unwired pre-push gate is uncovered");
+        assert!(
+            wiring_block["coverage"]["uncovered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|u| u == "task-gate"),
+            "an unwired pre-push gate is uncovered"
+        );
         // the gate is still advertised at all (git exists)
         assert!(wiring_block["automatic"]
             .as_array()
@@ -2806,12 +2881,18 @@ mod tests {
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
         // install the scaffold exactly as the installer would
-        std::fs::write(root.join(".git").join("hooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK)
-            .unwrap();
+        std::fs::write(
+            root.join(".git").join("hooks").join("pre-push"),
+            SCAFFOLDED_PRE_PUSH_HOOK,
+        )
+        .unwrap();
 
         let (wiring_block, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
-        assert_eq!(wiring_block["coverage"]["git-pre-push"], json!(["task-gate"]));
+        assert_eq!(
+            wiring_block["coverage"]["git-pre-push"],
+            json!(["task-gate"])
+        );
         assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
         // the honest read: no project guard is wired in that hook
         assert_eq!(verified["hook_project_guards"], json!([]));
@@ -2859,14 +2940,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
-        std::fs::write(root.join(".git").join("hooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK)
-            .unwrap();
+        std::fs::write(
+            root.join(".git").join("hooks").join("pre-push"),
+            SCAFFOLDED_PRE_PUSH_HOOK,
+        )
+        .unwrap();
 
         let (_, _, wire_instruction) = wiring_panel(&root, "MyProj");
-        assert_eq!(wire_instruction["files"], json!([]), "no scaffold over a live hook");
+        assert_eq!(
+            wire_instruction["files"],
+            json!([]),
+            "no scaffold over a live hook"
+        );
         let text = wire_instruction["text"].as_str().unwrap();
-        assert!(!text.contains("hooks install"), "no second install: {}", text);
-        assert!(!text.contains("install-hooks.sh"), "no second install: {}", text);
+        assert!(
+            !text.contains("hooks install"),
+            "no second install: {}",
+            text
+        );
+        assert!(
+            !text.contains("install-hooks.sh"),
+            "no second install: {}",
+            text
+        );
         // still actionable: the remaining work is the project guards
         assert!(text.contains("PROJECT_GATES"), "{}", text);
         let _ = std::fs::remove_dir_all(&root);
@@ -2881,7 +2977,11 @@ mod tests {
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
         std::fs::create_dir_all(root.join(".github").join("workflows")).unwrap();
-        std::fs::write(root.join(".github").join("workflows").join("ci.yml"), "on: push").unwrap();
+        std::fs::write(
+            root.join(".github").join("workflows").join("ci.yml"),
+            "on: push",
+        )
+        .unwrap();
 
         let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(false));
@@ -2894,7 +2994,11 @@ mod tests {
             .filter(|w| w["runs_in"] == "project-pipeline")
             .all(|w| w.get("client_side").is_none() && w.get("hook_runs_this").is_none()));
         let text = wire_instruction["text"].as_str().unwrap();
-        assert!(text.contains("hooks install"), "still nudged toward the hook: {}", text);
+        assert!(
+            text.contains("hooks install"),
+            "still nudged toward the hook: {}",
+            text
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2914,7 +3018,11 @@ mod tests {
         git_in(&root, &["init", "-q"]);
         std::fs::create_dir_all(root.join(".githooks")).unwrap();
         git_in(&root, &["config", "core.hooksPath", ".githooks"]);
-        std::fs::write(root.join(".githooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        std::fs::write(
+            root.join(".githooks").join("pre-push"),
+            SCAFFOLDED_PRE_PUSH_HOOK,
+        )
+        .unwrap();
 
         let (_, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -2936,21 +3044,30 @@ mod tests {
         git_in(&root, &["init", "-q"]);
         // the gate that used to run
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
-        std::fs::write(root.join(".git").join("hooks").join("pre-push"), SCAFFOLDED_PRE_PUSH_HOOK)
-            .unwrap();
+        std::fs::write(
+            root.join(".git").join("hooks").join("pre-push"),
+            SCAFFOLDED_PRE_PUSH_HOOK,
+        )
+        .unwrap();
         // hooks moved, and nothing was installed at the new location
         std::fs::create_dir_all(root.join(".githooks")).unwrap();
         git_in(&root, &["config", "core.hooksPath", ".githooks"]);
 
         let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(false));
-        assert!(wiring_block["coverage"]["uncovered"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|u| u == "task-gate"), "a gate that never runs is uncovered");
+        assert!(
+            wiring_block["coverage"]["uncovered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|u| u == "task-gate"),
+            "a gate that never runs is uncovered"
+        );
         // so the project is told to install at the path git actually runs
-        assert!(wire_instruction["text"].as_str().unwrap().contains("hooks install"));
+        assert!(wire_instruction["text"]
+            .as_str()
+            .unwrap()
+            .contains("hooks install"));
         assert!(!wire_instruction["files"].as_array().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3036,11 +3153,14 @@ mod tests {
         assert_eq!(verified["gate_point_resolved"], json!(false));
         assert_eq!(wiring_block["coverage"]["git-pre-push"], json!([]));
         assert_eq!(wire_instruction["files"], json!([]));
-        assert!(!wiring_block["automatic"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["runs_in"] == "git-pre-push"), "no git, no git-pre-push category");
+        assert!(
+            !wiring_block["automatic"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["runs_in"] == "git-pre-push"),
+            "no git, no git-pre-push category"
+        );
         assert!(wiring_block["coverage"]["uncovered"]
             .as_array()
             .unwrap()
@@ -3078,8 +3198,11 @@ mod tests {
         std::fs::set_permissions(&hook, perms).unwrap();
 
         // the installer must be a runnable script too
-        std::fs::write(root.join("scripts").join("install-hooks.sh"), SCAFFOLDED_INSTALL_HOOKS)
-            .unwrap();
+        std::fs::write(
+            root.join("scripts").join("install-hooks.sh"),
+            SCAFFOLDED_INSTALL_HOOKS,
+        )
+        .unwrap();
         let syntax = std::process::Command::new("bash")
             .arg("-n")
             .arg(root.join("scripts").join("install-hooks.sh"))
@@ -3110,15 +3233,25 @@ mod tests {
         };
 
         let clean = run_gate(0);
-        assert!(clean.status.success(), "a passing gate must let the push through");
+        assert!(
+            clean.status.success(),
+            "a passing gate must let the push through"
+        );
         let blocked = run_gate(1);
-        assert_eq!(blocked.status.code(), Some(1), "a failing gate must fail the push");
+        assert_eq!(
+            blocked.status.code(),
+            Some(1),
+            "a failing gate must fail the push"
+        );
         assert!(String::from_utf8_lossy(&blocked.stderr).contains("Push blocked"));
 
         // and the round trip: installing it makes the panel believe it
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::copy(&hook, root.join(".git").join("hooks").join("pre-push")).unwrap();
-        assert!(hook_observable(&root), "the installed scaffold must be observable");
+        assert!(
+            hook_observable(&root),
+            "the installed scaffold must be observable"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3183,7 +3316,9 @@ mod tests {
             !contents.iter().any(|c| c.contains("JavaScript")),
             "1 tooling js file out of 9 must not earn a rule"
         );
-        assert!(rules.iter().all(|r| r["heuristic"] == true && r["verified"] == false));
+        assert!(rules
+            .iter()
+            .all(|r| r["heuristic"] == true && r["verified"] == false));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3201,7 +3336,11 @@ mod tests {
         assert!(id.starts_with("myproj-"), "{}", id);
         let suffix = &id["myproj-".len()..];
         assert_eq!(suffix.len(), 4);
-        assert!(suffix.chars().all(|c| c.is_ascii_alphanumeric()), "{}", suffix);
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_alphanumeric()),
+            "{}",
+            suffix
+        );
         used.insert(id.clone());
         let second = allocate_task_id("myproj", &used).expect("allocated");
         assert_ne!(id, second, "collisions are checked, not trusted");
@@ -3216,7 +3355,11 @@ mod tests {
             store.clone(),
         )
         .await;
-        assert!(reply.starts_with("ERROR: namespace 'NewProj' does not exist"), "{}", reply);
+        assert!(
+            reply.starts_with("ERROR: namespace 'NewProj' does not exist"),
+            "{}",
+            reply
+        );
         assert!(reply.contains("neurostrata_bootstrap"), "{}", reply);
         assert!(
             store.list_namespaces().await.unwrap().is_empty(),
@@ -3242,7 +3385,11 @@ mod tests {
             store.clone(),
         )
         .await;
-        assert!(reply.starts_with("ERROR: unknown task_type 'recurring'"), "{}", reply);
+        assert!(
+            reply.starts_with("ERROR: unknown task_type 'recurring'"),
+            "{}",
+            reply
+        );
         // The signpost: this is where agents cross over to procedure memory.
         assert!(
             reply.contains("procedure") || reply.contains("neurostrata_procedure_perform"),
@@ -3266,8 +3413,14 @@ mod tests {
         assert_eq!(payload.metadata["task"]["status"], json!("open"));
         assert_eq!(payload.metadata["task"]["priority"], json!(1));
         assert_eq!(payload.metadata["task"]["task_type"], json!("task"));
-        assert!(payload.metadata["task"]["created_at"].as_str().unwrap().ends_with('Z'));
-        assert!(payload.metadata["task"]["history"].as_array().unwrap().is_empty());
+        assert!(payload.metadata["task"]["created_at"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z'));
+        assert!(payload.metadata["task"]["history"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3355,7 +3508,11 @@ mod tests {
             store.clone(),
         )
         .await;
-        assert!(reply.starts_with("ERROR: Illegal transition blocked -> in_progress"), "{}", reply);
+        assert!(
+            reply.starts_with("ERROR: Illegal transition blocked -> in_progress"),
+            "{}",
+            reply
+        );
         assert!(reply.contains("legal transitions are: open"), "{}", reply);
     }
 
@@ -3370,7 +3527,11 @@ mod tests {
         )
         .await;
         assert!(reply.contains("unknown status 'canceled'"), "{}", reply);
-        assert!(reply.contains("done only via neurostrata_task_complete"), "{}", reply);
+        assert!(
+            reply.contains("done only via neurostrata_task_complete"),
+            "{}",
+            reply
+        );
     }
 
     #[tokio::test]
@@ -3390,11 +3551,17 @@ mod tests {
         .await;
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
         assert!(
-            parsed["renamed"].as_str().unwrap().starts_with("renamed: 'Fix Kuzu"),
+            parsed["renamed"]
+                .as_str()
+                .unwrap()
+                .starts_with("renamed: 'Fix Kuzu"),
             "the reply names what it renamed: {}",
             reply
         );
-        assert!(parsed["transition"].is_null(), "a rename is not a transition");
+        assert!(
+            parsed["transition"].is_null(),
+            "a rename is not a transition"
+        );
 
         // Persisted: content IS the title (section 1.1).
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
@@ -3415,7 +3582,10 @@ mod tests {
         assert_eq!(history[0]["to"], "open", "no state moved");
         assert!(
             history[0]["note"].as_str().unwrap().contains("Fix Kuzu")
-                && history[0]["note"].as_str().unwrap().contains("Fix LadybugDB"),
+                && history[0]["note"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Fix LadybugDB"),
             "history keeps both titles: {:?}",
             history[0]["note"]
         );
@@ -3434,7 +3604,11 @@ mod tests {
             store.clone(),
         )
         .await;
-        assert!(reply.starts_with("ERROR: Failed to embed the task title"), "{}", reply);
+        assert!(
+            reply.starts_with("ERROR: Failed to embed the task title"),
+            "{}",
+            reply
+        );
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
         assert_eq!(
             payload.content, "the old words",
@@ -3474,8 +3648,14 @@ mod tests {
             );
         }
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.content, "the work", "a refused rename writes nothing");
-        assert!(payload.metadata["task"]["history"].as_array().unwrap().is_empty());
+        assert_eq!(
+            payload.content, "the work",
+            "a refused rename writes nothing"
+        );
+        assert!(payload.metadata["task"]["history"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3490,7 +3670,11 @@ mod tests {
             store.clone(),
         )
         .await;
-        assert!(reply.contains(&format!("the maximum is {}", MAX_TITLE)), "{}", reply);
+        assert!(
+            reply.contains(&format!("the maximum is {}", MAX_TITLE)),
+            "{}",
+            reply
+        );
 
         let reply = handle_task_create(
             json!({ "namespace": "MyProj", "title": too_long }),
@@ -3525,7 +3709,10 @@ mod tests {
         .await;
         assert!(reply.contains("\"renamed\": null"), "{}", reply);
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert!(payload.metadata["task"]["history"].as_array().unwrap().is_empty());
+        assert!(payload.metadata["task"]["history"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3583,10 +3770,20 @@ mod tests {
 
         handle_task_claim(args.clone(), store.clone()).await;
         let again = handle_task_claim(args, store.clone()).await;
-        assert!(again.contains("already claimed by this session"), "{}", again);
+        assert!(
+            again.contains("already claimed by this session"),
+            "{}",
+            again
+        );
 
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        assert_eq!(payload.metadata["task"]["history"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload.metadata["task"]["history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3609,7 +3806,11 @@ mod tests {
             store.clone(),
         )
         .await;
-        assert!(takeover.contains("\"status\": \"in_progress\""), "{}", takeover);
+        assert!(
+            takeover.contains("\"status\": \"in_progress\""),
+            "{}",
+            takeover
+        );
 
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
         assert_eq!(payload.metadata["task"]["assignee"], json!("agent-b"));
@@ -3680,7 +3881,10 @@ mod tests {
             "BLOCKED (Lock 2): task {} cannot complete without an extracted memory. Either call neurostrata_add_memory with metadata extracted_from: [\"{}\"], or retry neurostrata_task_complete with `memory.content` (what did you learn? what rule does this task prove?) or `link_memory_id`.",
             id, id
         );
-        assert_eq!(err, expected, "the -32603 body must match section 3.2 verbatim");
+        assert_eq!(
+            err, expected,
+            "the -32603 body must match section 3.2 verbatim"
+        );
         assert_eq!(
             status_of(&store, "MyProj", &id).await,
             Status::InProgress,
@@ -3783,7 +3987,11 @@ mod tests {
         assert_eq!(kept_vector, vector, "the linked memory keeps its vector");
         assert_eq!(kept.content, "an existing memory");
         assert_eq!(kept.metadata["extracted_from"], json!([id.as_str()]));
-        assert_eq!(kept.metadata["access_count"], json!(3), "everything else is untouched");
+        assert_eq!(
+            kept.metadata["access_count"],
+            json!(3),
+            "everything else is untouched"
+        );
     }
 
     #[tokio::test]
@@ -3815,16 +4023,25 @@ mod tests {
 
         let after = store.list("MyProj", None).await.unwrap();
         assert_eq!(after.len(), before + 1, "one memory was written");
-        let written = after.iter().find(|r| Some(r.id.as_str()) == extracted[0].as_str()).expect("the new memory");
+        let written = after
+            .iter()
+            .find(|r| Some(r.id.as_str()) == extracted[0].as_str())
+            .expect("the new memory");
         assert_eq!(written.payload.memory_type, "fact", "the schema default");
-        assert_eq!(written.payload.metadata["extracted_from"], json!([id.as_str()]));
+        assert_eq!(
+            written.payload.metadata["extracted_from"],
+            json!([id.as_str()])
+        );
         assert_eq!(
             status_of(&store, "MyProj", &id).await,
             Status::Done,
             "the transition happened after the extraction landed"
         );
         // The inline write also carries the pipeline's own stamps.
-        assert!(written.payload.metadata.get("valid_from").is_some(), "valid_from comes from the pipeline");
+        assert!(
+            written.payload.metadata.get("valid_from").is_some(),
+            "valid_from comes from the pipeline"
+        );
         assert!(written.payload.metadata.get("access_count").is_some());
     }
 
@@ -3867,7 +4084,10 @@ mod tests {
         .expect("the inline extraction writes the edge");
 
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
-        let lesson_id = parsed["extracted_memory_ids"][0].as_str().unwrap().to_string();
+        let lesson_id = parsed["extracted_memory_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
         let (_, lesson) = store.get("MyProj", &lesson_id).await.unwrap().unwrap();
         assert_eq!(lesson.memory_type, "rule", "the caller's memory_type lands");
         assert_eq!(
@@ -3952,20 +4172,29 @@ mod tests {
         .expect("the inline extraction writes the edge");
 
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
-        let lesson_id = parsed["extracted_memory_ids"][0].as_str().unwrap().to_string();
+        let lesson_id = parsed["extracted_memory_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
         let (_, lesson) = store.get("MyProj", &lesson_id).await.unwrap().unwrap();
         assert_eq!(lesson.memory_type, "fact");
         assert_eq!(lesson.metadata["extracted_from"], json!([id.as_str()]));
         assert!(lesson.metadata.get("source").is_none());
-        assert!(lesson.metadata.get("valid_from").is_some(), "pipeline stamp");
-        assert!(lesson.metadata.get("access_count").is_some(), "pipeline stamp");
+        assert!(
+            lesson.metadata.get("valid_from").is_some(),
+            "pipeline stamp"
+        );
+        assert!(
+            lesson.metadata.get("access_count").is_some(),
+            "pipeline stamp"
+        );
     }
 
     /// Emit site 3: closing a task with an inline lesson is "the task gave way
-/// to a lesson", so the pulse names both. Asserts the ends against the
-/// store rather than against the reply, because a `Superseded` whose
-/// `new_id` is the task and whose `old_id` is the lesson would still parse
-/// -- it would just send every subscriber down the wrong chain.
+    /// to a lesson", so the pulse names both. Asserts the ends against the
+    /// store rather than against the reply, because a `Superseded` whose
+    /// `new_id` is the task and whose `old_id` is the lesson would still parse
+    /// -- it would just send every subscriber down the wrong chain.
     #[tokio::test]
     async fn an_inline_extraction_emits_superseded_from_the_task_to_the_lesson() {
         let store = store_with_namespace("MyProj").await;
@@ -3995,7 +4224,11 @@ mod tests {
 
         let pulses = pulses_seen(&seen, 1).await;
         match &pulses[0] {
-            ThalamicPulse::Superseded { old_id, new_id, namespace } => {
+            ThalamicPulse::Superseded {
+                old_id,
+                new_id,
+                namespace,
+            } => {
                 assert_eq!(old_id, &id, "the task is the row that gave way");
                 assert_eq!(new_id, &lesson_id, "the lesson is the row that replaced it");
                 assert_eq!(namespace, "MyProj");
@@ -4120,7 +4353,9 @@ mod tests {
         let real = store_with_namespace("MyProj").await;
         let id = create_task(&real, "MyProj", "the work", 2).await;
         claim(&real, &id).await;
-        let store: Arc<dyn VectorStore> = Arc::new(ListHidingStore { inner: real.clone() });
+        let store: Arc<dyn VectorStore> = Arc::new(ListHidingStore {
+            inner: real.clone(),
+        });
         let (bus, seen) = recording_bus();
 
         let err = handle_task_complete(
@@ -4297,7 +4532,11 @@ mod tests {
         )
         .await
         .expect("extraction-backed completion");
-        assert!(completion.contains("\"status\": \"done\""), "{}", completion);
+        assert!(
+            completion.contains("\"status\": \"done\""),
+            "{}",
+            completion
+        );
         let open_id = create_task(&store, "MyProj", "actionable work", 1).await;
         let blocked_id = create_task(&store, "MyProj", "waiting work", 2).await;
         // The blocked one waits on the open one.
@@ -4318,12 +4557,18 @@ mod tests {
             .collect();
         assert!(ids.contains(&open_id.as_str()));
         assert!(ids.contains(&blocked_id.as_str()));
-        assert!(!ids.contains(&done_id.as_str()), "done is hidden by default");
+        assert!(
+            !ids.contains(&done_id.as_str()),
+            "done is hidden by default"
+        );
         // Priority order: actionable (P1) before waiting (P2).
         assert_eq!(ids[0], open_id);
 
-        let reply =
-            handle_task_list(json!({ "namespace": "MyProj", "ready": true }), store.clone()).await;
+        let reply = handle_task_list(
+            json!({ "namespace": "MyProj", "ready": true }),
+            store.clone(),
+        )
+        .await;
         let parsed: Value = serde_json::from_str(&reply).unwrap();
         let ids: Vec<&str> = parsed["tasks"]
             .as_array()
@@ -4331,7 +4576,11 @@ mod tests {
             .iter()
             .map(|t| t["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec![open_id.as_str()], "ready = open with no live blockers");
+        assert_eq!(
+            ids,
+            vec![open_id.as_str()],
+            "ready = open with no live blockers"
+        );
 
         let reply = handle_task_list(
             json!({ "namespace": "MyProj", "include_done": true }),
@@ -4422,9 +4671,15 @@ mod tests {
     #[test]
     fn snapshot_prefix_names_claimed_and_ready_tasks_and_opens_with_the_rule() {
         let memories = vec![
-            task_row("myproj-aaaa", json!({ "status": "in_progress", "assignee": "agent-a" })),
+            task_row(
+                "myproj-aaaa",
+                json!({ "status": "in_progress", "assignee": "agent-a" }),
+            ),
             task_row("myproj-bbbb", json!({ "status": "open", "priority": 1 })),
-            task_row("myproj-cccc", json!({ "status": "open", "priority": 3, "blocked_by": ["myproj-bbbb"] })),
+            task_row(
+                "myproj-cccc",
+                json!({ "status": "open", "priority": 3, "blocked_by": ["myproj-bbbb"] }),
+            ),
             task_row("myproj-dddd", json!({ "status": "done" })),
             SearchResult {
                 id: "rule-1".to_string(),
@@ -4458,8 +4713,15 @@ mod tests {
             "a task blocked by an unfinished one is not ready: {}",
             prefix
         );
-        assert!(!prefix.contains("myproj-dddd"), "done work is not listed: {}", prefix);
-        assert!(!prefix.contains("always use podman"), "memories stay in the snapshot body");
+        assert!(
+            !prefix.contains("myproj-dddd"),
+            "done work is not listed: {}",
+            prefix
+        );
+        assert!(
+            !prefix.contains("always use podman"),
+            "memories stay in the snapshot body"
+        );
     }
 
     #[test]
@@ -4470,7 +4732,11 @@ mod tests {
             "{}",
             prefix
         );
-        assert!(prefix.contains("No tasks are claimed or ready"), "{}", prefix);
+        assert!(
+            prefix.contains("No tasks are claimed or ready"),
+            "{}",
+            prefix
+        );
     }
 
     // ── bootstrap (section 3.2) ─────────────────────────────────────────
@@ -4499,7 +4765,11 @@ mod tests {
         );
 
         // The instructor left real work: the task exists server-side.
-        let (_, payload) = store.get("MyProj", &first_id).await.unwrap().expect("created");
+        let (_, payload) = store
+            .get("MyProj", &first_id)
+            .await
+            .unwrap()
+            .expect("created");
         assert_eq!(payload.memory_type, "task");
 
         let files = parsed["files"].as_array().unwrap();
@@ -4524,11 +4794,20 @@ mod tests {
         let instructions = parsed["instructions"].as_array().unwrap();
         assert_eq!(instructions.len(), 5);
         assert_eq!(instructions[0]["action"], json!("write_file"));
-        assert_eq!(instructions[1]["cmd"], json!("neurostrata-mcp hooks install"));
+        assert_eq!(
+            instructions[1]["cmd"],
+            json!("neurostrata-mcp hooks install")
+        );
         assert_eq!(instructions[2]["tool"], json!("neurostrata_task_claim"));
         assert_eq!(instructions[2]["params"]["id"], json!(first_id));
-        assert_eq!(instructions[3]["tool"], json!("neurostrata_ingest_directory"));
-        assert_eq!(parsed["hooks"]["install_command"], json!("neurostrata-mcp hooks install"));
+        assert_eq!(
+            instructions[3]["tool"],
+            json!("neurostrata_ingest_directory")
+        );
+        assert_eq!(
+            parsed["hooks"]["install_command"],
+            json!("neurostrata-mcp hooks install")
+        );
 
         // The wiring panel (docs/design-wiring-panel.md): one instruction
         // template, git-first but never git-only. /tmp has no .git, so the
@@ -4542,7 +4821,11 @@ mod tests {
         assert!(text.contains("No git detected"), "{}", text);
         assert!(text.contains("CMS publish"), "{}", text);
         assert!(text.contains("memory_type: rule"), "{}", text);
-        assert!(!text.contains("hooks install"), "no git, no hook instruction: {}", text);
+        assert!(
+            !text.contains("hooks install"),
+            "no git, no hook instruction: {}",
+            text
+        );
 
         let verified = &parsed["verified"];
         assert_eq!(verified["hook_installed"], json!(false));
@@ -4553,19 +4836,25 @@ mod tests {
             .unwrap()
             .iter()
             .any(|u| u == "memory-to-repo-drift"));
-        assert!(wiring["automatic"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|w| w["id"] != "task-gate"),
-            "the git default instance is not emitted without git");
+        assert!(
+            wiring["automatic"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|w| w["id"] != "task-gate"),
+            "the git default instance is not emitted without git"
+        );
         let gate_tasks: Vec<_> = parsed["tasks_created"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|t| t["title"].as_str().unwrap().contains("gate point"))
             .collect();
-        assert_eq!(gate_tasks.len(), 1, "exactly one gate-point task for a non-git project");
+        assert_eq!(
+            gate_tasks.len(),
+            1,
+            "exactly one gate-point task for a non-git project"
+        );
     }
 
     #[tokio::test]
@@ -4615,7 +4904,10 @@ mod tests {
         .await;
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
 
-        assert_eq!(parsed["detected"]["git_remote"], json!("git@github.com:me/proj.git"));
+        assert_eq!(
+            parsed["detected"]["git_remote"],
+            json!("git@github.com:me/proj.git")
+        );
         assert_eq!(parsed["detected"]["languages"], json!(["rust"]));
         assert_eq!(parsed["detected"]["ci"], json!(["github-actions"]));
         assert_eq!(parsed["detected"]["beads_dir"], json!(true));
@@ -4630,31 +4922,61 @@ mod tests {
         assert_eq!(parsed["suggested_rules"].as_array().unwrap().len(), 2); // rust + ci
 
         let created = parsed["tasks_created"].as_array().unwrap();
-        assert_eq!(created.len(), 2, "hook replacement + beads migration: {:?}", created);
-        assert!(created[1]["title"].as_str().unwrap().contains("Migrate 2 beads issues"));
+        assert_eq!(
+            created.len(),
+            2,
+            "hook replacement + beads migration: {:?}",
+            created
+        );
+        assert!(created[1]["title"]
+            .as_str()
+            .unwrap()
+            .contains("Migrate 2 beads issues"));
         assert!(created[1]["metadata_hint"]
             .as_str()
             .unwrap()
             .contains("neurostrata-mcp task import proj --from-beads .beads/issues.jsonl"));
 
         let instructions = parsed["instructions"].as_array().unwrap();
-        assert_eq!(instructions[0]["cmd"], json!("neurostrata-mcp hooks install --force"));
-        assert!(instructions.iter().any(|i| {
-            i["cmd"].as_str()
-                .map(|c| c.starts_with("neurostrata-mcp task import"))
-                .unwrap_or(false)
-        }), "the import step is instructed: {:?}", instructions);
-        assert!(instructions.iter().any(|i| i["tool"] == json!("neurostrata_add_memory")));
-        assert!(instructions.iter().any(|i| i["tool"] == json!("neurostrata_task_complete")),
-            "completing the setup tasks forces the first extractions: {:?}", instructions);
+        assert_eq!(
+            instructions[0]["cmd"],
+            json!("neurostrata-mcp hooks install --force")
+        );
+        assert!(
+            instructions.iter().any(|i| {
+                i["cmd"]
+                    .as_str()
+                    .map(|c| c.starts_with("neurostrata-mcp task import"))
+                    .unwrap_or(false)
+            }),
+            "the import step is instructed: {:?}",
+            instructions
+        );
+        assert!(instructions
+            .iter()
+            .any(|i| i["tool"] == json!("neurostrata_add_memory")));
+        assert!(
+            instructions
+                .iter()
+                .any(|i| i["tool"] == json!("neurostrata_task_complete")),
+            "completing the setup tasks forces the first extractions: {:?}",
+            instructions
+        );
 
         // The tasks really exist, in creation order.
         let rows = store.list("proj", None).await.unwrap();
-        let tasks: Vec<_> = rows.iter().filter(|r| r.payload.memory_type == "task").collect();
+        let tasks: Vec<_> = rows
+            .iter()
+            .filter(|r| r.payload.memory_type == "task")
+            .collect();
         assert_eq!(tasks.len(), 2);
         for created in created {
             let id = created["id"].as_str().unwrap();
-            assert!(tasks.iter().any(|t| t.id == id), "{} was announced but not created", id);
+            assert!(
+                tasks.iter().any(|t| t.id == id),
+                "{} was announced but not created",
+                id
+            );
         }
 
         std::fs::remove_dir_all(&root).ok();
@@ -4677,7 +4999,10 @@ mod tests {
 
         assert_eq!(parsed["conflicts"], json!([]));
         assert_eq!(parsed["tasks_created"], json!([]));
-        assert_eq!(parsed["instructions"][0]["cmd"], json!("neurostrata-mcp hooks install"));
+        assert_eq!(
+            parsed["instructions"][0]["cmd"],
+            json!("neurostrata-mcp hooks install")
+        );
         assert_eq!(parsed["suggested_rules"][0]["memory_type"], json!("rule"));
 
         std::fs::remove_dir_all(&root).ok();
@@ -4707,10 +5032,16 @@ mod tests {
         assert_eq!(summary.created, 2);
         assert_eq!(summary.skipped_existing, 0);
         assert_eq!(summary.non_issue_lines, 1, "the milestone line is skipped");
-        assert_eq!(summary.malformed_lines, 1, "the broken line is counted, not fatal");
+        assert_eq!(
+            summary.malformed_lines, 1,
+            "the broken line is counted, not fatal"
+        );
 
         let rows = store.list("proj", None).await.unwrap();
-        let tasks: Vec<_> = rows.iter().filter(|r| r.payload.memory_type == "task").collect();
+        let tasks: Vec<_> = rows
+            .iter()
+            .filter(|r| r.payload.memory_type == "task")
+            .collect();
         assert_eq!(tasks.len(), 2);
 
         let closed = tasks
@@ -4719,19 +5050,33 @@ mod tests {
             .expect("the closed issue was imported");
         assert_eq!(closed.payload.content, "Fix the gate");
         assert_eq!(closed.payload.metadata["task"]["status"], json!("done"));
-        assert_eq!(closed.payload.metadata["task"]["grandfathered"], json!(true));
-        assert_eq!(closed.payload.metadata["task"]["close_reason"], json!("Fixed"));
+        assert_eq!(
+            closed.payload.metadata["task"]["grandfathered"],
+            json!(true)
+        );
+        assert_eq!(
+            closed.payload.metadata["task"]["close_reason"],
+            json!("Fixed")
+        );
         assert_eq!(closed.payload.metadata["task"]["priority"], json!(0));
         assert_eq!(closed.payload.metadata["task"]["task_type"], json!("bug"));
-        assert_eq!(closed.payload.metadata["task"]["description"], json!("the gate wedged on push"));
+        assert_eq!(
+            closed.payload.metadata["task"]["description"],
+            json!("the gate wedged on push")
+        );
         assert_eq!(
             closed.payload.metadata["task"]["created_at"],
             json!("2026-05-25T16:54:42Z"),
             "timestamps are preserved verbatim"
         );
-        assert_eq!(closed.payload.user_id, "neo", "created_by becomes the record's user_id");
+        assert_eq!(
+            closed.payload.user_id, "neo",
+            "created_by becomes the record's user_id"
+        );
         // blocked_by is translated into this system's ids (see below).
-        let blocked = closed.payload.metadata["task"]["blocked_by"].as_array().unwrap();
+        let blocked = closed.payload.metadata["task"]["blocked_by"]
+            .as_array()
+            .unwrap();
         assert_eq!(blocked.len(), 1);
 
         let open = tasks
@@ -4758,7 +5103,10 @@ mod tests {
         assert_eq!(second.skipped_existing, 2);
 
         let rows = store.list("proj", None).await.unwrap();
-        let tasks: Vec<_> = rows.iter().filter(|r| r.payload.memory_type == "task").collect();
+        let tasks: Vec<_> = rows
+            .iter()
+            .filter(|r| r.payload.memory_type == "task")
+            .collect();
         assert_eq!(tasks.len(), 2, "no duplicates after a re-run");
     }
 

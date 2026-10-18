@@ -86,7 +86,12 @@ impl MemorySubscriber for ExportFreshnessDirty {
         // where the subscriber was constructed.
         let namespace = ctx.namespace;
         ctx.store
-            .upsert(namespace, &flag_id(namespace), vec![0.0; self.dimensions], dirty_payload(namespace, reason, ctx.ts))
+            .upsert(
+                namespace,
+                &flag_id(namespace),
+                vec![0.0; self.dimensions],
+                dirty_payload(namespace, reason, ctx.ts),
+            )
             .await
             .map(|_| ())
     }
@@ -146,11 +151,7 @@ pub async fn check_export_freshness(store: &dyn VectorStore) -> Result<(), Strin
                 }
             }
             Ok(None) => continue,
-            Err(e) => {
-                return Err(format!(
-                    "Failed to read freshness flag for {ns}: {e}"
-                ))
-            }
+            Err(e) => return Err(format!("Failed to read freshness flag for {ns}: {e}")),
         }
     }
     if dirty.is_empty() {
@@ -200,9 +201,11 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let store =
-            LadybugStore::for_testing(dir.join("freshness.lbug").to_string_lossy().to_string(), TEST_DIMENSIONS)
-                .expect("a throwaway store opens");
+        let store = LadybugStore::for_testing(
+            dir.join("freshness.lbug").to_string_lossy().to_string(),
+            TEST_DIMENSIONS,
+        )
+        .expect("a throwaway store opens");
         (dir, store)
     }
 
@@ -216,7 +219,10 @@ mod tests {
     async fn wired(tag: &str, namespaces: &[&str]) -> (PathBuf, ThalamicBus, Arc<LadybugStore>) {
         let (dir, store) = scratch(tag);
         for namespace in namespaces {
-            store.init(namespace).await.expect("the namespace's table exists");
+            store
+                .init(namespace)
+                .await
+                .expect("the namespace's table exists");
         }
         let store = Arc::new(store);
         let bus = ThalamicBus::new(16);
@@ -226,7 +232,12 @@ mod tests {
     }
 
     async fn flag_of(store: &LadybugStore, namespace: &str) -> Option<MemoryPayload> {
-        store.get(namespace, &flag_id(namespace)).await.ok().flatten().map(|(_, payload)| payload)
+        store
+            .get(namespace, &flag_id(namespace))
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, payload)| payload)
     }
 
     /// Waits for the flag to land. The bus dispatches on its own task, so the
@@ -238,7 +249,10 @@ mod tests {
             if let Some(payload) = flag_of(store, namespace).await {
                 return payload;
             }
-            assert!(Instant::now() < deadline, "no freshness flag landed for {namespace:?} within {FLAG_WAIT:?}");
+            assert!(
+                Instant::now() < deadline,
+                "no freshness flag landed for {namespace:?} within {FLAG_WAIT:?}"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -268,33 +282,52 @@ mod tests {
 
     #[tokio::test]
     async fn every_storage_mutation_marks_its_namespace_dirty() {
-        let (_dir, bus, store) =
-            wired("mutations", &["made", "revised", "retired"]).await;
+        let (_dir, bus, store) = wired("mutations", &["made", "revised", "retired"]).await;
 
         bus.emit(created("made"), &RecursionToken::root());
         bus.emit(superseded("revised"), &RecursionToken::root());
         bus.emit(archived("retired"), &RecursionToken::root());
         tokio::time::sleep(DISPATCH_WAIT).await;
 
-        for (namespace, reason) in
-            [("made", "created"), ("revised", "superseded"), ("retired", "archived")]
-        {
+        for (namespace, reason) in [
+            ("made", "created"),
+            ("revised", "superseded"),
+            ("retired", "archived"),
+        ] {
             let payload = await_flag(&store, namespace).await;
-            assert_eq!(payload.memory_type, FRESHNESS_FLAG_TYPE, "{namespace}: the row is the sentinel, not a memory");
-            assert_eq!(payload.metadata["dirty"], serde_json::json!(true), "{namespace}: the flag is set");
+            assert_eq!(
+                payload.memory_type, FRESHNESS_FLAG_TYPE,
+                "{namespace}: the row is the sentinel, not a memory"
+            );
+            assert_eq!(
+                payload.metadata["dirty"],
+                serde_json::json!(true),
+                "{namespace}: the flag is set"
+            );
             assert_eq!(
                 payload.metadata["dirty_reason"],
                 serde_json::json!(reason),
                 "{namespace}: the row names the mutation that dirtied it"
             );
-            assert_eq!(payload.metadata["namespace"], serde_json::json!(namespace), "{namespace}: the row names its own namespace");
+            assert_eq!(
+                payload.metadata["namespace"],
+                serde_json::json!(namespace),
+                "{namespace}: the row names its own namespace"
+            );
             assert!(
-                payload.metadata["dirty_at"].as_i64().expect("the flip is stamped") > 0,
+                payload.metadata["dirty_at"]
+                    .as_i64()
+                    .expect("the flip is stamped")
+                    > 0,
                 "{namespace}: the flip carries a timestamp"
             );
         }
 
-        assert_eq!(bus.metrics().dispatcher_handled, 3, "every pulse reached the subscriber");
+        assert_eq!(
+            bus.metrics().dispatcher_handled,
+            3,
+            "every pulse reached the subscriber"
+        );
     }
 
     /// Step 5's drill, plus the concurrent pair. One namespace dirtied by a
@@ -315,8 +348,16 @@ mod tests {
 
         let a = await_flag(&store, "a").await;
         let b = await_flag(&store, "b").await;
-        assert_eq!(a.metadata["dirty_reason"], serde_json::json!("created"), "a was dirtied by its own pulse");
-        assert_eq!(b.metadata["dirty_reason"], serde_json::json!("archived"), "b was dirtied by its own pulse");
+        assert_eq!(
+            a.metadata["dirty_reason"],
+            serde_json::json!("created"),
+            "a was dirtied by its own pulse"
+        );
+        assert_eq!(
+            b.metadata["dirty_reason"],
+            serde_json::json!("archived"),
+            "b was dirtied by its own pulse"
+        );
         assert_eq!(a.metadata["namespace"], serde_json::json!("a"));
         assert_eq!(b.metadata["namespace"], serde_json::json!("b"));
 
@@ -331,7 +372,11 @@ mod tests {
             .into_iter()
             .map(|r| r.id)
             .collect();
-        assert_eq!(ids_in_a, vec![flag_id("a")], "namespace a holds its own flag and nothing else");
+        assert_eq!(
+            ids_in_a,
+            vec![flag_id("a")],
+            "namespace a holds its own flag and nothing else"
+        );
 
         // The concurrent pair: two pulses for different namespaces emitted back
         // to back, so the dispatcher runs them in the same round.
@@ -341,17 +386,47 @@ mod tests {
 
         let a = await_flag(&store, "a").await;
         let b = await_flag(&store, "b").await;
-        assert_eq!(a.metadata["dirty_reason"], serde_json::json!("superseded"), "a took its own second flip");
-        assert_eq!(b.metadata["dirty_reason"], serde_json::json!("created"), "b took its own second flip");
+        assert_eq!(
+            a.metadata["dirty_reason"],
+            serde_json::json!("superseded"),
+            "a took its own second flip"
+        );
+        assert_eq!(
+            b.metadata["dirty_reason"],
+            serde_json::json!("created"),
+            "b took its own second flip"
+        );
 
-        let ids_in_a: Vec<String> =
-            store.list("a", None).await.expect("a lists").into_iter().map(|r| r.id).collect();
-        let ids_in_b: Vec<String> =
-            store.list("b", None).await.expect("b lists").into_iter().map(|r| r.id).collect();
-        assert_eq!(ids_in_a, vec![flag_id("a")], "two flips in one namespace are one row, updated");
-        assert_eq!(ids_in_b, vec![flag_id("b")], "two flips in one namespace are one row, updated");
+        let ids_in_a: Vec<String> = store
+            .list("a", None)
+            .await
+            .expect("a lists")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let ids_in_b: Vec<String> = store
+            .list("b", None)
+            .await
+            .expect("b lists")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            ids_in_a,
+            vec![flag_id("a")],
+            "two flips in one namespace are one row, updated"
+        );
+        assert_eq!(
+            ids_in_b,
+            vec![flag_id("b")],
+            "two flips in one namespace are one row, updated"
+        );
 
-        assert_eq!(bus.metrics().dispatcher_handled, 4, "every pulse reached the subscriber");
+        assert_eq!(
+            bus.metrics().dispatcher_handled,
+            4,
+            "every pulse reached the subscriber"
+        );
     }
 
     /// The sentinel's embedding has to be the store's width. `Memory.embedding`
@@ -365,10 +440,20 @@ mod tests {
         tokio::time::sleep(DISPATCH_WAIT).await;
         await_flag(&store, "sized").await;
 
-        let (vector, _payload) =
-            store.get("sized", &flag_id("sized")).await.expect("a read").expect("the flag row");
-        assert_eq!(vector.len(), TEST_DIMENSIONS, "the sentinel stores a zero vector of the store's width");
-        assert!(vector.iter().all(|f| *f == 0.0), "and it is the zero vector: {vector:?}");
+        let (vector, _payload) = store
+            .get("sized", &flag_id("sized"))
+            .await
+            .expect("a read")
+            .expect("the flag row");
+        assert_eq!(
+            vector.len(),
+            TEST_DIMENSIONS,
+            "the sentinel stores a zero vector of the store's width"
+        );
+        assert!(
+            vector.iter().all(|f| *f == 0.0),
+            "and it is the zero vector: {vector:?}"
+        );
     }
 
     /// A guard verdict is not a storage mutation, but it is about to become
@@ -401,7 +486,11 @@ mod tests {
             "the row names the guard call that dirtied the namespace"
         );
         assert_eq!(payload.metadata["dirty"], serde_json::json!(true));
-        assert_eq!(bus.metrics().dispatcher_handled, 1, "the pulse reached the subscriber");
+        assert_eq!(
+            bus.metrics().dispatcher_handled,
+            1,
+            "the pulse reached the subscriber"
+        );
     }
 
     // ---- A4 gate consumer -----------------------------------------------
@@ -430,8 +519,13 @@ mod tests {
             .await
             .expect("seed the dirty flag for a");
 
-        let err = check_export_freshness(&store).await.expect_err("the gate refuses");
-        assert!(err.contains("a"), "the error names the dirty namespace: {err}");
+        let err = check_export_freshness(&store)
+            .await
+            .expect_err("the gate refuses");
+        assert!(
+            err.contains("a"),
+            "the error names the dirty namespace: {err}"
+        );
         assert!(
             !err.contains("b"),
             "the error does not name a clean namespace: {err}"
@@ -444,7 +538,9 @@ mod tests {
     async fn the_check_passes_when_no_flag_is_set() {
         let (_dir, store) = scratch("clean");
         store.init("only").await.expect("init");
-        check_export_freshness(&store).await.expect("no flag set means nothing to refuse");
+        check_export_freshness(&store)
+            .await
+            .expect("no flag set means nothing to refuse");
     }
 
     /// A flag row whose `dirty` field has been flipped to `false` is treated
@@ -495,10 +591,15 @@ mod tests {
             .await
             .expect("c dirty");
 
-        let err = check_export_freshness(&store).await.expect_err("the gate refuses");
+        let err = check_export_freshness(&store)
+            .await
+            .expect_err("the gate refuses");
         assert!(err.contains("a"), "names a: {err}");
         assert!(err.contains("c"), "names c: {err}");
-        assert!(!err.contains("'b'") && !err.contains(" b "), "does not name b: {err}");
+        assert!(
+            !err.contains("'b'") && !err.contains(" b "),
+            "does not name b: {err}"
+        );
     }
 
     /// The `export-graph` CLI runs `check_export_freshness` before

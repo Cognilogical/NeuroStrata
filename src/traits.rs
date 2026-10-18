@@ -15,8 +15,7 @@ pub const MEMORY_VOCABULARY_JSON: &str = include_str!("schemas/memory-vocabulary
 pub fn memory_vocabulary() -> &'static serde_json::Value {
     static VOCAB: OnceLock<serde_json::Value> = OnceLock::new();
     VOCAB.get_or_init(|| {
-        serde_json::from_str(MEMORY_VOCABULARY_JSON)
-            .expect("shipped memory vocabulary parses")
+        serde_json::from_str(MEMORY_VOCABULARY_JSON).expect("shipped memory vocabulary parses")
     })
 }
 
@@ -266,7 +265,10 @@ mod tests {
         assert_eq!(rels["EXTRACTED_FROM"]["direction"], "directed");
         assert_eq!(rels["EXTRACTED_FROM"]["source_role"], "memory");
         assert_eq!(rels["EXTRACTED_FROM"]["target_role"], "task");
-        assert_eq!(rels["EXTRACTED_FROM"]["declaration_direction"], "self_to_target");
+        assert_eq!(
+            rels["EXTRACTED_FROM"]["declaration_direction"],
+            "self_to_target"
+        );
         assert_eq!(rels["EXTRACTED_FROM"]["metadata_key"], "extracted_from");
     }
 
@@ -283,7 +285,10 @@ mod tests {
     fn memory_vocabulary_rule_declares_enforcement_fields() {
         let v = memory_vocabulary();
         let fields = &v["memory_types"]["rule"]["fields"];
-        assert_eq!(fields["enforcement"]["enum"], serde_json::json!(["ENFORCED", "PARTIAL", "NOT_ENFORCED"]));
+        assert_eq!(
+            fields["enforcement"]["enum"],
+            serde_json::json!(["ENFORCED", "PARTIAL", "NOT_ENFORCED"])
+        );
         assert!(fields["source"].is_object());
         assert!(fields["guard"].is_object());
     }
@@ -318,11 +323,7 @@ mod tests {
                 "every-n-days:N"
             ])
         );
-        for nullable in [
-            "remaining_fires",
-            "valid_to",
-            "last_performed_at",
-        ] {
+        for nullable in ["remaining_fires", "valid_to", "last_performed_at"] {
             assert_eq!(
                 fields[nullable]["type"],
                 json!(["integer", "null"]),
@@ -331,7 +332,10 @@ mod tests {
             );
         }
         assert_eq!(fields["performance_count"]["type"], json!("integer"));
-        assert_eq!(fields["last_episodic_pointer"]["type"], json!(["string", "null"]));
+        assert_eq!(
+            fields["last_episodic_pointer"]["type"],
+            json!(["string", "null"])
+        );
         // The memory_type summary is what tools/list shows an agent, so it has
         // to name the new type.
         assert!(v["tool_summaries"]["memory_type"]
@@ -358,9 +362,12 @@ mod tests {
             id: "test-id".to_string(),
             score: 1.0,
             payload: MemoryPayload {
-                content: "c".into(), user_id: "u".into(),
-                memory_type: "rule".into(), agent_name: None,
-                location: String::new(), location_lines: String::new(),
+                content: "c".into(),
+                user_id: "u".into(),
+                memory_type: "rule".into(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
                 metadata: serde_json::json!({}),
             },
             evidence: Some(vec![SearchEvidence {
@@ -370,7 +377,10 @@ mod tests {
             }]),
         };
         let json = serde_json::to_value(&sr).unwrap();
-        assert!(json.get("evidence").is_none(), "evidence must be skip-serialized");
+        assert!(
+            json.get("evidence").is_none(),
+            "evidence must be skip-serialized"
+        );
     }
 
     #[test]
@@ -386,8 +396,16 @@ mod tests {
         let ev = SearchEvidence {
             kind: EvidenceKind::Governs2hop,
             path: vec![
-                EvidenceEdge { source: "a".into(), relation: "CONTAINS".into(), target: "b".into() },
-                EvidenceEdge { source: "c".into(), relation: "GOVERNS".into(), target: "b".into() },
+                EvidenceEdge {
+                    source: "a".into(),
+                    relation: "CONTAINS".into(),
+                    target: "b".into(),
+                },
+                EvidenceEdge {
+                    source: "c".into(),
+                    relation: "GOVERNS".into(),
+                    target: "b".into(),
+                },
             ],
             explanation: "explanation".into(),
         };
@@ -406,10 +424,22 @@ mod tests {
     #[test]
     fn has_source_covers_every_shape_the_field_takes() {
         for absent in [json!({}), json!({ "kind": "rule" })] {
-            assert!(!has_source(&absent), "absent source is not provenance: {}", absent);
+            assert!(
+                !has_source(&absent),
+                "absent source is not provenance: {}",
+                absent
+            );
         }
-        for blank in [json!({ "source": null }), json!({ "source": "" }), json!({ "source": "  " })] {
-            assert!(!has_source(&blank), "blank source is not provenance: {}", blank);
+        for blank in [
+            json!({ "source": null }),
+            json!({ "source": "" }),
+            json!({ "source": "  " }),
+        ] {
+            assert!(
+                !has_source(&blank),
+                "blank source is not provenance: {}",
+                blank
+            );
         }
         for real in [
             json!({ "source": "owner 2026-10-08" }),

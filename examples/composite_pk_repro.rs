@@ -73,7 +73,10 @@ fn count(conn: &Connection, q: &str) -> Result<i64, String> {
 
 fn main() {
     println!("lbug composite primary key probe");
-    println!("Memory-shaped table, FLOAT[{}] embedding column.\n", DIMENSIONS);
+    println!(
+        "Memory-shaped table, FLOAT[{}] embedding column.\n",
+        DIMENSIONS
+    );
 
     // ---- Probe 1: does the engine accept a two-column PRIMARY KEY at all? ----
     println!("1. CREATE NODE TABLE ... PRIMARY KEY (namespace, id)");
@@ -109,7 +112,11 @@ fn main() {
             match count(&conn, "MATCH (m:Memory) WHERE m.id = 'src' RETURN count(m)") {
                 Ok(n) => probe(
                     &format!("both rows coexist (found {})", n),
-                    if n == 2 { Ok(()) } else { Err(format!("expected 2, found {}", n)) },
+                    if n == 2 {
+                        Ok(())
+                    } else {
+                        Err(format!("expected 2, found {}", n))
+                    },
                 ),
                 Err(e) => probe("count the rows", Err(e)),
             };
@@ -126,7 +133,11 @@ fn main() {
             match count(&conn, "MATCH (m:Memory) WHERE m.id = 'src' RETURN count(m)") {
                 Ok(n) => probe(
                     &format!("MERGE updated rather than inserted (found {})", n),
-                    if n == 2 { Ok(()) } else { Err(format!("expected 2, found {}", n)) },
+                    if n == 2 {
+                        Ok(())
+                    } else {
+                        Err(format!("expected 2, found {}", n))
+                    },
                 ),
                 Err(e) => probe("re-count the rows", Err(e)),
             };
@@ -166,13 +177,19 @@ fn main() {
             embedding_literal(seed)
         )
     };
-    probe("insert id 'src' into ProjectA", run(&conn2, &mk("ProjectA", 1)));
+    probe(
+        "insert id 'src' into ProjectA",
+        run(&conn2, &mk("ProjectA", 1)),
+    );
     let dup = run(&conn2, &mk("ProjectB", 2));
     probe(
         "second project REFUSED (a refusal is better than silent theft)",
         match dup {
             Err(e) => {
-                println!("        engine said: {}", e.lines().next().unwrap_or("").trim());
+                println!(
+                    "        engine said: {}",
+                    e.lines().next().unwrap_or("").trim()
+                );
                 Ok(())
             }
             Ok(()) => Err("the engine accepted a duplicate id -- it did not refuse".to_string()),
@@ -204,13 +221,26 @@ fn main() {
             embedding_literal(seed)
         )
     };
-    probe("path 'src' in ProjectA (uuid-a)", run(&conn3, &seed_row("uuid-a", "ProjectA", 1)));
-    probe("path 'src' in ProjectB (uuid-b)", run(&conn3, &seed_row("uuid-b", "ProjectB", 2)));
+    probe(
+        "path 'src' in ProjectA (uuid-a)",
+        run(&conn3, &seed_row("uuid-a", "ProjectA", 1)),
+    );
+    probe(
+        "path 'src' in ProjectB (uuid-b)",
+        run(&conn3, &seed_row("uuid-b", "ProjectB", 2)),
+    );
 
-    match count(&conn3, "MATCH (m:Memory) WHERE m.path = 'src' RETURN count(m)") {
+    match count(
+        &conn3,
+        "MATCH (m:Memory) WHERE m.path = 'src' RETURN count(m)",
+    ) {
         Ok(n) => probe(
             &format!("both projects hold a 'src' node (found {})", n),
-            if n == 2 { Ok(()) } else { Err(format!("expected 2, found {}", n)) },
+            if n == 2 {
+                Ok(())
+            } else {
+                Err(format!("expected 2, found {}", n))
+            },
         ),
         Err(e) => probe("count", Err(e)),
     };
@@ -228,10 +258,17 @@ fn main() {
     );
 
     if merge_ok {
-        match count(&conn3, "MATCH (m:Memory) WHERE m.path = 'src' RETURN count(m)") {
+        match count(
+            &conn3,
+            "MATCH (m:Memory) WHERE m.path = 'src' RETURN count(m)",
+        ) {
             Ok(n) => probe(
                 &format!("it updated rather than inserted (found {})", n),
-                if n == 2 { Ok(()) } else { Err(format!("expected 2, found {}", n)) },
+                if n == 2 {
+                    Ok(())
+                } else {
+                    Err(format!("expected 2, found {}", n))
+                },
             ),
             Err(e) => probe("re-count", Err(e)),
         };
@@ -274,10 +311,17 @@ fn main() {
     };
     probe("ProjectA::src", run(&conn4, &qualified("ProjectA", 1)));
     probe("ProjectB::src", run(&conn4, &qualified("ProjectB", 2)));
-    match count(&conn4, "MATCH (m:Memory) WHERE m.id ENDS WITH '::src' RETURN count(m)") {
+    match count(
+        &conn4,
+        "MATCH (m:Memory) WHERE m.id ENDS WITH '::src' RETURN count(m)",
+    ) {
         Ok(n) => probe(
             &format!("both coexist (found {})", n),
-            if n == 2 { Ok(()) } else { Err(format!("expected 2, found {}", n)) },
+            if n == 2 {
+                Ok(())
+            } else {
+                Err(format!("expected 2, found {}", n))
+            },
         ),
         Err(e) => probe("count", Err(e)),
     };
@@ -293,5 +337,8 @@ fn main() {
         Err(e) => probe("suffix resolution", Err(e)),
     };
 
-    println!("\nDone. Scratch databases are under {}", std::env::temp_dir().display());
+    println!(
+        "\nDone. Scratch databases are under {}",
+        std::env::temp_dir().display()
+    );
 }

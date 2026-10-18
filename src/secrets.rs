@@ -14,7 +14,11 @@ pub struct Rejection {
 
 impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ERROR [SECURITY]: Rejected {} ({}). Do not store secrets.", self.location, self.category)
+        write!(
+            f,
+            "ERROR [SECURITY]: Rejected {} ({}). Do not store secrets.",
+            self.location, self.category
+        )
     }
 }
 
@@ -160,9 +164,7 @@ impl SecretScanner {
         )?;
 
         // JWT: three base64url segments separated by dots.
-        let jwt_re = Regex::new(
-            r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+",
-        )?;
+        let jwt_re = Regex::new(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")?;
 
         Ok(Self {
             provider_re,
@@ -173,9 +175,7 @@ impl SecretScanner {
 
     fn instance() -> Option<&'static SecretScanner> {
         static SCANNER: OnceLock<Option<SecretScanner>> = OnceLock::new();
-        SCANNER
-            .get_or_init(|| SecretScanner::build().ok())
-            .as_ref()
+        SCANNER.get_or_init(|| SecretScanner::build().ok()).as_ref()
     }
 
     /// Scan a string for secrets. Returns `None` if clean or the scanner is
@@ -250,7 +250,11 @@ impl SecretScanner {
             // Weak password detection: next to password=, even low-entropy
             // values like "hunter2" must be caught. Check if this value looks
             // like a real password (>=4 chars, not all same char).
-            if value.len() >= 4 && !value.chars().all(|c| c == value.chars().next().unwrap_or('x')) {
+            if value.len() >= 4
+                && !value
+                    .chars()
+                    .all(|c| c == value.chars().next().unwrap_or('x'))
+            {
                 return Some(Rejection {
                     location: location.to_string(),
                     category: "password",
@@ -273,7 +277,9 @@ impl SecretScanner {
             Value::String(s) => self.scan_inner(s, location, depth),
             Value::Array(arr) => {
                 for (i, item) in arr.iter().enumerate() {
-                    if let Some(r) = self.scan_value_inner(item, &format!("{}.{}", location, i), depth + 1) {
+                    if let Some(r) =
+                        self.scan_value_inner(item, &format!("{}.{}", location, i), depth + 1)
+                    {
                         return Some(r);
                     }
                 }
@@ -342,24 +348,28 @@ impl SecretScanner {
                     }
                 }
                 // Determine category from prefix.
-                return Some(if lower.starts_with("ghp_") || lower.starts_with("gho_")
-                    || lower.starts_with("ghs_") || lower.starts_with("ghr_")
-                    || lower.starts_with("github_pat_")
-                {
-                    "github_pat"
-                } else if lower.starts_with("sk-ant-") {
-                    "anthropic_token"
-                } else if lower.starts_with("sk-proj-") {
-                    "openai_project_key"
-                } else if lower.starts_with("sk-") {
-                    "openai_key"
-                } else if lower.starts_with("xox") {
-                    "slack_token"
-                } else if lower.starts_with("akia") {
-                    "aws_access_key"
-                } else {
-                    "provider_token"
-                });
+                return Some(
+                    if lower.starts_with("ghp_")
+                        || lower.starts_with("gho_")
+                        || lower.starts_with("ghs_")
+                        || lower.starts_with("ghr_")
+                        || lower.starts_with("github_pat_")
+                    {
+                        "github_pat"
+                    } else if lower.starts_with("sk-ant-") {
+                        "anthropic_token"
+                    } else if lower.starts_with("sk-proj-") {
+                        "openai_project_key"
+                    } else if lower.starts_with("sk-") {
+                        "openai_key"
+                    } else if lower.starts_with("xox") {
+                        "slack_token"
+                    } else if lower.starts_with("akia") {
+                        "aws_access_key"
+                    } else {
+                        "provider_token"
+                    },
+                );
             }
         }
         None
@@ -383,7 +393,11 @@ fn is_placeholder(lower: &str) -> bool {
         return true;
     }
     // Repeated same character (e.g. "xxxx", "aaaa", "***").
-    if trimmed.len() >= 3 && trimmed.chars().all(|c| c == trimmed.chars().next().unwrap_or('x')) {
+    if trimmed.len() >= 3
+        && trimmed
+            .chars()
+            .all(|c| c == trimmed.chars().next().unwrap_or('x'))
+    {
         return true;
     }
     // Known placeholder strings: whole-value match for short patterns like
@@ -487,7 +501,8 @@ pub fn scan_entry_point(
         return Some(r);
     }
     // 2. Scan metadata recursively.
-    if let Some(r) = SecretScanner::scan_value(metadata, &format!("{}.metadata", entry_point_name)) {
+    if let Some(r) = SecretScanner::scan_value(metadata, &format!("{}.metadata", entry_point_name))
+    {
         return Some(r);
     }
     None
@@ -533,7 +548,10 @@ mod tests {
     #[test]
     fn openai_key_detected() {
         // sk- + base62, ~51 chars total
-        let token = format!("sk-{}", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".repeat(1));
+        let token = format!(
+            "sk-{}",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".repeat(1)
+        );
         let r = SecretScanner::scan_str(&token, "content");
         // This is 4+62 = 66 chars, well over min_len=40
         assert!(r.is_some(), "sk- key should be detected");
@@ -541,7 +559,10 @@ mod tests {
 
     #[test]
     fn openai_project_key_detected() {
-        let token = format!("sk-proj-{}", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".repeat(2));
+        let token = format!(
+            "sk-proj-{}",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".repeat(2)
+        );
         let r = SecretScanner::scan_str(&token, "content").unwrap();
         assert_eq!(r.category, "openai_project_key");
     }
@@ -764,7 +785,11 @@ mod tests {
         let meta = json!({ "governs": ["src/daemon.rs"] });
 
         for entry in &["add_memory", "supersede_memory", "edit_memory"] {
-            assert!(scan_entry_point(clean, &meta, entry).is_none(), "{} should pass", entry);
+            assert!(
+                scan_entry_point(clean, &meta, entry).is_none(),
+                "{} should pass",
+                entry
+            );
         }
     }
 

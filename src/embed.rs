@@ -1,7 +1,7 @@
 use crate::traits::Embedder;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, TextInitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -75,10 +75,10 @@ fn find_existing_cache_dir() -> PathBuf {
     // every candidate below into a relative path, which is how a 523 MB model
     // cache ends up inside the caller's working directory.
     let home_path = dirs::home_dir().unwrap_or_default();
-    
+
     // Adopt the Neuro cache pattern: share models across all Neuro* tools
     let primary_neuro_cache = home_path.join(".cache/neuro/models/fastembed");
-    
+
     // Other common fastembed caches we should check to avoid re-downloading
     let cache_dirs = vec![
         primary_neuro_cache.clone(),
@@ -87,7 +87,12 @@ fn find_existing_cache_dir() -> PathBuf {
     ];
 
     for dir in cache_dirs {
-        if dir.exists() && dir.read_dir().map(|mut i| i.next().is_some()).unwrap_or(false) {
+        if dir.exists()
+            && dir
+                .read_dir()
+                .map(|mut i| i.next().is_some())
+                .unwrap_or(false)
+        {
             return dir; // Return the first valid existing cache directory
         }
     }
@@ -133,12 +138,16 @@ impl FastEmbedder {
             .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
 
         let cache_dir = find_existing_cache_dir();
-        
+
         if !cache_dir.exists() {
-            fs::create_dir_all(&cache_dir).context("Failed to create shared model cache directory")?;
+            fs::create_dir_all(&cache_dir)
+                .context("Failed to create shared model cache directory")?;
         }
 
-        eprintln!("Initializing FastEmbedder with model: {} using cache: {:?}", target_model.model_name, cache_dir);
+        eprintln!(
+            "Initializing FastEmbedder with model: {} using cache: {:?}",
+            target_model.model_name, cache_dir
+        );
 
         // fastembed defaults to 512 tokens regardless of what the model supports
         // (NomicEmbedTextV15 handles 8192), and truncates silently. Anything above
@@ -150,8 +159,8 @@ impl FastEmbedder {
                 .with_max_length(MAX_EMBED_TOKENS)
                 .with_show_download_progress(true),
         )?;
-        
-        Ok(Self { 
+
+        Ok(Self {
             model: Arc::new(Mutex::new(model)),
             dimensions: target_model.dimensions,
         })
@@ -166,8 +175,12 @@ impl Embedder for FastEmbedder {
         let model = Arc::clone(&self.model);
         let text = text.to_owned();
         let mut embeddings = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>> {
-            let mut guard = model.lock().map_err(|e| anyhow::anyhow!("model lock poisoned: {}", e))?;
-            guard.embed(vec![&*text], None).context("fastembed embed call failed")
+            let mut guard = model
+                .lock()
+                .map_err(|e| anyhow::anyhow!("model lock poisoned: {}", e))?;
+            guard
+                .embed(vec![&*text], None)
+                .context("fastembed embed call failed")
         })
         .await
         .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
@@ -188,12 +201,17 @@ pub struct RemoteEmbedder {
 }
 
 impl RemoteEmbedder {
-    pub fn new(base_url: String, api_key: String, api_model: String, dimensions: usize) -> Result<Self> {
+    pub fn new(
+        base_url: String,
+        api_key: String,
+        api_model: String,
+        dimensions: usize,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to create HTTP client")?;
-        
+
         Ok(Self {
             client,
             base_url,
@@ -202,7 +220,7 @@ impl RemoteEmbedder {
             dimensions,
         })
     }
-    
+
     async fn embed_with_retry(&self, text: &str) -> Result<Vec<f32>> {
         let mut attempts = 0;
         loop {
@@ -224,9 +242,10 @@ impl RemoteEmbedder {
             }
         }
     }
-    
+
     async fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
-        let response = self.client
+        let response = self
+            .client
             .post(&format!("{}/embeddings", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&serde_json::json!({
@@ -236,13 +255,13 @@ impl RemoteEmbedder {
             .send()
             .await
             .context("HTTP request failed")?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(anyhow::anyhow!("API error {}: {}", status, body));
         }
-        
+
         let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
         let embedding = json["data"][0]["embedding"]
             .as_array()
@@ -250,7 +269,7 @@ impl RemoteEmbedder {
             .iter()
             .map(|v| v.as_f64().unwrap_or(0.0) as f32)
             .collect();
-        
+
         Ok(embedding)
     }
 }
@@ -260,7 +279,7 @@ impl Embedder for RemoteEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_with_retry(text).await
     }
-    
+
     fn dimensions(&self) -> usize {
         self.dimensions
     }
@@ -268,14 +287,20 @@ impl Embedder for RemoteEmbedder {
 
 pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
     let target_model = configured_model()?;
-    
-    if let (Some(base_url), Some(api_key_env)) = (&target_model.base_url, &target_model.api_key_env) {
+
+    if let (Some(base_url), Some(api_key_env)) = (&target_model.base_url, &target_model.api_key_env)
+    {
         let api_key = std::env::var(api_key_env)
             .with_context(|| format!("API key env var {} not set", api_key_env))?;
-        let api_model = target_model.api_model.clone()
+        let api_model = target_model
+            .api_model
+            .clone()
             .unwrap_or_else(|| "text-embedding-3-small".to_string());
-        
-        eprintln!("Initializing RemoteEmbedder with model: {} at {}", api_model, base_url);
+
+        eprintln!(
+            "Initializing RemoteEmbedder with model: {} at {}",
+            api_model, base_url
+        );
         Ok(Arc::new(RemoteEmbedder::new(
             base_url.clone(),
             api_key,
@@ -323,7 +348,8 @@ mod tests {
             "test-key".to_string(),
             "test-model".to_string(),
             768,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(embedder.dimensions(), 768);
     }
 

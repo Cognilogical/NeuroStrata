@@ -76,7 +76,9 @@ impl std::fmt::Display for ArchiveOutcome {
             ArchiveOutcome::NotFound { namespace, id } => {
                 write!(f, "No memory with id {} in namespace {}.", id, namespace)
             }
-            ArchiveOutcome::Invalid(reason) | ArchiveOutcome::Failed(reason) => write!(f, "{}", reason),
+            ArchiveOutcome::Invalid(reason) | ArchiveOutcome::Failed(reason) => {
+                write!(f, "{}", reason)
+            }
         }
     }
 }
@@ -125,12 +127,7 @@ pub async fn archive_memory(
 
     let (vector, mut payload) = match store.get(&namespace, &id).await {
         Ok(Some(found)) => found,
-        Ok(None) => {
-            return ArchiveOutcome::NotFound {
-                namespace,
-                id,
-            }
-        }
+        Ok(None) => return ArchiveOutcome::NotFound { namespace, id },
         Err(e) => return ArchiveOutcome::Failed(format!("Failed to read memory {}: {}", id, e)),
     };
     // A legacy scalar/string metadata cannot carry the tombstone without
@@ -151,13 +148,19 @@ pub async fn archive_memory(
         .metadata
         .as_object_mut()
         .expect("object checked above")
-        .insert("archived_at".to_string(), serde_json::json!(chrono::Utc::now().timestamp()));
+        .insert(
+            "archived_at".to_string(),
+            serde_json::json!(chrono::Utc::now().timestamp()),
+        );
     if let Err(e) = store.upsert(&namespace, &id, vector, payload).await {
         return ArchiveOutcome::Failed(format!("Failed to archive memory {}: {}", id, e));
     }
 
     bus.emit(
-        ThalamicPulse::Archived { id: id.clone(), namespace: namespace.clone() },
+        ThalamicPulse::Archived {
+            id: id.clone(),
+            namespace: namespace.clone(),
+        },
         &RecursionToken::root(),
     );
 
@@ -195,7 +198,9 @@ mod tests {
 
     /// Seeds a throwaway row in the `global` namespace. The store is fresh
     /// per call so tests cannot read each other's writes.
-    async fn seed_global_row(tag: &str) -> (std::sync::Arc<dyn crate::traits::VectorStore>, String) {
+    async fn seed_global_row(
+        tag: &str,
+    ) -> (std::sync::Arc<dyn crate::traits::VectorStore>, String) {
         use crate::traits::VectorStore;
         let dir = std::env::temp_dir().join(format!(
             "ns-archive-allow-global-{tag}-{}",
@@ -246,7 +251,11 @@ mod tests {
             "the refusal class is Invalid, not Archived: {outcome:?}"
         );
         // The row is unchanged -- no metadata.archived, no pulse.
-        let (_, payload) = store.get("global", &id).await.unwrap().expect("still present");
+        let (_, payload) = store
+            .get("global", &id)
+            .await
+            .unwrap()
+            .expect("still present");
         assert!(
             !crate::handlers::archive_memory::is_archived(&payload),
             "the row's metadata still says live"
@@ -269,8 +278,15 @@ mod tests {
             bus.clone(),
         )
         .await;
-        assert!(outcome.is_archived(), "the archive really lands: {outcome:?}");
-        let (_, payload) = store.get("global", &id).await.unwrap().expect("still present");
+        assert!(
+            outcome.is_archived(),
+            "the archive really lands: {outcome:?}"
+        );
+        let (_, payload) = store
+            .get("global", &id)
+            .await
+            .unwrap()
+            .expect("still present");
         assert!(crate::handlers::archive_memory::is_archived(&payload));
     }
 
@@ -313,7 +329,10 @@ mod tests {
             bus,
         )
         .await;
-        assert!(outcome.is_archived(), "project-local archive proceeds without the flag: {outcome:?}");
+        assert!(
+            outcome.is_archived(),
+            "project-local archive proceeds without the flag: {outcome:?}"
+        );
     }
 
     /// The error message is specific: it names the namespace, names the
@@ -334,7 +353,10 @@ mod tests {
             other => panic!("expected Invalid, got {other:?}"),
         };
         assert!(message.contains("global"), "names the namespace: {message}");
-        assert!(message.contains("allow_global"), "names the flag: {message}");
+        assert!(
+            message.contains("allow_global"),
+            "names the flag: {message}"
+        );
     }
 
     /// Read-time filter helper. The tombstone (`metadata.archived: true`) is
@@ -383,7 +405,10 @@ mod tests {
         // requires) and the field it sets.
         let mut p = payload_fixture();
         p.metadata = json!({ "archived": true, "archived_at": 1_700_000_000 });
-        assert!(is_archived(&p), "the field archive_memory writes reads as archived");
+        assert!(
+            is_archived(&p),
+            "the field archive_memory writes reads as archived"
+        );
     }
 
     fn payload_fixture() -> MemoryPayload {

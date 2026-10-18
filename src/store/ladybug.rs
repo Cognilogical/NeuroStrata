@@ -84,7 +84,9 @@ fn unverified_config() -> SystemConfig {
 /// the right choice where an unreadable WAL should be investigated rather than
 /// recovered.
 fn strict_wal_verification() -> bool {
-    std::env::var("NEUROSTRATA_STRICT_WAL").map(|v| v == "1").unwrap_or(false)
+    std::env::var("NEUROSTRATA_STRICT_WAL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 fn is_wal_integrity_failure(err: &str) -> bool {
@@ -119,7 +121,10 @@ fn preserve_unclean_wal(local_path: &std::path::Path) {
         size
     );
     match std::fs::copy(&wal_file, &copy_file) {
-        Ok(_) => eprintln!("A copy was kept at {:?} in case recovery is incomplete.", copy_file),
+        Ok(_) => eprintln!(
+            "A copy was kept at {:?} in case recovery is incomplete.",
+            copy_file
+        ),
         Err(e) => eprintln!("WARNING: could not keep a copy of it: {}", e),
     }
 }
@@ -182,7 +187,10 @@ impl LadybugStore {
                     return Err(e.into());
                 }
 
-                eprintln!("ERROR: the write-ahead log failed verification: {}", err_msg);
+                eprintln!(
+                    "ERROR: the write-ahead log failed verification: {}",
+                    err_msg
+                );
 
                 if strict_wal_verification() {
                     return Err(anyhow::anyhow!(
@@ -220,9 +228,13 @@ impl LadybugStore {
                         corrupted_path.push(format!(".corrupted.{}", timestamp));
                         let corrupted_file = std::path::PathBuf::from(corrupted_path);
 
-                        let dropped_bytes = std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
+                        let dropped_bytes =
+                            std::fs::metadata(&wal_file).map(|m| m.len()).unwrap_or(0);
                         std::fs::rename(&wal_file, &corrupted_file).map_err(|err| {
-                            anyhow::anyhow!("Recovery failed: could not move the unreadable WAL file: {}", err)
+                            anyhow::anyhow!(
+                                "Recovery failed: could not move the unreadable WAL file: {}",
+                                err
+                            )
                         })?;
 
                         eprintln!(
@@ -231,8 +243,9 @@ impl LadybugStore {
                         );
                         eprintln!("ERROR: they were kept at {:?} -- do not delete it if those writes mattered.", corrupted_file);
                         // No WAL left to verify at this point.
-                        Database::new(&local_path, verifying_config())
-                            .map_err(|last_e| anyhow::anyhow!("Retry failed after discarding the WAL: {}", last_e))?
+                        Database::new(&local_path, verifying_config()).map_err(|last_e| {
+                            anyhow::anyhow!("Retry failed after discarding the WAL: {}", last_e)
+                        })?
                     }
                 }
             }
@@ -288,7 +301,8 @@ impl LadybugStore {
             // handing the caller a failure it can do nothing about.
             let mut attempt = 0;
             loop {
-                let (returned, result) = Self::write_owning_turn(db.clone(), turn, f.clone()).await?;
+                let (returned, result) =
+                    Self::write_owning_turn(db.clone(), turn, f.clone()).await?;
                 turn = returned;
 
                 match result {
@@ -309,7 +323,11 @@ impl LadybugStore {
 
         if outcome.is_err() {
             WRITES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("DIAGNOSTIC: gave up waiting on {} -- engine: {}", what, engine_stats());
+            eprintln!(
+                "DIAGNOSTIC: gave up waiting on {} -- engine: {}",
+                what,
+                engine_stats()
+            );
         }
 
         // Marked whatever the outcome: a write that timed out may still land,
@@ -393,7 +411,9 @@ struct WriteShapeWarning {
 
 /// Validates a memory payload's metadata shape and extracts edge specs.
 /// Returns the valid edge specs and any shape warnings (never rejects the write).
-fn parse_edge_specs(payload: &crate::traits::MemoryPayload) -> (Vec<EdgeSpec>, Vec<WriteShapeWarning>) {
+fn parse_edge_specs(
+    payload: &crate::traits::MemoryPayload,
+) -> (Vec<EdgeSpec>, Vec<WriteShapeWarning>) {
     let mut specs = Vec::new();
     let mut warnings = Vec::new();
 
@@ -439,7 +459,8 @@ fn parse_edge_specs(payload: &crate::traits::MemoryPayload) -> (Vec<EdgeSpec>, V
                         Value::String(s) if s.trim().is_empty() => {
                             warnings.push(WriteShapeWarning {
                                 field: format!("{}.{}", key, i),
-                                why: "relation target must contain a non-whitespace character".to_string(),
+                                why: "relation target must contain a non-whitespace character"
+                                    .to_string(),
                                 skipped: "this edge declaration".to_string(),
                             });
                         }
@@ -447,11 +468,13 @@ fn parse_edge_specs(payload: &crate::traits::MemoryPayload) -> (Vec<EdgeSpec>, V
                             // (D) qualified syntax check
                             if let Some(pos) = s.find(crate::parser::ingest::NAMESPACE_SEPARATOR) {
                                 let ns_part = &s[..pos];
-                                let id_part = &s[pos + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
+                                let id_part =
+                                    &s[pos + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
                                 if ns_part.trim().is_empty() || id_part.trim().is_empty() {
                                     warnings.push(WriteShapeWarning {
                                         field: format!("{}.{}", key, i),
-                                        why: "qualified target needs a namespace and local ID".to_string(),
+                                        why: "qualified target needs a namespace and local ID"
+                                            .to_string(),
                                         skipped: "this edge declaration".to_string(),
                                     });
                                     continue;
@@ -494,13 +517,16 @@ fn write_shape_warnings(payload: &crate::traits::MemoryPayload) -> Vec<WriteShap
 
 /// Emits one shape warning to stderr in the required JSON format.
 fn emit_write_shape_warning(namespace: &str, id: &str, warning: &WriteShapeWarning) {
-    eprintln!("[neurostrata:write-shape] {}", serde_json::json!({
-        "namespace": namespace,
-        "id": id,
-        "field": warning.field,
-        "why": warning.why,
-        "skipped": warning.skipped,
-    }));
+    eprintln!(
+        "[neurostrata:write-shape] {}",
+        serde_json::json!({
+            "namespace": namespace,
+            "id": id,
+            "field": warning.field,
+            "why": warning.why,
+            "skipped": warning.skipped,
+        })
+    );
 }
 
 /// Exact ID lookup for qualified target resolution.
@@ -648,8 +674,13 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
 /// lives, or record that a machine operation happened, not what it says, so
 /// they carry no meaning for a similarity search: directory ingestion's nodes,
 /// and the thalamic bus's sentinel and audit rows.
-const STRUCTURAL_MEMORY_TYPES: [&str; 5] =
-    ["directory", "file", "markdown", "freshness_flag", "guard_event"];
+const STRUCTURAL_MEMORY_TYPES: [&str; 5] = [
+    "directory",
+    "file",
+    "markdown",
+    "freshness_flag",
+    "guard_event",
+];
 
 /// Ranking gain for a memory that carries `metadata.source` (FEATURE-4).
 ///
@@ -662,19 +693,25 @@ const SOURCE_RANK_GAIN: f32 = 0.05;
 
 /// Normalize an evidence path for dedup. RELATES_TO edges have their
 /// endpoints sorted lexicographically; GOVERNS/CONTAINS are order-sensitive.
-fn norm_path(edges: &[crate::traits::EvidenceEdge], kind: &crate::traits::EvidenceKind) -> Vec<(String, String, String)> {
-    edges.iter().map(|e| {
-        if *kind == crate::traits::EvidenceKind::OneHop && e.relation == "RELATES_TO" {
-            let (a, b) = if e.source <= e.target {
-                (e.source.clone(), e.target.clone())
+fn norm_path(
+    edges: &[crate::traits::EvidenceEdge],
+    kind: &crate::traits::EvidenceKind,
+) -> Vec<(String, String, String)> {
+    edges
+        .iter()
+        .map(|e| {
+            if *kind == crate::traits::EvidenceKind::OneHop && e.relation == "RELATES_TO" {
+                let (a, b) = if e.source <= e.target {
+                    (e.source.clone(), e.target.clone())
+                } else {
+                    (e.target.clone(), e.source.clone())
+                };
+                (a, e.relation.clone(), b)
             } else {
-                (e.target.clone(), e.source.clone())
-            };
-            (a, e.relation.clone(), b)
-        } else {
-            (e.source.clone(), e.relation.clone(), e.target.clone())
-        }
-    }).collect()
+                (e.source.clone(), e.relation.clone(), e.target.clone())
+            }
+        })
+        .collect()
 }
 
 fn escape_ladybug_string(s: &str) -> String {
@@ -699,7 +736,11 @@ const RELINK_BATCH: usize = 500;
 /// It also reports the truth. The loop this replaces counted statements that
 /// did not error -- including every one whose MATCH found nothing -- so an
 /// ingest that linked nothing still announced hundreds of relinked edges.
-fn create_missing_edges(conn: &Connection, rel_type: &str, pairs: &[(String, String)]) -> Result<usize> {
+fn create_missing_edges(
+    conn: &Connection,
+    rel_type: &str,
+    pairs: &[(String, String)],
+) -> Result<usize> {
     let existing = conn.query(&format!(
         "MATCH (x:Memory)-[:{}]->(y:Memory) RETURN x.id, y.id",
         rel_type
@@ -821,7 +862,7 @@ impl VectorStore for LadybugStore {
             let safe_location = escape_ladybug_string(&payload.location);
             let safe_location_lines = escape_ladybug_string(&payload.location_lines);
             let safe_metadata = escape_ladybug_string(&serde_json::to_string(&payload.metadata)?);
-        
+
             let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
 
             let insert_query = format!(
@@ -840,7 +881,7 @@ impl VectorStore for LadybugStore {
             }
 
             let mut deferred_edges = Vec::new();
-        
+
             // Materialise the edges this memory declares. A target that does not exist
             // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
             // That is deliberate -- a rule may name a file the ingester has not reached.
@@ -1290,7 +1331,9 @@ impl VectorStore for LadybugStore {
         // An ingested node's id names the namespace that owns it, and the next
         // ingest of that namespace would MERGE onto the moved row and update it
         // where it now sits -- the cross-project theft qualified ids exist to stop.
-        if payload.user_id == "auto-ingestor" || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+        if payload.user_id == "auto-ingestor"
+            || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+        {
             return Ok(RelocateOutcome::Ingested);
         }
 
@@ -1333,7 +1376,10 @@ impl VectorStore for LadybugStore {
         let wal = std::path::PathBuf::from(wal);
         if wal.exists() {
             std::fs::copy(&wal, dir.join("ladybug.store.wal")).map_err(|e| {
-                anyhow::anyhow!("could not copy the write-ahead log into the snapshot: {}", e)
+                anyhow::anyhow!(
+                    "could not copy the write-ahead log into the snapshot: {}",
+                    e
+                )
             })?;
         }
         let manifest = serde_json::json!({
@@ -1467,7 +1513,7 @@ impl VectorStore for LadybugStore {
         let user_id = user_id.map(|v| v.to_string());
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
-        
+
             let query = if let Some(uid) = user_id {
                 format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, escape_ladybug_string(&uid))
             } else {
@@ -1518,9 +1564,9 @@ impl VectorStore for LadybugStore {
             let safe_id = escape_ladybug_string(&id);
 
             let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
-        
+
             let mut result = conn.query(&query)?;
-        
+
             if let Some(row) = result.next() {
                 // The column is FLOAT[N], a fixed-size ARRAY, so the engine hands
                 // back Value::Array. Matching only Value::List meant this always
@@ -1538,7 +1584,7 @@ impl VectorStore for LadybugStore {
                         }
                     }
                 }
-            
+
                 let content: String = format!("{}", row[1]);
                 let uid: String = format!("{}", row[2]);
                 let memory_type: String = format!("{}", row[3]);
@@ -1574,14 +1620,14 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
             let mut result = conn.query(query)?;
-        
+
             let mut namespaces = Vec::new();
             while let Some(row) = result.next() {
                 if let lbug::Value::String(ns) = row[0].clone() {
                     namespaces.push(ns);
                 }
             }
-        
+
             Ok(namespaces)
         })
         .await
@@ -1604,14 +1650,14 @@ impl VectorStore for LadybugStore {
             let mut retired_ids = std::collections::HashSet::new();
             let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
             let mut result_nodes = conn.query(query_nodes)?;
-        
+
             while let Some(row) = result_nodes.next() {
                 let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
                 let memory_type = if let lbug::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
                 let content = if let lbug::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
                 let location = if let lbug::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
-            
+
                 let mut absolute_path = "".to_string();
                 let mut domain = None;
                 let mut retired = false;
@@ -1688,11 +1734,11 @@ impl VectorStore for LadybugStore {
                     "superseded_by": superseded_by,
                 }));
             }
-        
+
             // 2. Fetch all edges, filtering out any incident on a retired node
             //    in active view.
             let mut links = Vec::new();
-        
+
             // RELATES_TO
             let query_relates = "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) RETURN a.id, b.id;";
             let mut res_relates = conn.query(query_relates)?;
@@ -1708,7 +1754,7 @@ impl VectorStore for LadybugStore {
                     "type": "RELATES_TO"
                 }));
             }
-        
+
             // CONTAINS
             let query_contains = "MATCH (a:Memory)-[r:CONTAINS]->(b:Memory) RETURN a.id, b.id;";
             let mut res_contains = conn.query(query_contains)?;
@@ -1724,7 +1770,7 @@ impl VectorStore for LadybugStore {
                     "type": "CONTAINS"
                 }));
             }
-        
+
             // GOVERNS
             let query_governs = "MATCH (a:Memory)-[r:GOVERNS]->(b:Memory) RETURN a.id, b.id;";
             let mut res_governs = conn.query(query_governs)?;
@@ -1813,8 +1859,10 @@ impl VectorStore for LadybugStore {
 /// now. If that number climbs and does not come down, a deadline that could not
 /// cancel its statement has left the work running, which is the hypothesis these
 /// were added to test (bead neurostrata-4nk).
-pub static ENGINE_CALLS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ENGINE_CALLS_STARTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// Writes whose caller gave up. The statement may still be running.
 pub static WRITES_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Times the engine refused a second write transaction.
@@ -1880,9 +1928,7 @@ fn is_retired(metadata: &Value) -> bool {
 /// capture `now` once instead of calling Utc::now() per row.
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
     match metadata.get("valid_to") {
-        Some(valid_to) if !valid_to.is_null() => {
-            valid_to.as_i64().unwrap_or(0) <= now
-        }
+        Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
         _ => false,
     }
 }
@@ -1989,8 +2035,14 @@ fn bump_access_count(metadata: &str) -> String {
         value = serde_json::json!({});
     }
     if let Some(obj) = value.as_object_mut() {
-        let count = obj.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        obj.insert("access_count".to_string(), serde_json::json!(count.saturating_add(1)));
+        let count = obj
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        obj.insert(
+            "access_count".to_string(),
+            serde_json::json!(count.saturating_add(1)),
+        );
     }
     value.to_string()
 }
@@ -2030,8 +2082,14 @@ mod tests {
             .export_database(&out.to_string_lossy())
             .await
             .expect("EXPORT snapshot on a fresh store");
-        assert!(out.join("ladybug.store").exists(), "the store file is in the snapshot");
-        assert!(out.join("manifest.json").exists(), "the snapshot carries a manifest");
+        assert!(
+            out.join("ladybug.store").exists(),
+            "the store file is in the snapshot"
+        );
+        assert!(
+            out.join("manifest.json").exists(),
+            "the snapshot carries a manifest"
+        );
     }
 
     #[test]
@@ -2042,15 +2100,22 @@ mod tests {
 
     #[test]
     fn a_legacy_absolute_declaration_finds_the_file_it_meant() {
-        let known = vec!["src/store/ladybug.rs".to_string(), "src/daemon.rs".to_string()];
+        let known = vec![
+            "src/store/ladybug.rs".to_string(),
+            "src/daemon.rs".to_string(),
+        ];
         assert_eq!(
             resolve("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
             Some("src/store/ladybug.rs")
         );
         // Backslashes are the same path, written the way Windows hands it over.
         assert_eq!(
-            resolve(r"C:\dev\projects
-eurostrata\src\daemon.rs", &known).as_deref(),
+            resolve(
+                r"C:\dev\projects
+eurostrata\src\daemon.rs",
+                &known
+            )
+            .as_deref(),
             Some("src/daemon.rs")
         );
     }
@@ -2058,7 +2123,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn an_exact_declaration_is_returned_untouched() {
         let known = vec!["src/daemon.rs".to_string()];
-        assert_eq!(resolve("src/daemon.rs", &known).as_deref(), Some("src/daemon.rs"));
+        assert_eq!(
+            resolve("src/daemon.rs", &known).as_deref(),
+            Some("src/daemon.rs")
+        );
     }
 
     /// The migration doctor prescribes is a re-ingest, which qualifies every
@@ -2073,7 +2141,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             resolve("C:/dev/projects/neurostrata/src/store/ladybug.rs", &known).as_deref(),
             Some("probe::src/store/ladybug.rs")
         );
-        assert_eq!(resolve("C:/old/mylib.rs", &["probe::lib.rs".to_string()]), None);
+        assert_eq!(
+            resolve("C:/old/mylib.rs", &["probe::lib.rs".to_string()]),
+            None
+        );
         assert_eq!(
             resolve(
                 "C:/old/src/a.rs",
@@ -2136,10 +2207,14 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             Ok::<(), anyhow::Error>(())
         };
 
-        let err = bounded("deleting a memory", std::time::Duration::from_millis(50), slow)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = bounded(
+            "deleting a memory",
+            std::time::Duration::from_millis(50),
+            slow,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("the database is busy"), "{}", err);
         assert!(err.contains("deleting a memory"), "{}", err);
@@ -2155,10 +2230,14 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         let lock = tokio::sync::Mutex::new(());
         let held = lock.lock().await;
 
-        let err = bounded("writing a memory", std::time::Duration::from_millis(50), async {
-            let _turn = lock.lock().await;
-            Ok::<(), anyhow::Error>(())
-        })
+        let err = bounded(
+            "writing a memory",
+            std::time::Duration::from_millis(50),
+            async {
+                let _turn = lock.lock().await;
+                Ok::<(), anyhow::Error>(())
+            },
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -2184,10 +2263,14 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             drop(turn);
         });
 
-        let err = bounded("writing a memory", std::time::Duration::from_millis(20), async {
-            let _held = Arc::clone(&lock).lock_owned().await;
-            Ok::<(), anyhow::Error>(())
-        })
+        let err = bounded(
+            "writing a memory",
+            std::time::Duration::from_millis(20),
+            async {
+                let _held = Arc::clone(&lock).lock_owned().await;
+                Ok::<(), anyhow::Error>(())
+            },
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -2227,7 +2310,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
 
     #[test]
     fn a_first_read_starts_the_count_at_one() {
-        assert_eq!(bump_access_count("{}"), json!({"access_count": 1}).to_string());
+        assert_eq!(
+            bump_access_count("{}"),
+            json!({"access_count": 1}).to_string()
+        );
     }
 
     #[test]
@@ -2306,7 +2392,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
                 }),
             );
             payload.location = "src/lib.rs".to_string();
-            store.upsert("probe", id, vec![0.0; 4], payload).await.unwrap();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
         }
 
         let graph = store
@@ -2363,7 +2452,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         // Targets first: the write-shape validator refuses edges whose target
         // row does not exist yet.
         store
-            .upsert("probe", "task-1", zero.clone(), retired_test_payload("task", "agent", json!({})))
+            .upsert(
+                "probe",
+                "task-1",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
             .await
             .unwrap();
         store
@@ -2389,12 +2483,18 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let all = store.export_graph(true, false, &std::collections::HashMap::new(), None).await.unwrap();
+        let all = store
+            .export_graph(true, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
         let nodes = all["nodes"].as_array().unwrap();
         let old = nodes.iter().find(|n| n["id"] == "old-rule").unwrap();
         assert_eq!(old["superseded"], true);
         assert_eq!(old["superseded_by"], "new-rule");
-        assert!(old["metadata"]["related_to"].is_array(), "metadata travels with the node");
+        assert!(
+            old["metadata"]["related_to"].is_array(),
+            "metadata travels with the node"
+        );
         let new = nodes.iter().find(|n| n["id"] == "new-rule").unwrap();
         assert_eq!(new["superseded"], false);
         assert_eq!(new["superseded_by"], serde_json::Value::Null);
@@ -2405,9 +2505,20 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             "the consolidation edge is part of the graph"
         );
 
-        let active = store.export_graph(false, false, &std::collections::HashMap::new(), None).await.unwrap();
-        let ids: Vec<_> = active["nodes"].as_array().unwrap().iter().map(|n| n["id"].clone()).collect();
-        assert!(!ids.contains(&json!("old-rule")), "--exclude-superseded drops retired rows");
+        let active = store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        let ids: Vec<_> = active["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].clone())
+            .collect();
+        assert!(
+            !ids.contains(&json!("old-rule")),
+            "--exclude-superseded drops retired rows"
+        );
     }
 
     #[tokio::test]
@@ -2419,22 +2530,45 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         // Both rules are written before the file exists, so only relinking can
         // give them edges.
         store
-            .upsert("probe", "retired-rule", zero.clone(), retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })))
+            .upsert(
+                "probe",
+                "retired-rule",
+                zero.clone(),
+                retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "live-rule", zero.clone(), retired_test_payload("rule", "agent", json!({ "governs": [file] })))
+            .upsert(
+                "probe",
+                "live-rule",
+                zero.clone(),
+                retired_test_payload("rule", "agent", json!({ "governs": [file] })),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", file, zero, retired_test_payload("file", "auto-ingestor", json!({})))
+            .upsert(
+                "probe",
+                file,
+                zero,
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
             .await
             .unwrap();
 
         store.relink_edges("probe").await.expect("relink");
 
-        assert_eq!(governs_edges_from(&store, "live-rule").await, 1, "a live rule is relinked");
-        assert_eq!(governs_edges_from(&store, "retired-rule").await, 0, "a retired rule is not");
+        assert_eq!(
+            governs_edges_from(&store, "live-rule").await,
+            1,
+            "a live rule is relinked"
+        );
+        assert_eq!(
+            governs_edges_from(&store, "retired-rule").await,
+            0,
+            "a retired rule is not"
+        );
     }
 
     #[tokio::test]
@@ -2443,15 +2577,34 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         let file = "probe::src/a.rs";
 
         store
-            .upsert("probe", file, vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .upsert(
+                "probe",
+                file,
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "symbol", vec![1.1, 0.0, 0.0, 0.0], retired_test_payload("code_ast", "auto-ingestor", json!({ "contained_by": [file] })))
+            .upsert(
+                "probe",
+                "symbol",
+                vec![1.1, 0.0, 0.0, 0.0],
+                retired_test_payload(
+                    "code_ast",
+                    "auto-ingestor",
+                    json!({ "contained_by": [file] }),
+                ),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "retired-rule", vec![0.0, 1.0, 0.0, 0.0], retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })))
+            .upsert(
+                "probe",
+                "retired-rule",
+                vec![0.0, 1.0, 0.0, 0.0],
+                retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })),
+            )
             .await
             .unwrap();
 
@@ -2468,7 +2621,11 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .collect();
 
         assert!(ids.contains(&"symbol".to_string()), "{:?}", ids);
-        assert!(!ids.contains(&"retired-rule".to_string()), "a retired rule stays retired: {:?}", ids);
+        assert!(
+            !ids.contains(&"retired-rule".to_string()),
+            "a retired rule stays retired: {:?}",
+            ids
+        );
     }
 
     #[test]
@@ -2486,15 +2643,19 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             pick_declared_target("probe", "C:/old/src/a.rs", &["probe::src/a.rs".to_string()]),
             crate::traits::TargetResolution::Resolved(ref id) if id == "probe::src/a.rs"
         ));
-        assert!(matches!(
-            pick_declared_target(
-                "probe",
-                "C:/old/src/a.rs",
-                &["probe::src/a.rs".to_string(), "probe::a.rs".to_string()]
+        assert!(
+            matches!(
+                pick_declared_target(
+                    "probe",
+                    "C:/old/src/a.rs",
+                    &["probe::src/a.rs".to_string(), "probe::a.rs".to_string()]
+                ),
+                crate::traits::TargetResolution::Ambiguous(_)
             ),
-            crate::traits::TargetResolution::Ambiguous(_)
-        ), "an ambiguous suffix is left alone");
-        assert!(declared_target_candidates("probe", "C:/old/src/a.rs").contains(&"probe::src/a.rs".to_string()));
+            "an ambiguous suffix is left alone"
+        );
+        assert!(declared_target_candidates("probe", "C:/old/src/a.rs")
+            .contains(&"probe::src/a.rs".to_string()));
     }
 
     #[tokio::test]
@@ -2517,7 +2678,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         assert_eq!(report.id, "rule-with-deferred-edge");
         assert_eq!(report.deferred_edges.len(), 1);
         assert_eq!(report.deferred_edges[0].rel_type, "GOVERNS");
-        assert_eq!(report.deferred_edges[0].declared_target, "src/not-ingested.rs");
+        assert_eq!(
+            report.deferred_edges[0].declared_target,
+            "src/not-ingested.rs"
+        );
         assert_eq!(report.deferred_edges[0].declaration_index, 0);
         assert!(matches!(
             report.deferred_edges[0].resolution,
@@ -2532,11 +2696,21 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     async fn a_rule_added_after_ingest_governs_the_file_it_names() {
         let store = retired_test_store().await;
         store
-            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .upsert(
+                "probe",
+                "probe::src/a.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": ["src/a.rs"] })))
+            .upsert(
+                "probe",
+                "rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/a.rs"] })),
+            )
             .await
             .unwrap();
 
@@ -2550,36 +2724,80 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     async fn moving_a_memory_keeps_the_row_and_its_edges() {
         let store = retired_test_store().await;
         store
-            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .upsert(
+                "probe",
+                "probe::src/a.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": ["probe::src/a.rs"] })))
+            .upsert(
+                "probe",
+                "rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["probe::src/a.rs"] })),
+            )
             .await
             .unwrap();
 
-        assert_eq!(store.relocate("rule", "probe", "global").await.unwrap(), RelocateOutcome::Moved);
+        assert_eq!(
+            store.relocate("rule", "probe", "global").await.unwrap(),
+            RelocateOutcome::Moved
+        );
 
-        assert!(store.get("global", "rule").await.unwrap().is_some(), "the memory is in its new namespace");
-        assert!(store.get("probe", "rule").await.unwrap().is_none(), "and no longer in the old one");
-        assert_eq!(governs_edges_from(&store, "rule").await, 1, "its edges came with it");
+        assert!(
+            store.get("global", "rule").await.unwrap().is_some(),
+            "the memory is in its new namespace"
+        );
+        assert!(
+            store.get("probe", "rule").await.unwrap().is_none(),
+            "and no longer in the old one"
+        );
+        assert_eq!(
+            governs_edges_from(&store, "rule").await,
+            1,
+            "its edges came with it"
+        );
     }
 
     #[tokio::test]
     async fn an_ingested_node_is_not_moved() {
         let store = retired_test_store().await;
         store
-            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .upsert(
+                "probe",
+                "probe::src/a.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
             .await
             .unwrap();
 
         assert_eq!(
-            store.relocate("probe::src/a.rs", "probe", "other").await.unwrap(),
+            store
+                .relocate("probe::src/a.rs", "probe", "other")
+                .await
+                .unwrap(),
             RelocateOutcome::Ingested
         );
-        assert!(store.get("probe", "probe::src/a.rs").await.unwrap().is_some(), "and it stays where it was");
-        assert_eq!(store.relocate("missing", "probe", "other").await.unwrap(), RelocateOutcome::NotFound);
-        assert_eq!(store.relocate("rule", "probe", "probe").await.unwrap(), RelocateOutcome::SameNamespace);
+        assert!(
+            store
+                .get("probe", "probe::src/a.rs")
+                .await
+                .unwrap()
+                .is_some(),
+            "and it stays where it was"
+        );
+        assert_eq!(
+            store.relocate("missing", "probe", "other").await.unwrap(),
+            RelocateOutcome::NotFound
+        );
+        assert_eq!(
+            store.relocate("rule", "probe", "probe").await.unwrap(),
+            RelocateOutcome::SameNamespace
+        );
     }
 
     #[test]
@@ -2590,8 +2808,18 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             "governs": ["src/lib.rs"]
         }));
         assert_eq!(specs.len(), 3);
-        assert!(specs.contains(&EdgeSpec { rel_type: "RELATES_TO", target_id: "a".into(), points_at_target: true, declaration_index: 0 }));
-        assert!(specs.contains(&EdgeSpec { rel_type: "GOVERNS", target_id: "src/lib.rs".into(), points_at_target: true, declaration_index: 0 }));
+        assert!(specs.contains(&EdgeSpec {
+            rel_type: "RELATES_TO",
+            target_id: "a".into(),
+            points_at_target: true,
+            declaration_index: 0
+        }));
+        assert!(specs.contains(&EdgeSpec {
+            rel_type: "GOVERNS",
+            target_id: "src/lib.rs".into(),
+            points_at_target: true,
+            declaration_index: 0
+        }));
     }
 
     /// Containment points from the parent to the child, so a directory contains
@@ -2706,8 +2934,11 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         for i in 0..N {
             let b = std::sync::Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
-                let dir = std::env::temp_dir()
-                    .join(format!("ns-mmap-parallel-{}-{}", std::process::id(), i));
+                let dir = std::env::temp_dir().join(format!(
+                    "ns-mmap-parallel-{}-{}",
+                    std::process::id(),
+                    i
+                ));
                 b.wait();
                 LadybugStore::for_testing(&dir, 4)
                     .map(|_| ())
@@ -2739,8 +2970,7 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn for_testing_uses_small_max_db_size() {
         let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/store/ladybug.rs"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/store/ladybug.rs"),
         )
         .expect("read self");
         let start = src
@@ -2873,7 +3103,13 @@ eurostrata\src\daemon.rs", &known).as_deref(),
                 let gain = 0.05 * (1.0 + n as f32).ln();
                 let capped = gain.min(0.5 * d);
                 let boosted = d - capped;
-                assert!(boosted >= 0.5 * d, "d={}, n={}: adjusted {} < d/2", d, n, boosted);
+                assert!(
+                    boosted >= 0.5 * d,
+                    "d={}, n={}: adjusted {} < d/2",
+                    d,
+                    n,
+                    boosted
+                );
                 assert!(boosted <= d, "d={}, n={}: adjusted {} > d", d, n, boosted);
             }
         }
@@ -2955,15 +3191,30 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         let file = "probe::src/a.rs";
 
         store
-            .upsert("probe", file, vec![0.0; 4], retired_test_payload("file", "auto-ingestor", json!({})))
+            .upsert(
+                "probe",
+                file,
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "live-rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": [file] })))
+            .upsert(
+                "probe",
+                "live-rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": [file] })),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "retired-rule", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })))
+            .upsert(
+                "probe",
+                "retired-rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": [file], "valid_to": 1 })),
+            )
             .await
             .unwrap();
 
@@ -3052,7 +3303,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         assert!(
             results[0].score < results[1].score,
             "sourced row must carry the lower (better) score: {:?}",
-            results.iter().map(|r| (r.id.clone(), r.score)).collect::<Vec<_>>()
+            results
+                .iter()
+                .map(|r| (r.id.clone(), r.score))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3115,7 +3369,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             ("used-unsourced", json!({ "access_count": 50 })),
         ] {
             store
-                .upsert("probe", id, vec![0.5; 4], retired_test_payload("rule", "agent", meta))
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.5; 4],
+                    retired_test_payload("rule", "agent", meta),
+                )
                 .await
                 .unwrap();
         }
@@ -3128,8 +3387,18 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .map(|r| (r.id, r.score))
             .collect();
 
-        let score_of = |id: &str| scored.iter().find(|(i, _)| i == id).map(|(_, s)| *s).unwrap();
-        assert!(score_of("sourced") < score_of("plain"), "sourced outranks plain: {:?}", scored);
+        let score_of = |id: &str| {
+            scored
+                .iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, s)| *s)
+                .unwrap()
+        };
+        assert!(
+            score_of("sourced") < score_of("plain"),
+            "sourced outranks plain: {:?}",
+            scored
+        );
         assert!(
             score_of("used-unsourced") < score_of("sourced"),
             "usage gain is not capped away by provenance: {:?}",
@@ -3149,7 +3418,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             ("null", json!({ "source": null })),
         ] {
             store
-                .upsert("probe", id, vec![0.5; 4], retired_test_payload("rule", "agent", meta))
+                .upsert(
+                    "probe",
+                    id,
+                    vec![0.5; 4],
+                    retired_test_payload("rule", "agent", meta),
+                )
                 .await
                 .unwrap();
         }
@@ -3165,7 +3439,11 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         let blank = scored.iter().find(|(i, _)| i == "blank").unwrap().1;
         let null = scored.iter().find(|(i, _)| i == "null").unwrap().1;
         let plain = scored.iter().find(|(i, _)| i == "unsourced").unwrap().1;
-        assert_eq!(blank, plain, "a blank source is not provenance: {:?}", scored);
+        assert_eq!(
+            blank, plain,
+            "a blank source is not provenance: {:?}",
+            scored
+        );
         assert_eq!(null, plain, "a null source is not provenance: {:?}", scored);
     }
 
@@ -3173,19 +3451,37 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     async fn export_graph_excludes_retired_by_default() {
         let store = retired_test_store().await;
         store
-            .upsert("probe", "live-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({})))
+            .upsert(
+                "probe",
+                "live-node",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "retired-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "valid_to": 1 })))
+            .upsert(
+                "probe",
+                "retired-node",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "valid_to": 1 })),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "another-live", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "related_to": ["live-node"] })))
+            .upsert(
+                "probe",
+                "another-live",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "related_to": ["live-node"] })),
+            )
             .await
             .unwrap();
 
-        let data = store.export_graph(false, false, &std::collections::HashMap::new(), None).await.unwrap();
+        let data = store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3198,7 +3494,8 @@ eurostrata\src\daemon.rs", &known).as_deref(),
 
         // No dangling edges to retired nodes.
         let links = data["links"].as_array().unwrap();
-        let retired_set: std::collections::HashSet<&str> = ["retired-node"].iter().copied().collect();
+        let retired_set: std::collections::HashSet<&str> =
+            ["retired-node"].iter().copied().collect();
         for link in links {
             let src = link.get("source").and_then(|s| s.as_str()).unwrap_or("");
             let tgt = link.get("target").and_then(|s| s.as_str()).unwrap_or("");
@@ -3214,15 +3511,28 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     async fn export_graph_include_retired_true_shows_all() {
         let store = retired_test_store().await;
         store
-            .upsert("probe", "live-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({})))
+            .upsert(
+                "probe",
+                "live-node",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
             .await
             .unwrap();
         store
-            .upsert("probe", "retired-node", vec![0.0; 4], retired_test_payload("rule", "agent", json!({ "valid_to": 1 })))
+            .upsert(
+                "probe",
+                "retired-node",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "valid_to": 1 })),
+            )
             .await
             .unwrap();
 
-        let data = store.export_graph(true, false, &std::collections::HashMap::new(), None).await.unwrap();
+        let data = store
+            .export_graph(true, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3266,7 +3576,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false, false, &std::collections::HashMap::new(), None).await.unwrap();
+        let data = store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3304,7 +3617,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false, true, &std::collections::HashMap::new(), None).await.unwrap();
+        let data = store
+            .export_graph(false, true, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3354,7 +3670,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             .await
             .unwrap();
 
-        let data = store.export_graph(false, true, &std::collections::HashMap::new(), None).await.unwrap();
+        let data = store
+            .export_graph(false, true, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
         let node_ids: Vec<&str> = data["nodes"]
             .as_array()
             .unwrap()
@@ -3377,8 +3696,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn vocabulary_validation_allows_missing_and_empty_arrays() {
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "rule".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({}),
         };
         let (specs, warnings) = parse_edge_specs(&p);
@@ -3397,8 +3720,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn vocabulary_validation_skips_only_invalid_edge_items() {
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "rule".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({ "governs": ["valid.rs", 42, "", null] }),
         };
         let (specs, warnings) = parse_edge_specs(&p);
@@ -3411,19 +3738,30 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn vocabulary_validation_preserves_custom_memory_types() {
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "preference".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "preference".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({}),
         };
         let (_, warnings) = parse_edge_specs(&p);
-        assert!(warnings.is_empty(), "custom types should be accepted silently");
+        assert!(
+            warnings.is_empty(),
+            "custom types should be accepted silently"
+        );
     }
 
     #[test]
     fn vocabulary_validation_preserves_payload_metadata() {
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "fact".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({ "governs": ["src/a.rs"], "domain": "test" }),
         };
         let (specs, warnings) = parse_edge_specs(&p);
@@ -3435,22 +3773,33 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn vocabulary_validation_accepts_existing_qualified_cross_namespace_target() {
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "rule".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({ "governs": ["OtherNS::src/a.rs"] }),
         };
         let (specs, warnings) = parse_edge_specs(&p);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].target_id, "OtherNS::src/a.rs");
-        assert!(warnings.is_empty(), "qualified cross-namespace targets should be accepted");
+        assert!(
+            warnings.is_empty(),
+            "qualified cross-namespace targets should be accepted"
+        );
     }
 
     #[test]
     fn vocabulary_validation_warns_for_missing_qualified_target() {
         // Qualified with empty local ID part
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "rule".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({ "governs": ["NS::"] }),
         };
         let (specs, warnings) = parse_edge_specs(&p);
@@ -3462,8 +3811,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     fn vocabulary_validation_warns_for_unresolved_unqualified_target() {
         // Non-array metadata
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "rule".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({ "governs": "not-an-array" }),
         };
         let (specs, warnings) = parse_edge_specs(&p);
@@ -3476,8 +3829,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     fn vocabulary_validation_rejects_empty_qualified_components_only() {
         // Empty namespace part
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "rule".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({ "governs": ["::src/a.rs"] }),
         };
         let (specs, warnings) = parse_edge_specs(&p);
@@ -3488,8 +3845,12 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn vocabulary_warning_has_exact_reason_and_skipped_fields() {
         let p = MemoryPayload {
-            content: "c".into(), user_id: "u".into(), memory_type: "rule".into(),
-            agent_name: None, location: String::new(), location_lines: String::new(),
+            content: "c".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
             metadata: json!({ "governs": [42] }),
         };
         let (specs, warnings) = parse_edge_specs(&p);
@@ -3507,18 +3868,41 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         store.init("probe").await.expect("create the schema");
 
         // File node (structural, zero vector)
-        store.upsert("probe", "probe::src/a.rs", vec![0.1; 4],
-            retired_test_payload("file", "auto-ingestor", json!({}))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "probe::src/a.rs",
+                vec![0.1; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
 
         // Symbol contained_by file (vector close to query)
-        store.upsert("probe", "probe::src/a.rs::run", vec![1.1, 0.0, 0.0, 0.0],
-            retired_test_payload("code_ast", "auto-ingestor",
-                json!({ "contained_by": ["probe::src/a.rs"] }))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "probe::src/a.rs::run",
+                vec![1.1, 0.0, 0.0, 0.0],
+                retired_test_payload(
+                    "code_ast",
+                    "auto-ingestor",
+                    json!({ "contained_by": ["probe::src/a.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
 
         // Rule governs file (vector orthogonal to query)
-        store.upsert("probe", "rule-1", vec![0.0, 1.1, 0.0, 0.0],
-            retired_test_payload("rule", "agent",
-                json!({ "governs": ["probe::src/a.rs"] }))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "rule-1",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload("rule", "agent", json!({ "governs": ["probe::src/a.rs"] })),
+            )
+            .await
+            .unwrap();
 
         store
     }
@@ -3527,19 +3911,36 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     async fn relationship_label_queries_return_actual_table_names() {
         let store = evidence_test_store().await;
         // Query closest to symbol; symbol is primary, file is one-hop, rule is governing
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         // Symbol should be primary (direct match)
-        let sym = results.iter().find(|r| r.id == "probe::src/a.rs::run").unwrap();
-        assert!(sym.evidence.as_ref().unwrap().iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
+        let sym = results
+            .iter()
+            .find(|r| r.id == "probe::src/a.rs::run")
+            .unwrap();
+        assert!(sym
+            .evidence
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
     }
 
     #[tokio::test]
     async fn one_hop_evidence_preserves_both_directed_orientations() {
         let store = evidence_test_store().await;
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         let file = results.iter().find(|r| r.id == "probe::src/a.rs").unwrap();
         let evs = file.evidence.as_ref().unwrap();
-        let one_hop: Vec<_> = evs.iter().filter(|e| e.kind == crate::traits::EvidenceKind::OneHop).collect();
+        let one_hop: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::OneHop)
+            .collect();
         assert!(!one_hop.is_empty(), "file should have one-hop evidence");
         // The CONTAINS edge: symbol contains_by file, so file is the source of CONTAINS
         // Path: "probe::src/a.rs::run" <-CONTAINS- "probe::src/a.rs"
@@ -3555,16 +3956,35 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         store.init("probe").await.unwrap();
 
         // mem-b must exist before mem-a references it via related_to
-        store.upsert("probe", "mem-b", vec![0.9, 0.1, 0.0, 0.0],
-            retired_test_payload("fact", "agent", json!({}))).await.unwrap();
-        store.upsert("probe", "mem-a", vec![1.1, 0.0, 0.0, 0.0],
-            retired_test_payload("rule", "agent",
-                json!({ "related_to": ["mem-b"] }))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "mem-b",
+                vec![0.9, 0.1, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "mem-a",
+                vec![1.1, 0.0, 0.0, 0.0],
+                retired_test_payload("rule", "agent", json!({ "related_to": ["mem-b"] })),
+            )
+            .await
+            .unwrap();
 
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 1).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1)
+            .await
+            .unwrap();
         let b = results.iter().find(|r| r.id == "mem-b").unwrap();
         let evs = b.evidence.as_ref().unwrap();
-        let one_hop: Vec<_> = evs.iter().filter(|e| e.kind == crate::traits::EvidenceKind::OneHop).collect();
+        let one_hop: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::OneHop)
+            .collect();
         assert!(!one_hop.is_empty());
         assert_eq!(one_hop[0].path[0].relation, "RELATES_TO");
     }
@@ -3574,17 +3994,40 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         let store = evidence_test_store().await;
         // A filler primary closer than the rule fills the primary quota, so
         // rule-1 stays out of the primary set and must arrive via expansion.
-        store.upsert("probe", "filler", vec![0.9, 0.1, 0.0, 0.0],
-            retired_test_payload("fact", "agent", json!({}))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "filler",
+                vec![0.9, 0.1, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
         // limit=2: primaries are the symbol (closest) and the filler; the file
         // arrives one hop away and the rule two hops away. Four results, the
         // full limit * 2 response.
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 2).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 2)
+            .await
+            .unwrap();
         let rule = results.iter().find(|r| r.id == "rule-1");
-        assert!(rule.is_some(), "rule-1 should appear in results, got: {:?}", results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
+        assert!(
+            rule.is_some(),
+            "rule-1 should appear in results, got: {:?}",
+            results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+        );
         let evs = rule.unwrap().evidence.as_ref().unwrap();
-        let gov2: Vec<_> = evs.iter().filter(|e| e.kind == crate::traits::EvidenceKind::Governs2hop).collect();
-        assert!(!gov2.is_empty(), "rule should have governs_2hop evidence, got: {:?}", evs.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>());
+        let gov2: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::Governs2hop)
+            .collect();
+        assert!(
+            !gov2.is_empty(),
+            "rule should have governs_2hop evidence, got: {:?}",
+            evs.iter()
+                .map(|e| format!("{:?}", e.kind))
+                .collect::<Vec<_>>()
+        );
         let path = &gov2[0].path;
         assert_eq!(path.len(), 2);
         assert_eq!(path[0].relation, "CONTAINS");
@@ -3597,11 +4040,20 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     async fn retired_intermediate_excludes_only_its_evidence_path() {
         let store = evidence_test_store().await;
         // Retire the file (intermediate between symbol and rule)
-        store.upsert("probe", "probe::src/a.rs", vec![0.1; 4],
-            retired_test_payload("file", "auto-ingestor",
-                json!({ "valid_to": 1 }))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "probe::src/a.rs",
+                vec![0.1; 4],
+                retired_test_payload("file", "auto-ingestor", json!({ "valid_to": 1 })),
+            )
+            .await
+            .unwrap();
 
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         let rule = results.iter().find(|r| r.id == "rule-1");
         // Rule should still appear (as one-hop via direct GOVERNS from symbol? no —
         // the only path to rule is through the file, which is retired)
@@ -3615,8 +4067,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             // If rule appears, its evidence should not reference the retired file
             for ev in rule.evidence.as_ref().unwrap() {
                 for edge in &ev.path {
-                    assert!(edge.source != "probe::src/a.rs" && edge.target != "probe::src/a.rs",
-                        "retired intermediate should not appear in evidence");
+                    assert!(
+                        edge.source != "probe::src/a.rs" && edge.target != "probe::src/a.rs",
+                        "retired intermediate should not appear in evidence"
+                    );
                 }
             }
         }
@@ -3628,44 +4082,105 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         // A second symbol fills the primary quota (limit=2) so rule-1 stays
         // expansion-only, and gives the rule a second intermediate to travel
         // through.
-        store.upsert("probe", "probe::src/b.rs", vec![0.0; 4],
-            retired_test_payload("file", "auto-ingestor", json!({}))).await.unwrap();
-        store.upsert("probe", "probe::src/b.rs::run", vec![1.1, 0.0, 0.0, 0.0],
-            retired_test_payload("code_ast", "auto-ingestor",
-                json!({ "contained_by": ["probe::src/b.rs"] }))).await.unwrap();
-        store.upsert("probe", "rule-1", vec![0.0, 1.1, 0.0, 0.0],
-            retired_test_payload("rule", "agent",
-                json!({ "governs": ["probe::src/a.rs", "probe::src/b.rs"] }))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "probe::src/b.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "probe::src/b.rs::run",
+                vec![1.1, 0.0, 0.0, 0.0],
+                retired_test_payload(
+                    "code_ast",
+                    "auto-ingestor",
+                    json!({ "contained_by": ["probe::src/b.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rule-1",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({ "governs": ["probe::src/a.rs", "probe::src/b.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
         // Retire the ORIGINAL intermediate: the a.rs path dies, the rule must
         // survive through b.rs alone.
-        store.upsert("probe", "probe::src/a.rs", vec![0.1; 4],
-            retired_test_payload("file", "auto-ingestor",
-                json!({ "valid_to": 1 }))).await.unwrap();
+        store
+            .upsert(
+                "probe",
+                "probe::src/a.rs",
+                vec![0.1; 4],
+                retired_test_payload("file", "auto-ingestor", json!({ "valid_to": 1 })),
+            )
+            .await
+            .unwrap();
 
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 2).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 2)
+            .await
+            .unwrap();
         let rule = results.iter().find(|r| r.id == "rule-1");
-        assert!(rule.is_some(), "rule-1 should survive via the active intermediate, got: {:?}", results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
+        assert!(
+            rule.is_some(),
+            "rule-1 should survive via the active intermediate, got: {:?}",
+            results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+        );
         let evs = rule.unwrap().evidence.as_ref().unwrap();
-        let gov2: Vec<_> = evs.iter().filter(|e| e.kind == crate::traits::EvidenceKind::Governs2hop).collect();
+        let gov2: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::Governs2hop)
+            .collect();
         assert!(!gov2.is_empty(), "rule should have governs_2hop evidence");
         for ev in &gov2 {
             for edge in &ev.path {
-                assert!(edge.source != "probe::src/a.rs" && edge.target != "probe::src/a.rs",
-                    "retired intermediate must not appear in surviving evidence: {:?}", ev.path);
+                assert!(
+                    edge.source != "probe::src/a.rs" && edge.target != "probe::src/a.rs",
+                    "retired intermediate must not appear in surviving evidence: {:?}",
+                    ev.path
+                );
             }
         }
         // The surviving path travels through the active intermediate.
-        assert!(gov2.iter().all(|e| e.path.iter().any(|edge| edge.target == "probe::src/b.rs" || edge.source == "probe::src/b.rs")));
+        assert!(gov2.iter().all(|e| e
+            .path
+            .iter()
+            .any(|edge| edge.target == "probe::src/b.rs" || edge.source == "probe::src/b.rs")));
     }
 
     #[tokio::test]
     async fn direct_match_evidence_has_no_edges() {
         let store = evidence_test_store().await;
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
-        let sym = results.iter().find(|r| r.id == "probe::src/a.rs::run").unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
+        let sym = results
+            .iter()
+            .find(|r| r.id == "probe::src/a.rs::run")
+            .unwrap();
         let evs = sym.evidence.as_ref().unwrap();
-        let direct = evs.iter().find(|e| e.kind == crate::traits::EvidenceKind::DirectMatch).unwrap();
-        assert!(direct.path.is_empty(), "direct match evidence has empty path");
+        let direct = evs
+            .iter()
+            .find(|e| e.kind == crate::traits::EvidenceKind::DirectMatch)
+            .unwrap();
+        assert!(
+            direct.path.is_empty(),
+            "direct match evidence has empty path"
+        );
     }
 
     #[tokio::test]
@@ -3673,11 +4188,17 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         let store = evidence_test_store().await;
         // file appears in both: one-hop from symbol (via CONTAINS) and as intermediate
         // in the governing path. It should have one evidence entry at most.
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         let file = results.iter().find(|r| r.id == "probe::src/a.rs").unwrap();
         let evs = file.evidence.as_ref().unwrap();
         // File should have one-hop evidence (from symbol via CONTAINS)
-        let one_hop: Vec<_> = evs.iter().filter(|e| e.kind == crate::traits::EvidenceKind::OneHop).collect();
+        let one_hop: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::OneHop)
+            .collect();
         assert!(!one_hop.is_empty());
     }
 
@@ -3703,25 +4224,42 @@ eurostrata\src\daemon.rs", &known).as_deref(),
         store.upsert("probe", "rule-1", vec![0.0, 1.1, 0.0, 0.0],
             retired_test_payload("rule", "agent",
                 json!({ "governs": ["probe::src/a.rs"], "related_to": ["probe::src/a.rs::run"] }))).await.unwrap();
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         let rule = results.iter().find(|r| r.id == "rule-1").unwrap();
         let evs = rule.evidence.as_ref().unwrap();
-        assert!(evs.len() <= 3, "evidence should be capped at 3, got {}", evs.len());
+        assert!(
+            evs.len() <= 3,
+            "evidence should be capped at 3, got {}",
+            evs.len()
+        );
         // Should be sorted by kind (OneHop before Governs2hop)
         for pair in evs.windows(2) {
-            assert!(pair[0].kind <= pair[1].kind, "evidence should be sorted by kind");
+            assert!(
+                pair[0].kind <= pair[1].kind,
+                "evidence should be sorted by kind"
+            );
         }
     }
 
     #[tokio::test]
     async fn expansion_never_creates_paths_longer_than_two_edges() {
         let store = evidence_test_store().await;
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         for r in &results {
             if let Some(evs) = &r.evidence {
                 for ev in evs {
-                    assert!(ev.path.len() <= 2, "{}: path too long ({} edges)",
-                        r.id, ev.path.len());
+                    assert!(
+                        ev.path.len() <= 2,
+                        "{}: path too long ({} edges)",
+                        r.id,
+                        ev.path.len()
+                    );
                 }
             }
         }
@@ -3730,7 +4268,10 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[tokio::test]
     async fn duplicate_paths_do_not_consume_result_slots() {
         let store = evidence_test_store().await;
-        let results = store.search("probe", vec![1.1, 0.0, 0.0, 0.0], 5).await.unwrap();
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5)
+            .await
+            .unwrap();
         // Each result should appear at most once
         let mut ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
         ids.sort();

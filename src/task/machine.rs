@@ -65,14 +65,14 @@ const fn t(from: Status, to: Status, guard: Guard) -> Transition {
 /// The whole machine: 4 states, 8 legal edges, one terminal state.
 /// `done` has exactly two entrances and both are ExtractionRequired.
 pub const TABLE: &[Transition] = &[
-    t(Status::Open, Status::InProgress, Guard::None),             // claim
+    t(Status::Open, Status::InProgress, Guard::None), // claim
     t(Status::Open, Status::Blocked, Guard::RequireReason),
-    t(Status::Open, Status::Done, Guard::ExtractionRequired),     // task_complete only
-    t(Status::InProgress, Status::Open, Guard::None),             // unclaim
+    t(Status::Open, Status::Done, Guard::ExtractionRequired), // task_complete only
+    t(Status::InProgress, Status::Open, Guard::None),         // unclaim
     t(Status::InProgress, Status::Blocked, Guard::RequireReason),
     t(Status::InProgress, Status::Done, Guard::ExtractionRequired), // task_complete only
-    t(Status::Blocked, Status::Open, Guard::RequireReason),       // resolution note
-    t(Status::Done, Status::Open, Guard::RequireReason),          // reopen; edges retained
+    t(Status::Blocked, Status::Open, Guard::RequireReason),         // resolution note
+    t(Status::Done, Status::Open, Guard::RequireReason),            // reopen; edges retained
 ];
 
 /// One task record: the id (which doubles as the record id) plus the payload
@@ -115,7 +115,11 @@ pub struct Ctx {
 pub enum TransitionError {
     /// Not in the table. Carries the legal set from the current state so the
     /// error message teaches the machine.
-    Illegal { from: Status, to: Status, legal: Vec<Status> },
+    Illegal {
+        from: Status,
+        to: Status,
+        legal: Vec<Status>,
+    },
     /// A RequireReason edge with an empty note.
     MissingReason { from: Status, to: Status },
     /// An ExtractionRequired edge with no extraction edge in sight.
@@ -174,7 +178,9 @@ pub fn apply(task: &Task, to: Status, ctx: &Ctx) -> Result<Task, TransitionError
             return Err(TransitionError::MissingReason { from, to });
         }
         Guard::ExtractionRequired if !ctx.extraction_edge_exists => {
-            return Err(TransitionError::ExtractionRequired { id: task.id.clone() });
+            return Err(TransitionError::ExtractionRequired {
+                id: task.id.clone(),
+            });
         }
         Guard::RequireReason | Guard::ExtractionRequired => {}
     }
@@ -212,7 +218,10 @@ pub fn apply(task: &Task, to: Status, ctx: &Ctx) -> Result<Task, TransitionError
     task_obj.insert("history".into(), serde_json::Value::Array(history));
     meta.insert("task".into(), serde_json::Value::Object(task_obj));
 
-    Ok(Task { id: task.id.clone(), payload })
+    Ok(Task {
+        id: task.id.clone(),
+        payload,
+    })
 }
 
 /// Appends a history entry without moving the state, and stamps `updated_at`:
@@ -250,7 +259,10 @@ pub fn annotate(task: &Task, ctx: &Ctx) -> Task {
     task_obj.insert("history".into(), serde_json::Value::Array(history));
     meta.insert("task".into(), serde_json::Value::Object(task_obj));
 
-    Task { id: task.id.clone(), payload }
+    Task {
+        id: task.id.clone(),
+        payload,
+    }
 }
 
 /// UTC timestamp in the shape the record examples use: `2026-10-08T10:12:00Z`.
@@ -334,7 +346,11 @@ mod tests {
         }
         let message = err.to_string();
         assert!(message.contains("blocked -> in_progress"), "{}", message);
-        assert!(message.contains("legal transitions are: open"), "{}", message);
+        assert!(
+            message.contains("legal transitions are: open"),
+            "{}",
+            message
+        );
     }
 
     #[test]
@@ -344,7 +360,10 @@ mod tests {
         match err {
             TransitionError::Illegal { from, legal, .. } => {
                 assert_eq!(from, Status::Open);
-                assert_eq!(legal, vec![Status::InProgress, Status::Blocked, Status::Done]);
+                assert_eq!(
+                    legal,
+                    vec![Status::InProgress, Status::Blocked, Status::Done]
+                );
             }
             other => panic!("expected Illegal, got {:?}", other),
         }
@@ -354,7 +373,11 @@ mod tests {
     fn blocking_without_a_reason_is_refused() {
         let err = apply(&task_with("open"), Status::Blocked, &ctx())
             .expect_err("RequireReason with an empty note");
-        assert!(matches!(err, TransitionError::MissingReason { .. }), "{:?}", err);
+        assert!(
+            matches!(err, TransitionError::MissingReason { .. }),
+            "{:?}",
+            err
+        );
         assert!(err.to_string().contains("pass `note`"), "{}", err);
 
         let mut with_note = ctx();
@@ -375,7 +398,8 @@ mod tests {
 
         let mut with_edge = ctx();
         with_edge.extraction_edge_exists = true;
-        let moved = apply(&task_with("in_progress"), Status::Done, &with_edge).expect("edge exists");
+        let moved =
+            apply(&task_with("in_progress"), Status::Done, &with_edge).expect("edge exists");
         assert_eq!(moved.status(), Status::Done);
     }
 
@@ -395,7 +419,10 @@ mod tests {
         c.reason = "regression reopened".to_string();
         let reopened = apply(&done, Status::Open, &c).expect("reason given");
         assert_eq!(reopened.status(), Status::Open);
-        let history = reopened.task_field("history").and_then(|h| h.as_array()).unwrap();
+        let history = reopened
+            .task_field("history")
+            .and_then(|h| h.as_array())
+            .unwrap();
         assert_eq!(history.len(), 1, "the transition is recorded");
         assert_eq!(history[0]["from"], "done");
         assert_eq!(history[0]["to"], "open");
@@ -406,7 +433,11 @@ mod tests {
 
     fn err_reopen_requires_reason(done: &Task) {
         let err = apply(done, Status::Open, &ctx()).expect_err("done -> open is RequireReason");
-        assert!(matches!(err, TransitionError::MissingReason { .. }), "{:?}", err);
+        assert!(
+            matches!(err, TransitionError::MissingReason { .. }),
+            "{:?}",
+            err
+        );
     }
 
     #[test]
@@ -417,8 +448,14 @@ mod tests {
 
         let moved = apply(&task, Status::InProgress, &ctx()).expect("legal");
 
-        assert!(moved.task_field("updated_at").and_then(|v| v.as_str()).is_some());
-        assert_eq!(moved.task_field("assignee"), Some(&serde_json::json!("kenton")));
+        assert!(moved
+            .task_field("updated_at")
+            .and_then(|v| v.as_str())
+            .is_some());
+        assert_eq!(
+            moved.task_field("assignee"),
+            Some(&serde_json::json!("kenton"))
+        );
         assert_eq!(moved.task_field("priority"), Some(&serde_json::json!(0)));
         // The original row is untouched; apply returns a new Task.
         assert_eq!(task.status(), Status::Open);
@@ -438,7 +475,11 @@ mod tests {
                 format!("\"{}\"", status.as_str())
             );
         }
-        assert_eq!(Status::parse("canceled"), None, "a fifth state buys nothing");
+        assert_eq!(
+            Status::parse("canceled"),
+            None,
+            "a fifth state buys nothing"
+        );
     }
 
     #[test]

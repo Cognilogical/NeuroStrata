@@ -10,22 +10,22 @@ mod judgment;
 mod parser;
 mod secrets;
 mod server;
-mod source_context;
 mod setup;
+mod source_context;
 mod store;
 mod synaptic_mesh;
 mod task;
 mod tools;
 mod traits;
 
-use config::Config;
-use std::sync::Arc;
 use crate::traits::SearchResult;
-use store::LadybugStore;
 use crate::traits::{Embedder, VectorStore};
-use embed::build_embedder;
-use clap::{Parser, Subcommand};
 use anyhow::Context;
+use clap::{Parser, Subcommand};
+use config::Config;
+use embed::build_embedder;
+use std::sync::Arc;
+use store::LadybugStore;
 
 #[derive(Parser, Debug)]
 #[command(name = "neurostrata-mcp")]
@@ -373,15 +373,17 @@ enum Skew {
 fn skew_verdict(info: Option<&serde_json::Value>, own: (u64, u64)) -> Skew {
     let info = match info {
         Some(i) => i,
-        None => {
-            return Skew::Stale(
-                "the daemon predates build verification (no /info), so it is older than this binary".to_string(),
-            )
-        }
+        None => return Skew::Stale(
+            "the daemon predates build verification (no /info), so it is older than this binary"
+                .to_string(),
+        ),
     };
     let hash = info.get("exe_hash").and_then(|v| v.as_u64());
     let len = info.get("exe_len").and_then(|v| v.as_u64());
-    let version = info.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let version = info
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     if hash == Some(own.0) && len == Some(own.1) {
         Skew::InSync(version.to_string())
     } else {
@@ -410,7 +412,9 @@ async fn fetch_daemon_info() -> Option<serde_json::Value> {
 /// Used by the proxy mode to locate the lock file before deciding whether
 /// to spawn a competing daemon.
 fn config_db_path() -> Option<String> {
-    Config::from_default_path().ok().map(|c| c.db_path.to_string_lossy().to_string())
+    Config::from_default_path()
+        .ok()
+        .map(|c| c.db_path.to_string_lossy().to_string())
 }
 
 fn dispatch_project_context(
@@ -428,7 +432,10 @@ fn dispatch_project_context(
                 .project_contexts
                 .get(source_id)
                 .expect("successful bind stores its source ID");
-            (format!("Bound {source_id} to {}", canonical.display()), true)
+            (
+                format!("Bound {source_id} to {}", canonical.display()),
+                true,
+            )
         }
         ProjectContextCommands::List => {
             let mut entries: Vec<_> = config.project_contexts.iter().collect();
@@ -619,8 +626,12 @@ async fn direct_report(
     config: &Config,
     namespace: &str,
 ) -> Result<crate::task::gate::GateReport, String> {
-    let dimensions = embed::configured_dimensions()
-        .map_err(|e| format!("the configured embedding dimensions could not be read: {}", e))?;
+    let dimensions = embed::configured_dimensions().map_err(|e| {
+        format!(
+            "the configured embedding dimensions could not be read: {}",
+            e
+        )
+    })?;
     let store: Arc<dyn VectorStore> = Arc::new(
         LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
             .map_err(|e| format!("the database could not be opened: {}", e))?,
@@ -686,7 +697,6 @@ fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
     }
 }
 
-
 /// Read-only queries against the store, transparently proxied to the daemon
 /// when one is running (guinea-pig BUG-8): `doctor`, `list` and `namespaces`
 /// are documented as changing nothing and must work while the system is up.
@@ -729,167 +739,178 @@ impl ReadSource {
 }
 
 async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()> {
+    // Read-only by design: it names what an upgrade left
+    // behind and how to fix it, and touches nothing itself.
+    // Guinea-pig BUG-9: every result is scoped and labeled.
+    // Unscoped output is what produced a confident wrong
+    // answer about a different project's graph.
+    let mut namespaces = read.namespaces().await?;
+    namespaces.sort();
+    if let Some(want) = scope {
+        if !namespaces.iter().any(|n| n.eq_ignore_ascii_case(want)) {
+            anyhow::bail!(
+                "no namespace '{}' here; known: {:?}. Refusing to print unscoped results.",
+                want,
+                namespaces
+            );
+        }
+        namespaces.retain(|n| n.eq_ignore_ascii_case(want));
+        println!("Namespace: {:?}\n", namespaces);
+    } else {
+        println!("Namespaces (all): {:?}\n", namespaces);
+    }
 
-                    // Read-only by design: it names what an upgrade left
-                    // behind and how to fix it, and touches nothing itself.
-                    // Guinea-pig BUG-9: every result is scoped and labeled.
-                    // Unscoped output is what produced a confident wrong
-                    // answer about a different project's graph.
-                    let mut namespaces = read.namespaces().await?;
-                    namespaces.sort();
-                    if let Some(want) = scope {
-                        if !namespaces.iter().any(|n| n.eq_ignore_ascii_case(want)) {
-                            anyhow::bail!(
-                                "no namespace '{}' here; known: {:?}. Refusing to print unscoped results.",
-                                want, namespaces
-                            );
-                        }
-                        namespaces.retain(|n| n.eq_ignore_ascii_case(want));
-                        println!("Namespace: {:?}\n", namespaces);
-                    } else {
-                        println!("Namespaces (all): {:?}\n", namespaces);
-                    }
+    let mut collisions = 0;
+    for (i, a) in namespaces.iter().enumerate() {
+        for b in namespaces.iter().skip(i + 1) {
+            if a.eq_ignore_ascii_case(b) {
+                collisions += 1;
+                let a_len = read.list(a).await.map(|m| m.len()).unwrap_or(0);
+                let b_len = read.list(b).await.map(|m| m.len()).unwrap_or(0);
+                println!("Two spellings of one project:");
+                println!("  '{}' holds {} memories", a, a_len);
+                println!("  '{}' holds {} memories", b, b_len);
+                let (from, to) = if a_len < b_len { (a, b) } else { (b, a) };
+                println!(
+                    "  Merge with: neurostrata-mcp move '{}' <id> '{}'  (one per id)\n",
+                    from, to
+                );
+            }
+        }
+    }
+    if collisions == 0 {
+        println!("No namespaces differ only by case.\n");
+    }
 
-                    let mut collisions = 0;
-                    for (i, a) in namespaces.iter().enumerate() {
-                        for b in namespaces.iter().skip(i + 1) {
-                            if a.eq_ignore_ascii_case(b) {
-                                collisions += 1;
-                                let a_len = read.list(a).await.map(|m| m.len()).unwrap_or(0);
-                                let b_len = read.list(b).await.map(|m| m.len()).unwrap_or(0);
-                                println!("Two spellings of one project:");
-                                println!("  '{}' holds {} memories", a, a_len);
-                                println!("  '{}' holds {} memories", b, b_len);
-                                let (from, to) = if a_len < b_len { (a, b) } else { (b, a) };
-                                println!(
-                                    "  Merge with: neurostrata-mcp move '{}' <id> '{}'  (one per id)\n",
-                                    from, to
-                                );
-                            }
-                        }
-                    }
-                    if collisions == 0 {
-                        println!("No namespaces differ only by case.\n");
-                    }
+    for ns in &namespaces {
+        let memories = read.list(ns).await?;
+        let known = crate::store::ladybug::KnownIds::new(memories.iter().map(|m| m.id.as_str()));
 
-                    for ns in &namespaces {
-                        let memories = read.list(ns).await?;
-                        let known = crate::store::ladybug::KnownIds::new(
-                            memories.iter().map(|m| m.id.as_str()),
-                        );
+        let mut resolvable = Vec::new();
+        let mut missing = Vec::new();
+        let mut never_read = 0;
+        let mut ingested = 0;
+        let mut unqualified = Vec::new();
 
-                        let mut resolvable = Vec::new();
-                        let mut missing = Vec::new();
-                        let mut never_read = 0;
-                        let mut ingested = 0;
-                        let mut unqualified = Vec::new();
+        for memory in &memories {
+            // Ingested ids carry the namespace that owns them.
+            // One written before that changed does not, and a
+            // bare path is unique to a project rather than to
+            // the database -- so two projects holding the same
+            // path still collide until each is re-ingested.
+            if memory.payload.user_id == "auto-ingestor" {
+                ingested += 1;
+                if !crate::parser::ingest::is_qualified(ns, &memory.id) {
+                    unqualified.push(memory.id.clone());
+                }
+            }
 
-                        for memory in &memories {
-                            // Ingested ids carry the namespace that owns them.
-                            // One written before that changed does not, and a
-                            // bare path is unique to a project rather than to
-                            // the database -- so two projects holding the same
-                            // path still collide until each is re-ingested.
-                            if memory.payload.user_id == "auto-ingestor" {
-                                ingested += 1;
-                                if !crate::parser::ingest::is_qualified(ns, &memory.id) {
-                                    unqualified.push(memory.id.clone());
-                                }
-                            }
+            if memory
+                .payload
+                .metadata
+                .get("access_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                == 0
+            {
+                never_read += 1;
+            }
+            for edge in crate::store::ladybug::edge_specs(&memory.payload.metadata) {
+                if known.contains(&edge.target_id) {
+                    continue;
+                }
+                match known.resolve(&edge.target_id) {
+                    Some(_) => resolvable.push(edge.target_id.clone()),
+                    None => missing.push(edge.target_id.clone()),
+                }
+            }
+        }
 
-                            if memory.payload.metadata.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
-                                never_read += 1;
-                            }
-                            for edge in crate::store::ladybug::edge_specs(&memory.payload.metadata) {
-                                if known.contains(&edge.target_id) {
-                                    continue;
-                                }
-                                match known.resolve(&edge.target_id) {
-                                    Some(_) => resolvable.push(edge.target_id.clone()),
-                                    None => missing.push(edge.target_id.clone()),
-                                }
-                            }
-                        }
+        println!("[{}] {} memories", ns, memories.len());
+        println!(
+            "  [{}] ingested nodes carrying this namespace in their id: {} of {}",
+            ns,
+            ingested - unqualified.len(),
+            ingested
+        );
+        if !unqualified.is_empty() {
+            println!(
+                "    {} predate namespace qualification. They resolve, but the next",
+                unqualified.len()
+            );
+            println!("    project ingesting a shared path takes them.");
+            for id in unqualified.iter().take(3) {
+                println!("      {}", id);
+            }
+            println!("    Migrate: neurostrata-mcp ingest <dir> {}", ns);
+            println!("    Backup first: re-ingest rewrites every id.");
+        }
+        println!(
+            "  [{}] declared targets that need the older absolute form resolved: {}",
+            ns,
+            resolvable.len()
+        );
+        for target in resolvable.iter().take(3) {
+            println!("    {}", target);
+        }
+        println!(
+            "  [{}] declared targets that match nothing ingested: {}",
+            ns,
+            missing.len()
+        );
+        for target in missing.iter().take(3) {
+            println!("    {}", target);
+        }
+        println!(
+            "  [{}] memories never counted as read: {} of {}",
+            ns,
+            never_read,
+            memories.len()
+        );
+        if never_read == memories.len() && !memories.is_empty() {
+            println!(
+                "    Every one. Before the embedding decode was fixed, each retrieval tried to"
+            );
+            println!(
+                "    write an empty vector and was refused, so the Neural Gain Filter had nothing"
+            );
+            println!("    to rank by. Counts start rising again from the next search.");
+        }
+        println!();
+    }
 
-                        println!("[{}] {} memories", ns, memories.len());
-                        println!(
-                            "  [{}] ingested nodes carrying this namespace in their id: {} of {}",
-                            ns,
-                            ingested - unqualified.len(),
-                            ingested
-                        );
-                        if !unqualified.is_empty() {
-                            println!(
-                                "    {} predate namespace qualification. They resolve, but the next",
-                                unqualified.len()
-                            );
-                            println!("    project ingesting a shared path takes them.");
-                            for id in unqualified.iter().take(3) {
-                                println!("      {}", id);
-                            }
-                            println!("    Migrate: neurostrata-mcp ingest <dir> {}", ns);
-                            println!("    Backup first: re-ingest rewrites every id.");
-                        }
-                        println!(
-                            "  [{}] declared targets that need the older absolute form resolved: {}",
-                            ns,
-                            resolvable.len()
-                        );
-                        for target in resolvable.iter().take(3) {
-                            println!("    {}", target);
-                        }
-                        println!("  [{}] declared targets that match nothing ingested: {}", ns, missing.len());
-                        for target in missing.iter().take(3) {
-                            println!("    {}", target);
-                        }
-                        println!(
-                            "  [{}] memories never counted as read: {} of {}",
-                            ns,
-                            never_read,
-                            memories.len()
-                        );
-                        if never_read == memories.len() && !memories.is_empty() {
-                            println!(
-                                "    Every one. Before the embedding decode was fixed, each retrieval tried to"
-                            );
-                            println!(
-                                "    write an empty vector and was refused, so the Neural Gain Filter had nothing"
-                            );
-                            println!("    to rank by. Counts start rising again from the next search.");
-                        }
-                        println!();
-                    }
-                
     Ok(())
 }
 
 async fn run_namespaces(read: &ReadSource) -> anyhow::Result<()> {
+    let namespaces = read.namespaces().await?;
+    println!("Namespaces:");
+    for ns in namespaces {
+        println!("  - {}", ns);
+    }
 
-                    let namespaces = read.namespaces().await?;
-                    println!("Namespaces:");
-                    for ns in namespaces {
-                        println!("  - {}", ns);
-                    }
-                
     Ok(())
 }
 
 async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
+    let results: Vec<SearchResult> = read.list(namespace).await?;
+    println!(
+        "Found {} memories in namespace '{}':\n",
+        results.len(),
+        namespace
+    );
+    for res in results {
+        let location_str = if res.payload.location.is_empty() {
+            "N/A".to_string()
+        } else {
+            res.payload.location.clone()
+        };
+        println!("--- ID: {} ---", res.id);
+        println!("Type: {}", res.payload.memory_type);
+        println!("Location: {}", location_str);
+        println!("Content: {}\n", res.payload.content);
+    }
 
-                    let results: Vec<SearchResult> = read.list(namespace).await?;
-                    println!("Found {} memories in namespace '{}':\n", results.len(), namespace);
-                    for res in results {
-                        let location_str = if res.payload.location.is_empty() {
-                            "N/A".to_string()
-                        } else {
-                            res.payload.location.clone()
-                        };
-                        println!("--- ID: {} ---", res.id);
-                        println!("Type: {}", res.payload.memory_type);
-                        println!("Location: {}", location_str);
-                        println!("Content: {}\n", res.payload.content);
-                    }
-                
     Ok(())
 }
 
@@ -900,7 +921,10 @@ mod tests {
     #[test]
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
         let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
-        assert!(parsed.is_err(), "a typo must never reach std::process::Command");
+        assert!(
+            parsed.is_err(),
+            "a typo must never reach std::process::Command"
+        );
     }
 
     #[test]
@@ -1103,11 +1127,17 @@ mod tests {
         assert!(!daemon_holds_lock(&db), "nothing holds a fresh lock");
 
         let held = take_daemon_lock(&db).expect("the first daemon takes the lock");
-        assert!(daemon_holds_lock(&db), "a live holder is visible to shutdown");
+        assert!(
+            daemon_holds_lock(&db),
+            "a live holder is visible to shutdown"
+        );
         assert!(take_daemon_lock(&db).is_err(), "a second daemon is refused");
 
         drop(held);
-        assert!(!daemon_holds_lock(&db), "the lock is free once its holder is gone");
+        assert!(
+            !daemon_holds_lock(&db),
+            "the lock is free once its holder is gone"
+        );
     }
 
     #[test]
@@ -1140,9 +1170,18 @@ mod tests {
     #[test]
     fn a_daemon_that_holds_the_lock_but_is_silent_is_busy_not_gone() {
         assert!(daemon_busy(DaemonProbe::Silent, true));
-        assert!(daemon_busy(DaemonProbe::Absent, true), "listener closed, still checkpointing");
-        assert!(!daemon_busy(DaemonProbe::Silent, false), "silence with no holder is no daemon");
-        assert!(!daemon_busy(DaemonProbe::Responsive, true), "an answering daemon is asked, not refused");
+        assert!(
+            daemon_busy(DaemonProbe::Absent, true),
+            "listener closed, still checkpointing"
+        );
+        assert!(
+            !daemon_busy(DaemonProbe::Silent, false),
+            "silence with no holder is no daemon"
+        );
+        assert!(
+            !daemon_busy(DaemonProbe::Responsive, true),
+            "an answering daemon is asked, not refused"
+        );
     }
 
     /// Section 5.1: a verdict maps to 0/1; no verdict blocks only under
@@ -1152,8 +1191,16 @@ mod tests {
         assert_eq!(gate_exit_code(Some(true), false), 0);
         assert_eq!(gate_exit_code(Some(true), true), 0);
         assert_eq!(gate_exit_code(Some(false), false), 1);
-        assert_eq!(gate_exit_code(Some(false), true), 1, "a verdict never changes with the flag");
-        assert_eq!(gate_exit_code(None, false), 2, "infra warns and lets the push through");
+        assert_eq!(
+            gate_exit_code(Some(false), true),
+            1,
+            "a verdict never changes with the flag"
+        );
+        assert_eq!(
+            gate_exit_code(None, false),
+            2,
+            "infra warns and lets the push through"
+        );
         assert_eq!(
             gate_exit_code(None, true),
             1,
@@ -1168,26 +1215,26 @@ mod tests {
         assert!(PRE_PUSH_HOOK.starts_with("#!/bin/bash\n"));
         assert!(PRE_PUSH_HOOK.contains("command -v neurostrata-mcp >/dev/null || exit 0"));
         assert!(PRE_PUSH_HOOK.contains("[ -n \"$NEUROSTRATA_SKIP_GATE\" ] && exit 0"));
-        assert!(PRE_PUSH_HOOK
-            .contains("NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")"));
+        assert!(
+            PRE_PUSH_HOOK.contains("NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")")
+        );
         assert!(PRE_PUSH_HOOK.contains("neurostrata-mcp task gate \"$NAMESPACE\" --strict"));
         assert!(PRE_PUSH_HOOK.contains("code=$?"));
         assert!(PRE_PUSH_HOOK.contains("if [ $code -eq 1 ]; then"));
         assert!(PRE_PUSH_HOOK.contains("NEUROSTRATA_SKIP_GATE=1 git push"));
-        assert!(PRE_PUSH_HOOK.contains("exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking"));
-        assert!(!PRE_PUSH_HOOK.contains("$code -eq 2"), "2 never blocks in the hook itself");
+        assert!(PRE_PUSH_HOOK
+            .contains("exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking"));
+        assert!(
+            !PRE_PUSH_HOOK.contains("$code -eq 2"),
+            "2 never blocks in the hook itself"
+        );
     }
 
     #[test]
     fn the_gate_and_hook_commands_parse_with_their_flags() {
-        let cli = Cli::try_parse_from([
-            "neurostrata-mcp",
-            "task",
-            "gate",
-            "NeuroStrata",
-            "--strict",
-        ])
-        .expect("task gate parses");
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "task", "gate", "NeuroStrata", "--strict"])
+                .expect("task gate parses");
         match cli.command {
             Some(Commands::Task {
                 action:
@@ -1237,12 +1284,22 @@ mod tests {
             other => panic!("expected Task/Validate, got {:?}", other),
         }
 
-        let cli =
-            Cli::try_parse_from(["neurostrata-mcp", "task", "import", "MyProj", "--from-beads", ".beads/issues.jsonl"])
-                .expect("task import parses");
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "task",
+            "import",
+            "MyProj",
+            "--from-beads",
+            ".beads/issues.jsonl",
+        ])
+        .expect("task import parses");
         match cli.command {
             Some(Commands::Task {
-                action: TaskCommands::Import { namespace, from_beads },
+                action:
+                    TaskCommands::Import {
+                        namespace,
+                        from_beads,
+                    },
             }) => {
                 assert_eq!(namespace, "MyProj");
                 assert_eq!(from_beads, ".beads/issues.jsonl");
@@ -1250,22 +1307,23 @@ mod tests {
             other => panic!("expected Task/Import, got {:?}", other),
         }
 
-        let cli =
-            Cli::try_parse_from(["neurostrata-mcp", "doctor", "--namespace", "MyProj"]).expect("doctor parses");
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "doctor", "--namespace", "MyProj"])
+            .expect("doctor parses");
         match cli.command {
             Some(Commands::Doctor { namespace }) => {
                 assert_eq!(namespace.as_deref(), Some("MyProj"))
             }
             other => panic!("expected Doctor, got {:?}", other),
         }
-        let cli = Cli::try_parse_from(["neurostrata-mcp", "doctor"]).expect("doctor parses unscoped");
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "doctor"]).expect("doctor parses unscoped");
         match cli.command {
             Some(Commands::Doctor { namespace }) => assert!(namespace.is_none()),
             other => panic!("expected Doctor, got {:?}", other),
         }
 
-        let cli =
-            Cli::try_parse_from(["neurostrata-mcp", "hooks", "install", "--force"]).expect("hooks install parses");
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "hooks", "install", "--force"])
+            .expect("hooks install parses");
         match cli.command {
             Some(Commands::Hooks {
                 action: HooksCommands::Install { force },
@@ -1274,8 +1332,8 @@ mod tests {
         }
 
         // The flag stays optional: plain `hooks install` is the common case.
-        let cli =
-            Cli::try_parse_from(["neurostrata-mcp", "hooks", "install"]).expect("hooks install parses bare");
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "hooks", "install"])
+            .expect("hooks install parses bare");
         match cli.command {
             Some(Commands::Hooks {
                 action: HooksCommands::Install { force },
@@ -1290,8 +1348,8 @@ mod tests {
     /// and report only "no memory with that id".
     #[test]
     fn the_archive_and_bus_metrics_commands_parse() {
-        let cli =
-            Cli::try_parse_from(["neurostrata-mcp", "bus-metrics"]).expect("bus-metrics takes no arguments");
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "bus-metrics"])
+            .expect("bus-metrics takes no arguments");
         assert!(
             matches!(cli.command, Some(Commands::BusMetrics)),
             "bus-metrics takes no arguments: {:?}",
@@ -1398,13 +1456,27 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = run_bus_metrics(true, &addr, &mut out, &mut err).await.unwrap();
-        assert_eq!(code, 0, "a daemon answered: {:?}", String::from_utf8_lossy(&err));
+        let code = run_bus_metrics(true, &addr, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(
+            code,
+            0,
+            "a daemon answered: {:?}",
+            String::from_utf8_lossy(&err)
+        );
 
         let printed = String::from_utf8(out).expect("stdout is UTF-8");
-        let snapshot: serde_json::Value = serde_json::from_str(printed.trim())
-            .unwrap_or_else(|e| panic!("stdout must be the metrics JSON itself, not prose about it: {printed} ({e})"));
-        assert_eq!(snapshot["events_emitted"], 1, "one pulse was emitted: {printed}");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(printed.trim()).unwrap_or_else(|e| {
+                panic!(
+                    "stdout must be the metrics JSON itself, not prose about it: {printed} ({e})"
+                )
+            });
+        assert_eq!(
+            snapshot["events_emitted"], 1,
+            "one pulse was emitted: {printed}"
+        );
         for field in [
             "events_emitted",
             "dispatcher_handled",
@@ -1415,9 +1487,16 @@ mod tests {
             "subscriber_timeouts",
             "recursion_blocks",
         ] {
-            assert!(snapshot.get(field).is_some(), "{field} must be in what the operator reads: {printed}");
+            assert!(
+                snapshot.get(field).is_some(),
+                "{field} must be in what the operator reads: {printed}"
+            );
         }
-        assert_eq!(printed.trim(), body.trim(), "stdout is the daemon's body verbatim");
+        assert_eq!(
+            printed.trim(),
+            body.trim(),
+            "stdout is the daemon's body verbatim"
+        );
 
         stub.abort();
     }
@@ -1430,9 +1509,14 @@ mod tests {
     async fn bus_metrics_without_a_daemon_exits_nonzero_and_prints_no_json() {
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = run_bus_metrics(false, DAEMON_ADDR, &mut out, &mut err).await.unwrap();
+        let code = run_bus_metrics(false, DAEMON_ADDR, &mut out, &mut err)
+            .await
+            .unwrap();
 
-        assert_eq!(code, BUS_METRICS_FAILURE_EXIT, "no daemon is a failure, not an idle bus");
+        assert_eq!(
+            code, BUS_METRICS_FAILURE_EXIT,
+            "no daemon is a failure, not an idle bus"
+        );
         assert!(
             out.is_empty(),
             "a fabricated zeroed snapshot must never reach stdout: {:?}",
@@ -1458,12 +1542,21 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = run_bus_metrics(true, &addr, &mut out, &mut err).await.unwrap();
+        let code = run_bus_metrics(true, &addr, &mut out, &mut err)
+            .await
+            .unwrap();
 
         assert_eq!(code, BUS_METRICS_FAILURE_EXIT, "the daemon never answered");
-        assert!(out.is_empty(), "no JSON is printed for an unreachable daemon: {:?}", String::from_utf8_lossy(&out));
+        assert!(
+            out.is_empty(),
+            "no JSON is printed for an unreachable daemon: {:?}",
+            String::from_utf8_lossy(&out)
+        );
         let said = String::from_utf8(err).expect("stderr is UTF-8");
-        assert!(said.contains(&addr) && said.contains("cannot read bus metrics"), "{said}");
+        assert!(
+            said.contains(&addr) && said.contains("cannot read bus metrics"),
+            "{said}"
+        );
     }
 
     /// The POST is bounded. Untimed it could hang on a port that accepts and
@@ -1545,8 +1638,7 @@ fn refuse_bus_metrics_unreachable_to(
     writeln!(
         err,
         "no NeuroStrata daemon answered at {} -- cannot read bus metrics: {}",
-        addr,
-        cause
+        addr, cause
     )
 }
 
@@ -1588,7 +1680,12 @@ async fn run_bus_metrics(
         // 404 is the expected answer from a daemon older than this route, and
         // saying so beats reporting an empty body as if the bus had said
         // nothing at all.
-        writeln!(err, "POST /bus/metrics answered {}: {}", status.as_u16(), body)?;
+        writeln!(
+            err,
+            "POST /bus/metrics answered {}: {}",
+            status.as_u16(),
+            body
+        )?;
         if status == reqwest::StatusCode::NOT_FOUND {
             writeln!(err, "That daemon predates the route. `neurostrata-mcp status` reports a stale daemon by comparing build fingerprints.")?;
         }
@@ -1639,12 +1736,18 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(false);
 
             if lock_held {
-                eprintln!("NeuroStrata daemon is starting (lock held); waiting for it to answer...");
+                eprintln!(
+                    "NeuroStrata daemon is starting (lock held); waiting for it to answer..."
+                );
                 let client = reqwest::Client::new();
-                for _ in 0..1200 { // up to 2 minutes
-                    if client.get("http://127.0.0.1:34343/health")
+                for _ in 0..1200 {
+                    // up to 2 minutes
+                    if client
+                        .get("http://127.0.0.1:34343/health")
                         .timeout(std::time::Duration::from_millis(500))
-                        .send().await.is_ok()
+                        .send()
+                        .await
+                        .is_ok()
                     {
                         eprintln!("Daemon is already running. Starting MCP proxy...");
                         server::start_mcp_proxy(server::DaemonOrigin::AlreadyRunning).await?;
@@ -1657,25 +1760,29 @@ async fn main() -> anyhow::Result<()> {
             }
 
             eprintln!("NeuroStrata MCP Server initializing...");
-            
+
             // Spawn the daemon as a detached process
-            let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("neurostrata-mcp"));
+            let exe = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("neurostrata-mcp"));
             std::process::Command::new(exe)
                 .arg("daemon")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()?;
-            
-            eprintln!("Waiting for daemon to become ready (this may take a moment while models load)...");
-            
+
+            eprintln!(
+                "Waiting for daemon to become ready (this may take a moment while models load)..."
+            );
+
             // Wait for daemon to become ready. Bounded per attempt as well as
             // overall: an unbound port on this machine hangs rather than
             // refusing -- the behaviour DaemonProbe exists to describe -- so an
             // untimed send here could spend the whole "30 seconds max" inside
             // one call.
             let client = reqwest::Client::new();
-            for _ in 0..300 { // 30 seconds max
+            for _ in 0..300 {
+                // 30 seconds max
                 if client
                     .get("http://127.0.0.1:34343/health")
                     .timeout(std::time::Duration::from_millis(500))
@@ -1724,7 +1831,8 @@ async fn main() -> anyhow::Result<()> {
                     embedder,
                     vector_store,
                     Some(config.deduplication.clone()),
-                ).await;
+                )
+                .await;
                 record_final_checkpoint(&outcome);
                 outcome?;
             }
@@ -1810,12 +1918,17 @@ async fn main() -> anyhow::Result<()> {
                 // that was already wedged gets longer, because engine waits of
                 // two and a half minutes have been measured.
                 let mut saw_lock = held;
-                let attempts = if probe == DaemonProbe::Responsive { 900 } else { 2400 };
+                let attempts = if probe == DaemonProbe::Responsive {
+                    900
+                } else {
+                    2400
+                };
                 for _ in 0..attempts {
                     if daemon_holds_lock(&db_path) {
                         saw_lock = true;
                     } else if saw_lock {
-                        let report = std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
+                        let report =
+                            std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
                         if report == FINAL_CHECKPOINT_OK {
                             println!("Daemon stopped and checkpointed.");
                             return Ok(());
@@ -1823,7 +1936,10 @@ async fn main() -> anyhow::Result<()> {
                         if report.is_empty() {
                             eprintln!("The daemon exited without reporting its final checkpoint, so writes since the last one may not be on disk.");
                         } else {
-                            eprintln!("The daemon exited, but its final checkpoint did not complete: {}", report);
+                            eprintln!(
+                                "The daemon exited, but its final checkpoint did not complete: {}",
+                                report
+                            );
                         }
                         std::process::exit(1);
                     } else if let Err(e) = client
@@ -1887,7 +2003,10 @@ async fn main() -> anyhow::Result<()> {
                         let own = daemon::exe_fingerprint();
                         match skew_verdict(fetch_daemon_info().await.as_ref(), own) {
                             Skew::InSync(v) => {
-                                println!("build: in sync with this binary ({}, hash {:016x})", v, own.0);
+                                println!(
+                                    "build: in sync with this binary ({}, hash {:016x})",
+                                    v, own.0
+                                );
                                 println!("status: healthy -- one daemon is serving every console");
                                 std::process::exit(0);
                             }
@@ -1908,7 +2027,9 @@ async fn main() -> anyhow::Result<()> {
                     _ => {
                         println!("daemon: not running");
                         println!("lock: free");
-                        println!("status: down -- safe to start exactly one: neurostrata-mcp daemon");
+                        println!(
+                            "status: down -- safe to start exactly one: neurostrata-mcp daemon"
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -1968,7 +2089,10 @@ async fn main() -> anyhow::Result<()> {
 
                 let snapshot = std::path::Path::new(&dir).join("ladybug.store");
                 if !snapshot.exists() {
-                    eprintln!("{:?} does not look like a snapshot: no ladybug.store inside it.", dir);
+                    eprintln!(
+                        "{:?} does not look like a snapshot: no ladybug.store inside it.",
+                        dir
+                    );
                     std::process::exit(1);
                 }
                 std::fs::copy(&snapshot, &target)?;
@@ -1991,10 +2115,17 @@ async fn main() -> anyhow::Result<()> {
                 let namespaces = vector_store.list_namespaces().await.unwrap_or_default();
                 println!("Restored {} into {:?}", dir, target);
                 if !namespaces.is_empty() {
-                    println!("It holds {} namespace(s): {}", namespaces.len(), namespaces.join(", "));
+                    println!(
+                        "It holds {} namespace(s): {}",
+                        namespaces.len(),
+                        namespaces.join(", ")
+                    );
                 }
                 if target != config.db_path {
-                    println!("To use it, set db_path in ~/.config/neurostrata/config.json to {:?}", target);
+                    println!(
+                        "To use it, set db_path in ~/.config/neurostrata/config.json to {:?}",
+                        target
+                    );
                 }
                 return Ok(());
             }
@@ -2049,53 +2180,50 @@ async fn main() -> anyhow::Result<()> {
                         return Ok(());
                     }
 
-                    let outcome: Result<serde_json::Value, String> =
-                        if probe == DaemonProbe::Responsive {
-                            match reqwest::Client::new()
-                                .post("http://127.0.0.1:34343/tasks/gate")
-                                .json(&serde_json::json!({
-                                    "namespace": namespace,
-                                    "strict": strict,
-                                }))
-                                .timeout(std::time::Duration::from_secs(10))
-                                .send()
-                                .await
-                            {
-                                Ok(resp) if resp.status().is_success() => match resp.text().await {
-                                    Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
-                                        .map_err(|e| {
-                                            format!(
-                                                "the daemon's gate reply could not be read: {}",
-                                                e
-                                            )
-                                        }),
-                                    Err(e) => Err(format!(
-                                        "the daemon's gate reply could not be read: {}",
-                                        e
-                                    )),
-                                },
-                                Ok(resp) => Err(format!(
-                                    "the daemon answered {} on /tasks/gate",
-                                    resp.status()
-                                )),
-                                Err(e) => Err(format!("the request to the daemon failed: {}", e)),
-                            }
-                        } else {
-                            match Config::from_default_path() {
-                                Err(e) => Err(format!("the config could not be read: {}", e)),
-                                Ok(config) => {
-                                    if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
-                                        Err(DAEMON_BUSY_MESSAGE.to_string())
-                                    } else if probe == DaemonProbe::Silent {
-                                        Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
-                                    } else {
-                                        direct_report(&config, &namespace)
-                                            .await
-                                            .map(|report| report.gate_json())
-                                    }
+                    let outcome: Result<serde_json::Value, String> = if probe
+                        == DaemonProbe::Responsive
+                    {
+                        match reqwest::Client::new()
+                            .post("http://127.0.0.1:34343/tasks/gate")
+                            .json(&serde_json::json!({
+                                "namespace": namespace,
+                                "strict": strict,
+                            }))
+                            .timeout(std::time::Duration::from_secs(10))
+                            .send()
+                            .await
+                        {
+                            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                                Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
+                                    .map_err(|e| {
+                                        format!("the daemon's gate reply could not be read: {}", e)
+                                    }),
+                                Err(e) => {
+                                    Err(format!("the daemon's gate reply could not be read: {}", e))
+                                }
+                            },
+                            Ok(resp) => Err(format!(
+                                "the daemon answered {} on /tasks/gate",
+                                resp.status()
+                            )),
+                            Err(e) => Err(format!("the request to the daemon failed: {}", e)),
+                        }
+                    } else {
+                        match Config::from_default_path() {
+                            Err(e) => Err(format!("the config could not be read: {}", e)),
+                            Ok(config) => {
+                                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                                    Err(DAEMON_BUSY_MESSAGE.to_string())
+                                } else if probe == DaemonProbe::Silent {
+                                    Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
+                                } else {
+                                    direct_report(&config, &namespace)
+                                        .await
+                                        .map(|report| report.gate_json())
                                 }
                             }
-                        };
+                        }
+                    };
 
                     match outcome {
                         Ok(body) => {
@@ -2111,10 +2239,7 @@ async fn main() -> anyhow::Result<()> {
                                         .get("kind")
                                         .and_then(|k| k.as_str())
                                         .unwrap_or("?"),
-                                    violation
-                                        .get("id")
-                                        .and_then(|i| i.as_str())
-                                        .unwrap_or("?"),
+                                    violation.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
                                     violation
                                         .get("detail")
                                         .and_then(|d| d.as_str())
@@ -2172,11 +2297,8 @@ async fn main() -> anyhow::Result<()> {
                             .send()
                             .await
                         {
-                            Ok(resp) if resp.status().is_success() => resp
-                                .text()
-                                .await
-                                .ok()
-                                .and_then(|body| {
+                            Ok(resp) if resp.status().is_success() => {
+                                resp.text().await.ok().and_then(|body| {
                                     serde_json::from_str::<serde_json::Value>(&body)
                                         .ok()
                                         .and_then(|v| {
@@ -2184,7 +2306,8 @@ async fn main() -> anyhow::Result<()> {
                                                 .and_then(|t| t.as_str())
                                                 .map(String::from)
                                         })
-                                }),
+                                })
+                            }
                             _ => None,
                         }
                     } else {
@@ -2295,7 +2418,9 @@ async fn main() -> anyhow::Result<()> {
             Commands::Setup { repo_path } => {
                 let repo = match repo_path {
                     Some(p) => p,
-                    None => std::env::current_dir().with_context(|| "cannot determine current_dir")?,
+                    None => {
+                        std::env::current_dir().with_context(|| "cannot determine current_dir")?
+                    }
                 };
                 match setup::run_setup(&repo) {
                     Ok(report) => {
@@ -2341,13 +2466,18 @@ async fn main() -> anyhow::Result<()> {
                             "{} already exists and was not written by NeuroStrata.",
                             target.display()
                         );
-                        eprintln!("Re-run with --force to replace it with the NeuroStrata task gate:");
+                        eprintln!(
+                            "Re-run with --force to replace it with the NeuroStrata task gate:"
+                        );
                         eprintln!("  neurostrata-mcp hooks install --force");
                         std::process::exit(1);
                     }
                     std::fs::write(&target, PRE_PUSH_HOOK)?;
                     set_hook_executable(&target)?;
-                    println!("Installed the NeuroStrata task gate at {}.", target.display());
+                    println!(
+                        "Installed the NeuroStrata task gate at {}.",
+                        target.display()
+                    );
                     return Ok(());
                 }
             },
@@ -2405,12 +2535,18 @@ async fn main() -> anyhow::Result<()> {
                         {
                             let mut query = url.query_pairs_mut();
                             query
-                                .append_pair("include_superseded", &(!exclude_superseded).to_string())
+                                .append_pair(
+                                    "include_superseded",
+                                    &(!exclude_superseded).to_string(),
+                                )
                                 .append_pair("include_archived", &include_archived.to_string())
                                 .append_pair("all", "true");
                             if let Some(anchor) = anchor_override.as_ref() {
                                 query
-                                    .append_pair("anchor_root", &anchor.project_root.to_string_lossy())
+                                    .append_pair(
+                                        "anchor_root",
+                                        &anchor.project_root.to_string_lossy(),
+                                    )
                                     .append_pair("source_id", &anchor.source_id);
                             }
                         }
@@ -2457,7 +2593,7 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Run `neurostrata-mcp shutdown` to stop it safely -- killing the process discards any writes made since the last checkpoint.");
                     std::process::exit(1);
                 }
-                
+
                 let config = Config::from_default_path()?;
                 if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
@@ -2488,12 +2624,22 @@ async fn main() -> anyhow::Result<()> {
                         println!("daemon: not running");
                         println!(
                             "lock: {}",
-                            if daemon_holds_lock(&config.db_path) { "held" } else { "free" }
+                            if daemon_holds_lock(&config.db_path) {
+                                "held"
+                            } else {
+                                "free"
+                            }
                         );
-                        println!("status: down -- safe to start exactly one: neurostrata-mcp daemon");
+                        println!(
+                            "status: down -- safe to start exactly one: neurostrata-mcp daemon"
+                        );
                         std::process::exit(1);
                     }
-                    Commands::Ingest { dir, namespace, schema_path } => {
+                    Commands::Ingest {
+                        dir,
+                        namespace,
+                        schema_path,
+                    } => {
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -2506,7 +2652,10 @@ async fn main() -> anyhow::Result<()> {
                         };
 
                         if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
-                            println!("Ingesting AST from {:?} into namespace '{}'", dir_path, namespace);
+                            println!(
+                                "Ingesting AST from {:?} into namespace '{}'",
+                                dir_path, namespace
+                            );
                             crate::parser::ingest::ingest_directory(
                                 dir_path,
                                 &schema,
@@ -2604,19 +2753,32 @@ async fn main() -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
                     }
-                    Commands::Move { source_namespace, id, target_namespace } => {
+                    Commands::Move {
+                        source_namespace,
+                        id,
+                        target_namespace,
+                    } => {
                         // One statement that changes the namespace. Copying to the
                         // target and deleting from the source removed the only copy,
                         // because upsert never rewrites a row's namespace.
-                        match vector_store.relocate(&id, &source_namespace, &target_namespace).await? {
+                        match vector_store
+                            .relocate(&id, &source_namespace, &target_namespace)
+                            .await?
+                        {
                             crate::traits::RelocateOutcome::Moved => {
-                                println!("Moved {} from '{}' to '{}'.", id, source_namespace, target_namespace);
+                                println!(
+                                    "Moved {} from '{}' to '{}'.",
+                                    id, source_namespace, target_namespace
+                                );
                             }
                             crate::traits::RelocateOutcome::SameNamespace => {
                                 println!("{} is already in '{}'.", id, source_namespace);
                             }
                             crate::traits::RelocateOutcome::NotFound => {
-                                eprintln!("No memory with id {} in namespace {}.", id, source_namespace);
+                                eprintln!(
+                                    "No memory with id {} in namespace {}.",
+                                    id, source_namespace
+                                );
                                 std::process::exit(1);
                             }
                             crate::traits::RelocateOutcome::Ingested => {
@@ -2628,7 +2790,12 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Commands::Add { namespace, memory_type, content, location } => {
+                    Commands::Add {
+                        namespace,
+                        memory_type,
+                        content,
+                        location,
+                    } => {
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -2640,10 +2807,18 @@ async fn main() -> anyhow::Result<()> {
                             metadata: serde_json::json!({}),
                         };
                         let id = uuid::Uuid::new_v4().to_string();
-                        vector_store.upsert(&namespace, &id, vector, payload).await?;
+                        vector_store
+                            .upsert(&namespace, &id, vector, payload)
+                            .await?;
                         println!("Memory added successfully with ID: {}", id);
                     }
-                    Commands::Edit { namespace, id, new_namespace, content, location } => {
+                    Commands::Edit {
+                        namespace,
+                        id,
+                        new_namespace,
+                        content,
+                        location,
+                    } => {
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,
@@ -2655,7 +2830,9 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await?
                         {
-                            crate::server::EditOutcome::Edited => println!("Successfully edited memory {}", id),
+                            crate::server::EditOutcome::Edited => {
+                                println!("Successfully edited memory {}", id)
+                            }
                             crate::server::EditOutcome::NotFound => {
                                 eprintln!("No memory with id {} in namespace {}.", id, namespace);
                                 std::process::exit(1);
@@ -2669,7 +2846,11 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Commands::SetMetadata { namespace, id, metadata } => {
+                    Commands::SetMetadata {
+                        namespace,
+                        id,
+                        metadata,
+                    } => {
                         let new_metadata: serde_json::Value = serde_json::from_str(&metadata)
                             .map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
                         match crate::server::set_metadata(
@@ -2680,7 +2861,9 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await?
                         {
-                            crate::server::MetadataOutcome::Updated => println!("Successfully updated metadata for memory {}", id),
+                            crate::server::MetadataOutcome::Updated => {
+                                println!("Successfully updated metadata for memory {}", id)
+                            }
                             crate::server::MetadataOutcome::NotFound => {
                                 eprintln!("No memory with id {} in namespace {}.", id, namespace);
                                 std::process::exit(1);

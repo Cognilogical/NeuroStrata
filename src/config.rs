@@ -11,43 +11,57 @@ pub struct DeduplicationConfig {
     /// Presence of key enables deduplication, absence disables it
     #[serde(default)]
     pub judgment_api_key: Option<String>,
-    
+
     /// Request timeout in seconds
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
-    
+
     /// Similarity threshold for candidate selection (0.0-1.0)
     #[serde(default = "default_similarity_threshold")]
     pub similarity_threshold: f32,
-    
+
     /// Confidence threshold to consider something a duplicate (0.0-1.0)
     #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f32,
-    
+
     /// Maximum number of candidates to check
     #[serde(default = "default_max_candidates")]
     pub max_candidates: usize,
-    
+
     /// Circuit breaker: failures before opening
     #[serde(default = "default_cb_failure_threshold")]
     pub cb_failure_threshold: u32,
-    
+
     /// Circuit breaker: initial backoff in seconds
     #[serde(default = "default_cb_backoff_initial")]
     pub cb_backoff_initial_seconds: u64,
-    
+
     /// Circuit breaker: maximum backoff in seconds
     #[serde(default = "default_cb_backoff_max")]
     pub cb_backoff_max_seconds: u64,
 }
 
-fn default_timeout() -> u64 { 5 }
-fn default_similarity_threshold() -> f32 { 0.85 }
-fn default_confidence_threshold() -> f32 { 0.8 }
-fn default_max_candidates() -> usize { 5 }
-fn default_cb_failure_threshold() -> u32 { 3 }
-fn default_cb_backoff_initial() -> u64 { 30 }
-fn default_cb_backoff_max() -> u64 { 3600 }
+fn default_timeout() -> u64 {
+    5
+}
+fn default_similarity_threshold() -> f32 {
+    0.85
+}
+fn default_confidence_threshold() -> f32 {
+    0.8
+}
+fn default_max_candidates() -> usize {
+    5
+}
+fn default_cb_failure_threshold() -> u32 {
+    3
+}
+fn default_cb_backoff_initial() -> u64 {
+    30
+}
+fn default_cb_backoff_max() -> u64 {
+    3600
+}
 
 impl Default for DeduplicationConfig {
     fn default() -> Self {
@@ -68,7 +82,7 @@ impl Default for DeduplicationConfig {
 pub struct Config {
     #[serde(default)]
     pub db_path: PathBuf,
-    
+
     #[serde(default)]
     pub deduplication: DeduplicationConfig,
 
@@ -125,20 +139,24 @@ impl Config {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not read config at {}", path.display()))?;
         let mut config: Config = serde_json::from_str(&content)?;
-        
+
         // If they have a legacy config where db_path points to an existing directory (from LanceDB),
         // we need to append a filename so LadybugDB doesn't crash.
         if config.db_path.is_dir() {
             config.db_path = config.db_path.join("ladybug.db");
         }
-        
+
         Ok(config)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Could not create config directory {}", parent.display()))?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Could not create config directory {}", parent.display())
+            })?;
         }
 
         let file_name = path
@@ -163,9 +181,9 @@ impl Config {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = options
-                .open(&temp_path)
-                .with_context(|| format!("Could not create temporary config {}", temp_path.display()))?;
+            let mut file = options.open(&temp_path).with_context(|| {
+                format!("Could not create temporary config {}", temp_path.display())
+            })?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -176,7 +194,10 @@ impl Config {
             file.write_all(b"\n")?;
             if let Some(permissions) = existing_permissions {
                 file.set_permissions(permissions).with_context(|| {
-                    format!("Could not preserve config permissions at {}", path.display())
+                    format!(
+                        "Could not preserve config permissions at {}",
+                        path.display()
+                    )
                 })?;
             }
             file.sync_all()?;
@@ -195,13 +216,22 @@ impl Config {
             anyhow::bail!("Project context source ID must not be empty");
         }
         let metadata = fs::metadata(marker_path).with_context(|| {
-            format!("Project context marker does not exist: {}", marker_path.display())
+            format!(
+                "Project context marker does not exist: {}",
+                marker_path.display()
+            )
         })?;
         if !metadata.is_dir() {
-            anyhow::bail!("Project context marker is not a directory: {}", marker_path.display());
+            anyhow::bail!(
+                "Project context marker is not a directory: {}",
+                marker_path.display()
+            );
         }
         if marker_path.file_name().and_then(|name| name.to_str()) != Some(".NeuroStrata") {
-            anyhow::bail!("Project context path must end in .NeuroStrata: {}", marker_path.display());
+            anyhow::bail!(
+                "Project context path must end in .NeuroStrata: {}",
+                marker_path.display()
+            );
         }
 
         let canonical_path = fs::canonicalize(marker_path)
@@ -212,7 +242,8 @@ impl Config {
                 canonical_path.display()
             );
         }
-        self.project_contexts.insert(source_id.to_string(), canonical_path);
+        self.project_contexts
+            .insert(source_id.to_string(), canonical_path);
         Ok(())
     }
 
@@ -281,7 +312,10 @@ mod tests {
             Some(&fs::canonicalize(&marker).unwrap())
         );
         assert_eq!(config.db_path, PathBuf::from("custom.db"));
-        assert_eq!(config.deduplication.judgment_api_key.as_deref(), Some("keep-me"));
+        assert_eq!(
+            config.deduplication.judgment_api_key.as_deref(),
+            Some("keep-me")
+        );
         assert_eq!(config.deduplication.similarity_threshold, 0.42);
     }
 

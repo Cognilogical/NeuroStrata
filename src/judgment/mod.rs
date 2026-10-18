@@ -44,13 +44,13 @@ use crate::config::DeduplicationConfig;
 pub struct CircuitBreakerConfig {
     /// Number of failures before opening circuit
     pub failure_threshold: u32,
-    
+
     /// Initial backoff duration (milliseconds)
     pub initial_backoff_ms: u64,
-    
+
     /// Maximum backoff duration (milliseconds)
     pub max_backoff_ms: u64,
-    
+
     /// Backoff multiplier
     pub backoff_multiplier: f64,
 }
@@ -77,7 +77,9 @@ impl DeduplicationChecker {
     pub fn new(config: DeduplicationConfig) -> Result<Self> {
         // Determine provider based on API key presence - the key itself is the enable signal
         let provider: Box<dyn JudgmentProvider> = if config.judgment_api_key.is_some() {
-            Box::new(typesafe_jev::TypeSafeJevProvider::new(config.judgment_api_key.clone().unwrap())?)
+            Box::new(typesafe_jev::TypeSafeJevProvider::new(
+                config.judgment_api_key.clone().unwrap(),
+            )?)
         } else {
             Box::new(provider::MockJudgmentProvider::new())
         };
@@ -121,9 +123,7 @@ impl DeduplicationChecker {
         // Apply timeout to judgment call
         let timeout = Duration::from_secs(self.config.timeout_seconds);
         let result = tokio::time::timeout(timeout, async {
-            self.provider
-                .judge_duplicates(new_memory, candidates)
-                .await
+            self.provider.judge_duplicates(new_memory, candidates).await
         })
         .await;
 
@@ -131,7 +131,7 @@ impl DeduplicationChecker {
             Ok(Ok(judgments)) => {
                 // Success - reset circuit breaker
                 self.circuit_breaker.record_success();
-                
+
                 // Filter by confidence threshold
                 let duplicates: Vec<_> = judgments
                     .into_iter()

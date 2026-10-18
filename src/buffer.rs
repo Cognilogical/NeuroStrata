@@ -21,8 +21,7 @@ pub(crate) struct BufferConfig {
 }
 
 pub(crate) fn load_config() -> BufferConfig {
-    let path = dirs::home_dir()
-        .map(|h| h.join(".config").join("neurostrata").join("config.json"));
+    let path = dirs::home_dir().map(|h| h.join(".config").join("neurostrata").join("config.json"));
     let raw = path
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
@@ -225,7 +224,8 @@ mod tests {
         assert_eq!(rolled.len(), 1, "the rolled file survives inside retention");
         // Backdate it past retention and roll again: it must be pruned.
         let old = sessions.join(&rolled[0]);
-        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 90);
+        let old_time =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60 * 24 * 90);
         let f = std::fs::File::options().write(true).open(&old).unwrap();
         f.set_modified(old_time).unwrap();
         append_entry(&root, &"y".repeat(200), &[], 100, 30).unwrap();
@@ -251,7 +251,11 @@ mod tests {
         // file must not exist, and when enabled the append must succeed. Both
         // outcomes are contract; only a crash is a failure.
         if result.contains("Episodic Buffer disabled") {
-            assert!(!root.join(".NeuroStrata").join("sessions").join("current.md").exists());
+            assert!(!root
+                .join(".NeuroStrata")
+                .join("sessions")
+                .join("current.md")
+                .exists());
         } else {
             assert!(result.contains("\"appended\":true"));
         }

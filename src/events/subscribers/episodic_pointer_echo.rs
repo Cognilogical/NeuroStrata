@@ -69,7 +69,10 @@ impl EpisodicPointerEcho {
     /// `project_root` is the same root `neurostrata_append_log` is given: the
     /// buffer lives at `<project_root>/.NeuroStrata/sessions/`.
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        Self { project_root: project_root.into(), load_config: buffer::load_config }
+        Self {
+            project_root: project_root.into(),
+            load_config: buffer::load_config,
+        }
     }
 
     /// The subscriber over an explicit config loader. Tests only: the operator
@@ -80,7 +83,10 @@ impl EpisodicPointerEcho {
         project_root: impl Into<PathBuf>,
         load_config: fn() -> buffer::BufferConfig,
     ) -> Self {
-        Self { project_root: project_root.into(), load_config }
+        Self {
+            project_root: project_root.into(),
+            load_config,
+        }
     }
 }
 
@@ -96,7 +102,12 @@ impl MemorySubscriber for EpisodicPointerEcho {
         _token: &RecursionToken,
         _ctx: &SubscriberContext<'_>,
     ) -> Result<(), SubscriberError> {
-        let ThalamicPulse::Created { id, namespace, kind } = event else {
+        let ThalamicPulse::Created {
+            id,
+            namespace,
+            kind,
+        } = event
+        else {
             return Ok(());
         };
 
@@ -139,7 +150,10 @@ impl MemorySubscriber for EpisodicPointerEcho {
 /// This is the one place the subscriber mirrors `buffer`'s layout, and it must
 /// move if that moves.
 fn current_log(project_root: &Path) -> PathBuf {
-    project_root.join(".NeuroStrata").join("sessions").join("current.md")
+    project_root
+        .join(".NeuroStrata")
+        .join("sessions")
+        .join("current.md")
 }
 
 /// Whether the buffer already carries a pointer for this `(id, kind)`.
@@ -183,7 +197,9 @@ fn newest_rolled_log(sessions: Option<&Path>) -> Option<PathBuf> {
             continue;
         };
         let path = entry.path();
-        let is_newer = newest.as_ref().is_none_or(|(t, p)| (mtime, &path) > (*t, p));
+        let is_newer = newest
+            .as_ref()
+            .is_none_or(|(t, p)| (mtime, &path) > (*t, p));
         if is_newer {
             newest = Some((mtime, path));
         }
@@ -215,8 +231,15 @@ fn file_carries_pointer(path: &Path, id: &str, kind: &str) -> bool {
     // Started mid-file: the first line is a fragment, and may have split a
     // multi-byte character (hence the lossy decode above). Dropped, because a
     // half-line matching nothing is the safe way to be wrong.
-    let tail = if start > 0 { chunk.split_once('\n').map_or("", |(_, rest)| rest) } else { chunk };
-    tail.lines().rev().take(IDEMPOTENCY_SCAN_LINES).any(|line| pointer_matches(line, id, kind))
+    let tail = if start > 0 {
+        chunk.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        chunk
+    };
+    tail.lines()
+        .rev()
+        .take(IDEMPOTENCY_SCAN_LINES)
+        .any(|line| pointer_matches(line, id, kind))
 }
 
 /// Whether one buffer line is a pointer to exactly this `(id, kind)`.
@@ -230,7 +253,9 @@ fn file_carries_pointer(path: &Path, id: &str, kind: &str) -> bool {
 /// inside `xa`) from reading as a duplicate.
 fn pointer_matches(line: &str, id: &str, kind: &str) -> bool {
     let mut fields = line.split('\t');
-    let labeled = fields.next().is_some_and(|prefix| prefix.ends_with(POINTER_LABEL));
+    let labeled = fields
+        .next()
+        .is_some_and(|prefix| prefix.ends_with(POINTER_LABEL));
     labeled && fields.next() == Some(id) && fields.next() == Some(kind)
 }
 
@@ -255,7 +280,9 @@ mod tests {
 
     /// The buffer file the agent's own `append_log` entries land in.
     fn buffer_file(root: &Path) -> PathBuf {
-        root.join(".NeuroStrata").join("sessions").join("current.md")
+        root.join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md")
     }
 
     fn created(id: &str, kind: &str) -> ThalamicPulse {
@@ -270,12 +297,18 @@ mod tests {
     /// [`EpisodicPointerEcho::with_config`]: the real config is machine-global,
     /// so tests that want a definite outcome supply it.
     fn buffer_on() -> buffer::BufferConfig {
-        buffer::BufferConfig { enabled: true, retention_days: 30 }
+        buffer::BufferConfig {
+            enabled: true,
+            retention_days: 30,
+        }
     }
 
     /// The operator switch off -- `"episodic_buffer": false` in the config.
     fn buffer_off() -> buffer::BufferConfig {
-        buffer::BufferConfig { enabled: false, retention_days: 30 }
+        buffer::BufferConfig {
+            enabled: false,
+            retention_days: 30,
+        }
     }
 
     fn echo_of(root: &Path) -> EpisodicPointerEcho {
@@ -297,10 +330,23 @@ mod tests {
 
         let text = std::fs::read_to_string(buffer_file(&root))
             .expect("a Created pulse must leave a buffer file behind");
-        assert_eq!(text.lines().count(), 1, "exactly one pointer per Created: {text:?}");
-        assert!(text.contains("mem-1\ttask"), "the id/kind pointer: {text:?}");
-        assert!(text.contains("NeuroStrata"), "the namespace it landed in: {text:?}");
-        assert!(text.starts_with("- *["), "written through the buffer's own entry format: {text:?}");
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "exactly one pointer per Created: {text:?}"
+        );
+        assert!(
+            text.contains("mem-1\ttask"),
+            "the id/kind pointer: {text:?}"
+        );
+        assert!(
+            text.contains("NeuroStrata"),
+            "the namespace it landed in: {text:?}"
+        );
+        assert!(
+            text.starts_with("- *["),
+            "written through the buffer's own entry format: {text:?}"
+        );
     }
 
     /// The failure path, drilled: the same `(id, kind)` emitted twice must
@@ -324,7 +370,11 @@ mod tests {
             1,
             "a second emit of the same (id, kind) must be a no-op: {text:?}"
         );
-        assert_eq!(text.matches("mem-1\ttask").count(), 1, "one pointer, one occurrence: {text:?}");
+        assert_eq!(
+            text.matches("mem-1\ttask").count(),
+            1,
+            "one pointer, one occurrence: {text:?}"
+        );
         // Both pulses really did reach the dispatcher -- the count above is the
         // idempotency check holding, not a second pulse silently lost.
         let m = bus.metrics();
@@ -345,7 +395,11 @@ mod tests {
         tokio::time::sleep(DISPATCH_WAIT).await;
 
         let text = std::fs::read_to_string(buffer_file(&root)).unwrap();
-        assert_eq!(text.lines().count(), 2, "distinct ids are distinct pointers: {text:?}");
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "distinct ids are distinct pointers: {text:?}"
+        );
     }
 
     /// Only `Created` echoes. `Superseded` and `Archived` are mutations of a
@@ -366,7 +420,10 @@ mod tests {
             &RecursionToken::root(),
         );
         bus.emit(
-            ThalamicPulse::Archived { id: "mem-1".into(), namespace: "NeuroStrata".into() },
+            ThalamicPulse::Archived {
+                id: "mem-1".into(),
+                namespace: "NeuroStrata".into(),
+            },
             &RecursionToken::root(),
         );
         tokio::time::sleep(DISPATCH_WAIT).await;
@@ -375,7 +432,11 @@ mod tests {
             !buffer_file(&root).exists(),
             "a pulse the subscriber does not match must not create the buffer"
         );
-        assert_eq!(bus.metrics().dispatcher_handled, 2, "both pulses still dispatched");
+        assert_eq!(
+            bus.metrics().dispatcher_handled,
+            2,
+            "both pulses still dispatched"
+        );
     }
 
     /// `"episodic_buffer": false` means the operator turned this file off. The
@@ -386,7 +447,10 @@ mod tests {
     async fn a_disabled_buffer_writes_no_pointer() {
         let root = scratch("disabled");
         let bus = ThalamicBus::new(16);
-        bus.register(Box::new(EpisodicPointerEcho::with_config(root.clone(), buffer_off)));
+        bus.register(Box::new(EpisodicPointerEcho::with_config(
+            root.clone(),
+            buffer_off,
+        )));
 
         bus.emit(created("mem-1", "task"), &RecursionToken::root());
         tokio::time::sleep(DISPATCH_WAIT).await;
@@ -398,7 +462,11 @@ mod tests {
         // Suppressed at the write, not by dropping the pulse: the dispatcher
         // still handled it, which is what makes this an operator's switch
         // rather than a quiet failure.
-        assert_eq!(bus.metrics().dispatcher_handled, 1, "the pulse still reached the subscriber");
+        assert_eq!(
+            bus.metrics().dispatcher_handled,
+            1,
+            "the pulse still reached the subscriber"
+        );
     }
 
     /// Idempotency across a rollover. The buffer renames `current.md` to
@@ -471,7 +539,8 @@ mod tests {
 
         let text = std::fs::read_to_string(buffer_file(&root)).unwrap();
         assert_eq!(
-            text.matches(&format!("{POINTER_LABEL}\tmem-1\ttask")).count(),
+            text.matches(&format!("{POINTER_LABEL}\tmem-1\ttask"))
+                .count(),
             1,
             "the echo follows the agent's note instead of being suppressed by it: {text:?}"
         );
@@ -505,7 +574,10 @@ mod tests {
         );
         if written {
             let text = std::fs::read_to_string(buffer_file(&root)).unwrap();
-            assert!(text.contains("mem-1\ttask"), "the pointer it wrote: {text:?}");
+            assert!(
+                text.contains("mem-1\ttask"),
+                "the pointer it wrote: {text:?}"
+            );
         }
     }
 
@@ -515,11 +587,24 @@ mod tests {
     #[test]
     fn a_prefix_id_is_not_mistaken_for_a_duplicate() {
         let line = format!("- *[2026-10-09 08:00:00]*: {POINTER_LABEL}\tmem-1\ttask\tNeuroStrata");
-        assert!(!pointer_matches(&line, "mem", "task"), "suffix ids are distinct: {line:?}");
-        assert!(pointer_matches(&line, "mem-1", "task"), "the exact pair matches: {line:?}");
-        assert!(!pointer_matches(&line, "mem-1", "fact"), "the kind is half the key: {line:?}");
         assert!(
-            !pointer_matches("- *[2026-10-09 08:00:00]*: mem-1 is the task I finished", "mem-1", "task"),
+            !pointer_matches(&line, "mem", "task"),
+            "suffix ids are distinct: {line:?}"
+        );
+        assert!(
+            pointer_matches(&line, "mem-1", "task"),
+            "the exact pair matches: {line:?}"
+        );
+        assert!(
+            !pointer_matches(&line, "mem-1", "fact"),
+            "the kind is half the key: {line:?}"
+        );
+        assert!(
+            !pointer_matches(
+                "- *[2026-10-09 08:00:00]*: mem-1 is the task I finished",
+                "mem-1",
+                "task"
+            ),
             "an agent-authored note is not a pointer: no tabbed fields"
         );
         assert!(
