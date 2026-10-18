@@ -269,6 +269,7 @@ async fn save_task(
     store
         .upsert(namespace, id, vector, payload)
         .await
+        .map(|_| ())
         .map_err(|e| format!("Failed to store task '{}': {}", id, e))
 }
 
@@ -1123,7 +1124,7 @@ pub async fn handle_task_complete(
                 location_lines,
                 metadata: meta,
             };
-            let lesson_id = crate::server::embed_dedup_and_upsert(
+            let report = crate::server::embed_dedup_and_upsert(
                 &store,
                 &emb,
                 &namespace,
@@ -1133,7 +1134,7 @@ pub async fn handle_task_complete(
             .await?;
             memories = list_now().await?;
             edge = gate::extraction_exists(&memories, &id);
-            inline_lesson = Some(lesson_id);
+            inline_lesson = Some(report.id);
         }
     }
 
@@ -4030,7 +4031,7 @@ mod tests {
             id: &str,
             vector: Vec<f32>,
             payload: MemoryPayload,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
             self.inner.upsert(namespace, id, vector, payload).await
         }
         async fn search(

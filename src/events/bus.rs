@@ -73,7 +73,7 @@ impl VectorStore for StoreNotAttached {
         _id: &str,
         _vector: Vec<f32>,
         _payload: MemoryPayload,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::traits::UpsertReport> {
         Err(Self::err())
     }
     async fn search(
@@ -752,7 +752,7 @@ mod tests {
             _id: &str,
             _vector: Vec<f32>,
             _payload: MemoryPayload,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
             Err(anyhow!("recording store: unused by this test"))
         }
         async fn search(

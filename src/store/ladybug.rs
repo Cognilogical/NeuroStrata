@@ -461,6 +461,7 @@ fn parse_edge_specs(payload: &crate::traits::MemoryPayload) -> (Vec<EdgeSpec>, V
                                 rel_type,
                                 target_id: s.clone(),
                                 points_at_target,
+                                declaration_index: i,
                             });
                         }
                         _ => {
@@ -620,6 +621,7 @@ impl<'a> KnownIds<'a> {
 pub struct EdgeSpec {
     pub rel_type: &'static str,
     pub target_id: String,
+    pub declaration_index: usize,
     /// true for `self -> target`, false for `target -> self`. Containment reads
     /// the other way round: the parent contains the child, not the reverse.
     pub points_at_target: bool,
@@ -801,7 +803,7 @@ impl VectorStore for LadybugStore {
         id: &str,
         vector: Vec<f32>,
         payload: MemoryPayload,
-    ) -> Result<()> {
+    ) -> Result<crate::traits::UpsertReport> {
         let namespace = namespace.to_string();
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
@@ -836,6 +838,8 @@ impl VectorStore for LadybugStore {
             for w in &shape_warnings {
                 emit_write_shape_warning(&namespace, &id, w);
             }
+
+            let mut deferred_edges = Vec::new();
         
             // Materialise the edges this memory declares. A target that does not exist
             // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
@@ -846,6 +850,12 @@ impl VectorStore for LadybugStore {
                     match exact_target_exists(conn, &edge.target_id) {
                         Ok(true) => edge.target_id.clone(),
                         Ok(false) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Missing,
+                            });
                             emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                                 field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                                 why: "qualified target does not exist".to_string(),
@@ -853,7 +863,13 @@ impl VectorStore for LadybugStore {
                             });
                             continue;
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Failed(e.to_string()),
+                            });
                             emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                                 field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                                 why: "target lookup failed".to_string(),
@@ -864,8 +880,16 @@ impl VectorStore for LadybugStore {
                     }
                 } else {
                     match resolve_target_on_write(conn, &namespace, &edge.target_id) {
-                        Some(found) => found,
-                        None => {
+                        crate::traits::TargetResolution::Resolved(found) => found,
+                        resolution @ crate::traits::TargetResolution::Missing
+                        | resolution @ crate::traits::TargetResolution::Ambiguous(_)
+                        | resolution @ crate::traits::TargetResolution::Failed(_) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution,
+                            });
                             emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                                 field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                                 why: "unqualified target is missing or ambiguous".to_string(),
@@ -886,6 +910,12 @@ impl VectorStore for LadybugStore {
                     from, to, edge.rel_type
                 );
                 if let Err(e) = conn.query(&edge_query) {
+                    deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                        rel_type: edge.rel_type.to_string(),
+                        declared_target: edge.target_id.clone(),
+                        declaration_index: edge.declaration_index,
+                        resolution: crate::traits::TargetResolution::Failed(e.to_string()),
+                    });
                     emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                         field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                         why: "edge materialization failed".to_string(),
@@ -895,7 +925,10 @@ impl VectorStore for LadybugStore {
                 }
             }
 
-            Ok(())
+            Ok(crate::traits::UpsertReport {
+                id: id.clone(),
+                deferred_edges,
+            })
         })
         .await
     }
@@ -1559,6 +1592,7 @@ impl VectorStore for LadybugStore {
         include_retired: bool,
         include_archived: bool,
     ) -> Result<serde_json::Value> {
+        let anchor_root = configured_anchor_root();
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().timestamp();
 
@@ -1600,29 +1634,11 @@ impl VectorStore for LadybugStore {
                     retired_ids.insert(id.clone());
                 }
 
-                // If absolute_path wasn't in metadata, try to compute it from location
-                if absolute_path.is_empty() && !location.is_empty() {
-                    let p = std::path::Path::new(&location);
-                    if p.is_absolute() {
-                        absolute_path = location.clone();
-                    } else if let Ok(cwd) = std::env::current_dir() {
-                        // dunce, not std. std::fs::canonicalize returns Windows'
-                        // extended-length form, \\?\C:\dev\..., which most
-                        // consumers cannot use: the visualizer turns this into a
-                        // vscode://file URL, where \\?\ becomes //?/, and the
-                        // editor opens and reports that the file does not exist.
-                        // dunce returns the plain form where one exists, and
-                        // leaves a genuine UNC path alone rather than corrupting
-                        // it -- which is the case a hand-rolled prefix strip
-                        // tends to get wrong.
-                        if let Ok(resolved) = dunce::canonicalize(cwd.join(p)) {
-                            absolute_path = resolved.to_string_lossy().to_string();
-                        }
-                        // canonicalize fails when the file is gone -- a memory
-                        // naming a since-deleted path. absolute_path stays empty,
-                        // which is what tells the UI it has nothing to open.
-                    }
-                }
+                absolute_path = export_absolute_path(
+                    &location,
+                    &absolute_path,
+                    anchor_root.as_deref(),
+                );
 
                 if !include_retired && retired {
                     continue;
@@ -1886,18 +1902,27 @@ fn declared_target_candidates(namespace: &str, declared: &str) -> Vec<String> {
 /// Chooses among the ids that exist: the memory's own namespace first, then the
 /// id exactly as declared, then a suffix -- but only one. An ambiguous suffix
 /// produces no edge, because a wrong edge is worse than a missing one.
-fn pick_declared_target(namespace: &str, declared: &str, found: &[String]) -> Option<String> {
+fn pick_declared_target(
+    namespace: &str,
+    declared: &str,
+    found: &[String],
+) -> crate::traits::TargetResolution {
     let qualified = crate::parser::ingest::qualified_id(namespace, &declared.replace('\\', "/"));
     if found.iter().any(|id| *id == qualified) {
-        return Some(qualified);
+        return crate::traits::TargetResolution::Resolved(qualified);
     }
     if found.iter().any(|id| id == declared) {
-        return Some(declared.to_string());
+        return crate::traits::TargetResolution::Resolved(declared.to_string());
     }
-    let mut suffixes = found.iter().filter(|id| **id != qualified && id.as_str() != declared);
-    match (suffixes.next(), suffixes.next()) {
-        (Some(only), None) => Some(only.clone()),
-        _ => None,
+    let suffixes: Vec<String> = found
+        .iter()
+        .filter(|id| **id != qualified && id.as_str() != declared)
+        .cloned()
+        .collect();
+    match suffixes.len() {
+        0 => crate::traits::TargetResolution::Missing,
+        1 => crate::traits::TargetResolution::Resolved(suffixes[0].clone()),
+        _ => crate::traits::TargetResolution::Ambiguous(suffixes),
     }
 }
 
@@ -1906,7 +1931,11 @@ fn pick_declared_target(namespace: &str, declared: &str, found: &[String]) -> Op
 /// The exact id stays unscoped, as edges always have been; everything inferred
 /// from it is confined to the memory's own namespace, so a bare `src/lib.rs`
 /// cannot land on another project's file.
-fn resolve_target_on_write(conn: &Connection, namespace: &str, declared: &str) -> Option<String> {
+fn resolve_target_on_write(
+    conn: &Connection,
+    namespace: &str,
+    declared: &str,
+) -> crate::traits::TargetResolution {
     let candidates = declared_target_candidates(namespace, declared)
         .iter()
         .map(|c| format!("'{}'", escape_ladybug_string(c)))
@@ -1918,12 +1947,42 @@ fn resolve_target_on_write(conn: &Connection, namespace: &str, declared: &str) -
         escape_ladybug_string(namespace),
         candidates
     );
-    let mut rows = conn.query(&query).ok()?;
+    let mut rows = match conn.query(&query) {
+        Ok(rows) => rows,
+        Err(e) => return crate::traits::TargetResolution::Failed(e.to_string()),
+    };
     let mut found = Vec::new();
     while let Some(row) = rows.next() {
         found.push(format!("{}", row[0]));
     }
     pick_declared_target(namespace, declared, &found)
+}
+
+/// Resolve an explicitly configured project root without assuming a VCS.
+/// An absent setting means export must not derive paths from its ambient CWD.
+fn configured_anchor_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
+        .filter(|root| !root.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn export_absolute_path(
+    location: &str,
+    stored_absolute_path: &str,
+    anchor_root: Option<&std::path::Path>,
+) -> String {
+    let location_path = std::path::Path::new(location);
+    if location_path.is_absolute() {
+        return location.to_string();
+    }
+    if let Some(root) = anchor_root.filter(|_| !location.is_empty()) {
+        let candidate = root.join(location_path);
+        return dunce::canonicalize(&candidate)
+            .unwrap_or(candidate)
+            .to_string_lossy()
+            .into_owned();
+    }
+    stored_absolute_path.to_string()
 }
 
 /// Fails a future that outstays its deadline, with a message that says what was
@@ -2378,25 +2437,71 @@ eurostrata\src\daemon.rs", &known).as_deref(),
     #[test]
     fn a_declaration_prefers_its_own_namespace_then_its_exact_id_then_one_suffix() {
         let both = vec!["probe::src/a.rs".to_string(), "src/a.rs".to_string()];
-        assert_eq!(pick_declared_target("probe", "src/a.rs", &both).as_deref(), Some("probe::src/a.rs"));
-        assert_eq!(
-            pick_declared_target("probe", "src/a.rs", &["src/a.rs".to_string()]).as_deref(),
-            Some("src/a.rs")
-        );
-        assert_eq!(
-            pick_declared_target("probe", "C:/old/src/a.rs", &["probe::src/a.rs".to_string()]).as_deref(),
-            Some("probe::src/a.rs")
-        );
-        assert_eq!(
+        assert!(matches!(
+            pick_declared_target("probe", "src/a.rs", &both),
+            crate::traits::TargetResolution::Resolved(ref id) if id == "probe::src/a.rs"
+        ));
+        assert!(matches!(
+            pick_declared_target("probe", "src/a.rs", &["src/a.rs".to_string()]),
+            crate::traits::TargetResolution::Resolved(ref id) if id == "src/a.rs"
+        ));
+        assert!(matches!(
+            pick_declared_target("probe", "C:/old/src/a.rs", &["probe::src/a.rs".to_string()]),
+            crate::traits::TargetResolution::Resolved(ref id) if id == "probe::src/a.rs"
+        ));
+        assert!(matches!(
             pick_declared_target(
                 "probe",
                 "C:/old/src/a.rs",
                 &["probe::src/a.rs".to_string(), "probe::a.rs".to_string()]
             ),
-            None,
-            "an ambiguous suffix is left alone"
-        );
+            crate::traits::TargetResolution::Ambiguous(_)
+        ), "an ambiguous suffix is left alone");
         assert!(declared_target_candidates("probe", "C:/old/src/a.rs").contains(&"probe::src/a.rs".to_string()));
+    }
+
+    #[tokio::test]
+    async fn upsert_reports_unresolved_edge_target_and_declaration_index() {
+        let store = retired_test_store().await;
+        let report = store
+            .upsert(
+                "probe",
+                "rule-with-deferred-edge",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({ "governs": ["src/not-ingested.rs"] }),
+                ),
+            )
+            .await
+            .expect("memory write remains fail-soft");
+
+        assert_eq!(report.id, "rule-with-deferred-edge");
+        assert_eq!(report.deferred_edges.len(), 1);
+        assert_eq!(report.deferred_edges[0].rel_type, "GOVERNS");
+        assert_eq!(report.deferred_edges[0].declared_target, "src/not-ingested.rs");
+        assert_eq!(report.deferred_edges[0].declaration_index, 0);
+        assert!(matches!(
+            report.deferred_edges[0].resolution,
+            crate::traits::TargetResolution::Missing
+        ));
+    }
+
+    #[test]
+    fn export_rebases_relative_locations_only_to_an_explicit_anchor_root() {
+        assert_eq!(
+            export_absolute_path(
+                "src/lib.rs",
+                "/transient/worktree/src/lib.rs",
+                Some(std::path::Path::new("/canonical/project")),
+            ),
+            "/canonical/project/src/lib.rs"
+        );
+        assert_eq!(
+            export_absolute_path("src/lib.rs", "/stored/project/src/lib.rs", None),
+            "/stored/project/src/lib.rs"
+        );
     }
 
     /// Ingestion qualifies node ids, and a rule names the file the way a human
@@ -2464,8 +2569,8 @@ eurostrata\src\daemon.rs", &known).as_deref(),
             "governs": ["src/lib.rs"]
         }));
         assert_eq!(specs.len(), 3);
-        assert!(specs.contains(&EdgeSpec { rel_type: "RELATES_TO", target_id: "a".into(), points_at_target: true }));
-        assert!(specs.contains(&EdgeSpec { rel_type: "GOVERNS", target_id: "src/lib.rs".into(), points_at_target: true }));
+        assert!(specs.contains(&EdgeSpec { rel_type: "RELATES_TO", target_id: "a".into(), points_at_target: true, declaration_index: 0 }));
+        assert!(specs.contains(&EdgeSpec { rel_type: "GOVERNS", target_id: "src/lib.rs".into(), points_at_target: true, declaration_index: 0 }));
     }
 
     /// Containment points from the parent to the child, so a directory contains

@@ -1273,12 +1273,15 @@ mod tests {
             id: &str,
             vector: Vec<f32>,
             payload: MemoryPayload,
-        ) -> anyhow::Result<()> {
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
             self.upserts
                 .lock()
                 .expect("recording store poisoned")
                 .push((namespace.to_string(), id.to_string(), vector.len(), payload.memory_type));
-            Ok(())
+            Ok(crate::traits::UpsertReport {
+                id: id.to_string(),
+                deferred_edges: Vec::new(),
+            })
         }
         async fn search(
             &self,
