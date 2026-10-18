@@ -113,7 +113,13 @@ impl VectorStore for StoreNotAttached {
     async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
         Err(Self::err())
     }
-    async fn export_graph(&self, _include_retired: bool, _include_archived: bool) -> anyhow::Result<serde_json::Value> {
+    async fn export_graph(
+        &self,
+        _include_retired: bool,
+        _include_archived: bool,
+        _project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+        _anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+    ) -> anyhow::Result<serde_json::Value> {
         Err(Self::err())
     }
     async fn increment_access_count(&self, _namespace: &str, _id: &str) -> anyhow::Result<()> {
@@ -798,7 +804,13 @@ mod tests {
         async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
             Err(anyhow!("recording store: unused by this test"))
         }
-        async fn export_graph(&self, _include_retired: bool, _include_archived: bool) -> anyhow::Result<serde_json::Value> {
+        async fn export_graph(
+            &self,
+            _include_retired: bool,
+            _include_archived: bool,
+            _project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            _anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
             Err(anyhow!("recording store: unused by this test"))
         }
         async fn increment_access_count(&self, _namespace: &str, _id: &str) -> anyhow::Result<()> {

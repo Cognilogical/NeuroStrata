@@ -2,6 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// The shipped vocabulary schema, embedded at compile time. v2 adds the
@@ -206,6 +208,8 @@ pub trait VectorStore: Send + Sync {
         &self,
         include_retired: bool,
         include_archived: bool,
+        project_contexts: &HashMap<String, PathBuf>,
+        anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
     ) -> Result<serde_json::Value>;
 
     /// Increment the access count of a specific memory by its ID.
