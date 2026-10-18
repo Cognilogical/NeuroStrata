@@ -142,14 +142,39 @@ impl Config {
             .context("Config path must name a file")?
             .to_string_lossy();
         let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+        let existing_permissions = match fs::metadata(path) {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Could not inspect config permissions at {}", path.display())
+                })
+            }
+        };
         let result = (|| -> Result<()> {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
                 .open(&temp_path)
                 .with_context(|| format!("Could not create temporary config {}", temp_path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .context("Could not restrict temporary config permissions")?;
+            }
             serde_json::to_writer_pretty(&mut file, self)?;
             file.write_all(b"\n")?;
+            if let Some(permissions) = existing_permissions {
+                file.set_permissions(permissions).with_context(|| {
+                    format!("Could not preserve config permissions at {}", path.display())
+                })?;
+            }
             file.sync_all()?;
             fs::rename(&temp_path, path)
                 .with_context(|| format!("Could not replace config at {}", path.display()))?;
@@ -290,6 +315,41 @@ mod tests {
             config.project_contexts.get("second"),
             Some(&fs::canonicalize(&second).unwrap())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_preserves_existing_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("permissions");
+        let config_path = write_config(&root);
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = Config::load_from(&config_path).unwrap();
+
+        config.save_to(&config_path).unwrap();
+
+        let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_creates_owner_only_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("new-permissions");
+        let config_path = root.join("config.json");
+        let config = Config {
+            db_path: PathBuf::from("test.db"),
+            deduplication: DeduplicationConfig::default(),
+            project_contexts: HashMap::new(),
+        };
+
+        config.save_to(&config_path).unwrap();
+
+        let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     fn write_config(root: &Path) -> PathBuf {
