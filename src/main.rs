@@ -67,6 +67,10 @@ enum Commands {
         /// Output path for the JSON graph export
         out_path: Option<String>,
 
+        /// Select the registered source marker for the default output path
+        #[arg(long)]
+        source_id: Option<String>,
+
         /// Leave superseded (retired) memories out of the export entirely
         #[arg(long)]
         exclude_superseded: bool,
@@ -897,6 +901,30 @@ mod tests {
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
         let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
         assert!(parsed.is_err(), "a typo must never reach std::process::Command");
+    }
+
+    #[test]
+    fn source_id_option_parses_with_existing_export_flags() {
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "export-graph",
+            "./graph.json",
+            "--source-id",
+            "source-a",
+            "--exclude-superseded",
+            "--include-archived",
+        ])
+        .expect("export-graph source selection parses");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ExportGraph {
+                out_path: Some(path),
+                source_id: Some(source_id),
+                exclude_superseded: true,
+                include_archived: true,
+            }) if path == "./graph.json" && source_id == "source-a"
+        ));
     }
 
     #[test]
@@ -2324,18 +2352,48 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             other => {
+                let graph_target = if let Commands::ExportGraph {
+                    out_path,
+                    source_id,
+                    ..
+                } = &other
+                {
+                    let source_config = source_id
+                        .as_ref()
+                        .map(|_| Config::from_default_path())
+                        .transpose()?;
+                    let empty_contexts = std::collections::HashMap::new();
+                    let contexts = source_config
+                        .as_ref()
+                        .map(|config| &config.project_contexts)
+                        .unwrap_or(&empty_contexts);
+                    let project_root =
+                        std::env::var_os("NEUROSTRATA_PROJECT_ROOT").map(std::path::PathBuf::from);
+                    let invocation_dir = std::env::current_dir()?;
+                    Some(crate::source_context::resolve_graph_output_path(
+                        out_path.as_deref().map(std::path::Path::new),
+                        source_id.as_deref(),
+                        contexts,
+                        project_root.as_deref(),
+                        &invocation_dir,
+                    )?)
+                } else {
+                    None
+                };
+
                 if daemon_running {
                     // Read-only graph export is not a store mutation: it rides
                     // the daemon like backup does, instead of demanding a
                     // shutdown (the same trap as guinea-pig BUG-5).
                     if let Commands::ExportGraph {
-                        out_path,
                         exclude_superseded,
                         include_archived,
+                        ..
                     } = &other
                     {
-                        let default_path = ".NeuroStrata/graph/graph.json".to_string();
-                        let target_path = out_path.as_ref().unwrap_or(&default_path);
+                        let target_path = graph_target
+                            .as_ref()
+                            .expect("export graph target resolved before daemon dispatch");
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
                         let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
@@ -2363,8 +2421,11 @@ async fn main() -> anyhow::Result<()> {
                             eprintln!("Graph export failed: {}", body);
                             std::process::exit(1);
                         }
-                        println!("Exporting Memory Graph to {}", target_path);
-                        if let Some(parent) = std::path::Path::new(target_path).parent() {
+                        println!("Exporting Memory Graph to {}", target_path.display());
+                        if let Some(parent) = target_path
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                        {
                             std::fs::create_dir_all(parent)?;
                         }
                         std::fs::write(target_path, body)?;
@@ -2460,11 +2521,19 @@ async fn main() -> anyhow::Result<()> {
                             println!("Ingestion complete.");
                         }
                     }
-                    Commands::ExportGraph { out_path, exclude_superseded, include_archived } => {
-                        let default_path = ".NeuroStrata/graph/graph.json".to_string();
-                        let target_path = out_path.as_ref().unwrap_or(&default_path);
-                        println!("Exporting Memory Graph to {}", target_path);
-                        if let Some(parent) = std::path::Path::new(target_path).parent() {
+                    Commands::ExportGraph {
+                        exclude_superseded,
+                        include_archived,
+                        ..
+                    } => {
+                        let target_path = graph_target
+                            .as_ref()
+                            .expect("export graph target resolved before direct dispatch");
+                        println!("Exporting Memory Graph to {}", target_path.display());
+                        if let Some(parent) = target_path
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                        {
                             std::fs::create_dir_all(parent)?;
                         }
                         vector_store.init("global").await?;
