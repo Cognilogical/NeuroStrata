@@ -240,6 +240,13 @@ enum Commands {
         repo_path: Option<std::path::PathBuf>,
     },
 
+    /// Manage stable source IDs and their local NeuroStrata marker directories
+    #[command(name = "project-context")]
+    ProjectContext {
+        #[command(subcommand)]
+        action: ProjectContextCommands,
+    },
+
     /// Git hook management: installs the one hook that exists
     Hooks {
         #[command(subcommand)]
@@ -257,6 +264,19 @@ enum Commands {
         #[command(subcommand)]
         action: crate::synaptic_mesh::SynapticMeshCommands,
     },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum ProjectContextCommands {
+    /// Bind a stable source ID to an existing .NeuroStrata marker directory
+    Bind {
+        source_id: String,
+        marker_path: std::path::PathBuf,
+    },
+    /// List configured source IDs and their marker directories
+    List,
+    /// Remove a source ID binding
+    Unbind { source_id: String },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -386,6 +406,49 @@ async fn fetch_daemon_info() -> Option<serde_json::Value> {
 /// to spawn a competing daemon.
 fn config_db_path() -> Option<String> {
     Config::from_default_path().ok().map(|c| c.db_path.to_string_lossy().to_string())
+}
+
+fn dispatch_project_context(
+    action: &ProjectContextCommands,
+    config_path: &std::path::Path,
+) -> anyhow::Result<String> {
+    let mut config = Config::load_from(config_path)?;
+    let (output, changed) = match action {
+        ProjectContextCommands::Bind {
+            source_id,
+            marker_path,
+        } => {
+            config.bind_project_context(source_id, marker_path)?;
+            let canonical = config
+                .project_contexts
+                .get(source_id)
+                .expect("successful bind stores its source ID");
+            (format!("Bound {source_id} to {}", canonical.display()), true)
+        }
+        ProjectContextCommands::List => {
+            let mut entries: Vec<_> = config.project_contexts.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let output = if entries.is_empty() {
+                "No project contexts configured.".to_string()
+            } else {
+                entries
+                    .into_iter()
+                    .map(|(source_id, path)| format!("{source_id}\t{}", path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            (output, false)
+        }
+        ProjectContextCommands::Unbind { source_id } => {
+            config.unbind_project_context(source_id)?;
+            (format!("Unbound {source_id}"), true)
+        }
+    };
+
+    if changed {
+        config.save_to(config_path)?;
+    }
+    Ok(output)
 }
 
 /// The daemon creates its lock by appending ".daemon.lock" to the db_path
@@ -833,6 +896,128 @@ mod tests {
     fn a_mistyped_subcommand_is_an_error_not_an_execution() {
         let parsed = Cli::try_parse_from(["neurostrata-mcp", "lsit"]);
         assert!(parsed.is_err(), "a typo must never reach std::process::Command");
+    }
+
+    #[test]
+    fn project_context_bind_parses_source_id_and_path() {
+        let cli = Cli::try_parse_from([
+            "neurostrata-mcp",
+            "project-context",
+            "bind",
+            "source-a",
+            "/tmp/project/.NeuroStrata",
+        ])
+        .expect("project-context bind parses");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ProjectContext {
+                action: ProjectContextCommands::Bind {
+                    source_id,
+                    marker_path
+                }
+            }) if source_id == "source-a"
+                && marker_path == std::path::Path::new("/tmp/project/.NeuroStrata")
+        ));
+    }
+
+    #[test]
+    fn project_context_list_parses_without_arguments() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "project-context", "list"])
+            .expect("project-context list parses");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ProjectContext {
+                action: ProjectContextCommands::List
+            })
+        ));
+    }
+
+    #[test]
+    fn project_context_unbind_parses_source_id() {
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "project-context", "unbind", "source-a"])
+            .expect("project-context unbind parses");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::ProjectContext {
+                action: ProjectContextCommands::Unbind { source_id }
+            }) if source_id == "source-a"
+        ));
+    }
+
+    #[test]
+    fn project_context_dispatch_persists_bind_lists_and_rejects_unknown_unbind() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-project-context-dispatch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let marker = root.join("project/.NeuroStrata");
+        std::fs::create_dir_all(&marker).unwrap();
+        let config_path = root.join("config.json");
+        let db_path = root.join("db/ladybug.db");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({"db_path": db_path}).to_string(),
+        )
+        .unwrap();
+
+        let bound = dispatch_project_context(
+            &ProjectContextCommands::Bind {
+                source_id: "source-a".to_string(),
+                marker_path: marker.clone(),
+            },
+            &config_path,
+        )
+        .unwrap();
+        let canonical = std::fs::canonicalize(&marker).unwrap();
+        assert_eq!(bound, format!("Bound source-a to {}", canonical.display()));
+        assert_eq!(
+            Config::load_from(&config_path)
+                .unwrap()
+                .project_contexts
+                .get("source-a"),
+            Some(&canonical)
+        );
+        assert!(
+            !db_path.exists(),
+            "config dispatch never creates the database"
+        );
+
+        assert_eq!(
+            dispatch_project_context(&ProjectContextCommands::List, &config_path).unwrap(),
+            format!("source-a\t{}", canonical.display())
+        );
+
+        let original = std::fs::read(&config_path).unwrap();
+        let error = dispatch_project_context(
+            &ProjectContextCommands::Unbind {
+                source_id: "unknown".to_string(),
+            },
+            &config_path,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Unknown project context source ID"));
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+
+        assert_eq!(
+            dispatch_project_context(
+                &ProjectContextCommands::Unbind {
+                    source_id: "source-a".to_string(),
+                },
+                &config_path,
+            )
+            .unwrap(),
+            "Unbound source-a"
+        );
+        assert!(Config::load_from(&config_path)
+            .unwrap()
+            .project_contexts
+            .is_empty());
+        assert!(!db_path.exists());
     }
 
     /// `set_hook_executable` is the only place the binary uses
@@ -1388,6 +1573,18 @@ async fn run_bus_metrics(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
+
+    // This config-only command must not probe, start, or stop a daemon, and it
+    // must not construct an embedder or open the database.
+    if let Some(Commands::ProjectContext { action }) = cli.command.as_ref() {
+        let config_path = Config::default_path()?;
+        if !config_path.exists() {
+            Config::from_default_path()?;
+        }
+        println!("{}", dispatch_project_context(action, &config_path)?);
+        return Ok(());
+    }
 
     // Check if the daemon is already running on port 34343
     let probe = probe_daemon().await;
@@ -1480,8 +1677,6 @@ async fn main() -> anyhow::Result<()> {
     // it is.
 
     // Now parse using clap
-    let cli = Cli::parse();
-
     if let Some(command) = cli.command {
         match command {
             Commands::Daemon => {
@@ -2410,6 +2605,7 @@ async fn main() -> anyhow::Result<()> {
                     | Commands::Restore { .. }
                     | Commands::Task { .. }
                     | Commands::Setup { .. }
+                    | Commands::ProjectContext { .. }
                     | Commands::BusMetrics
                     | Commands::Hooks { .. } => unreachable!(),
                 }
