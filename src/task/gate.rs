@@ -236,6 +236,15 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
             continue;
         }
         let rule = &row.payload.metadata;
+        // Malformed expiry metadata is not proof that a rule is retired.
+        // Superseded rules stay in the store as history, not active claims.
+        if rule
+            .get("valid_to")
+            .and_then(Value::as_i64)
+            .is_some_and(|valid_to| valid_to <= now)
+        {
+            continue;
+        }
         let has_source = crate::traits::has_source(rule);
         if !has_source {
             report.violations.push(Violation {
@@ -514,6 +523,75 @@ mod tests {
             .map(|v| v.id.as_str())
             .collect();
         assert_eq!(hits, vec!["rule-unsourced", "rule-blank"]);
+    }
+
+    #[test]
+    fn retired_rules_do_not_fail_active_rule_checks() {
+        let rows = vec![
+            row("active-unsourced", "rule", "Active rule", json!({})),
+            row(
+                "retired-unsourced",
+                "rule",
+                "Superseded rule",
+                json!({ "valid_to": NOW - 1 }),
+            ),
+            row(
+                "retired-at-boundary",
+                "rule",
+                "Rule expiring now",
+                json!({ "valid_to": NOW }),
+            ),
+            row(
+                "retired-overclaim",
+                "rule",
+                "Expired enforced rule",
+                json!({
+                    "valid_to": NOW - 1,
+                    "source": "owner 2026-10-08",
+                    "enforcement": "ENFORCED",
+                    "guard": "no-such-wire"
+                }),
+            ),
+            row(
+                "future-unsourced",
+                "rule",
+                "Still-current rule",
+                json!({ "valid_to": NOW + 1 }),
+            ),
+            row(
+                "malformed-expiry-unsourced",
+                "rule",
+                "Unparseable expiry remains active",
+                json!({ "valid_to": "invalid" }),
+            ),
+        ];
+
+        let report = evaluate(&rows, NOW);
+        let unsourced: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|violation| violation.kind == "rule_without_source")
+            .map(|violation| violation.id.as_str())
+            .collect();
+
+        assert_eq!(
+            unsourced,
+            vec![
+                "active-unsourced",
+                "future-unsourced",
+                "malformed-expiry-unsourced"
+            ]
+        );
+        assert!(!report.violations.iter().any(|violation| {
+            violation.id == "retired-overclaim" && violation.kind == "rule_overclaims_enforcement"
+        }));
+        assert!(
+            !report
+                .violations
+                .iter()
+                .any(|violation| violation.id.starts_with("retired-")),
+            "retired rules must not block the active-rule gate"
+        );
     }
 
     /// A6 rule honesty: a rule that claims ENFORCED must name a real wire.
