@@ -1,8 +1,20 @@
 # External review: HyperSkill (rux001/HyperSkill) vs. the NeuroStrata graph
 
+> **Reader's note.** This is the *working analysis* — the author's full
+> reasoning, kept for provenance. The **panel-facing package** is two files,
+> deliberately split so the panel's own judgment is not anchored by the
+> author's conclusions:
+> - `2026-10-20-hyperskill-panel-brief.md` — **Part A**: the subject and a
+>   factual census of NeuroStrata, with no evaluation. Read first.
+> - `2026-10-20-hyperskill-review-findings.md` — **Part B**: the author's
+>   summation and the **bug register**. Read second.
+>
+> Where this document and the findings file differ, the findings file is
+> current. This document is a superset of the working notes; the *bug
+> register* and the *graph* conclusions were sharpened after it was written.
+
 **Status:** proposal — capture only. No implementation, no adoption decision, no
-behavior change. Queued for Frontier-model evaluation alongside
-`2026-10-20-gap-proactive-recall-and-access-topology.md`.
+behavior change. Queued for Frontier-model evaluation.
 
 **Subject:** HyperSkill — *Self-Evolving LLM Agents via Hypergraph-Structured Skill
 Memory* (Xu, Yang, Huang; arXiv:2608.16114, 17 Aug 2026; Apache-2.0)
