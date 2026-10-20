@@ -117,7 +117,7 @@ trajectories* — limited benefit in low-data regimes.
 | Encoder | `all-MiniLM-L6-v2` (local `sentence-transformers`) | `fastembed` local / Dendritic Bridge remote (`src/embed.rs`) |
 | Unit of knowledge | trajectory (an episode *node* with membership edges) | memory row (rule / fact / procedure / task) |
 | Relations | bipartite membership edges (episode node → members) | 4 declared: `GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM` (`src/store/ladybug.rs:814-824`) |
-| Retrieval | dual-path (subtask + trajectory) + κ co-occurrence | single-path vector + directed GraphRAG expansion — **not** hybrid (`src/store/ladybug.rs:995`, `:1085`) |
+| Retrieval | dual-path (subtask + trajectory) + κ co-occurrence | dense vector → **graph expansion computed but discarded before the agent** (`ladybug.rs:1277` sentinel score + `server.rs:1978` truncate-to-5); **no lexical/BM25 track** |
 | Lifecycle | prune + merge, automatic | supersede/archive only, **no merge** (`neurostrata_supersede_memory`, `neurostrata_archive_memory`) |
 | Outcome signal | episode success/fail → `γ` | **absent** — `access_count` counts retrievals, not correctness |
 | Provenance | none | `metadata.source` required on rules; `task_validate` enforces (`src/task/gate.rs:248`) |
@@ -143,7 +143,7 @@ and cross-instance sharing. Their unit of knowledge is different (trajectory vs.
 row), their correctness oracle is different (scorer vs. none), and their
 lifecycle differs (prune/merge vs. supersede/archive).
 
-### The graph stays
+### The graph stays — but it does not currently reach the agent
 
 **Nothing here argues for replacing NeuroStrata's graph, and the source check
 rules out the main reason one might have thought so.** HyperSkill's
@@ -154,6 +154,15 @@ NeuroStrata's `Memory` nodes and `RELATES_TO` / `CONTAINS` / `GOVERNS` /
 traversal with evidence paths (`src/store/ladybug.rs:1085-1116`) is already
 implemented. HyperSkill's structure is a *naming convention over a bipartite
 graph* — and the naming is a fair thing to borrow.
+
+**But the graph's results are currently dropped before an agent sees them.**
+The expansion runs and its evidence paths are correct, yet the
+scoring-and-truncation contract discards them (`src/store/ladybug.rs:1277`
+gives expansions a sentinel `score: 10.0`; `src/server.rs:1978` keeps the 5
+lowest-scoring rows, which are always primaries). See §5 for the full
+finding and its live confirmation. **This is the single highest-value thing
+the panel can act on**, and it is smaller and cheaper than any of the seven
+ideas below.
 
 What NeuroStrata has that HyperSkill does not: a real graph with four
 materialized relation types, provenance on every rule, bi-temporal validity,
@@ -184,11 +193,13 @@ structural analog of HyperSkill's subtask path. **This is the one idea worth
 piloting first** — it needs no new storage primitive, only a second retrieval
 path over rows that already exist.
 
-Note that NeuroStrata's *existing* retrieval already has a second path: the
+Note that NeuroStrata's *existing* retrieval already reaches the graph: the
 GraphRAG expansion (`src/store/ladybug.rs:1085`) pulls directed neighbors of
-the vector hits. So the structural idea is not "add a second path" so much as
-"key the second path on the *current task's decomposition* rather than on the
-vector hits' neighbors."
+the vector hits and returns them as first-class results with evidence paths.
+So the structural idea is not "add a second path" — a structural path already
+exists — but "key that path on the *current task's decomposition* rather than
+on the vector hits' neighbors." HyperSkill's subtask path is exactly that
+re-keying.
 
 ### Q2 (Shape) — the "hypergraph" is a bipartite graph, and NeuroStrata already has one
 
@@ -295,16 +306,18 @@ whose quality is low get archived, or merely ranked lower?** The last question
 is where the tombstone invariant and HyperSkill's prune-as-delete collide, and
 it is the one the panel must resolve before anything is built.
 
-**Idea 2 — A second retrieval path keyed on structure, not wording.**
-NeuroStrata has symbol rows and `GOVERNS` edges; HyperSkill shows that
-matching a *decomposition* of the current task against stored nodes surfaces
-knowledge that task-level wording misses. *Questions:* what is the NeuroStrata
-decomposition primitive — the AST plan, the task's subtasks, the `domain` tag?
-Does it become a second retrieval path alongside the existing vector +
-GraphRAG expansion, or a new surface? Note the paper's own sensitivity
-result: **performance is best at `k = 2` and degrades as k grows** — a compact
-surface. NeuroStrata's snapshot truncates to 5; the paper suggests fewer is
-better.
+**Idea 2 — Re-key the existing graph path on the current task's decomposition.**
+NeuroStrata has symbol rows and `GOVERNS` edges, and search already expands
+vector hits through the graph (1-hop and 2-hop `GOVERNS`, with evidence paths).
+HyperSkill shows that matching a *decomposition* of the current task against
+stored nodes surfaces knowledge that task-level wording misses. *Questions:*
+what is the NeuroStrata decomposition primitive — the AST plan, the task's
+subtasks, the `domain` tag? And is the change "expand from the *decomposition's*
+neighbors" rather than "expand from the *query's* neighbors"? Note the paper's
+own sensitivity result: **performance is best at `k = 2` and degrades as k
+grows** — a compact surface. NeuroStrata's expansion is already capped per
+family (`src/store/ladybug.rs:1239-1258`), so a smaller, better-chosen seed set
+may matter more than more of them.
 
 **Idea 3 — Co-occurrence as a ranking signal over `RELATES_TO`.**
 κ(v) = number of retrieved rows that co-occur with v. Complements vector
@@ -421,15 +434,92 @@ records such an implementation. The likely history is the LadybugDB/Kuzu
 migration (`CHANGELOG.md` records the Tantivy FTS feature, and the store is now
 `lbug 0.20.4`), with the docs never updated.
 
-Consequence for the panel: **NeuroStrata currently has one retrieval track, not
-two.** Exact-token recall relies on the embedder, not on keyword matching. That
-raises the value of Idea 2 (a second, structure-keyed path) and makes the
+Consequence for the panel — stated carefully, because the shorthand "one
+retrieval track" is easy to misread, and the investigation turned up something
+sharper than a missing feature.
+
+### The graph is built, queried — and then thrown away before the agent sees it
+
+This is the most consequential finding in the review, so it is stated
+precisely. It was **not** visible from the source alone; it took live MCP
+calls to see.
+
+**The graph is real and populated.** The `NeuroStrata` namespace export
+contains **1,277 materialized edges** — 885 `CONTAINS`, 250 `EXTRACTED_FROM`,
+96 `RELATES_TO`, 46 `GOVERNS` — of which **325 join two non-structural
+rule/fact/procedure rows**. So the graph is not a stub.
+
+**The expansion is computed correctly.** The store's `search` does the one-hop
+neighbor and two-hop `GOVERNS` expansion and attaches evidence paths
+(`src/store/ladybug.rs:1085-1116`, `:1239-1281`). The store's own tests prove
+it: `one_hop_evidence_preserves_both_directed_orientations` (`:3932`) and
+`governs_two_hop_evidence_contains_primary_file_and_rule` (`:3993`).
+
+**But the expansion never reaches the agent.** Two truncations drop it:
+
+| Stage | Line | Effect |
+|---|---|---|
+| expansions get a **hard-coded** score | `src/store/ladybug.rs:1277` | `score: 10.0` |
+| primaries get their real distance | `src/store/ladybug.rs:1062` | `score: boosted_distance` (≈0–1) |
+| store sorts by score **ASC**, truncates to `limit*2` | `src/store/ladybug.rs:1284-1287` | expansions sort *last* |
+| server truncates to **5** | `src/server.rs:1978` | the 5 survivors are always 5 **primaries** |
+
+Because the sort is ascending and every primary's distance is far below the
+expansions' hard-coded `10.0`, the five rows that survive are always five
+direct vector hits. The expanded rows — and their evidence paths — are
+computed, then discarded.
+
+**Confirmed empirically.** Live `neurostrata_search_memory` calls across a
+semantic query, an exact-token query, a nonsense query, and a query aimed at a
+rule reachable *only* by a `RELATES_TO` edge: every one returned exactly five
+results and **zero** `Path [one_hop]` / `Why: This memory is one graph hop
+from a direct match.` lines. The rule behind the `RELATES_TO` edge never
+appeared. The evidence-rendering code (`src/server.rs:2262-2340`) and its byte
+budgets (`MAX_EVIDENCE_BYTES_PER_RESULT` 512, `MAX_EVIDENCE_BYTES_PER_RESPONSE`
+2048) are therefore **dead in practice** for `search_memory`.
+
+### So what is the answer to "is the graph given to agents?"
+
+**No.** Not for `search_memory`. The graph is built, populated, queried, and
+its results are then dropped by the scoring-and-truncation contract. The
+"Hybrid GraphRAG" step at `src/store/ladybug.rs:1085` — a name the code
+itself uses — does not surface to the agent.
+
+Two independent gaps, then, and they should not be conflated:
+
+| | documented | actual |
+|---|---|---|
+| dense vector | yes | yes |
+| graph expansion | (unstated; named in code) | **computed but discarded before the agent** |
+| BM25 / exact keyword | yes | **absent entirely** |
+
+**This is a retrieval-path defect, not a graph-model defect.** The graph model
+is sound and is the right structure. What is broken is the contract between
+the store and the surface: a hard-coded sentinel score of `10.0` is a
+plausible way to sort expansions last, but it makes them unreachable whenever
+there are ≥5 primaries — which is essentially always.
+
+**Practical consequence:** today, `search_memory` returns pure top-5 vector
+similarity. A memory whose *text* is an exact token — a function name, an env
+var, a config key, an error string — is found only if its *embedding* happens
+to land near the query; semantic similarity is a blunt instrument for "the
+user typed this exact identifier." And a rule that matters only because of its
+*relationship* to a rule you already found is invisible.
+
+This raises the value of Idea 2 (re-keying the graph path) and makes the
 BM25/RRF question live rather than hypothetical: if the documented hybrid
-retrieval is genuinely wanted, it is *absent work*, and the co-occurrence
-signal (Idea 3) would be a third candidate track rather than a fourth.
+retrieval is genuinely wanted, it is *absent work*; the co-occurrence signal
+(Idea 3) would then be a third candidate track rather than a fourth.
 Resolving whether the docs or the code is authoritative is a separate,
 smaller question — but it should not be answered by assuming the docs are
 right.
+
+**For the panel:** the first question is not "should we add BM25" or "should
+we add co-occurrence." It is **"why does the graph expansion never reach an
+agent?"** — because fixing that is a smaller, cheaper change than any of the
+seven ideas, and it would make the graph NeuroStrata already pays for
+actually pay off. The remaining ideas are worth evaluating *after* that is
+answered, not instead of it.
 
 ---
 
