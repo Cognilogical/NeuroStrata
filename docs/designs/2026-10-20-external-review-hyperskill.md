@@ -12,6 +12,11 @@
 > Where this document and the findings file differ, the findings file is
 > current. This document is a superset of the working notes; the *bug
 > register* and the *graph* conclusions were sharpened after it was written.
+>
+> - `2026-10-20-argon-k3-panel-verdicts.md` — **Part C**: the panel's verdicts
+>   (Argon + K3), the **six verified corrections** to Part B, six new
+>   NeuroStrata defects, five new HyperSkill paper-vs-code defects, and the
+>   adjudicated fix plan. Read after Part B.
 
 **Status:** proposal — capture only. No implementation, no adoption decision, no
 behavior change. Queued for Frontier-model evaluation.

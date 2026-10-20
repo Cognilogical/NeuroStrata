@@ -1,11 +1,34 @@
 # Panel findings B: author's summation and NeuroStrata bug register
 
 **Read after** `2026-10-20-hyperskill-panel-brief.md`, and only after
-recording your own answers to Q1–Q5 there. The brief is deliberately
+recording your own answers to Q1-Q5 there. The brief is deliberately
 conclusion-free; this file is where the author's conclusions and claims live.
 
 **Status:** capture only. No fix is authorized by this document. Every claim
 below is stated with its evidence so the panel can refute it.
+
+> ### ⚠️ CORRECTED — read `2026-10-20-argon-k3-panel-verdicts.md` (Part C)
+>
+> The Argon (Gemini 4) and K3 (Kimi K3) panel ran on this package and
+> **confirmed all three findings** (BUG-1, BUG-2, DOC-1) with the same
+> severities. But it also found **six errors in the material below**, all
+> verified against source at HEAD `230c5ff`. Do not read this file without
+> Part C alongside it.
+>
+> | # | Correction |
+> |---|---|
+> | **C1** | BUG-1's "Regression evidence" says `6e5ffe8` "introduced both the `score: 10.0` assignment and the evidence rendering." **The sentinel predates it** — `ce3004e^:src/store/kuzu.rs:206` already carries `score: 10.0`. `6e5ffe8` added evidence-carrying expansion rows and per-family admission. This file contradicts itself on the point. |
+> | **C2** | §3's claim that "fixing BUG-1 alone would widen BUG-2's window" is **mechanically wrong**: `embed_dedup_and_upsert` calls `store.search` **directly** (`server.rs:1152`), bypassing `handle_search_memory`, and `store.search` already returns the expansion rows. The dedup filter receives all five expansions **today**. The recommended order (BUG-2 first or together) stands; the stated mechanism does not. |
+> | **C3** | BUG-1's Option (a) ("restore the pre-`61451bd` behavior") is **broken as written**: with `fetch = 15` (`server.rs:1950`), removing `results.truncate(5)` yields up to **30** rendered rows. The old behavior is only restorable if the `!include_tasks` filter moves **into** `store.search`. |
+> | **C4** | §1.3's highest-rated idea rests on **three false code claims**: `hit_count` is never incremented anywhere; the guard's semantic evaluator (`guard/semantic.rs:68-89`) cannot see architectural `rule`/`fact`/`procedure` rows at all; and `rule_ids_triggered` (`guard/validator.rs:70`) records the top-3 vector matches, computed **before** the `deprecated` check and **before** `matches_trigger`. The guard's polarity is also inverted — a `REJECT` verdict means the rule *caught* a bad action. **The idea must be re-derived.** |
+> | **C5** | §1.2's idea ranking contradicts §3's "the bug register is upstream of the idea list." The bug register is the priority list; the seven ideas are a secondary sort on top of a *working* system. |
+> | **C6** | Two framing slips: §1.1's "episode node ≡ `task` row" is too strong (analogous in shape, not equivalent in semantics); §1.2 prices negative exemplars as "low" when a vocabulary-contract change with no migration path is **medium**. |
+>
+> **Six new NeuroStrata defects** (BUG-3…BUG-8) and **five new HyperSkill
+> paper-vs-code defects** were also found, and **BUG-2's fix was already
+> prescribed** on 2026-10-18 in
+> `docs/superpowers/specs/2026-10-18-local-self-improvement-design.md` Phase 1 —
+> never implemented. All of it is in Part C.
 
 ---
 
