@@ -216,6 +216,20 @@ convention, or a declared vocabulary term? If it rides `domain`, note that
 `domain` is currently free-text with no validation and no filter — it would
 need both.
 
+**Q5 — Negative exemplars (added by the external review).** What represents
+"we tried this here, and it went wrong"? NeuroStrata's vocabulary has no type
+for a failed attempt: a `rule` states what must hold, a `fact` states what is
+true, and there is nothing for a *negative* example. The companion external
+review (`2026-10-20-external-review-hyperskill.md`) found this gap in the
+course of assessing HyperSkill, which extracts *mistakes* from failed
+trajectories as first-class nodes to avoid. See that document, Idea 5, for
+whether a polarity field on an existing type would suffice.
+
+**External review.** `2026-10-20-external-review-hyperskill.md` assesses
+HyperSkill (arXiv:2608.16114) against these questions. It contributes a
+mechanism to Q1, Q2, and Q4, the *shape* of an answer to Q3, and Q5 above. It
+does not change any question here.
+
 ---
 
 ## 5. Non-goals and guardrails for this brief
