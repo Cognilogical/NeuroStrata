@@ -13,9 +13,19 @@ Memory* (Xu, Yang, Huang; arXiv:2608.16114, 17 Aug 2026; Apache-2.0)
 
 ## 1. What HyperSkill is, from its source
 
-Memory is a hypergraph `G = (V, E)` over two node types — **subtask** steps and
-reusable **skills** — where each hyperedge binds the subtasks and skills of *one
-trajectory* together with a distilled lesson and a utility score.
+Memory is described by the paper as a hypergraph `G = (V, E)` over two node
+types — **subtask** steps and reusable **skills** — where each hyperedge binds
+the subtasks and skills of *one trajectory* together with a distilled lesson and
+a utility score.
+
+**In the implementation, the "hyperedge" is a node.** Verified in source: it is
+a `Memory`/`networkx` node carrying `role="hyperedge"`, joined to its members
+by ordinary binary edges carrying `role="membership"`
+(`hyperskill/hypergraph_core.py:532-536`; members are read back through
+`G.neighbors(he_id)` filtered on that role, `:551-557`). `networkx` has no
+hypergraph primitive, so the structure is a **bipartite two-level graph**; the
+n-ary language is a presentation of that design. This matters for the
+assessment — see §3, Q2.
 
 Three mechanisms, read from `hyperskill/hypergraph_core.py` and
 `hyperskill/provider.py`:
@@ -24,11 +34,11 @@ Three mechanisms, read from `hyperskill/hypergraph_core.py` and
 decomposed into subtasks by an LLM call (`provider.py:598`
 `_generate_initial_plan`). Two candidate sets are then formed and unioned:
 - *subtask path* — the plan is embedded and matched against stored **subtask**
-  nodes; each match expands to its incident hyperedges, surfacing trajectories
+  nodes; each match expands to its incident episode nodes, surfacing trajectories
   that share **procedural structure** even when the task wording differs
   (`hypergraph_core.py:602-617`).
-- *trajectory path* — the task description is matched directly against **hyperedge**
-  embeddings, where a hyperedge is embedded as `task_query ‖ fragment`
+- *trajectory path* — the task description is matched directly against **episode**
+  embeddings, where an episode is embedded as `task_query ‖ fragment`
   (`hypergraph_core.py:598-600`, `add_hyperedge` at `:494`).
 
 **M2 — Co-occurrence ranking** (`hypergraph_core.py:667` `_rank_skills_mistakes`).
@@ -105,8 +115,8 @@ trajectories* — limited benefit in low-data regimes.
 |---|---|---|
 | Store | `networkx` GraphML + numpy index, on disk | LadybugDB vector+graph tables (`src/store/ladybug.rs`) |
 | Encoder | `all-MiniLM-L6-v2` (local `sentence-transformers`) | `fastembed` local / Dendritic Bridge remote (`src/embed.rs`) |
-| Unit of knowledge | trajectory (hyperedge) | memory row (rule / fact / procedure / task) |
-| Relations | hypergraph membership (n-ary) | 4 declared: `GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM` (`src/schemas/memory-vocabulary.v3.json`) |
+| Unit of knowledge | trajectory (an episode *node* with membership edges) | memory row (rule / fact / procedure / task) |
+| Relations | bipartite membership edges (episode node → members) | 4 declared: `GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM` (`src/store/ladybug.rs:814-824`) |
 | Retrieval | dual-path (subtask + trajectory) + κ co-occurrence | single-path vector + directed GraphRAG expansion — **not** hybrid (`src/store/ladybug.rs:995`, `:1085`) |
 | Lifecycle | prune + merge, automatic | supersede/archive only, **no merge** (`neurostrata_supersede_memory`, `neurostrata_archive_memory`) |
 | Outcome signal | episode success/fail → `γ` | **absent** — `access_count` counts retrievals, not correctness |
@@ -133,10 +143,29 @@ and cross-instance sharing. Their unit of knowledge is different (trajectory vs.
 row), their correctness oracle is different (scorer vs. none), and their
 lifecycle differs (prune/merge vs. supersede/archive).
 
+### The graph stays
+
+**Nothing here argues for replacing NeuroStrata's graph, and the source check
+rules out the main reason one might have thought so.** HyperSkill's
+"hypergraph" is implemented as a **bipartite two-level graph** — an episode
+*node* with ordinary binary membership edges (`hypergraph_core.py:532-536`).
+NeuroStrata's `Memory` nodes and `RELATES_TO` / `CONTAINS` / `GOVERNS` /
+`EXTRACTED_FROM` edges are already that shape, and the 1-hop/2-hop directed
+traversal with evidence paths (`src/store/ladybug.rs:1085-1116`) is already
+implemented. HyperSkill's structure is a *naming convention over a bipartite
+graph* — and the naming is a fair thing to borrow.
+
+What NeuroStrata has that HyperSkill does not: a real graph with four
+materialized relation types, provenance on every rule, bi-temporal validity,
+tombstones over deletion, and cross-instance sharing. What HyperSkill has that
+NeuroStrata lacks: a **co-occurrence signal** computed over its graph, and a
+**node convention** (an explicit episode record carrying a lesson). Those are
+additions to a graph that already exists — not a substrate change.
+
 **But HyperSkill answers three of the four questions in the companion gap brief
 (`2026-10-20-gap-proactive-recall-and-access-topology.md` §4) with mechanisms
 NeuroStrata does not have.** The alignment is not accidental — that brief's
-shortfalls are exactly the ones a hypergraph skill memory was built to solve.
+shortfalls are exactly the ones a skill memory over a graph was built to solve.
 
 ### Q1 (Trigger) — partial answer, and the strongest idea here
 
@@ -161,24 +190,45 @@ the vector hits. So the structural idea is not "add a second path" so much as
 "key the second path on the *current task's decomposition* rather than on the
 vector hits' neighbors."
 
-### Q2 (Shape) — the hyperedge is a real answer to a real gap
+### Q2 (Shape) — the "hypergraph" is a bipartite graph, and NeuroStrata already has one
 
 The brief asked what represents "component X reaches system Y by channel Z under
 credential boundary W because reason R." HyperSkill's answer is *not* a record
 with fields — it is an **n-ary association**: the nodes are the parts, the
-hyperedge is the relation, and the edge carries the distilled lesson.
+episode is the relation, and it carries the distilled lesson.
 
-NeuroStrata's relations are all **pairwise**. The paper's own framing (§1) is
-that pairwise edges "decompose n-ary co-occurrence into disconnected binary
-links and discard the joint compositional context." A NeuroStrata
-`RELATES_TO` web cannot express "these four rules and this failure mode
-co-occurred in one incident."
+**But the paper's hypergraph framing overstates what is actually implemented.**
+Verified in source: HyperSkill's "hyperedge" is a **node** with
+`role="hyperedge"`, connected to its members by ordinary **binary** edges with
+`role="membership"` (`hyperskill/hypergraph_core.py:532-536`; members are read
+back via `G.neighbors(he_id)` filtered on that role, `:551-557`). `networkx`
+has no hypergraph primitive. So the implementation is a **bipartite
+two-level graph**: an episode node fanning out to member nodes. The paper's
+n-ary language (§1, §3.2) is a *presentation* of that two-level node design,
+not a different data model.
 
-The honest reading: the hyperedge is a *better shape for episode-shaped
-knowledge*, and NeuroStrata's `task` row plus `EXTRACTED_FROM` edge is the
-*existing* approximation of an episode. Whether NeuroStrata needs a true
-hyperedge is an open question for the panel — but the **n-ary argument is
-sound** and should be evaluated on its merits.
+**That is the same structure NeuroStrata already has.** `Memory` nodes with
+`RELATES_TO` / `CONTAINS` / `GOVERNS` / `EXTRACTED_FROM` edges
+(`src/store/ladybug.rs:814-824` — every one is `FROM Memory TO Memory`).
+HyperSkill's episode node is NeuroStrata's `task` row; its membership edge is
+`RELATES_TO` or `EXTRACTED_FROM`. The traversal is already implemented too:
+search expands vector hits one and two hops with directed evidence paths
+(`src/store/ladybug.rs:1085-1116`) — which is exactly HyperSkill's "expand
+matched subtask nodes to their incident hyperedges"
+(`hyperskill/hypergraph_core.py:614-617`).
+
+**So this is not a case for replacing NeuroStrata's graph.** It is a case for
+borrowing two *conventions* from a different naming of the same structure:
+
+1. an explicit **episode-level node** that groups its members and carries the
+   distilled lesson — NeuroStrata's `task` row is the existing approximation,
+   but a task is a *work record*, not an *episode record*; and
+2. **co-occurrence ranking over that grouping** (κ, below) — a signal the
+   current ranking has no way to compute.
+
+The panel should read the paper's §1 hypergraph argument as an argument for a
+**node convention**, and should evaluate it against what NeuroStrata's graph
+already expresses — not as a case for a new substrate.
 
 ### Q3 (Enforcement) — mostly not applicable, one useful piece
 
@@ -267,14 +317,20 @@ existing relevance cap (`src/store/ladybug.rs`, `boosted_distance = distance -
 (usage_gain + source_gain).min(0.5 * distance)`), so any new term inherits that
 cap and stays a tie-breaker rather than an override.
 
-**Idea 4 — Hyperedge-shaped episode knowledge.** *Questions:* does NeuroStrata
-need true n-ary edges, or is the existing `task` row + `EXTRACTED_FROM` edge +
-`RELATES_TO` web sufficient for episode-shaped knowledge? The panel should read
-the paper's §1 argument for hyperedges against NeuroStrata's actual relational
-need before accepting that a new edge type is warranted. Note the vocabulary's
-own constraint: `extensions.custom_relations` says custom relations are **not
-materialized** — so a new relation type is a vocabulary change, not a
-configuration.
+**Idea 4 — An explicit episode-level node, reusing the existing graph.**
+HyperSkill's "hyperedge" is a *node* with membership edges — a bipartite
+two-level graph, which NeuroStrata's `Memory` + `RELATES_TO`/`CONTAINS`/
+`GOVERNS`/`EXTRACTED_FROM` structure already is. So this idea is **not** "add
+a new edge type" (and not "adopt a hypergraph"); it is: *is there value in an
+explicit episode record that groups its members and carries the distilled
+lesson?* NeuroStrata's `task` row is the existing approximation, but a task
+is a work record — status, assignee, history — not an episode record holding
+"these members co-occurred here, and here is the lesson." *Questions:* is a
+`task` row the right container, a new memory type the right container, or
+neither? If a new type, does it need a new relation, or can `RELATES_TO` carry
+membership? Remember `extensions.custom_relations`: custom relations are
+**not materialized**, so a new relation type is a vocabulary change, not a
+configuration — but a new *node* type with existing relations is not.
 
 **Idea 5 — Negative exemplars as a first-class type.** Failed trajectories
 become mistakes to avoid. NeuroStrata has no type for "tried, went wrong."
@@ -297,16 +353,22 @@ mechanisms, not *adopting* as a dependency or a storage layer. The panel
 should treat "vendor HyperSkill" as off the table unless it can show a reason
 NeuroStrata's LadybugDB substrate cannot express the mechanism.
 
+**This is a statement about the substrate, not about the graph.** NeuroStrata's
+graph — `Memory` nodes, four materialized relation types, directed 1-hop/2-hop
+traversal with evidence paths — is the right structure and stays. What must
+not be transplanted is the *storage engine*, the *encoder*, and the *delete on
+prune* lifecycle. Every candidate idea above is implementable on the existing
+graph; none of them requires a new substrate.
+
 ---
 
 ## 5. Evidence quality and what the panel should not over-read
 
 - **The ablation is small.** Four configurations, one backbone (Qwen3-30B-A3B)
-  for the ablation table, 100–170 tasks per benchmark. GAIA's full-model
-  advantage over "w/o trajectory retrieval" is **0.00** (36.97 vs 35.76 is the
-  hypergraph row; subtask-vs-trajectory differences there are small). The
-  headline numbers are real but the per-mechanism deltas are within a few points
-  on 100-ish tasks.
+  for the ablation table, 100–170 tasks per benchmark. The per-mechanism
+  deltas are within a few points on 100-ish tasks, and on GAIA two of the three
+  ablations cost only **1.21**. The headline numbers are real; the per-mechanism
+  attribution is not sharp.
 - **The baselines are all agent-memory systems, not code-architecture stores.**
   Nothing in the evaluation shows these mechanisms transfer to a store whose
   contents are architectural *rules* with provenance and a correctness notion
@@ -381,8 +443,9 @@ because this review found a gap the brief did not name. HyperSkill contributes:
 
 - **Q1 (Trigger)** — a concrete mechanism (structural/subtask-path retrieval)
   and a caution (an LLM call per task; small-k beats large-k).
-- **Q2 (Shape)** — the n-ary argument, and the constraint that custom
-  relations are not materialized.
+- **Q2 (Shape)** — the episode-as-node convention (its "hyperedge" is a node
+  with membership edges — the same bipartite shape NeuroStrata's graph
+  already is), and the constraint that custom relations are not materialized.
 - **Q3 (Enforcement)** — little direct help, but the *shape* of a quality
   signal, and the one unused outcome source NeuroStrata already owns (guard
   verdicts).
@@ -432,6 +495,14 @@ from this document is the *mechanism* and the *question*, not any consumer fact.
 - Vector + directed GraphRAG retrieval, **no** BM25/Tantivy/RRF —
   `src/store/ladybug.rs:995` (vector step), `:1085` (expansion step);
   `Cargo.toml` has no FTS dependency.
+- **The graph, and why it stays** — four materialized relation tables, all
+  `FROM Memory TO Memory` (`src/store/ladybug.rs:814-824`); directed 1-hop
+  neighbor and 2-hop `GOVERNS` expansion with evidence paths
+  (`src/store/ladybug.rs:1085-1116`); the only four relations are
+  materialized (`extensions.custom_relations`), and endpoint role typing is
+  descriptive only (`extensions.role_enforcement`: "no endpoint type
+  rejection"), so a new *node* type can participate in existing relations
+  without a vocabulary change.
 - Documented-but-absent hybrid retrieval — `README.md:17`,
   `docs/COGNITIVE_ARCHITECTURE.md:29`, `CHANGELOG.md:173`,
   `docs/architecture/MEMORY_AGENTS_VERDICT.md:36`.
