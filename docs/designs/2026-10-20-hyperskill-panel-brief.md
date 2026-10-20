@@ -10,6 +10,13 @@ Apache-2.0). Repository: `https://github.com/rux001/HyperSkill`.
 
 **Status:** review input. Nothing here is approved, adopted, or scheduled.
 
+> **Package now complete.** This brief (Part A) was reviewed on 2026-10-20 by
+> two independent architect seats — Argon (Gemini 4) and K3 (Kimi K3) — who
+> read this file first and formed their own answers before opening Part B.
+> Their verdicts, the corrections to Part B, and the adjudicated fix plan are
+> in `2026-10-20-argon-k3-panel-verdicts.md` (Part C). Both confirmed all
+> three findings in the bug register and both corrected six errors in Part B.
+
 ---
 
 ## How to use this brief
