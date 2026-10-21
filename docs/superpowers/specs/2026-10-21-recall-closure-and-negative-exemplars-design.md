@@ -184,6 +184,13 @@ keeping even when its shape is imperfect; a rejected write would lose it.
 
 ### 3.2 B — The per-namespace domain registry
 
+**The registry row is a cache, not the truth.** The truth is the namespace's own rows —
+the domains it actually carries. The registry row is a denormalized index of those
+domains, kept current on the write path so that a write can be checked with one read
+instead of a scan of the namespace. Everything below follows from that framing: a cache
+may be stale; a stale cache must never cause a **wrong acceptance**; and it repairs
+itself (§3.2.3).
+
 #### 3.2.1 Where it lives
 
 One registry row **per namespace**:
@@ -254,7 +261,22 @@ per-namespace reading.**
 
 #### 3.2.3 What an unregistered slug does
 
-**Rejected, with the registered list and a one-call remedy.** The write returns:
+**Three ways through.** A write carrying slug S is accepted when:
+
+1. **S is in the registry row's list** — the common case, one read.
+2. **S is in the namespace's own data — the reconcile.** When the row's list does not
+   hold S, the handler re-derives the list from the namespace's rows (the same scan the
+   bootstrap uses: `store.list`, `src/traits.rs:192`, then slug-normalize every
+   `metadata.domain` they carry) and merges the result into the cache. If S is among
+   them, S is a domain this namespace has used, the write is accepted, and the cache is
+   repaired. The scan runs only on a path that would otherwise have been a rejection, so
+   its cost is paid on the rare path, never the hot one. This is what makes a lost
+   cache entry a non-event rather than a false rejection (§3.2.5).
+3. **`register_domain: true`** — the caller declares the domain genuinely new. The slug
+   is inserted into the cache (sorted, deduplicated) and the write proceeds.
+
+Anything else is a **rejection**, with the registered list and a one-call remedy. The
+write returns:
 
 ```
 ERROR [DOMAIN]: domain 'database-access' is not registered in namespace 'NeuroStrata'.
@@ -264,8 +286,7 @@ register_domain: true if 'database-access' is a genuinely new domain.
 
 `neurostrata_add_memory` and `neurostrata_task_complete` gain one optional boolean
 `register_domain` (default `false`), mirroring the `create_new_namespace` escape hatch
-already in the tool schema (§2). With `register_domain: true` the slug is inserted into
-the registry (sorted, deduplicated) and the write proceeds.
+already in the tool schema (§2).
 
 **Where each path takes the slug from.** The two write paths differ, and the flag
 follows the slug, not the other way round:
@@ -310,7 +331,7 @@ carries the original row's already-validated domain forward.
   domain is legal locally and no shared record is ever refused for a domain the local
   registry has not seen.
 
-#### 3.2.5 The registry update is atomic — across processes too
+#### 3.2.5 The registry update: serialized, retried, and never load-bearing
 
 Registering a domain is a **read-merge-write**: read the registry row, add the slug to
 the sorted list, write it back. That sequence is not atomic by itself, and the store
@@ -324,21 +345,37 @@ the loser does not fail — it retries (`WRITE_COLLISION_RETRIES`,
 directly (`src/main.rs:2844`, `:2862`). The registry must not assume it is alone in the
 store.
 
-**The fix has two halves.**
+**There is no compare-and-swap to fall back on.** The engine's writes are auto-commit
+`conn.query` calls; there is no transaction wrapper and no `BEGIN`/`COMMIT` anywhere in
+the store (`src/store/ladybug.rs:281-340`, `:868-1003`). A cross-process update cannot
+be made atomic. The best available is a **bounded compare-and-retry**:
 
 1. **In-process serialization.** The registry update runs under a **process-wide
    registry mutex** — registrations are rare and off the hot path — so two registrations
    inside one process cannot interleave.
-2. **Cross-process compare-and-retry.** After the write, the row is re-read and checked
-   against **the whole set that was there before the write**, not only against the new
-   slug: every slug in the pre-write set must still be present. If one is missing,
-   another writer changed the row under us; the update is re-merged and written again
-   (bounded — three attempts is enough for a rare event). If the attempts are exhausted,
-   the call **fails loudly**: it never reports a registration that did not stick.
+2. **Compare-and-retry.** After the write, the row is re-read and checked against the
+   whole set that was there before the write, not only against the new slug: every slug
+   in the pre-write set must still be present. If one is missing, another writer
+   changed the row under us; the update is re-merged and written again (bounded — three
+   attempts is enough for a rare event).
 
-No `VectorStore` trait method is added. `store.get` and `store.upsert` are enough
-(`src/traits.rs:195`, `:152-158`); the mutex, the retry and the verification live in the
-handler layer, beside the write path.
+**What that does not cover, stated plainly.** The retry cannot see a write that landed
+*before* our own write: we read an old list, another process added a slug, and our
+write overwrites it. The row we wrote still contains our whole pre-write set, so the
+check passes and **that other process's slug is dropped from the cache**. Only from the
+cache — the namespace's own rows, which are the truth, are never touched (§3.2). And
+because the cache is not the truth, the loss is neither a wrong acceptance nor a
+corrupted row: it is a **miss**, repaired by the reconcile of §3.2.3 the next time a
+write needs that slug.
+
+**So a cache update never fails the write.** If the bounded retries are exhausted, the
+write still proceeds — the acceptance decision was already made — and the failure is
+reported in the response's warnings rather than swallowed. There is no case where the
+caller is told a domain was registered when the cache does not hold it.
+
+No `VectorStore` trait method is added. `store.get`, `store.list` and `store.upsert` are
+enough (`src/traits.rs:192`, `:195`, `:152-158`); the mutex, the retry and the
+verification live in the handler layer, beside the write path.
 
 ---
 
@@ -418,7 +455,8 @@ Worst case 3 × 120 characters ≈ 90–100 tokens at session start.
 #### 3.3.5 What the topic seat is, then
 
 Mid-session topic transitions are served by the parent's `append_log` recall (≤3 entries,
-≤120 chars each — parent §4.1.2). Session/task start is served by this strap. Both are
+≤120 chars total each, prefix included — parent §4.1.2). Session/task start is served by
+this strap. Both are
 bounded, additive and `access_count`-neutral, so an agent that triggers both in one turn
 sees at most six compact entries — **at most** 720 characters of pointer text (≈180
 tokens) — and the two seats answer different moments, so in practice they rarely fire
@@ -463,12 +501,19 @@ the recall response.
 **The surface is a composite, and the bus is untouched.** `handle_bus_metrics` today
 serializes `bus.metrics()` — a bare `BusMetrics` of eight integers, with no extension
 point (`src/handlers/bus_metrics.rs:20-23`; the existing test asserts that those eight
-fields sit at the top level of the body). The counters therefore live in their own
-module, and the handler is widened to take them as a second argument: it serializes the
-bus metrics to a `serde_json::Value`, inserts `"domain_filter"` as an **extra top-level
-key**, and serializes the result. The bus's eight integers stay exactly where they are,
-so every existing reader of that body keeps working, and the bus itself never learns
-what a domain is.
+fields sit at the top level of the body, by containment rather than exact shape). The
+counters therefore live in their own module, and the handler reads them **directly**:
+they are process-global atomics beside the search path, so the handler's signature does
+not change, no `AppState` field is added, and the route needs no plumbing
+(`src/daemon.rs:539`, `:1106-1110`). The handler serializes the bus metrics to a
+`serde_json::Value`, inserts `"domain_filter"` as an **extra top-level key**, and
+serializes the result. The bus's eight integers stay exactly where they are, so every
+existing reader of that body keeps working, and the bus itself never learns what a
+domain is.
+
+`neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:116-117`),
+so it inherits this body without knowing anything about it.
+
 **Who reads it:** the operator and the agent, via `neurostrata-mcp bus-metrics`; the next
 retrieval-related spec reads the recorded numbers.
 
@@ -496,10 +541,10 @@ parent's deferral from rolling forward unmentioned.
 |---|---|---|
 | `metadata.attempt` | `fact` metadata | `{approach, outcome, failure_mode, context}` — all four required by the declared shape; `outcome` ∈ `["failed"]`. A missing or malformed value **warns**, it does not reject the write. |
 | `metadata.domain_registry` | `fact` metadata (the registry row) | `{domains: [...]}` — sorted, deduplicated slugs. The row is private and excluded from recall and from the snapshot body. |
-| `register_domain` | `neurostrata_add_memory`, `neurostrata_task_complete` | optional boolean, default `false`. When `true`, the slug is added to the registry and the write proceeds. The slug comes from `domain` (add_memory) or `metadata.domain` (task_complete); a non-string `domain` is rejected. |
+| `register_domain` | `neurostrata_add_memory`, `neurostrata_task_complete` | optional boolean, default `false`. When `true`, the slug is added to the registry cache and the write proceeds. The slug comes from `domain` (add_memory) or `metadata.domain` (task_complete); a non-string `domain` is rejected. |
 | `domain` (input) | `neurostrata_get_snapshot` | optional string or array of slugs; normalized before comparison. |
-| Domain strap entry | the snapshot's `Domain strap` section | `{id, memory_type, domain, valid_from, access_count, snippet}`; ≤3 entries; `snippet` ≤120 chars; ≤2 entries per domain in `recent_domain` mode. |
-| `recalled[]` snippet (parent) | the `append_log` response | prefixed with `"[FAILED ATTEMPT] "` when the row carries a valid `metadata.attempt` — prefixed **before** truncation. |
+| Domain strap entry | the snapshot's `Domain strap` section | `{id, memory_type, domain, valid_from, access_count, snippet}`; ≤3 entries; `snippet` ≤120 chars **total, prefix included**; ≤2 entries per domain in `recent_domain` mode. |
+| `recalled[]` snippet (parent) | the `append_log` response | prefixed with `"[FAILED ATTEMPT] "` when the row carries a valid `metadata.attempt` — prefixed **before** truncation, and the prefix counts toward the 120 characters. |
 | `"domain_filter"` | the metrics surface | four integer counters, explicit zeros — an extra top-level key beside the bus's own eight integers (§3.4.2) |
 
 ---
@@ -513,15 +558,15 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 |---|---|---|
 | 0 | **[P]** Prerequisite: the rule-honesty hardening + legacy backfill lands | task `neurostrata-bzdn` |
 | 1 | **[P]** Domain slug normalizer, applied on write and on comparison | new helper + `src/server.rs:1279-1281`; `src/store/ladybug.rs:1070-1085` |
-| 2 | **[N]** Registry row helpers: the deterministic v5 id, the lookup, the bootstrap seed (list + normalize + union), and the registry update (`store.upsert`) under the process-wide registry mutex, with a verify-after-write | new module beside the store; `src/traits.rs:192`, `:195`, `:152-158` |
+| 2 | **[N]** Registry row helpers: the deterministic v5 id, the lookup, the bootstrap seed (list + normalize + union), the reconcile scan, and the registry update (`store.upsert`) under the process-wide registry mutex, with a bounded compare-and-retry that never fails the write | new module beside the store; `src/traits.rs:192`, `:195`, `:152-158` |
 | 3 | **[P+N]** Vocabulary **one** bump 4 → 5: `fact.fields.topology` (P), `fact.fields.attempt`, `fact.fields.domain_registry` (N); the assert at `src/traits.rs:263`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69`, `:158`, `:161`; `src/traits.rs:263` |
-| 4 | **[N]** The write-path registry check: bootstrap when absent, reject when present and unregistered, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1278-1281`, `:1319-1325`; `src/task/mod.rs:1131-1141`, `:1181-1188` |
+| 4 | **[N]** The write-path registry check: bootstrap when absent, reconcile when the slug is missing from the cache, reject when it is in neither the cache nor the namespace's data, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1278-1281`, `:1319-1325`; `src/task/mod.rs:1131-1141`, `:1181-1188` |
 | 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:165-172`; `src/store/ladybug.rs:1004`; `src/server.rs:1956` |
 | 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:1083-1094`; `src/server.rs:1442`, `:1446` |
 | 7 | **[P]** `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; the recall rides the response | `src/buffer.rs:129`, `:171-177`; `src/server.rs:373-380`, `:664`, `:2051` |
 | 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:424`; `src/server.rs:2222`; the parent's `recalled[]` response, built beside `src/buffer.rs:169-176`; `src/server.rs:1152-1173` |
 | 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-161`, `:1454-1493` |
-| 10 | **[N]** The `domain_filter` counters and their surface | new module beside the search path; `src/handlers/bus_metrics.rs` |
+| 10 | **[N]** The `domain_filter` counters and their surface — process-global atomics in a module beside the search path, read directly by the metrics handler (no signature change, no `AppState` field, no route plumbing) | new module beside the search path; `src/handlers/bus_metrics.rs:20-23`; `src/daemon.rs:539`, `:1106-1110` |
 | 11 | **[N]** The mesh import step unions an imported record's domain into the local registry | `src/synaptic_mesh/import.rs` |
 | 12 | Tests (§6) | `src/server.rs`, `src/buffer.rs`, `src/store/ladybug.rs`, `src/schemas/` |
 | 13 | Docs: the honest-recall note, the registry note; `CHANGELOG.md` | repo docs |
@@ -549,7 +594,10 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
    creates the registry row with `["auth", "database-access"]`.
 8. A subsequent write in that namespace with `domain: "storage"` is **rejected** with the
    registered list, and no row is inserted; repeating it with `register_domain: true`
-   succeeds and the registry becomes `["auth", "database-access", "storage"]`.
+   succeeds and the registry becomes `["auth", "database-access", "storage"]`. A slug
+   that is missing from the cache but **present in the namespace's own data** is
+   accepted instead of rejected — the reconcile (§3.2.3) — and the cache is repaired to
+   include it.
 9. The registry row never appears in search results or in the snapshot's top-5 body, and
    `get_snapshot` renders `Registered domains (3): auth, database-access, storage`.
 10. The registry row is not exported to the mesh (`eligibility: private`), and an
@@ -579,7 +627,8 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | An unregistered domain slug is written | Rejected, with the registered list and the `register_domain` remedy | The wrong slug never enters the store; the caller is told exactly what to do. |
 | A namespace's first domain write happens with 20 legacy free-text domains | The bootstrap seeds the registry with all of them | No legacy domain is orphaned; the write still succeeds. |
 | The registry row is deleted or the namespace is wiped | The next domain write re-bootstraps | Self-healing; no manual repair step. |
-| Two agents register a domain concurrently | The registry's read-merge-write runs under the process-wide registry mutex, and the merged row is re-read and verified before the call reports success | No slug can vanish from the registry without the caller being told |
+| Two agents register a domain concurrently | In-process, the registry mutex serializes them. Cross-process, the store has no compare-and-swap, so a registration can still lose another process's slug **from the cache** — the namespace's data is never touched, and the next write that needs that slug triggers a reconcile that restores it (§3.2.3) | The loss is a cache miss — never a wrong acceptance, never a corrupted row |
+| The reconcile scan is expensive | It runs only on the path that would otherwise have been a rejection, and only over the namespace's own rows | A rejection is rare; the hot path is one read |
 | The bootstrap registers a stale domain from a retired row | Stale entries cost nothing; a missing legacy domain would | The bootstrap errs toward registering more, never less |
 | The strap's mode is wrong for the caller's intent | The mode is printed in the section header | The caller can see which selection produced the rows. |
 | The strap would show only one domain | `recent_domain` mode caps at 2 per domain | A narrow namespace cannot consume every slot. |
@@ -744,6 +793,27 @@ HEAD: the vocabulary version and its single assert (`src/schemas/memory-vocabula
 `src/traits.rs:263`), the `rule.fields` precedent (`:39-64`), `fact` having no `fields`
 object (`:66-69`), the bump policy (`:155`), and the two `tool_summaries` keys (`:158`,
 `:161`).
+
+**The third checker's findings** (session `ses_ea34460a4ffeIo2Z9ucZgtTT27`, verdict:
+"not yet approvable"). It confirmed the mechanisms it could reach — the registry's
+trait-API feasibility, the snapshot's `store.list` path and the separation of the
+snapshot's retain from the store's search filter, the composite metrics body's
+compatibility with the existing test (which asserts containment, not exact shape), and
+the numeric bounds — and found two substantive defects, both in the amended material:
+
+| The finding | The fix |
+|---|---|
+| **The compare-and-retry has a real lost-update hole.** When the other writer's write lands *before* ours, our write clobbers its slug; the row we wrote still contains our whole pre-write set, so the check passes and that other process's slug is silently lost. §7's claim that "no slug can vanish from the registry without the caller being told" was **false**. | §3.2 is reframed: **the registry row is a cache of the domains in use; the namespace's own rows are the truth.** A lost cache entry is a miss, not a wrong acceptance and not a corrupted row, and it is repaired by a new **reconcile** path (§3.2.3): when the cache does not hold the slug, the handler re-derives the list from the namespace's rows (the bootstrap's own scan) and, if the slug is there, accepts the write and repairs the cache. The scan runs only on the path that would otherwise have been a rejection. §7's row and §5 step 2 were rewritten to match. |
+| There is **no compare-and-swap**: the engine's writes are auto-commit `conn.query` calls, with no transaction wrapper and no `BEGIN`/`COMMIT` anywhere in the store (`src/store/ladybug.rs:281-340`, `:868-1003`), so a cross-process update cannot be made atomic | §3.2.5 now says so outright, and states that a cache update **never fails the write**: if the bounded retries are exhausted the write still proceeds — the acceptance decision was already made — and the failure is reported in the response's warnings rather than swallowed. |
+| The metrics plumbing was **unstated**: `AppState` (`src/daemon.rs:51-70`) has no counters field, so "the handler takes them as a second argument" would have required the route, the HTTP handler and two direct-call test sites to change | The counters are now **process-global atomics** in their own module, read directly by the handler: no signature change, no `AppState` field, no route plumbing, and the existing unit test keeps compiling. `neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:116-117`), so it inherits the body without knowing anything about it. |
+| The ≤120-character bound was still stated two ways (§4's row and §3.3.5's parent anchor) | Both now say **total, prefix included**. |
+| Cross-connection read visibility after another process's commit could not be verified at the engine level | It is **no longer load-bearing**: the cache framing means a stale cache is repaired by the reconcile, and a failed cache update never fails the write. |
+
+The round also verified what it could and left three items unread: the `BusMetrics`
+derive line above `src/events/subscriber.rs:178`, `src/server.rs:2652` (the
+`recall_hit_rate` promotion path) and `src/server.rs:2019` — all read and confirmed by
+the orchestrator, along with the store's four filter sites
+(`src/store/ladybug.rs:1083-1094`, `:1206-1213`, `:1262-1269`, `:1341-1347`).
 
 **Brief:** `docs/designs/2026-10-21-panel-brief-recall-closure-and-negative-exemplars.md`
 · **Parent brief:** `docs/designs/2026-10-20-gap-proactive-recall-and-access-topology.md`
