@@ -3143,4 +3143,64 @@ mod tests {
             "variant preserved durably outside the checkout"
         );
     }
+
+    /// The acceptance sweep (AC 8): a fact carrying an access topology crosses
+    /// the mesh's record path and comes back whole.
+    ///
+    /// The mesh is closed over `SHAREABLE_MEMORY_TYPES`
+    /// (`SHAREABLE_MEMORY_TYPES`, above), so a `fact` is inside the closure
+    /// and is applied; and the import carries the record's metadata onto the
+    /// row verbatim, so a field the vocabulary only learned in v5 --
+    /// `metadata.topology` -- travels unchanged rather than being flattened
+    /// away.
+    #[tokio::test]
+    async fn a_topology_fact_survives_the_mesh_round_trip() {
+        let (_base, mesh) = mesh_with_commit("topology");
+        let id = Uuid::new_v4();
+        let topology = json!({
+            "component": "api-gateway",
+            "target_system": "ledger-service",
+            "channel": "mTLS",
+            "credential_boundary": "eu-west-1 VPC",
+            "reason": "the ledger accepts traffic only from inside the VPC",
+        });
+        let mut value = record_value(
+            "synaptic-mesh-record/v1",
+            id,
+            "probe",
+            "fact",
+            "active",
+            None,
+            json!({"text": "the ledger is reachable only through the gateway"}),
+        );
+        value["metadata"]["topology"] = topology.clone();
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+
+        let store = fresh_store("topology").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("the full-tree replay applies");
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the fact crossed the mesh");
+        assert_eq!(
+            payload.memory_type, "fact",
+            "the shareable closure holds: a fact is a fact on the far side"
+        );
+        assert_eq!(
+            payload.metadata["topology"], topology,
+            "the access topology crosses the mesh unchanged"
+        );
+    }
 }
