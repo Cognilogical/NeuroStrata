@@ -938,6 +938,17 @@ struct WriteShapeWarning {
     skipped: String,
 }
 
+/// The five keys `fact.fields.topology` declares (vocabulary v5). Extra keys
+/// are ignored; a missing key or a present key that is not a string is a
+/// defect.
+const TOPOLOGY_KEYS: [&str; 5] = [
+    "component",
+    "target_system",
+    "channel",
+    "credential_boundary",
+    "reason",
+];
+
 /// Validates a memory payload's metadata shape and extracts edge specs.
 /// Returns the valid edge specs and any shape warnings (never rejects the write).
 fn parse_edge_specs(
@@ -1031,6 +1042,37 @@ fn parse_edge_specs(
                     field: key.to_string(),
                     why: "relation declaration must be an array".to_string(),
                     skipped: "declarations in this field".to_string(),
+                });
+            }
+        }
+    }
+
+    // (E) access topology shape. The field is declared on a `fact`, so the
+    // check keys off the memory type: on any other type `topology` is an
+    // undeclared metadata key and is accepted unchanged.
+    //
+    // The check is soft. A malformed claim warns and is still written, because
+    // a rejected write would lose the claim entirely.
+    if payload.memory_type.trim() == "fact" {
+        if let Some(topology) = payload.metadata.get("topology") {
+            let mut defects: Vec<String> = Vec::new();
+            match topology {
+                Value::Object(fields) => {
+                    for key in TOPOLOGY_KEYS {
+                        match fields.get(key) {
+                            None => defects.push(format!("is missing the required key {:?}", key)),
+                            Some(Value::String(_)) => { /* a string: as declared */ }
+                            Some(_) => defects.push(format!("key {:?} must be a string", key)),
+                        }
+                    }
+                }
+                _ => defects.push("must be an object".to_string()),
+            }
+            if !defects.is_empty() {
+                warnings.push(WriteShapeWarning {
+                    field: "metadata.topology".to_string(),
+                    why: format!("metadata.topology {}", defects.join("; ")),
+                    skipped: "the topology shape check; the fact is still written".to_string(),
                 });
             }
         }
@@ -4143,6 +4185,133 @@ eurostrata\src\daemon.rs",
         assert!(specs.is_empty());
         assert_eq!(warnings[0].why, "relation target must be a string");
         assert_eq!(warnings[0].skipped, "this edge declaration");
+    }
+
+    /// The access-topology shape check (vocabulary v5).
+    ///
+    /// A `fact` declares the access path it describes in `metadata.topology`.
+    /// The check is soft: a malformed shape warns and the fact is still
+    /// written, because a rejected write would lose the claim.
+    mod topology {
+        use super::*;
+
+        fn well_formed_topology() -> Value {
+            json!({
+                "component": "api-gateway",
+                "target_system": "ledger-service",
+                "channel": "mTLS",
+                "credential_boundary": "eu-west-1 VPC",
+                "reason": "the ledger accepts traffic only from inside the VPC",
+            })
+        }
+
+        fn fact_with_topology(topology: Value) -> MemoryPayload {
+            MemoryPayload {
+                content: "c".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: json!({ "topology": topology }),
+            }
+        }
+
+        #[test]
+        fn a_well_formed_topology_writes_without_a_warning() {
+            let mut topology = well_formed_topology();
+            // An extra key is not a defect: the declared shape ignores them.
+            topology["extra_key"] = json!("ignored");
+            let (specs, warnings) = parse_edge_specs(&fact_with_topology(topology));
+            assert!(specs.is_empty(), "the check never touches the edge specs");
+            assert!(
+                !warnings.iter().any(|w| w.field == "metadata.topology"),
+                "a well-formed topology raises no warning: {warnings:?}"
+            );
+            assert!(
+                warnings.is_empty(),
+                "the payload carries nothing else that could warn: {warnings:?}"
+            );
+        }
+
+        #[test]
+        fn a_malformed_topology_warns_and_the_fact_is_still_written() {
+            // A required key is missing.
+            let mut missing = well_formed_topology();
+            missing.as_object_mut().unwrap().remove("channel");
+            let (specs, warnings) = parse_edge_specs(&fact_with_topology(missing));
+            assert!(specs.is_empty(), "the check never touches the edge specs");
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].field, "metadata.topology");
+            assert_eq!(
+                warnings[0].why,
+                "metadata.topology is missing the required key \"channel\""
+            );
+            assert_eq!(
+                warnings[0].skipped,
+                "the topology shape check; the fact is still written"
+            );
+
+            // The topology is not an object at all.
+            let (_, warnings) = parse_edge_specs(&fact_with_topology(json!("not-an-object")));
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].field, "metadata.topology");
+            assert_eq!(warnings[0].why, "metadata.topology must be an object");
+
+            // A present key that is not a string.
+            let mut not_a_string = well_formed_topology();
+            not_a_string["channel"] = json!(42);
+            let (_, warnings) = parse_edge_specs(&fact_with_topology(not_a_string));
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].field, "metadata.topology");
+            assert_eq!(
+                warnings[0].why,
+                "metadata.topology key \"channel\" must be a string"
+            );
+        }
+
+        #[test]
+        fn a_topology_on_a_memory_that_is_not_a_fact_is_not_checked() {
+            let p = MemoryPayload {
+                memory_type: "rule".into(),
+                ..fact_with_topology(json!("not-an-object"))
+            };
+            let (_, warnings) = parse_edge_specs(&p);
+            assert!(
+                warnings.is_empty(),
+                "the field is declared on a fact alone, and an undeclared metadata \
+                 key is accepted unchanged: {warnings:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_fact_with_a_malformed_topology_is_still_written() {
+            let store = retired_test_store().await;
+            store
+                .upsert(
+                    "probe",
+                    "probe::fact",
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "fact",
+                        "agent",
+                        json!({ "topology": { "component": "api-gateway" } }),
+                    ),
+                )
+                .await
+                .expect("a malformed topology is a warning, not a rejection");
+
+            let stored = store
+                .get("probe", "probe::fact")
+                .await
+                .unwrap()
+                .expect("the fact is stored");
+            assert_eq!(
+                stored.1.metadata["topology"]["component"],
+                json!("api-gateway"),
+                "the topology is stored exactly as it was given"
+            );
+        }
     }
 
     // --- Integration tests: search with evidence ---

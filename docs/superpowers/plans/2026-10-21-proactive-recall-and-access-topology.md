@@ -229,7 +229,7 @@ Expected: FAIL — `search_with_domain` does not exist.
 
 Add `DomainMatchMode` and `DomainSearchOutcome` to `src/traits.rs`, and add `search_with_domain` to `trait VectorStore` with a body that calls `self.search(namespace, vector, limit, include_tasks, include_archived).await?` and returns `DomainSearchOutcome { results, mode: DomainMatchMode::Vector }`.
 
-The default body is what keeps the blast radius at one implementation. The five `impl VectorStore for` sites are `src/events/bus.rs:66` (`StoreNotAttached`), `src/events/bus.rs:836` (`RecordingStore`), `src/daemon.rs:1321` (`RecordingStore`, in the daemon's test module — the struct is at `:1283`), `src/guard/testkit.rs:92` (`MockStore`) and `src/task/mod.rs:4310` (`ListHidingStore`); the implementors that override the new method are `src/store/ladybug.rs:1544` (`LadybugStore`) and `src/guard/testkit.rs:153` (`MockStore`). A store that cannot filter must say so with `Vector`, never pretend the filter applied.
+The default body is what keeps the blast radius at one implementation. The five `impl VectorStore for` sites are `src/events/bus.rs:66` (`StoreNotAttached`), `src/events/bus.rs:836` (`RecordingStore`), `src/daemon.rs:1321` (`RecordingStore`, in the daemon's test module — the struct is at `:1283`), `src/guard/testkit.rs:92` (`MockStore`) and `src/task/mod.rs:4310` (`ListHidingStore`); the implementors that override the new method are `src/store/ladybug.rs:1586` (`LadybugStore`) and `src/guard/testkit.rs:153` (`MockStore`). A store that cannot filter must say so with `Vector`, never pretend the filter applied.
 
 - [ ] **Step 4: Run the trait tests**
 
@@ -238,7 +238,7 @@ Expected: PASS — the existing trait tests still pass; the new method is additi
 
 - [ ] **Step 5: Override `search_with_domain` in `LadybugStore`**
 
-`LadybugStore::search` (`src/store/ladybug.rs:1523`) delegates to the shared `search_inner` (`src/store/ladybug.rs:17`), which does two things inside one `with_conn` closure: the base candidate loop (`:79-174`) and the graph expansion (`:197` onward). The filter must sit inside the base candidate loop, so restructure that method as follows, all inside the same closure:
+`LadybugStore::search` (`src/store/ladybug.rs:1565`) delegates to the shared `search_inner` (`src/store/ladybug.rs:17`), which does two things inside one `with_conn` closure: the base candidate loop (`:79-174`) and the graph expansion (`:197` onward). The filter must sit inside the base candidate loop, so restructure that method as follows, all inside the same closure:
 
 - The base loop keeps **two** lists: `all_primaries` (every row the loop accepts, exactly as today) and `filtered_primaries` (the rows whose `domain_key` is in the key set). The key set is an owned `HashSet<String>` built from the `domains` argument before the closure is entered — `with_conn` requires `FnOnce(&Connection) -> Result<T> + Send + 'static` (`:907-911`), so a borrowed slice cannot cross into it. **Each provided domain is normalized with `crate::domain::normalize_domain_slug` before being added to the set, so the store's contract is: the key set is compared by normalized slug — the same comparison-time normalization applied to the row's stored domain.**
 - When the key set is empty, every row goes to both lists and the mode is `Vector` — no filter was asked for, so the behaviour is byte-identical to today's `search`.
@@ -434,7 +434,7 @@ git commit -m "feat(vocabulary): declare fact.fields.topology and bump the versi
 ### Task 5: The topology shape check — a soft warning, never a rejection
 
 **Files:**
-- Modify: `src/store/ladybug.rs:943-1040` (`parse_edge_specs`; the `WriteShapeWarning` struct is at `:935-939`)
+- Modify: `src/store/ladybug.rs:954-1082` (`parse_edge_specs`; the `WriteShapeWarning` struct is at `:935-939`)
 
 **Interfaces:**
 - Consumes: the declared shape from Task 4 (`component`, `target_system`, `channel`, `credential_boundary`, `reason`).
@@ -465,10 +465,11 @@ Expected: FAIL — no warning is produced today.
 In `parse_edge_specs`, add a section (E) after the existing relation-key checks:
 
 - `metadata.topology` absent → no warning.
-- Present and an object carrying all five keys, each a string → no warning.
-- Present and anything else → one `WriteShapeWarning { field: "metadata.topology", why: <what is wrong>, skipped: "the topology shape check; the fact is still written" }`.
+- Present on a memory that is not a `fact` → no warning: the field is declared on `fact` alone, and an undeclared metadata key is accepted unchanged.
+- Present on a `fact` and an object carrying all five keys, each a string → no warning. **Extra keys are ignored** — an extra key is not a defect and never warns.
+- Present on a `fact` and anything else — not an object, a missing required key, or a present key that is not a string → one `WriteShapeWarning { field: "metadata.topology", why: <what is wrong>, skipped: "the topology shape check; the fact is still written" }`.
 
-The check never affects the returned edge specs and never rejects the write. `parse_edge_specs` returns warnings; the caller emits them (the emit loop is at `src/store/ladybug.rs:1424-1427`) and the upsert continues.
+The check never affects the returned edge specs and never rejects the write. `parse_edge_specs` returns warnings; the caller emits them (the emit loop is at `src/store/ladybug.rs:1467-1469`) and the upsert continues.
 
 - [ ] **Step 4: Run the tests**
 
@@ -594,7 +595,7 @@ Normalize each tag with `crate::domain::normalize_domain_slug`, dropping the one
 
 - No surviving slug → no embedding, no search: `recalled: []`, and **no `recalled_from` key**.
 - Otherwise → embed the joined query **once** (`emb.embed(&query)`), then `store.init(&namespace)` (the search handler does exactly this at `src/server.rs:2023`; a search against an uninitialized namespace is a missing table, not a failed query), then `store.search_with_domain(&namespace, vec, 3, false, false, &slugs)` and work from `outcome.results` and `outcome.mode`. `include_tasks` and `include_archived` are both false: task rows are backlog chatter and archived rows are tombstones, exactly as `search_memory` treats them by default.
-- **Keep only the direct matches.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:191-197`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node is a structural type excluded from the base query (`src/store/ladybug.rs:1206-1212`) and reachable only through the expansion, and it carries no `metadata.domain` and a synthetic score of 1.0. Keep a result only when its evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2043-2046`). "The first three results the store returns" is **not** the rule: the store does not truncate at the primaries, so in any namespace with fewer than three primaries the first three results are expansion rows.
+- **Keep only the direct matches.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:191-197`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node is a structural type excluded from the base query (`src/store/ladybug.rs:1248-1254`) and reachable only through the expansion, and it carries no `metadata.domain` and a synthetic score of 1.0. Keep a result only when its evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2043-2046`). "The first three results the store returns" is **not** the rule: the store does not truncate at the primaries, so in any namespace with fewer than three primaries the first three results are expansion rows.
 - Each entry is `{id, memory_type, domain, score, snippet}`: `domain` is the row's normalized slug or `null` when it has none; `score` is the result's score; `snippet` is the content truncated to 120 characters on a character boundary (`content.chars().take(120).collect()`).
 - `recalled_from` is present **exactly when the search ran**: `"domain"` when the outcome's mode is `DomainMatchMode::Domain`, `"vector"` when the mode is `DomainMatchMode::Vector` (the filter matched nothing and was skipped, so the unfiltered rows came back). It is absent in the no-slug case above.
 - A store error must not fail the append: the log entry is the handler's primary duty, so the error is logged with `tracing::warn!` and the response carries `recalled: []` and **no `recalled_from`** — no search produced rows, so there is no mode to report. Reporting `"vector"` there would claim a vector search that never happened.
@@ -638,8 +639,8 @@ In `src/store/ladybug.rs`'s inline test module: upsert a `file` node first (so t
 
 1. the fact's `metadata.topology` round-trips unchanged through a search for it;
 2. the fact reaches the `file` node through the graph — the `GOVERNS` edge is what the one-hop expansion traverses (`src/store/ladybug.rs:197`) — with the expansion row carrying `EvidenceKind::OneHop`;
-3. the `file` node is a **structural** type (`src/store/ladybug.rs:1206-1212`), so it is excluded from the base candidate query and is reachable *only* through that expansion — which is the point of the one-hop path, and the reason the recall filters to direct matches;
-4. `export_graph` carries the fact node **and** the `GOVERNS` link to the file node. The call is `store.export_graph(false, false, &HashMap::new(), None)` — four arguments (`src/store/ladybug.rs:1916`, the trait declaration at `src/traits.rs:231`) — and the result is a JSON object with `nodes` and `links`. Acceptance criterion 5 asks for the topology fact to appear in `export_graph` with its `GOVERNS` edges; asserting only the search would leave that criterion untested.
+3. the `file` node is a **structural** type (`src/store/ladybug.rs:1248-1254`), so it is excluded from the base candidate query and is reachable *only* through that expansion — which is the point of the one-hop path, and the reason the recall filters to direct matches;
+4. `export_graph` carries the fact node **and** the `GOVERNS` link to the file node. The call is `store.export_graph(false, false, &HashMap::new(), None)` — four arguments (`src/store/ladybug.rs:1958`, the trait declaration at `src/traits.rs:231`) — and the result is a JSON object with `nodes` and `links`. Acceptance criterion 5 asks for the topology fact to appear in `export_graph` with its `GOVERNS` edges; asserting only the search would leave that criterion untested.
 
 - [ ] **Step 2: Write the failing test — the mesh round-trip**
 
@@ -785,6 +786,6 @@ This plan was put to two independent seats on 2026-10-21, each answering the sam
 | Q5 — is `recalled_from: "vector"` honest when nothing was searched? | **UNSOUND** | **AMBIGUOUS** | Both agreed the error case misreports. Resolved by the mode being present **exactly when a search ran** — absent on an untagged turn and absent on a failed search. That also makes the two values land exactly on the closure spec's two counters. |
 | Q6 — coverage of the spec's acceptance criteria; are the anchors real? | **MISSING** (3 gaps) | **MISSING** (4 gaps) | All absorbed: the `export_graph` assertion (AC 5), the ≤3-cap and ≤120-char assertions (AC 3), the free-text-domain → slug-tag round trip (AC 1), the rule row this spec must write (AC 9), and the non-vacuous `access_count` assertions. |
 
-**Anchor corrections applied.** `WriteShapeWarning` is at `src/store/ladybug.rs:935-939` (not `:413-418`); the warnings are emitted at `:1424-1427` (not `:907`); `rule.fields` opens at `src/schemas/memory-vocabulary.v3.json:42`; the five `impl VectorStore for` sites are `src/events/bus.rs:66`, `src/events/bus.rs:836`, `src/daemon.rs:1321`, `src/guard/testkit.rs:92` and `src/task/mod.rs:4310`, and the daemon's `RecordingStore` implements the trait at `:1321` (its struct is at `:1283`). Both seats' anchors were accurate apart from that drift.
+**Anchor corrections applied.** `WriteShapeWarning` is at `src/store/ladybug.rs:935-939` (not `:413-418`); the warnings are emitted at `:1467-1469` (not `:907`); `rule.fields` opens at `src/schemas/memory-vocabulary.v3.json:42`; the five `impl VectorStore for` sites are `src/events/bus.rs:66`, `src/events/bus.rs:836`, `src/daemon.rs:1321`, `src/guard/testkit.rs:92` and `src/task/mod.rs:4310`, and the daemon's `RecordingStore` implements the trait at `:1321` (its struct is at `:1283`). Both seats' anchors were accurate apart from that drift.
 
 **Spec amendments made in the same commit.** The parent spec's §4.1.2 (the mode's presence rule; direct matches only), §4.3.5 (no mode without a search), §5 (the `recalled_from` contract row), §4.2.4 and §4.3.2 (anchor corrections), §6 step 0 and §10 (the dependency edge, narrowed and named); and the closure spec's §3.4.2 (a call with no mode increments neither domain-filter counter).
