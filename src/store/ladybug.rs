@@ -6051,6 +6051,63 @@ eurostrata\src\daemon.rs",
         );
     }
 
+    #[tokio::test]
+    async fn mock_store_search_with_domain_honours_limit() {
+        use crate::guard::testkit::MockStore;
+        use crate::traits::{DomainMatchMode, VectorStore};
+
+        let mock = MockStore::new();
+        let namespace = "probe";
+
+        // Seed 3 rows with different domains
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        for (id, domain) in [
+            ("fact-a", "auth"),
+            ("fact-b", "database"),
+            ("fact-c", "compute"),
+        ] {
+            let payload = retired_test_payload("fact", "agent", json!({ "domain": domain }));
+            mock.upsert(namespace, id, query_vec.clone(), payload)
+                .await
+                .unwrap();
+        }
+
+        // Empty-key branch (domains = &[]): limit = 1 should return exactly 1 row
+        let outcome = mock
+            .search_with_domain(namespace, query_vec.clone(), 1, false, false, &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.mode, DomainMatchMode::Vector);
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "empty-key branch: limit=1 must return exactly 1 row"
+        );
+
+        // Filtered branch (domains = &["database"]): limit = 1 should return exactly 1 matching row
+        let outcome = mock
+            .search_with_domain(
+                namespace,
+                query_vec,
+                1,
+                false,
+                false,
+                &["database".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.mode, DomainMatchMode::Domain);
+        assert_eq!(
+            outcome.results.len(),
+            1,
+            "filtered branch: limit=1 must return exactly 1 row"
+        );
+        assert_eq!(
+            outcome.results[0].id, "fact-b",
+            "filtered branch: must return the matching row"
+        );
+    }
+
     /// The thread that runs the engine must have an alternate signal stack
     /// big enough for the crash handler.
     ///
