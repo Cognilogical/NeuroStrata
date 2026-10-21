@@ -64,12 +64,19 @@ impl MockStore {
 
     /// List of (namespace, id) pairs that have had `increment_access_count` called.
     /// Used by tests to verify the access count was incremented.
-    pub fn incremented_ids(&self) -> Vec<(String, String)> {
-        self.incremented_ids.lock().expect("mock store lock").clone()
+    /// Temporarily allowed until Task 6's tests consume it.
+    #[allow(dead_code)]
+    pub(crate) fn incremented_ids(&self) -> Vec<(String, String)> {
+        self.incremented_ids
+            .lock()
+            .expect("mock store lock")
+            .clone()
     }
 
     /// Configure whether `search` and `search_with_domain` should fail.
     /// Used by tests to exercise error paths.
+    /// Temporarily allowed until Task 6's tests consume it.
+    #[allow(dead_code)]
     pub(crate) fn set_search_fails(&self, fails: bool) {
         *self.search_fails.lock().expect("mock store lock") = fails;
     }
@@ -153,7 +160,9 @@ impl VectorStore for MockStore {
         domains: &[String],
     ) -> Result<DomainSearchOutcome> {
         if *self.search_fails.lock().expect("mock store lock") {
-            return Err(anyhow::anyhow!("MockStore search_with_domain configured to fail"));
+            return Err(anyhow::anyhow!(
+                "MockStore search_with_domain configured to fail"
+            ));
         }
 
         // Normalize the provided domains into a set (lowercase-kebab).
@@ -195,6 +204,17 @@ impl VectorStore for MockStore {
             if domain_match {
                 filtered_primaries.push(sr);
             }
+
+            // Stop condition: honour limit in the no-filter branch too,
+            // matching the real store's behaviour (src/store/ladybug.rs:164-172).
+            let stop_count = if domain_keys.is_empty() {
+                all_primaries.len()
+            } else {
+                filtered_primaries.len()
+            };
+            if stop_count >= limit {
+                break;
+            }
         }
 
         // Determine chosen set and mode (soft fallback when filter empties candidates).
@@ -203,10 +223,16 @@ impl VectorStore for MockStore {
             (all_primaries, DomainMatchMode::Vector)
         } else if filtered_primaries.is_empty() && !all_primaries.is_empty() {
             // Filter would empty the candidates: skip it, use unfiltered, mode is Vector
-            (all_primaries.into_iter().take(limit).collect(), DomainMatchMode::Vector)
+            (
+                all_primaries.into_iter().take(limit).collect(),
+                DomainMatchMode::Vector,
+            )
         } else {
             // Filter applied successfully
-            (filtered_primaries.into_iter().take(limit).collect(), DomainMatchMode::Domain)
+            (
+                filtered_primaries.into_iter().take(limit).collect(),
+                DomainMatchMode::Domain,
+            )
         };
 
         Ok(DomainSearchOutcome {
@@ -239,11 +265,7 @@ impl VectorStore for MockStore {
                 id: r.id.clone(),
                 score: 1.0,
                 payload: r.payload.clone(),
-                evidence: Some(vec![crate::traits::SearchEvidence {
-                    kind: crate::traits::EvidenceKind::DirectMatch,
-                    path: vec![],
-                    explanation: "This memory matched the query vector.".to_string(),
-                }]),
+                evidence: None,
             })
             .collect())
     }
