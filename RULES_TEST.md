@@ -21,7 +21,7 @@ Work is NOT complete until `neurostrata_task_complete` succeeded, the task gate 
   4. **Quality Gates:** Run tests, linters, builds. Mid-session, `neurostrata_task_validate` (or `neurostrata-mcp task validate <ns>`) is the advisory gate report — it never blocks.
   5. **Push to Remote (CRITICAL):**
      - `git pull --rebase`
-     - `git push` — the pre-push hook runs `neurostrata-mcp task gate <namespace> --strict`; violations (any `in_progress` task, `done` without an extracted memory, P0 open >24h) block the push.
+     - `git push` — the pre-push hook runs `neurostrata-mcp task gate <namespace> --strict`; violations (any live, non-retired `in_progress` task, `done` without an extracted memory, P0 open >24h) block the push.
      - `git status` (Must show "up to date with origin")
   - Escape hatch for a wedged/unavailable database (an ops problem, not agent misconduct): `NEUROSTRATA_SKIP_GATE=1 git push`.
 - **Never Strand Work:** Never stop before pushing. Never say "ready to push when you are" (the agent must do it).

@@ -298,7 +298,7 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "status": { "type": "string", "enum": ["open", "in_progress", "blocked", "done"], "description": "Only tasks in this state." },
                                 "assignee": { "type": "string", "description": "Only tasks claimed by this assignee." },
-                                "ready": { "type": "boolean", "description": "Only actionable work: open with every blocker done." },
+                                "ready": { "type": "boolean", "description": "Only actionable work: open (not retired), with every blocker done. A retired blocker counts as done -- it is history, unless a live successor still carries the work." },
                                 "include_done": { "type": "boolean", "description": "Include finished tasks in the unfiltered listing." }
                             },
                             "required": ["namespace"]

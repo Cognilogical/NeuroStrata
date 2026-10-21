@@ -196,7 +196,7 @@ neurostrata_task_complete, which requires memory extraction (Lock 2)."*
     "namespace": {"type":"string"},
     "status": {"type":"string","enum":["open","in_progress","blocked","done"]},
     "assignee": {"type":"string"},
-    "ready": {"type":"boolean","description":"open AND all blocked_by tasks are done. This is `bd ready`."},
+    "ready": {"type":"boolean","description":"open AND not retired AND all blocked_by tasks are done. A retired blocker counts as done -- it is history -- unless a live successor still carries the work. This is `bd ready`."},
     "include_done": {"type":"boolean","default":false}
   }, "required": ["namespace"] }
 ```
@@ -363,6 +363,34 @@ Violation iff:
 
 Stale (advisory, never blocking): `in_progress` with no update in >60 min —
 surfaced by `task_validate` and `get_snapshot`, not the gate.
+
+**Retired rows are history, not live claims.** A row whose `metadata.valid_to`
+has passed is retired (superseded, or expired) and the gate does not judge
+it: a retired rule is not an active assertion, a retired task is not work in
+flight, so it raises neither a rule-provenance violation, nor `in_progress`,
+nor P0 rot, nor staleness. Malformed expiry metadata is not proof of
+retirement, so such a row stays live and keeps failing closed.
+
+The obligation travels with the work rather than evaporating with the row: a
+retired task row is exempt from the extraction check only when the row that
+replaced it carries the lesson — `metadata.superseded_by` must point at a
+successor that is itself a task, is not retired, is `done`, and already has
+an inbound EXTRACTED_FROM edge. Anything less (a successor that is not a
+task, one that is still open, one whose own lesson is still missing, one
+that is itself retired, or no successor at all) leaves the lesson owed by
+the retired row, which still blocks.
+
+A retired task row is not offered as claimed or ready work in the snapshot
+(prefix): the gate does not judge it, so an agent must not be sent to
+release a claim that no longer blocks anything.
+
+The same rule governs readiness. A retired blocker is history and no longer
+holds its dependents — unless a live successor still carries the work, in
+which case the dependents still wait for that successor. A retired task row
+is never offered as ready work itself.
+
+The counts describe the namespace's task rows, retired ones included and
+counted apart in `counts.retired`; the violations describe the live ones.
 
 ### 5.4 Session completion (Q7)
 
