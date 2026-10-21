@@ -184,7 +184,7 @@ git commit -m "feat(domain): normalize domain slugs on write and on comparison"
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/store/ladybug.rs`'s inline test module, add three `#[tokio::test]`s. Use `LadybugStore::for_testing(path, 4)` (`:143`) and `store.init(namespace)`, exactly as the existing store tests do; the vector dimension is 4, so upsert and search with a 4-float vector.
+In `src/store/ladybug.rs`'s inline test module, add five `#[tokio::test]`s. Use `LadybugStore::for_testing(path, 4)` (`:143`) and `store.init(namespace)`, exactly as the existing store tests do; the vector dimension is 4, so upsert and search with a 4-float vector.
 
 ```rust
 #[tokio::test]
@@ -201,9 +201,18 @@ async fn a_domain_filter_that_would_empty_the_candidates_falls_back_to_the_unfil
 async fn a_legacy_free_text_domain_matches_the_slug_at_comparison_time() { /* one fact stored with
     metadata.domain "Database Access", search with the key set ["database-access"], assert the fact
     is returned with mode Domain, and assert the stored metadata value is still "Database Access" */ }
+
+#[tokio::test]
+async fn a_filtered_search_with_limit_below_unfiltered_count_returns_only_matching_rows() { /* seed
+    more than `limit` rows whose domains do NOT match the key set, plus one that does; assert the
+    filtered result holds the matching row and mode is Domain, and the unfiltered set exceeds `limit` */ }
+
+#[tokio::test]
+async fn mock_store_search_with_domain_matches_real_store_behaviour() { /* pin MockStore to the
+    real store's behaviour: same input, same returned ids, same mode */ }
 ```
 
-The third test is Review Focus #3; the second is Review Focus #2. The legacy row in the third test is **seeded straight into the store with an upsert**, not written through the add path — the add path normalizes on write (Task 1), so a row that still reads `"Database Access"` is exactly what a pre-migration row looks like.
+The third test is Review Focus #3; the second is Review Focus #2. The legacy row in the third test is **seeded straight into the store with an upsert**, not written through the add path — the add path normalizes on write (Task 1), so a row that still reads `"Database Access"` is exactly what a pre-migration row looks like. The fourth test exercises the stop condition counting `filtered_primaries` (a filtered search that legitimately returns fewer than `limit` rows while the unfiltered set exceeds `limit`). The fifth test pins the mock to the real store's behaviour so the two cannot drift.
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
@@ -225,7 +234,7 @@ Expected: PASS — the existing trait tests still pass; the new method is additi
 
 `LadybugStore::search` (`src/store/ladybug.rs:1004`) does two things inside one `with_conn` closure: the base candidate loop (`:1064-1137`) and the graph expansion (`:1142` onward). The filter must sit inside the base candidate loop, so restructure that method as follows, all inside the same closure:
 
-- The base loop keeps **two** lists: `all_primaries` (every row the loop accepts, exactly as today) and `filtered_primaries` (the rows whose `domain_key` is in the key set). The key set is an owned `HashSet<String>` built from the `domains` argument before the closure is entered — `with_conn` requires `FnOnce(&Connection) -> Result<T> + Send + 'static` (`:388-392`), so a borrowed slice cannot cross into it.
+- The base loop keeps **two** lists: `all_primaries` (every row the loop accepts, exactly as today) and `filtered_primaries` (the rows whose `domain_key` is in the key set). The key set is an owned `HashSet<String>` built from the `domains` argument before the closure is entered — `with_conn` requires `FnOnce(&Connection) -> Result<T> + Send + 'static` (`:388-392`), so a borrowed slice cannot cross into it. **Each provided domain is normalized with `crate::domain::normalize_domain_slug` before being added to the set, so the store's contract is: the key set is compared by normalized slug — the same comparison-time normalization applied to the row's stored domain.**
 - When the key set is empty, every row goes to both lists and the mode is `Vector` — no filter was asked for, so the behaviour is byte-identical to today's `search`.
 - When the key set is non-empty, a row whose `domain_key` is `None` or is not in the set is skipped for `filtered_primaries` but still counted in `all_primaries`. The filter check happens **after** the row-class filters (`task`, tombstoned, mesh-conflicting) and **before** the usage boost, so the boost and the budget are spent only on rows the filter admitted.
 - The loop's stop condition counts `filtered_primaries`, so a filtered search may legitimately return fewer rows than `limit`. **That is why `all_primaries` can exceed `limit`**: the loop keeps scanning (to fill the filtered set) long after it has accepted `limit` rows overall. The truncation below is therefore real, not a no-op.

@@ -1528,7 +1528,16 @@ impl VectorStore for LadybugStore {
         include_tasks: bool,
         include_archived: bool,
     ) -> Result<Vec<SearchResult>> {
-        let outcome = search_inner(self, namespace, vector, limit, include_tasks, include_archived, HashSet::new()).await?;
+        let outcome = search_inner(
+            self,
+            namespace,
+            vector,
+            limit,
+            include_tasks,
+            include_archived,
+            HashSet::new(),
+        )
+        .await?;
         Ok(outcome.results)
     }
 
@@ -1543,8 +1552,23 @@ impl VectorStore for LadybugStore {
     ) -> Result<DomainSearchOutcome> {
         // Build the normalized domain key set before entering the closure.
         // The closure requires an owned HashSet because with_conn needs FnOnce + Send + 'static.
-        let domain_keys: HashSet<String> = domains.iter().cloned().collect();
-        search_inner(self, namespace, vector, limit, include_tasks, include_archived, domain_keys).await
+        // Normalize each provided domain slug so the store's contract is:
+        // "the key set is compared by normalized slug" — the same comparison-time
+        // normalization applied to the row's stored domain.
+        let domain_keys: HashSet<String> = domains
+            .iter()
+            .filter_map(|d| crate::domain::normalize_domain_slug(d))
+            .collect();
+        search_inner(
+            self,
+            namespace,
+            vector,
+            limit,
+            include_tasks,
+            include_archived,
+            domain_keys,
+        )
+        .await
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
@@ -5709,7 +5733,6 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let zero = vec![0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Two facts with different domains
@@ -5734,14 +5757,27 @@ eurostrata\src\daemon.rs",
 
         // Search with domain filter for "database" only
         let outcome = store
-            .search_with_domain("probe", query_vec, 10, false, false, &["database".to_string()])
+            .search_with_domain(
+                "probe",
+                query_vec,
+                10,
+                false,
+                false,
+                &["database".to_string()],
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"database-fact"), "database-fact should be returned");
-        assert!(!ids.contains(&"auth-fact"), "auth-fact should be filtered out");
+        assert!(
+            ids.contains(&"database-fact"),
+            "database-fact should be returned"
+        );
+        assert!(
+            !ids.contains(&"auth-fact"),
+            "auth-fact should be filtered out"
+        );
     }
 
     #[tokio::test]
@@ -5750,7 +5786,6 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let zero = vec![0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // One fact with domain "auth"
@@ -5766,13 +5801,23 @@ eurostrata\src\daemon.rs",
 
         // Search with domain filter for "database" (no match)
         let outcome = store
-            .search_with_domain("probe", query_vec, 10, false, false, &["database".to_string()])
+            .search_with_domain(
+                "probe",
+                query_vec,
+                10,
+                false,
+                false,
+                &["database".to_string()],
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Vector);
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"auth-fact"), "auth-fact should be returned via fallback");
+        assert!(
+            ids.contains(&"auth-fact"),
+            "auth-fact should be returned via fallback"
+        );
     }
 
     #[tokio::test]
@@ -5781,7 +5826,6 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let zero = vec![0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // One fact with legacy free-text domain "Database Access"
@@ -5798,18 +5842,213 @@ eurostrata\src\daemon.rs",
 
         // Search with the normalized slug "database-access"
         let outcome = store
-            .search_with_domain("probe", query_vec, 10, false, false, &["database-access".to_string()])
+            .search_with_domain(
+                "probe",
+                query_vec,
+                10,
+                false,
+                false,
+                &["database-access".to_string()],
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
         let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"legacy-fact"), "legacy-fact should match the normalized slug");
+        assert!(
+            ids.contains(&"legacy-fact"),
+            "legacy-fact should match the normalized slug"
+        );
 
         // Verify the stored metadata still has the original free-text value
-        let legacy = outcome.results.iter().find(|r| r.id == "legacy-fact").unwrap();
-        let stored_domain = legacy.payload.metadata.get("domain").and_then(|v| v.as_str());
-        assert_eq!(stored_domain, Some("Database Access"), "stored domain must remain unchanged");
+        // Use a fresh get() read-back to assert no migration occurred.
+        let stored = store.get("probe", "legacy-fact").await.unwrap().unwrap();
+        let stored_domain = stored.1.metadata.get("domain").and_then(|v| v.as_str());
+        assert_eq!(
+            stored_domain,
+            Some("Database Access"),
+            "stored domain must remain unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filtered_search_with_limit_below_unfiltered_count_returns_only_matching_rows() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-domain-filter-limit-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+
+        // Seed 5 rows with domain "other" (won't match) and 1 row with domain "target" (will match).
+        // Limit is 3, so unfiltered all_primaries would exceed limit (6 > 3),
+        // but only the one "target" row should pass the filter.
+        for i in 0..5 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("other-fact-{}", i),
+                    query_vec.clone(),
+                    retired_test_payload("fact", "agent", json!({ "domain": "other" })),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "target-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "domain": "target" })),
+            )
+            .await
+            .unwrap();
+
+        // Search with domain filter for "target" only, limit = 3
+        let outcome = store
+            .search_with_domain(
+                "probe",
+                query_vec.clone(),
+                3,
+                false,
+                false,
+                &["target".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Filter applied successfully: only the matching row returned, mode is Domain
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "only the matching row should be returned");
+        assert!(
+            ids.contains(&"target-fact"),
+            "target-fact should be returned"
+        );
+
+        // Verify that unfiltered set really did exceed limit (otherwise test is vacuous)
+        let unfiltered = store
+            .search("probe", query_vec.clone(), 10, false, false)
+            .await
+            .unwrap();
+        assert!(
+            unfiltered.len() > 3,
+            "unfiltered set must exceed limit for the stop condition to be meaningful"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_store_search_with_domain_matches_real_store_behaviour() {
+        use crate::guard::testkit::MockStore;
+        use crate::traits::VectorStore;
+
+        let mock = MockStore::new();
+        let namespace = "probe";
+
+        // Seed same data as the real store tests: two facts with different domains
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        mock.upsert(
+            namespace,
+            "auth-fact",
+            query_vec.clone(),
+            retired_test_payload("fact", "agent", json!({ "domain": "auth" })),
+        )
+        .await
+        .unwrap();
+        mock.upsert(
+            namespace,
+            "database-fact",
+            query_vec.clone(),
+            retired_test_payload("fact", "agent", json!({ "domain": "database" })),
+        )
+        .await
+        .unwrap();
+
+        // Test 1: domain filter narrows candidates
+        let outcome = mock
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                10,
+                false,
+                false,
+                &["database".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"database-fact"),
+            "database-fact should be returned"
+        );
+        assert!(
+            !ids.contains(&"auth-fact"),
+            "auth-fact should be filtered out"
+        );
+
+        // Test 2: filter that would empty falls back to unfiltered
+        let outcome = mock
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                10,
+                false,
+                false,
+                &["nonexistent".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Vector);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"auth-fact"),
+            "auth-fact should be returned via fallback"
+        );
+        assert!(
+            ids.contains(&"database-fact"),
+            "database-fact should be returned via fallback"
+        );
+
+        // Test 3: legacy free-text domain matches normalized slug
+        mock.upsert(
+            namespace,
+            "legacy-fact",
+            query_vec.clone(),
+            retired_test_payload("fact", "agent", json!({ "domain": "Database Access" })),
+        )
+        .await
+        .unwrap();
+        let outcome = mock
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                10,
+                false,
+                false,
+                &["database-access".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"legacy-fact"),
+            "legacy-fact should match the normalized slug"
+        );
+
+        // Test 4: no filter returns all with Vector mode
+        let outcome = mock
+            .search_with_domain(namespace, query_vec, 10, false, false, &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Vector);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "all three facts should be returned when no filter"
+        );
     }
 
     /// The thread that runs the engine must have an alternate signal stack
