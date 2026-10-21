@@ -5942,30 +5942,64 @@ eurostrata\src\daemon.rs",
         use crate::guard::testkit::MockStore;
         use crate::traits::VectorStore;
 
+        // Build a REAL store and a MOCK store
+        let real = retired_test_store().await;
         let mock = MockStore::new();
         let namespace = "probe";
 
-        // Seed same data as the real store tests: two facts with different domains
+        // Seed IDENTICAL rows into both stores
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
-        mock.upsert(
+        let payload_auth = retired_test_payload("fact", "agent", json!({ "domain": "auth" }));
+        let payload_db = retired_test_payload("fact", "agent", json!({ "domain": "database" }));
+        let payload_legacy =
+            retired_test_payload("fact", "agent", json!({ "domain": "Database Access" }));
+
+        // Insert into real store
+        real.upsert(
             namespace,
             "auth-fact",
             query_vec.clone(),
-            retired_test_payload("fact", "agent", json!({ "domain": "auth" })),
+            payload_auth.clone(),
         )
         .await
         .unwrap();
-        mock.upsert(
+        real.upsert(
             namespace,
             "database-fact",
             query_vec.clone(),
-            retired_test_payload("fact", "agent", json!({ "domain": "database" })),
+            payload_db.clone(),
+        )
+        .await
+        .unwrap();
+        real.upsert(
+            namespace,
+            "legacy-fact",
+            query_vec.clone(),
+            payload_legacy.clone(),
         )
         .await
         .unwrap();
 
-        // Test 1: domain filter narrows candidates
-        let outcome = mock
+        // Insert into mock store
+        mock.upsert(namespace, "auth-fact", query_vec.clone(), payload_auth)
+            .await
+            .unwrap();
+        mock.upsert(namespace, "database-fact", query_vec.clone(), payload_db)
+            .await
+            .unwrap();
+        mock.upsert(namespace, "legacy-fact", query_vec.clone(), payload_legacy)
+            .await
+            .unwrap();
+
+        // Helper to get sorted IDs from a DomainSearchOutcome
+        let sorted_ids = |outcome: &crate::traits::DomainSearchOutcome| -> Vec<String> {
+            let mut ids: Vec<String> = outcome.results.iter().map(|r| r.id.clone()).collect();
+            ids.sort();
+            ids
+        };
+
+        // Case A: key set matches exactly one row → mode Domain, only that row returned
+        let real_outcome = real
             .search_with_domain(
                 namespace,
                 query_vec.clone(),
@@ -5976,19 +6010,33 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
-        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(
-            ids.contains(&"database-fact"),
-            "database-fact should be returned"
+        let mock_outcome = mock
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                10,
+                false,
+                false,
+                &["database".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(real_outcome.mode, crate::traits::DomainMatchMode::Domain);
+        assert_eq!(mock_outcome.mode, crate::traits::DomainMatchMode::Domain);
+        assert_eq!(
+            sorted_ids(&real_outcome),
+            sorted_ids(&mock_outcome),
+            "real and mock must return the same set of IDs for narrowing case"
         );
-        assert!(
-            !ids.contains(&"auth-fact"),
-            "auth-fact should be filtered out"
+        assert_eq!(
+            sorted_ids(&real_outcome),
+            vec!["database-fact".to_string()],
+            "only the matching row should be returned"
         );
 
-        // Test 2: filter that would empty falls back to unfiltered
-        let outcome = mock
+        // Case B: key set matches nothing → soft fallback → mode Vector, all rows returned
+        let real_outcome = real
             .search_with_domain(
                 namespace,
                 query_vec.clone(),
@@ -5999,27 +6047,33 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Vector);
-        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
-        assert!(
-            ids.contains(&"auth-fact"),
-            "auth-fact should be returned via fallback"
+        let mock_outcome = mock
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                10,
+                false,
+                false,
+                &["nonexistent".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(real_outcome.mode, crate::traits::DomainMatchMode::Vector);
+        assert_eq!(mock_outcome.mode, crate::traits::DomainMatchMode::Vector);
+        assert_eq!(
+            sorted_ids(&real_outcome),
+            sorted_ids(&mock_outcome),
+            "real and mock must return the same set of IDs for fallback case"
         );
-        assert!(
-            ids.contains(&"database-fact"),
-            "database-fact should be returned via fallback"
+        assert_eq!(
+            sorted_ids(&real_outcome).len(),
+            3,
+            "all three rows should be returned via soft fallback"
         );
 
-        // Test 3: legacy free-text domain matches normalized slug
-        mock.upsert(
-            namespace,
-            "legacy-fact",
-            query_vec.clone(),
-            retired_test_payload("fact", "agent", json!({ "domain": "Database Access" })),
-        )
-        .await
-        .unwrap();
-        let outcome = mock
+        // Case C: legacy free-text domain matches normalized slug at comparison time
+        let real_outcome = real
             .search_with_domain(
                 namespace,
                 query_vec.clone(),
@@ -6030,22 +6084,49 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
-        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        let mock_outcome = mock
+            .search_with_domain(
+                namespace,
+                query_vec.clone(),
+                10,
+                false,
+                false,
+                &["database-access".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(real_outcome.mode, crate::traits::DomainMatchMode::Domain);
+        assert_eq!(mock_outcome.mode, crate::traits::DomainMatchMode::Domain);
+        assert_eq!(
+            sorted_ids(&real_outcome),
+            sorted_ids(&mock_outcome),
+            "real and mock must return the same set of IDs for legacy case"
+        );
         assert!(
-            ids.contains(&"legacy-fact"),
+            sorted_ids(&real_outcome).contains(&"legacy-fact".to_string()),
             "legacy-fact should match the normalized slug"
         );
 
-        // Test 4: no filter returns all with Vector mode
-        let outcome = mock
+        // Case D: no filter (empty key set) → mode Vector, all rows returned
+        let real_outcome = real
+            .search_with_domain(namespace, query_vec.clone(), 10, false, false, &[])
+            .await
+            .unwrap();
+        let mock_outcome = mock
             .search_with_domain(namespace, query_vec, 10, false, false, &[])
             .await
             .unwrap();
-        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Vector);
-        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+
+        assert_eq!(real_outcome.mode, crate::traits::DomainMatchMode::Vector);
+        assert_eq!(mock_outcome.mode, crate::traits::DomainMatchMode::Vector);
         assert_eq!(
-            ids.len(),
+            sorted_ids(&real_outcome),
+            sorted_ids(&mock_outcome),
+            "real and mock must return the same set of IDs for empty key set"
+        );
+        assert_eq!(
+            sorted_ids(&real_outcome).len(),
             3,
             "all three facts should be returned when no filter"
         );
@@ -6059,12 +6140,14 @@ eurostrata\src\daemon.rs",
         let mock = MockStore::new();
         let namespace = "probe";
 
-        // Seed 3 rows with different domains
+        // Seed: TWO rows matching "database", ONE row matching "auth", ONE row matching "compute"
+        // This ensures the filtered branch has multiple matching rows to test truncation.
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
         for (id, domain) in [
-            ("fact-a", "auth"),
-            ("fact-b", "database"),
-            ("fact-c", "compute"),
+            ("fact-db-1", "database"),
+            ("fact-db-2", "database"),
+            ("fact-auth", "auth"),
+            ("fact-compute", "compute"),
         ] {
             let payload = retired_test_payload("fact", "agent", json!({ "domain": domain }));
             mock.upsert(namespace, id, query_vec.clone(), payload)
@@ -6085,6 +6168,7 @@ eurostrata\src\daemon.rs",
         );
 
         // Filtered branch (domains = &["database"]): limit = 1 should return exactly 1 matching row
+        // We seeded TWO "database" rows, so truncation must happen.
         let outcome = mock
             .search_with_domain(
                 namespace,
@@ -6100,11 +6184,12 @@ eurostrata\src\daemon.rs",
         assert_eq!(
             outcome.results.len(),
             1,
-            "filtered branch: limit=1 must return exactly 1 row"
+            "filtered branch: limit=1 must return exactly 1 row (truncation)"
         );
+        // The mock returns in insertion order, so the first matching row is "fact-db-1"
         assert_eq!(
-            outcome.results[0].id, "fact-b",
-            "filtered branch: must return the matching row"
+            outcome.results[0].id, "fact-db-1",
+            "filtered branch: must return the first matching row in insertion order"
         );
     }
 
