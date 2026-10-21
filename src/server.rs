@@ -130,7 +130,7 @@ pub async fn process_mcp_request(
                                     },
                                     "description": "An array of file paths, line numbers, and symbols this memory governs. Memories MUST reference the specific documents they belong to."
                                 },
-                                "domain": { "type": "string", "description": "Optional category or domain this rule belongs to (e.g., 'frontend', 'database', 'devops', 'api')." },
+                                "domain": { "type": "string", "description": "Optional category or domain this rule belongs to (e.g., 'frontend', 'database', 'devops', 'api'). It is stored normalized to a lowercase-kebab slug ('Database Access' becomes 'database-access'); a value that normalizes to nothing, and any non-string value, is stored exactly as given." },
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory IDs this rule connects to, forming a knowledge graph edge." },
                                 "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                             },
@@ -1283,14 +1283,13 @@ async fn handle_add_memory(
             meta_obj.insert("related_to".to_string(), related_to.clone());
         }
     }
-    // The domain is stored as its slug, so a stored domain is already a key.
-    // A domain with no usable slug, and any non-string domain, is stored
-    // exactly as it was given -- the write never guesses a domain.
-    if arguments.get("domain").is_some() {
-        if let Some(slug) = crate::domain::domain_key(&metadata) {
-            if let Some(meta_obj) = metadata.as_object_mut() {
-                meta_obj.insert("domain".to_string(), Value::String(slug));
-            }
+    // The stored domain is normalized to its slug -- from the argument or from
+    // the caller's own metadata -- so a stored domain is already a key. A
+    // domain with no usable slug, and any non-string domain, is stored exactly
+    // as it was given: the write never guesses a domain.
+    if let Some(slug) = crate::domain::domain_key(&metadata) {
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            meta_obj.insert("domain".to_string(), Value::String(slug));
         }
     }
     stamp_new_memory(&mut metadata);
@@ -3504,6 +3503,70 @@ mod tests {
             .find(|r| r.payload.content == "a rule with a numbered domain")
             .expect("the memory is stored");
         assert_eq!(stored.payload.metadata["domain"], serde_json::json!(42));
+    }
+
+    /// A string domain that has no usable slug is stored exactly as it was
+    /// given: the write never drops a domain and never invents one.
+    #[tokio::test]
+    async fn a_domain_that_normalizes_to_nothing_is_stored_as_given() {
+        let (store, _) = store_with_one_rule("probe").await;
+
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "a rule whose domain has no slug",
+                "namespace": "probe",
+                "domain": "!!!",
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(added.starts_with("Successfully added memory"), "{}", added);
+
+        let stored = store
+            .list("probe", None)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| r.payload.content == "a rule whose domain has no slug")
+            .expect("the memory is stored");
+        assert_eq!(stored.payload.metadata["domain"], serde_json::json!("!!!"));
+    }
+
+    /// A domain that arrived in the caller's own metadata is normalized like
+    /// any other: the spec's data contract holds for every memory's
+    /// `metadata.domain`, not only for the ones carried by the argument.
+    #[tokio::test]
+    async fn a_metadata_supplied_domain_is_normalized_on_write() {
+        let (store, _) = store_with_one_rule("probe").await;
+
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "a rule whose domain arrives in the metadata",
+                "namespace": "probe",
+                "metadata": { "domain": "Database Access" },
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(added.starts_with("Successfully added memory"), "{}", added);
+
+        let stored = store
+            .list("probe", None)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| r.payload.content == "a rule whose domain arrives in the metadata")
+            .expect("the memory is stored");
+        assert_eq!(
+            stored.payload.metadata["domain"],
+            serde_json::json!("database-access")
+        );
     }
 
     #[tokio::test]
