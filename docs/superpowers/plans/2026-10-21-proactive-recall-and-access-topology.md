@@ -27,7 +27,7 @@ Every task's requirements implicitly include this section.
 - **Slug shape.** `domain` and the append_log `tags` normalize to lowercase-kebab tokens matching `^[a-z0-9]+(-[a-z0-9]+)*$`. Normalization happens **on write** and **on comparison** — the comparison normalizes the candidate row's stored value, which is what makes this migration-free.
 - **The domain filter is soft.** If it would empty the candidate set, it is skipped and the unfiltered candidates are returned. A wrong domain must never blind recall. A silent substitution is forbidden, so the mode is always reported whenever a search ran.
 - **`metadata.topology` is soft.** A malformed value raises a `WriteShapeWarning` (`src/store/ladybug.rs:935-939`) and the write still succeeds. A rejected write would lose the claim.
-- **One vocabulary bump, here: 4 → 5**, carrying `fact.fields.topology`. The single assert is at `src/traits.rs:300`. The next bump (5 → 6, carrying `fact.fields.attempt` and `fact.fields.domain_registry`) belongs to the recall-closure spec (`neurostrata-r30c`) — not to this plan.
+- **One vocabulary bump, here: 4 → 5**, carrying `fact.fields.topology`. The single assert is at `src/traits.rs:301`. The next bump (5 → 6, carrying `fact.fields.attempt` and `fact.fields.domain_registry`) belongs to the recall-closure spec (`neurostrata-r30c`) — not to this plan.
 - **No storage migration.** `metadata` is a JSON blob; normalization happens at comparison time, so legacy free-text domains keep working without a rewrite or a grandfathering pass.
 - **`VectorStore::search` keeps its signature.** The filter arrives as a new `search_with_domain` method with a default implementation; the `include_tasks` / `include_archived` flags are the precedent for adding a parameter to a search.
 - **No consumer-system facts and no consumer vocabulary in the `NeuroStrata` namespace.** This plan ships generic machinery only.
@@ -364,8 +364,8 @@ git commit -m "feat(search): an optional domain filter on neurostrata_search_mem
 ### Task 4: The vocabulary bump — `fact.fields.topology`, version 4 → 5
 
 **Files:**
-- Modify: `src/schemas/memory-vocabulary.v3.json:2` (the version), `:66-69` (the `fact` type), `:158-161` (the two `tool_summaries` keys)
-- Modify: `src/traits.rs:298-318` (the vocabulary test and its assert)
+- Modify: `src/schemas/memory-vocabulary.v3.json:2` (the version), `:66-75` (the `fact` type), `:164-167` (the two `tool_summaries` keys)
+- Modify: `src/traits.rs:293-319` (the vocabulary test and its assert)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -406,11 +406,11 @@ In `src/schemas/memory-vocabulary.v3.json`:
 
 This mirrors the `rule.fields` precedent (`:42-64`): a flat `{type, definition}` entry, no nested schema — the vocabulary file has no `properties`/`required` convention, and the machine-checked shape lives in the code (Task 5), not in prose.
 
-- `tool_summaries.add` and `tool_summaries.memory_type` (`:158-161`) each gain a mention of `metadata.topology`, so the agent discovers the shape rather than guessing it.
+- `tool_summaries.add` and `tool_summaries.memory_type` (`:164-167`) each gain a mention of `metadata.topology`, so the agent discovers the shape rather than guessing it.
 
 - [ ] **Step 4: Move the assert**
 
-`src/traits.rs:300` asserts the vocabulary version — change it to 5.
+`src/traits.rs:301` asserts the vocabulary version — change it to 5.
 
 - [ ] **Step 5: Run the tests**
 
@@ -762,7 +762,7 @@ git commit -m "docs: the honest-recall note and the changelog entry"
 
 - `cargo test --bin neurostrata-mcp` reports 0 failed, and the count is the baseline plus the new tests.
 - `cargo build --bin neurostrata-mcp` reports no new warning.
-- The vocabulary is at version 5, the assert at `src/traits.rs:300` says 5, and `fact.fields.topology` is declared and surfaced in both `tool_summaries` keys.
+- The vocabulary is at version 5, the assert at `src/traits.rs:301` says 5, and `fact.fields.topology` is declared and surfaced in both `tool_summaries` keys.
 - `neurostrata_append_log` returns `recalled` on every response and `recalled_from` on every response where a search ran, with at most three entries and a 120-character snippet cap.
 - `neurostrata_search_memory` behaves exactly as before when no `domain` argument is given.
 - The plan's nine tasks are committed, and the CHANGELOG and `docs/recall.md` describe what shipped.
