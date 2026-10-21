@@ -73,6 +73,8 @@ pub enum EvidenceKind {
     OneHop,
     #[serde(rename = "governs_2hop")]
     Governs2hop,
+    #[serde(rename = "episode_sibling")]
+    EpisodeSibling,
 }
 
 /// One directed edge in an evidence path.

@@ -1159,6 +1159,14 @@ impl VectorStore for LadybugStore {
                     id_list, safe_ns, id_list, fetch_limit
                 );
 
+                // Episode-sibling query: memories extracted from the same task.
+                // Symmetric through the task: (m:Memory)-[:EXTRACTED_FROM]->(t:Memory)<-[:EXTRACTED_FROM]-(s:Memory)
+                // m = originating primary, t = intermediate task, s = sibling candidate.
+                let episode_sibling_q = format!(
+                    "MATCH (m:Memory)-[:EXTRACTED_FROM]->(t:Memory)<-[:EXTRACTED_FROM]-(s:Memory) WHERE m.id IN [{}] AND s.namespace = '{}' AND NOT s.id IN [{}] RETURN DISTINCT s.id, s.content, s.user_id, s.memory_type, s.agent_name, s.location, s.location_lines, s.metadata, m.id, t.id, t.metadata ORDER BY s.id ASC, m.id ASC, t.id ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+
                 // Phase 1: Read all rows, build evidence, group by result ID.
                 // Value: (payload, evidence_list, co_occurrence_count).
                 // co_occurrence_count = number of DISTINCT originating primaries that reach this candidate.
@@ -1306,26 +1314,95 @@ impl VectorStore for LadybugStore {
                     }
                 }
 
+                // Process episode-sibling query
+                // Row layout: s.id, s.content, s.user_id, s.memory_type, s.agent_name, s.location, s.location_lines, s.metadata, m.id, t.id, t.metadata
+                if let Ok(rows) = conn.query(&episode_sibling_q) {
+                    for row in rows {
+                        let result_id: String = format!("{}", row[0]);
+                        let content: String = format!("{}", row[1]);
+                        let user_id: String = format!("{}", row[2]);
+                        let memory_type: String = format!("{}", row[3]);
+                        let agent_name: String = format!("{}", row[4]);
+                        let location: String = format!("{}", row[5]);
+                        let location_lines: String = format!("{}", row[6]);
+                        let metadata_str: String = format!("{}", row[7]);
+                        let metadata_val: Value =
+                            serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                        if is_retired_at(&metadata_val, now) { continue; }
+                        if primary_set.contains(result_id.as_str()) { continue; }
+
+                        // Row-class filters for the SIBLING (same as other expansion candidates)
+                        if !include_tasks && memory_type == "task" { continue; }
+                        if !include_archived && is_archived(&metadata_val) { continue; }
+                        if is_mesh_conflicting(&metadata_val) { continue; }
+
+                        let primary_id: String = format!("{}", row[8]); // m.id (originating primary)
+                        let t_id: String = format!("{}", row[9]);     // t.id (intermediate task)
+                        let t_metadata_str: String = format!("{}", row[10]);
+                        let t_metadata: Value =
+                            serde_json::from_str(&t_metadata_str).unwrap_or(Value::Null);
+
+                        // Retired intermediate task invalidates only that path (matching two-hop rule)
+                        if is_retired_at(&t_metadata, now) { continue; }
+
+                        // Evidence path: primary -(EXTRACTED_FROM)-> task <-EXTRACTED_FROM- sibling
+                        let edges = vec![
+                            crate::traits::EvidenceEdge {
+                                source: primary_id.clone(),
+                                relation: "EXTRACTED_FROM".to_string(),
+                                target: t_id.clone(),
+                            },
+                            crate::traits::EvidenceEdge {
+                                source: result_id.clone(),
+                                relation: "EXTRACTED_FROM".to_string(),
+                                target: t_id,
+                            },
+                        ];
+                        let kind = crate::traits::EvidenceKind::EpisodeSibling;
+
+                        let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                        if entry.payload.is_none() {
+                            entry.payload = Some(MemoryPayload {
+                                content, user_id, memory_type,
+                                agent_name: Some(agent_name),
+                                location, location_lines, metadata: metadata_val,
+                            });
+                        }
+                        // Track distinct primary sources for co-occurrence ranking
+                        entry.primary_sources.insert(primary_id);
+                        let norm = norm_path(&edges, &kind);
+                        if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
+                            entry.evidence.push(crate::traits::SearchEvidence {
+                                kind,
+                                explanation: "This memory and a direct match were both extracted from the same task.".to_string(),
+                                path: edges,
+                            });
+                        }
+                    }
+                }
+
                 // Phase 2: Admit DISTINCT result IDs in family order — one-hop
-                // family first, then governing-only — capped at `limit` per family.
+                // family first, then episode-sibling, then governing-only — capped at `limit` per family.
                 // Within each family, order by co-occurrence count (distinct primary sources) DESC,
                 // then by id ASC for stable tiebreak.
                 let mut candidates: Vec<(usize, usize, String)> = by_id.iter()
                     .filter_map(|(id, entry)| {
                         entry.payload.as_ref()?;
-                        let family = if entry.evidence.iter().any(|e| e.kind == crate::traits::EvidenceKind::OneHop) { 0 } else { 1 };
+                        let family = if entry.evidence.iter().any(|e| e.kind == crate::traits::EvidenceKind::OneHop) { 0 }
+                            else if entry.evidence.iter().any(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling) { 1 }
+                            else { 2 };
                         let co_occur = entry.primary_sources.len();
                         Some((family, co_occur, id.clone()))
                     })
                     .collect();
-                // Sort by: family ASC (one-hop first), co_occurrence DESC, id ASC
+                // Sort by: family ASC (one-hop, then episode-sibling, then governing), co_occurrence DESC, id ASC
                 candidates.sort_by(|a, b| {
-                    a.0.cmp(&b.0)  // family: 0 (one-hop) before 1 (governing)
+                    a.0.cmp(&b.0)  // family: 0 (one-hop) before 1 (episode-sibling) before 2 (governing)
                         .then_with(|| b.1.cmp(&a.1))  // co-occurrence DESC
                         .then_with(|| a.2.cmp(&b.2))  // id ASC for stable tiebreak
                 });
                 let mut admitted = Vec::new();
-                let mut per_family = [0usize; 2];
+                let mut per_family = [0usize; 3];
                 for (family, _co_occur, id) in &candidates {
                     if per_family[*family] >= limit {
                         continue;
@@ -4871,5 +4948,671 @@ eurostrata\src\daemon.rs",
                 }
             }
         }
+    }
+
+    // --- Episode-sibling expansion tests ---
+
+    /// Build a test store with a task and multiple lessons extracted from it.
+    async fn episode_sibling_test_store() -> LadybugStore {
+        let dir = std::env::temp_dir().join(format!("ns-episode-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 4];
+
+        // Task row MUST be created FIRST so EXTRACTED_FROM edges materialize
+        store
+            .upsert(
+                "probe",
+                "task-1",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        // Primary: a fact that matches the query
+        store
+            .upsert(
+                "probe",
+                "primary-lesson",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+
+        // Sibling lesson 1: extracted from same task
+        store
+            .upsert(
+                "probe",
+                "sibling-lesson-1",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+
+        // Sibling lesson 2: extracted from same task
+        store
+            .upsert(
+                "probe",
+                "sibling-lesson-2",
+                vec![0.0, 0.0, 1.1, 0.0],
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+
+        // Another task with many lessons (for family independence test)
+        store
+            .upsert(
+                "probe",
+                "task-many",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        for i in 0..5 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("many-lesson-{}", i),
+                    vec![0.1 * (i + 1) as f32, 0.1, 0.1, 0.1],
+                    retired_test_payload(
+                        "fact",
+                        "agent",
+                        json!({ "extracted_from": ["task-many"] }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        // One-hop neighbor for family independence test
+        store
+            .upsert(
+                "probe",
+                "one-hop-neighbor",
+                vec![0.9, 0.1, 0.1, 0.1],
+                retired_test_payload("fact", "agent", json!({ "related_to": ["primary-lesson"] })),
+            )
+            .await
+            .unwrap();
+
+        store
+    }
+
+    #[tokio::test]
+    async fn episode_sibling_appears_in_results() {
+        let store = episode_sibling_test_store().await;
+        let results =
+            search_with_filters(&store, "probe", vec![1.1, 0.0, 0.0, 0.0], 5, false, false).await;
+
+        // Primary should be there
+        let primary = results.iter().find(|r| r.id == "primary-lesson");
+        assert!(primary.is_some(), "primary-lesson should be in results");
+
+        // Sibling should appear as expansion
+        let sibling = results.iter().find(|r| r.id == "sibling-lesson-1");
+        assert!(
+            sibling.is_some(),
+            "sibling-lesson-1 should be in results: {:?}",
+            results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+        );
+
+        // Sibling should have EpisodeSibling evidence
+        let sibling = sibling.unwrap();
+        let evs = sibling.evidence.as_ref().unwrap();
+        let ep_sib = evs
+            .iter()
+            .find(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling);
+        assert!(
+            ep_sib.is_some(),
+            "sibling should have EpisodeSibling evidence, got: {:?}",
+            evs.iter()
+                .map(|e| format!("{:?}", e.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn episode_sibling_evidence_has_correct_path_and_explanation() {
+        let store = episode_sibling_test_store().await;
+        let results =
+            search_with_filters(&store, "probe", vec![1.1, 0.0, 0.0, 0.0], 5, false, false).await;
+
+        let sibling = results.iter().find(|r| r.id == "sibling-lesson-1").unwrap();
+        let evs = sibling.evidence.as_ref().unwrap();
+        let ep_sib = evs
+            .iter()
+            .find(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling)
+            .unwrap();
+
+        // Path should have exactly 2 edges
+        assert_eq!(
+            ep_sib.path.len(),
+            2,
+            "EpisodeSibling path should have 2 edges"
+        );
+
+        // First edge: primary -(EXTRACTED_FROM)-> task
+        assert_eq!(ep_sib.path[0].source, "primary-lesson");
+        assert_eq!(ep_sib.path[0].relation, "EXTRACTED_FROM");
+        assert_eq!(ep_sib.path[0].target, "task-1");
+
+        // Second edge: sibling -(EXTRACTED_FROM)-> task
+        assert_eq!(ep_sib.path[1].source, "sibling-lesson-1");
+        assert_eq!(ep_sib.path[1].relation, "EXTRACTED_FROM");
+        assert_eq!(ep_sib.path[1].target, "task-1");
+
+        // Explanation should match spec
+        assert_eq!(
+            ep_sib.explanation,
+            "This memory and a direct match were both extracted from the same task."
+        );
+    }
+
+    #[tokio::test]
+    async fn task_row_never_appears_as_result() {
+        let store = episode_sibling_test_store().await;
+        let results =
+            search_with_filters(&store, "probe", vec![1.1, 0.0, 0.0, 0.0], 5, false, false).await;
+
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"task-1"),
+            "task row should never appear as a result"
+        );
+        assert!(
+            !ids.contains(&"task-many"),
+            "task-many row should never appear as a result"
+        );
+    }
+
+    #[tokio::test]
+    async fn family_independence_many_lessons_do_not_crowd_out_one_hop() {
+        let store = episode_sibling_test_store().await;
+        // limit=1: one primary, up to 1 one-hop, up to 1 episode-sibling, up to 1 governing
+        let results =
+            search_with_filters(&store, "probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false).await;
+
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+
+        // Primary should be there
+        assert!(ids.contains(&"primary-lesson"));
+
+        // One-hop neighbor should be admitted (family 0)
+        assert!(
+            ids.contains(&"one-hop-neighbor"),
+            "one-hop neighbor should be admitted despite many siblings"
+        );
+
+        // At least one episode sibling should be admitted (family 1)
+        let has_sibling = ids
+            .iter()
+            .any(|id| id.starts_with("sibling-lesson") || id.starts_with("many-lesson"));
+        assert!(
+            has_sibling,
+            "at least one episode sibling should be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn family_independence_one_hop_does_not_crowd_out_siblings() {
+        let store = episode_sibling_test_store().await;
+        // Add many one-hop neighbors
+        let zero = vec![0.0f32; 4];
+        for i in 0..5 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("extra-neighbor-{}", i),
+                    vec![0.9, 0.1, 0.1, 0.1],
+                    retired_test_payload(
+                        "fact",
+                        "agent",
+                        json!({ "related_to": ["primary-lesson"] }),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+
+        // limit=1: should still admit one episode sibling
+        let results =
+            search_with_filters(&store, "probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false).await;
+
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+
+        // Primary should be there
+        assert!(ids.contains(&"primary-lesson"));
+
+        // At least one episode sibling should be admitted (family 1)
+        let has_sibling = ids
+            .iter()
+            .any(|id| id.starts_with("sibling-lesson") || id.starts_with("many-lesson"));
+        assert!(
+            has_sibling,
+            "episode sibling should be admitted despite many one-hop neighbors: {:?}",
+            ids
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_sibling_is_excluded() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-episode-archived-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 4];
+
+        // Task MUST be created first
+        store
+            .upsert(
+                "probe",
+                "task-1",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "primary",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "archived-sibling",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "extracted_from": ["task-1"], "archived": true }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let results =
+            search_with_filters(&store, "probe", query_vec.clone(), 5, false, false).await;
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"archived-sibling"),
+            "archived sibling should be excluded by default"
+        );
+
+        // With include_archived=true, it should appear
+        let results_archived =
+            search_with_filters(&store, "probe", query_vec, 5, false, true).await;
+        let ids_archived: Vec<&str> = results_archived.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids_archived.contains(&"archived-sibling"),
+            "archived sibling should appear when include_archived=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_conflicting_sibling_is_excluded() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-episode-conflict-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 4];
+
+        // Task MUST be created first
+        store
+            .upsert(
+                "probe",
+                "task-1",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "primary",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "conflict-sibling",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "extracted_from": ["task-1"], "mesh": { "conflict": true } }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let results = search_with_filters(&store, "probe", query_vec, 5, false, false).await;
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"conflict-sibling"),
+            "mesh-conflicting sibling should be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_typed_sibling_is_excluded() {
+        let dir = std::env::temp_dir().join(format!("ns-episode-task-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 4];
+
+        // Task MUST be created first
+        store
+            .upsert(
+                "probe",
+                "task-1",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "primary",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "task-sibling",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload("task", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+
+        let results =
+            search_with_filters(&store, "probe", query_vec.clone(), 5, false, false).await;
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"task-sibling"),
+            "task-typed sibling should be excluded by default"
+        );
+
+        // With include_tasks=true, it should appear
+        let results_tasks = search_with_filters(&store, "probe", query_vec, 5, true, false).await;
+        let ids_tasks: Vec<&str> = results_tasks.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids_tasks.contains(&"task-sibling"),
+            "task-typed sibling should appear when include_tasks=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_intermediate_task_invalidates_path() {
+        let dir = std::env::temp_dir().join(format!("ns-episode-retired-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 4];
+
+        // Task MUST be created first (with valid_to=1 to be retired)
+        store
+            .upsert(
+                "probe",
+                "task-1",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({ "valid_to": 1 })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "primary",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "sibling",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+
+        // Use limit=1 so only 'primary' is a primary; 'sibling' becomes an expansion candidate
+        let results = search_with_filters(&store, "probe", query_vec, 1, false, false).await;
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"sibling"),
+            "sibling should not appear when intermediate task is retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn co_occurrence_sibling_from_two_primaries_counts_two() {
+        let dir = std::env::temp_dir().join(format!("ns-episode-cooccur-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 4];
+
+        // Task MUST be created first
+        store
+            .upsert(
+                "probe",
+                "task-1",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        // Two primaries extracted from the same task
+        store
+            .upsert(
+                "probe",
+                "primary-1",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "primary-2",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+        // Sibling extracted from same task - vector far from query so it doesn't become a primary
+        store
+            .upsert(
+                "probe",
+                "sibling",
+                vec![0.0, 0.0, 0.0, 1.1],
+                retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] })),
+            )
+            .await
+            .unwrap();
+
+        // Search with limit=2 so only the two primaries are in primary_ids
+        let results = search_with_filters(&store, "probe", query_vec, 2, false, false).await;
+        let sibling = results.iter().find(|r| r.id == "sibling").unwrap();
+        let evs = sibling.evidence.as_ref().unwrap();
+        let ep_sib: Vec<_> = evs
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling)
+            .collect();
+
+        // Should have two distinct EpisodeSibling paths (one from each primary)
+        assert_eq!(
+            ep_sib.len(),
+            2,
+            "should have two EpisodeSibling paths, one per primary"
+        );
+
+        // Co-occurrence: primary_sources should contain both primaries
+        // We verify by checking the evidence paths have both primary sources (first edge of each path)
+        let primary_sources: std::collections::HashSet<_> = ep_sib
+            .iter()
+            .filter_map(|e| e.path.first().map(|edge| edge.source.as_str()))
+            .collect();
+        assert!(primary_sources.contains("primary-1"));
+        assert!(primary_sources.contains("primary-2"));
+        assert_eq!(primary_sources.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn episode_sibling_serializes_as_episode_sibling() {
+        let ev = crate::traits::SearchEvidence {
+            kind: crate::traits::EvidenceKind::EpisodeSibling,
+            path: vec![
+                crate::traits::EvidenceEdge {
+                    source: "primary".into(),
+                    relation: "EXTRACTED_FROM".into(),
+                    target: "task".into(),
+                },
+                crate::traits::EvidenceEdge {
+                    source: "sibling".into(),
+                    relation: "EXTRACTED_FROM".into(),
+                    target: "task".into(),
+                },
+            ],
+            explanation: "test".into(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "episode_sibling");
+    }
+
+    #[tokio::test]
+    async fn existing_invariants_hold_expansions_not_seeded_from_excluded_rows() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-episode-invariant-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let zero = vec![0.0f32; 4];
+
+        // Primary
+        store
+            .upsert(
+                "probe",
+                "primary",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        // Task that governs primary (should NOT seed expansions because it's a task)
+        store
+            .upsert(
+                "probe",
+                "task-governs",
+                zero.clone(),
+                retired_test_payload("task", "agent", json!({ "governs": ["primary"] })),
+            )
+            .await
+            .unwrap();
+        // A rule that the task governs (should NOT be reached via task)
+        store
+            .upsert(
+                "probe",
+                "ruled-by-task",
+                vec![0.0, 1.1, 0.0, 0.0],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        // Re-upsert task-governs with the new governs edge
+        store
+            .upsert(
+                "probe",
+                "task-governs",
+                zero.clone(),
+                retired_test_payload(
+                    "task",
+                    "agent",
+                    json!({ "governs": ["primary", "ruled-by-task"] }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let results = search_with_filters(&store, "probe", query_vec, 5, false, false).await;
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"task-governs"),
+            "task-governs should be excluded"
+        );
+
+        // ruled-by-task should NOT appear via the task (task is excluded from seeding)
+        // It might appear via other paths, but not via task-governs
+        for r in &results {
+            if let Some(evs) = &r.evidence {
+                for ev in evs {
+                    for edge in &ev.path {
+                        assert_ne!(
+                            edge.source, "task-governs",
+                            "expansion should not be seeded from task-governs (source)"
+                        );
+                        assert_ne!(
+                            edge.target, "task-governs",
+                            "expansion should not be seeded from task-governs (target)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_still_reaches_server_caller() {
+        // This is an integration-style test verifying the store returns evidence
+        // that the server can render. The server's exhaustive match on EvidenceKind
+        // will fail to compile if EpisodeSibling is not handled.
+        let store = episode_sibling_test_store().await;
+        let results =
+            search_with_filters(&store, "probe", vec![1.1, 0.0, 0.0, 0.0], 5, false, false).await;
+
+        let sibling = results.iter().find(|r| r.id == "sibling-lesson-1").unwrap();
+        assert!(sibling.evidence.is_some());
+        let evs = sibling.evidence.as_ref().unwrap();
+        let ep_sib = evs
+            .iter()
+            .find(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling);
+        assert!(
+            ep_sib.is_some(),
+            "EpisodeSibling evidence should be present for server rendering"
+        );
     }
 }
