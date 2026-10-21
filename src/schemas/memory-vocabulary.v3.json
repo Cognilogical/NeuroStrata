@@ -69,7 +69,7 @@
       "fields": {
         "topology": {
           "type": "object",
-          "definition": "The access-path shape of the fact. All five keys are required and each is a string: component (where the path starts), target_system (what it reaches), channel (the transport or protocol), credential_boundary (the network, identity or trust boundary the channel crosses), reason (why the path is constrained). A missing or malformed value warns; the fact is still written."
+          "definition": "The access-path shape of the fact. All five keys are required and each is a string: component (where the path starts), target_system (what it reaches), channel (the transport or protocol), credential_boundary (the network, identity or trust boundary the channel crosses), reason (why the path is constrained). Extra keys are ignored. A missing or malformed value warns; the fact is still written."
         }
       }
     },

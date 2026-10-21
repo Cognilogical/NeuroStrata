@@ -414,6 +414,25 @@ mod tests {
                 key
             );
         }
+        assert!(
+            definition.contains("Extra keys are ignored."),
+            "the topology definition states what happens to an extra key"
+        );
+        // The summaries are how the agent discovers the shape, so both of
+        // them have to carry it.
+        for key in ["add", "memory_type"] {
+            let summary = v["tool_summaries"][key].as_str().unwrap();
+            assert!(
+                summary.contains("metadata.topology"),
+                "the {} summary mentions metadata.topology",
+                key
+            );
+            assert!(
+                summary.contains("component, target_system, channel, credential_boundary, reason"),
+                "the {} summary names the five topology keys",
+                key
+            );
+        }
     }
 
     #[test]
