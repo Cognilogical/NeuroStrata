@@ -1042,4 +1042,68 @@ mod tests {
             "the quarantined entry is the one left pending"
         );
     }
+
+    /// The mesh's PUBLISH path reduces a record's metadata to the curated
+    /// envelope — `eligibility`, `source`, `tags` (`projected_metadata`,
+    /// above). So a `fact` carrying a declared field such as
+    /// `metadata.topology` crosses the mesh as a `fact` RECORD — the type
+    /// closure holds and the content travels — while the declared field
+    /// itself stays node-local: the wire format is unchanged.
+    #[test]
+    fn a_published_fact_keeps_the_curated_metadata_envelope() {
+        let (mesh, outbox) = fixture("curated-envelope", None);
+        let id = Uuid::new_v4();
+        let topology = json!({
+            "component": "api-gateway",
+            "target_system": "ledger-service",
+            "channel": "mTLS",
+            "credential_boundary": "eu-west-1 VPC",
+            "reason": "the ledger accepts traffic only from inside the VPC",
+        });
+        let entry = OutboxEntry {
+            memory_type: "fact".to_string(),
+            ..created(
+                &id.to_string(),
+                json!({
+                    "eligibility": "shareable",
+                    "source": "owner 2026-10-21",
+                    "tags": ["access-topology"],
+                    "topology": topology,
+                }),
+            )
+        };
+        outbox.append(&entry).unwrap();
+
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 1, "the fact is published: {report:?}");
+        assert_eq!(report.skipped, 0, "the fact is not skipped: {report:?}");
+
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let text = std::fs::read_to_string(&path).expect("the record file must exist");
+        let record: MeshRecord =
+            serde_json::from_str(&text).expect("the file parses as MeshRecord");
+
+        // The type closure holds: the record is still a `fact`.
+        assert_eq!(record.memory_type, "fact");
+        // The definition travels.
+        assert_eq!(
+            record.content,
+            json!("the memory text"),
+            "the fact's content crosses the mesh"
+        );
+        // The curated envelope survives...
+        assert_eq!(record.metadata["eligibility"], json!("shareable"));
+        assert_eq!(record.metadata["source"], json!("owner 2026-10-21"));
+        assert_eq!(record.metadata["tags"], json!(["access-topology"]));
+        // ...and nothing else does: a declared field is NOT published.
+        assert!(
+            record.metadata.get("topology").is_none(),
+            "the published metadata is the curated envelope: {}",
+            record.metadata
+        );
+    }
 }

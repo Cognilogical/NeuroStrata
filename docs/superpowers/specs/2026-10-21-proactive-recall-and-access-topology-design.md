@@ -179,7 +179,7 @@ For the same reason, the **domain-scoped snapshot lane** is deferred: in this ph
 
 | Option | Decision | Reason |
 |---|---|---|
-| A new top-level `topology` memory type | **Rejected** | The mesh is closed over its shareable types — `SHAREABLE_MEMORY_TYPES = ["rule", "fact", "procedure"]` (`src/synaptic_mesh/import.rs:61`) — and an unknown `memory_type` is **rejected at import time** with a hard `Err` (`:649-655`; the contract is documented at `src/synaptic_mesh/record.rs:26-28`). A new top-level type breaks mesh import unless the mesh wire contract is also changed — out of scope, and expensive under the mesh's honesty rules. A `fact` carrying declared fields crosses the mesh today. |
+| A new top-level `topology` memory type | **Rejected** | The mesh is closed over its shareable types — `SHAREABLE_MEMORY_TYPES = ["rule", "fact", "procedure"]` (`src/synaptic_mesh/import.rs:61`) — and an unknown `memory_type` is **rejected at import time** with a hard `Err` (`:649-655`; the contract is documented at `src/synaptic_mesh/record.rs:26-28`). A new top-level type breaks mesh import unless the mesh wire contract is also changed — out of scope, and expensive under the mesh's honesty rules. A `fact` crosses the mesh today as a `fact` record — the mesh's closure is over the memory **type**, so a declared field on `fact` does not break it. The published record's `metadata` is the mesh's curated envelope (`eligibility`, `source`, `tags`; `src/synaptic_mesh/worker.rs:282-296`), so a declared field such as `metadata.topology` stays **node-local**: this spec does not change the mesh's wire format. |
 | A metadata convention on `fact`, **undeclared** | **Rejected** | Undeclared metadata is invisible to the agent — the exact failure `domain` already exhibits (§4.3). A convention nobody is told about is not a vocabulary. |
 | **A declared typed sub-object on `fact`** | **Chosen** | Discoverable (declared + surfaced in `tool_summaries`), mesh-safe (`memory_type` stays `fact`), zero storage migration, and it reuses the typed-sub-field pattern the vocabulary already established. |
 
@@ -298,7 +298,7 @@ Ordered. Each step is independently testable.
 5. A `fact` with a well-formed `metadata.topology` round-trips, exports, and appears in `export_graph` with its `GOVERNS` edges to the ingested files.
 6. A `fact` with a malformed `metadata.topology` is written **and** emits a `WriteShapeWarning`.
 7. `vocabulary_version` is 5 and `src/traits.rs:263` asserts 5.
-8. A topology `fact` survives a SynapticMesh export/import round-trip (its `memory_type` is `fact`, so the closure holds).
+8. A topology `fact` survives a SynapticMesh round-trip **as a `fact` record** — its `memory_type` stays `fact`, so the mesh's type closure holds, and the import path preserves a record's metadata when it is handed one. The *published* record's `metadata` is the mesh's curated envelope (`eligibility`, `source`, `tags`; `src/synaptic_mesh/worker.rs:282-296`), so `metadata.topology` itself stays node-local — the topology is not published, by design.
 9. A `rule` written under this spec passes the tightened `rule-honesty` check (`enforcement` present and valid, `guard` consistent with it).
 10. Search with no `domain` argument behaves exactly as today.
 

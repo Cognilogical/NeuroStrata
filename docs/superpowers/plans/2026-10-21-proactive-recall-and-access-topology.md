@@ -700,7 +700,7 @@ In `src/store/ladybug.rs`'s inline test module: upsert a `file` node first (so t
 
 - [ ] **Step 2: Write the failing test — the mesh round-trip**
 
-Export a `fact` carrying `metadata.topology` through the mesh's record path and import it back; assert the imported memory's `memory_type` is still `fact` and its `metadata.topology` is intact. The mesh is closed over `SHAREABLE_MEMORY_TYPES` (`src/synaptic_mesh/import.rs:61`) and rejects an unknown `memory_type` at import (`:649-655`) — a `fact` with a new *field* crosses the mesh unchanged, which is what this test proves. Put the test beside the mesh's existing import tests, and reuse their harness.
+Export a `fact` carrying `metadata.topology` through the mesh's record path and import it back; assert the imported memory's `memory_type` is still `fact` and its `metadata.topology` is intact. The mesh is closed over `SHAREABLE_MEMORY_TYPES` (`src/synaptic_mesh/import.rs:61`) and rejects an unknown `memory_type` at import (`:649-655`) — a `fact` stays inside the closure, which is what this test proves: the **import** path preserves a record's metadata when it is handed one. The **publish** side is a different path with a different contract: the published record's `metadata` is the mesh's curated envelope (`eligibility`, `source`, `tags`; `src/synaptic_mesh/worker.rs:282-296`, called from `:268`), so a `fact`'s `metadata.topology` is **not** published — the topology stays node-local, and this plan does not change the mesh's wire format. The publish-side boundary is pinned by its own test in `src/synaptic_mesh/worker.rs`'s test module (`a_published_fact_keeps_the_curated_metadata_envelope`): a published `fact` keeps `memory_type == "fact"` and the curated envelope, and carries **no** `topology` key. Put the test beside the mesh's existing import tests, and reuse their harness.
 
 - [ ] **Step 3: Run them**
 
@@ -718,6 +718,8 @@ Expected: PASS — 0 failed.
 git add src/store/ladybug.rs src/synaptic_mesh/
 git commit -m "test: the topology fact reaches its governed file and survives a mesh round-trip"
 ```
+
+**The sweep also found a pre-existing bug, filed rather than fixed.** The store's graph expansion reads the query's outgoing-direction flag with `format!("{}", row[10]) == "true"` (`src/store/ladybug.rs:272` for the one-hop rows, `:332` for the two-hop rows), but the `lbug` crate renders a boolean as `True`/`False` (`lbug-0.20.4/src/value.rs:289-290`), so the comparison is always false and `outgoing` is always false. The outgoing one-hop query matches `(a:Memory)-[e]->(b:Memory)` with `a` in the primaries (`src/store/ladybug.rs:209`), so the true direction is primary→result, while the code builds `(src, tgt) = (result_id, primary_id)` (`src/store/ladybug.rs:275-279`) — the outgoing one-hop and two-hop evidence paths are therefore printed in the wrong direction. It does not affect the recall (which keeps only direct matches, `src/traits.rs:100-105`), and it predates this plan (`6e5ffe8`), so it is **not** fixed here — this task is test-only. It is filed as **`neurostrata-ttmr`** (P2, owner `opencode-agent`): fix the comparison and add a test asserting the one-hop edge runs fact→file.
 
 ---
 
