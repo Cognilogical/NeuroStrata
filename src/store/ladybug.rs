@@ -4252,11 +4252,13 @@ eurostrata\src\daemon.rs",
                 "the topology shape check; the fact is still written"
             );
 
-            // The topology is not an object at all.
-            let (_, warnings) = parse_edge_specs(&fact_with_topology(json!("not-an-object")));
-            assert_eq!(warnings.len(), 1, "{warnings:?}");
-            assert_eq!(warnings[0].field, "metadata.topology");
-            assert_eq!(warnings[0].why, "metadata.topology must be an object");
+            // The topology is not an object at all: a string, an array, a null.
+            for topology in [json!("not-an-object"), json!(["component"]), Value::Null] {
+                let (_, warnings) = parse_edge_specs(&fact_with_topology(topology));
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert_eq!(warnings[0].field, "metadata.topology");
+                assert_eq!(warnings[0].why, "metadata.topology must be an object");
+            }
 
             // A present key that is not a string.
             let mut not_a_string = well_formed_topology();
@@ -4282,6 +4284,41 @@ eurostrata\src\daemon.rs",
                 "the field is declared on a fact alone, and an undeclared metadata \
                  key is accepted unchanged: {warnings:?}"
             );
+        }
+
+        /// The check's key list and the vocabulary's own list must be the same
+        /// list. A vocabulary bump that added a key would otherwise leave the
+        /// store enforcing a stale shape, silently.
+        #[test]
+        fn the_topology_keys_match_the_vocabulary() {
+            let v = crate::traits::memory_vocabulary();
+            let summary = v["tool_summaries"]["memory_type"]
+                .as_str()
+                .expect("the memory_type summary is a string");
+            let listed = summary
+                .split_once("metadata.topology (")
+                .expect("the summary lists the topology keys")
+                .1
+                .split_once(')')
+                .expect("the listed keys are parenthesised")
+                .0;
+            let vocabulary_keys: Vec<&str> = listed.split(", ").collect();
+            assert_eq!(
+                vocabulary_keys,
+                TOPOLOGY_KEYS.to_vec(),
+                "the check enforces the vocabulary's own key list"
+            );
+
+            let definition = v["memory_types"]["fact"]["fields"]["topology"]["definition"]
+                .as_str()
+                .expect("the topology field carries a definition");
+            for key in TOPOLOGY_KEYS {
+                assert!(
+                    definition.contains(key),
+                    "the topology definition names {}",
+                    key
+                );
+            }
         }
 
         #[tokio::test]

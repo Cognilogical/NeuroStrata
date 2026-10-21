@@ -442,17 +442,35 @@ git commit -m "feat(vocabulary): declare fact.fields.topology and bump the versi
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/store/ladybug.rs`'s inline test module, add:
+In `src/store/ladybug.rs`'s inline test module, add a **nested `mod topology`** and put the tests
+inside it. The nesting is what makes this task's own run command select them: the filter
+`store::ladybug::tests::topology` matches the module path, not a flat test name. A flat
+`a_well_formed_topology_…` would live at `store::ladybug::tests::a_well_formed_topology_…`, which
+does not contain that substring — the command below would report a false green.
 
 ```rust
-#[test]
-fn a_well_formed_topology_writes_without_a_warning() { /* a payload whose metadata.topology carries
-    all five keys as strings; assert parse_edge_specs returns no warning mentioning topology */ }
+mod topology {
+    #[test]
+    fn a_well_formed_topology_writes_without_a_warning() { /* a payload whose metadata.topology carries
+        all five keys as strings; assert parse_edge_specs returns no warning mentioning topology */ }
 
-#[test]
-fn a_malformed_topology_warns_and_the_fact_is_still_written() { /* a payload whose metadata.topology is
-    missing "channel", and one whose metadata.topology is a string; assert each yields a
-    WriteShapeWarning whose field is "metadata.topology" */ }
+    #[test]
+    fn a_malformed_topology_warns_and_the_fact_is_still_written() { /* a payload whose metadata.topology is
+        missing "channel", and ones whose metadata.topology is a string, an array and a null; assert each
+        yields a WriteShapeWarning whose field is "metadata.topology" */ }
+
+    #[test]
+    fn a_topology_on_a_memory_that_is_not_a_fact_is_not_checked() { /* a rule carrying a malformed
+        topology; assert no warning, because the field is declared on a fact alone */ }
+
+    #[tokio::test]
+    async fn a_fact_with_a_malformed_topology_is_still_written() { /* the real store; assert the fact is
+        written and its metadata.topology is stored exactly as it was given */ }
+
+    #[test]
+    fn the_topology_keys_match_the_vocabulary() { /* compare the check's own key list against the
+        vocabulary's five names, so a vocabulary bump cannot leave the check enforcing a stale shape */ }
+}
 ```
 
 - [ ] **Step 2: Run them and watch them fail**
