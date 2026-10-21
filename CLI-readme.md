@@ -164,7 +164,7 @@ neurostrata-mcp task gate <namespace> [--strict] [--self-test]
 
 *Exit codes:*
 *   `0` — clean.
-*   `1` — violations (any `in_progress` task, a `done` task without a consolidated extraction, or a P0 open beyond 24h).
+*   `1` — violations (any live, non-retired `in_progress` task, a `done` task without a consolidated extraction, or a P0 open beyond 24h).
 *   `2` — infrastructure error (without `--strict`, this warns and allows).
 
 *Example:*
@@ -189,10 +189,10 @@ neurostrata-mcp task validate <namespace>
 ```
 
 *Report categories:*
-*   `violations` — what the gate would block a push on: any `in_progress` task, a `done` task without a consolidated extraction, a P0 left `open` beyond 24h, or rule dishonesty — a rule claiming `ENFORCED` without a real `guard` wire (`rule_overclaims_enforcement`), or a rule with no `source` provenance (`rule_without_source`).
+*   `violations` — what the gate would block a push on: any live (non-retired) `in_progress` task, a `done` task without a consolidated extraction, a P0 left `open` beyond 24h, or rule dishonesty — a rule claiming `ENFORCED` without a real `guard` wire (`rule_overclaims_enforcement`), or a rule with no `source` provenance (`rule_without_source`).
 *   `stale` — advisory only: `in_progress` with no update in over 60 minutes. Surfaced, never blocking.
 *   `unextracted_done` — `done` tasks with zero `EXTRACTED_FROM` edges. Impossible through `task_complete` by construction; checked anyway because imports and hand edits exist (beads-imported history is `grandfathered` and exempt).
-*   `counts` — totals per status.
+*   `counts` — totals per status (retired rows are counted inside their status bucket), plus `retired`: the subset of task rows the gate judged only for the extraction lock. A retired row (`metadata.valid_to` has passed) is not live work, so it raises no `in_progress`, P0-rot or staleness violation. A retired `done` row is exempt from the extraction check only when `metadata.superseded_by` names a successor that is itself a task row, is not retired, is `done`, and already has an inbound `EXTRACTED_FROM` edge; otherwise it still owes its lesson and still blocks.
 
 *The gate contract* (all gates, ours or prescribed): exit `0` pass / `1` violation found / `2` infra error. Every gate should accept `--self-test`: exit 0 iff a planted violation makes it exit 1 and the tree is byte-identical afterward — a gate that passes its own test is not a gate.
 

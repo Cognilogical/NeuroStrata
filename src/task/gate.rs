@@ -5,6 +5,11 @@
 //! query), so the gate runs inside a `git push`.
 //!
 //! Design: docs/design-task-subsystem.md sections 4 and 5.3.
+//!
+//! The gate judges live work. A row whose `metadata.valid_to` has passed is
+//! retired history: it is not an active rule and not work in flight, so it
+//! raises no violation -- except the extraction lesson it still owes, which
+//! travels to the row that superseded it.
 
 use crate::task::machine::Status;
 use crate::traits::{MemoryPayload, SearchResult, VectorStore};
@@ -37,6 +42,10 @@ pub struct Counts {
     pub blocked: usize,
     pub done: usize,
     pub total: usize,
+    /// Task rows the gate did not judge because they are retired history.
+    /// Counted separately so the report never looks self-contradictory:
+    /// `in_progress` may exceed the number of `in_progress` violations.
+    pub retired: usize,
 }
 
 impl Counts {
@@ -47,6 +56,7 @@ impl Counts {
             "blocked": self.blocked,
             "done": self.done,
             "total": self.total,
+            "retired": self.retired,
         })
     }
 }
@@ -89,6 +99,47 @@ impl GateReport {
 
 pub fn is_task(result: &SearchResult) -> bool {
     result.payload.memory_type == "task"
+}
+
+/// Whether a row is retired history: its `metadata.valid_to` has passed.
+///
+/// A retired row records something that used to be true -- a superseded
+/// memory, an expired rule -- and is not a live claim, so the gate does
+/// not judge it. Malformed expiry metadata is not proof of retirement, so
+/// such a row stays live and keeps failing closed.
+///
+/// This deliberately disagrees with the store's own retirement filter
+/// (`store::ladybug::is_retired_at`), which treats an unparseable expiry as
+/// expired and hides the row from search. The store hides; the gate
+/// refuses to forgive. A row the gate still judges is at least still
+/// visible in `task_list`.
+pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
+    metadata
+        .get("valid_to")
+        .and_then(Value::as_i64)
+        .is_some_and(|valid_to| valid_to <= now)
+}
+
+/// Whether a retired row's lesson is carried by a live successor: the row
+/// that replaced it is itself a completed task whose own inbound extraction
+/// edge exists.
+///
+/// Anything less leaves the obligation where it started. A successor that
+/// is not a task, one that is still open (a reopened task owes nothing yet),
+/// one whose own lesson is still missing, one that is itself retired, and
+/// no successor at all -- all of them mean the retired row still owes its
+/// lesson and still blocks.
+fn obligation_carried(metadata: &Value, memories: &[SearchResult], now: i64) -> bool {
+    let Some(successor) = metadata.get("superseded_by").and_then(Value::as_str) else {
+        return false;
+    };
+    memories.iter().any(|m| {
+        m.id == successor
+            && is_task(m)
+            && !is_retired(&m.payload.metadata, now)
+            && task_status(m) == Status::Done
+            && extraction_exists(memories, &m.id)
+    })
 }
 
 pub fn task_status(result: &SearchResult) -> Status {
@@ -150,10 +201,20 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
         report.counts.total += 1;
         let meta = row.payload.metadata.get("task");
         let content = row.payload.content.as_str();
+        // A retired row is history, not work in flight: it is neither
+        // unfinished work nor rot. It is still counted (the counts describe
+        // the namespace's rows) but it raises no live-work violation.
+        let retired = is_retired(&row.payload.metadata, now);
+        if retired {
+            report.counts.retired += 1;
+        }
 
         match task_status(row) {
             Status::Open => {
                 report.counts.open += 1;
+                if retired {
+                    continue;
+                }
                 // Missing priority reads as the default (2), never as P0:
                 // absence of data is not a reason to block a push.
                 let priority = meta
@@ -174,6 +235,9 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
             }
             Status::InProgress => {
                 report.counts.in_progress += 1;
+                if retired {
+                    continue;
+                }
                 let assignee = meta
                     .and_then(|t| t.get("assignee"))
                     .and_then(|a| a.as_str())
@@ -203,6 +267,11 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
             Status::Blocked => report.counts.blocked += 1,
             Status::Done => {
                 report.counts.done += 1;
+                // A retired row hands its lesson to the row that replaced it.
+                // With no successor carrying it, the lesson is still owed here.
+                if retired && obligation_carried(&row.payload.metadata, memories, now) {
+                    continue;
+                }
                 // Imported beads history is exempt: demanding retroactive
                 // extraction from 40 closed issues is friction, not
                 // enforcement (section 7).
@@ -238,11 +307,7 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
         let rule = &row.payload.metadata;
         // Malformed expiry metadata is not proof that a rule is retired.
         // Superseded rules stay in the store as history, not active claims.
-        if rule
-            .get("valid_to")
-            .and_then(Value::as_i64)
-            .is_some_and(|valid_to| valid_to <= now)
-        {
+        if is_retired(rule, now) {
             continue;
         }
         let has_source = crate::traits::has_source(rule);
@@ -648,6 +713,322 @@ mod tests {
             .unwrap()
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
+    }
+
+    /// A retired task row is history, not live work: it blocks nothing
+    /// except the extraction lesson it still owes.
+    #[test]
+    fn retired_task_rows_are_outside_the_live_gate() {
+        let memories = vec![
+            // Live work still blocks.
+            task(
+                "live-in-progress",
+                json!({ "status": "in_progress", "assignee": "agent-a", "updated_at": iso(60) }),
+            ),
+            // A live claim that has gone quiet is stale, and only stale.
+            task(
+                "live-stale-in-progress",
+                json!({ "status": "in_progress", "assignee": "agent-a", "updated_at": iso(DAY * 3) }),
+            ),
+            // Retired work does not.
+            row(
+                "retired-in-progress",
+                "task",
+                "work for retired-in-progress",
+                json!({
+                    "task": { "status": "in_progress", "assignee": "ghost", "updated_at": iso(60) },
+                    "valid_to": NOW - 1
+                }),
+            ),
+            row(
+                "retired-stale-in-progress",
+                "task",
+                "work for retired-stale-in-progress",
+                json!({
+                    "task": { "status": "in_progress", "assignee": "ghost", "updated_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1
+                }),
+            ),
+            row(
+                "retired-p0-open",
+                "task",
+                "work for retired-p0-open",
+                json!({
+                    "task": { "status": "open", "priority": 0, "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1
+                }),
+            ),
+            // Expiring exactly now is already history.
+            row(
+                "retired-at-boundary",
+                "task",
+                "work for retired-at-boundary",
+                json!({
+                    "task": { "status": "in_progress", "assignee": "ghost", "updated_at": iso(60) },
+                    "valid_to": NOW
+                }),
+            ),
+            // An unparseable expiry is not proof of retirement: it stays live.
+            row(
+                "malformed-expiry-in-progress",
+                "task",
+                "work for malformed-expiry-in-progress",
+                json!({
+                    "task": { "status": "in_progress", "assignee": "agent-a", "updated_at": iso(60) },
+                    "valid_to": "invalid"
+                }),
+            ),
+            // A future expiry is not a retirement yet: the row is still live.
+            row(
+                "future-expiry-in-progress",
+                "task",
+                "work for future-expiry-in-progress",
+                json!({
+                    "task": { "status": "in_progress", "assignee": "agent-a", "updated_at": iso(60) },
+                    "valid_to": NOW + 1
+                }),
+            ),
+            // The lesson moved with the work: the retired row hands its
+            // obligation to a successor that is itself done and has a lesson.
+            row(
+                "retired-done-with-successor",
+                "task",
+                "work for retired-done-with-successor",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "live-successor"
+                }),
+            ),
+            task(
+                "live-successor",
+                json!({ "status": "done", "created_at": iso(DAY * 3) }),
+            ),
+            row(
+                "mem-lesson",
+                "fact",
+                "the lesson",
+                json!({ "extracted_from": ["live-successor"] }),
+            ),
+            // A retired row with no successor still owes its lesson.
+            row(
+                "retired-done-no-successor",
+                "task",
+                "work for retired-done-no-successor",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1
+                }),
+            ),
+            // A live done row without an extraction still blocks.
+            task(
+                "live-done-no-lesson",
+                json!({ "status": "done", "created_at": iso(DAY) }),
+            ),
+            // A successor that is done but has no lesson of its own carries
+            // nothing: it owes one too, and so does the row it replaced.
+            task(
+                "done-successor-no-lesson",
+                json!({ "status": "done", "created_at": iso(DAY) }),
+            ),
+            row(
+                "retired-done-successor-no-lesson",
+                "task",
+                "work for retired-done-successor-no-lesson",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "done-successor-no-lesson"
+                }),
+            ),
+            // A successor that is still open carries nothing: a reopened
+            // task owes no lesson yet, so the retired row still owes one.
+            row(
+                "retired-done-successor-open",
+                "task",
+                "work for retired-done-successor-open",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "open-successor"
+                }),
+            ),
+            task(
+                "open-successor",
+                json!({ "status": "open", "priority": 2, "created_at": iso(DAY) }),
+            ),
+            // A successor that was reopened is live work again: it is not
+            // finished work that carries a lesson, so it carries nothing.
+            task(
+                "reopened-successor",
+                json!({ "status": "open", "priority": 2, "created_at": iso(DAY) }),
+            ),
+            row(
+                "mem-lesson-reopened",
+                "fact",
+                "the earlier lesson",
+                json!({ "extracted_from": ["reopened-successor"] }),
+            ),
+            row(
+                "retired-done-successor-reopened",
+                "task",
+                "work for retired-done-successor-reopened",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "reopened-successor"
+                }),
+            ),
+            // A successor that is itself retired carries nothing.
+            row(
+                "retired-done-successor-retired",
+                "task",
+                "work for retired-done-successor-retired",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "retired-successor"
+                }),
+            ),
+            row(
+                "retired-successor",
+                "task",
+                "work for retired-successor",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1
+                }),
+            ),
+            row(
+                "mem-lesson-retired",
+                "fact",
+                "the earlier lesson",
+                json!({ "extracted_from": ["retired-successor"] }),
+            ),
+            // A successor that does not exist carries nothing.
+            row(
+                "retired-done-successor-missing",
+                "task",
+                "work for retired-done-successor-missing",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "no-such-row"
+                }),
+            ),
+            // A successor that is not a task carries nothing.
+            row(
+                "retired-done-successor-nontask",
+                "task",
+                "work for retired-done-successor-nontask",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "mem-fact"
+                }),
+            ),
+            row("mem-fact", "fact", "an unrelated fact", json!({})),
+            // A successor that is not a task carries nothing, even when it
+            // wears a task-shaped metadata block and a lesson of its own.
+            row(
+                "mem-fact-done",
+                "fact",
+                "a fact wearing a task's clothes",
+                json!({ "task": { "status": "done" } }),
+            ),
+            row(
+                "mem-lesson-fact",
+                "fact",
+                "the lesson",
+                json!({ "extracted_from": ["mem-fact-done"] }),
+            ),
+            row(
+                "retired-done-successor-factshape",
+                "task",
+                "work for retired-done-successor-factshape",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "mem-fact-done"
+                }),
+            ),
+        ];
+
+        let report = evaluate(&memories, NOW);
+
+        let in_progress: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "in_progress")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(
+            in_progress,
+            vec![
+                "live-in-progress",
+                "live-stale-in-progress",
+                "malformed-expiry-in-progress",
+                "future-expiry-in-progress"
+            ]
+        );
+
+        let rot: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "p0_open_over_24h")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert!(
+            rot.is_empty(),
+            "a retired open row is not live rot: {:?}",
+            rot
+        );
+
+        // The lesson moved with the work: the retired row whose successor
+        // carries it is clean. Every retired row whose successor does not
+        // carry it still owes one, and still blocks.
+        let unextracted: Vec<&str> = report
+            .unextracted_done
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(
+            unextracted,
+            vec![
+                "retired-done-no-successor",
+                "live-done-no-lesson",
+                "done-successor-no-lesson",
+                "retired-done-successor-no-lesson",
+                "retired-done-successor-open",
+                "retired-done-successor-reopened",
+                "retired-done-successor-retired",
+                "retired-done-successor-missing",
+                "retired-done-successor-nontask",
+                "retired-done-successor-factshape",
+            ]
+        );
+        // The advisory list is not the gate: the blocking list must carry
+        // them, or the push gate would stay green.
+        let blocking: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "done_without_extraction")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(blocking, unextracted);
+        assert!(!report.ok(), "an unfulfilled lesson still blocks");
+
+        // Only live work goes stale; retired work is not work in flight.
+        let stale: Vec<&str> = report.stale.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(stale, vec!["live-stale-in-progress"]);
+
+        // Counts describe the namespace's task rows, retired ones included
+        // and counted apart; violations describe the live ones.
+        assert_eq!(report.counts.total, 23);
+        assert_eq!(report.counts.in_progress, 7);
+        assert_eq!(report.counts.open, 3);
+        assert_eq!(report.counts.done, 13);
+        assert_eq!(report.counts.retired, 14);
     }
 
     #[test]

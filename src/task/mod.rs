@@ -187,16 +187,38 @@ fn blocked_by_of(payload: &MemoryPayload) -> Vec<String> {
 }
 
 fn task_statuses(memories: &[SearchResult]) -> HashMap<String, Status> {
-    memories
+    let now = chrono::Utc::now().timestamp();
+    let retired: HashSet<&str> = memories
+        .iter()
+        .filter(|m| gate::is_task(m) && gate::is_retired(&m.payload.metadata, now))
+        .map(|m| m.id.as_str())
+        .collect();
+    let mut statuses: HashMap<String, Status> = memories
         .iter()
         .filter(|m| gate::is_task(m))
         .map(|m| (m.id.clone(), gate::task_status(m)))
-        .collect()
+        .collect();
+    // A retired blocker is history, but the work it stood for lives on in the
+    // row that replaced it: a live unfinished successor still holds its
+    // dependents. A retired blocker with no live successor is void -- the
+    // dependency named a record that no longer exists.
+    for m in memories.iter().filter(|m| retired.contains(m.id.as_str())) {
+        let successor = m
+            .payload
+            .metadata
+            .get("superseded_by")
+            .and_then(|v| v.as_str())
+            .filter(|id| !retired.contains(id))
+            .and_then(|id| statuses.get(id).copied());
+        statuses.insert(m.id.clone(), successor.unwrap_or(Status::Done));
+    }
+    statuses
 }
 
 /// `ready` (section 3.2): open AND every blocker done. A blocker that is
 /// missing cannot be done, so the task stays unready -- conservative by
-/// default rather than optimistically actionable.
+/// default rather than optimistically actionable. A retired blocker counts
+/// as done: it is history, and history resolves nothing further.
 fn is_ready(payload: &MemoryPayload, statuses: &HashMap<String, Status>) -> bool {
     blocked_by_of(payload)
         .iter()
@@ -866,6 +888,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         }
     };
     let statuses = task_statuses(&memories);
+    let now = chrono::Utc::now().timestamp();
 
     let mut tasks: Vec<&SearchResult> = memories.iter().filter(|m| gate::is_task(m)).collect();
     // Done is hidden by default: finished work is history, not the backlog.
@@ -886,7 +909,11 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         });
     }
     if ready_only {
-        tasks.retain(|m| gate::task_status(m) == Status::Open && is_ready(&m.payload, &statuses));
+        tasks.retain(|m| {
+            gate::task_status(m) == Status::Open
+                && !gate::is_retired(&m.payload.metadata, now)
+                && is_ready(&m.payload, &statuses)
+        });
     }
 
     // Highest priority first; ties keep the list deterministic by id.
@@ -899,7 +926,9 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
     let summaries: Vec<Value> = tasks
         .iter()
         .map(|m| {
-            let ready = gate::task_status(m) == Status::Open && is_ready(&m.payload, &statuses);
+            let ready = gate::task_status(m) == Status::Open
+                && !gate::is_retired(&m.payload.metadata, now)
+                && is_ready(&m.payload, &statuses);
             let mut summary = task_summary(&m.id, &m.payload);
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("ready".to_string(), json!(ready));
@@ -1227,10 +1256,17 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
 /// because the mandatory pre-flight tool carries it.
 pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
     let statuses = task_statuses(memories);
+    let now = chrono::Utc::now().timestamp();
     let mut claimed: Vec<&SearchResult> = Vec::new();
     let mut ready: Vec<&SearchResult> = Vec::new();
     for m in memories {
         if !gate::is_task(m) {
+            continue;
+        }
+        // Retired rows are history, not work in flight, and the gate does
+        // not judge them. Offering one as claimed work would send an agent
+        // to release a claim that no longer blocks anything.
+        if gate::is_retired(&m.payload.metadata, now) {
             continue;
         }
         match gate::task_status(m) {
@@ -4610,6 +4646,172 @@ mod tests {
         assert_eq!(parsed["tasks"][0]["id"], json!(done_id));
     }
 
+    /// Writes a task row with hand-set top-level metadata, so a test can
+    /// plant a retired row the task tools would never create.
+    async fn upsert_task_row(
+        store: &Arc<dyn VectorStore>,
+        namespace: &str,
+        id: &str,
+        content: &str,
+        task_meta: Value,
+        extra: Value,
+    ) {
+        let vector = emb().embed(content).await.unwrap();
+        let mut metadata = json!({ "task": task_meta });
+        if let Value::Object(map) = extra {
+            for (key, value) in map {
+                metadata[key] = value;
+            }
+        }
+        store
+            .upsert(
+                namespace,
+                id,
+                vector,
+                MemoryPayload {
+                    content: content.to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata,
+                },
+            )
+            .await
+            .expect("upsert task row");
+    }
+
+    /// A retired task row is history: it is not ready work, and it does not
+    /// hold its dependents hostage -- unless a live successor still carries
+    /// the work.
+    #[tokio::test]
+    async fn retired_rows_are_not_ready_work_and_do_not_hold_dependents() {
+        let store = store_with_namespace("MyProj").await;
+        let now = chrono::Utc::now().timestamp();
+
+        // A retired blocker with no live successor: history, so its
+        // dependent is free to run.
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-retired",
+            "retired work",
+            json!({ "status": "open", "priority": 1 }),
+            json!({ "valid_to": now - 1 }),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-dependent",
+            "work that waited for the retired one",
+            json!({ "status": "open", "priority": 1, "blocked_by": ["MyProj-retired"] }),
+            json!({}),
+        )
+        .await;
+
+        // A retired blocker whose successor still carries the work: the
+        // dependent still waits.
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-retired-with-successor",
+            "retired work with a live successor",
+            json!({ "status": "open", "priority": 1 }),
+            json!({ "valid_to": now - 1, "superseded_by": "MyProj-live-work" }),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-live-work",
+            "the work that carries on",
+            json!({ "status": "in_progress", "assignee": "agent-a" }),
+            json!({}),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-dependent-on-successor",
+            "work that still waits for the live successor",
+            json!({
+                "status": "open",
+                "priority": 1,
+                "blocked_by": ["MyProj-retired-with-successor"]
+            }),
+            json!({}),
+        )
+        .await;
+
+        // A live blocker, and one whose expiry has not passed, both hold
+        // their dependents.
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-live-blocker",
+            "unfinished work",
+            json!({ "status": "open", "priority": 1 }),
+            json!({}),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-dependent-on-live",
+            "work that waits for the live blocker",
+            json!({ "status": "open", "priority": 1, "blocked_by": ["MyProj-live-blocker"] }),
+            json!({}),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-future-blocker",
+            "work that expires later",
+            json!({ "status": "open", "priority": 1 }),
+            json!({ "valid_to": now + 3600 }),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-dependent-on-future",
+            "work that waits for the future blocker",
+            json!({ "status": "open", "priority": 1, "blocked_by": ["MyProj-future-blocker"] }),
+            json!({}),
+        )
+        .await;
+
+        let reply = handle_task_list(
+            json!({ "namespace": "MyProj", "ready": true }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
+        let ids: Vec<&str> = parsed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "MyProj-dependent",
+                "MyProj-future-blocker",
+                "MyProj-live-blocker"
+            ],
+            "a retired row is not ready work, and only a live successor keeps a dependent waiting"
+        );
+
+        // The unfiltered listing still shows the history.
+        let reply = handle_task_list(json!({ "namespace": "MyProj" }), store.clone()).await;
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(parsed["count"], json!(9));
+    }
+
     #[tokio::test]
     async fn unclaiming_releases_the_holders_marks() {
         let store = store_with_namespace("MyProj").await;
@@ -4721,6 +4923,51 @@ mod tests {
         assert!(
             !prefix.contains("always use podman"),
             "memories stay in the snapshot body"
+        );
+    }
+
+    #[test]
+    fn snapshot_prefix_omits_retired_task_rows() {
+        // A retired row is history. The gate does not judge it, so the
+        // snapshot must not tell an agent to release a claim that no
+        // longer blocks anything.
+        let mut retired = task_row(
+            "myproj-retired",
+            json!({ "status": "in_progress", "assignee": "ghost" }),
+        );
+        retired.payload.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 1);
+        let mut retired_open = task_row(
+            "myproj-retired-open",
+            json!({ "status": "open", "priority": 0 }),
+        );
+        retired_open.payload.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 1);
+
+        let memories = vec![
+            retired,
+            retired_open,
+            task_row(
+                "myproj-live",
+                json!({ "status": "in_progress", "assignee": "agent-a" }),
+            ),
+            // Live work whose only blocker was superseded is ready: a retired
+            // blocker is history, and history must not hide live work.
+            task_row(
+                "myproj-blocked-by-retired",
+                json!({ "status": "open", "priority": 1, "blocked_by": ["myproj-retired-open"] }),
+            ),
+        ];
+
+        let prefix = snapshot_prefix(&memories);
+        assert!(prefix.contains("myproj-live"), "{}", prefix);
+        assert!(
+            prefix.contains("myproj-blocked-by-retired"),
+            "a retired blocker must not hold live work hostage: {}",
+            prefix
+        );
+        assert!(
+            !prefix.contains("myproj-retired"),
+            "a retired row is not work in flight: {}",
+            prefix
         );
     }
 
