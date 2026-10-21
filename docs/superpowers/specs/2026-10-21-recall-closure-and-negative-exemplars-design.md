@@ -24,9 +24,14 @@ questions. Nothing here is parked.
 | **C + D — One strap, not two** | A single **snapshot domain strap**: ≤3 entries, computed off the pre-cut list, deduped against the top-5, two modes — `explicit` (the caller names a domain) and `recent_domain` (the caller names none). It closes the `access_count: 0` hole **and** provides the topic seat. |
 | **E — Open questions** | All four **decided**: two seats with a bounded budget each, one metric family with thresholds, one migration (lazy, in-band), and one named task (`neurostrata-r7dj`). |
 
-**The vocabulary bump is one, not two.** The parent spec's `fact.fields.topology` is
-unbuilt, so `topology`, `attempt` and `domain_registry` ride **one** `vocabulary_version`
-4 → 5 bump, not 4 → 5 → 6.
+**The vocabulary bump is two, and the order is fixed.** The parent spec's
+`fact.fields.topology` is built first — the parent's implementation task
+`neurostrata-426k` lands ahead of this spec's implementation — so the parent owns the
+`vocabulary_version` **4 → 5** bump and this spec owns **5 → 6** for `attempt` and
+`domain_registry`. This spec's premise when it was written ("`topology` is unbuilt, so
+all three ride one bump") is now stale: `topology` ships with version 5, and this
+spec's two fields ship with version 6. The single assert at `src/traits.rs:263` moves
+with each bump, and there is no third bump.
 
 **The through-line, unchanged:** nothing new where something already exists. The topic
 switch is already written; the domain is already written; the snapshot already computes
@@ -607,7 +612,7 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | 0 | **[P]** Prerequisite: the rule-honesty hardening + legacy backfill lands | task `neurostrata-bzdn` |
 | 1 | **[P]** Domain slug normalizer, applied on write and on comparison | new helper + `src/server.rs:1279-1281`; `src/store/ladybug.rs:1070-1085` |
 | 2 | **[N]** Registry row helpers: the deterministic v5 id, the lookup, the bootstrap seed (list + normalize + union), the reconcile scan, and the registry update (`store.upsert`) under the process-wide registry mutex, with a bounded compare-and-retry that never fails the write | new module beside the store; `src/traits.rs:192`, `:195`, `:152-158` |
-| 3 | **[P+N]** Vocabulary **one** bump 4 → 5: `fact.fields.topology` (P), `fact.fields.attempt`, `fact.fields.domain_registry` (N); the assert at `src/traits.rs:263`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69`, `:158`, `:161`; `src/traits.rs:263` |
+| 3 | **[P+N]** Vocabulary, **two** bumps in a fixed order: **4 → 5** (P) carries `fact.fields.topology` and lands with the parent's implementation; **5 → 6** (N) carries `fact.fields.attempt` and `fact.fields.domain_registry` and lands with this spec's; the assert at `src/traits.rs:263`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69`, `:158`, `:161`; `src/traits.rs:263` |
 | 4 | **[N]** The write-path registry check: bootstrap when absent, reconcile when the slug is missing from the cache, reject when it is in neither the cache nor the namespace's data, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1278-1281`, `:1319-1325`; `src/task/mod.rs:1131-1141`, `:1181-1188` |
 | 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:165-172`; `src/store/ladybug.rs:1004`; `src/server.rs:1956` |
 | 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:1083-1094`; `src/server.rs:1442`, `:1446` |
@@ -627,8 +632,9 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
    SynapticMesh export/import round-trip (`memory_type` stays `fact`).
 2. A `fact` with a malformed `metadata.attempt` is **written** and emits a
    `WriteShapeWarning`.
-3. `vocabulary_version` is 5, `src/traits.rs:263` asserts 5, and the vocabulary declares
-   `fact.fields.topology`, `fact.fields.attempt` and `fact.fields.domain_registry`.
+3. `vocabulary_version` is 6, `src/traits.rs:263` asserts 6, and the vocabulary declares
+   `fact.fields.topology`, `fact.fields.attempt` and `fact.fields.domain_registry`
+   (`topology` shipped with the parent's 4 → 5 bump; this spec's two fields ship with 6).
 4. A search for *"how do we do X"* in a namespace holding both a positive `fact` about X
    and a negative exemplar about X returns **both**, and the negative one renders the
    `Attempt [FAILED in <context>]: …` line.
@@ -702,8 +708,10 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 
 - **No storage migration.** The registry is seeded lazily, in-band, on the first domain
   write; comparison-time normalization keeps the read path unchanged.
-- **Vocabulary 4 → 5, once** — one assert plus any external consumer of the schema. The
-  parent's `topology` rides the same bump because the parent is unbuilt.
+- **Vocabulary 4 → 5 → 6, in that order** — one assert plus any external consumer of the
+  schema. The parent's `topology` ships with the parent's 4 → 5 bump (the parent's
+  implementation lands first); this spec's `attempt` and `domain_registry` ship with
+  5 → 6.
 - **`VectorStore`** — no signature change (the registry uses `get`/`list`/`upsert`); the
   parent's domain filter uses the default-method form (parent §4.3.2).
 - **`neurostrata_add_memory` / `neurostrata_task_complete`** — one optional boolean
