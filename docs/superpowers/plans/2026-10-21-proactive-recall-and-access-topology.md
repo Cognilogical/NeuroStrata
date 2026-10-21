@@ -21,21 +21,21 @@ Every task's requirements implicitly include this section.
 - **One seat.** The recall rides the `neurostrata_append_log` response and nowhere else. No new MCP tool, no new snapshot lane, no `get_snapshot` strap — the parent spec §4.1.4 deferred those and they are closed in the recall-closure spec (`neurostrata-r30c`), not here.
 - **`recalled` is always present** on the append_log response: an explicit empty array when there is nothing to recall. Silence about "nothing was recalled" is a lie the caller has to guess about (the repo's explicit-zero convention).
 - **`recalled_from` is present exactly when a search ran.** `"domain"` means the domain filter chose the rows; `"vector"` means the filter matched nothing and was skipped, so the unfiltered rows were returned. It is **absent** when no search ran (an untagged turn, or every tag normalized away) and when the search failed — in neither case did a search produce rows, so there is no mode to report. Reporting `"vector"` there would claim a vector search that never happened, which is the misreport the mode exists to prevent. The two values map exactly onto the closure spec's two domain-filter counters (`domain_narrowed_hits` / `domain_fallback_vector`, closure spec `:535-536`); a call with no mode increments neither.
-- **Only direct matches are recalled.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:1445-1466`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node carries no `metadata.domain` and a synthetic score of 1.0. The recall keeps only the results whose evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses (`src/server.rs:2008-2013`). Taking "the first three results the store returns" instead would recall governed nodes in any namespace with fewer than three primaries. `MockStore` must therefore stamp `DirectMatch` too (`src/guard/testkit.rs:114` stamps `evidence: None` today), or the mock-based tests would filter themselves to nothing.
+- **Only direct matches are recalled.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:191-197`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node carries no `metadata.domain` and a synthetic score of 1.0. The recall keeps only the results whose evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses (`src/server.rs:2043-2046`). Taking "the first three results the store returns" instead would recall governed nodes in any namespace with fewer than three primaries. `MockStore` must therefore stamp `DirectMatch` too (`src/guard/testkit.rs:144-148` stamps `DirectMatch`), or the mock-based tests would filter themselves to nothing.
 - **Bounds.** At most **3** entries; `snippet` at most **120 characters**; one embedding per tagged turn and none at all when there are no tags.
-- **The recall never mutates `access_count`.** Only `neurostrata_search_memory` (`src/server.rs:2019`) and the get-memory handler (`src/server.rs:2652`) increment it. A wrong recall must not be able to promote itself into a future snapshot's top-5.
+- **The recall never mutates `access_count`.** Only `neurostrata_search_memory` (`src/server.rs:2051-2054`) and the get-memory handler (`src/server.rs:2708-2710`) increment it. A wrong recall must not be able to promote itself into a future snapshot's top-5.
 - **Slug shape.** `domain` and the append_log `tags` normalize to lowercase-kebab tokens matching `^[a-z0-9]+(-[a-z0-9]+)*$`. Normalization happens **on write** and **on comparison** — the comparison normalizes the candidate row's stored value, which is what makes this migration-free.
 - **The domain filter is soft.** If it would empty the candidate set, it is skipped and the unfiltered candidates are returned. A wrong domain must never blind recall. A silent substitution is forbidden, so the mode is always reported whenever a search ran.
-- **`metadata.topology` is soft.** A malformed value raises a `WriteShapeWarning` (`src/store/ladybug.rs:415-420`) and the write still succeeds. A rejected write would lose the claim.
-- **One vocabulary bump, here: 4 → 5**, carrying `fact.fields.topology`. The single assert is at `src/traits.rs:263`. The next bump (5 → 6, carrying `fact.fields.attempt` and `fact.fields.domain_registry`) belongs to the recall-closure spec (`neurostrata-r30c`) — not to this plan.
+- **`metadata.topology` is soft.** A malformed value raises a `WriteShapeWarning` (`src/store/ladybug.rs:935-939`) and the write still succeeds. A rejected write would lose the claim.
+- **One vocabulary bump, here: 4 → 5**, carrying `fact.fields.topology`. The single assert is at `src/traits.rs:300`. The next bump (5 → 6, carrying `fact.fields.attempt` and `fact.fields.domain_registry`) belongs to the recall-closure spec (`neurostrata-r30c`) — not to this plan.
 - **No storage migration.** `metadata` is a JSON blob; normalization happens at comparison time, so legacy free-text domains keep working without a rewrite or a grandfathering pass.
 - **`VectorStore::search` keeps its signature.** The filter arrives as a new `search_with_domain` method with a default implementation; the `include_tasks` / `include_archived` flags are the precedent for adding a parameter to a search.
 - **No consumer-system facts and no consumer vocabulary in the `NeuroStrata` namespace.** This plan ships generic machinery only.
-- **The recall initializes the namespace before searching.** `store.init(&namespace)` first, exactly as `handle_search_memory` does (`src/server.rs:1994`). A search against an uninitialized namespace is not a failed query, it is a missing table.
-- **A test that cannot fail is not a test.** `MockStore::increment_access_count` is a no-op today (`src/guard/testkit.rs:181-183`), so "the recall never moves an `access_count`" would pass against it for any handler that never calls the increment — including a broken one. The mock must **count** the increments, and the access-count assertions must be backed by the real `LadybugStore` somewhere, not only by the mock.
-- **One binary.** `src/main.rs` is the crate root (`mod` list at `src/main.rs:1-20`), so a new module is registered there and nowhere else.
-- **Baseline.** 620 tests pass and the build emits 14 warnings before this plan starts. A task that adds a failing test, breaks a passing one, or adds a 15th build warning does not pass.
-- **The supersede path needs no change.** It clones the old payload and replaces only `governs`, `related_to` and `contained_by` (`src/server.rs:1690`, `:1733`), so a stored `domain` is carried over, not rewritten. Correcting a wrong domain means a new write, not a supersede.
+- **The recall initializes the namespace before searching.** `store.init(&namespace)` first, exactly as `handle_search_memory` does (`src/server.rs:2023`). A search against an uninitialized namespace is not a failed query, it is a missing table.
+- **A test that cannot fail is not a test.** `MockStore::increment_access_count` is no longer a no-op (`src/guard/testkit.rs:306-312`) — it records every id it was asked to increment — so "the recall never moves an `access_count`" is backed by a counter that can fail. The mock must **count** the increments, and the access-count assertions must be backed by the real `LadybugStore` somewhere, not only by the mock.
+- **One binary.** `src/main.rs` is the crate root (`mod` list at `src/main.rs:1-21`), so a new module is registered there and nowhere else.
+- **Baseline.** 638 tests pass and the build emits 14 warnings before Task 4 starts. A task that adds a failing test, breaks a passing one, or adds a 15th build warning does not pass.
+- **The supersede path needs no change.** It clones the old payload and replaces only `governs`, `related_to` and `contained_by` (`src/server.rs:1700`, `:1743`), so a stored `domain` is carried over, not rewritten. Correcting a wrong domain means a new write, not a supersede.
 - **Never invent a source fact.** Cite `file:line`. If the code disagrees with this plan, the code wins: fix the plan in the same commit that fixes the code.
 
 ---
@@ -56,8 +56,8 @@ The five input classes the spec implies but no acceptance criterion names. Each 
 
 **Files:**
 - Create: `src/domain.rs`
-- Modify: `src/main.rs:1-20` (add `mod domain;` between `mod daemon;` and `mod embed;`)
-- Modify: `src/server.rs:1279-1281` (the add path's domain write)
+- Modify: `src/main.rs:1-21` (add `mod domain;` between `mod daemon;` and `mod embed;`)
+- Modify: `src/server.rs:1280-1282` (the add path's domain write)
 
 **Interfaces:**
 - Consumes: nothing. This is the first task.
@@ -121,7 +121,7 @@ Expected: PASS — 3 tests.
 
 - [ ] **Step 5: Normalize the domain on write**
 
-At `src/server.rs:1279-1281`, the add path inserts the `domain` argument into the metadata verbatim. Once the metadata is assembled, a **string** `metadata.domain` is replaced with `normalize_domain_slug(value)` — wherever it came from, the `domain` argument or the caller's own `metadata` object — because the spec's data contract holds for every memory's `metadata.domain`: "lowercase-kebab slug; normalized on write **and** on comparison" (`docs/superpowers/specs/2026-10-21-proactive-recall-and-access-topology-design.md:271`). When the normalization returns `None`, the stored value is left exactly as it was given. A non-string `domain` is stored as given and is never coerced, converted or dropped — Review Focus #4.
+At `src/server.rs:1280-1282`, the add path inserts the `domain` argument into the metadata verbatim. Once the metadata is assembled, a **string** `metadata.domain` is replaced with `normalize_domain_slug(value)` — wherever it came from, the `domain` argument or the caller's own `metadata` object — because the spec's data contract holds for every memory's `metadata.domain`: "lowercase-kebab slug; normalized on write **and** on comparison" (`docs/superpowers/specs/2026-10-21-proactive-recall-and-access-topology-design.md:271`). When the normalization returns `None`, the stored value is left exactly as it was given. A non-string `domain` is stored as given and is never coerced, converted or dropped — Review Focus #4.
 
 - [ ] **Step 6: Add a test for the write path's behavior**
 
@@ -144,8 +144,8 @@ git commit -m "feat(domain): normalize domain slugs on write and on comparison"
 ### Task 2: The domain-filtered search in the store
 
 **Files:**
-- Modify: `src/traits.rs` (the `VectorStore` trait, after `search` at `:165-172`; the new types near the other trait types)
-- Modify: `src/store/ladybug.rs` (the `LadybugStore` search, `:1004-1137` and the expansion block that follows it)
+- Modify: `src/traits.rs` (the `VectorStore` trait, after `search` at `:182-189`; the new types near the other trait types)
+- Modify: `src/store/ladybug.rs` (the `LadybugStore` search, now the shared `search_inner` at `:17-528` with the trait's `search` and `search_with_domain` at `:1523-1572`, and the expansion block that follows the base loop at `:191-507`)
 
 **Interfaces:**
 - Consumes: `crate::domain::domain_key(&serde_json::Value) -> Option<String>` (Task 1).
@@ -184,7 +184,7 @@ git commit -m "feat(domain): normalize domain slugs on write and on comparison"
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/store/ladybug.rs`'s inline test module, add six `#[tokio::test]`s. Use `LadybugStore::for_testing(path, 4)` (`:143`) and `store.init(namespace)`, exactly as the existing store tests do; the vector dimension is 4, so upsert and search with a 4-float vector.
+In `src/store/ladybug.rs`'s inline test module, add six `#[tokio::test]`s. Use `LadybugStore::for_testing(path, 4)` (`:662`) and `store.init(namespace)`, exactly as the existing store tests do; the vector dimension is 4, so upsert and search with a 4-float vector.
 
 ```rust
 #[tokio::test]
@@ -229,7 +229,7 @@ Expected: FAIL — `search_with_domain` does not exist.
 
 Add `DomainMatchMode` and `DomainSearchOutcome` to `src/traits.rs`, and add `search_with_domain` to `trait VectorStore` with a body that calls `self.search(namespace, vector, limit, include_tasks, include_archived).await?` and returns `DomainSearchOutcome { results, mode: DomainMatchMode::Vector }`.
 
-The default body is what keeps the blast radius at one implementation. The five `impl VectorStore for` sites are `src/events/bus.rs:66` (`StoreNotAttached`), `src/events/bus.rs:836` (`RecordingStore`), `src/daemon.rs:1321` (`RecordingStore`, in the daemon's test module — the struct is at `:1283`), `src/guard/testkit.rs:65` (`MockStore`) and `src/task/mod.rs:4310` (`ListHidingStore`); only `src/store/ladybug.rs:820` (`LadybugStore`) overrides the new method. A store that cannot filter must say so with `Vector`, never pretend the filter applied.
+The default body is what keeps the blast radius at one implementation. The five `impl VectorStore for` sites are `src/events/bus.rs:66` (`StoreNotAttached`), `src/events/bus.rs:836` (`RecordingStore`), `src/daemon.rs:1321` (`RecordingStore`, in the daemon's test module — the struct is at `:1283`), `src/guard/testkit.rs:92` (`MockStore`) and `src/task/mod.rs:4310` (`ListHidingStore`); the implementors that override the new method are `src/store/ladybug.rs:1544` (`LadybugStore`) and `src/guard/testkit.rs:153` (`MockStore`). A store that cannot filter must say so with `Vector`, never pretend the filter applied.
 
 - [ ] **Step 4: Run the trait tests**
 
@@ -238,9 +238,9 @@ Expected: PASS — the existing trait tests still pass; the new method is additi
 
 - [ ] **Step 5: Override `search_with_domain` in `LadybugStore`**
 
-`LadybugStore::search` (`src/store/ladybug.rs:1004`) does two things inside one `with_conn` closure: the base candidate loop (`:1064-1137`) and the graph expansion (`:1142` onward). The filter must sit inside the base candidate loop, so restructure that method as follows, all inside the same closure:
+`LadybugStore::search` (`src/store/ladybug.rs:1523`) delegates to the shared `search_inner` (`src/store/ladybug.rs:17`), which does two things inside one `with_conn` closure: the base candidate loop (`:79-174`) and the graph expansion (`:197` onward). The filter must sit inside the base candidate loop, so restructure that method as follows, all inside the same closure:
 
-- The base loop keeps **two** lists: `all_primaries` (every row the loop accepts, exactly as today) and `filtered_primaries` (the rows whose `domain_key` is in the key set). The key set is an owned `HashSet<String>` built from the `domains` argument before the closure is entered — `with_conn` requires `FnOnce(&Connection) -> Result<T> + Send + 'static` (`:388-392`), so a borrowed slice cannot cross into it. **Each provided domain is normalized with `crate::domain::normalize_domain_slug` before being added to the set, so the store's contract is: the key set is compared by normalized slug — the same comparison-time normalization applied to the row's stored domain.**
+- The base loop keeps **two** lists: `all_primaries` (every row the loop accepts, exactly as today) and `filtered_primaries` (the rows whose `domain_key` is in the key set). The key set is an owned `HashSet<String>` built from the `domains` argument before the closure is entered — `with_conn` requires `FnOnce(&Connection) -> Result<T> + Send + 'static` (`:907-911`), so a borrowed slice cannot cross into it. **Each provided domain is normalized with `crate::domain::normalize_domain_slug` before being added to the set, so the store's contract is: the key set is compared by normalized slug — the same comparison-time normalization applied to the row's stored domain.**
 - When the key set is empty, every row goes to both lists and the mode is `Vector` — no filter was asked for, so the behaviour is byte-identical to today's `search`.
 - When the key set is non-empty, a row whose `domain_key` is `None` or is not in the set is skipped for `filtered_primaries` but still counted in `all_primaries`. The filter check happens **after** the row-class filters (`task`, tombstoned, mesh-conflicting) and **before** the usage boost, so the boost and the budget are spent only on rows the filter admitted.
 - The loop's stop condition counts `filtered_primaries`, so a filtered search may legitimately return fewer rows than `limit`. **That is why `all_primaries` can exceed `limit`**: the loop keeps scanning (to fill the filtered set) long after it has accepted `limit` rows overall. The truncation below is therefore real, not a no-op.
@@ -251,12 +251,12 @@ Expected: PASS — the existing trait tests still pass; the new method is additi
 
 - [ ] **Step 6: Make the mock store domain-aware, and honest about direct hits**
 
-`MockStore` (`src/guard/testkit.rs:30`) needs a `search_with_domain` override so that callers can be tested without a database: it filters its rows by `crate::domain::domain_key(&row.payload.metadata)` against the key set, and when the filter would empty the set it returns the unfiltered rows with `DomainMatchMode::Vector` — the same soft fallback the real store has. A test double that behaves differently from the store it stands in for is a trap.
+`MockStore` (`src/guard/testkit.rs:32`) needs a `search_with_domain` override so that callers can be tested without a database: it filters its rows by `crate::domain::domain_key(&row.payload.metadata)` against the key set, and when the filter would empty the set it returns the unfiltered rows with `DomainMatchMode::Vector` — the same soft fallback the real store has. A test double that behaves differently from the store it stands in for is a trap.
 
 Three more corrections to the mock, all required by the recall's contract and all currently wrong:
 
-- **`search` must stamp `EvidenceKind::DirectMatch`.** It sets `evidence: None` today (`src/guard/testkit.rs:114`), while every primary row the real store returns carries `Some(vec![EvidenceKind::DirectMatch])` (`src/store/ladybug.rs:1127-1132`). The recall keeps only direct matches (Global Constraints), so a mock that returns no evidence filters itself to nothing — every mock-based recall test would fail for the wrong reason, and a future change that loosened the filter to "the first three results" would still pass. Stamp `DirectMatch` on every row the mock returns.
-- **`increment_access_count` must count.** It is a no-op today (`src/guard/testkit.rs:181-183`), so "the recall never moves an `access_count`" passes against it for any handler that never calls the increment — including a broken one. Give the mock a counter of the ids it was asked to increment, and expose it (a `pub(crate) fn access_count_increments(&self) -> Vec<String>`, or an `AtomicUsize` plus the ids) so the assertion is real.
+- **`search` must stamp `EvidenceKind::DirectMatch`.** The stamping lives at `src/guard/testkit.rs:144-148`, which carries `DirectMatch` like every primary row the real store returns (`Some(vec![EvidenceKind::DirectMatch])`, `src/store/ladybug.rs:149-153`). The recall keeps only direct matches (Global Constraints), so a mock that returns no evidence filters itself to nothing — every mock-based recall test would fail for the wrong reason, and a future change that loosened the filter to "the first three results" would still pass. Stamp `DirectMatch` on every row the mock returns.
+- **`increment_access_count` must count.** It records every id it was asked to increment (`src/guard/testkit.rs:306-312`), so "the recall never moves an `access_count`" is a counter-backed assertion instead of a no-op that passes for any handler. Give the mock a counter of the ids it was asked to increment, and expose it (a `pub(crate) fn access_count_increments(&self) -> Vec<String>`, or an `AtomicUsize` plus the ids) so the assertion is real.
 - **`search` must be able to fail on demand.** Add a `pub(crate) fn set_search_fails(&self, fails: bool)` toggle so the recall's error path — "a store error must not fail the append" — has a test. Without it the error branch is untested code in a handler whose whole point is that it never fails the append.
 
 These changes are additive: the mock's public surface grows, nothing that uses it changes shape.
@@ -365,7 +365,7 @@ git commit -m "feat(search): an optional domain filter on neurostrata_search_mem
 
 **Files:**
 - Modify: `src/schemas/memory-vocabulary.v3.json:2` (the version), `:66-69` (the `fact` type), `:158-161` (the two `tool_summaries` keys)
-- Modify: `src/traits.rs:261-281` (the vocabulary test and its assert)
+- Modify: `src/traits.rs:298-318` (the vocabulary test and its assert)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -383,7 +383,7 @@ fn memory_vocabulary_declares_the_topology_field_on_a_fact() {
 }
 ```
 
-Use the same vocabulary-loading helper the neighbouring vocabulary tests use (`src/traits.rs:252` onward).
+Use the same vocabulary-loading helper the neighbouring vocabulary tests use (`src/traits.rs:289` onward).
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -410,7 +410,7 @@ This mirrors the `rule.fields` precedent (`:42-64`): a flat `{type, definition}`
 
 - [ ] **Step 4: Move the assert**
 
-`src/traits.rs:263` asserts the vocabulary version — change it to 5.
+`src/traits.rs:300` asserts the vocabulary version — change it to 5.
 
 - [ ] **Step 5: Run the tests**
 
@@ -434,7 +434,7 @@ git commit -m "feat(vocabulary): declare fact.fields.topology and bump the versi
 ### Task 5: The topology shape check — a soft warning, never a rejection
 
 **Files:**
-- Modify: `src/store/ladybug.rs:424-521` (`parse_edge_specs`; the `WriteShapeWarning` struct is at `:415-420`)
+- Modify: `src/store/ladybug.rs:943-1040` (`parse_edge_specs`; the `WriteShapeWarning` struct is at `:935-939`)
 
 **Interfaces:**
 - Consumes: the declared shape from Task 4 (`component`, `target_system`, `channel`, `credential_boundary`, `reason`).
@@ -468,7 +468,7 @@ In `parse_edge_specs`, add a section (E) after the existing relation-key checks:
 - Present and an object carrying all five keys, each a string → no warning.
 - Present and anything else → one `WriteShapeWarning { field: "metadata.topology", why: <what is wrong>, skipped: "the topology shape check; the fact is still written" }`.
 
-The check never affects the returned edge specs and never rejects the write. `parse_edge_specs` returns warnings; the caller emits them (the emit loop is at `src/store/ladybug.rs:905-906`) and the upsert continues.
+The check never affects the returned edge specs and never rejects the write. `parse_edge_specs` returns warnings; the caller emits them (the emit loop is at `src/store/ladybug.rs:1424-1427`) and the upsert continues.
 
 - [ ] **Step 4: Run the tests**
 
@@ -498,7 +498,7 @@ git commit -m "feat(store): warn on a malformed metadata.topology without reject
 - Modify: `src/server.rs`'s inline test module (the real-store acceptance test)
 
 **Interfaces:**
-- Consumes: `crate::domain::normalize_domain_slug` (Task 1); `VectorStore::search_with_domain` and `DomainMatchMode` (Task 2); `crate::server::resolve_namespace(&Arc<dyn VectorStore>, &str) -> String` (`src/server.rs:2051`).
+- Consumes: `crate::domain::normalize_domain_slug` (Task 1); `VectorStore::search_with_domain` and `DomainMatchMode` (Task 2); `crate::server::resolve_namespace(&Arc<dyn VectorStore>, &str) -> String` (`src/server.rs:2108`).
 - Produces:
   ```rust
   // src/buffer.rs
@@ -559,7 +559,7 @@ async fn a_fact_written_with_a_free_text_domain_is_recalled_by_its_slug_tag() { 
 
 The write goes through the real add path, so the stored domain is the normalized slug `database-access` — the write path normalizes on write (Task 1 Step 5) and the recall matches on the slug (Task 2). A legacy row that still reads `"Database Access"` is covered by Task 2's third test (`a_legacy_free_text_domain_matches_the_slug_at_comparison_time`).
 
-The real-store test is acceptance criterion 1 (the free-text domain is written, the slug tag recalls it), criterion 2 (an `access_count: 0` fact is recalled) and criterion 4 (the recall moved no `access_count`) in the same namespace, through the real store, with no pre-seeded slug. `StubEmbedder` emits a 4-float vector (`src/guard/testkit.rs:198-214`) and `for_testing(dir, 4)` declares 4 dimensions, so the two agree. Use the established add-path pattern: `create_new_namespace: true` and no `project_root` in the add call (`src/server.rs:3421-3432` — the `.NeuroStrata` directory check only runs when a `project_root` is supplied, `src/server.rs:1214-1229`), and `quiet_bus()` (`src/server.rs:3093`) for the bus.
+The real-store test is acceptance criterion 1 (the free-text domain is written, the slug tag recalls it), criterion 2 (an `access_count: 0` fact is recalled) and criterion 4 (the recall moved no `access_count`) in the same namespace, through the real store, with no pre-seeded slug. `StubEmbedder` emits a 4-float vector (`src/guard/testkit.rs:327-345`) and `for_testing(dir, 4)` declares 4 dimensions, so the two agree. Use the established add-path pattern: `create_new_namespace: true` and no `project_root` in the add call (`src/server.rs:3685-3696` — the `.NeuroStrata` directory check only runs when a `project_root` is supplied, `src/server.rs:1214-1229`), and `quiet_bus()` (`src/server.rs:3357`) for the bus.
 
 Use `crate::guard::testkit::{MockStore, StubEmbedder}` (a `pub(crate)` module, `src/guard/mod.rs:13`) for the mock store and the embedder, and the same config/buffer setup the existing buffer tests use (`scratch(tag)` at `src/buffer.rs:187`).
 
@@ -570,7 +570,7 @@ Expected: FAIL — `handle_append_log` takes one argument and returns no `recall
 
 - [ ] **Step 3: Widen the handler and the dispatch**
 
-Change `handle_append_log` to take `emb: Arc<dyn Embedder>` and `store: Arc<dyn VectorStore>` after `arguments`. At `src/server.rs:664`, call `crate::buffer::handle_append_log(arguments, emb.clone(), store.clone()).await` — exactly as the neighbouring dispatches do (`task_setup` at `:655-661`, `guard_validate` at `:667-673`).
+Change `handle_append_log` to take `emb: Arc<dyn Embedder>` and `store: Arc<dyn VectorStore>` after `arguments`. At `src/server.rs:664`, call `crate::buffer::handle_append_log(arguments, emb.clone(), store.clone()).await` — exactly as the neighbouring dispatches do (`task_setup` at `:656-662`, `guard_validate` at `:668-674`).
 
 - [ ] **Step 4: Add the optional `namespace` to the input schema**
 
@@ -584,7 +584,7 @@ It stays optional; `content` and `project_root` remain required.
 
 - [ ] **Step 5: Resolve the namespace**
 
-The handler needs a namespace to search. Read `arguments["namespace"]`; when it is absent, use `project_root.file_name()`. Pass the result through `crate::server::resolve_namespace(&store, candidate)` (it is `pub(crate)`, `src/server.rs:2051`), which maps a path-like or unknown name onto the real namespace.
+The handler needs a namespace to search. Read `arguments["namespace"]`; when it is absent, use `project_root.file_name()`. Pass the result through `crate::server::resolve_namespace(&store, candidate)` (it is `pub(crate)`, `src/server.rs:2108`), which maps a path-like or unknown name onto the real namespace.
 
 - [ ] **Step 6: Build the query and the key set**
 
@@ -593,8 +593,8 @@ Normalize each tag with `crate::domain::normalize_domain_slug`, dropping the one
 - [ ] **Step 7: Run the recall**
 
 - No surviving slug → no embedding, no search: `recalled: []`, and **no `recalled_from` key**.
-- Otherwise → embed the joined query **once** (`emb.embed(&query)`), then `store.init(&namespace)` (the search handler does exactly this at `src/server.rs:1994`; a search against an uninitialized namespace is a missing table, not a failed query), then `store.search_with_domain(&namespace, vec, 3, false, false, &slugs)` and work from `outcome.results` and `outcome.mode`. `include_tasks` and `include_archived` are both false: task rows are backlog chatter and archived rows are tombstones, exactly as `search_memory` treats them by default.
-- **Keep only the direct matches.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:1445-1466`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node is a structural type excluded from the base query (`src/store/ladybug.rs:687-693`) and reachable only through the expansion, and it carries no `metadata.domain` and a synthetic score of 1.0. Keep a result only when its evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2008-2013`). "The first three results the store returns" is **not** the rule: the store does not truncate at the primaries, so in any namespace with fewer than three primaries the first three results are expansion rows.
+- Otherwise → embed the joined query **once** (`emb.embed(&query)`), then `store.init(&namespace)` (the search handler does exactly this at `src/server.rs:2023`; a search against an uninitialized namespace is a missing table, not a failed query), then `store.search_with_domain(&namespace, vec, 3, false, false, &slugs)` and work from `outcome.results` and `outcome.mode`. `include_tasks` and `include_archived` are both false: task rows are backlog chatter and archived rows are tombstones, exactly as `search_memory` treats them by default.
+- **Keep only the direct matches.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:191-197`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node is a structural type excluded from the base query (`src/store/ladybug.rs:1206-1212`) and reachable only through the expansion, and it carries no `metadata.domain` and a synthetic score of 1.0. Keep a result only when its evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2043-2046`). "The first three results the store returns" is **not** the rule: the store does not truncate at the primaries, so in any namespace with fewer than three primaries the first three results are expansion rows.
 - Each entry is `{id, memory_type, domain, score, snippet}`: `domain` is the row's normalized slug or `null` when it has none; `score` is the result's score; `snippet` is the content truncated to 120 characters on a character boundary (`content.chars().take(120).collect()`).
 - `recalled_from` is present **exactly when the search ran**: `"domain"` when the outcome's mode is `DomainMatchMode::Domain`, `"vector"` when the mode is `DomainMatchMode::Vector` (the filter matched nothing and was skipped, so the unfiltered rows came back). It is absent in the no-slug case above.
 - A store error must not fail the append: the log entry is the handler's primary duty, so the error is logged with `tracing::warn!` and the response carries `recalled: []` and **no `recalled_from`** — no search produced rows, so there is no mode to report. Reporting `"vector"` there would claim a vector search that never happened.
@@ -637,9 +637,9 @@ git commit -m "feat(recall): ride a domain-filtered recall on the append_log res
 In `src/store/ladybug.rs`'s inline test module: upsert a `file` node first (so the edge resolves on the fact's write), then upsert a `fact` node whose metadata carries `governs: [<the file node's id>]` and a well-formed `metadata.topology` (all five keys, string-valued). Assert four things:
 
 1. the fact's `metadata.topology` round-trips unchanged through a search for it;
-2. the fact reaches the `file` node through the graph — the `GOVERNS` edge is what the one-hop expansion traverses (`src/store/ladybug.rs:1142`) — with the expansion row carrying `EvidenceKind::OneHop`;
-3. the `file` node is a **structural** type (`src/store/ladybug.rs:687-693`), so it is excluded from the base candidate query and is reachable *only* through that expansion — which is the point of the one-hop path, and the reason the recall filters to direct matches;
-4. `export_graph` carries the fact node **and** the `GOVERNS` link to the file node. The call is `store.export_graph(false, false, &HashMap::new(), None)` — four arguments (`src/store/ladybug.rs:1817`, the trait declaration at `src/traits.rs:214`) — and the result is a JSON object with `nodes` and `links`. Acceptance criterion 5 asks for the topology fact to appear in `export_graph` with its `GOVERNS` edges; asserting only the search would leave that criterion untested.
+2. the fact reaches the `file` node through the graph — the `GOVERNS` edge is what the one-hop expansion traverses (`src/store/ladybug.rs:197`) — with the expansion row carrying `EvidenceKind::OneHop`;
+3. the `file` node is a **structural** type (`src/store/ladybug.rs:1206-1212`), so it is excluded from the base candidate query and is reachable *only* through that expansion — which is the point of the one-hop path, and the reason the recall filters to direct matches;
+4. `export_graph` carries the fact node **and** the `GOVERNS` link to the file node. The call is `store.export_graph(false, false, &HashMap::new(), None)` — four arguments (`src/store/ladybug.rs:1916`, the trait declaration at `src/traits.rs:231`) — and the result is a JSON object with `nodes` and `links`. Acceptance criterion 5 asks for the topology fact to appear in `export_graph` with its `GOVERNS` edges; asserting only the search would leave that criterion untested.
 
 - [ ] **Step 2: Write the failing test — the mesh round-trip**
 
@@ -678,6 +678,8 @@ git commit -m "test: the topology fact reaches its governed file and survives a 
 **This task is gated.** The parent's spec §4.4 makes the rule-honesty hardening land first and separately, because the pre-push gate runs namespace-wide: tightening the validator flags the 86 legacy NeuroStrata rule rows until they are backfilled. That work is task `neurostrata-bzdn` (P2, ready, unassigned) and it is **not** this plan's to fold in — a tightening that lands without its backfill would fail the gate.
 
 Tasks 1–7 do not depend on this task. This task depends on `neurostrata-bzdn` landing. If `neurostrata-bzdn` has not landed when you reach this task, it waits — the blocker is named, tracked and owned; it is not dropped.
+
+**Blocking dependency: `neurostrata-bzdn`.** Task 8 — the AC-9 rule row plus its conformance test — is gated on task `neurostrata-bzdn` (the rule-honesty hardening plus the rule backfill). The concrete next action when it unblocks: write the rule row under spec §4.4 and add the conformance test.
 
 - [ ] **Step 1: Confirm the gate**
 
@@ -760,7 +762,7 @@ git commit -m "docs: the honest-recall note and the changelog entry"
 
 - `cargo test --bin neurostrata-mcp` reports 0 failed, and the count is the baseline plus the new tests.
 - `cargo build --bin neurostrata-mcp` reports no new warning.
-- The vocabulary is at version 5, the assert at `src/traits.rs:263` says 5, and `fact.fields.topology` is declared and surfaced in both `tool_summaries` keys.
+- The vocabulary is at version 5, the assert at `src/traits.rs:300` says 5, and `fact.fields.topology` is declared and surfaced in both `tool_summaries` keys.
 - `neurostrata_append_log` returns `recalled` on every response and `recalled_from` on every response where a search ran, with at most three entries and a 120-character snippet cap.
 - `neurostrata_search_memory` behaves exactly as before when no `domain` argument is given.
 - The plan's nine tasks are committed, and the CHANGELOG and `docs/recall.md` describe what shipped.
@@ -778,11 +780,11 @@ This plan was put to two independent seats on 2026-10-21, each answering the sam
 |---|---|---|---|
 | Q1 — is the default-method trait form a faithful reading of §4.3.2/§4.3.5? | SOUND | SOUND | Kept as written. |
 | Q2 — is the two-list candidate loop with an unfiltered expansion correct? | SOUND | SOUND, one imprecision | Kept; the imprecision was wording, now stated explicitly — `all_primaries` can exceed `limit` because the loop stops on the *filtered* count, so the fallback truncation is real. |
-| Q3 — "the first three results" vs only `EvidenceKind::DirectMatch` rows? | **UNSOUND** | **AMBIGUOUS** | Both converged on the fix: the recall filters to direct matches, and `MockStore` must stamp `DirectMatch` (it stamps `evidence: None` today). K3's point — the positional rule only worked because the mock returns no evidence — is why the mock had to change too. |
+| Q3 — "the first three results" vs only `EvidenceKind::DirectMatch` rows? | **UNSOUND** | **AMBIGUOUS** | Both converged on the fix: the recall filters to direct matches, and `MockStore` must stamp `DirectMatch` (it stamped `evidence: None` before Task 2). K3's point — the positional rule only worked because the mock returns no evidence — is why the mock had to change too. |
 | Q4 — is the vocabulary-bump ordering coherent; does the parent spec need an amendment? | SOUND | SOUND | No amendment. Both seats confirmed the parent spec's §13 already records `neurostrata-426k` as the closure's prerequisite without claiming 4 → 5 is final. |
 | Q5 — is `recalled_from: "vector"` honest when nothing was searched? | **UNSOUND** | **AMBIGUOUS** | Both agreed the error case misreports. Resolved by the mode being present **exactly when a search ran** — absent on an untagged turn and absent on a failed search. That also makes the two values land exactly on the closure spec's two counters. |
 | Q6 — coverage of the spec's acceptance criteria; are the anchors real? | **MISSING** (3 gaps) | **MISSING** (4 gaps) | All absorbed: the `export_graph` assertion (AC 5), the ≤3-cap and ≤120-char assertions (AC 3), the free-text-domain → slug-tag round trip (AC 1), the rule row this spec must write (AC 9), and the non-vacuous `access_count` assertions. |
 
-**Anchor corrections applied.** `WriteShapeWarning` is at `src/store/ladybug.rs:415-420` (not `:413-418`); the warnings are emitted at `:905-906` (not `:907`); `rule.fields` opens at `src/schemas/memory-vocabulary.v3.json:42`; the five `impl VectorStore for` sites are `src/events/bus.rs:66`, `src/events/bus.rs:836`, `src/daemon.rs:1321`, `src/guard/testkit.rs:65` and `src/task/mod.rs:4310`, and the daemon's `RecordingStore` implements the trait at `:1321` (its struct is at `:1283`). Both seats' anchors were accurate apart from that drift.
+**Anchor corrections applied.** `WriteShapeWarning` is at `src/store/ladybug.rs:935-939` (not `:413-418`); the warnings are emitted at `:1424-1427` (not `:907`); `rule.fields` opens at `src/schemas/memory-vocabulary.v3.json:42`; the five `impl VectorStore for` sites are `src/events/bus.rs:66`, `src/events/bus.rs:836`, `src/daemon.rs:1321`, `src/guard/testkit.rs:92` and `src/task/mod.rs:4310`, and the daemon's `RecordingStore` implements the trait at `:1321` (its struct is at `:1283`). Both seats' anchors were accurate apart from that drift.
 
 **Spec amendments made in the same commit.** The parent spec's §4.1.2 (the mode's presence rule; direct matches only), §4.3.5 (no mode without a search), §5 (the `recalled_from` contract row), §4.2.4 and §4.3.2 (anchor corrections), §6 step 0 and §10 (the dependency edge, narrowed and named); and the closure spec's §3.4.2 (a call with no mode increments neither domain-filter counter).
