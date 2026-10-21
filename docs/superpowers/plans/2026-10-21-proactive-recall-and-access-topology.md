@@ -472,6 +472,7 @@ git commit -m "feat(store): warn on a malformed metadata.topology without reject
 - Modify: `src/buffer.rs:129-181` (`handle_append_log`)
 - Modify: `src/server.rs:371-381` (the `neurostrata_append_log` `inputSchema`)
 - Modify: `src/server.rs:664` (the dispatch)
+- Modify: `src/server.rs`'s inline test module (the real-store acceptance test)
 
 **Interfaces:**
 - Consumes: `crate::domain::normalize_domain_slug` (Task 1); `VectorStore::search_with_domain` and `DomainMatchMode` (Task 2); `crate::server::resolve_namespace(&Arc<dyn VectorStore>, &str) -> String` (`src/server.rs:2051`).
@@ -488,7 +489,7 @@ git commit -m "feat(store): warn on a malformed metadata.topology without reject
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/buffer.rs`'s inline test module, add seven tests. Six run against the mock store and the stub embedder — fast and unit-level. The seventh runs against the **real** `LadybugStore`, because two of the acceptance criteria cannot fail against a mock (Global Constraints: `MockStore::search` ignores the vector and its `increment_access_count` is a no-op, so "the recall never moves an `access_count`" would pass for any handler at all).
+In `src/buffer.rs`'s inline test module, add six tests. All six run against the mock store and the stub embedder — fast and unit-level. The seventh test — the real-store one — lives in `src/server.rs`'s inline test module instead, because it must drive the **real write path** (`handle_add_memory` is module-private) and then the recall (`crate::buffer::handle_append_log` is `pub`).
 
 Mock-backed:
 
@@ -520,18 +521,22 @@ async fn a_failed_search_does_not_fail_the_append() { /* a store whose search re
     the response still carries `recalled: []` and no `recalled_from` */ }
 ```
 
-Real-store-backed:
+Real-store-backed (in `src/server.rs`'s inline test module):
 
 ```rust
 #[tokio::test]
-async fn a_fact_with_no_access_count_is_recalled_from_the_real_store() { /* a temp-dir
-    LadybugStore::for_testing(dir, 4); init the namespace; upsert one fact whose metadata carries
-    domain "Database Access" and access_count 0; append a tagged turn with tags ["database-access"];
-    assert the fact's id is in `recalled` and `recalled_from` is "domain"; assert the fact's stored
-    access_count is still 0 */ }
+async fn a_fact_written_with_a_free_text_domain_is_recalled_by_its_slug_tag() { /* a temp-dir
+    LadybugStore::for_testing(dir, 4); store.init("probe"); call handle_add_memory with namespace
+    "probe", create_new_namespace true, memory_type "fact", domain "Database Access" and some
+    content; assert the reply starts with "Successfully added memory"; then call
+    crate::buffer::handle_append_log with namespace "probe", project_root <the temp dir> and tags
+    ["database-access"]; parse the response as JSON; assert `recalled` holds the new fact's id and
+    `recalled_from` is "domain"; assert the fact's stored access_count is still 0 */ }
 ```
 
-The real-store test is acceptance criterion 1 (the free-text domain is written, the slug tag recalls it) and criterion 2 (an `access_count: 0` fact is recalled) in the same namespace, through the real store, with no pre-seeded slug. `StubEmbedder` emits a 4-float vector (`src/guard/testkit.rs:198-214`) and `for_testing(dir, 4)` declares 4 dimensions, so the two agree.
+The write goes through the real add path, so the stored domain is the normalized slug `database-access` — the write path normalizes on write (Task 1 Step 5) and the recall matches on the slug (Task 2). A legacy row that still reads `"Database Access"` is covered by Task 2's third test (`a_legacy_free_text_domain_matches_the_slug_at_comparison_time`).
+
+The real-store test is acceptance criterion 1 (the free-text domain is written, the slug tag recalls it), criterion 2 (an `access_count: 0` fact is recalled) and criterion 4 (the recall moved no `access_count`) in the same namespace, through the real store, with no pre-seeded slug. `StubEmbedder` emits a 4-float vector (`src/guard/testkit.rs:198-214`) and `for_testing(dir, 4)` declares 4 dimensions, so the two agree. Use the established add-path pattern: `create_new_namespace: true` and no `project_root` in the add call (`src/server.rs:3421-3432` — the `.NeuroStrata` directory check only runs when a `project_root` is supplied, `src/server.rs:1214-1229`), and `quiet_bus()` (`src/server.rs:3093`) for the bus.
 
 Use `crate::guard::testkit::{MockStore, StubEmbedder}` (a `pub(crate)` module, `src/guard/mod.rs:13`) for the mock store and the embedder, and the same config/buffer setup the existing buffer tests use (`scratch(tag)` at `src/buffer.rs:187`).
 
@@ -578,7 +583,7 @@ The response object at `src/buffer.rs:171-177` gains `recalled` and `recalled_fr
 - [ ] **Step 9: Run the tests**
 
 Run: `cargo test --bin neurostrata-mcp buffer::tests`
-Expected: PASS — 7 new tests plus the existing buffer tests.
+Expected: PASS — the 6 new buffer tests plus the existing buffer tests, and the new server test (run it with `cargo test --bin neurostrata-mcp a_fact_written_with_a_free_text_domain_is_recalled_by_its_slug_tag`).
 
 - [ ] **Step 10: Run the full suite**
 
