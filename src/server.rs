@@ -1283,6 +1283,16 @@ async fn handle_add_memory(
             meta_obj.insert("related_to".to_string(), related_to.clone());
         }
     }
+    // The domain is stored as its slug, so a stored domain is already a key.
+    // A domain with no usable slug, and any non-string domain, is stored
+    // exactly as it was given -- the write never guesses a domain.
+    if arguments.get("domain").is_some() {
+        if let Some(slug) = crate::domain::domain_key(&metadata) {
+            if let Some(meta_obj) = metadata.as_object_mut() {
+                meta_obj.insert("domain".to_string(), Value::String(slug));
+            }
+        }
+    }
     stamp_new_memory(&mut metadata);
 
     // Honour an unambiguous Governs line in the prose (guinea-pig Option 2):
@@ -3437,6 +3447,63 @@ mod tests {
             reply
         );
         assert!(reply.contains("metadata"), "{}", reply);
+    }
+
+    /// The write path normalizes a string domain to its slug, so a stored
+    /// domain is already a key. A domain the write cannot read is never
+    /// guessed at: a non-string domain is stored exactly as it was given.
+    #[tokio::test]
+    async fn a_string_domain_is_normalized_on_write_and_a_non_string_domain_is_not() {
+        let (store, _) = store_with_one_rule("probe").await;
+
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "the database access rule",
+                "namespace": "probe",
+                "domain": "Database Access",
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(added.starts_with("Successfully added memory"), "{}", added);
+
+        let stored = store
+            .list("probe", None)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| r.payload.content == "the database access rule")
+            .expect("the memory is stored");
+        assert_eq!(
+            stored.payload.metadata["domain"],
+            serde_json::json!("database-access")
+        );
+
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "a rule with a numbered domain",
+                "namespace": "probe",
+                "domain": 42,
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(added.starts_with("Successfully added memory"), "{}", added);
+
+        let stored = store
+            .list("probe", None)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| r.payload.content == "a rule with a numbered domain")
+            .expect("the memory is stored");
+        assert_eq!(stored.payload.metadata["domain"], serde_json::json!(42));
     }
 
     #[tokio::test]
