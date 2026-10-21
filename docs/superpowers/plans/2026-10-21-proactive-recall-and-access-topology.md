@@ -283,8 +283,9 @@ git commit -m "feat(store): filter search by normalized domain, with a soft fall
 ### Task 3: The `domain` argument on `neurostrata_search_memory`
 
 **Files:**
-- Modify: `src/server.rs:184-192` (the tool's `inputSchema`)
-- Modify: `src/server.rs:1956-2035` (`handle_search_memory`)
+- Modify: `src/server.rs:186-195` (the tool's `inputSchema`; the tool entry itself is `src/server.rs:183-196`)
+- Modify: `src/server.rs:1966-2093` (`handle_search_memory`)
+- Modify: `src/traits.rs:106-111` (the `DomainSearchOutcome` type) and `src/traits.rs:242-260` (the trait's default `search_with_domain`) — drop the two transient `#[allow(dead_code)]` markers Task 2 left on the `mode` field and on the default method, because this task is where the API becomes live
 
 **Interfaces:**
 - Consumes: `VectorStore::search_with_domain(...) -> Result<DomainSearchOutcome>` (Task 2).
@@ -292,7 +293,7 @@ git commit -m "feat(store): filter search by normalized domain, with a soft fall
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/server.rs`'s inline test module, add two `#[tokio::test]`s. Build the store with `crate::guard::testkit::MockStore` (a `pub(crate)` module, `src/guard/mod.rs:13`) and the embedder with the `StubEmbedder` already in that test module (`src/server.rs:2972`); seed the store with two facts carrying different `metadata.domain` values.
+In `src/server.rs`'s inline test module, add two `#[tokio::test]`s. Build the store with `crate::guard::testkit::MockStore` (a `pub(crate)` module, `src/guard/mod.rs:13`) and the embedder with the `StubEmbedder` already in that test module (`src/server.rs:3026`); seed the store with two facts carrying different `metadata.domain` values.
 
 ```rust
 #[tokio::test]
@@ -303,6 +304,8 @@ async fn search_memory_without_a_domain_behaves_exactly_as_today() { /* no domai
 async fn search_memory_with_a_domain_filters_the_results_and_reports_the_mode() { /* a domain argument;
     assert the non-matching rows are gone and the report carries the mode line */ }
 ```
+
+The filter has more than one outcome, so the implementation carries four more tool-level tests, all driving `handle_search_memory` rather than the store: `search_memory_with_a_domain_that_matches_nothing_reports_the_skip` (the soft fallback), `search_memory_with_a_domain_that_does_not_normalize_reports_the_skip` (a domain that does not normalize, as a string and as an array), `search_memory_with_an_empty_domain_argument_reports_no_mode` (an argument that names no domain), and `search_memory_with_a_free_text_domain_matches_the_legacy_row` (a legacy `"Database Access"` row matched by the slug, with no migration).
 
 - [ ] **Step 2: Run them and watch them fail**
 
@@ -321,16 +324,21 @@ Add to the `neurostrata_search_memory` `inputSchema` properties:
 
 - [ ] **Step 4: Apply the filter**
 
-In `handle_search_memory`, read `arguments["domain"]` as either a string or an array of strings, normalize each with `crate::domain::normalize_domain_slug`, and drop the values that do not normalize. The survivors go into a `Vec<String>` named `slugs`; an absent or empty `domain` yields an empty `slugs`, which is the "no filter" case.
+In `handle_search_memory`, read `arguments["domain"]` as either a string or an array of strings, normalize each with `crate::domain::normalize_domain_slug`, and drop the values that do not normalize. The survivors go into a `Vec<String>` named `slugs`.
 
-Replace the call at `src/server.rs:1993-2003` with `store.search_with_domain(namespace, vec, DEFAULT_LIMIT, include_tasks, include_archived, &slugs)`, and use `outcome.results` in place of `results`. Everything else in the handler — the `access_count` increment for direct hits (`:2019`), the "No relevant memories found." branch, the rendered report — stays as it is.
+The handler also tracks **whether a domain was requested**, because a requested filter that never reached the store still has to be reported. `domain_requested` is true when the `domain` key is present **and** the raw value carries at least one non-empty string entry: a plain string that is not empty or whitespace-only, or an array with at least one such entry. `domain` absent, `[]`, `""`, `[""]` and a whitespace-only string name no domain, so `domain_requested` is false and the search reads exactly as it did before the filter existed — that is the "no filter" case, and it does not change. A value that was asked for but does not normalize (`"!!!"`) leaves `slugs` empty while `domain_requested` stays true: the filter is reported as skipped, never silently replaced by an unfiltered search.
+
+Replace the call at `src/server.rs:2026-2034` with `store.search_with_domain(namespace, vec, DEFAULT_LIMIT, include_tasks, include_archived, &slugs)`, and use `outcome.results` in place of `results`. Everything else in the handler — the `access_count` increment for direct hits (`src/server.rs:2041-2057`), the "No relevant memories found." branch, the rendered report — stays as it is.
 
 - [ ] **Step 5: Report the mode**
 
-When a domain was requested, prepend one line to the rendered report — the repo's "one flattened line" style:
+When a domain was requested (`domain_requested` is true), prepend one line to the rendered report — the repo's "one flattened line" style. There are three variants; the em dash in the two skipped lines is U+2014:
 
-- filter applied → `domain filter: applied (domain)`
-- filter skipped → `domain filter: skipped — no row matched the domain; the results are unfiltered (vector)`
+- filter applied — the store's mode is `Domain` → `domain filter: applied (domain)`
+- filter skipped, and at least one slug survived to compare — the store's mode is `Vector` → `domain filter: skipped — no row matched the domain; the results are unfiltered (vector)`
+- filter skipped, and no slug survived, because the domain did not normalize → `domain filter: skipped — the domain did not normalize; the results are unfiltered (vector)`
+
+The "no slug survived" case is decided first (`src/server.rs:2069`), because the store's mode alone cannot tell the two kinds of skip apart: an empty key set was never compared with anything, so the store reports `Vector` for it as well.
 
 When no domain was requested, the report is byte-identical to today's. This is an orchestrator decision, not a spec line: the spec requires the mode only on the recall response, but the same silent-substitution rule applies here, and the spec's §4.3.5 gives the reason. It is additive — the line appears only when a caller asked for a domain.
 
@@ -347,7 +355,7 @@ Expected: PASS — 0 failed.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/server.rs
+git add src/server.rs src/traits.rs
 git commit -m "feat(search): an optional domain filter on neurostrata_search_memory"
 ```
 

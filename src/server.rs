@@ -2001,19 +2001,24 @@ async fn handle_search_memory(
 
     // An optional domain filter: a slug, or a list of slugs. Each value is
     // normalized here, so the store compares by slug on both sides and a
-    // legacy free-text domain still matches. A value that normalizes to
-    // nothing is dropped; an empty list is the "no filter" case.
-    let slugs: Vec<String> = match arguments.get("domain") {
-        Some(Value::String(one)) => crate::domain::normalize_domain_slug(one)
-            .into_iter()
-            .collect(),
-        Some(Value::Array(many)) => many
-            .iter()
-            .filter_map(|v| v.as_str())
-            .filter_map(crate::domain::normalize_domain_slug)
-            .collect(),
+    // legacy free-text domain still matches.
+    let raw_domains: Vec<&str> = match arguments.get("domain") {
+        Some(Value::String(one)) => vec![one.as_str()],
+        Some(Value::Array(many)) => many.iter().filter_map(|v| v.as_str()).collect(),
         _ => Vec::new(),
     };
+    // A domain was requested when the caller named at least one non-empty
+    // value. An absent, empty or whitespace-only argument names nothing, and
+    // the search then reads exactly as it did before the filter existed.
+    let domain_requested = raw_domains.iter().any(|d| !d.trim().is_empty());
+    // The values that normalize survive; the rest are dropped. A filter with
+    // no survivors is reported as skipped, never silently replaced by an
+    // unfiltered search.
+    let slugs: Vec<String> = raw_domains
+        .iter()
+        .copied()
+        .filter_map(crate::domain::normalize_domain_slug)
+        .collect();
 
     if let Ok(_) = store.init(namespace).await {
         if let Ok(vec) = emb.embed(&query).await {
@@ -2052,19 +2057,25 @@ async fn handle_search_memory(
                     }
 
                     let report = render_search_results(&results);
-                    if slugs.is_empty() {
+                    if !domain_requested {
                         report
                     } else {
                         // A filter that was skipped is a substitution the caller
                         // has to be told about: a wrong domain must never blind
                         // the search, and a silent fallback would misreport what
-                        // was searched.
-                        let mode_line = match mode {
-                            crate::traits::DomainMatchMode::Domain => {
-                                "domain filter: applied (domain)"
-                            }
-                            crate::traits::DomainMatchMode::Vector => {
-                                "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
+                        // was searched. The store's mode alone cannot tell the
+                        // two kinds of skip apart -- an empty key set was never
+                        // compared with anything -- so the survivors decide.
+                        let mode_line = if slugs.is_empty() {
+                            "domain filter: skipped — the domain did not normalize; the results are unfiltered (vector)"
+                        } else {
+                            match mode {
+                                crate::traits::DomainMatchMode::Domain => {
+                                    "domain filter: applied (domain)"
+                                }
+                                crate::traits::DomainMatchMode::Vector => {
+                                    "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
+                                }
                             }
                         };
                         format!("{}\n\n{}", mode_line, report)
@@ -3218,6 +3229,99 @@ mod tests {
                 "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
             ),
             "the report says the filter was skipped: {report}"
+        );
+    }
+
+    /// A domain that normalizes to nothing is not a silent unfiltered search:
+    /// the caller asked for a filter, so the report says the filter was
+    /// skipped and why. Both argument shapes that carry it are covered.
+    #[tokio::test]
+    async fn search_memory_with_a_domain_that_does_not_normalize_reports_the_skip() {
+        let (store, auth_id, data_id) = store_with_two_domains("probe").await;
+
+        for domain in [serde_json::json!("!!!"), serde_json::json!(["!!!"])] {
+            let report = handle_search_memory(
+                serde_json::json!({ "namespace": "probe", "query": "rules", "domain": domain }),
+                Arc::new(StubEmbedder),
+                store.clone(),
+            )
+            .await;
+
+            assert!(
+                report.contains(&auth_id),
+                "the rows come back unfiltered: {report}"
+            );
+            assert!(
+                report.contains(&data_id),
+                "the rows come back unfiltered: {report}"
+            );
+            assert!(
+                report.starts_with(
+                    "domain filter: skipped — the domain did not normalize; the results are unfiltered (vector)"
+                ),
+                "the report says the domain did not normalize: {report}"
+            );
+        }
+    }
+
+    /// An argument that names no domain at all is not a request for one: the
+    /// report stays byte-identical to the one a search without a filter gives.
+    #[tokio::test]
+    async fn search_memory_with_an_empty_domain_argument_reports_no_mode() {
+        let (store, auth_id, data_id) = store_with_two_domains("probe").await;
+
+        for domain in [
+            serde_json::json!([]),
+            serde_json::json!(""),
+            serde_json::json!([""]),
+            serde_json::json!("   "),
+        ] {
+            let report = handle_search_memory(
+                serde_json::json!({ "namespace": "probe", "query": "rules", "domain": domain }),
+                Arc::new(StubEmbedder),
+                store.clone(),
+            )
+            .await;
+
+            assert!(
+                report.contains(&auth_id) && report.contains(&data_id),
+                "both rules are back: {report}"
+            );
+            assert!(
+                !report.contains("domain filter:"),
+                "no mode line when no domain was asked for: {report}"
+            );
+        }
+    }
+
+    /// A legacy row whose stored domain is free text still matches the slug:
+    /// the comparison normalizes the stored value, so the filter works
+    /// without a migration and without rewriting the row.
+    #[tokio::test]
+    async fn search_memory_with_a_free_text_domain_matches_the_legacy_row() {
+        let store: Arc<dyn VectorStore> = Arc::new(crate::guard::testkit::MockStore::new());
+        store.init("probe").await.expect("init the namespace");
+        let mut legacy = payload("the legacy database rule");
+        legacy.metadata = serde_json::json!({ "domain": "Database Access" });
+        store
+            .upsert("probe", "legacy-rule", vec![0.1, 0.2, 0.3, 0.4], legacy)
+            .await
+            .expect("seed the legacy rule");
+
+        let report = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "rules", "domain": "Database Access" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+
+        assert!(
+            report.contains("legacy-rule"),
+            "the legacy row is back: {report}"
+        );
+        assert!(
+            report.starts_with("domain filter: applied (domain)"),
+            "the report says the filter chose the rows: {report}"
         );
     }
 
