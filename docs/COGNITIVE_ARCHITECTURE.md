@@ -14,19 +14,36 @@ Agents never overwrite history. When an architectural decision changes, the syst
 
 ### 3. Neural Gain Mechanism (Access-Based Synaptic Weighting)
 *Inspired by the Ebbinghaus Forgetting Curve and synaptic plasticity.*
-All vector databases rank results by mathematical distance (e.g., L2 or Cosine). NeuroStrata applies a **Neural Gain Filter** on top of this. Every time a memory is retrieved, the engine asynchronously increments its `access_count` metadata in the background. During retrieval, the engine dynamically calculates a final salience score: `Base Distance - (ln(Access Frequency) * Neural Boost)`. Outdated, unused rules naturally decay out of the context window, while highly-accessed core principles permanently float to the top without completely dominating standard semantic search results due to the logarithmic limit.
+All vector databases rank results by mathematical distance (e.g., L2 or Cosine). NeuroStrata applies a **Neural Gain Filter** on top of this. Every **direct** hit — a row the vector query matched, not a graph-expansion neighbour — has its `access_count` metadata incremented in the background (`src/server.rs:1995-2012`), and that counter only ever rises (`src/store/ladybug.rs:1913-1934`, `:2123-2140`). During retrieval, the engine computes a final salience score from the raw distance `d`:
+
+```
+usage_gain   = 0.05 * ln(1 + access_count)
+source_gain  = 0.05 if metadata.source is present, else 0
+capped_gain  = min(usage_gain + source_gain, 0.5 * d)
+salience     = d - capped_gain
+```
+
+(`src/store/ladybug.rs:1093-1100`; the provenance constant is `SOURCE_RANK_GAIN` at `:709`, and the provenance test is `crate::traits::has_source` — `src/traits.rs:49`.) The **cap**, not the logarithm, is what keeps the boost from becoming an override: a row's final distance is never below `0.5 * d`, so a boosted row can overtake a row up to twice as far away, but never one less than half as far away. Highly-accessed core principles therefore hold the top without displacing a genuinely closer memory. Unused rules fall in *relative* rank as other rows are retrieved — the counter itself never decays — and expired rules leave recall entirely through the bi-temporal `valid_to` filter (`src/store/ladybug.rs:2020-2025`), not through a decay score.
 
 ### 4. Domain-Isolated Knowledge Shelves (Contextual Compartmentalization)
 *Inspired by declarative knowledge clustering.*
-To prevent massive context hallucination, NeuroStrata categorizes vectors into explicit declarative `domains` (e.g., `frontend`, `database`, `devops`, `api`). This allows agents to compartmentalize their focus, drastically shrinking the vector search space and ensuring high-fidelity retrieval for domain-specific tasks.
+NeuroStrata carries an explicit declarative `domain` tag on a memory (e.g., `frontend`, `database`, `devops`, `api`) — set from the `domain` argument at write time (`src/server.rs:1276-1277`) and to `code_ast` for ingested symbols (`src/parser/ingest.rs:465`). The tag is *descriptive* metadata: it is surfaced by graph export (`src/store/ladybug.rs:1764`, `:1817`) and is **not** a filter on the retrieval query. What actually shrinks the vector search space is the **namespace** — the Tri-Strata partitioning of §7 — because a search runs inside exactly one namespace (`src/store/ladybug.rs:1045-1048`). Compartmentalization is therefore real, but it is carried by the namespace, not by the `domain` label.
 
 ### 5. Pre-computed Cognitive Snapshots (Zero-Shot Context Grounding)
 *Inspired by the psychological concept of "Working Memory Priming".*
 Instead of forcing agents to blindly search a new repository and waste expensive token processing, NeuroStrata features a `neurostrata_get_snapshot` tool. This instantly returns the top-5 highest-weighted, active cognitive nodes for any project. This "wake-up context" perfectly grounds an agent in a repository's most critical rules the second a session begins.
 
-### 6. Reciprocal Rank Fusion (Hybrid Semantic & FTS Retrieval)
-*Inspired by human dual-process theory (gist vs. verbatim recall).*
-Relying solely on dense vector embeddings is notoriously poor for finding exact variable names, acronyms, or specific syntax. NeuroStrata's Rust backend utilizes `tantivy` to combine dense vector semantic search with exact Full-Text Search (BM25 keyword matching). These two retrieval tracks are merged via Reciprocal Rank Fusion (RRF), ensuring agents recall both the "gist" of an architectural concept and the exact "verbatim" code syntax.
+### 6. Deterministic Retrieval — Boosted Distance + Bounded Graph Evidence
+*Inspired by human dual-process theory (gist vs. verbatim recall) — of which only the "gist" track is built.*
+
+Retrieval is one deterministic pipeline. No LLM, no rank fusion, no keyword index:
+
+1. **Row-class filter, then vector distance.** The store filters row classes *before* the candidate budget is spent — structural rows (`directory`, `file`, `markdown`, `freshness_flag`, `guard_event`) are always excluded (`:677-683`, `:1035`), `task` rows are excluded unless the caller passes `include_tasks` (`:1036-1037`), tombstoned rows are excluded unless the caller passes `include_archived` (`:1080`), and mesh-conflicting rows are excluded outright (`:1083`; the same filters run over expansion candidates at `:1186-1188` and `:1245-1247`). What remains is scanned with `array_distance` and ordered by `dist ASC, id ASC` (`:1045-1048`). There is **no lexical/BM25 track, no full-text index, and no Reciprocal Rank Fusion** anywhere in the codebase — `tantivy` was never a dependency of this crate (`git log -S'tantivy' -- Cargo.toml` is empty, and the current `Cargo.toml` contains no FTS crate), and the store creates exactly one node table plus four relation tables (`:821-844`). Earlier documentation described this step as "hybrid semantic + BM25 retrieval fused by RRF"; that description never matched the code, and it is corrected by the erratum in `CHANGELOG.md` (see also `docs/designs/2026-10-20-argon-k3-panel-verdicts.md` §1, DOC-1).
+2. **Capped boost.** §3's usage-and-provenance boost is applied to that distance, bounded at `0.5 * distance` (`:1093-1100`). A direct match carries `EvidenceKind::DirectMatch` (`:1117`).
+3. **Bounded directed-graph expansion.** Direct matches are expanded along the graph: one hop over `RELATES_TO`, `CONTAINS` and `GOVERNS` in both directions, and two hops over `GOVERNS` (`:1138`, `:1140-1160`). Each expanded row carries the evidence path that reached it, capped at three paths per result (`:1354`). Candidates are admitted per family — the one-hop family first, then the governing-only family — at most `limit` per family, and within a family by co-occurrence count (how many distinct primaries reached the row) descending, with the id as the tie-break (`:1306-1332`).
+4. **Ordering and rendering.** Direct matches sort first on their real boosted distance; expansion rows follow in their admission order, and the discriminator is the evidence kind, not a magic score constant (`:1336-1339`, `:1364-1376`). The store returns its primaries plus their bounded expansions without a second truncation (`:1378-1382`), and the server asks for five primaries and renders everything it gets back (`src/server.rs:1987-1991`).
+
+**Exact-identifier recall — the known gap, and the recommendation (NOT IMPLEMENTED).** Relying solely on dense vector embeddings *is* poor at finding exact variable names, acronyms, or specific syntax: a memory whose text is an exact identifier — a function name, an env var, a config key, an error string — is found only if its *embedding* lands near the query. The adjudicated recommendation for closing that gap is a **narrow deterministic `CONTAINS` / symbol-id match** — reusing the relation and `symbol` rows the store already holds — rather than a Tantivy + RRF build: it adds no dependency, no index to operate, and no second ranking rule to keep auditable (`docs/designs/2026-10-20-argon-k3-panel-verdicts.md` §5, Phase 4). **This is a recommendation only. It is not implemented, and no part of the shipped retrieval path performs exact-token matching today.**
 
 ### 7. 3-Tier Stratification (Contextual Hierarchy)
 *Inspired by the division of Working Memory vs. Long-Term Memory.*
@@ -57,7 +74,7 @@ Knowing-that is only two-thirds of memory. NeuroStrata's third leg carries `memo
 
 ### 13. Tombstone-Aware Retrieval
 *Inspired by clean recall: a retired memory is one the operator has stopped trusting, and recall surfaces should respect that.*
-Tombstones are not deletes: the row keeps its content, its id, and its provenance, and `metadata.archived: true` is *merged* in beside them. The shared read-time helper `crate::handlers::archive_memory::is_archived(payload)` is strict on the field shape (literal `true` only), so a typo never hides a row. Every read surface — `search_memory`, `get_snapshot`, `export-graph` — honors the tombstone by default; the uniform `include_archived: true` escape hatch exists for audits and deliberate second-looks.
+Tombstones are not deletes: the row keeps its content, its id, and its provenance, and `metadata.archived: true` is *merged* in beside them. The read-time test is strict on the field shape (literal `true` only), so a typo never hides a row. Every read surface — `search_memory`, `get_snapshot`, `export-graph` — honors the tombstone by default, and the uniform `include_archived: true` escape hatch exists for audits and deliberate second-looks. The strict test is written in three places that must agree: the handler helper `crate::handlers::archive_memory::is_archived(payload)` (`src/handlers/archive_memory.rs:57-63`, used by `get_snapshot` at `src/server.rs:1439`), a store-level twin (`src/store/ladybug.rs:691-693`, used by the search path at `:1080`, `:1187`, `:1246`), and the inline read in the graph export (`:1792-1796`).
 
 ### 14. SynapticMesh — the inter-instance synaptic layer
 
