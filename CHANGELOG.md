@@ -4,6 +4,26 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.10.0] - 2026-10-20
+
+### Added
+- **Universal source-anchor registry (`src/source_context.rs`).** Graph export no longer rebases one repository's relative paths onto whichever checkout happened to launch the export. Each stable source identity is bound to its own canonical `.NeuroStrata` marker directory, and the project root is derived from that marker's parent.
+  - `neurostrata-mcp project-context bind|list|unbind` — bind a stable `source_id` to an existing `.NeuroStrata` marker directory; more than one source root can be configured in a single client configuration.
+  - Export resolves each node's `locations[].location` against the binding for that row's own source, so one shared database can serve several repositories, linked worktrees, and unrelated process working directories and still export the same graph for the same snapshot and config, regardless of the caller's CWD.
+  - Machine paths stay out of the exported provenance: they appear only in the legacy `absolute_path` projection, and only when a matching local binding is configured. The provider-neutral `locations[].source_context` contract is preserved — Core reads the standardized `source_id` discriminator and round-trips provider-specific fields (revision, workspace) opaquely.
+  - Core stays VCS-agnostic: it stores and exports source provenance, and does not discover repositories, inspect refs, switch branches, or decide whether a consumer should reject a missing source.
+  - `NEUROSTRATA_ANCHOR_ROOT` + `NEUROSTRATA_SOURCE_ID` still work as a legacy scoped override; the root on its own is deprecated and ignored with a warning.
+- **Marker-path validation.** A bound source ID must point at a real `.NeuroStrata` marker directory; an invalid or ambiguous one is refused rather than quietly resolving paths against the caller's working directory.
+- **`counts.retired` in the gate report.** The advisory report now says how many task rows it judged only as history, so `in_progress: 1` with no `in_progress` violation stops reading as a contradiction.
+
+### Fixed
+- **The gate judged retired rows as live work.** A task row whose `metadata.valid_to` has passed (superseded or expired) still raised `in_progress`, P0-rot and staleness signals, so a superseded claim could block every push forever, naming an assignee who no longer exists. Retired rows are now history: they raise no live-work violation, they are never offered as claimed or ready work, and a retired blocker stops holding its dependents unless a live successor still carries the work.
+- **The extraction lock had a hole on retired rows.** A retired `done` row is exempt from `done_without_extraction` only when `metadata.superseded_by` names a successor that is itself a task row, is not retired, is `done`, and already has an inbound `EXTRACTED_FROM` edge. Anything else — a successor that is still open or was reopened, one whose own lesson is missing, one that is itself retired, one that is not a task, one that does not exist — leaves the lesson owed by the retired row, which still blocks. Malformed expiry metadata is not proof of retirement and keeps failing closed.
+- **Retired rules failed the gate's provenance check.** A superseded rule was still judged as an active claim and could be reported as `rule_without_source`. Retired rules are now skipped by the rule checks — with the same deliberate divergence from the store's own retirement filter, which treats an unparseable expiry as expired and hides the row from search: the store hides; the gate refuses to forgive.
+- **Saving the client config dropped fields it did not know and reset the file's permissions.** Unknown top-level config keys are preserved on save, and the config file keeps its original mode instead of being rewritten under the process umask.
+- **Source anchors and edge diagnostics were unstable.** Anchor resolution and graph export resolve through the source's own binding, and a `GOVERNS` edge that cannot be resolved to a real file is now reported as deferred instead of failing the write silently.
+- **The docs and the engine disagreed.** The CLI reference, the task-subsystem design doc, the tool schema and the push-gate instructions now describe the same retirement and readiness semantics the engine implements.
+
 ## [1.9.0] - 2026-10-11
 
 ### Added
