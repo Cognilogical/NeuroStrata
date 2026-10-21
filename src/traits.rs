@@ -293,11 +293,12 @@ mod tests {
     /// The relation-count assertion moved here from the v1 test: v2 declares
     /// exactly four relations, the fourth being the extraction edge. v3 keeps
     /// them and adds the rule-honesty fields (A6); v4 adds `procedure` and
-    /// keeps every relation as it was.
+    /// keeps every relation as it was; v5 adds the fact `topology` field,
+    /// which is a field and not a relation.
     #[test]
-    fn memory_vocabulary_v4_parses_and_has_exact_relations() {
+    fn memory_vocabulary_v5_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 4);
+        assert_eq!(v["vocabulary_version"], 5);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
@@ -387,6 +388,32 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("procedure"));
+    }
+
+    /// v5 access topology: a fact declares the access path it describes, so a
+    /// reader can see which component reaches which system over which
+    /// channel, and which boundary that channel crosses.
+    #[test]
+    fn memory_vocabulary_declares_the_topology_field_on_a_fact() {
+        let v = memory_vocabulary();
+        let topology = &v["memory_types"]["fact"]["fields"]["topology"];
+        assert_eq!(topology["type"], "object");
+        let definition = topology["definition"]
+            .as_str()
+            .expect("the topology field carries a definition");
+        for key in [
+            "component",
+            "target_system",
+            "channel",
+            "credential_boundary",
+            "reason",
+        ] {
+            assert!(
+                definition.contains(key),
+                "the topology definition names {}",
+                key
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 {
-  "vocabulary_version": 4,
+  "vocabulary_version": 5,
   "relations": {
     "GOVERNS": {
       "direction": "directed",
@@ -65,7 +65,13 @@
     },
     "fact": {
       "definition": "A descriptive assertion, not inherently a constraint.",
-      "structural": false
+      "structural": false,
+      "fields": {
+        "topology": {
+          "type": "object",
+          "definition": "The access-path shape of the fact. All five keys are required and each is a string: component (where the path starts), target_system (what it reaches), channel (the transport or protocol), credential_boundary (the network, identity or trust boundary the channel crosses), reason (why the path is constrained). A missing or malformed value warns; the fact is still written."
+        }
+      }
     },
     "task": {
       "definition": "A tracked unit of work with a status. Reaches 'done' only through neurostrata_task_complete, which requires an extracted memory (Lock 2).",
@@ -155,9 +161,9 @@
     "version_policy": "Increment vocabulary_version for semantic changes."
   },
   "tool_summaries": {
-    "add": "Vocabulary v2: rule/fact/task; metadata governs, contained_by, related_to and extracted_from accept target-ID arrays; custom types remain valid.",
+    "add": "Vocabulary v2: rule/fact/task; metadata governs, contained_by, related_to and extracted_from accept target-ID arrays; a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason), the access path the fact describes; custom types remain valid.",
     "search": "Expanded matches add bounded, directed evidence paths; RELATES_TO is undirected; memory_type 'task' is excluded unless include_tasks is true.",
     "ingest": "Vocabulary v2: directory/file/markdown containers and symbols; code_ast remains the stored symbol type.",
-    "memory_type": "Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); structural types are directory/file/markdown/symbol; custom types remain valid; default context."
+    "memory_type": "Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason); structural types are directory/file/markdown/symbol; custom types remain valid; default context."
   }
 }
