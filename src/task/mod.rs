@@ -200,16 +200,14 @@ fn task_statuses(memories: &[SearchResult]) -> HashMap<String, Status> {
         .collect();
     // A retired blocker is history, but the work it stood for lives on in the
     // row that replaced it: a live unfinished successor still holds its
-    // dependents. A retired blocker with no live successor is void -- the
-    // dependency named a record that no longer exists.
+    // dependents. The successor is the row at the end of the supersession
+    // chain, not merely the next link -- a work that was replaced twice is
+    // still in flight under the row that replaced it twice. A retired blocker
+    // with no live successor is void -- the dependency named a record that no
+    // longer exists.
     for m in memories.iter().filter(|m| retired.contains(m.id.as_str())) {
-        let successor = m
-            .payload
-            .metadata
-            .get("superseded_by")
-            .and_then(|v| v.as_str())
-            .filter(|id| !retired.contains(id))
-            .and_then(|id| statuses.get(id).copied());
+        let successor = gate::live_successor(&m.payload.metadata, memories, now)
+            .and_then(|s| statuses.get(&s.id).copied());
         statuses.insert(m.id.clone(), successor.unwrap_or(Status::Done));
     }
     statuses
@@ -877,6 +875,13 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let ready_only = args.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Retired rows are history, and history is not work: the gate does not
+    // judge them and the snapshot does not offer them, so the listing does
+    // not either. The opt-in shows them, labelled, for the audit.
+    let include_retired = args
+        .get("include_retired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let memories = match store.list(&namespace, None).await {
         Ok(m) => m,
@@ -908,6 +913,9 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
                 == Some(who.as_str())
         });
     }
+    if !include_retired {
+        tasks.retain(|m| !gate::is_retired(&m.payload.metadata, now));
+    }
     if ready_only {
         tasks.retain(|m| {
             gate::task_status(m) == Status::Open
@@ -926,12 +934,17 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
     let summaries: Vec<Value> = tasks
         .iter()
         .map(|m| {
-            let ready = gate::task_status(m) == Status::Open
-                && !gate::is_retired(&m.payload.metadata, now)
-                && is_ready(&m.payload, &statuses);
+            let retired = gate::is_retired(&m.payload.metadata, now);
+            let ready =
+                gate::task_status(m) == Status::Open && !retired && is_ready(&m.payload, &statuses);
             let mut summary = task_summary(&m.id, &m.payload);
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("ready".to_string(), json!(ready));
+                if retired {
+                    // A row shown as history must say so, so nobody reads it as
+                    // live claimed work.
+                    obj.insert("retired".to_string(), json!(true));
+                }
             }
             summary
         })
@@ -977,6 +990,10 @@ pub async fn handle_task_complete(
     check_namespace(&namespace)?;
 
     let (task, vector) = load_task(&store, &namespace, &id).await?;
+    // The clock the gate reads with: a lesson row that has been retired is
+    // history and discharges nothing, so the completion path asks the same
+    // question the gate asks.
+    let now = chrono::Utc::now().timestamp();
     if task.status() == Status::Done {
         return Err(format!(
             "ERROR: task {} is already done. Reopen it first (neurostrata_task_update with status 'open') if there is more work.",
@@ -1003,7 +1020,7 @@ pub async fn handle_task_complete(
     // Path 1: the edge already exists (a memory written earlier with
     // `extracted_from: [id]`).
     let mut memories = list_now().await?;
-    let mut edge = gate::extraction_exists(&memories, &id);
+    let mut edge = gate::extraction_exists(&memories, &id, now);
 
     // Path 2: bind an already-written memory. Its existing vector is reused
     // verbatim -- linking must never change what the memory ranks for.
@@ -1061,7 +1078,7 @@ pub async fn handle_task_complete(
                 })?;
             // Verified after the write: the rule is an edge *after the call*.
             memories = list_now().await?;
-            edge = gate::extraction_exists(&memories, &id);
+            edge = gate::extraction_exists(&memories, &id, now);
         }
     }
 
@@ -1170,7 +1187,7 @@ pub async fn handle_task_complete(
             )
             .await?;
             memories = list_now().await?;
-            edge = gate::extraction_exists(&memories, &id);
+            edge = gate::extraction_exists(&memories, &id, now);
             inline_lesson = Some(report.id);
         }
     }
@@ -4806,10 +4823,171 @@ mod tests {
             "a retired row is not ready work, and only a live successor keeps a dependent waiting"
         );
 
-        // The unfiltered listing still shows the history.
+        // The unfiltered listing does not offer history as work; the opt-in
+        // shows it, labelled as history.
         let reply = handle_task_list(json!({ "namespace": "MyProj" }), store.clone()).await;
         let parsed: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(parsed["count"], json!(7));
+        let reply = handle_task_list(
+            json!({ "namespace": "MyProj", "include_retired": true }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(parsed["count"], json!(9));
+    }
+
+    /// Retired rows are history: the default listing does not offer them as
+    /// work, and the opt-in shows them labelled as history.
+    #[tokio::test]
+    async fn task_list_hides_retired_rows_by_default_and_shows_them_on_request() {
+        let store = store_with_namespace("MyProj").await;
+        let now = chrono::Utc::now().timestamp();
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-live",
+            "live work",
+            json!({ "status": "open", "priority": 1 }),
+            json!({}),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-retired",
+            "retired work",
+            json!({ "status": "in_progress", "assignee": "ghost" }),
+            json!({ "valid_to": now - 1 }),
+        )
+        .await;
+
+        let reply = handle_task_list(json!({ "namespace": "MyProj" }), store.clone()).await;
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(parsed["count"], json!(1), "history is not offered as work");
+
+        let reply = handle_task_list(
+            json!({ "namespace": "MyProj", "include_retired": true }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(parsed["count"], json!(2));
+        let retired = parsed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "MyProj-retired")
+            .expect("the retired row is listed on request");
+        assert_eq!(
+            retired["retired"],
+            json!(true),
+            "a row shown as history must say so"
+        );
+    }
+
+    /// Readiness follows the chain: a retired blocker whose successor is also
+    /// retired still holds its dependent while the chain carries live work,
+    /// and a chain that ends with no live work holds nothing.
+    #[tokio::test]
+    async fn readiness_follows_the_supersession_chain_to_the_live_work() {
+        let store = store_with_namespace("MyProj").await;
+        let now = chrono::Utc::now().timestamp();
+
+        // retired blocker -> retired successor -> live work in flight
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-chain-retired",
+            "retired work",
+            json!({ "status": "open", "priority": 1 }),
+            json!({ "valid_to": now - 1, "superseded_by": "MyProj-chain-mid" }),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-chain-mid",
+            "the same work, replaced again",
+            json!({ "status": "open", "priority": 1 }),
+            json!({ "valid_to": now - 1, "superseded_by": "MyProj-chain-live" }),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-chain-live",
+            "the work that carries on",
+            json!({ "status": "in_progress", "assignee": "agent-a" }),
+            json!({}),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-chain-dependent",
+            "work that waits for the chain",
+            json!({ "status": "open", "priority": 1, "blocked_by": ["MyProj-chain-retired"] }),
+            json!({}),
+        )
+        .await;
+
+        // A chain that ends with no live successor is void: the dependent runs.
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-void-retired",
+            "retired work, chain ends",
+            json!({ "status": "open", "priority": 1 }),
+            json!({ "valid_to": now - 1, "superseded_by": "MyProj-void-mid" }),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-void-mid",
+            "retired again, with nothing behind it",
+            json!({ "status": "open", "priority": 1 }),
+            json!({ "valid_to": now - 1 }),
+        )
+        .await;
+        upsert_task_row(
+            &store,
+            "MyProj",
+            "MyProj-void-dependent",
+            "work that waited for a void chain",
+            json!({ "status": "open", "priority": 1, "blocked_by": ["MyProj-void-retired"] }),
+            json!({}),
+        )
+        .await;
+
+        let reply = handle_task_list(
+            json!({ "namespace": "MyProj", "ready": true }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).unwrap();
+        let ids: Vec<&str> = parsed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
+        assert!(
+            !ids.contains(&"MyProj-chain-dependent"),
+            "the chain still carries live work, so the dependent still waits: {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&"MyProj-chain-live"),
+            "the live successor is claimed, not ready: {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&"MyProj-void-dependent"),
+            "a chain with no live work behind it holds nothing: {:?}",
+            ids
+        );
     }
 
     #[tokio::test]

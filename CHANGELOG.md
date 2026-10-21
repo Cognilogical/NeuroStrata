@@ -4,6 +4,17 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.10.1] - 2026-10-20
+
+### Fixed
+- **The successor was resolved one link deep.** A work that was replaced twice was resolved to the row that replaced it *once* — itself retired — so the gate read the chain as void: the extraction obligation was dropped, and the dependents of a blocker were released while the work was still in flight under the row that replaced it twice. The successor is now the row at the end of the supersession chain, walked bounded and cycle-safe, and one rule decides the three surfaces that need it: readiness, the extraction obligation, and the snapshot.
+- **A retired lesson discharged an obligation.** The extraction check accepted any row that declared `extracted_from`, including a row that had itself been superseded or expired — history the store hides from search. A retired lesson discharges nothing now, and the gate and the completion path read the same way: the store hides; the gate refuses to forgive.
+- **A lesson was pinned to one row id.** The row that replaced a finished task is the same work under a new id, so the lesson extracted from the old id is the successor's lesson too. The successor was demanding a second lesson for work that was already consolidated, and the push gate could not be satisfied. `extracted_from` now names any id in the work's lineage: the row itself, then the rows it replaced.
+- **`task_list` offered history as work.** The listing showed retired rows as ordinary records — a superseded claim read as live claimed work — while the gate ignored them and the snapshot hid them. The three surfaces now agree: retired rows are hidden from the default listing, and come back labelled `retired: true` under `include_retired: true`.
+- **Retiring a stuck claim moved it, and said nothing about how to release it.** `supersede_memory` clones the task payload, so the successor inherited the claim — status, assignee, session, and the age of the claim — and the claim kept blocking the push gate with no instruction anywhere saying how to let it go. The decision is now written down: **a claim is a lease on the work, not on the row id**, so the successor keeps the claim (correcting a task's text must not hand live work to another agent), and retiring a row is not releasing a claim. Releasing it is the explicit act it always was — `neurostrata_task_update` with `status: "open"`, which clears the assignee and the session — and the supersede reply now names the successor id and that call.
+
+**Correction to 1.10.0's notes.** 1.10.0 described the successor as a single link ("`metadata.superseded_by` must point at a successor that is ... not retired", and "one that is itself retired ... leaves the lesson owed") and described the lesson as an edge into one row id. Both were one link and one id too narrow: the successor is the row at the end of the chain, and the lesson belongs to the work. 1.10.1 is the implementation of what 1.10.0's notes described.
+
 ## [1.10.0] - 2026-10-20
 
 ### Added
