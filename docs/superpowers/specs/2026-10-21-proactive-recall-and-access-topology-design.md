@@ -389,7 +389,7 @@ forward unmentioned.
 | Q5 — negative exemplars (§2.1) | `2026-10-21-recall-closure-and-negative-exemplars-design.md` §3.1 | A `fact` carrying a declared typed sub-object `metadata.attempt` (`approach`, `outcome`, `failure_mode`, `context`); `outcome` closed to `["failed"]` is the only negative marker |
 | The `get_snapshot` topic lane (§4.1.4) | same spec §3.3 | One snapshot **domain strap** with two modes — `explicit` (the caller names a domain) and `recent_domain` — ≤3 entries, computed off the pre-cut list |
 | The domain-scoped snapshot lane (§4.1.4) | same spec §3.3 | The same strap; it is what closes the `access_count: 0` hole at session start |
-| The per-namespace domain registry (§4.3.3) | same spec §3.2 | One registry row per namespace, seeded lazily with every legacy domain on the first domain write; an unregistered slug is rejected, with a `register_domain: true` escape hatch |
+| The per-namespace domain registry (§4.3.3) | same spec §3.2 | One registry row per namespace — a **cache** of the domains the namespace actually uses — seeded lazily with every legacy domain on the first domain write; a slug in neither the cache nor the namespace's own data is rejected, with a `register_domain: true` escape hatch |
 | §11.1 — is the `append_log` seat sufficient? | same spec §3.4.1 | Decided: two bounded seats; sufficiency measured by `recall_hit_rate` with a threshold |
 | §11.2 — does a domain filter pay? | same spec §3.4.2, §10 | Instrumented: four named counters with explicit zeros |
 | §11.3 — is the registry worth its migration? | same spec §3.4.3 | Decided: yes; the migration is lazy and in-band, with no offline migration |
