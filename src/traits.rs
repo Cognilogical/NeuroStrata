@@ -93,6 +93,23 @@ pub struct SearchEvidence {
     pub explanation: String,
 }
 
+/// How the domain filter affected the search results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainMatchMode {
+    /// The rows were chosen by the domain filter.
+    Domain,
+    /// The rows were chosen without the domain filter: no key set was given,
+    /// or the filter found nothing and was skipped.
+    Vector,
+}
+
+/// The outcome of a domain-filtered search.
+#[derive(Debug, Clone)]
+pub struct DomainSearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub mode: DomainMatchMode,
+}
+
 /// What an attempt to move a memory between namespaces found.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RelocateOutcome {
@@ -221,6 +238,26 @@ pub trait VectorStore: Send + Sync {
 
     /// Increment the access count of a specific memory by its ID.
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()>;
+
+    /// Search with an optional domain key set. The default implementation ignores
+    /// the key set and reports `Vector`, so a store that cannot filter stays honest.
+    async fn search_with_domain(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        domains: &[String],
+    ) -> Result<DomainSearchOutcome> {
+        let results = self
+            .search(namespace, vector, limit, include_tasks, include_archived)
+            .await?;
+        Ok(DomainSearchOutcome {
+            results,
+            mode: DomainMatchMode::Vector,
+        })
+    }
 
     /// Write a self-contained snapshot of the store into `dir`.
     ///

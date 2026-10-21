@@ -1,12 +1,531 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use lbug::{Connection, Database, SystemConfig};
 
-use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult, VectorStore};
+use crate::domain::domain_key;
+use crate::traits::{
+    DomainMatchMode, DomainSearchOutcome, MemoryPayload, RelocateOutcome, SearchResult, VectorStore,
+};
+
+/// Internal search routine shared by `search` and `search_with_domain`.
+/// Takes an owned `HashSet<String>` of domain keys (already normalized).
+async fn search_inner(
+    store: &LadybugStore,
+    namespace: &str,
+    vector: Vec<f32>,
+    limit: usize,
+    include_tasks: bool,
+    include_archived: bool,
+    domain_keys: HashSet<String>,
+) -> Result<DomainSearchOutcome> {
+    let namespace = namespace.to_string();
+    store
+        .with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
+            let now = chrono::Utc::now().timestamp();
+
+            // LadybugDB (the embedder) has no OFFSET, so we over-fetch with a larger LIMIT and
+            // filter/trim in Rust. The multiplier bounds cost: at most
+            // FETCH_MULTIPLIER * limit rows are scanned from the engine.
+            const FETCH_MULTIPLIER: usize = 10;
+            let fetch_limit = limit * FETCH_MULTIPLIER;
+
+            // Step 1: Base vector search.
+            //
+            // Structural nodes are stored with an all-zero embedding, and the
+            // distance from an all-zero row is the query vector's own magnitude
+            // -- the same value for every one of them, whatever was asked. Left
+            // in, they tie with each other and can fill the limit with path
+            // stubs. They stay reachable through the graph expansion in step 2,
+            // which is where they are actually useful.
+            //
+            // ORDER BY dist ASC, id ASC gives deterministic tie-breaking so the
+            // same query returns the same rows across runs.
+            let structural_types = STRUCTURAL_MEMORY_TYPES
+                .iter()
+                .map(|t| format!("'{}'", t))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // Build the row-class filter for the base query.
+            // We exclude tasks, archived, and mesh-conflicting rows HERE so they
+            // never consume the candidate budget. The server escape hatches
+            // (include_tasks, include_archived) control whether these filters apply.
+            let mut excluded_types = STRUCTURAL_MEMORY_TYPES.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            if !include_tasks {
+                excluded_types.push("task".to_string());
+            }
+            let excluded_types_str = excluded_types
+                .iter()
+                .map(|t| format!("'{}'", t))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let search_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
+                safe_ns, excluded_types_str, vec_str, fetch_limit
+            );
+
+            let result = conn.query(&search_query)?;
+            let mut all_primaries = Vec::new();
+            let mut filtered_primaries = Vec::new();
+
+            for row in result {
+                let id: String = format!("{}", row[0]);
+                let distance: f32 = match &row[1] {
+                    lbug::Value::Float(f) if f.is_finite() && *f >= 0.0 => *f,
+                    lbug::Value::Double(d) if d.is_finite() && *d >= 0.0 => *d as f32,
+                    _ => continue,
+                };
+
+                let content: String = format!("{}", row[2]);
+                let user_id: String = format!("{}", row[3]);
+                let memory_type: String = format!("{}", row[4]);
+                let agent_name: String = format!("{}", row[5]);
+                let location: String = format!("{}", row[6]);
+                let location_lines: String = format!("{}", row[7]);
+                let metadata_str: String = format!("{}", row[8]);
+
+                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+
+                // Skip retired rows -- they do not count toward the limit.
+                if is_retired_at(&metadata_val, now) {
+                    continue;
+                }
+
+                // Row-class filters: archived and mesh-conflicting rows are
+                // filtered HERE in the store so they never consume a primary slot.
+                // The server escape hatches control these filters.
+                if !include_archived && is_archived(&metadata_val) {
+                    continue;
+                }
+                if is_mesh_conflicting(&metadata_val) {
+                    continue;
+                }
+
+                // Domain filter check: happens AFTER row-class filters and BEFORE usage boost.
+                // The domain_keys set is already normalized (lowercase-kebab).
+                let domain_match = if domain_keys.is_empty() {
+                    true // empty key set = no filter asked for
+                } else {
+                    domain_key(&metadata_val)
+                        .map(|k| domain_keys.contains(&k))
+                        .unwrap_or(false)
+                };
+
+                // Usage boost: ln(1+n) gives a real gain even at n=1, and the
+                // cap at half distance preserves semantic ranking order.
+                //
+                // FEATURE-4: provenance earns a share of that same capped
+                // budget. It is added *inside* the cap rather than after it --
+                // subtracting from `distance` a term that was never itself
+                // bounded is how a tie-breaker quietly becomes an override and
+                // starts returning the wrong memory for the right reason.
+                let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let n = access_count.max(0) as f32;
+                let gain = 0.05 * (1.0 + n).ln();
+                let source_gain = if crate::traits::has_source(&metadata_val) { SOURCE_RANK_GAIN } else { 0.0 };
+                let capped_gain = (gain + source_gain).min(0.5 * distance);
+                let boosted_distance = distance - capped_gain;
+
+                let sr = SearchResult {
+                    id: id.clone(),
+                    score: boosted_distance,
+                    payload: MemoryPayload {
+                        content,
+                        user_id,
+                        memory_type,
+                        agent_name: Some(agent_name),
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                    evidence: Some(vec![crate::traits::SearchEvidence {
+                        kind: crate::traits::EvidenceKind::DirectMatch,
+                        path: vec![],
+                        explanation: "This memory matched the query vector.".to_string(),
+                    }]),
+                };
+
+                // Every accepted row goes to all_primaries
+                all_primaries.push(sr.clone());
+
+                // Only domain-matching rows go to filtered_primaries
+                if domain_match {
+                    filtered_primaries.push(sr);
+                }
+
+                // Stop condition counts filtered_primaries when filter is active,
+                // otherwise counts all_primaries (which is the same as filtered when empty).
+                let stop_count = if domain_keys.is_empty() {
+                    all_primaries.len()
+                } else {
+                    filtered_primaries.len()
+                };
+                if stop_count >= limit {
+                    break;
+                }
+            }
+
+            // Determine chosen set and mode.
+            let (chosen_primaries, mode) = if domain_keys.is_empty() {
+                // No filter asked for: all rows go to both lists, mode is Vector
+                (all_primaries, DomainMatchMode::Vector)
+            } else if filtered_primaries.is_empty() && !all_primaries.is_empty() {
+                // Filter would empty the candidates: skip it, use unfiltered, mode is Vector
+                (all_primaries.into_iter().take(limit).collect(), DomainMatchMode::Vector)
+            } else {
+                // Filter applied successfully
+                (filtered_primaries, DomainMatchMode::Domain)
+            };
+
+            let primary_ids: Vec<String> = chosen_primaries.iter().map(|r| r.id.clone()).collect();
+            let mut results = chosen_primaries;
+
+            // Step 2: Hybrid GraphRAG — directed evidence expansion.
+            // Four bounded queries replace the old undirected ones, each using
+            // label(e) for the relationship name and an outgoing flag for direction.
+            // The expansion is NOT domain-filtered: a topology fact's GOVERNS neighbour
+            // is the context that made the fact worth recalling, and filtering it away
+            // would break the one-hop path the parent spec §4.2.3 depends on.
+            if !primary_ids.is_empty() {
+                let id_list = primary_ids.iter()
+                    .map(|id| format!("'{}'", escape_ladybug_string(&id)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let supported_labels = ["RELATES_TO", "CONTAINS", "GOVERNS"];
+                let primary_set: std::collections::HashSet<&str> =
+                    primary_ids.iter().map(|s| s.as_str()).collect();
+
+                // One-hop neighbor queries (outgoing and incoming)
+                let neighbor_out_q = format!(
+                    "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, true AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+                let neighbor_in_q = format!(
+                    "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, false AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+
+                // Two-hop governing queries (outgoing and incoming)
+                let govern_out_q = format!(
+                    "MATCH (a:Memory)-[e]->(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata, a.id, label(e) AS relation, f.id, f.metadata, true AS outgoing ORDER BY r.id ASC, f.id ASC, a.id ASC, relation ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+                let govern_in_q = format!(
+                    "MATCH (a:Memory)<-[e]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata, a.id, label(e) AS relation, f.id, f.metadata, false AS outgoing ORDER BY r.id ASC, f.id ASC, a.id ASC, relation ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+
+                // Episode-sibling query: memories extracted from the same task.
+                // Symmetric through the task: (m:Memory)-[:EXTRACTED_FROM]->(t:Memory)<-[:EXTRACTED_FROM]-(s:Memory)
+                // m = originating primary, t = intermediate task, s = sibling candidate.
+                let episode_sibling_q = format!(
+                    "MATCH (m:Memory)-[:EXTRACTED_FROM]->(t:Memory)<-[:EXTRACTED_FROM]-(s:Memory) WHERE m.id IN [{}] AND s.namespace = '{}' AND NOT s.id IN [{}] RETURN DISTINCT s.id, s.content, s.user_id, s.memory_type, s.agent_name, s.location, s.location_lines, s.metadata, m.id, t.id, t.metadata ORDER BY s.id ASC, m.id ASC, t.id ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+
+                // Phase 1: Read all rows, build evidence, group by result ID.
+                // Value: (payload, evidence_list, co_occurrence_count).
+                // co_occurrence_count = number of DISTINCT originating primaries that reach this candidate.
+                #[derive(Default)]
+                struct CandidateEntry {
+                    payload: Option<MemoryPayload>,
+                    evidence: Vec<crate::traits::SearchEvidence>,
+                    primary_sources: std::collections::HashSet<String>,
+                }
+                let mut by_id: std::collections::HashMap<String, CandidateEntry> =
+                    std::collections::HashMap::new();
+
+                // Process one-hop neighbor queries (4 directed branches total).
+                for q in [&neighbor_out_q, &neighbor_in_q] {
+                    if let Ok(rows) = conn.query(q) {
+                        for row in rows {
+                            let result_id: String = format!("{}", row[0]);
+                            let content: String = format!("{}", row[1]);
+                            let user_id: String = format!("{}", row[2]);
+                            let memory_type: String = format!("{}", row[3]);
+                            let agent_name: String = format!("{}", row[4]);
+                            let location: String = format!("{}", row[5]);
+                            let location_lines: String = format!("{}", row[6]);
+                            let metadata_str: String = format!("{}", row[7]);
+                            let metadata_val: Value =
+                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                            if is_retired_at(&metadata_val, now) { continue; }
+                            if primary_set.contains(result_id.as_str()) { continue; }
+
+                            // Row-class filters for expansion candidates (same as primaries)
+                            // Use memory_type column directly, not metadata
+                            if !include_tasks && memory_type == "task" { continue; }
+                            if !include_archived && is_archived(&metadata_val) { continue; }
+                            if is_mesh_conflicting(&metadata_val) { continue; }
+
+                            let primary_id: String = format!("{}", row[8]);
+                            let relation: String = format!("{}", row[9]);
+                            let outgoing: bool = format!("{}", row[10]) == "true";
+                            if !supported_labels.contains(&relation.as_str()) { continue; }
+
+                            let (src, tgt) = if outgoing {
+                                (primary_id.clone(), result_id.clone())
+                            } else {
+                                (result_id.clone(), primary_id.clone())
+                            };
+                            let edges = vec![crate::traits::EvidenceEdge {
+                                source: src.clone(), relation: relation.clone(), target: tgt.clone(),
+                            }];
+                            let kind = crate::traits::EvidenceKind::OneHop;
+                            let norm = norm_path(&edges, &kind);
+
+                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                            if entry.payload.is_none() {
+                                entry.payload = Some(MemoryPayload {
+                                    content, user_id, memory_type,
+                                    agent_name: Some(agent_name),
+                                    location, location_lines, metadata: metadata_val,
+                                });
+                            }
+                            // Track distinct primary sources for co-occurrence ranking
+                            entry.primary_sources.insert(primary_id);
+                            if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
+                                entry.evidence.push(crate::traits::SearchEvidence {
+                                    kind,
+                                    explanation: "This memory is one graph hop from a direct match.".to_string(),
+                                    path: edges,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Process two-hop governing queries
+                for q in [&govern_out_q, &govern_in_q] {
+                    if let Ok(rows) = conn.query(q) {
+                        for row in rows {
+                            let result_id: String = format!("{}", row[0]);
+                            // memory_type is at row[3] (r.memory_type) - use column directly for task filter
+                            let memory_type: String = format!("{}", row[3]);
+                            let metadata_str: String = format!("{}", row[7]);
+                            let metadata_val: Value =
+                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                            if is_retired_at(&metadata_val, now) { continue; }
+                            if primary_set.contains(result_id.as_str()) { continue; }
+
+                            // Row-class filters for expansion candidates
+                            // Use memory_type column directly, not metadata (same as one-hop fix)
+                            if !include_tasks && memory_type == "task" { continue; }
+                            if !include_archived && is_archived(&metadata_val) { continue; }
+                            if is_mesh_conflicting(&metadata_val) { continue; }
+
+                            let primary_id: String = format!("{}", row[8]);
+                            let relation: String = format!("{}", row[9]);
+                            let f_id: String = format!("{}", row[10]);
+                            let f_metadata_str: String = format!("{}", row[11]);
+                            let f_metadata: Value =
+                                serde_json::from_str(&f_metadata_str).unwrap_or(Value::Null);
+                            let outgoing: bool = format!("{}", row[12]) == "true";
+
+                            // Retired intermediate invalidates only that path
+                            if is_retired_at(&f_metadata, now) { continue; }
+                            if !supported_labels.contains(&relation.as_str()) { continue; }
+
+                            let (src1, tgt1) = if outgoing {
+                                (primary_id.clone(), f_id.clone())
+                            } else {
+                                (f_id.clone(), primary_id.clone())
+                            };
+                            let edges = vec![
+                                crate::traits::EvidenceEdge {
+                                    source: src1, relation, target: tgt1,
+                                },
+                                crate::traits::EvidenceEdge {
+                                    source: result_id.clone(),
+                                    relation: "GOVERNS".to_string(),
+                                    target: f_id,
+                                },
+                            ];
+                            let kind = crate::traits::EvidenceKind::Governs2hop;
+                            let norm = norm_path(&edges, &kind);
+
+                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                            if entry.payload.is_none() {
+                                let content: String = format!("{}", row[1]);
+                                let user_id: String = format!("{}", row[2]);
+                                let agent_name: String = format!("{}", row[4]);
+                                let location: String = format!("{}", row[5]);
+                                let location_lines: String = format!("{}", row[6]);
+                                entry.payload = Some(MemoryPayload {
+                                    content, user_id, memory_type: memory_type.clone(),
+                                    agent_name: Some(agent_name),
+                                    location, location_lines, metadata: metadata_val,
+                                });
+                            }
+                            // Track distinct primary sources for co-occurrence ranking
+                            entry.primary_sources.insert(primary_id);
+                            if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
+                                entry.evidence.push(crate::traits::SearchEvidence {
+                                    kind,
+                                    explanation: "This memory governs a node one hop from a direct match.".to_string(),
+                                    path: edges,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Process episode-sibling query
+                // Row layout: s.id, s.content, s.user_id, s.memory_type, s.agent_name, s.location, s.location_lines, s.metadata, m.id, t.id, t.metadata
+                if let Ok(rows) = conn.query(&episode_sibling_q) {
+                    for row in rows {
+                        let result_id: String = format!("{}", row[0]);
+                        let content: String = format!("{}", row[1]);
+                        let user_id: String = format!("{}", row[2]);
+                        let memory_type: String = format!("{}", row[3]);
+                        let agent_name: String = format!("{}", row[4]);
+                        let location: String = format!("{}", row[5]);
+                        let location_lines: String = format!("{}", row[6]);
+                        let metadata_str: String = format!("{}", row[7]);
+                        let metadata_val: Value =
+                            serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                        if is_retired_at(&metadata_val, now) { continue; }
+                        if primary_set.contains(result_id.as_str()) { continue; }
+
+                        // Row-class filters for the SIBLING (same as other expansion candidates)
+                        if !include_tasks && memory_type == "task" { continue; }
+                        if !include_archived && is_archived(&metadata_val) { continue; }
+                        if is_mesh_conflicting(&metadata_val) { continue; }
+
+                        let primary_id: String = format!("{}", row[8]); // m.id (originating primary)
+                        let t_id: String = format!("{}", row[9]);     // t.id (intermediate task)
+                        let t_metadata_str: String = format!("{}", row[10]);
+                        let t_metadata: Value =
+                            serde_json::from_str(&t_metadata_str).unwrap_or(Value::Null);
+
+                        // Retired intermediate task invalidates only that path (matching two-hop rule)
+                        if is_retired_at(&t_metadata, now) { continue; }
+
+                        // Evidence path: primary -(EXTRACTED_FROM)-> task <-EXTRACTED_FROM- sibling
+                        let edges = vec![
+                            crate::traits::EvidenceEdge {
+                                source: primary_id.clone(),
+                                relation: "EXTRACTED_FROM".to_string(),
+                                target: t_id.clone(),
+                            },
+                            crate::traits::EvidenceEdge {
+                                source: result_id.clone(),
+                                relation: "EXTRACTED_FROM".to_string(),
+                                target: t_id,
+                            },
+                        ];
+                        let kind = crate::traits::EvidenceKind::EpisodeSibling;
+
+                        let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                        if entry.payload.is_none() {
+                            entry.payload = Some(MemoryPayload {
+                                content, user_id, memory_type,
+                                agent_name: Some(agent_name),
+                                location, location_lines, metadata: metadata_val,
+                            });
+                        }
+                        // Track distinct primary sources for co-occurrence ranking
+                        entry.primary_sources.insert(primary_id);
+                        let norm = norm_path(&edges, &kind);
+                        if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
+                            entry.evidence.push(crate::traits::SearchEvidence {
+                                kind,
+                                explanation: "This memory and a direct match were both extracted from the same task.".to_string(),
+                                path: edges,
+                            });
+                        }
+                    }
+                }
+
+                // Phase 2: Admit DISTINCT result IDs in family order — one-hop
+                // family first, then episode-sibling, then governing-only — capped at `limit` per family.
+                // Within each family, order by co-occurrence count (distinct primary sources) DESC,
+                // then by id ASC for stable tiebreak.
+                let mut candidates: Vec<(usize, usize, String)> = by_id.iter()
+                    .filter_map(|(id, entry)| {
+                        entry.payload.as_ref()?;
+                        let family = if entry.evidence.iter().any(|e| e.kind == crate::traits::EvidenceKind::OneHop) { 0 }
+                            else if entry.evidence.iter().any(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling) { 1 }
+                            else { 2 };
+                        let co_occur = entry.primary_sources.len();
+                        Some((family, co_occur, id.clone()))
+                    })
+                    .collect();
+                // Sort by: family ASC (one-hop, then episode-sibling, then governing), co_occurrence DESC, id ASC
+                candidates.sort_by(|a, b| {
+                    a.0.cmp(&b.0)  // family: 0 (one-hop) before 1 (episode-sibling) before 2 (governing)
+                        .then_with(|| b.1.cmp(&a.1))  // co-occurrence DESC
+                        .then_with(|| a.2.cmp(&b.2))  // id ASC for stable tiebreak
+                });
+                let mut admitted = Vec::new();
+                let mut per_family = [0usize; 3];
+                for (family, _co_occur, id) in &candidates {
+                    if per_family[*family] >= limit {
+                        continue;
+                    }
+                    per_family[*family] += 1;
+                    admitted.push(id.clone());
+                }
+
+                // Phase 3: Build results with capped evidence (max 3 per result).
+                // Score for expansions: use a small constant that sorts after all
+                // real boosted_distance scores but before the old 10.0 sentinel.
+                // The real discriminator is EvidenceKind, not score.
+                const EXPANSION_BASE_SCORE: f32 = 1.0; // sorts after any real boosted_distance (< 1.0 typically)
+                for id in &admitted {
+                    let entry = by_id.remove(id).unwrap();
+                    let payload = entry.payload.unwrap();
+                    let mut evidence = entry.evidence;
+                    // Sort evidence: kind (OneHop < Governs2hop), then path edges
+                    evidence.sort_by(|a, b| {
+                        a.kind.cmp(&b.kind).then_with(|| {
+                            a.path.iter().zip(b.path.iter())
+                                .map(|(ae, be)| ae.source.cmp(&be.source)
+                                    .then(ae.relation.cmp(&be.relation))
+                                    .then(ae.target.cmp(&be.target)))
+                                .find(|o| *o != std::cmp::Ordering::Equal)
+                                .unwrap_or(a.path.len().cmp(&b.path.len()))
+                        })
+                    });
+                    evidence.truncate(3);
+                    results.push(SearchResult {
+                        id: id.clone(),
+                        score: EXPANSION_BASE_SCORE,
+                        payload,
+                        evidence: if evidence.is_empty() { None } else { Some(evidence) },
+                    });
+                }
+            }
+
+            // Final sort: primaries (DirectMatch, real boosted_distance) first,
+            // then expansions (OneHop/Governs2hop, EXPANSION_BASE_SCORE).
+            // Within expansions, the admission order (co-occurrence DESC, family order) is preserved.
+            results.sort_by(|a, b| {
+                let a_is_primary = a.evidence.as_ref().map_or(false, |evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
+                let b_is_primary = b.evidence.as_ref().map_or(false, |evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
+                match (a_is_primary, b_is_primary) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    (true, true) => a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal),
+                    (false, false) => std::cmp::Ordering::Equal, // preserve admission order (stable sort)
+                }
+            });
+
+            // Return limit primaries + their expansions (no truncation to limit*2)
+            // The admission caps already bound expansions to limit per family.
+            Ok(DomainSearchOutcome { results, mode })
+        })
+        .await
+}
 
 pub struct LadybugStore {
     #[allow(dead_code)]
@@ -1009,467 +1528,23 @@ impl VectorStore for LadybugStore {
         include_tasks: bool,
         include_archived: bool,
     ) -> Result<Vec<SearchResult>> {
-        let namespace = namespace.to_string();
-        self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-            let vec_str = format!("[{}]", vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(","));
-            let now = chrono::Utc::now().timestamp();
+        let outcome = search_inner(self, namespace, vector, limit, include_tasks, include_archived, HashSet::new()).await?;
+        Ok(outcome.results)
+    }
 
-            // LadybugDB (the embedder) has no OFFSET, so we over-fetch with a larger LIMIT and
-            // filter/trim in Rust. The multiplier bounds cost: at most
-            // FETCH_MULTIPLIER * limit rows are scanned from the engine.
-            const FETCH_MULTIPLIER: usize = 10;
-            let fetch_limit = limit * FETCH_MULTIPLIER;
-
-            // Step 1: Base vector search.
-            //
-            // Structural nodes are stored with an all-zero embedding, and the
-            // distance from an all-zero row is the query vector's own magnitude
-            // -- the same value for every one of them, whatever was asked. Left
-            // in, they tie with each other and can fill the limit with path
-            // stubs. They stay reachable through the graph expansion in step 2,
-            // which is where they are actually useful.
-            //
-            // ORDER BY dist ASC, id ASC gives deterministic tie-breaking so the
-            // same query returns the same rows across runs.
-            let structural_types = STRUCTURAL_MEMORY_TYPES
-                .iter()
-                .map(|t| format!("'{}'", t))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            // Build the row-class filter for the base query.
-            // We exclude tasks, archived, and mesh-conflicting rows HERE so they
-            // never consume the candidate budget. The server escape hatches
-            // (include_tasks, include_archived) control whether these filters apply.
-            let mut excluded_types = STRUCTURAL_MEMORY_TYPES.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-            if !include_tasks {
-                excluded_types.push("task".to_string());
-            }
-            let excluded_types_str = excluded_types
-                .iter()
-                .map(|t| format!("'{}'", t))
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            let search_query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{}' AND NOT m.memory_type IN [{}] RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
-                safe_ns, excluded_types_str, vec_str, fetch_limit
-            );
-
-            let result = conn.query(&search_query)?;
-            let mut primary_ids = Vec::new();
-            let mut results = Vec::new();
-
-            for row in result {
-                let id: String = format!("{}", row[0]);
-                let distance: f32 = match &row[1] {
-                    lbug::Value::Float(f) if f.is_finite() && *f >= 0.0 => *f,
-                    lbug::Value::Double(d) if d.is_finite() && *d >= 0.0 => *d as f32,
-                    _ => continue,
-                };
-
-                let content: String = format!("{}", row[2]);
-                let user_id: String = format!("{}", row[3]);
-                let memory_type: String = format!("{}", row[4]);
-                let agent_name: String = format!("{}", row[5]);
-                let location: String = format!("{}", row[6]);
-                let location_lines: String = format!("{}", row[7]);
-                let metadata_str: String = format!("{}", row[8]);
-
-                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
-
-                // Skip retired rows -- they do not count toward the limit.
-                if is_retired_at(&metadata_val, now) {
-                    continue;
-                }
-
-                // Row-class filters: archived and mesh-conflicting rows are
-                // filtered HERE in the store so they never consume a primary slot.
-                // The server escape hatches control these filters.
-                if !include_archived && is_archived(&metadata_val) {
-                    continue;
-                }
-                if is_mesh_conflicting(&metadata_val) {
-                    continue;
-                }
-
-                // Usage boost: ln(1+n) gives a real gain even at n=1, and the
-                // cap at half distance preserves semantic ranking order.
-                //
-                // FEATURE-4: provenance earns a share of that same capped
-                // budget. It is added *inside* the cap rather than after it --
-                // subtracting from `distance` a term that was never itself
-                // bounded is how a tie-breaker quietly becomes an override and
-                // starts returning the wrong memory for the right reason.
-                let access_count = metadata_val.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let n = access_count.max(0) as f32;
-                let gain = 0.05 * (1.0 + n).ln();
-                let source_gain = if crate::traits::has_source(&metadata_val) { SOURCE_RANK_GAIN } else { 0.0 };
-                let capped_gain = (gain + source_gain).min(0.5 * distance);
-                let boosted_distance = distance - capped_gain;
-
-                primary_ids.push(id.clone());
-
-                results.push(SearchResult {
-                    id,
-                    score: boosted_distance,
-                    payload: MemoryPayload {
-                        content,
-                        user_id,
-                        memory_type,
-                        agent_name: Some(agent_name),
-                        location,
-                        location_lines,
-                        metadata: metadata_val,
-                    },
-                    evidence: Some(vec![crate::traits::SearchEvidence {
-                        kind: crate::traits::EvidenceKind::DirectMatch,
-                        path: vec![],
-                        explanation: "This memory matched the query vector.".to_string(),
-                    }]),
-                });
-
-                // We have enough active primaries; stop scanning.
-                if results.len() >= limit {
-                    break;
-                }
-            }
-
-            // Step 2: Hybrid GraphRAG — directed evidence expansion.
-            // Four bounded queries replace the old undirected ones, each using
-            // label(e) for the relationship name and an outgoing flag for direction.
-            if !primary_ids.is_empty() {
-                let id_list = primary_ids.iter()
-                    .map(|id| format!("'{}'", escape_ladybug_string(&id)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let supported_labels = ["RELATES_TO", "CONTAINS", "GOVERNS"];
-                let primary_set: std::collections::HashSet<&str> =
-                    primary_ids.iter().map(|s| s.as_str()).collect();
-
-                // One-hop neighbor queries (outgoing and incoming)
-                let neighbor_out_q = format!(
-                    "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, true AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
-                    id_list, safe_ns, id_list, fetch_limit
-                );
-                let neighbor_in_q = format!(
-                    "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, false AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
-                    id_list, safe_ns, id_list, fetch_limit
-                );
-
-                // Two-hop governing queries (outgoing and incoming)
-                let govern_out_q = format!(
-                    "MATCH (a:Memory)-[e]->(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata, a.id, label(e) AS relation, f.id, f.metadata, true AS outgoing ORDER BY r.id ASC, f.id ASC, a.id ASC, relation ASC LIMIT {}",
-                    id_list, safe_ns, id_list, fetch_limit
-                );
-                let govern_in_q = format!(
-                    "MATCH (a:Memory)<-[e]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata, a.id, label(e) AS relation, f.id, f.metadata, false AS outgoing ORDER BY r.id ASC, f.id ASC, a.id ASC, relation ASC LIMIT {}",
-                    id_list, safe_ns, id_list, fetch_limit
-                );
-
-                // Episode-sibling query: memories extracted from the same task.
-                // Symmetric through the task: (m:Memory)-[:EXTRACTED_FROM]->(t:Memory)<-[:EXTRACTED_FROM]-(s:Memory)
-                // m = originating primary, t = intermediate task, s = sibling candidate.
-                let episode_sibling_q = format!(
-                    "MATCH (m:Memory)-[:EXTRACTED_FROM]->(t:Memory)<-[:EXTRACTED_FROM]-(s:Memory) WHERE m.id IN [{}] AND s.namespace = '{}' AND NOT s.id IN [{}] RETURN DISTINCT s.id, s.content, s.user_id, s.memory_type, s.agent_name, s.location, s.location_lines, s.metadata, m.id, t.id, t.metadata ORDER BY s.id ASC, m.id ASC, t.id ASC LIMIT {}",
-                    id_list, safe_ns, id_list, fetch_limit
-                );
-
-                // Phase 1: Read all rows, build evidence, group by result ID.
-                // Value: (payload, evidence_list, co_occurrence_count).
-                // co_occurrence_count = number of DISTINCT originating primaries that reach this candidate.
-                #[derive(Default)]
-                struct CandidateEntry {
-                    payload: Option<MemoryPayload>,
-                    evidence: Vec<crate::traits::SearchEvidence>,
-                    primary_sources: std::collections::HashSet<String>,
-                }
-                let mut by_id: std::collections::HashMap<String, CandidateEntry> =
-                    std::collections::HashMap::new();
-
-                // Process one-hop neighbor queries (4 directed branches total).
-                for q in [&neighbor_out_q, &neighbor_in_q] {
-                    if let Ok(rows) = conn.query(q) {
-                        for row in rows {
-                            let result_id: String = format!("{}", row[0]);
-                            let content: String = format!("{}", row[1]);
-                            let user_id: String = format!("{}", row[2]);
-                            let memory_type: String = format!("{}", row[3]);
-                            let agent_name: String = format!("{}", row[4]);
-                            let location: String = format!("{}", row[5]);
-                            let location_lines: String = format!("{}", row[6]);
-                            let metadata_str: String = format!("{}", row[7]);
-                            let metadata_val: Value =
-                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
-                            if is_retired_at(&metadata_val, now) { continue; }
-                            if primary_set.contains(result_id.as_str()) { continue; }
-
-                            // Row-class filters for expansion candidates (same as primaries)
-                            // Use memory_type column directly, not metadata
-                            if !include_tasks && memory_type == "task" { continue; }
-                            if !include_archived && is_archived(&metadata_val) { continue; }
-                            if is_mesh_conflicting(&metadata_val) { continue; }
-
-                            let primary_id: String = format!("{}", row[8]);
-                            let relation: String = format!("{}", row[9]);
-                            let outgoing: bool = format!("{}", row[10]) == "true";
-                            if !supported_labels.contains(&relation.as_str()) { continue; }
-
-                            let (src, tgt) = if outgoing {
-                                (primary_id.clone(), result_id.clone())
-                            } else {
-                                (result_id.clone(), primary_id.clone())
-                            };
-                            let edges = vec![crate::traits::EvidenceEdge {
-                                source: src.clone(), relation: relation.clone(), target: tgt.clone(),
-                            }];
-                            let kind = crate::traits::EvidenceKind::OneHop;
-                            let norm = norm_path(&edges, &kind);
-
-                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
-                            if entry.payload.is_none() {
-                                entry.payload = Some(MemoryPayload {
-                                    content, user_id, memory_type,
-                                    agent_name: Some(agent_name),
-                                    location, location_lines, metadata: metadata_val,
-                                });
-                            }
-                            // Track distinct primary sources for co-occurrence ranking
-                            entry.primary_sources.insert(primary_id);
-                            if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
-                                entry.evidence.push(crate::traits::SearchEvidence {
-                                    kind,
-                                    explanation: "This memory is one graph hop from a direct match.".to_string(),
-                                    path: edges,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Process two-hop governing queries
-                for q in [&govern_out_q, &govern_in_q] {
-                    if let Ok(rows) = conn.query(q) {
-                        for row in rows {
-                            let result_id: String = format!("{}", row[0]);
-                            // memory_type is at row[3] (r.memory_type) - use column directly for task filter
-                            let memory_type: String = format!("{}", row[3]);
-                            let metadata_str: String = format!("{}", row[7]);
-                            let metadata_val: Value =
-                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
-                            if is_retired_at(&metadata_val, now) { continue; }
-                            if primary_set.contains(result_id.as_str()) { continue; }
-
-                            // Row-class filters for expansion candidates
-                            // Use memory_type column directly, not metadata (same as one-hop fix)
-                            if !include_tasks && memory_type == "task" { continue; }
-                            if !include_archived && is_archived(&metadata_val) { continue; }
-                            if is_mesh_conflicting(&metadata_val) { continue; }
-
-                            let primary_id: String = format!("{}", row[8]);
-                            let relation: String = format!("{}", row[9]);
-                            let f_id: String = format!("{}", row[10]);
-                            let f_metadata_str: String = format!("{}", row[11]);
-                            let f_metadata: Value =
-                                serde_json::from_str(&f_metadata_str).unwrap_or(Value::Null);
-                            let outgoing: bool = format!("{}", row[12]) == "true";
-
-                            // Retired intermediate invalidates only that path
-                            if is_retired_at(&f_metadata, now) { continue; }
-                            if !supported_labels.contains(&relation.as_str()) { continue; }
-
-                            let (src1, tgt1) = if outgoing {
-                                (primary_id.clone(), f_id.clone())
-                            } else {
-                                (f_id.clone(), primary_id.clone())
-                            };
-                            let edges = vec![
-                                crate::traits::EvidenceEdge {
-                                    source: src1, relation, target: tgt1,
-                                },
-                                crate::traits::EvidenceEdge {
-                                    source: result_id.clone(),
-                                    relation: "GOVERNS".to_string(),
-                                    target: f_id,
-                                },
-                            ];
-                            let kind = crate::traits::EvidenceKind::Governs2hop;
-                            let norm = norm_path(&edges, &kind);
-
-                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
-                            if entry.payload.is_none() {
-                                let content: String = format!("{}", row[1]);
-                                let user_id: String = format!("{}", row[2]);
-                                let agent_name: String = format!("{}", row[4]);
-                                let location: String = format!("{}", row[5]);
-                                let location_lines: String = format!("{}", row[6]);
-                                entry.payload = Some(MemoryPayload {
-                                    content, user_id, memory_type: memory_type.clone(),
-                                    agent_name: Some(agent_name),
-                                    location, location_lines, metadata: metadata_val,
-                                });
-                            }
-                            // Track distinct primary sources for co-occurrence ranking
-                            entry.primary_sources.insert(primary_id);
-                            if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
-                                entry.evidence.push(crate::traits::SearchEvidence {
-                                    kind,
-                                    explanation: "This memory governs a node one hop from a direct match.".to_string(),
-                                    path: edges,
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Process episode-sibling query
-                // Row layout: s.id, s.content, s.user_id, s.memory_type, s.agent_name, s.location, s.location_lines, s.metadata, m.id, t.id, t.metadata
-                if let Ok(rows) = conn.query(&episode_sibling_q) {
-                    for row in rows {
-                        let result_id: String = format!("{}", row[0]);
-                        let content: String = format!("{}", row[1]);
-                        let user_id: String = format!("{}", row[2]);
-                        let memory_type: String = format!("{}", row[3]);
-                        let agent_name: String = format!("{}", row[4]);
-                        let location: String = format!("{}", row[5]);
-                        let location_lines: String = format!("{}", row[6]);
-                        let metadata_str: String = format!("{}", row[7]);
-                        let metadata_val: Value =
-                            serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
-                        if is_retired_at(&metadata_val, now) { continue; }
-                        if primary_set.contains(result_id.as_str()) { continue; }
-
-                        // Row-class filters for the SIBLING (same as other expansion candidates)
-                        if !include_tasks && memory_type == "task" { continue; }
-                        if !include_archived && is_archived(&metadata_val) { continue; }
-                        if is_mesh_conflicting(&metadata_val) { continue; }
-
-                        let primary_id: String = format!("{}", row[8]); // m.id (originating primary)
-                        let t_id: String = format!("{}", row[9]);     // t.id (intermediate task)
-                        let t_metadata_str: String = format!("{}", row[10]);
-                        let t_metadata: Value =
-                            serde_json::from_str(&t_metadata_str).unwrap_or(Value::Null);
-
-                        // Retired intermediate task invalidates only that path (matching two-hop rule)
-                        if is_retired_at(&t_metadata, now) { continue; }
-
-                        // Evidence path: primary -(EXTRACTED_FROM)-> task <-EXTRACTED_FROM- sibling
-                        let edges = vec![
-                            crate::traits::EvidenceEdge {
-                                source: primary_id.clone(),
-                                relation: "EXTRACTED_FROM".to_string(),
-                                target: t_id.clone(),
-                            },
-                            crate::traits::EvidenceEdge {
-                                source: result_id.clone(),
-                                relation: "EXTRACTED_FROM".to_string(),
-                                target: t_id,
-                            },
-                        ];
-                        let kind = crate::traits::EvidenceKind::EpisodeSibling;
-
-                        let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
-                        if entry.payload.is_none() {
-                            entry.payload = Some(MemoryPayload {
-                                content, user_id, memory_type,
-                                agent_name: Some(agent_name),
-                                location, location_lines, metadata: metadata_val,
-                            });
-                        }
-                        // Track distinct primary sources for co-occurrence ranking
-                        entry.primary_sources.insert(primary_id);
-                        let norm = norm_path(&edges, &kind);
-                        if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
-                            entry.evidence.push(crate::traits::SearchEvidence {
-                                kind,
-                                explanation: "This memory and a direct match were both extracted from the same task.".to_string(),
-                                path: edges,
-                            });
-                        }
-                    }
-                }
-
-                // Phase 2: Admit DISTINCT result IDs in family order — one-hop
-                // family first, then episode-sibling, then governing-only — capped at `limit` per family.
-                // Within each family, order by co-occurrence count (distinct primary sources) DESC,
-                // then by id ASC for stable tiebreak.
-                let mut candidates: Vec<(usize, usize, String)> = by_id.iter()
-                    .filter_map(|(id, entry)| {
-                        entry.payload.as_ref()?;
-                        let family = if entry.evidence.iter().any(|e| e.kind == crate::traits::EvidenceKind::OneHop) { 0 }
-                            else if entry.evidence.iter().any(|e| e.kind == crate::traits::EvidenceKind::EpisodeSibling) { 1 }
-                            else { 2 };
-                        let co_occur = entry.primary_sources.len();
-                        Some((family, co_occur, id.clone()))
-                    })
-                    .collect();
-                // Sort by: family ASC (one-hop, then episode-sibling, then governing), co_occurrence DESC, id ASC
-                candidates.sort_by(|a, b| {
-                    a.0.cmp(&b.0)  // family: 0 (one-hop) before 1 (episode-sibling) before 2 (governing)
-                        .then_with(|| b.1.cmp(&a.1))  // co-occurrence DESC
-                        .then_with(|| a.2.cmp(&b.2))  // id ASC for stable tiebreak
-                });
-                let mut admitted = Vec::new();
-                let mut per_family = [0usize; 3];
-                for (family, _co_occur, id) in &candidates {
-                    if per_family[*family] >= limit {
-                        continue;
-                    }
-                    per_family[*family] += 1;
-                    admitted.push(id.clone());
-                }
-
-                // Phase 3: Build results with capped evidence (max 3 per result).
-                // Score for expansions: use a small constant that sorts after all
-                // real boosted_distance scores but before the old 10.0 sentinel.
-                // The real discriminator is EvidenceKind, not score.
-                const EXPANSION_BASE_SCORE: f32 = 1.0; // sorts after any real boosted_distance (< 1.0 typically)
-                for id in &admitted {
-                    let entry = by_id.remove(id).unwrap();
-                    let payload = entry.payload.unwrap();
-                    let mut evidence = entry.evidence;
-                    // Sort evidence: kind (OneHop < Governs2hop), then path edges
-                    evidence.sort_by(|a, b| {
-                        a.kind.cmp(&b.kind).then_with(|| {
-                            a.path.iter().zip(b.path.iter())
-                                .map(|(ae, be)| ae.source.cmp(&be.source)
-                                    .then(ae.relation.cmp(&be.relation))
-                                    .then(ae.target.cmp(&be.target)))
-                                .find(|o| *o != std::cmp::Ordering::Equal)
-                                .unwrap_or(a.path.len().cmp(&b.path.len()))
-                        })
-                    });
-                    evidence.truncate(3);
-                    results.push(SearchResult {
-                        id: id.clone(),
-                        score: EXPANSION_BASE_SCORE,
-                        payload,
-                        evidence: if evidence.is_empty() { None } else { Some(evidence) },
-                    });
-                }
-            }
-
-            // Final sort: primaries (DirectMatch, real boosted_distance) first,
-            // then expansions (OneHop/Governs2hop, EXPANSION_BASE_SCORE).
-            // Within expansions, the admission order (co-occurrence DESC, family order) is preserved.
-            results.sort_by(|a, b| {
-                let a_is_primary = a.evidence.as_ref().map_or(false, |evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
-                let b_is_primary = b.evidence.as_ref().map_or(false, |evs| evs.iter().any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch));
-                match (a_is_primary, b_is_primary) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    (true, true) => a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal),
-                    (false, false) => std::cmp::Ordering::Equal, // preserve admission order (stable sort)
-                }
-            });
-
-            // Return limit primaries + their expansions (no truncation to limit*2)
-            // The admission caps already bound expansions to limit per family.
-            Ok(results)
-        })
-        .await
+    async fn search_with_domain(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        domains: &[String],
+    ) -> Result<DomainSearchOutcome> {
+        // Build the normalized domain key set before entering the closure.
+        // The closure requires an owned HashSet because with_conn needs FnOnce + Send + 'static.
+        let domain_keys: HashSet<String> = domains.iter().cloned().collect();
+        search_inner(self, namespace, vector, limit, include_tasks, include_archived, domain_keys).await
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
@@ -5624,6 +5699,117 @@ eurostrata\src\daemon.rs",
             ep_sib.is_some(),
             "EpisodeSibling evidence should be present for server rendering"
         );
+    }
+
+    // --- TASK 2 tests: domain-filtered search ---
+
+    #[tokio::test]
+    async fn a_domain_filter_narrows_the_candidates_to_the_matching_domain() {
+        let dir = std::env::temp_dir().join(format!("ns-domain-filter-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let zero = vec![0.0f32; 4];
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+
+        // Two facts with different domains
+        store
+            .upsert(
+                "probe",
+                "auth-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "domain": "auth" })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "database-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "domain": "database" })),
+            )
+            .await
+            .unwrap();
+
+        // Search with domain filter for "database" only
+        let outcome = store
+            .search_with_domain("probe", query_vec, 10, false, false, &["database".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"database-fact"), "database-fact should be returned");
+        assert!(!ids.contains(&"auth-fact"), "auth-fact should be filtered out");
+    }
+
+    #[tokio::test]
+    async fn a_domain_filter_that_would_empty_the_candidates_falls_back_to_the_unfiltered_rows() {
+        let dir = std::env::temp_dir().join(format!("ns-domain-fallback-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let zero = vec![0.0f32; 4];
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+
+        // One fact with domain "auth"
+        store
+            .upsert(
+                "probe",
+                "auth-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "domain": "auth" })),
+            )
+            .await
+            .unwrap();
+
+        // Search with domain filter for "database" (no match)
+        let outcome = store
+            .search_with_domain("probe", query_vec, 10, false, false, &["database".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Vector);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"auth-fact"), "auth-fact should be returned via fallback");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_free_text_domain_matches_the_slug_at_comparison_time() {
+        let dir = std::env::temp_dir().join(format!("ns-domain-legacy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let zero = vec![0.0f32; 4];
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+
+        // One fact with legacy free-text domain "Database Access"
+        // Seeded straight into the store (not through the add path)
+        store
+            .upsert(
+                "probe",
+                "legacy-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({ "domain": "Database Access" })),
+            )
+            .await
+            .unwrap();
+
+        // Search with the normalized slug "database-access"
+        let outcome = store
+            .search_with_domain("probe", query_vec, 10, false, false, &["database-access".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.mode, crate::traits::DomainMatchMode::Domain);
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"legacy-fact"), "legacy-fact should match the normalized slug");
+
+        // Verify the stored metadata still has the original free-text value
+        let legacy = outcome.results.iter().find(|r| r.id == "legacy-fact").unwrap();
+        let stored_domain = legacy.payload.metadata.get("domain").and_then(|v| v.as_str());
+        assert_eq!(stored_domain, Some("Database Access"), "stored domain must remain unchanged");
     }
 
     /// The thread that runs the engine must have an alternate signal stack
