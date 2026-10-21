@@ -23,9 +23,10 @@ pub struct MeshRecord {
     pub schema_version: String,
     pub id: Uuid,
     pub namespace: String,
-    /// Memory type from the NeuroStrata vocabulary: `rule`, `fact`,
-    /// `procedure`, or `structural`. The mesh is closed over this set; an
-    /// unknown value is rejected at import time.
+    /// Memory type from the NeuroStrata vocabulary: `rule`, `fact`, or
+    /// `procedure`. The mesh is closed over this set (`SHAREABLE_MEMORY_TYPES`
+    /// in `synaptic_mesh/import.rs`); an unknown value — including
+    /// `structural` — is rejected at import time.
     pub memory_type: String,
     pub lifecycle: Lifecycle,
     /// Type-specific content. For `procedure`, this carries the definition
