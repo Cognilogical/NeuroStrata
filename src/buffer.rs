@@ -6,6 +6,10 @@
 
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::Arc;
+
+use crate::domain::normalize_domain_slug;
+use crate::traits::{DomainMatchMode, Embedder, VectorStore};
 
 /// Roll `current.md` once it would cross this size (README: 500KB).
 const ROLLOVER_BYTES: u64 = 500 * 1024;
@@ -126,7 +130,11 @@ fn prune_rolled(sessions: &Path, retention_days: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-pub async fn handle_append_log(arguments: Value) -> String {
+pub async fn handle_append_log(
+    arguments: Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
     let content = match arguments.get("content").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.to_string(),
         _ => {
@@ -161,28 +169,142 @@ pub async fn handle_append_log(arguments: Value) -> String {
             .to_string();
     }
 
-    match append_entry(
+    // Resolve namespace
+    let namespace_arg = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let namespace = if let Some(ns) = namespace_arg {
+        ns
+    } else {
+        project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| "default".to_string())
+    };
+    let namespace = crate::server::resolve_namespace(&store, &namespace).await;
+
+    // Build the query and key set from normalized tags
+    let slugs: Vec<String> = tags
+        .iter()
+        .filter_map(|t| normalize_domain_slug(t))
+        .collect();
+
+    // First, do the append
+    let append_result = append_entry(
         &project_root,
         &content,
         &tags,
         ROLLOVER_BYTES,
         config.retention_days,
-    ) {
-        Ok(outcome) => json!({
-            "appended": true,
-            "file": outcome.file,
-            "size_bytes": outcome.size_bytes,
-            "rolled": outcome.rolled,
-            "tags": tags,
-        })
-        .to_string(),
-        Err(e) => format!("ERROR: could not append to the Episodic Buffer: {}", e),
-    }
+    );
+
+    // Helper to build an error response from append_result
+    let build_append_response = |res: &Result<Outcome, std::io::Error>, recalled: Vec<Value>, recalled_from: Option<&str>| -> String {
+        let mut resp = match res {
+            Ok(outcome) => json!({
+                "appended": true,
+                "file": outcome.file,
+                "size_bytes": outcome.size_bytes,
+                "rolled": outcome.rolled,
+                "tags": tags,
+            }),
+            Err(_) => json!({
+                "appended": true,
+                "file": "",
+                "size_bytes": 0,
+                "rolled": false,
+                "tags": tags,
+            }),
+        };
+        resp["recalled"] = json!(recalled);
+        if let Some(mode) = recalled_from {
+            resp["recalled_from"] = json!(mode);
+        }
+        resp.to_string()
+    };
+
+    // Then run the recall if we have slugs
+    let (recalled, recalled_from) = if slugs.is_empty() {
+        (vec![], None)
+    } else {
+        // Embed the joined query once
+        let query = slugs.join(" ");
+        let vec = match emb.embed(&query).await {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!("Failed to generate embedding for recall");
+                return build_append_response(&append_result, vec![], None);
+            }
+        };
+
+        // Initialize namespace before searching
+        if let Err(e) = store.init(&namespace).await {
+            tracing::warn!("Failed to initialize namespace for recall: {}", e);
+            return build_append_response(&append_result, vec![], None);
+        }
+
+        // Run the recall search
+        let outcome = match store
+            .search_with_domain(
+                &namespace,
+                vec,
+                3,              // limit = 3
+                false,          // include_tasks = false
+                false,          // include_archived = false
+                &slugs,
+            )
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("Recall search failed: {}", e);
+                return build_append_response(&append_result, vec![], None);
+            }
+        };
+
+        // Keep only direct matches
+        let direct_matches: Vec<_> = outcome
+            .results
+            .into_iter()
+            .filter(|res| {
+                res.evidence.as_ref().map_or(false, |evs| {
+                    evs.iter()
+                        .any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch)
+                })
+            })
+            .take(3)
+            .map(|res| {
+                let domain = crate::domain::domain_key(&res.payload.metadata);
+                let snippet = res.payload.content.chars().take(120).collect::<String>();
+                json!({
+                    "id": res.id,
+                    "memory_type": res.payload.memory_type,
+                    "domain": domain,
+                    "score": res.score,
+                    "snippet": snippet,
+                })
+            })
+            .collect();
+
+        let recalled_from_str = match outcome.mode {
+            DomainMatchMode::Domain => Some("domain"),
+            DomainMatchMode::Vector => Some("vector"),
+        };
+
+        (direct_matches, recalled_from_str)
+    };
+
+    // Build the response
+    build_append_response(&append_result, recalled, recalled_from.as_deref())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guard::testkit::{MockStore, StubEmbedder};
+    use std::sync::Arc;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -242,10 +364,16 @@ mod tests {
     #[tokio::test]
     async fn disabled_mode_is_a_no_op() {
         let root = scratch("off");
-        let result = handle_append_log(json!({
-            "content": "hello",
-            "project_root": root.display().to_string(),
-        }))
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        let result = handle_append_log(
+            json!({
+                "content": "hello",
+                "project_root": root.display().to_string(),
+            }),
+            emb,
+            store,
+        )
         .await;
         // Whether this no-ops depends on the machine's config; when disabled the
         // file must not exist, and when enabled the append must succeed. Both
@@ -259,5 +387,276 @@ mod tests {
         } else {
             assert!(result.contains("\"appended\":true"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_tagged_turn_recalls_the_matching_fact() {
+        let root = scratch("recall-match");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        // Store a fact with domain "Database Access" (normalizes to "database-access")
+        let fact_id = "fact-1";
+        let mut payload = crate::traits::MemoryPayload {
+            content: "Use connection pooling for database access".to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "domain": "Database Access" }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload.clone())
+            .await
+            .unwrap();
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on db",
+                "project_root": root.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert!(recalled.is_array());
+        let recalled_arr = recalled.as_array().unwrap();
+        assert_eq!(recalled_arr.len(), 1, "exactly one fact recalled: {}", result);
+        assert_eq!(recalled_arr[0].get("id").and_then(|v| v.as_str()), Some(fact_id));
+        assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+    }
+
+    #[tokio::test]
+    async fn the_recall_never_exceeds_three_entries_or_a_120_character_snippet() {
+        let root = scratch("recall-cap");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        // Store 4 facts with long content
+        for i in 1..=4 {
+            let fact_id = format!("fact-{}", i);
+            let long_content = "x".repeat(200);
+            let mut payload = crate::traits::MemoryPayload {
+                content: long_content,
+                user_id: "tester".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({ "domain": "database-access" }),
+            };
+            store
+                .upsert("probe", &fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+                .await
+                .unwrap();
+        }
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on db",
+                "project_root": root.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        let recalled_arr = recalled.as_array().unwrap();
+        assert!(recalled_arr.len() <= 3, "at most 3 entries recalled, got {}", recalled_arr.len());
+        for entry in recalled_arr {
+            let snippet = entry.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                snippet.chars().count() <= 120,
+                "snippet exceeds 120 chars: {} (len={})",
+                snippet,
+                snippet.chars().count()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_untagged_turn_recalls_nothing_and_costs_no_embedding() {
+        let root = scratch("recall-untagged");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        // Store a fact
+        let fact_id = "fact-1";
+        let mut payload = crate::traits::MemoryPayload {
+            content: "some fact".to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "domain": "database-access" }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on something",
+                "project_root": root.display().to_string(),
+                "namespace": "probe",
+                // no tags
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert_eq!(recalled.as_array().unwrap().len(), 0, "recalled must be empty array");
+        // No recalled_from key at all when no search ran
+        assert!(
+            parsed.get("recalled_from").is_none(),
+            "recalled_from must be absent when no search ran: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tag_that_normalizes_to_nothing_is_dropped() {
+        let root = scratch("recall-normalize-nothing");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        // Store a fact
+        let fact_id = "fact-1";
+        let mut payload = crate::traits::MemoryPayload {
+            content: "some fact".to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "domain": "database-access" }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        // Tags that normalize to nothing
+        let result = handle_append_log(
+            json!({
+                "content": "working on something",
+                "project_root": root.display().to_string(),
+                "tags": ["!!!", "  "],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert_eq!(recalled.as_array().unwrap().len(), 0, "recalled must be empty array");
+        assert!(
+            parsed.get("recalled_from").is_none(),
+            "recalled_from must be absent when tags normalize to nothing: {}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recall_never_moves_an_access_count() {
+        let root = scratch("recall-no-access-count");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        // Store a fact
+        let fact_id = "fact-1";
+        let mut payload = crate::traits::MemoryPayload {
+            content: "some fact".to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "domain": "database-access" }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let initial_increments = store.incremented_ids().len();
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on db",
+                "project_root": root.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let final_increments = store.incremented_ids().len();
+        assert_eq!(
+            final_increments, initial_increments,
+            "increment_access_count must not be called during recall; got {} new increments",
+            final_increments - initial_increments
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn a_failed_search_does_not_fail_the_append() {
+        let root = scratch("recall-failed-search");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+        // Make search_with_domain fail
+        store.set_search_fails(true);
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on db",
+                "project_root": root.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        assert_eq!(recalled.as_array().unwrap().len(), 0, "recalled must be empty array on error");
+        assert!(
+            parsed.get("recalled_from").is_none(),
+            "recalled_from must be absent when search failed: {}",
+            result
+        );
     }
 }

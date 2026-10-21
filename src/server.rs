@@ -375,7 +375,8 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "content": { "type": "string", "description": "The log entry: what just happened, what changed, what was decided." },
                                 "project_root": { "type": "string", "description": "Absolute path to the project root; the buffer lives at <project_root>/.NeuroStrata/sessions/." },
-                                "tags": { "type": "array", "items": { "type": "string" }, "description": "Topic tags for this turn (e.g. ['auth', 'database']). When present, a Topic Switch marker is injected." }
+                                "tags": { "type": "array", "items": { "type": "string" }, "description": "Topic tags for this turn (e.g. ['auth', 'database']). When present, a Topic Switch marker is injected." },
+                                "namespace": { "type": "string", "description": "The exact project name. Optional: defaults to the project root's directory name, resolved against the known namespaces." }
                             },
                             "required": ["content", "project_root"]
                         }
@@ -662,7 +663,7 @@ pub async fn process_mcp_request(
                             .await;
                         }
                         "neurostrata_append_log" => {
-                            result_text = crate::buffer::handle_append_log(arguments).await;
+                            result_text = crate::buffer::handle_append_log(arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_guard_validate" => {
                             result_text = handle_guard_validate(
@@ -5821,5 +5822,72 @@ mod tests {
             !text.contains(&conflicting_id),
             "the conflicting row is never served, even under include_archived: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_fact_written_with_a_free_text_domain_is_recalled_by_its_slug_tag() {
+        let dir = std::env::temp_dir().join(format!(
+            "ns-recall-real-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        store.init("probe").await.expect("init");
+
+        // Write a fact with free-text domain "Database Access" (normalizes to "database-access")
+        let add_result = handle_add_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "create_new_namespace": true,
+                "memory_type": "fact",
+                "content": "Use connection pooling for database access",
+                "domain": "Database Access",
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(add_result.starts_with("Successfully added memory"), "add failed: {}", add_result);
+        // Extract the fact ID from the response
+        let fact_id = add_result
+            .lines()
+            .find(|l| l.starts_with("Memory ID: "))
+            .map(|l| l[11..].trim().to_string())
+            .expect("fact ID in response");
+
+        // Now recall via append_log with the slug tag
+        let recall_result = crate::buffer::handle_append_log(
+            serde_json::json!({
+                "content": "working on db",
+                "project_root": dir.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&recall_result).unwrap();
+        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+        let recalled = parsed.get("recalled").expect("recalled field must be present");
+        let recalled_arr = recalled.as_array().unwrap();
+        assert_eq!(recalled_arr.len(), 1, "exactly one fact recalled: {}", recall_result);
+        assert_eq!(
+            recalled_arr[0].get("id").and_then(|v| v.as_str()),
+            Some(fact_id.as_str())
+        );
+        assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+
+        // Verify access_count was not incremented (still 0)
+        let hit_count = store
+            .get("probe", &fact_id)
+            .await
+            .unwrap()
+            .and_then(|(_, p)| p.metadata.get("hit_count").and_then(|v| v.as_u64()))
+            .unwrap_or(0);
+        assert_eq!(hit_count, 0, "access_count must not be incremented by recall");
     }
 }
