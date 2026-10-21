@@ -81,6 +81,8 @@ impl VectorStore for StoreNotAttached {
         _namespace: &str,
         _vector: Vec<f32>,
         _limit: usize,
+        _include_tasks: bool,
+        _include_archived: bool,
     ) -> anyhow::Result<Vec<SearchResult>> {
         Err(Self::err())
     }
@@ -849,6 +851,8 @@ mod tests {
             _namespace: &str,
             _vector: Vec<f32>,
             _limit: usize,
+            _include_tasks: bool,
+            _include_archived: bool,
         ) -> anyhow::Result<Vec<SearchResult>> {
             Err(anyhow!("recording store: unused by this test"))
         }

@@ -1150,7 +1150,10 @@ pub(crate) async fn embed_dedup_and_upsert(
         .map_err(|_| "Failed to generate embedding.".to_string())?;
     // Check for duplicates if deduplication is enabled
     if let Some(checker) = dedup {
-        if let Ok(candidates) = store.search(namespace, vector.clone(), 5).await {
+        if let Ok(candidates) = store
+            .search(namespace, vector.clone(), 5, false, false)
+            .await
+        {
             // Filter to only high-similarity candidates
             let similar: Vec<_> = candidates.into_iter().filter(|c| c.score >= 0.85).collect();
 
@@ -1160,7 +1163,7 @@ pub(crate) async fn embed_dedup_and_upsert(
                     if !duplicates.is_empty() {
                         let dup = &duplicates[0];
                         return Err(format!(
-                            "Potential duplicate detected: Memory is similar to existing memory {} (confidence: {:.2}). Use neurostrata_edit_memory to update the existing memory instead.",
+                            "Potential duplicate detected: Memory is similar to existing memory {} (confidence: {:.2}). Use neurostrata_supersede_memory to update the existing memory instead.",
                             dup.existing_memory_id, dup.confidence
                         ));
                     }
@@ -1967,53 +1970,56 @@ async fn handle_search_memory(
     let namespace = namespace.as_str();
 
     // Task rows are backlog chatter, not recall material: excluded unless the
-    // caller asks for them (section 1.1). The over-fetch keeps a full page
-    // after the filter, then trims back to the promised five.
+    // caller asks for them (section 1.1).
     let include_tasks = arguments
         .get("include_tasks")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let fetch = if include_tasks { 5 } else { 15 };
+    // `archive_memory` writes the tombstone; the search surface
+    // honors it by default. The escape hatch (`include_archived:
+    // true`) is for audits, recovery, and any deliberate
+    // second-look -- the operator who needs to find a row that
+    // has been retired from default recall.
+    let include_archived = arguments
+        .get("include_archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // The store now applies row-class filters and returns `limit` primaries
+    // plus their bounded expansions. We ask for 5 primaries (the default page).
+    const DEFAULT_LIMIT: usize = 5;
 
     if let Ok(_) = store.init(namespace).await {
         if let Ok(vec) = emb.embed(&query).await {
-            if let Ok(fetched) = store.search(namespace, vec, fetch).await {
-                let mut results = fetched;
-                // `archive_memory` writes the tombstone; the search surface
-                // honors it by default. The escape hatch (`include_archived:
-                // true`) is for audits, recovery, and any deliberate
-                // second-look -- the operator who needs to find a row that
-                // has been retired from default recall.
-                let include_archived = arguments
-                    .get("include_archived")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if !include_tasks {
-                    results.retain(|r| r.payload.memory_type != "task");
-                }
-                if !include_archived {
-                    results.retain(|r| !crate::handlers::archive_memory::is_archived(&r.payload));
-                }
-                // Conflicting mesh rows are suppressed from the effective
-                // view (spec §"Concurrent merge policy"): the local accepted
-                // projection may be stale, and the incoming variant is
-                // preserved in the conflict overlay for a human to resolve.
-                // Honesty: a conflicting row still carries
-                // `metadata.mesh.conflict` if it ever surfaces another way.
-                results.retain(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload));
-                results.truncate(5);
+            if let Ok(results) = store
+                .search(
+                    namespace,
+                    vec,
+                    DEFAULT_LIMIT,
+                    include_tasks,
+                    include_archived,
+                )
+                .await
+            {
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
                 } else {
+                    // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
                     for res in &results {
-                        let store_clone = store.clone();
-                        let ns_clone = namespace.to_string();
-                        let id_clone = res.id.clone();
-                        tokio::spawn(async move {
-                            let _ = store_clone
-                                .increment_access_count(&ns_clone, &id_clone)
-                                .await;
+                        let is_direct_hit = res.evidence.as_ref().map_or(false, |evs| {
+                            evs.iter()
+                                .any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch)
                         });
+                        if is_direct_hit {
+                            let store_clone = store.clone();
+                            let ns_clone = namespace.to_string();
+                            let id_clone = res.id.clone();
+                            tokio::spawn(async move {
+                                let _ = store_clone
+                                    .increment_access_count(&ns_clone, &id_clone)
+                                    .await;
+                            });
+                        }
                     }
 
                     render_search_results(&results)

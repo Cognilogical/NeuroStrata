@@ -4,6 +4,32 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [Unreleased] - 2026-10-20
+
+### Fixed
+
+- **The graph expansion never reached the caller.** The store computed one-hop and two-hop evidence and the read path then threw it away. Expansion rows were identifiable only by a magic score constant, the store's limit counted rows the caller could not use, and the row-class filters ran *after* the candidate budget had been spent — so an excluded row could take a slot that a real memory never got. Expansion is now a first-class result: direct matches and expanded rows are told apart by evidence kind (`EvidenceKind::DirectMatch` versus `OneHop` / `Governs2hop`) rather than by a magic number; `limit` counts recall-eligible primaries and the bounded expansions ride along with them; and the row-class filters (`task`, tombstoned, mesh-conflicting) are applied in the store, before the budget is spent. `access_count` now moves for direct hits only — an expanded row is evidence, not a read.
+- **The expansion ranked by accident.** Candidates inside a family were ordered by id, so a UUID decided which memory surfaced first. They are now ordered by how many distinct direct matches reach them, descending — a memory several hits point at is the better answer — with the family order and the per-family caps unchanged and the id kept as the tiebreak.
+- **The guard recorded triggers that never happened.** `rule_ids_triggered` listed the top candidate rules before the deprecated check and before the trigger was matched, and it was reported on passes too, so a verdict claimed rules that had not fired. It now lists only the rules that actually triggered, and `hit_count` — written once at creation and never again — counts firings.
+- **A stale tool name in the duplicate-rejection message.** The message told agents to call `neurostrata_edit_memory`, a tool that is no longer in `tools/list`; it now names `neurostrata_supersede_memory`.
+
+### Changed
+
+- **`VectorStore::search` takes the row-class filters.** The signature gained `include_tasks` and `include_archived`, because the store is now the single place that decides which rows are recall-eligible. Any other implementor of the trait must be updated.
+
+### Documentation (erratum)
+
+- **ERRATUM — the "Tantivy FTS Hybrid Search / Reciprocal Rank Fusion" description of retrieval never matched the code.** The entry shipped in the 1.0.0 section below ("**Tantivy FTS Hybrid Search:** Integrated hybrid exact-keyword and vector search using Reciprocal Rank Fusion (RRF)") describes a feature that was never built, and the same description was repeated in `README.md` and in the cognitive-architecture and verdict documents. The 1.0.0 line is left exactly as it was written — this erratum supersedes it rather than rewriting history.
+  - **What was wrong.** `tantivy` has never been a dependency of this crate: `git log -S'tantivy' -- Cargo.toml` returns nothing, and the current `Cargo.toml` contains no full-text-search crate. There is no `CREATE_INDEX`, no FTS statement, no BM25 scorer and no rank-fusion code anywhere in `src/`. The store creates one node table and four relation tables and nothing else (`src/store/ladybug.rs:821-844`). The likely origin of the confusion is the source comment "Step 2: Hybrid GraphRAG" (`src/store/ladybug.rs:1129`) — a *graph* expansion, not a lexical one.
+  - **What the code actually does.** Two deterministic steps, with no model in either:
+    1. **Boosted vector distance.** Row classes are filtered first — structural rows always, `task` rows unless `include_tasks`, tombstoned rows unless `include_archived`, mesh-conflicting rows always (`src/store/ladybug.rs:1035`, `:1036-1037`, `:1080`, `:1083`) — and what remains is scanned with `array_distance`, ordered by `dist ASC, id ASC` (`src/store/ladybug.rs:1045-1048`). A usage-and-provenance gain is then subtracted from that distance: `gain = 0.05 * ln(1 + access_count)`, plus `0.05` when the row carries `metadata.source` (`src/store/ladybug.rs:1093-1098`, `:709`; the provenance test is `crate::traits::has_source`, `src/traits.rs:49`), and the combined gain is **capped at `0.5 * distance`** (`src/store/ladybug.rs:1099-1100`) so the boost can reorder rows only within a factor of two and never becomes an override.
+    2. **Bounded directed-graph expansion.** Direct matches are expanded one hop over `RELATES_TO`, `CONTAINS` and `GOVERNS` in both directions, and two hops over `GOVERNS` (`src/store/ladybug.rs:1138`, `:1140-1160`). Each expanded row carries the evidence path that reached it (at most three per result, `src/store/ladybug.rs:1354`), candidates are admitted per family with the one-hop family first and, within a family, by co-occurrence count descending (`src/store/ladybug.rs:1306-1332`), and expansion rows sort after the direct matches on the evidence kind rather than on a magic score constant (`src/store/ladybug.rs:1336-1339`, `:1364-1376`). The server asks for five primaries and renders what the store returns (`src/server.rs:1987-1991`); `access_count` is incremented for direct hits only (`src/server.rs:1995-2012`).
+  - **Documents corrected:** `README.md` (the "BM25 via Tantivy" and "Embedded LadybugDB & Tantivy" claims, the Synaptic-Pruning wording, the search-scope statement, and the guard-tool and daemon-route lists); `docs/COGNITIVE_ARCHITECTURE.md` §3 (the neural-gain formula, which omitted the `0.5 * distance` cap and the provenance term), §4 (`domain` is descriptive metadata, not a retrieval filter) and §6 (the "Reciprocal Rank Fusion" section, now "Deterministic Retrieval — Boosted Distance + Bounded Graph Evidence"); and `docs/architecture/MEMORY_AGENTS_VERDICT.md` §2.2 and R1/R3, whose no-LLM-reranker argument rested on the false RRF premise and has been re-derived on the true premise.
+  - **Consequence, still open.** Exact-identifier recall — a function name, an env var, a config key, an error string — depends on the embedder landing near the query, because no lexical track exists. The adjudicated recommendation is a **narrow deterministic `CONTAINS` / symbol-id match**, preferred over a Tantivy + RRF build. **It is not implemented.**
+  - **Panel record:** `docs/designs/2026-10-20-argon-k3-panel-verdicts.md` (Part C, §1 DOC-1 and §5 Phase 4) and `docs/designs/2026-10-20-hyperskill-review-findings.md` (Part B, DOC-1).
+
+---
+
 ## [1.10.1] - 2026-10-20
 
 ### Fixed

@@ -1348,6 +1348,8 @@ mod tests {
             _namespace: &str,
             _vector: Vec<f32>,
             _limit: usize,
+            _include_tasks: bool,
+            _include_archived: bool,
         ) -> anyhow::Result<Vec<SearchResult>> {
             Ok(Vec::new())
         }

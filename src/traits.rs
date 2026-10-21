@@ -156,11 +156,17 @@ pub trait VectorStore: Send + Sync {
     ) -> Result<UpsertReport>;
 
     /// Search for the closest memories to a given vector.
+    ///
+    /// Returns up to `limit` recall-eligible primary matches PLUS their bounded
+    /// graph expansions. Row-class filtering (tasks, archived, mesh conflicts)
+    /// is applied BEFORE the candidate budget is spent.
     async fn search(
         &self,
         namespace: &str,
         vector: Vec<f32>,
         limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
     ) -> Result<Vec<SearchResult>>;
 
     /// Delete a specific memory by its ID.
