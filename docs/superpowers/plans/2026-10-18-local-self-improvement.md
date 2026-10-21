@@ -30,6 +30,9 @@ contracts are established.
 - Do not add SQLite. Persist observations outside LadybugDB as append-only JSONL.
 - Dedup distances use unboosted raw distance, lower-is-closer, scoped by
   embedder; never reuse the current `0.85` threshold as cosine.
+- The new dedup path reads `deduplication.max_candidates` as its candidate
+  limit, replacing the hardcoded `5` in the current path. Keep the config
+  field; do not tune the current inverted-filter path on it.
 - Exact canonical duplicates may reuse an existing extracted memory. Statistical
   model scores never auto-link memories; inline task completion must not be
   blocked by a non-canonical match.
@@ -53,12 +56,14 @@ contracts are established.
 2. **Lock 2:** Exact extraction reuse must create `EXTRACTED_FROM`; every
    non-canonical model match on inline `task_complete` must allow completion.
 3. **Temporal/correlation joins:** A task can finish in the same call as inline
-   extraction; link later events by namespace and memory IDs after task/session
-   completion.
+   extraction; link later events by namespace and memory IDs, using connection
+   and task IDs when available, after task/session completion.
 4. **Label leakage:** No connected component or Gold calibration/evaluation pair
    may cross splits; inferred labels never enter Gold calibration/evaluation.
 5. **Runtime/export failure:** Missing Python, invalid ONNX, timeout, or parity
    mismatch must preserve the incumbent and continue baseline writes.
+6. **Candidate limit:** the raw-distance candidate set is bounded by the
+   configured `deduplication.max_candidates`, not a hardcoded count.
 
 ---
 
@@ -66,7 +71,7 @@ contracts are established.
 
 | File | Responsibility |
 |---|---|
-| `src/traits.rs` | `RawDistanceQuery`, `RawDistanceCandidate`, and the raw-distance store contract. |
+| `src/traits.rs` | `Embedder::embedder_id`, `RawDistanceQuery`, raw-distance and exact-content store contracts. |
 | `src/store/ladybug.rs` | Unboosted nearest-candidate query and type/lifecycle filtering. |
 | `src/judgment/canonical.rs` | Stable exact-canonical identity and memory-type identity rules. |
 | `src/judgment/policy.rs` | Exact, distance-band, and provider-confidence decision policy. |
@@ -83,6 +88,7 @@ contracts are established.
 | `src/setup.rs` | Install/manage local training runtime without blocking daemon startup. |
 | `Cargo.toml`, `Cargo.lock` | Direct stable-hash dependency and optional Laya inference feature. |
 | `tests/fixtures/learning/` | Fixed bridge fixture and component-disjoint Gold calibration/evaluation cases. |
+| `docs/superpowers/reports/laya-bridge-contract.json` | Committed Phase-0 verified trainer argv/artifact/export contract and parity evidence; contains no user memory data or local absolute paths. |
 
 The spec's future retrieval/procedure/task learner policies are not implemented
 by this first plan. This release records their ordinary-use events in the common
@@ -106,11 +112,32 @@ observation envelope; each active learner still needs its own follow-up plan.
   Rust `laya-onnx` crate.
 - Produces: a checked report showing whether a stock fine-tuned checkpoint,
   tokenizer, and calibration configuration load in Rust and preserve predictions.
+  Persist `laya_bridge_report.json` with trainer/package version, verified
+  non-shell argv contract, expected artifacts, export steps, runtime target
+  results, and per-fixture Python/Rust probabilities and parity. Commit the
+  sanitized contract/evidence to
+  `docs/superpowers/reports/laya-bridge-contract.json`; keep generated model
+  artifacts and machine-specific paths out of the repository.
 
-- [ ] **Step 1: Add tiny train and evaluation fixtures** with the same `state`,
-  `questions`, and soft `expected` schema used by the Rust dataset builder.
+```rust
+pub struct VerifiedTrainerContract {
+    pub package_version: String,
+    pub argv_template: Vec<String>, // exact verified args; no shell syntax
+    pub expected_artifacts: Vec<String>,
+    pub export_steps: Vec<String>,
+}
+impl VerifiedTrainerContract {
+    pub fn argv_for(&self, paths: &LearningPaths, version: &ModelVersion) -> Vec<OsString>;
+}
+```
+
+- [ ] **Step 1: Add tiny train and evaluation fixtures** with the stock
+  `state`, `questions`, and `gold` probability schema used for soft targets by
+  upstream `laya-train`; Rust dataset generation must serialize that contract.
   Include exact pairs, controlled paraphrases, and hard negatives; no production
-  memory data and no train/eval pair overlap.
+  memory data and no train/eval pair overlap. Do not use upstream `expected` for
+  uncertain labels: that field represents hard answers, while `gold` carries
+  per-answer probabilities.
 - [ ] **Step 2: Add a failing bridge contract test** that expects a trained
   checkpoint directory, ONNX bundle, tokenizer, calibration metadata, and
   fixed-input predictions. It must fail with a specific missing-artifact
@@ -119,11 +146,16 @@ observation envelope; each active learner still needs its own follow-up plan.
   runtime and Laya training package without a manual user step.** Use a temporary
   bootstrap harness; do not add product runtime code until the bridge gate passes.
   Provisioning must not block daemon startup. Stop for design review if any
-  supported release platform cannot do this locally.
+  current release target (Linux x86_64, Linux aarch64, macOS arm64, Windows
+  x86_64) cannot do this locally.
 - [ ] **Step 4: Write the Python probe** to invoke the documented
-  `laya-train --loss soft-ce --freeze-encoder` flow on the fixture, then use the
-  upstream-supported export path. Keep generated artifacts in a temporary
-  directory and leave no model files in the repository.
+  stock `laya-train` interface on the fixture, then use the upstream-supported
+  export path. First inspect the installed package's actual CLI/API and record
+  its exact version, invocation arguments, output layout, and export procedure
+  in `laya_bridge_report.json`; do not assume flag names. Use only upstream
+  soft-cross-entropy and a documented frozen-encoder or differential-learning-rate
+  mode. Keep generated artifacts in a temporary directory and leave no model
+  files in the repository.
 - [ ] **Step 5: Load the exported bundle in the Rust example** and record the
   Python and Rust `noul` probabilities for every fixture case.
 - [ ] **Step 6: Run the bridge probe.**
@@ -133,9 +165,12 @@ Run: `python3 scripts/learning/laya_bridge_probe.py`
 Expected: exit 0 only when Rust loads the exported bundle and maximum absolute
 probability difference is `<= 1e-4` (provisional bridge tolerance from Argon's
 review). Otherwise exit nonzero with the exact unsupported format/operator or
-mismatch. **If this task fails, stop Tasks 7–9
-and return an architecture blocker; Tasks 2–6 may still ship. Do not silently
-switch to remote Jev or assume a Python sidecar.**
+mismatch. On export or parity failure, continue observation capture and baseline
+work in Tasks 2–6 and baseline-only controls in Task 9; keep provider behavior
+at the local heuristic (`auto` behaves as heuristic), block Laya Tasks 7–8, and
+file a follow-up for any alternative local bridge. Never switch to Jev or assume
+a Python sidecar. **Do not hold the shared observation foundation hostage to
+the optional Laya bridge.**
 
 - [ ] **Step 7: Commit the probe and result report.**
 
@@ -159,6 +194,11 @@ pub struct RawDistanceCandidate {
     pub payload: MemoryPayload,
 }
 
+pub struct ExactContentCandidate {
+    pub id: String,
+    pub payload: MemoryPayload,
+}
+
 pub enum DedupCandidateScope {
     Domain,
     Procedure { trigger: String },
@@ -175,6 +215,13 @@ async fn nearest_by_raw_distance(
     vector: Vec<f32>,
     query: RawDistanceQuery,
 ) -> Result<Vec<RawDistanceCandidate>>;
+
+async fn find_active_exact_content(
+    &self,
+    namespace: &str,
+    exact_content: &str,
+    scope: DedupCandidateScope,
+) -> Result<Vec<ExactContentCandidate>>;
 ```
 
 `Domain` excludes `directory`, `file`, `markdown`, `freshness_flag`,
@@ -182,33 +229,52 @@ async fn nearest_by_raw_distance(
 `user_id == "auto-ingestor"`. `Procedure { trigger }` returns only active,
 unspent procedures with that exact trigger.
 
+`RawDistanceQuery.limit` is the configured `deduplication.max_candidates`
+(`src/config.rs:28-29`). The current dedup path ignores that field and passes
+a hardcoded `5` to the store search (`src/server.rs:1152`); the new path reads
+the configured value instead. Keep the config field — it is the knob this path
+needs.
+
 - [ ] **Step 1: Add failing `VectorStore` contract tests** for ascending raw
-  distance and excluded row types.
-- [ ] **Step 2: Add the method to `VectorStore` and every implementation.** Test
-  fakes return fixtures and do no hidden ranking.
-- [ ] **Step 3: Implement the LadybugDB query** using `array_distance` ordered
+  distance, excluded row types, and exact-content lookup independent of vector
+  top-K.
+- [ ] **Step 2: Add both methods to `VectorStore` and every implementation.** Test
+  fakes return fixtures and do no hidden ranking. `RawDistanceQuery.limit` is
+  passed through unchanged; the store applies no default or cap of its own.
+- [ ] **Step 3: Implement `nearest_by_raw_distance`** using `array_distance` ordered
   ascending before any usage/source boost or GraphRAG expansion. Filter archived,
   retired, expired, `auto-ingestor`, `directory`, `file`, `markdown`,
-  `freshness_flag`, `guard_event`, `task`, `symbol`, and `code_ast` rows.
+  `freshness_flag`, `guard_event`, `task`, `procedure`, `symbol`, and `code_ast`
+  rows from Domain scope.
 - [ ] **Step 4: Implement `Procedure` scope**: require `memory_type == "procedure"`,
   matching `metadata.trigger`, not lapsed, and not spent (`remaining_fires != 0`).
   Domain scope excludes procedures and admits other active non-structural domain
   memory types.
-- [ ] **Step 5: Add regression tests**:
+- [ ] **Step 5: Implement `find_active_exact_content`** as an exact UTF-8 content
+  lookup over all eligible active rows in the requested scope, independent of
+  embedding rank and without the top-K limit. Apply lifecycle/type/trigger
+  filters before returning candidates; require byte-for-byte equality with no
+  whitespace normalization. Canonical metadata comparison remains in Task 3.
+- [ ] **Step 6: Add `Embedder::embedder_id(&self) -> &str`** and implement it for
+  production embedders and every test stub. Add stable IDs for model/provider
+  identity; retain `dimensions()` as a separate value.
+- [ ] **Step 7: Add regression tests**:
   `raw_distance_is_ascending_and_unboosted`,
   `raw_distance_is_invariant_to_access_count_and_source`,
   `raw_distance_excludes_graph_expansion_sentinel`,
   `raw_distance_excludes_task_structural_symbol_and_ingester_rows`,
-  `procedure_scope_matches_trigger_and_budget`, and
-  `exact_duplicate_survives_candidate_filter`.
-- [ ] **Step 6: Run the focused tests.**
+  `procedure_scope_matches_trigger_and_budget`,
+  `exact_content_lookup_finds_match_outside_vector_top_k`, and
+  `dedup_candidate_limit_uses_configured_max_candidates`.
+- [ ] **Step 8: Run the focused tests.**
 
 Run: `cargo test raw_distance -- --test-threads=1`
+Run: `cargo test exact_content_lookup -- --test-threads=1`
 
 Expected: all raw-distance tests pass; existing `search()` ranking tests remain
 unchanged.
 
-- [ ] **Step 7: Run all compile-time trait implementations** with
+- [ ] **Step 9: Run all compile-time trait implementations** with
   `cargo test --no-run -- --test-threads=1` and commit.
 
 ## Task 3: Define Canonical Identity and Safe Write Decisions
@@ -216,8 +282,9 @@ unchanged.
 **Files:**
 - Create: `src/judgment/canonical.rs`
 - Create: `src/judgment/policy.rs`
+- Test: unit tests in `src/judgment/canonical.rs` and `src/judgment/policy.rs`
 - Modify: `src/judgment/mod.rs`
-- Modify: `src/server.rs`
+- Modify: `src/server.rs` (shared canonical metadata normalization and pulse semantics)
 - Modify: `src/task/mod.rs`
 
 **Interfaces:**
@@ -242,7 +309,7 @@ pub struct DedupHint {
 }
 
 pub struct MemoryWriteReport {
-    pub upsert: UpsertReport,
+    pub upsert: Option<UpsertReport>, // None for BlockedExact or reuse without write
     pub decision: DedupDecision,
     pub dedup_hint: Option<DedupHint>,
     pub linked_existing_id: Option<String>,
@@ -257,6 +324,17 @@ pub struct EmbedderDistancePolicy {
 pub struct DedupDecisionPolicy {
     pub distance_by_embedder: BTreeMap<String, EmbedderDistancePolicy>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CalibrationTier { ProxyInternal, Gold }
+
+pub fn model_may_block(
+    calibration_tier: CalibrationTier,
+    model_version: &str,
+    active_version: Option<&str>,
+    is_bare_standalone_add: bool,
+) -> bool;
 ```
 
 `canonical_duplicate_key(namespace: &str, payload: &MemoryPayload) -> Result<String>`
@@ -271,27 +349,46 @@ not treat raw-distance equality or a model score as proof of canonical identity.
   `src/judgment/canonical.rs`; compare canonical strings, not vector distances.
 - [ ] **Step 3: Add failing policy tests** for allow, allow-with-hint, exact
   duplicate reject, exact existing-memory reuse with `metadata.extracted_from`,
-  and promoted-model blocking on a bare add only.
+  and promoted-model blocking on a bare add only. Assert
+  `proxy_internal_cannot_block`, `shadow_model_cannot_block`,
+  `gold_model_must_be_active_to_block`, and
+  `inline_task_extraction_never_model_blocks`. `BlockedModel` is unreachable
+  until a `Gold`-calibrated model is the active promoted version.
 - [ ] **Step 4: Implement `DedupDecisionPolicy`** in `src/judgment/policy.rs`;
   raw-distance hint bands remain disabled until the Phase-2 distribution study
-  writes per-embedder thresholds to `datasets/dedup/distance_policy.json`.
+  writes per-embedder thresholds to `datasets/dedup/distance_policy.json`. An
+  absent policy file means no distance hint band; do not invent a default.
 - [ ] **Step 5: Change `embed_dedup_and_upsert`** to consume
   `nearest_by_raw_distance` and return `MemoryWriteReport`. Do not threshold on
-  `SearchResult.score` or the old `0.85` value.
+  `SearchResult.score` or the old `0.85` value. Build the query with
+  `limit = config.deduplication.max_candidates`, replacing the hardcoded `5`
+  this path passes today (`src/server.rs:1152`); do not remove the config
+  field.
 - [ ] **Step 6: Implement exact reuse**: for an exact key with
   `metadata.extracted_from`, update the existing candidate's metadata
-  idempotently, reuse its vector, return its ID, and create no twin row. For a
-  bare exact `add_memory`, return a duplicate response without inserting.
+  idempotently, reuse its vector, return its ID, and create no twin row. Find
+  exact-content candidates through `find_active_exact_content`, then compare the
+  canonical key; do not rely on raw-distance top-K. For a bare exact
+  `add_memory`, return a duplicate response without inserting.
 - [ ] **Step 7: Preserve Lock 2:** on inline `task_complete(memory=...)`, a
   canonical exact pair reuses/links the existing ID; a non-canonical model
   positive returns allow-with-hint and never blocks completion or auto-links.
-  A promoted model may block only a bare standalone `add_memory`.
-- [ ] **Step 8: Fix the duplicate guidance** to name actual MCP tools
+  A promoted, active `Gold` model may block only a bare standalone
+  `add_memory`. Add a shared canonical metadata normalization helper and call it
+  before key computation from both `add_memory` and inline `task_complete`, so
+  location stamping and derived `governs` fields cannot diverge. Add a test that
+  semantically identical tool inputs through both routes produce the same
+  canonical key, including locations and `governs` metadata.
+- [ ] **Step 8: Emit `ThalamicPulse::Created` only for a newly inserted memory.**
+  Exact reuse/link must not emit Created; add regression coverage proving no
+  false creation pulse or creation outcome occurs.
+- [ ] **Step 9: Fix the duplicate guidance** to name actual MCP tools
   `neurostrata_supersede_memory` and `neurostrata_archive_memory`.
-- [ ] **Step 9: Run tests**:
+- [ ] **Step 10: Run tests**:
   `cargo test canonical_duplicate -- --test-threads=1` and
+  `cargo test judgment::policy -- --test-threads=1` and
   `cargo test task_complete -- --test-threads=1`.
-- [ ] **Step 10: Commit.**
+- [ ] **Step 11: Commit.**
 
 ## Task 4: Add the Local Observation and Outcome Ledger
 
@@ -317,13 +414,20 @@ pub struct LearningContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct PayloadHash(pub String); // lowercase 64-character SHA-256 hex
+pub struct PayloadHash(pub String); // opaque algorithm-prefixed digest, e.g. sha256:<hex>
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSource { RawDistance, ExactContent }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservedCandidate {
     pub candidate_id: String,
     pub payload_hash: PayloadHash,
-    pub raw_distance: f32,
+    pub source: CandidateSource,
+    pub raw_distance: Option<f32>,
+    pub provider_confidence: Option<f32>,
+    pub shadow_prediction: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,11 +437,16 @@ pub struct DecisionObservation {
     pub occurred_at: i64,
     pub namespace: String,
     pub context: LearningContext,
+    pub result_memory_id: Option<String>,
     pub input_payload_hash: PayloadHash,
     pub candidates: Vec<ObservedCandidate>,
     pub embedder_id: String,
+    pub embedder_dimensions: usize,
+    pub selected_provider: String,
     pub policy_version: String,
     pub model_version: Option<String>,
+    pub shadow_provider: Option<String>,
+    pub shadow_model_version: Option<String>,
     pub decision: DedupDecision,
 }
 
@@ -359,6 +468,7 @@ pub enum LearningOutcomeKind {
     MemorySuperseded,
     MemoryArchived,
     TaskCompleted,
+    // Recorded for future retrieval learning; never derives a dedup label in V1.
     MemoryInspected,
     ProcedurePerformed,
 }
@@ -392,18 +502,26 @@ impl LearningRecorder {
   where present; join later events by `(namespace, memory_id)` across completion
   and reconnect. No follow-up remains `Unlabeled`.
 - [ ] **Step 7: Record dedup observations** for every raw top-K candidate,
-  including current provider/policy/model version, embedder identity/dimensions,
-  raw distance, decision, and point-in-time payload hashes.
+  including result memory ID after write/reuse resolution, selected provider,
+  provider confidence per candidate, policy/model version, embedder identity and
+  dimensions, raw distance, decision, content-hash snapshots, plus shadow
+  provider/model version and per-candidate predictions when available. Also
+  record exact-content-only candidates with source `exact_content` and
+  `raw_distance: None`; raw-query candidates carry source `raw_distance` and
+  their measured distance. Finalize the observation after the write outcome
+  supplies `result_memory_id`.
 - [ ] **Step 8: Record other normal-use observations** with distinct `kind` values
   for search exposure, explicit `get_memory`, task extraction/linkage, and
-  procedure performance. Do not assign their future learner labels in this task.
+  procedure performance. `MemoryInspected` is retained for a future retrieval
+  learner and must not derive any dedup label in V1.
 - [ ] **Step 9: Register mutation/task outcome recording** through a separate
   `MemorySubscriber` plus the `task_complete`/`procedure_perform` call sites.
   Recorder failure must not fail the memory/task operation.
 - [ ] **Step 10: Add tests** for `observation_logging_failure_does_not_fail_write`,
   `task_completion_outcome_joins_after_task_done`,
   `connection_id_crosses_stdio_proxy_to_daemon`, and
-  `no_follow_up_is_unlabeled`.
+  `follow_up_absence_leaves_observation_unlabeled`,
+  `observation_records_result_id_and_shadow_predictions`.
 - [ ] **Step 11: Run focused tests.**
 
 Run: `cargo test learning:: -- --test-threads=1`
@@ -456,6 +574,9 @@ one compatibility release without auto-selecting Jev.
   presence auto-select Jev. When `provider == Jev`, prefer the configured
   environment variable (default `TYPESAFE_API_KEY`), then use the legacy literal
   only as a compatibility fallback.
+- [ ] **Step 2a: File a tracked follow-up to remove the legacy literal-key shim
+  in release N+1; verify new configuration docs use only the environment
+  reference.**
 - [ ] **Step 3: Change daemon wiring** so local observation/raw-distance
   collection does not depend on `judgment_api_key.is_some()`; `none` alone
   disables it.
@@ -524,14 +645,20 @@ pub async fn build_dedup_dataset(
 - [ ] **Step 4: Add separately adjudicated Gold fixtures** with disjoint
   `gold_calib` and `gold_eval` partitions; tests reject overlap or weak labels.
 - [ ] **Step 5: Build reproducible Rust-serialized Laya input JSONL** with
-  `state`, `questions`, and soft `expected` targets. Label files with
+  `state`, `questions`, and `gold` soft-probability targets in the upstream
+  `laya-train` schema. Label files with
   `proxy_internal` or `gold` calibration provenance.
 - [ ] **Step 6: Add raw-distance distribution and baseline reports** for the
   heuristic, frozen Laya (when bridge passes), and explicit Jev only when
   selected for a same-dataset comparison. Do not claim Gold metrics from proxy
-  suites. Write the measured per-embedder hint bands to a versioned
-  `datasets/dedup/distance_policy.json`; leave model blocking thresholds unset
-  until a Gold-calibrated Laya candidate exists.
+  suites. This step is the sole producer of a versioned
+  `datasets/dedup/distance_policy.json` containing measured per-embedder hint
+  bands and source-report hashes; leave model blocking thresholds unset until a
+  Gold-calibrated Laya candidate exists. Task 3 must treat a missing policy file
+  as no hint band.
+- [ ] **Step 6a: Test policy-file absence and versioning** with
+  `missing_distance_policy_yields_no_hint_band` and
+  `distance_policy_records_source_report_hash`.
 - [ ] **Step 7: Run dataset/split tests.**
 
 Run: `cargo test learning::dataset -- --test-threads=1`
@@ -560,9 +687,6 @@ distance report tests pass.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeState { Ready, Provisioning, Unavailable }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CalibrationTier { ProxyInternal, Gold }
 pub type ModelVersion = String;
 
 pub struct ModelBundle {
@@ -605,11 +729,16 @@ impl LayaOnnxProvider {
 - [ ] **Step 3: Implement `LearningRuntimeManager`** in
   `src/learning/runtime.rs` and connect it to normal setup. Provision a pinned,
   app-managed Python runtime, `laya-train`, the selected base checkpoint, and
-  the validated export utility locally on supported release platforms. Do not
-  require a system-global Python installation or manual venv/training command.
+  the validated export utility locally on every current release target: Linux
+  x86_64, Linux aarch64, macOS arm64, and Windows x86_64. Do not require a
+  system-global Python installation or manual venv/training command.
   Provision in the background; progress/failure is queryable without blocking
   daemon startup. If any supported release platform cannot meet this contract,
   stop for owner review rather than shipping a user setup sidequest.
+- [ ] **Step 3a: Add CI provisioning smoke tests** on each release-matrix target.
+  Verify runtime installation, pinned `laya-train` version, local base-model
+  availability, and offline startup/inference; any unsupported target blocks
+  enabling the feature in that release.
 - [ ] **Step 4: Implement `LayaOnnxProvider`** using canonical Rust `noul`
   questions and a provisioned local bundle path (`allow_download = false`). CPU
   inference runs inside `spawn_blocking` under a semaphore; hold the permit until
@@ -639,8 +768,8 @@ Laya dependency and still compiles.
 **Interfaces:**
 - Consumes: versioned datasets, local trainer runtime, model bundle loader, and
   the fixed Gold/proxy evaluation suites.
-- Produces: `TrainingJobState`, `EvaluationReport`, and an atomic
-  `active_model.json` manifest naming incumbent and shadow bundle versions.
+- Produces: `TrainingJobState`, `EvaluationReport`, and atomically replaced
+  `learning/active.json`, matching the approved spec.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -659,6 +788,13 @@ pub struct EvaluationReport {
     pub suites: Vec<SuiteReport>,
 }
 pub struct SuiteReport { pub name: String, pub metrics: serde_json::Value }
+pub struct ActiveManifest {
+    pub active_version: Option<ModelVersion>,
+    pub previous_good_version: Option<ModelVersion>,
+    pub candidate_version: Option<ModelVersion>,
+    pub shadow_version: Option<ModelVersion>,
+    pub provider_mode: DedupProviderMode,
+}
 pub struct LearningCoordinator { recorder: Arc<LearningRecorder> }
 
 impl LearningCoordinator {
@@ -675,20 +811,17 @@ impl LearningCoordinator {
 - [ ] **Step 2: Implement data-sufficiency checks** using Phase-2 measured class
   floors. All counts are config/manifest values determined from the baseline
   study, not magic constants copied from architect proposals.
-- [ ] **Step 3: Invoke `LocalTrainingRuntime.laya_train`** using direct process
-  arguments from `LearningPaths`:
+- [ ] **Step 3: Invoke `LocalTrainingRuntime.laya_train`** using the exact
+  versioned argument contract verified and saved by Task 1 in
+  `laya_bridge_report.json`. Translate its argument template into direct process
+  arguments using `LearningPaths`; do not hardcode unverified upstream flags or
+  interpolate a shell command. Assert the trainer can only use the provisioned
+  local base-model path.
 
 ```rust
-Command::new(&runtime.laya_train)
-    .arg("--data").arg(paths.train_jsonl())
-    .arg("--base").arg(paths.base_model_dir())
-    .arg("--out").arg(paths.candidate_dir(&version))
-    .arg("--eval").arg(paths.proxy_eval_jsonl())
-    .arg("--loss").arg("soft-ce")
-    .arg("--freeze-encoder")
+Command::new(&runtime.laya_train).args(verified_contract.argv_for(&paths, &version))
 ```
 
-The base model path is local; the trainer cannot fetch weights during a job.
 Capture stdout/stderr and exit status; failure leaves the incumbent untouched.
 - [ ] **Step 4: Mark the stock trainer's internal calibration** as
   `proxy_internal`. Such bundles may run in shadow mode only.
@@ -698,8 +831,10 @@ Capture stdout/stderr and exit status; failure leaves the incumbent untouched.
 - [ ] **Step 6: Evaluate against raw-distance heuristic, frozen Laya, incumbent,
   deterministic invariants, proxy consensus, and Gold shards.** Store separate
   reports; only Gold metrics support absolute accuracy claims.
-- [ ] **Step 7: Promote atomically only after all spec gates pass. Keep the
-  previous known-good bundle and test rollback on load/runtime errors.**
+- [ ] **Step 7: Promote by atomic replacement of `learning/active.json` only
+  after all spec gates pass. Preserve `previous_good_version` and the previous
+  bundle; test rollback on load/runtime errors and manifest recovery after an
+  interrupted replacement.**
 - [ ] **Step 8: Test candidate metrics and split manifests using fixtures.**
 
 Run: `cargo test learning::trainer -- --test-threads=1`
@@ -722,12 +857,16 @@ preserve the incumbent.
 - CLI enum: `neurostrata-mcp learn status|pause|resume|rollback|reset`.
 - Internal daemon routes: `GET /learning/status -> LearnStatus` and
   `POST /learning/control` with strict `LearningControlRequest` JSON;
-  no new MCP labeling tools.
+  no new MCP labeling tools. The daemon route rejects
+  `purge_observations: true`; only the offline CLI purge path may delete source
+  observations.
 - Persist `status.json` and `control.json` under the learning directory. When the
   daemon is offline, `learn status` reads the last persisted status and labels
   it stale; pause/resume/reset control updates `control.json` for the next start.
 - `learn reset` removes derived datasets/candidates; observation purge requires
-  explicit `--purge-observations`.
+  explicit `--purge-observations --confirm-purge`. Purge is never queued: it is
+  allowed only while the daemon is offline and executes immediately; if the
+  daemon is running, refuse and instruct the operator to stop it first.
 
 ```rust
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -738,19 +877,28 @@ pub struct LearningControlRequest {
     pub purge_observations: bool,
 }
 pub struct LearnStatus {
+    pub provider_mode: DedupProviderMode,
     pub active_version: Option<ModelVersion>,
+    pub previous_good_version: Option<ModelVersion>,
+    pub candidate_version: Option<ModelVersion>,
     pub shadow_version: Option<ModelVersion>,
     pub runtime_state: RuntimeState,
+    pub training_state: TrainingJobState,
+    pub pending_reason: Option<String>,
+    pub unlabeled_observations: usize,
     pub counts_by_label_tier: BTreeMap<LabelTier, usize>,
+    pub latest_evaluation: Option<EvaluationReport>,
 }
 ```
 
-- [ ] **Step 1: Add CLI parse tests** for every `learn` action and invalid
-  combinations.
+- [ ] **Step 1: Add CLI parse tests** for every `learn` action, invalid
+  combinations, and purge confirmation requirements.
 - [ ] **Step 2: Add local daemon status/control handlers** that report explicit
   zero counts and do not mutate memory rows.
 - [ ] **Step 2a: Add tests** for offline status staleness and persisted pause,
-  resume, rollback, and reset controls being applied at the next daemon start.
+  resume, rollback, and non-purge reset controls being applied at the next
+  daemon start. Verify observation purge is rejected while online and is never
+  written into `control.json`.
 - [ ] **Step 3: Wire background schedule** to start only when training runtime,
   data floors, and the Phase-0 bridge gate are satisfied; pause/resume persists
   without stopping ordinary MCP service.
