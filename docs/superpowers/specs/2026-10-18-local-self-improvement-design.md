@@ -2,7 +2,10 @@
 
 **Date:** 2026-10-18
 **Path:** Architectural
-**Status:** Draft for owner’s written-spec review; Argon and orchestrator agree.
+**Status:** Approved. Two-seat review 2026-10-21 (Argon and K3, both
+approve-with-changes) with the required changes applied; the owner approved on
+the same date on the condition that both seats be good with the design. The
+implementation plan is still the owner's call.
 **Scope:** Local learning foundation, first dedup-learning loop, and staged
 expansion to other NeuroStrata capabilities. No implementation authorized by
 this document alone.
@@ -59,16 +62,20 @@ keeps the current baseline; it does not claim improvement.
    `array_distance(...) AS dist`, orders by `dist ASC`, and assigns
    `SearchResult.score` to a distance reduced by usage and source boosts. Lower
    values mean closer results; this is not a cosine score. Graph-expanded
-   neighbors are appended with sentinel score `10.0`. The current dedup filter
-   can therefore discard close matches and admit distant or graph-expanded
-   results.
+   neighbors are appended with `EXPANSION_BASE_SCORE = 1.0`
+   (`src/store/ladybug.rs:1418`, applied at `:1437`) and are told apart from
+   primaries by evidence kind, not by score. The current dedup filter
+   (`score >= 0.85`) can therefore discard close matches and admit distant
+   primaries and graph-expanded rows alike.
 4. The same `embed_dedup_and_upsert` path serves `add_memory` and inline task
    completion. A write decision can occur in the same call that marks a task
    done. Later outcomes must join by memory IDs across completed tasks and
    subsequent connections, not only by an active task ID.
-5. The current duplicate error refers to `neurostrata_edit_memory`, which is not
-   an MCP tool. The available corrective surfaces are
-   `neurostrata_supersede_memory` and `neurostrata_archive_memory`.
+5. The duplicate error already names `neurostrata_supersede_memory`
+   (`src/server.rs:1166`), which is a real MCP tool; the earlier
+   `neurostrata_edit_memory` reference no longer exists in the source. The error
+   does not yet name the other corrective surface,
+   `neurostrata_archive_memory`, so the remaining work is to name both.
 6. The current TypeSafe adapter uses `/evaluate` and parses
    `answers[*].probability`; current public System One documentation describes
    `/v1/systemone` and `noul` answers. Validate the protocol with fixtures
@@ -128,14 +135,23 @@ record; preserve preceding complete records. Model promotion updates
 `active.json` by atomic replacement. Retain the active and previous known-good
 bundles; dataset rebuilds never mutate the source observation log.
 
+Every record carries a `schema_version`. It starts at `1` and is additive-only
+within a major version: new optional fields do not bump it, a breaking change
+does, and a reader that does not recognize a record's major version ignores
+that record rather than mis-parsing it. Concurrent appends are serialized behind
+one writer, so a partial line is only ever the final line of a file.
+
 ### Correlation
 
 The NeuroStrata-owned stdio proxy generates a connection ID at process start
-and forwards it to the local daemon in an internal HTTP header. This avoids
-client-specific MCP schema changes. When a task is claimed, associate its task
-ID with that connection. Outcomes join observations by namespace, candidate
-memory IDs, and connection/task IDs when available. Memory IDs remain the
-fallback join across task completion, process restart, and later sessions.
+and forwards it to the local daemon in an internal HTTP header
+(`X-NeuroStrata-Conn-Id`). This avoids client-specific MCP schema changes. The
+header is internal: a direct HTTP caller that omits it is not rejected — the
+daemon assigns a per-request fallback token instead. When a task is claimed,
+associate its task ID with that connection. Outcomes join observations by
+namespace, candidate memory IDs, and connection/task IDs when available. Memory
+IDs remain the fallback join across task completion, process restart, and later
+sessions.
 
 The outcome join must handle inline task extraction: the task may be completed
 in the same call that emitted the dedup observation. Do not require the task to
@@ -159,23 +175,49 @@ do not discard observations using an uncalibrated distance threshold. A
 - candidate IDs and stable order as presented to the decision policy.
 
 Outcome events record relevant memory creation, supersession, archival, task
-completion, and subsequent actions. Observations with no qualifying outcome
-remain `Unlabeled`; silence never means a prediction was correct.
+completion, and subsequent actions. The pulse bus cannot carry task completion
+by itself: `ThalamicPulse` emits `Superseded` only on the inline-extraction
+path (`src/task/mod.rs:1199-1215`), because the other two `task_complete`
+paths attach an edge to a memory that already existed and announce no move.
+Task completion outcomes are therefore captured explicitly on all three Lock 2
+paths — inline extraction, `metadata.extracted_from` pre-attached, and
+`link_memory_id` — and are not inferred from the pulse bus. Observations with
+no qualifying outcome remain `Unlabeled`; silence never means a prediction was
+correct.
 
 ## Candidate selection and write behavior
 
 Add a dedicated `nearest_by_raw_distance` path for deduplication. It returns
 active domain-memory candidates ordered by the unboosted distance metric. It
 excludes GraphRAG-expanded neighbors, sentinel scores, usage counts, and source
-boosts. Exclude `directory`, `file`, `markdown`, `freshness_flag`, `guard_event`,
-`task`, `symbol`, and `code_ast` rows, plus rows owned by `auto-ingestor`.
-`symbol`/`code_ast` are machine-ingested AST declarations, not memories an agent
-can supersede or archive. Include procedures only against active, unspent
-procedures with the same trigger; exclude procedures from other memory types.
-Other active domain-memory types remain eligible for model comparison but
-cannot trigger the exact-match path across types. Regular `search_memory`
-continues to use its existing relevance and graph ranking behavior.
-Retrieval-learning changes must not alter the dedup candidate set.
+boosts. The candidate set is the top `K` rows, where `K` is the configured
+`deduplication.max_candidates`.
+
+Exclusions, with their provenance. `directory`, `file`, `markdown`,
+`freshness_flag`, and `guard_event` are excluded today
+(`STRUCTURAL_MEMORY_TYPES`, `src/store/ladybug.rs:677-683`); `task` is excluded
+today only when `include_tasks` is false (`:1036`). Excluding `symbol`,
+`code_ast`, and rows owned by `auto-ingestor` is **new** behavior this design
+adds to the dedup path only. `symbol`/`code_ast` are machine-ingested AST
+declarations, not memories an agent can supersede or archive. Include
+procedures only against active, unspent procedures with the same trigger;
+exclude procedures from other memory types. Other active domain-memory types
+remain eligible for model comparison but cannot trigger the exact-match path
+across types. Regular `search_memory` continues to use its existing relevance
+and graph ranking behavior. Retrieval-learning changes must not alter the dedup
+candidate set.
+
+Exclude rows whose metadata marks a SynapticMesh conflict
+(`is_mesh_conflicting`, `src/store/ladybug.rs:698-700`, applied at
+`:1083-1085`) from `nearest_by_raw_distance` **and** from canonical exact-match
+reuse, so the dedup path never blocks on, hints toward, or reuses a row whose
+conflict is unresolved.
+
+Apply the type, owner, and conflict exclusions in the query's `WHERE` clause
+rather than filtering after the fetch: the store fetches `FETCH_MULTIPLIER *
+limit` rows (`src/store/ladybug.rs:1011-1012`) and filters in Rust, so
+post-fetch filtering can starve a small `K` in namespaces dense with excluded
+rows.
 
 Record the embedder identity and vector dimensions with every raw distance.
 Distance scales are embedder-specific; do not convert distance to cosine using
@@ -196,7 +238,9 @@ alone do not.
 
 Candidates are active only when not archived, retired, or expired by `valid_to`.
 For procedures, missing or null `remaining_fires` means unbounded; zero means
-spent and excludes the candidate.
+spent and excludes the candidate. `remaining_fires` is a procedure-runtime
+convention that the store does not enforce today, so the dedup path reads it
+from metadata rather than relying on a store-level filter.
 
 During collection and calibration:
 
@@ -217,8 +261,12 @@ During collection and calibration:
   without inventing a similarity cutoff.
 - Surface `dedup_hint` consistently from both `add_memory` and inline task
   completion. A hint never blocks Lock 2 task completion.
-- Replace the invalid `neurostrata_edit_memory` guidance with the available
-  supersede/archive tools.
+- Observation and dataset persistence failures never fail a memory write or a
+  task completion. The learning substrate is best-effort beside the write path:
+  a failed append is logged and the write proceeds.
+- Keep the duplicate error naming the real corrective tools. It already names
+  `neurostrata_supersede_memory`; extend it to name `neurostrata_archive_memory`
+  as well.
 
 All numeric distance cutoffs remain unset until the Phase 2 baseline study.
 
@@ -393,13 +441,19 @@ label distributions. Acceptance criteria below are structural and testable.
   MCP tool schemas remain unchanged.
 - Add unboosted `nearest_by_raw_distance`; test ascending ordering, exact-match
   retrieval, invariance to access-count/source metadata, and exclusion of
-  GraphRAG sentinel neighbors, task/structural rows, `symbol`/`code_ast`, and
-  `auto-ingestor` rows. Procedure candidates must match trigger and remain
-  unspent/unlapsed.
+  GraphRAG sentinel neighbors, task/structural rows, `symbol`/`code_ast`,
+  `auto-ingestor` rows, and mesh-conflicting rows. Procedure candidates must
+  match trigger and remain unspent/unlapsed.
 - Remove the inverted `score >= 0.85` filter and stop interpreting the existing
   `similarity_threshold` as a cosine threshold. Record embedder identity,
   dimensions, and all top-K raw-distance candidates, where K is the configured
   `deduplication.max_candidates`.
+- Bypass the existing judgment call in this phase:
+  `DeduplicationChecker::check_duplicates` (`src/server.rs:1162`) is not
+  invoked unless provider `jev` is explicitly selected. Under `auto`,
+  `heuristic`, `laya-local`, and `none`, the path records candidates and applies
+  only the canonical-key decision; no model confidence is consulted and no
+  shadow comparison runs until Phase 3.
 - Enable local observation without an API key. Before Phase 2 establishes a
   distance band, verify only canonical exact matches produce the exact-duplicate
   response; raw-distance candidates remain recorded without speculative hints.
@@ -408,15 +462,20 @@ label distributions. Acceptance criteria below are structural and testable.
   attach the task link. A non-canonical model match must never auto-link.
 - Verify inline `task_complete(memory=...)` reuses an exact-canonical existing
   memory, writes the `EXTRACTED_FROM` link, and completes Lock 2 without a twin
-  row. A non-canonical model positive must allow-with-hint on this path and
-  must never block completion or auto-link the candidate.
-- After Phase 2 establishes the band, verify uncertain candidates produce a
-  non-blocking hint in both `add_memory` and inline task completion and preserve
-  successful writes/task completion.
+  row. The reused row's `metadata.extracted_from` must be updated before the
+  Lock 2 gate re-reads the memory list, so the gate observes the new link. A
+  non-canonical model positive must allow-with-hint on this path and must never
+  block completion or auto-link the candidate.
+- Verify that the candidate set excludes mesh-conflicting rows in both
+  `nearest_by_raw_distance` and canonical exact-match reuse.
 - Verify outcome joins work after task completion, across connections, and via
-  memory IDs. Missing outcomes remain unlabeled.
-- Fix the invalid MCP corrective-tool name. Verify JSONL append/recovery and
-  that observation failures do not fail memory writes.
+  memory IDs. Missing outcomes remain unlabeled. Task completion outcomes are
+  captured on all three Lock 2 paths, not inferred from the pulse bus.
+- Keep the duplicate error naming the real corrective tools. It already names
+  `neurostrata_supersede_memory`; extend it to name `neurostrata_archive_memory`
+  as well. Verify JSONL append/recovery, including a crash during append that
+  leaves a partial final line, and that observation failures do not fail memory
+  writes or task completion.
 
 ### Phase 2 — Dataset builder and baseline study
 
@@ -425,10 +484,16 @@ label distributions. Acceptance criteria below are structural and testable.
 - Verify connected-component and time-disjoint splits; weak labels are rejected
   from Gold calibration and final evaluation. Partition the maintainer benchmark
   into disjoint `gold_calib` and `gold_eval` shards, with neither in the weight
-  training set.
+  training set. When a forward-time observation touches a component that
+  already exists in the training window, drop the cross-boundary component
+  members from the forward-time evaluation slice rather than leak the component
+  across splits.
 - Report raw-distance percentiles by embedder, provider, memory type, and
   deterministic/inferred label tier. Select hint/block boundaries only after
   reviewing these distributions.
+- Once this phase establishes the distance band, verify that uncertain
+  candidates produce a non-blocking hint in both `add_memory` and inline task
+  completion, and that successful writes and task completions are preserved.
 - Establish heuristic, frozen-Laya, and (if selected) Jev baselines on the
   same supported evaluation cases. Curate the fixed Gold benchmark before
   making absolute accuracy claims.
