@@ -5,8 +5,10 @@
 //! engine and a vector round-trip into every assertion; an in-memory store
 //! keeps the assertions on the thing under test -- the recorded signal.
 
+use crate::domain::domain_key;
 use crate::traits::{
-    Embedder, MemoryPayload, RelocateOutcome, SearchResult, UpsertReport, VectorStore,
+    DomainMatchMode, DomainSearchOutcome, Embedder, MemoryPayload, RelocateOutcome, SearchResult,
+    UpsertReport, VectorStore,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -29,12 +31,18 @@ struct Row {
 /// the tests need to decide which rules are candidates and in what order.
 pub struct MockStore {
     rows: Mutex<Vec<Row>>,
+    /// Toggle to make search/search_with_domain return an error.
+    search_fails: Mutex<bool>,
+    /// Track which (namespace, id) pairs have had increment_access_count called.
+    incremented_ids: Mutex<Vec<(String, String)>>,
 }
 
 impl MockStore {
     pub fn new() -> Self {
         Self {
             rows: Mutex::new(Vec::new()),
+            search_fails: Mutex::new(false),
+            incremented_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -52,6 +60,18 @@ impl MockStore {
         rows.iter()
             .find(|r| r.namespace == namespace && r.id == id)
             .map(|r| r.payload.metadata.clone())
+    }
+
+    /// List of (namespace, id) pairs that have had `increment_access_count` called.
+    /// Used by tests to verify the access count was incremented.
+    pub fn incremented_ids(&self) -> Vec<(String, String)> {
+        self.incremented_ids.lock().expect("mock store lock").clone()
+    }
+
+    /// Configure whether `search` and `search_with_domain` should fail.
+    /// Used by tests to exercise error paths.
+    pub(crate) fn set_search_fails(&self, fails: bool) {
+        *self.search_fails.lock().expect("mock store lock") = fails;
     }
 }
 
@@ -102,6 +122,9 @@ impl VectorStore for MockStore {
         _include_tasks: bool,
         _include_archived: bool,
     ) -> Result<Vec<SearchResult>> {
+        if *self.search_fails.lock().expect("mock store lock") {
+            return Err(anyhow::anyhow!("MockStore search configured to fail"));
+        }
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()
@@ -111,9 +134,85 @@ impl VectorStore for MockStore {
                 id: r.id.clone(),
                 score: 1.0,
                 payload: r.payload.clone(),
-                evidence: None,
+                evidence: Some(vec![crate::traits::SearchEvidence {
+                    kind: crate::traits::EvidenceKind::DirectMatch,
+                    path: vec![],
+                    explanation: "This memory matched the query vector.".to_string(),
+                }]),
             })
             .collect())
+    }
+
+    async fn search_with_domain(
+        &self,
+        namespace: &str,
+        _vector: Vec<f32>,
+        limit: usize,
+        _include_tasks: bool,
+        _include_archived: bool,
+        domains: &[String],
+    ) -> Result<DomainSearchOutcome> {
+        if *self.search_fails.lock().expect("mock store lock") {
+            return Err(anyhow::anyhow!("MockStore search_with_domain configured to fail"));
+        }
+
+        // Normalize the provided domains into a set (lowercase-kebab).
+        let domain_keys: std::collections::HashSet<String> = domains
+            .iter()
+            .filter_map(|d| crate::domain::normalize_domain_slug(d))
+            .collect();
+
+        let rows = self.rows.lock().expect("mock store lock");
+        let mut all_primaries = Vec::new();
+        let mut filtered_primaries = Vec::new();
+
+        for r in rows.iter().filter(|r| r.namespace == namespace) {
+            // Domain filter check: happens BEFORE we consider the row for the filtered set.
+            // The domain_keys set is already normalized (lowercase-kebab).
+            let domain_match = if domain_keys.is_empty() {
+                true // empty key set = no filter asked for
+            } else {
+                domain_key(&r.payload.metadata)
+                    .map(|k| domain_keys.contains(&k))
+                    .unwrap_or(false)
+            };
+
+            let sr = SearchResult {
+                id: r.id.clone(),
+                score: 1.0,
+                payload: r.payload.clone(),
+                evidence: Some(vec![crate::traits::SearchEvidence {
+                    kind: crate::traits::EvidenceKind::DirectMatch,
+                    path: vec![],
+                    explanation: "This memory matched the query vector.".to_string(),
+                }]),
+            };
+
+            // Every accepted row goes to all_primaries
+            all_primaries.push(sr.clone());
+
+            // Only domain-matching rows go to filtered_primaries
+            if domain_match {
+                filtered_primaries.push(sr);
+            }
+        }
+
+        // Determine chosen set and mode (soft fallback when filter empties candidates).
+        let (chosen_primaries, mode) = if domain_keys.is_empty() {
+            // No filter asked for: all rows go to both lists, mode is Vector
+            (all_primaries, DomainMatchMode::Vector)
+        } else if filtered_primaries.is_empty() && !all_primaries.is_empty() {
+            // Filter would empty the candidates: skip it, use unfiltered, mode is Vector
+            (all_primaries.into_iter().take(limit).collect(), DomainMatchMode::Vector)
+        } else {
+            // Filter applied successfully
+            (filtered_primaries.into_iter().take(limit).collect(), DomainMatchMode::Domain)
+        };
+
+        Ok(DomainSearchOutcome {
+            results: chosen_primaries,
+            mode,
+        })
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
@@ -140,7 +239,11 @@ impl VectorStore for MockStore {
                 id: r.id.clone(),
                 score: 1.0,
                 payload: r.payload.clone(),
-                evidence: None,
+                evidence: Some(vec![crate::traits::SearchEvidence {
+                    kind: crate::traits::EvidenceKind::DirectMatch,
+                    path: vec![],
+                    explanation: "This memory matched the query vector.".to_string(),
+                }]),
             })
             .collect())
     }
@@ -178,7 +281,11 @@ impl VectorStore for MockStore {
         Ok(serde_json::json!({"nodes": [], "links": []}))
     }
 
-    async fn increment_access_count(&self, _namespace: &str, _id: &str) -> Result<()> {
+    async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {
+        self.incremented_ids
+            .lock()
+            .expect("mock store lock")
+            .push((namespace.to_string(), id.to_string()));
         Ok(())
     }
 
