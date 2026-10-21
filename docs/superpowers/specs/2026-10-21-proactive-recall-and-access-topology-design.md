@@ -121,9 +121,13 @@ The existing response object (`src/buffer.rs:171-177`: `appended`, `file`, `size
 
 `recalled` is **always present** — an explicit empty array when `tags` is empty or nothing matched. Silence about "nothing was recalled" would be a lie the caller has to guess about (the repo's explicit-zero convention).
 
+`recalled_from` is present **exactly when a search ran**. It names the mode that produced the rows: `"domain"` when the domain filter narrowed the candidates, `"vector"` when the filter matched nothing and was skipped. It is **absent** when no search ran (an untagged turn, or every tag normalized away) and when the search failed — in neither case did a search produce rows, so there is no mode to report. Reporting `"vector"` there would claim a vector search that never happened, which is the misreport §4.3.5 exists to prevent. *(Amended 2026-10-21 after the plan review: Argon and K3 both found the unconditional field dishonest in the no-search and error cases.)*
+
 **Bounds:** at most **3** entries; `snippet` at most 120 characters. Worst case context cost ≈ 150 tokens, and only on tagged turns.
 
 **Retrieval:** the recall calls `VectorStore::search` **directly** — vector-distance ranked with the capped usage boost (`src/store/ladybug.rs:1087-1100`), with the domain filter of §4.3 applied. Because it queries the store rather than the snapshot, it **bypasses the `access_count` top-5 cut by construction** — which is the §3.3 hole, closed.
+
+**Only direct matches are recalled.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:1445-1466`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node carries no `metadata.domain` and a synthetic score of 1.0. The recall therefore keeps only the results whose evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2008-2013`). Without it, a namespace with fewer than three primaries would recall governed nodes it never matched. *(Amended 2026-10-21 after the plan review: Argon's Q3.)*
 
 **Query construction:** the query text is the normalized tags joined by a space (e.g. `"auth database"`), embedded **once** — one embedding call per tagged turn, no more. The same normalized tags are the domain filter's key set (§4.3.1), so a tagged turn is searched by both meaning and key in a single pass.
 
@@ -187,7 +191,7 @@ Topology rows bind to code through the **existing** path: `locations` → `metad
 
 #### 4.2.4 Validation and cost
 
-`parse_edge_specs` (`src/store/ladybug.rs:414`) gains a shape check for `metadata.topology`; a malformed value raises a `WriteShapeWarning` (`:519`) and the durable `fact` write still succeeds. The claim is worth keeping even when its shape is imperfect; a rejected write would lose it.
+`parse_edge_specs` (`src/store/ladybug.rs:424`) gains a shape check for `metadata.topology`; a malformed value raises a `WriteShapeWarning` (the struct is at `:415-420`, the warnings are emitted by the upsert at `:905-906`) and the durable `fact` write still succeeds. The claim is worth keeping even when its shape is imperfect; a rejected write would lose it.
 
 Cost: one vocabulary file edit + the version bump + the assert + two `tool_summaries` strings. **Zero storage migration** — existing facts carry no `metadata.topology` and remain valid.
 
@@ -211,7 +215,7 @@ The read-side normalization is what makes this **migration-free**: legacy free-t
 An optional `domain` filter is added to:
 
 - `neurostrata_search_memory` (`src/server.rs:1956`), and
-- the store's candidate loop (`src/store/ladybug.rs:1070-1085`).
+- the store's candidate loop (`src/store/ladybug.rs:1064-1137`).
 
 `VectorStore::search` currently takes `(namespace, vector, limit, include_tasks, include_archived)` (`src/traits.rs:165-172`); the `include_*` flags are the precedent for another parameter.
 
@@ -236,7 +240,7 @@ Recorded for that later phase, so the bootstrap is not re-litigated: **the first
 
 #### 4.3.5 Soft fallback
 
-If a domain filter would empty the candidate set, the filter is **skipped** and the unfiltered candidates are returned — a wrong domain must not blind recall. The store's search is a pure-vector match (`src/store/ladybug.rs:1046`); the domain filter proposed in §4.3.2 narrows that candidate set, and the soft fallback is a property of that new filter, not an existing code path. Because a silent fallback would misreport what was searched, the recall response states which mode produced it: `recalled_from: "domain" | "vector"`. *(This field is an orchestrator addition, not a panel decision; it exists because the repo's honesty rules forbid a silent substitution.)*
+If a domain filter would empty the candidate set, the filter is **skipped** and the unfiltered candidates are returned — a wrong domain must not blind recall. The store's search is a pure-vector match (`src/store/ladybug.rs:1046`); the domain filter proposed in §4.3.2 narrows that candidate set, and the soft fallback is a property of that new filter, not an existing code path. Because a silent fallback would misreport what was searched, the recall response states which mode produced it: `recalled_from: "domain" | "vector"`. *(This field is an orchestrator addition, not a panel decision; it exists because the repo's honesty rules forbid a silent substitution.)* When no search ran, or the search failed, the response carries **no mode at all** (§4.1.2) — an honest silence beats a mode that names a search that never happened. The two values map exactly onto the two domain-filter counters the recall-closure spec defines (`domain_narrowed_hits` / `domain_fallback_vector`): a call with no mode ran no filter and increments neither.
 
 ---
 
@@ -262,7 +266,7 @@ The full ruling is memory `5d25375d` (unanimous: Argon, K3, orchestrator). In br
 |---|---|---|
 | `recalled` | `neurostrata_append_log` response | array, 0–3 entries; **always present** |
 | `recalled[]` entry | same | `{id, memory_type, domain, score, snippet}`; `snippet` ≤ 120 chars |
-| `recalled_from` | same | `"domain"` \| `"vector"` — how the rows were selected |
+| `recalled_from` | same | `"domain"` \| `"vector"` — how the rows were selected; **present exactly when a search ran**, absent when no search ran or the search failed |
 | `metadata.topology` | `fact` metadata | `{component, target_system, channel, credential_boundary, reason}` — all five required by the declared shape; a missing or malformed value warns, it does not reject the write |
 | `metadata.domain` | all memory metadata | lowercase-kebab slug; normalized on write **and** on comparison |
 
@@ -274,11 +278,11 @@ Ordered. Each step is independently testable.
 
 | # | Step | Where |
 |---|---|---|
-| 0 | **Prerequisite:** the `rule-honesty` hardening + legacy backfill lands | task `neurostrata-bzdn` |
-| 1 | Domain slug normalizer; applied on write (the add path) and on comparison | new helper + `src/server.rs:1279-1281`; `src/store/ladybug.rs:1070-1085` |
-| 2 | Optional `domain` filter on search (store + MCP tool), with the soft fallback when the filter would empty the candidate set | `src/traits.rs:165-172`, `src/store/ladybug.rs:994-1127` (the filter narrows the vector query at `:1046`); `src/server.rs:1956` |
+| 0 | **Prerequisite for the rule row and the rule-honesty conformance test:** the `rule-honesty` hardening + legacy backfill lands. It does **not** gate the mechanism — the recall, the filter and the vocabulary change land independently of it | task `neurostrata-bzdn` |
+| 1 | Domain slug normalizer; applied on write (the add path) and on comparison | new helper + `src/server.rs:1279-1281`; `src/store/ladybug.rs:1064-1137` |
+| 2 | Optional `domain` filter on search (store + MCP tool), with the soft fallback when the filter would empty the candidate set | `src/traits.rs:165-172`, `src/store/ladybug.rs:1004-1137` (the filter narrows the vector query at `:1046`); `src/server.rs:1956` |
 | 3 | Vocabulary: `fact.fields.topology`, version 4 → 5, assert, `tool_summaries` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69`, `:158-161`; `src/traits.rs:263` |
-| 4 | Shape check for `metadata.topology` → soft warning | `src/store/ladybug.rs:414`, `:519` |
+| 4 | Shape check for `metadata.topology` → soft warning | `src/store/ladybug.rs:424`, `:415-420` |
 | 5 | `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; query text = normalized tags joined, embedded once, and the same tags are the domain filter's key set; `recalled` + `recalled_from` in the response | `src/buffer.rs:129`, `:143-152`, `:171-177`; `src/server.rs:373-380`, `:664`, `:2051` |
 | 6 | Tests (§7) | `src/buffer.rs`, `src/server.rs`, `src/store/ladybug.rs` |
 | 7 | Docs: the honest-recall note; `CHANGELOG.md` entry | repo docs |
@@ -327,7 +331,7 @@ Ordered. Each step is independently testable.
 
 ## 10. Dependencies, sequencing, deferrals
 
-**Lands first:** `neurostrata-bzdn` — the `rule-honesty` hardening plus the legacy backfill (NeuroStrata: 86 rule rows, 84 missing `enforcement`; keywest.health: 137 rows, 137 missing `enforcement`, 102 missing `source`).
+**Lands first relative to this spec's own rule rows:** `neurostrata-bzdn` — the `rule-honesty` hardening plus the legacy backfill (NeuroStrata: 86 rule rows, 84 missing `enforcement`; keywest.health: 137 rows, 137 missing `enforcement`, 102 missing `source`). The dependency is one-directional and narrow: the hardening must land before a rule row written under §4.4 is written, because the tightened contract is what the row must satisfy. It does not gate the mechanism — the recall, the domain filter and the vocabulary bump are implementable against `b3904d8` without it.
 
 **Already landed and orthogonal:** `c446b2c` — episode siblings via `EXTRACTED_FROM` (`EvidenceKind::EpisodeSibling`, `src/store/ladybug.rs:1165-1168`, `:1317-1382`).
 

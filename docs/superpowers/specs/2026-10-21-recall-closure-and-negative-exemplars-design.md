@@ -536,6 +536,15 @@ nothing about domains — so the counters do not live inside the bus):
 | `domain_fallback_vector` | calls where the filter matched 0 rows and fell back to the unfiltered vector search (`recalled_from: "vector"`) |
 | `single_domain_bypasses` | calls in a namespace whose registry holds ≤1 domain (filtering could not narrow anything) |
 
+**A call with no `recalled_from` increments none of the four.** The parent spec
+(`docs/superpowers/specs/2026-10-21-proactive-recall-and-access-topology-design.md`
+§4.1.2) makes the mode present *exactly* when a search ran, and absent when no search
+ran (an untagged turn, or every tag normalized away) or when the search failed. Such a
+call carried no filter and narrowed nothing, so it is not a domain-filter call at all —
+and a failed search is not a fallback, because no unfiltered search was run in its place.
+Counting it as `domain_fallback_vector` would overstate the filter's fallback rate with
+the errors it produced.
+
 Exposed as `"domain_filter": {…}` on the metrics surface, with **explicit zeros** on a
 fresh daemon, and surfaced per call as `recalled_from` / `registered_domain_count` on
 the recall response.
