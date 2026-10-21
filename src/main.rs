@@ -2,6 +2,7 @@ mod buffer;
 mod config;
 mod crash;
 mod daemon;
+mod domain;
 mod embed;
 mod events;
 mod guard;
