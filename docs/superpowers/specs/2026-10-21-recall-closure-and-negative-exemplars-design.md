@@ -81,6 +81,7 @@ elsewhere or is another spec's subject):
 | A semantic change requires a `vocabulary_version` bump; asserted in one place | `src/schemas/memory-vocabulary.v3.json:155`; `src/traits.rs:263` |
 | The agent learns vocabulary **only** from `tool_summaries` and the tool description | `src/schemas/memory-vocabulary.v3.json:158`, `:161`; overlaid onto the tools at `src/server.rs:456-501` |
 | The mesh is closed over `["rule","fact","procedure"]`; an unknown `memory_type` is **rejected at import** | `src/synaptic_mesh/import.rs:61`, `:649-655`; contract `src/synaptic_mesh/record.rs:26-28` |
+| The mesh's own import doc **contradicts its code**: the comment says an unknown type is "ignored and reported, never applied, never crash"; the code returns a hard `Err` | doc `src/synaptic_mesh/import.rs:57-60`; code `:649-655`. Task `neurostrata-wl4i` owns the reconciliation (§11). This spec is safe under **either** reading — a `fact` is shareable under both. |
 | A mesh row whose id is not a parseable **UUID is skipped** — ids must be UUIDs | `src/synaptic_mesh/worker.rs:180-183`; `MeshRecord.id: Uuid` at `src/synaptic_mesh/record.rs:24` |
 | Mesh export publishes only `eligibility: shareable`; absent or `private` reads as private | `src/synaptic_mesh/worker.rs:174-179` |
 | Relations are closed; the four keys are hardcoded | `src/store/ladybug.rs:455-462` |
@@ -95,7 +96,9 @@ elsewhere or is another spec's subject):
 | `store.get(namespace, id)` and `store.list(namespace, user_id)` exist | `src/traits.rs:195`, `:192` |
 | `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2019`, `:2652`; `src/store/ladybug.rs:2003` |
 | `create_new_namespace: true` is the established **escape-hatch** precedent for a write that would otherwise be refused | `src/server.rs:117`, `:1217-1222` |
-| Structural types are excluded from recall candidates | `src/store/ladybug.rs:687` |
+| Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:687`; the excluded-type list is built at `:1045` and applied in the query at `:1055-1057` |
+| The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `src/store/ladybug.rs:1083-1094` (base search), `:1206-1213`, `:1262-1269` (graph expansion) |
+| The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1152-1173` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
 | `format_memory` is the rendering path for a returned row | `src/server.rs:2222` |
 | The bus metrics surface serializes the bus's own counters (eight integers) | `src/handlers/bus_metrics.rs:20-23` |
 
@@ -155,8 +158,14 @@ the shape, and an undeclared shape is invisible (§2).
   2. Every truncated `snippet` (§3.3, and the parent's `recalled[]`) is prefixed with
      `"[FAILED ATTEMPT] "` **before** truncation, so truncation can never strip the
      marker and leave the tail of a failure reading as an instruction.
-- **Deduplication.** `metadata.attempt` joins the canonical exact-match key, so a negative
-  exemplar about subject X never exact-match blocks a positive `fact` about subject X.
+- **Deduplication.** The store's duplicate check is **semantic** — the candidates scoring
+  `>= 0.85` are handed to the judgment provider, which compares them against the
+  incoming payload (§2; there is no canonical exact-match key to extend, and none is
+  invented here). The candidate set is therefore **partitioned by attempt-presence**
+  before the check: a row carrying a valid `metadata.attempt` is compared only against
+  rows that carry one, and a row without one only against rows without. A negative
+  exemplar about subject X can consequently never block a positive `fact` about subject
+  X, while two attempts about the same approach are still compared with each other.
 
 #### 3.1.4 Validation
 
@@ -190,9 +199,23 @@ resolve a project-root path — it would be a second path to truth); a `rule` (i
 fail the rule-honesty gate for missing `enforcement`/`guard`); a custom `memory_type`
 (rejected by mesh import if ever shared).
 
-The registry row is **excluded from recall candidates and from the snapshot body** — the
-same predicate the store already applies to structural rows (§2). It is metadata, not
-knowledge.
+The registry row is **excluded from recall results and from the snapshot body**. It is
+metadata, not knowledge. The mechanism is explicit, not borrowed:
+
+- **In the store**, the exclusion is a metadata predicate at the store's per-row filter
+  seam — beside `is_retired_at`, `is_archived` and `is_mesh_conflicting`
+  (`src/store/ladybug.rs:1083-1094`, and the two graph-expansion passes at `:1206-1213`
+  and `:1262-1269`). A row whose metadata carries `domain_registry` is dropped there,
+  so it never consumes a *result* slot. It may consume one **over-fetch** slot
+  (`fetch_limit = limit * 10`), the same cost class as any other filtered row.
+- **In the snapshot**, the exclusion is a `retain` on the list the snapshot has already
+  fetched — beside the archived and mesh-conflicting retains (`src/server.rs:1442`,
+  `:1446`) — so it costs nothing beyond the scan.
+
+The structural-type exclusion is **not** the mechanism: that one is by `memory_type` at
+query-build time (`src/store/ladybug.rs:1045`, `:1055-1057`) over a fixed five-member
+const, with no per-row hook. The registry row is a `fact`, so it is not in that set and
+needs a predicate of its own.
 
 #### 3.2.2 The bootstrap, and why it is namespace-level
 
@@ -210,10 +233,13 @@ per-namespace reading.**
 **Bootstrap (lazy, in-band, zero offline migration).** On a write carrying a `domain`:
 
 1. Look up the registry row (`store.get`, `src/traits.rs:195`).
-2. If it is **absent** — the namespace's first domain write — list the namespace's active
-   rows (`store.list`, `src/traits.rs:192`), slug-normalize every `metadata.domain` they
-   carry, union them with the incoming slug, and write the registry row. Every legacy
-   domain is grandfathered at once, and **the write always succeeds**.
+2. If it is **absent** — the namespace's first domain write — list the namespace's rows
+   (`store.list(namespace, None)`, `src/traits.rs:192`; it returns every row in the
+   namespace), slug-normalize every `metadata.domain` they carry, union them with the
+   incoming slug, and write the registry row. Every legacy domain is grandfathered at
+   once, and **the write always succeeds**. The bootstrap deliberately errs toward
+   registering **more**: a stale domain left behind by a retired or archived row costs
+   nothing, whereas a missing legacy domain would reject a legitimate write.
 3. If it is **present** and the incoming slug is not in it, the write is **rejected**
    (§3.2.3).
 
@@ -257,6 +283,29 @@ carries the original row's already-validated domain forward.
   import step **unions that slug into the local registry row**, so an imported row's
   domain is legal locally and no shared record is ever refused for a domain the local
   registry has not seen.
+
+#### 3.2.5 The registry update is atomic
+
+Registering a domain is a **read-merge-write**: read the registry row, add the slug to
+the sorted list, write it back. That sequence is not atomic by itself, and the store
+does not make it atomic for us: each `VectorStore` call opens its own connection
+(`with_conn`, `src/store/ladybug.rs:388-410`), and the write lock the store does hold
+(`write_with_deadline`, `:281-299`) covers the write alone, not the preceding read. Two
+concurrent registrations would therefore be able to overwrite each other, and one slug
+would vanish from the registry without a word.
+
+**The fix is in the handler, not the store.** The registry update runs under a
+**process-wide registry mutex** — registrations are rare and off the hot path — so the
+read-merge-write is serialized inside the daemon, which is the only process that can
+write to the store at all (the engine admits one writer; a second is refused rather than
+queued, `src/store/ladybug.rs:289-296`). The merged row is then **re-read and
+verified**: if the slug is not in the list that came back, the write is reported as
+failed rather than silently accepted. A caller is never told a domain was registered
+when it was not.
+
+No `VectorStore` trait method is added. `store.get` and `store.upsert` are enough
+(`src/traits.rs:195`, `:152-158`); the mutex and the verification live in the handler
+layer, beside the write path.
 
 ---
 
@@ -321,7 +370,8 @@ body, with an **explicit zero** when empty (`(0): []`). Worst case 3 × 120 char
 Mid-session topic transitions are served by the parent's `append_log` recall (≤3 entries,
 ≤120 chars). Session/task start is served by this strap. Both are bounded, additive and
 `access_count`-neutral, so an agent that triggers both in one turn sees at most six
-compact entries — under ~300 characters of pointer text.
+compact entries — under 720 characters of pointer text (≈200 tokens), and the two seats
+answer different moments, so in practice they rarely fire together.
 
 ---
 
@@ -402,13 +452,13 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 |---|---|---|
 | 0 | **[P]** Prerequisite: the rule-honesty hardening + legacy backfill lands | task `neurostrata-bzdn` |
 | 1 | **[P]** Domain slug normalizer, applied on write and on comparison | new helper + `src/server.rs:1279-1281`; `src/store/ladybug.rs:1070-1085` |
-| 2 | **[N]** Registry row helpers: the deterministic v5 id, the lookup, the bootstrap seed (list + normalize + union), and the registry update (`store.upsert`) | new module beside the store; `src/traits.rs:192`, `:195`, `:158` |
+| 2 | **[N]** Registry row helpers: the deterministic v5 id, the lookup, the bootstrap seed (list + normalize + union), and the registry update (`store.upsert`) under the process-wide registry mutex, with a verify-after-write | new module beside the store; `src/traits.rs:192`, `:195`, `:152-158` |
 | 3 | **[P+N]** Vocabulary **one** bump 4 → 5: `fact.fields.topology` (P), `fact.fields.attempt`, `fact.fields.domain_registry` (N); the assert at `src/traits.rs:263`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69`, `:158`, `:161`; `src/traits.rs:263` |
 | 4 | **[N]** The write-path registry check: bootstrap when absent, reject when present and unregistered, `register_domain: true` to override — on both write paths that accept a domain | `src/server.rs:1279-1325`; `src/task/mod.rs:1130-1155` |
 | 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:165-172`; `src/store/ladybug.rs:1004`; `src/server.rs:1956` |
-| 6 | **[N]** Registry row excluded from recall candidates and from the snapshot body | `src/store/ladybug.rs:1087-1095`; `src/server.rs:1441-1447` |
+| 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:1083-1094`; `src/server.rs:1442`, `:1446` |
 | 7 | **[P]** `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; the recall rides the response | `src/buffer.rs:129`, `:171-177`; `src/server.rs:373-380`, `:664`, `:2051` |
-| 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; `attempt` joins the canonical dedup key | `src/store/ladybug.rs:424`; `src/server.rs:2222`; `src/buffer.rs:171-177`; `src/server.rs:1152-1173` |
+| 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:424`; `src/server.rs:2222`; the parent's `recalled[]` response, built beside `src/buffer.rs:169-176`; `src/server.rs:1152-1173` |
 | 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-161`, `:1454-1493` |
 | 10 | **[N]** The `domain_filter` counters and their surface | new module beside the search path; `src/handlers/bus_metrics.rs` |
 | 11 | **[N]** The mesh import step unions an imported record's domain into the local registry | `src/synaptic_mesh/import.rs` |
@@ -430,7 +480,9 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
    `Attempt [FAILED in <context>]: …` line.
 5. Every truncated snippet of a negative exemplar begins with `"[FAILED ATTEMPT] "`, and
    is ≤ 120 characters **including** the prefix.
-6. A negative exemplar about X never exact-match blocks a positive `fact` about X.
+6. A negative exemplar about X never blocks a positive `fact` about X: the duplicate
+   check's candidate set is partitioned by attempt-presence, so the two are never
+   compared against each other.
 7. In a namespace with no registry row and an existing memory carrying
    `domain: "Database Access"`, writing a memory with `domain: "Auth"` succeeds and
    creates the registry row with `["auth", "database-access"]`.
@@ -466,11 +518,14 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | An unregistered domain slug is written | Rejected, with the registered list and the `register_domain` remedy | The wrong slug never enters the store; the caller is told exactly what to do. |
 | A namespace's first domain write happens with 20 legacy free-text domains | The bootstrap seeds the registry with all of them | No legacy domain is orphaned; the write still succeeds. |
 | The registry row is deleted or the namespace is wiped | The next domain write re-bootstraps | Self-healing; no manual repair step. |
-| Two agents register a domain concurrently | The registry update is a read-modify-write under the store's lock | No lost update. |
+| Two agents register a domain concurrently | The registry's read-merge-write runs under the process-wide registry mutex, and the merged row is re-read and verified before the call reports success | No slug can vanish from the registry without the caller being told |
+| The bootstrap registers a stale domain from a retired row | Stale entries cost nothing; a missing legacy domain would | The bootstrap errs toward registering more, never less |
 | The strap's mode is wrong for the caller's intent | The mode is printed in the section header | The caller can see which selection produced the rows. |
 | The strap would show only one domain | `recent_domain` mode caps at 2 per domain | A narrow namespace cannot consume every slot. |
 | The domain filter would empty the candidate set | The filter is skipped; `recalled_from: "vector"` | Recall is never blind, and the substitution is reported. |
 | The mesh imports a record with an unseen domain | The slug is unioned into the local registry | No shared record is refused for a local vocabulary gap. |
+| The registry row matches a vector query | It is dropped at the store's per-row filter seam, so it never occupies a result slot; at worst it uses one over-fetch slot | No registry content is ever returned to an agent. |
+| The mesh's unknown-type policy is reconciled the other way (`neurostrata-wl4i`) | The negative exemplar is a `fact`, which is shareable under either reading | The design does not depend on the unresolved contradiction. |
 | The vocabulary bump breaks a consumer | One assert at `src/traits.rs:263` | Localized, compile-time, greppable. |
 
 ---
@@ -538,6 +593,7 @@ the registry helpers (2) and the vocabulary declaration (3).
 | §11.4 — the distance band | task `neurostrata-r7dj` |
 | The parent spec's own implementation | task `neurostrata-426k` |
 | The rule-honesty hardening and the legacy backfill | task `neurostrata-bzdn` |
+| The mesh's import doc contradicts its code (an unknown `memory_type`: ignored, or a hard error) | task `neurostrata-wl4i` |
 
 ---
 
@@ -586,6 +642,23 @@ E.1–E.3 and named E.4 as a task.
 | The brief cited `increment_access_count` at `src/store/ladybug.rs:1993` | It is at `:2003`. (Argon) |
 | `src/synaptic_mesh/record.rs:26-28` names `structural` as a mesh memory type | The binding set is three (`src/synaptic_mesh/import.rs:61`); `structural` is rejected at import. Doc corrected in commit `c5acd4f`. (K3) |
 | A mesh row may carry a non-UUID id | Rows whose id fails `Uuid::parse_str` are skipped (`src/synaptic_mesh/worker.rs:180-183`) — the registry row therefore uses a deterministic **UUID v5**. (Argon) |
+
+**The checker's findings** (session `ses_ea3515449fferHzlPrObOKwd9E`). The checker
+confirmed 21 of 22 spot-checked substrate anchors, confirmed all four corrections above,
+and refuted two claims this spec had made:
+
+| Claim as first written | The checker's finding | The fix |
+|---|---|---|
+| "`metadata.attempt` joins the canonical exact-match key" | No canonical exact-match key exists in `src/`. `src/server.rs:1152-1173` is the **semantic** duplicate check — candidates scoring `>= 0.85`, then `checker.check_duplicates(payload, &similar)`. | §3.1.3 now **partitions the duplicate check's candidate set by attempt-presence** — a mechanism that exists — instead of extending a key that does not. |
+| "the registry row is excluded by the same predicate the store already applies to structural rows" | `STRUCTURAL_MEMORY_TYPES` is a fixed `const [&str; 5]` consulted only at query-build time; it has no per-row hook, and its members are `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` — **not** `symbol`. | §3.2.1 now names the real seam: a metadata predicate in the store's per-row filter (`src/store/ladybug.rs:1083-1094`) and a `retain` on the snapshot's fetched list (`src/server.rs:1442`, `:1446`). |
+| "the mesh rejects an unknown `memory_type` at import" | The **code** does reject it (`:649-655`); the **comment** directly above it (`:57-60`) says unknown types are "ignored and reported, never applied, never crash". The mesh's own doc contradicts its own code. | Recorded in §2 as a known contradiction; filed as task `neurostrata-wl4i`. The design is safe under either reading. |
+
+The checker's run ended at its step limit with the feasibility pass and the numeric
+consistency pass unfinished. The orchestrator completed both against source — the
+registry-row exclusion, the registry's read-modify-write under the store's lock, the
+bootstrap scan through `store.list`, the `[FAILED ATTEMPT]` prefix applied before
+truncation, the polarity partition, and the arithmetic of every bound in §3 and §6 —
+and a narrow re-check was dispatched to confirm the amended spec.
 
 **Brief:** `docs/designs/2026-10-21-panel-brief-recall-closure-and-negative-exemplars.md`
 · **Parent brief:** `docs/designs/2026-10-20-gap-proactive-recall-and-access-topology.md`
