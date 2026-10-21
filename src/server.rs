@@ -188,7 +188,8 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "query": { "type": "string", "description": "What to search for." },
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
-                                "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." }
+                                "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." },
+                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -1998,18 +1999,37 @@ async fn handle_search_memory(
     // plus their bounded expansions. We ask for 5 primaries (the default page).
     const DEFAULT_LIMIT: usize = 5;
 
+    // An optional domain filter: a slug, or a list of slugs. Each value is
+    // normalized here, so the store compares by slug on both sides and a
+    // legacy free-text domain still matches. A value that normalizes to
+    // nothing is dropped; an empty list is the "no filter" case.
+    let slugs: Vec<String> = match arguments.get("domain") {
+        Some(Value::String(one)) => crate::domain::normalize_domain_slug(one)
+            .into_iter()
+            .collect(),
+        Some(Value::Array(many)) => many
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(crate::domain::normalize_domain_slug)
+            .collect(),
+        _ => Vec::new(),
+    };
+
     if let Ok(_) = store.init(namespace).await {
         if let Ok(vec) = emb.embed(&query).await {
-            if let Ok(results) = store
-                .search(
+            if let Ok(outcome) = store
+                .search_with_domain(
                     namespace,
                     vec,
                     DEFAULT_LIMIT,
                     include_tasks,
                     include_archived,
+                    &slugs,
                 )
                 .await
             {
+                let mode = outcome.mode;
+                let results = outcome.results;
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
                 } else {
@@ -2031,7 +2051,24 @@ async fn handle_search_memory(
                         }
                     }
 
-                    render_search_results(&results)
+                    let report = render_search_results(&results);
+                    if slugs.is_empty() {
+                        report
+                    } else {
+                        // A filter that was skipped is a substitution the caller
+                        // has to be told about: a wrong domain must never blind
+                        // the search, and a silent fallback would misreport what
+                        // was searched.
+                        let mode_line = match mode {
+                            crate::traits::DomainMatchMode::Domain => {
+                                "domain filter: applied (domain)"
+                            }
+                            crate::traits::DomainMatchMode::Vector => {
+                                "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
+                            }
+                        };
+                        format!("{}\n\n{}", mode_line, report)
+                    }
                 }
             } else {
                 "Failed to search database.".to_string()
@@ -3067,6 +3104,120 @@ mod tests {
         assert_ne!(
             text, "Failed to search database.",
             "the search path no longer hits ARRAY_DISTANCE's integer-array binder error: {text}"
+        );
+    }
+
+    /// A store holding two rules in two different domains, so a domain filter
+    /// has something to choose between.
+    async fn store_with_two_domains(namespace: &str) -> (Arc<dyn VectorStore>, String, String) {
+        let store: Arc<dyn VectorStore> = Arc::new(crate::guard::testkit::MockStore::new());
+        store.init(namespace).await.expect("init the namespace");
+        let mut auth = payload("the auth service terminates mTLS");
+        auth.metadata = serde_json::json!({ "domain": "auth" });
+        let mut data = payload("the database access layer runs on podman");
+        data.metadata = serde_json::json!({ "domain": "database-access" });
+        let auth_id = "auth-rule".to_string();
+        let data_id = "data-rule".to_string();
+        store
+            .upsert(namespace, &auth_id, vec![0.1, 0.2, 0.3, 0.4], auth)
+            .await
+            .expect("seed the auth rule");
+        store
+            .upsert(namespace, &data_id, vec![0.5, 0.6, 0.7, 0.8], data)
+            .await
+            .expect("seed the database rule");
+        (store, auth_id, data_id)
+    }
+
+    /// A search with no domain reads exactly as it did before the filter
+    /// existed: the same rows, and no mode line, because no substitution
+    /// happened.
+    #[tokio::test]
+    async fn search_memory_without_a_domain_behaves_exactly_as_today() {
+        let (store, auth_id, data_id) = store_with_two_domains("probe").await;
+
+        let report = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "rules" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+
+        assert!(report.contains(&auth_id), "the auth rule is back: {report}");
+        assert!(
+            report.contains(&data_id),
+            "the database rule is back: {report}"
+        );
+        assert_eq!(
+            report.matches("--- Memory ID:").count(),
+            2,
+            "exactly the two rules, and no others: {report}"
+        );
+        assert!(
+            !report.contains("domain filter:"),
+            "no mode line when no domain was asked for: {report}"
+        );
+        assert!(
+            report.starts_with("--- Memory ID:"),
+            "the report opens with the memories, unchanged: {report}"
+        );
+    }
+
+    /// A domain filter narrows the rows, and the report says so. The mode line
+    /// is the honest half of the filter: the caller is told whether the
+    /// filter chose the rows.
+    #[tokio::test]
+    async fn search_memory_with_a_domain_filters_the_results_and_reports_the_mode() {
+        let (store, auth_id, data_id) = store_with_two_domains("probe").await;
+
+        let report = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "rules", "domain": "auth" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+
+        assert!(
+            report.contains(&auth_id),
+            "the matching rule is back: {report}"
+        );
+        assert!(
+            !report.contains(&data_id),
+            "the other domain's rule is gone: {report}"
+        );
+        assert!(
+            report.starts_with("domain filter: applied (domain)"),
+            "the report says the filter chose the rows: {report}"
+        );
+    }
+
+    /// A domain that matches nothing is skipped rather than emptying the
+    /// results -- a wrong domain must never blind the search -- and the report
+    /// says the rows were not chosen by the filter.
+    #[tokio::test]
+    async fn search_memory_with_a_domain_that_matches_nothing_reports_the_skip() {
+        let (store, auth_id, data_id) = store_with_two_domains("probe").await;
+
+        let report = handle_search_memory(
+            serde_json::json!({ "namespace": "probe", "query": "rules", "domain": "no-such-domain" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+
+        assert!(
+            report.contains(&auth_id),
+            "the rows come back unfiltered: {report}"
+        );
+        assert!(
+            report.contains(&data_id),
+            "the rows come back unfiltered: {report}"
+        );
+        assert!(
+            report.starts_with(
+                "domain filter: skipped — no row matched the domain; the results are unfiltered (vector)"
+            ),
+            "the report says the filter was skipped: {report}"
         );
     }
 

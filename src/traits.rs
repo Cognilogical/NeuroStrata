@@ -107,9 +107,6 @@ pub enum DomainMatchMode {
 #[derive(Debug, Clone)]
 pub struct DomainSearchOutcome {
     pub results: Vec<SearchResult>,
-    /// `mode` is read by Task 3 and Task 6 (callers of `search_with_domain`).
-    /// Temporarily allowed until those tasks land.
-    #[allow(dead_code)]
     pub mode: DomainMatchMode,
 }
 
@@ -244,8 +241,6 @@ pub trait VectorStore: Send + Sync {
 
     /// Search with an optional domain key set. The default implementation ignores
     /// the key set and reports `Vector`, so a store that cannot filter stays honest.
-    /// Temporarily allowed until Task 3 and Task 6 call it.
-    #[allow(dead_code)]
     async fn search_with_domain(
         &self,
         namespace: &str,
