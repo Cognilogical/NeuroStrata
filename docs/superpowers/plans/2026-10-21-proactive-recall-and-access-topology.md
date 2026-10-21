@@ -121,11 +121,11 @@ Expected: PASS — 3 tests.
 
 - [ ] **Step 5: Normalize the domain on write**
 
-At `src/server.rs:1279-1281`, the add path inserts the `domain` argument into the metadata verbatim. After that insert, when the inserted value is a string, replace it with `normalize_domain_slug(value)`; when that returns `None`, leave the stored value exactly as it was given. A non-string `domain` is stored as given and is never coerced, converted or dropped — Review Focus #4.
+At `src/server.rs:1279-1281`, the add path inserts the `domain` argument into the metadata verbatim. Once the metadata is assembled, a **string** `metadata.domain` is replaced with `normalize_domain_slug(value)` — wherever it came from, the `domain` argument or the caller's own `metadata` object — because the spec's data contract holds for every memory's `metadata.domain`: "lowercase-kebab slug; normalized on write **and** on comparison" (`docs/superpowers/specs/2026-10-21-proactive-recall-and-access-topology-design.md:271`). When the normalization returns `None`, the stored value is left exactly as it was given. A non-string `domain` is stored as given and is never coerced, converted or dropped — Review Focus #4.
 
 - [ ] **Step 6: Add a test for the write path's behavior**
 
-In `src/server.rs`'s inline test module, add a test that calls the add path with `domain: "Database Access"` and asserts the stored metadata's `domain` is `"database-access"`, and a second assertion with `domain: 42` that the stored value is still the number `42`. Use the same handler the existing add-path tests use.
+In `src/server.rs`'s inline test module, add a test that calls the add path with `domain: "Database Access"` and asserts the stored metadata's `domain` is `"database-access"`, and a second assertion with `domain: 42` that the stored value is still the number `42`. Use the same handler the existing add-path tests use. The same module also asserts that a string domain which normalizes to nothing (`domain: "!!!"`) is stored exactly as given, and that a domain arriving in the caller's `metadata` (`metadata: {"domain": "Database Access"}`) is stored as `"database-access"`.
 
 - [ ] **Step 7: Run the full suite**
 
