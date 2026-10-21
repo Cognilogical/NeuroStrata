@@ -2362,6 +2362,29 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                 let rendered_path = render_path(ev, orig);
                 format!("\nPath [governs_2hop]: {}\nWhy: This memory governs a node one hop from a direct match.", rendered_path)
             }
+            crate::traits::EvidenceKind::EpisodeSibling => {
+                // Two hops: primary -(EXTRACTED_FROM)-> task <-EXTRACTED_FROM- sibling (result)
+                // Originating primary: first edge's source (primary -> task)
+                if ev.path.len() < 2 {
+                    continue;
+                }
+                let first = &ev.path[0];
+                // First edge must be primary -(EXTRACTED_FROM)-> task
+                if first.relation != "EXTRACTED_FROM" {
+                    continue;
+                }
+                let orig = first.source.as_str();
+                // Last edge's source must be result.id (sibling -> task)
+                if let Some(last) = ev.path.last() {
+                    if last.source != result.id || last.relation != "EXTRACTED_FROM" {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+                let rendered_path = render_path(ev, orig);
+                format!("\nPath [episode_sibling]: {}\nWhy: This memory and a direct match were both extracted from the same task.", rendered_path)
+            }
         };
 
         if suffix.len() <= per_result_cap {
