@@ -184,7 +184,7 @@ git commit -m "feat(domain): normalize domain slugs on write and on comparison"
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/store/ladybug.rs`'s inline test module, add five `#[tokio::test]`s. Use `LadybugStore::for_testing(path, 4)` (`:143`) and `store.init(namespace)`, exactly as the existing store tests do; the vector dimension is 4, so upsert and search with a 4-float vector.
+In `src/store/ladybug.rs`'s inline test module, add six `#[tokio::test]`s. Use `LadybugStore::for_testing(path, 4)` (`:143`) and `store.init(namespace)`, exactly as the existing store tests do; the vector dimension is 4, so upsert and search with a 4-float vector.
 
 ```rust
 #[tokio::test]
@@ -208,11 +208,17 @@ async fn a_filtered_search_with_limit_below_unfiltered_count_returns_only_matchi
     filtered result holds the matching row and mode is Domain, and the unfiltered set exceeds `limit` */ }
 
 #[tokio::test]
-async fn mock_store_search_with_domain_matches_real_store_behaviour() { /* pin MockStore to the
-    real store's behaviour: same input, same returned ids, same mode */ }
+async fn mock_store_search_with_domain_matches_real_store_behaviour() { /* seed same rows into
+    LadybugStore and MockStore, run same search_with_domain calls against both, assert same ids
+    in same order and same mode for narrowing and soft-fallback cases */ }
+
+#[tokio::test]
+async fn mock_store_search_with_domain_honours_limit() { /* seed 3 rows, call with limit=1 for
+    empty-key branch (domains=&[]) and filtered branch (domains=&["database"]), assert exactly 1
+    row returned in each case */ }
 ```
 
-The third test is Review Focus #3; the second is Review Focus #2. The legacy row in the third test is **seeded straight into the store with an upsert**, not written through the add path — the add path normalizes on write (Task 1), so a row that still reads `"Database Access"` is exactly what a pre-migration row looks like. The fourth test exercises the stop condition counting `filtered_primaries` (a filtered search that legitimately returns fewer than `limit` rows while the unfiltered set exceeds `limit`). The fifth test pins the mock to the real store's behaviour so the two cannot drift.
+The third test is Review Focus #3; the second is Review Focus #2. The legacy row in the third test is **seeded straight into the store with an upsert**, not written through the add path — the add path normalizes on write (Task 1), so a row that still reads `"Database Access"` is exactly what a pre-migration row looks like. The fourth test exercises the stop condition counting `filtered_primaries` (a filtered search that legitimately returns fewer than `limit` rows while the unfiltered set exceeds `limit`). The fifth test is a differential comparison: same inputs into both stores, asserting identical returned ids, order, and mode for narrowing and soft-fallback cases. The sixth test exercises the mock's `limit` fix (empty-key and filtered branches).
 
 - [ ] **Step 2: Run the tests and watch them fail**
 
