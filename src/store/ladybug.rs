@@ -6427,4 +6427,152 @@ eurostrata\src\daemon.rs",
             "the engine thread must have an alternate stack of at least {required} bytes, got {observed}"
         );
     }
+
+    /// The acceptance sweep (AC 5): a fact with a well-formed access topology
+    /// round-trips, reaches the file it governs through the one-hop expansion,
+    /// and carries that `GOVERNS` edge into the exported graph.
+    ///
+    /// The file node is written FIRST, so the edge resolves on the fact's
+    /// write, and it is written as a `file` -- a structural type, excluded
+    /// from the base candidate query. That is the point: the governed file is
+    /// reachable ONLY through the expansion, never as a direct match, which is
+    /// why the recall filters to direct matches and never recalls a governed
+    /// AST node in place of the fact.
+    #[tokio::test]
+    async fn a_topology_fact_reaches_its_governed_file_and_exports() {
+        let store = retired_test_store().await;
+
+        let topology = json!({
+            "component": "api-gateway",
+            "target_system": "ledger-service",
+            "channel": "mTLS",
+            "credential_boundary": "eu-west-1 VPC",
+            "reason": "the ledger accepts traffic only from inside the VPC",
+        });
+
+        // The structural file node, written before the fact so the GOVERNS
+        // edge has a target to resolve against.
+        store
+            .upsert(
+                "probe",
+                "ledger-file",
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .expect("the file node is written");
+
+        store
+            .upsert(
+                "probe",
+                "topology-fact",
+                vec![1.1, 0.0, 0.0, 0.0],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({
+                        "governs": ["ledger-file"],
+                        "topology": topology,
+                    }),
+                ),
+            )
+            .await
+            .expect("the fact is written");
+
+        // (1) The topology round-trips unchanged through a search for it.
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 5, false, false)
+            .await
+            .expect("the search runs");
+        let fact = results
+            .iter()
+            .find(|r| r.id == "topology-fact")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fact is in the results: {:?}",
+                    results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            fact.payload.metadata["topology"], topology,
+            "the access topology round-trips unchanged"
+        );
+
+        // (2) The fact reaches the file node through the GOVERNS edge, and the
+        //     expansion row carries OneHop evidence.
+        let file = results
+            .iter()
+            .find(|r| r.id == "ledger-file")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the governed file is reached through the expansion: {:?}",
+                    results.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+                )
+            });
+        let evidence = file.evidence.as_ref().expect("the expansion row carries evidence");
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.kind == crate::traits::EvidenceKind::OneHop),
+            "the governed file is reached in one hop: {:?}",
+            evidence
+                .iter()
+                .map(|e| format!("{:?}", e.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            evidence.iter().any(|e| e.path.iter().any(|edge| {
+                edge.relation == "GOVERNS"
+                    && ((edge.source == "topology-fact" && edge.target == "ledger-file")
+                        || (edge.source == "ledger-file" && edge.target == "topology-fact"))
+            })),
+            "the one-hop path names the GOVERNS edge between the fact and the file: {:?}",
+            evidence
+        );
+
+        // (3) The file node is a structural type: it is NOT a base candidate,
+        //     so it carries no DirectMatch and is reachable only through the
+        //     expansion -- which is why the recall keeps the fact and drops
+        //     the governed node.
+        assert!(
+            STRUCTURAL_MEMORY_TYPES.contains(&"file"),
+            "a file node is a structural type: {:?}",
+            STRUCTURAL_MEMORY_TYPES
+        );
+        assert!(
+            !crate::traits::is_direct_match(&file.evidence),
+            "the structural file is not a direct match: {:?}",
+            file.evidence
+        );
+        assert!(
+            crate::traits::is_direct_match(&fact.evidence),
+            "the fact itself is the direct match: {:?}",
+            fact.evidence
+        );
+
+        // (4) The export carries the fact node AND the GOVERNS link to the file.
+        let graph = store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .expect("the graph exports");
+        let nodes = graph["nodes"].as_array().expect("the export carries nodes");
+        let fact_node = nodes
+            .iter()
+            .find(|n| n["id"] == "topology-fact")
+            .expect("the fact node is in the export");
+        assert_eq!(
+            fact_node["metadata"]["topology"], topology,
+            "the export carries the topology with the fact"
+        );
+        let links = graph["links"].as_array().expect("the export carries links");
+        assert!(
+            links.iter().any(|l| {
+                l["source"] == "topology-fact"
+                    && l["target"] == "ledger-file"
+                    && l["type"] == "GOVERNS"
+            }),
+            "the GOVERNS link to the file is in the export: {:?}",
+            links
+        );
+    }
 }
