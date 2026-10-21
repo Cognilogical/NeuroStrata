@@ -1,5 +1,6 @@
 mod buffer;
 mod config;
+mod crash;
 mod daemon;
 mod embed;
 mod events;
@@ -415,6 +416,26 @@ fn config_db_path() -> Option<String> {
     Config::from_default_path()
         .ok()
         .map(|c| c.db_path.to_string_lossy().to_string())
+}
+
+/// Where crash breadcrumbs go: a `crash` directory beside the database.
+///
+/// The database already lives under the user's own config directory, so the
+/// breadcrumbs do too -- no privileged path, no setup, and nothing an
+/// operator has to remove by hand. When the config cannot be read there is
+/// no database path to follow, so the breadcrumbs go to the config
+/// directory itself.
+fn crash_dir() -> std::path::PathBuf {
+    if let Ok(config) = Config::from_default_path() {
+        if let Some(parent) = config.db_path.parent().and_then(|p| p.parent()) {
+            return parent.join("crash");
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".config")
+        .join("neurostrata")
+        .join("crash")
 }
 
 fn dispatch_project_context(
@@ -1696,8 +1717,29 @@ async fn run_bus_metrics(
     Ok(0)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// The tokio runtime, built by hand rather than by `#[tokio::main]`.
+///
+/// The only reason to build it by hand is the crash handler. `SA_ONSTACK`
+/// runs the handler on the thread's alternate signal stack, and the Rust
+/// standard library gives each thread an 8192-byte one -- too small for the
+/// handler's backtrace capture, which would then fault inside the handler
+/// and lose the breadcrumb. `on_thread_start` is the only hook tokio offers
+/// for a per-thread setup, and it covers the worker threads.
+fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| {
+            let _ = crash::install_alt_stack();
+        })
+        .build()?)
+}
+
+fn main() -> anyhow::Result<()> {
+    let runtime = runtime()?;
+    runtime.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
 
@@ -1710,6 +1752,15 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("{}", dispatch_project_context(action, &config_path)?);
         return Ok(());
+    }
+
+    // The crash breadcrumb, installed before anything long-running so the
+    // daemon and the MCP proxy are both covered. A failure here costs a
+    // diagnostic, not the run: the handler is never a prerequisite, so the
+    // process carries on without it.
+    let dir = crash_dir();
+    if let Err(e) = crash::install(&dir) {
+        eprintln!("crash breadcrumbs are off ({}): {}", dir.display(), e);
     }
 
     // Check if the daemon is already running on port 34343

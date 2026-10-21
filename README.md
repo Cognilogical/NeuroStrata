@@ -489,6 +489,25 @@ only by case resolve to the one already stored, and `neurostrata-mcp doctor` rep
 anything an upgrade left inconsistent -- duplicate namespaces, declarations that match
 no file, and how many memories have never been counted as read.
 
+## 🩺 When the daemon crashes
+
+If the daemon dies, it leaves a breadcrumb behind: a file named
+`crash-<pid>-<timestamp>.txt` in the `crash` directory beside your database
+(`~/.config/NeuroStrata/crash` by default). It holds the signal, the pid, the
+thread, the time, and a backtrace of the faulting thread. Nothing else is
+needed to read it, and no privilege is involved: the daemon writes it into
+your own configuration directory, so it works for every user of NeuroStrata
+without root and without any setup.
+
+The backtrace is the part that names the fault. If it is missing, the crash
+still happened on a thread whose stack was too small for the capture, and the
+minimal report beside it is all there is.
+
+A **core dump** holds the same fault in more detail, but a core is a
+machine-wide setting (`kernel.core_pattern`) and so is an administrator's
+choice, not something NeuroStrata requires or asks for. Where one is
+available, `coredumpctl list` and `coredumpctl info <pid>` read it.
+
 ## 🛡️ Security & Compliance
 
 NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications** and common AI red-teaming vectors:

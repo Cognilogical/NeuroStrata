@@ -355,6 +355,13 @@ impl LadybugStore {
     {
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
+            // The engine runs here, on a blocking-pool thread, and a fault
+            // in it is the crash this daemon is known for. The crash handler
+            // needs an alternate signal stack bigger than the one the
+            // standard library gives a thread, so this thread is given one
+            // before it touches the engine. The call is idempotent, so the
+            // pool reusing this thread does not leak another stack.
+            let _ = crate::crash::install_alt_stack();
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
@@ -386,6 +393,9 @@ impl LadybugStore {
         let db = self.db.clone();
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
+            // As in `with_locked_conn`: the engine runs on this thread, so
+            // the crash handler's alternate signal stack is installed here.
+            let _ = crate::crash::install_alt_stack();
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
@@ -5613,6 +5623,35 @@ eurostrata\src\daemon.rs",
         assert!(
             ep_sib.is_some(),
             "EpisodeSibling evidence should be present for server rendering"
+        );
+    }
+
+    /// The thread that runs the engine must have an alternate signal stack
+    /// big enough for the crash handler.
+    ///
+    /// This is the crash path that matters: the engine runs on a
+    /// blocking-pool thread, and the handler runs on that thread's
+    /// alternate stack. The Rust standard library gives a thread 8192 bytes
+    /// of it, which is too small -- the handler would fault inside itself
+    /// and the breadcrumb would be lost.
+    #[tokio::test]
+    async fn the_engine_thread_has_an_alternate_stack_the_handler_can_run_on() {
+        // The size the handler asks for, measured on this thread.
+        crate::crash::install_alt_stack().expect("the alternate stack installs");
+        let required = crate::crash::alt_stack_size();
+        assert!(
+            required >= 32 * 1024,
+            "the handler needs at least 32 KiB of alternate stack, got {required}"
+        );
+
+        let store = episode_sibling_test_store().await;
+        let observed = store
+            .with_conn(|_conn| Ok(crate::crash::alt_stack_size()))
+            .await
+            .expect("the engine call finishes");
+        assert!(
+            observed >= required,
+            "the engine thread must have an alternate stack of at least {required} bytes, got {observed}"
         );
     }
 }
