@@ -333,11 +333,20 @@ Ordered. Each step is independently testable.
 
 **Deferred, with the reason recorded:** Q5 (§2.1); the `get_snapshot` topic lane (§4.1.4); the domain-scoped snapshot lane (§4.1.4); the per-namespace domain registry (§4.3.3).
 
+**All four are now closed** — see §13. The deferrals above are kept as the historical
+record of why each was parked at the time; the resolutions live in
+`docs/superpowers/specs/2026-10-21-recall-closure-and-negative-exemplars-design.md`.
+
 **Hard dependencies on unlanded work:** none. Q1, Q2 and Q4 are implementable against `b3904d8` as verified.
 
 ---
 
 ## 11. Open questions that need observation data, not a review
+
+> **Closed 2026-10-21.** Each of the four below is now **decided** — questions 1–3 in
+> the recall-closure spec (§3.4), question 4 as task `neurostrata-r7dj`. The text is
+> kept as the record of what was open when this spec was written; it is not a standing
+> deferral.
 
 1. **Is the `append_log` seat sufficient?** It fires on every tagged turn, which may be more often than a topic actually changes. If the recall proves noisy, the lever is the strap budget (§4.1.2) before it is a different seat.
 2. **Does a domain filter actually pay?** A namespace with one domain gains nothing from it. The filter's value is measurable only across namespaces with several domains.
@@ -366,3 +375,27 @@ Ordered. Each step is independently testable.
 | `access_count` is incremented only by the two MCP handlers | `src/server.rs:2019`, `:2652` |
 
 **Brief.** `docs/designs/2026-10-20-gap-proactive-recall-and-access-topology.md` · **Panel verdicts:** `docs/designs/2026-10-20-argon-k3-panel-verdicts.md` · **External review:** `docs/designs/2026-10-20-external-review-hyperskill.md`
+
+---
+
+## 13. Deferral resolutions (added 2026-10-21)
+
+The owner's no-deferral ruling (memory `bca58f91`, `AGENTS.md` §9) closes this spec's
+deferral set. Every item this spec parked is now decided, and none of it rolls
+forward unmentioned.
+
+| Deferred here | Closed in | How |
+|---|---|---|
+| Q5 — negative exemplars (§2.1) | `2026-10-21-recall-closure-and-negative-exemplars-design.md` §3.1 | A `fact` carrying a declared typed sub-object `metadata.attempt` (`approach`, `outcome`, `failure_mode`, `context`); `outcome` closed to `["failed"]` is the only negative marker |
+| The `get_snapshot` topic lane (§4.1.4) | same spec §3.3 | One snapshot **domain strap** with two modes — `explicit` (the caller names a domain) and `recent_domain` — ≤3 entries, computed off the pre-cut list |
+| The domain-scoped snapshot lane (§4.1.4) | same spec §3.3 | The same strap; it is what closes the `access_count: 0` hole at session start |
+| The per-namespace domain registry (§4.3.3) | same spec §3.2 | One registry row per namespace, seeded lazily with every legacy domain on the first domain write; an unregistered slug is rejected, with a `register_domain: true` escape hatch |
+| §11.1 — is the `append_log` seat sufficient? | same spec §3.4.1 | Decided: two bounded seats; sufficiency measured by `recall_hit_rate` with a threshold |
+| §11.2 — does a domain filter pay? | same spec §3.4.2, §10 | Instrumented: four named counters with explicit zeros |
+| §11.3 — is the registry worth its migration? | same spec §3.4.3 | Decided: yes; the migration is lazy and in-band, with no offline migration |
+| §11.4 — the distance band | — | Task `neurostrata-r7dj` (the local-self-improvement spec's Phase 2) |
+| This spec's own implementation | — | Task `neurostrata-426k` (prerequisite for the recall-closure implementation, task `neurostrata-r30c`) |
+
+The bootstrap rule this spec recorded so it would not be re-litigated is adopted as
+written, read **per namespace**: the first domain write creates the registry; later
+writes validate against it.
