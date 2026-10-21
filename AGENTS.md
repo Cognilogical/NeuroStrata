@@ -83,6 +83,17 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 - **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
 - **Paths:** Always use absolute paths when using file system tools.
 
+## 9. No Deferrals (owner ruling, 2026-10-21)
+- **NEVER defer.** No spec, brief, plan, or task may contain a "deferred" bucket, an
+  "out of scope / revisit later" clause, or an open question parked for "observation data".
+- **Every open item is exactly one of:** (a) decided inside the artifact being written, or
+  (b) filed as a tracked task with an owner and a concrete next action, and named in that
+  artifact.
+- **"We will know later" is not an answer.** When a mechanism would only pay off with more
+  usage, instrument it and name the metric in the spec — do not postpone the mechanism.
+- **Close the whole set.** A spec that defers items hands the next spec a closed list to
+  resolve; a deferral never rolls forward unmentioned.
+
 <!-- lean-ctx-compression -->
 OUTPUT STYLE: expert-terse
 - Telegraph format: subject-verb-object, drop articles/prepositions
