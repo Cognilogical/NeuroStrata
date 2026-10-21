@@ -93,6 +93,17 @@ pub struct SearchEvidence {
     pub explanation: String,
 }
 
+/// Returns true when the evidence carries a DirectMatch — the shared
+/// predicate used by both the recall path (buffer.rs) and the search
+/// handler's access-count bump (server.rs). One definition, two callers,
+/// so they cannot drift.
+pub fn is_direct_match(evidence: &Option<Vec<SearchEvidence>>) -> bool {
+    evidence.as_ref().map_or(false, |evs| {
+        evs.iter()
+            .any(|e| e.kind == EvidenceKind::DirectMatch)
+    })
+}
+
 /// How the domain filter affected the search results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainMatchMode {

@@ -2041,11 +2041,7 @@ async fn handle_search_memory(
                 } else {
                     // Increment access_count ONLY for direct hits (EvidenceKind::DirectMatch)
                     for res in &results {
-                        let is_direct_hit = res.evidence.as_ref().map_or(false, |evs| {
-                            evs.iter()
-                                .any(|e| e.kind == crate::traits::EvidenceKind::DirectMatch)
-                        });
-                        if is_direct_hit {
+                        if crate::traits::is_direct_match(&res.evidence) {
                             let store_clone = store.clone();
                             let ns_clone = namespace.to_string();
                             let id_clone = res.id.clone();
@@ -2860,6 +2856,7 @@ mod migration_notice_tests {
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
+    use crate::guard::testkit::MockStore;
 
     #[test]
     fn locations_preserve_opaque_source_context_without_interpreting_it() {
@@ -5830,8 +5827,13 @@ mod tests {
             "ns-recall-real-{}",
             uuid::Uuid::new_v4()
         ));
+        // Create the parent directory for both the store and buffer
+        std::fs::create_dir_all(&dir).expect("create parent dir");
+        // Use a subdirectory path for the LadybugStore database (not created yet)
+        // to avoid conflict with the buffer's .NeuroStrata directory.
+        let store_dir = dir.join("store");
         let store: Arc<dyn VectorStore> =
-            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp"));
+            Arc::new(crate::store::LadybugStore::for_testing(&store_dir, 4).expect("open temp"));
         store.init("probe").await.expect("init");
 
         // Write a fact with free-text domain "Database Access" (normalizes to "database-access")
@@ -5857,7 +5859,23 @@ mod tests {
             .map(|l| l[11..].trim().to_string())
             .expect("fact ID in response");
 
+        // Read access_count BEFORE recall (must be present and 0)
+        let before = store
+            .get("probe", &fact_id)
+            .await
+            .unwrap()
+            .expect("fact must exist after add");
+        let access_before = before
+            .1
+            .metadata
+            .get("access_count")
+            .expect("access_count must be present on a fact after add")
+            .as_u64()
+            .expect("access_count must be a number");
+        assert_eq!(access_before, 0, "access_count must be 0 after add");
+
         // Now recall via append_log with the slug tag
+        // Use the parent dir (not store_dir) for the buffer's project_root
         let recall_result = crate::buffer::handle_append_log(
             serde_json::json!({
                 "content": "working on db",
@@ -5871,7 +5889,7 @@ mod tests {
         .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&recall_result).unwrap();
-        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+        assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false), "appended was false or missing: {}", recall_result);
         let recalled = parsed.get("recalled").expect("recalled field must be present");
         let recalled_arr = recalled.as_array().unwrap();
         assert_eq!(recalled_arr.len(), 1, "exactly one fact recalled: {}", recall_result);
@@ -5881,13 +5899,130 @@ mod tests {
         );
         assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
 
-        // Verify access_count was not incremented (still 0)
-        let hit_count = store
+        // Read access_count AFTER recall (must be present and unchanged)
+        let after = store
             .get("probe", &fact_id)
             .await
             .unwrap()
-            .and_then(|(_, p)| p.metadata.get("hit_count").and_then(|v| v.as_u64()))
-            .unwrap_or(0);
-        assert_eq!(hit_count, 0, "access_count must not be incremented by recall");
+            .expect("fact must still exist after recall");
+        let access_after = after
+            .1
+            .metadata
+            .get("access_count")
+            .expect("access_count must be present on a fact after recall")
+            .as_u64()
+            .expect("access_count must be a number");
+        assert_eq!(access_after, 0, "access_count must still be 0 after recall");
+        assert_eq!(access_after, access_before, "access_count must not change during recall");
+    }
+
+    /// The neurostrata_append_log tool's inputSchema must carry the optional
+    /// `namespace` property (not in required).
+    #[tokio::test]
+    async fn append_log_tool_schema_carries_optional_namespace() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response = process_mcp_request(
+            request,
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let append_log = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_append_log")
+            .expect("neurostrata_append_log must be in tools/list");
+        let props = append_log["inputSchema"]["properties"]
+            .as_object()
+            .expect("inputSchema.properties must be an object");
+        assert!(props.contains_key("namespace"), "namespace property missing: {:?}", props);
+        let required = append_log["inputSchema"]["required"]
+            .as_array()
+            .expect("required must be an array");
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(!required_names.contains(&"namespace"), "namespace must not be in required: {:?}", required_names);
+    }
+
+    /// End-to-end MCP path: tools/call → dispatch → handler → JSON with recalled.
+    /// Uses the branch-tolerant pattern from disabled_mode_is_a_no_op.
+    #[tokio::test]
+    async fn append_log_mcp_call_returns_recalled_in_text_result() {
+        let root = std::env::temp_dir().join(format!("ns-append-log-mcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("scratch project root");
+        let store = Arc::new(MockStore::new());
+        store.init("probe").await.unwrap();
+
+        // Seed a fact to recall
+        let fact_id = "fact-mcp";
+        let payload = crate::traits::MemoryPayload {
+            content: "Use connection pooling for database access".to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "domain": "database-access" }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(7)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_append_log",
+                "arguments": {
+                    "content": "working on db",
+                    "project_root": root.display().to_string(),
+                    "tags": ["database-access"],
+                    "namespace": "probe",
+                }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let response = process_mcp_request(
+            request,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+
+        // The response shape is { result: { content: [{ type: "text", text: "..." }] } }
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("content[0].text must be a string");
+        // Branch-tolerant: buffer may be disabled by machine config
+        if text.contains("Episodic Buffer disabled") {
+            assert!(!text.contains("\"appended\":true"), "disabled response must not claim success: {}", text);
+        } else {
+            let parsed: serde_json::Value = serde_json::from_str(text)
+                .expect("handler returns JSON");
+            assert!(parsed.get("appended").and_then(|v| v.as_bool()).unwrap_or(false));
+            assert!(parsed.get("recalled").is_some(), "recalled must be present: {}", text);
+            let recalled = parsed.get("recalled").unwrap().as_array().unwrap();
+            assert_eq!(recalled.len(), 1);
+            assert_eq!(recalled[0].get("id").and_then(|v| v.as_str()), Some(fact_id));
+            assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
+        }
     }
 }
