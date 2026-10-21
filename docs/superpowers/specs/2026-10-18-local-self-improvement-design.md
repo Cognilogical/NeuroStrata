@@ -398,7 +398,8 @@ label distributions. Acceptance criteria below are structural and testable.
   unspent/unlapsed.
 - Remove the inverted `score >= 0.85` filter and stop interpreting the existing
   `similarity_threshold` as a cosine threshold. Record embedder identity,
-  dimensions, and all top-K raw-distance candidates.
+  dimensions, and all top-K raw-distance candidates, where K is the configured
+  `deduplication.max_candidates`.
 - Enable local observation without an API key. Before Phase 2 establishes a
   distance band, verify only canonical exact matches produce the exact-duplicate
   response; raw-distance candidates remain recorded without speculative hints.
