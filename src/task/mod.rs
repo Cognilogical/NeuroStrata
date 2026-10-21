@@ -2271,7 +2271,7 @@ pub async fn handle_task_setup(
             .to_string();
         let mut similar: Vec<Value> = Vec::new();
         if let Ok(vec) = emb.embed(&content).await {
-            if let Ok(hits) = store.search(&namespace, vec, 3).await {
+            if let Ok(hits) = store.search(&namespace, vec, 3, false, false).await {
                 for hit in hits {
                     let preview: String = hit.payload.content.chars().take(160).collect();
                     similar.push(json!({
@@ -4325,8 +4325,12 @@ mod tests {
             namespace: &str,
             vector: Vec<f32>,
             limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
         ) -> anyhow::Result<Vec<SearchResult>> {
-            self.inner.search(namespace, vector, limit).await
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
         }
         async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
             self.inner.delete(namespace, id).await

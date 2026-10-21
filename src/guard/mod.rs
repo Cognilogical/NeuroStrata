@@ -9,5 +9,8 @@ pub mod sandbox;
 pub mod semantic;
 pub mod validator;
 
+#[cfg(test)]
+pub(crate) mod testkit;
+
 pub use models::{BehavioralRule, ValidateRequest, ValidateResponse, ValidateVerdict};
 pub use validator::GuardValidator;

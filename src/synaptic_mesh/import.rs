@@ -1723,7 +1723,7 @@ mod tests {
 
         // Ordinary row: a search-shaped read finds it without special casing.
         let query = emb().embed("always use podman").await.unwrap();
-        let hits = store.search("probe", query, 5).await.unwrap();
+        let hits = store.search("probe", query, 5, false, false).await.unwrap();
         assert!(!hits.is_empty(), "search must see applied mesh rows");
         assert_eq!(hits[0].id, id.to_string());
 

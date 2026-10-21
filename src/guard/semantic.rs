@@ -61,7 +61,15 @@ impl SemanticEvaluator {
     ) -> Result<Vec<BehavioralRule>> {
         let vector = self.embedder.embed(payload).await?;
 
-        let search_results = self.store.search(&self.namespace, vector, limit).await?;
+        // The store's row-class flags belong to the general search path's
+        // contract. The guard asks for everything in its own namespace and
+        // applies its own rule filter below (the `guard_rule` metadata
+        // fields), so a change to the store's contract cannot silently change
+        // which rules the guard is able to see.
+        let search_results = self
+            .store
+            .search(&self.namespace, vector, limit, true, true)
+            .await?;
 
         let rules = search_results
             .into_iter()
@@ -96,6 +104,41 @@ impl SemanticEvaluator {
     pub async fn evaluate(&self, payload: &str) -> Result<Vec<BehavioralRule>> {
         // Return top 3 matching rules
         self.match_constraints(payload, 3).await
+    }
+
+    /// Record one firing of a rule: bump its persisted `hit_count` by one.
+    ///
+    /// `hit_count` is the only record of how often a rule actually fired, and
+    /// it was read as a live signal while nothing ever wrote it -- so every
+    /// consumer of the field was reading a constant zero.
+    ///
+    /// The bump reads the row, changes this one field, and writes the row
+    /// back with the vector it already had: the rule keeps its embedding and
+    /// its identity, and only the counter moves.
+    pub async fn increment_hit_count(&self, rule_id: &str) -> Result<()> {
+        let Some((vector, mut payload)) = self.store.get(&self.namespace, rule_id).await? else {
+            // The rule is gone. There is nothing left to count, and inventing
+            // a row for a rule that no longer exists would resurrect it.
+            return Ok(());
+        };
+
+        if !payload.metadata.is_object() {
+            anyhow::bail!("rule {rule_id} carries metadata that is not an object");
+        }
+
+        let hits = payload
+            .metadata
+            .get("hit_count")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)))
+            .unwrap_or(0);
+        payload.metadata["hit_count"] = serde_json::json!(hits + 1);
+
+        self.store
+            .upsert(&self.namespace, rule_id, vector, payload)
+            .await
+            .context("Failed to record the rule hit")?;
+
+        Ok(())
     }
 }
 
