@@ -227,11 +227,14 @@ async fn find_active_exact_content(
 `Domain` excludes `directory`, `file`, `markdown`, `freshness_flag`,
 `guard_event`, `task`, `procedure`, `symbol`, `code_ast`, and
 `user_id == "auto-ingestor"`. `Procedure { trigger }` returns only active,
-unspent procedures with that exact trigger.
+unspent procedures with that exact trigger. Every scope also excludes rows
+whose metadata marks a SynapticMesh conflict (`is_mesh_conflicting`,
+`src/store/ladybug.rs:698-700`, applied at `:1083-1085`), so the dedup path
+never blocks on, hints toward, or reuses a row whose conflict is unresolved.
 
 `RawDistanceQuery.limit` is the configured `deduplication.max_candidates`
 (`src/config.rs:28-29`). The current dedup path ignores that field and passes
-a hardcoded `5` to the store search (`src/server.rs:1152`); the new path reads
+a hardcoded `5` to the store search (`src/server.rs:1154`); the new path reads
 the configured value instead. Keep the config field — it is the knob this path
 needs.
 
@@ -245,7 +248,12 @@ needs.
   ascending before any usage/source boost or GraphRAG expansion. Filter archived,
   retired, expired, `auto-ingestor`, `directory`, `file`, `markdown`,
   `freshness_flag`, `guard_event`, `task`, `procedure`, `symbol`, and `code_ast`
-  rows from Domain scope.
+  rows from Domain scope, plus rows marked mesh-conflicting. Push the type,
+  owner, and conflict exclusions into the query's `WHERE` clause rather than
+  filtering after the fetch: the store fetches `FETCH_MULTIPLIER * limit` rows
+  (`src/store/ladybug.rs:1011-1012`) and filters in Rust, so post-fetch
+  filtering can starve a small `max_candidates` in namespaces dense with
+  excluded rows.
 - [ ] **Step 4: Implement `Procedure` scope**: require `memory_type == "procedure"`,
   matching `metadata.trigger`, not lapsed, and not spent (`remaining_fires != 0`).
   Domain scope excludes procedures and admits other active non-structural domain
@@ -253,8 +261,9 @@ needs.
 - [ ] **Step 5: Implement `find_active_exact_content`** as an exact UTF-8 content
   lookup over all eligible active rows in the requested scope, independent of
   embedding rank and without the top-K limit. Apply lifecycle/type/trigger
-  filters before returning candidates; require byte-for-byte equality with no
-  whitespace normalization. Canonical metadata comparison remains in Task 3.
+  filters and the mesh-conflict exclusion before returning candidates; require
+  byte-for-byte equality with no whitespace normalization. Canonical metadata
+  comparison remains in Task 3.
 - [ ] **Step 6: Add `Embedder::embedder_id(&self) -> &str`** and implement it for
   production embedders and every test stub. Add stable IDs for model/provider
   identity; retain `dimensions()` as a separate value.
@@ -362,8 +371,11 @@ not treat raw-distance equality or a model score as proof of canonical identity.
   `nearest_by_raw_distance` and return `MemoryWriteReport`. Do not threshold on
   `SearchResult.score` or the old `0.85` value. Build the query with
   `limit = config.deduplication.max_candidates`, replacing the hardcoded `5`
-  this path passes today (`src/server.rs:1152`); do not remove the config
-  field.
+  this path passes today (`src/server.rs:1154`); do not remove the config
+  field. Call the judgment provider only when provider mode is `Jev`: the
+  existing `checker.check_duplicates` call (`src/server.rs:1162`) is bypassed
+  under `auto`, `heuristic`, `laya-local`, and `none`, so the local path never
+  depends on a remote judgment.
 - [ ] **Step 6: Implement exact reuse**: for an exact key with
   `metadata.extracted_from`, update the existing candidate's metadata
   idempotently, reuse its vector, return its ID, and create no twin row. Find
@@ -489,8 +501,9 @@ impl LearningRecorder {
   `~/.config/neurostrata/learning/`; append observations/outcomes without
   writing telemetry rows into LadybugDB.
 - [ ] **Step 3: Implement `BlobStore::put(payload) -> PayloadHash`** with a
-  direct SHA-256 dependency; same payload produces the same hash and only one
-  blob record.
+  direct SHA-256 dependency (`sha2`; `Cargo.toml` carries no hash crate today —
+  add it as a direct dependency, not transitively); same payload produces the
+  same hash and only one blob record.
 - [ ] **Step 4: Add a per-process UUID connection ID** in
   `server::start_mcp_proxy`, send `X-NeuroStrata-Conn-Id` on each local POST,
   extract it in `daemon::handle_mcp`, and pass `LearningContext` to
