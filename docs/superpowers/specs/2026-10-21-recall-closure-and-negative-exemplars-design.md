@@ -655,10 +655,11 @@ and refuted two claims this spec had made:
 
 The checker's run ended at its step limit with the feasibility pass and the numeric
 consistency pass unfinished. The orchestrator completed both against source — the
-registry-row exclusion, the registry's read-modify-write under the store's lock, the
-bootstrap scan through `store.list`, the `[FAILED ATTEMPT]` prefix applied before
-truncation, the polarity partition, and the arithmetic of every bound in §3 and §6 —
-and a narrow re-check was dispatched to confirm the amended spec.
+registry-row exclusion, the registry's read-merge-write and the atomicity hole the
+store's own locking does **not** cover (§3.2.5), the bootstrap scan through
+`store.list`, the `[FAILED ATTEMPT]` prefix applied before truncation, the polarity
+partition, and the arithmetic of every bound in §3 and §6 — and a narrow re-check was
+dispatched to confirm the amended spec.
 
 **Brief:** `docs/designs/2026-10-21-panel-brief-recall-closure-and-negative-exemplars.md`
 · **Parent brief:** `docs/designs/2026-10-20-gap-proactive-recall-and-access-topology.md`
