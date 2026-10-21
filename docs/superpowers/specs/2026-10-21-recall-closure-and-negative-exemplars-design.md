@@ -216,7 +216,7 @@ metadata, not knowledge. The mechanism is explicit, not borrowed:
 
 - **In the store**, the exclusion is a metadata predicate at the store's per-row filter
   seam — beside `is_retired_at`, `is_archived` and `is_mesh_conflicting`
-  (`src/store/ladybug.rs:1083-1094`) — applied at **all three** filter sites: the base
+  (`src/store/ladybug.rs:1083-1094`) — applied at **all four** filter sites: the base
   search (`:1083-1094`), the one-hop expansion (`:1206-1213`) and the two-hop govern
   expansion (`:1262-1269`), plus the episode-sibling pass (`:1341-1347`). A row whose
   metadata carries `domain_registry` is dropped at each of them, so it never consumes a
@@ -256,8 +256,9 @@ per-namespace reading.**
    once, and **the write always succeeds**. The bootstrap deliberately errs toward
    registering **more**: a stale domain left behind by a retired or archived row costs
    nothing, whereas a missing legacy domain would reject a legitimate write.
-3. If it is **present** and the incoming slug is not in it, the write is **rejected**
-   (§3.2.3).
+3. If it is **present** and the incoming slug is not in it, the **reconcile** runs
+   (§3.2.3): the slug is accepted if the namespace's own data carries it, and rejected
+   only when neither the cache nor the data carries it.
 
 #### 3.2.3 What an unregistered slug does
 
@@ -272,8 +273,9 @@ per-namespace reading.**
    repaired. The scan runs only on a path that would otherwise have been a rejection, so
    its cost is paid on the rare path, never the hot one. This is what makes a lost
    cache entry a non-event rather than a false rejection (§3.2.5).
-3. **`register_domain: true`** — the caller declares the domain genuinely new. The slug
-   is inserted into the cache (sorted, deduplicated) and the write proceeds.
+3. **`register_domain: true`** — the caller declares the domain genuinely new. The write
+   proceeds; the cache is updated afterwards (§3.2.5), so a cache failure cannot undo
+   the declaration.
 
 **The order is fixed.** The acceptance decision — cache hit, reconcile hit, or
 `register_domain` — is made **before** any registry write. The registry write is a
@@ -370,8 +372,8 @@ be made atomic. The best available is a **bounded compare-and-retry**:
 2. **Compare-and-retry.** After the write, the row is re-read and checked against the
    whole set that was there before the write, not only against the new slug: every slug
    in the pre-write set must still be present. If one is missing, another writer
-   changed the row under us; the update is re-merged and written again (bounded — three
-   attempts is enough for a rare event).
+   changed the row under us; the update is re-merged and written again. The bound is
+   **at most three attempts in total** — enough for a rare event, and no more.
 
 **What that does not cover, stated plainly.** The retry cannot see a write that landed
 *before* our own write: we read an old list, another process added a slug, and our
@@ -384,8 +386,11 @@ write needs that slug.
 
 **So a cache update never fails the write.** If the bounded retries are exhausted, the
 write still proceeds — the acceptance decision was already made — and the failure is
-reported in the response's warnings rather than swallowed. There is no case where the
-caller is told a domain was registered when the cache does not hold it.
+reported in the response's warnings rather than swallowed. What the caller is told is
+what happened: with `register_domain: true` the domain is accepted as the caller
+declared it, and if the cache update did not stick, the response says so in a warning.
+The cache never claims a registration it does not hold, and the caller is never told
+the cache holds one it does not.
 
 No `VectorStore` trait method is added. `store.get`, `store.list` and `store.upsert` are
 enough (`src/traits.rs:192`, `:195`, `:152-158`); the mutex, the retry and the
@@ -449,7 +454,9 @@ there is nothing to show:
   is no registry row yet, the line reads `Registered domains (0): none` — an explicit
   zero, never a silent omission. This is one of the two places the dynamic
   per-namespace enum is surfaced (§3.2.4); the other is the rejection message of
-  §3.2.3.
+  §3.2.3. The count is the **cache's**, and the cache can be stale (§3.2) — it is the
+  set of domains the agent should expect to be accepted, and the reconcile keeps it
+  close to the truth. It is never a promise that the list is exhaustive.
 - **`Domain strap [mode: <explicit|recent_domain>]`** — the strap itself, at most 3
   entries, or `(0): []` when the selection is empty. The mode is printed so a caller
   can never mistake a `recent_domain` selection for a domain match.
@@ -488,12 +495,28 @@ Backup Protocol); the snapshot strap covers session/task start (`AGENTS.md` §3,
 Pre-Flight Hook). Neither alone covers both moments.
 
 **Metric: `recall_hit_rate`** — the fraction of recall responses whose `id`s the agent
-later promotes with `neurostrata_get_memory` in the same session.
-**Threshold:** below 10% over any 30-day window with ≥50 tagged turns, the recall budget
-is tightened (the parent's §11.1 lever) before any new seat is considered.
-**Where:** a counter incremented where `get_memory` increments `access_count`
-(`src/server.rs:2652`), joined to the ids the recall returned.
-**Who reads it:** the operator via the metrics surface in §3.4.2.
+later promotes with `neurostrata_get_memory`.
+**Threshold:** below 10% over the daemon's current lifetime with ≥50 tagged turns since
+it started, the recall budget is tightened (the parent's §11.1 lever) before any new
+seat is considered.
+**Where:** two counters in the same module as the domain counters (§3.4.2) —
+`recall_responses`, incremented where the recall response is built (the parent's
+`append_log` path, `src/buffer.rs:129-177`), and `recall_promotions`, incremented where
+`get_memory` increments `access_count` (`src/server.rs:2652`). The join is a **bounded
+in-memory set of recently-recalled ids** in that module: the recall path records the
+ids it returned, the promotion path tests membership and removes the id. The set is
+bounded (the most recent recall responses) and evicted on promotion or on age, so it
+never grows without limit and never outlives the daemon.
+**Scope:** the join is **per namespace, not per session** — the MCP tool surface carries
+no session id, so a session-scoped join could not be built from what the tools receive.
+A response whose ids age out of the bounded set before promotion counts as unpromoted,
+so the measured rate is a lower bound.
+**Window:** the counters live in memory and reset when the daemon restarts, exactly as
+the bus's own counters do ("what the bus has done since the daemon started",
+`src/main.rs:110-117`). The operator reads them from a running daemon; a threshold read
+after a restart starts from zero.
+**Who reads it:** the operator, via the metrics surface in §3.4.2 — the body reports
+`"recall": {recall_responses, recall_promotions}`, and the rate is their quotient.
 
 #### 3.4.2 Does a domain filter actually pay?
 
@@ -517,8 +540,9 @@ serializes `bus.metrics()` — a bare `BusMetrics` of eight integers, with no ex
 point (`src/handlers/bus_metrics.rs:20-23`; the existing test asserts that those eight
 fields sit at the top level of the body, by containment rather than exact shape). The
 counters therefore live in their own module, and the handler reads them **directly**:
-they are process-global atomics beside the search path, so the handler's signature does
-not change, no `AppState` field is added, and the route needs no plumbing
+they are process-global atomics **in the daemon process** (see the next paragraph),
+beside the search path, so the handler's signature does not
+change, no `AppState` field is added, and the route needs no plumbing
 (`src/daemon.rs:539`, `:1106-1110`). The handler serializes the bus metrics to a
 `serde_json::Value`, inserts `"domain_filter"` as an **extra top-level key**, and
 serializes the result. The bus's eight integers stay exactly where they are, so every
@@ -626,17 +650,27 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
    `get_snapshot` renders `Registered domains (3): auth, database-access, storage`.
 10. The registry row is not exported to the mesh (`eligibility: private`), and an
     imported shared record's domain is unioned into the local registry.
-11. With 5 memories at `access_count: 10` and one new `fact` at `access_count: 0` with a
+11. **The acceptance decision precedes any registry write.** A cache update that fails —
+    an exhausted retry, a store error — never converts an accepted write into a
+    rejection, nor a rejection into an acceptance; it is reported as a warning.
+12. **The reconcile normalizes as the write path does.** A slug that no row of the
+    namespace carries is rejected, even if the reconcile's own normalization could have
+    matched it; a slug the namespace has used under a different spelling is accepted
+    through the reconcile.
+13. **A non-string `domain` is rejected**, not guessed at, on both write paths.
+14. With 5 memories at `access_count: 10` and one new `fact` at `access_count: 0` with a
     domain, `get_snapshot` shows all five in the top-5 body **and** the new fact in the
     domain strap — with and without an explicit `domain` argument.
-12. A domain-tagged memory already in the top-5 is not duplicated in the strap.
-13. `access_count` is unchanged, row for row, across a `get_snapshot` call.
-14. The strap never exceeds 3 entries, and never 2 from one domain in `recent_domain`
+15. A domain-tagged memory already in the top-5 is not duplicated in the strap.
+16. `access_count` is unchanged, row for row, across a `get_snapshot` call.
+17. The strap never exceeds 3 entries, and never 2 from one domain in `recent_domain`
     mode; an empty strap renders an explicit zero and names its mode.
-15. The metrics surface reports `"domain_filter"` with four explicit zeros on a fresh
-    daemon, and the counters move on domain-filtered calls.
-16. `neurostrata_search_memory` with no `domain` argument behaves exactly as today.
-17. This spec contains no deferred item: §11 is the closed list, and every entry in it is
+18. The metrics surface reports `"domain_filter"` with four explicit zeros on a fresh
+    daemon, and the counters move on domain-filtered calls **served by the daemon**; the
+    stdio proxy process holds no counter state. The same body reports `"recall"` with
+    two explicit zeros — `recall_responses` and `recall_promotions` (§3.4.1).
+19. `neurostrata_search_memory` with no `domain` argument behaves exactly as today.
+20. This spec contains no deferred item: §11 is the closed list, and every entry in it is
     either decided here or a named task.
 
 ---
@@ -705,11 +739,15 @@ the registry helpers (2) and the vocabulary declaration (3).
 
 | Metric | Definition | Surface | Threshold | Reader |
 |---|---|---|---|---|
-| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | recall promotion path (`src/server.rs:2652`) | < 10% over 30 days with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
-| `domain_queries_total` | recall/search calls carrying a domain filter | metrics surface | — | operator; agent |
-| `domain_narrowed_hits` | filter matched ≥1 row and narrowed the set | metrics surface | — | operator; agent |
-| `domain_fallback_vector` | filter matched 0 rows; fell back to vector | metrics surface | a persistently high rate means the domains are wrong or sparse | operator; the next registry spec |
-| `single_domain_bypasses` | calls in a namespace whose registry holds ≤1 domain | metrics surface | — | operator |
+| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | `"recall": {recall_responses, recall_promotions}` on the metrics surface (§3.4.2); incremented at the recall path (`src/buffer.rs:129-177`) and the promotion path (`src/server.rs:2652`) | < 10% over the daemon's current lifetime with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
+| `domain_queries_total` | recall/search calls carrying a domain filter | `"domain_filter"` on the metrics surface — an extra top-level key beside the bus's eight integers (§3.4.2) | — | operator; agent |
+| `domain_narrowed_hits` | filter matched ≥1 row and narrowed the set | as above | — | operator; agent |
+| `domain_fallback_vector` | filter matched 0 rows; fell back to vector | as above | a persistently high rate means the domains are wrong or sparse | operator; the next registry spec |
+| `single_domain_bypasses` | calls in a namespace whose registry holds ≤1 domain | as above | — | operator |
+
+Every counter above is a process-global atomic in the **daemon** process, and the
+metrics surface is served by that same process (§3.4.2). The counters reset when the
+daemon restarts, exactly as the bus's own do.
 
 ---
 
@@ -805,7 +843,7 @@ cited lines, and surfaced eight more:
 | The store has **three** row-class filter sites, not two — the episode-sibling pass at `src/store/ladybug.rs:1341-1347` also filters rows | §3.2.1 now names all four sites (base search, one-hop, two-hop, sibling). The registry row could not reach the sibling pass anyway — it carries no `EXTRACTED_FROM` edge — but the exclusion is applied there too, so the rule is uniform rather than incidental. |
 | `Registered domains (N)` was referenced by §3.2.4, §5 step 9 and acceptance criterion 9, but **§3.3 never defined it** | §3.3.3 now defines both rendered sections: `Registered domains (N): …` (with an explicit `(0): none`) and `Domain strap [mode: …]`. |
 | "under 720 characters" contradicted 6 × 120 = 720 exactly | §3.3.5 now says **at most** 720 characters (≈180 tokens), and anchors the parent's bound to parent §4.1.2. |
-| The ≤120-character bound was stated two ways — "`snippet` ≤ 120 characters" and "≤ 120 characters **including** the prefix" | §3.3.2 now says it once: the snippet's **total** length is ≤ 120 characters, prefix included. The prefix is part of the budget, not added on top of it. |
+| The ≤120-character bound was stated two ways — "`snippet` ≤ 120 characters" and "≤ 120 characters **including** the prefix" | §3.3.2 now says it once: the snippet's **total** length is ≤ 120 characters, prefix included. The prefix is part of the budget, not added on top of it. **Superseded by the third round** — the bound now reads the same way in §3.3.2, §3.3.5 and §4. |
 | The `domain_filter` counters do not fit a surface that is a bare eight-integer `BusMetrics` with no extension point (`src/handlers/bus_metrics.rs:20-23`) — while the spec also said they do not live inside the bus | §3.4.2 now specifies the composite: the handler serializes the bus metrics to a `serde_json::Value`, inserts `"domain_filter"` as an **extra top-level key**, and serializes that. The bus's eight integers stay exactly where they are, so no existing reader breaks, and the bus never learns what a domain is. |
 | **"The daemon is the only process that can write to the store" was false.** The engine admits one writer at a time, but the loser *retries* (`WRITE_COLLISION_RETRIES`, `src/store/ladybug.rs:289-320`), and the CLI's `add` command writes to the same store directly (`src/main.rs:2844`, `:2862`) | §3.2.5 was rewritten: an in-process **registry mutex**, plus a **cross-process compare-and-retry** that checks the *whole* pre-write set (not just the new slug) and fails loudly if the bounded retries are exhausted. **Superseded by the third round** — the retries no longer fail the write; the cache framing and the reconcile replaced that rule (§3.2.5, §3.2.3). |
 | `neurostrata_task_complete` has **no top-level `domain` argument** — the completion's metadata is the caller's `memory.metadata` object (`src/task/mod.rs:1131-1141`), so `register_domain` there had no stated source of the slug | §3.2.3 now gives each write path its slug source: `domain` on add_memory, `metadata.domain` on task_complete; the flag follows the slug, and is a no-op when the completion carries no domain. |
@@ -827,7 +865,7 @@ the numeric bounds — and found two substantive defects, both in the amended ma
 
 | The finding | The fix |
 |---|---|
-| **The compare-and-retry has a real lost-update hole.** When the other writer's write lands *before* ours, our write clobbers its slug; the row we wrote still contains our whole pre-write set, so the check passes and that other process's slug is silently lost. §7's claim that "no slug can vanish from the registry without the caller being told" was **false**. | §3.2 is reframed: **the registry row is a cache of the domains in use; the namespace's own rows are the truth.** A lost cache entry is a miss, not a wrong acceptance and not a corrupted row, and it is repaired by a new **reconcile** path (§3.2.3): when the cache does not hold the slug, the handler re-derives the list from the namespace's rows (the bootstrap's own scan) and, if the slug is there, accepts the write and repairs the cache. The scan runs only on the path that would otherwise have been a rejection. §7's row and §5 step 2 were rewritten to match. |
+| **The compare-and-retry has a real lost-update hole.** When the other writer's write lands *before* ours, our write clobbers its slug; the row we wrote still contains our whole pre-write set, so the check passes and that other process's slug is silently lost. §7's claim that "no slug can vanish from the registry without the caller being told" was **false**. | §3.2 is reframed: **the registry row is a cache of the domains in use; the namespace's own rows are the truth.** A lost cache entry is a miss, not a wrong acceptance and not a corrupted row, and it is repaired by a new **reconcile** path (§3.2.3): when the cache does not hold the slug, the handler re-derives the list from the namespace's rows (the bootstrap's own scan) and, if the slug is there, accepts the write and repairs the cache. The scan runs only on the path that would otherwise have been a rejection. §7's row and §5 step 2 were rewritten to match, and §6's criterion 8 gained the reconcile clause. |
 | There is **no compare-and-swap**: the engine's writes are auto-commit `conn.query` calls, with no transaction wrapper and no `BEGIN`/`COMMIT` anywhere in the store (`src/store/ladybug.rs:281-340`, `:868-1003`), so a cross-process update cannot be made atomic | §3.2.5 now says so outright, and states that a cache update **never fails the write**: if the bounded retries are exhausted the write still proceeds — the acceptance decision was already made — and the failure is reported in the response's warnings rather than swallowed. |
 | The metrics plumbing was **unstated**: `AppState` (`src/daemon.rs:51-70`) has no counters field, so "the handler takes them as a second argument" would have required the route, the HTTP handler and the handler's own unit test to change | The counters are now **process-global atomics** in their own module, read directly by the handler: no signature change, no `AppState` field, no route plumbing, and the existing unit test keeps compiling. `neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:110-117`), so it inherits the body without knowing anything about it. **Refined by the fourth round** — the owning process is pinned to the daemon (see below). |
 | The ≤120-character bound was still stated two ways (§4's row and §3.3.5's parent anchor) | Both now say **total, prefix included**. |
@@ -861,6 +899,25 @@ the system", one write at a time (`:2096`, `:2245`), and the store issues no `BE
 `COMMIT`; the CLI's `bus-metrics` is an HTTP client of the daemon (`src/main.rs:110-117`);
 and the CLI's `add` command does write to the same store directly
 (`src/main.rs:2844-2862`).
+
+**The fifth checker's findings** (session `ses_ea33ba38affe4f7c5AGfN1rZ2B`, a consistency
+sweep with no source re-verification). It mapped every acceptance criterion to a
+mechanism and found three blockers — two sentences that would have been implemented
+literally, and one coverage gap — plus a set of editorial nits:
+
+| The finding | The fix |
+|---|---|
+| **Blocker.** §3.2.2's bootstrap step 3 still said a cache miss ⇒ "the write is **rejected**", contradicting the reconcile's acceptance in §3.2.3 — the last place the cache was still treated as authoritative | §3.2.2 step 3 now routes a cache miss to the reconcile: the slug is accepted if the namespace's own data carries it, and rejected only when neither the cache nor the data carries it. |
+| **Blocker.** §3.2.5 still claimed "there is no case where the caller is told a domain was registered when the cache does not hold it" — false under the cache framing, because `register_domain: true` plus an exhausted retry accepts the write while the cache misses it | §3.2.5 now says what is true: the cache never claims a registration it does not hold, the caller is never told the cache holds one it does not, and a cache update that did not stick is reported as a warning. |
+| **Blocker (coverage).** The two behaviours this revision introduced — acceptance before any registry write, and normalizer parity — had **no acceptance criterion**, so the spec's own headline claims were untested; the daemon pin and the non-string `domain` rejection were likewise untested | §6 grew three criteria (11, 12, 13) covering the ordering, the normalizer parity and the non-string rejection, and criterion 18 now asserts that the counters move **in the daemon** while the proxy holds none. The criteria after the insertion were renumbered (11–17 → 14–20); the only cross-reference to a criterion number (criterion 9, in this log) is unaffected. |
+| `recall_hit_rate` had **no surface** — §3.4.1 read it "via the metrics surface in §3.4.2", but §3.4.2 hosts only the four `domain_filter` counters, and its 30-day window was unmeasurable from in-memory counters | §3.4.1 now names the two counters (`recall_responses`, `recall_promotions`), the bounded in-memory set of recently-recalled ids that joins them, the surface (`"recall": {…}` beside `"domain_filter"`), and the window (**the daemon's current lifetime** — the counters reset on restart, exactly as the bus's own do). The join is **per namespace, not per session**: the MCP tool surface carries no session id, so a session-scoped join could not be built from what the tools receive. §10's row was rewritten to match. |
+| The retry bound was phrased as justification ("three attempts is enough for a rare event") rather than as a bound | §3.2.5 now states **at most three attempts in total**. |
+| §3.2.1 said "applied at **all three** filter sites" and then listed four | Now "all four". |
+| §3.2.3's path 3 read as insert-then-write, against the fixed decide-then-write order | Reworded: the write proceeds on the caller's declaration, and the cache is updated afterwards. |
+| "Process-global" appeared unqualified before the daemon pin | The first mention now says "process-global atomics **in the daemon process**". |
+| `Registered domains (N)` is rendered from the cache, and nothing said it could be stale | §3.3.3 now says the count is the cache's, that the reconcile keeps it close to the truth, and that it is never a promise of exhaustiveness. |
+| §12's second-checker row said "§3.3.2 now says it **once**" while the bound also stood in §3.3.5 and §4 | That row is marked **superseded**, and the third round's row is the one that matches the current text. |
+| §12's third-checker row did not record the §6 criterion-8 edit | It now does. |
 
 **Brief:** `docs/designs/2026-10-21-panel-brief-recall-closure-and-negative-exemplars.md`
 · **Parent brief:** `docs/designs/2026-10-20-gap-proactive-recall-and-access-topology.md`
