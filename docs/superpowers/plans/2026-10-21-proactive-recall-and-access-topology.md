@@ -511,7 +511,7 @@ git commit -m "feat(store): warn on a malformed metadata.topology without reject
 ### Task 6: The recall on the `append_log` response
 
 **Files:**
-- Modify: `src/buffer.rs:133-335` (`handle_append_log`)
+- Modify: `src/buffer.rs:133-298` (`handle_append_log`) and `src/buffer.rs:300-322` (the `success_response` helper — one response shape, four call sites)
 - Modify: `src/server.rs:371-382` (the `neurostrata_append_log` `inputSchema`)
 - Modify: `src/server.rs:665-666` (the dispatch)
 - Modify: `src/server.rs`'s inline test module (the real-store acceptance test + MCP wiring tests)
@@ -548,7 +548,11 @@ git commit -m "feat(store): warn on a malformed metadata.topology without reject
     "recalled": []
   }
   ```
-  A `tracing::warn!` is also emitted with the same error text.
+  The failure is also logged with `tracing::warn!`, but the log line and the `error` field
+  carry deliberately different texts: the log line is an event and reads "Failed to append
+  to the Episodic Buffer: {e}", while the `error` field is the caller-facing message and
+  reads "could not append to the Episodic Buffer: {e}" — the wording the tool used before
+  this change, preserved so existing callers are unaffected.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -601,7 +605,7 @@ The write goes through the real add path, so the stored domain is the normalized
 
 The real-store test is acceptance criterion 1 (the free-text domain is written, the slug tag recalls it), criterion 2 (an `access_count: 0` fact is recalled) and criterion 4 (the recall moved no `access_count`) in the same namespace, through the real store, with no pre-seeded slug. `StubEmbedder` emits a 4-float vector (`src/guard/testkit.rs:327-345`) and `for_testing(dir, 4)` declares 4 dimensions, so the two agree. Use the established add-path pattern: `create_new_namespace: true` and no `project_root` in the add call (`src/server.rs:3683-3694` — the `.NeuroStrata` directory check only runs when a `project_root` is supplied, `src/server.rs:1215-1230`), and `quiet_bus()` (`src/server.rs:3355`) for the bus.
 
-Use `crate::guard::testkit::{MockStore, StubEmbedder}` (a `pub(crate)` module, `src/guard/mod.rs:13`) for the mock store and the embedder, and the same config/buffer setup the existing buffer tests use (`scratch(tag)` at `src/buffer.rs:345`).
+Use `crate::guard::testkit::{MockStore, StubEmbedder}` (a `pub(crate)` module, `src/guard/mod.rs:13`) for the mock store and the embedder, and the same config/buffer setup the existing buffer tests use (`scratch(tag)` at `src/buffer.rs:332`).
 
 - [ ] **Step 2: Run them and watch them fail**
 
@@ -642,7 +646,7 @@ Normalize each tag with `crate::domain::normalize_domain_slug`, dropping the one
 
 - [ ] **Step 8: Add the fields to the response**
 
-The response object at `src/buffer.rs:321-333` gains `recalled` and `recalled_from`. `recalled` is always present, on every response — the empty array is the explicit zero. `recalled_from` is present **only on the responses where a search ran**; build the response object conditionally rather than inserting a placeholder, so an untagged turn carries no mode key at all. A JSON consumer reading `recalled_from` must be able to conclude "a search ran and this is how it chose" — not "the mode is unknown".
+The response object is built by the `success_response` helper (`src/buffer.rs:300-322`, the JSON literal at `:310-320`), and it gains `recalled` and `recalled_from`. `recalled` is always present, on every response — the empty array is the explicit zero. `recalled_from` is present **only on the responses where a search ran**; build the response object conditionally rather than inserting a placeholder, so an untagged turn carries no mode key at all. A JSON consumer reading `recalled_from` must be able to conclude "a search ran and this is how it chose" — not "the mode is unknown". Every successful append goes through that one helper — the three recall-failure early returns and the final response — so the response contract cannot drift across call sites.
 
 - [ ] **Step 9: Run the tests**
 
