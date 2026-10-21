@@ -14,6 +14,7 @@
 use crate::task::machine::Status;
 use crate::traits::{MemoryPayload, SearchResult, VectorStore};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A blocking rule break: exactly the shape POST /tasks/gate returns.
@@ -120,26 +121,128 @@ pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
         .is_some_and(|valid_to| valid_to <= now)
 }
 
+/// The chain bound: a namespace is written by many hands, so a loop in the
+/// lineage is data, not a hang.
+const MAX_CHAIN: usize = 32;
+
+/// The rows a row replaced, as ids. `supersedes` is written as one id, but a
+/// hand-edited row may carry a list, and a list is read as a list.
+fn superseded_ids(metadata: &Value) -> Vec<String> {
+    match metadata.get("supersedes") {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The first live row in a retired row's supersession chain: the row that
+/// carries the work now.
+///
+/// The chain, not the next link: a row that was replaced twice is followed to
+/// the row that replaced it twice. Bounded and cycle-safe, because a
+/// namespace is written by many hands and a loop in the lineage is data, not a
+/// hang.
+pub(crate) fn live_successor<'a>(
+    metadata: &Value,
+    memories: &'a [SearchResult],
+    now: i64,
+) -> Option<&'a SearchResult> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current = metadata.get("superseded_by").and_then(Value::as_str)?;
+    for _ in 0..MAX_CHAIN {
+        if !seen.insert(current.to_string()) {
+            // A cycle carries nothing.
+            return None;
+        }
+        let row = memories.iter().find(|m| m.id == current)?;
+        if !is_retired(&row.payload.metadata, now) {
+            return Some(row);
+        }
+        current = row
+            .payload
+            .metadata
+            .get("superseded_by")
+            .and_then(Value::as_str)?;
+    }
+    None
+}
+
+/// The ids one unit of work passed through: the row's own id, then the rows
+/// it replaced, then theirs.
+///
+/// A lesson belongs to the work, not to one row id: the row that replaced a
+/// finished task is the same work under a new id, so the lesson extracted
+/// from the old id is its lesson too.
+pub(crate) fn work_lineage(memories: &[SearchResult], id: &str) -> Vec<String> {
+    let mut lineage: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current = id.to_string();
+    while lineage.len() < MAX_CHAIN {
+        if !seen.insert(current.clone()) {
+            break;
+        }
+        lineage.push(current.clone());
+        let Some(row) = memories.iter().find(|m| m.id == current) else {
+            break;
+        };
+        let Some(next) = superseded_ids(&row.payload.metadata).into_iter().next() else {
+            break;
+        };
+        current = next;
+    }
+    lineage
+}
+
+/// Whether a live lesson discharges the given task: some row declares
+/// `metadata.extracted_from: ["<task id>"]`, where the task id is any id in
+/// the task's work lineage.
+///
+/// A retired lesson row is history: it discharges nothing, exactly as the
+/// store hides it from search. The store hides; the gate refuses to forgive.
+pub fn extraction_exists(memories: &[SearchResult], task_id: &str, now: i64) -> bool {
+    let lineage = work_lineage(memories, task_id);
+    memories.iter().any(|m| {
+        m.id != task_id
+            && !is_retired(&m.payload.metadata, now)
+            && m.payload
+                .metadata
+                .get("extracted_from")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().any(|target| {
+                        target
+                            .as_str()
+                            .map(|t| lineage.iter().any(|id| id == t))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+    })
+}
+
 /// Whether a retired row's lesson is carried by a live successor: the row
 /// that replaced it is itself a completed task whose own inbound extraction
 /// edge exists.
 ///
+/// The successor is the row at the end of the supersession chain, not merely
+/// the next link: a work that was replaced twice is carried by the row that
+/// replaced it twice.
+///
 /// Anything less leaves the obligation where it started. A successor that
 /// is not a task, one that is still open (a reopened task owes nothing yet),
-/// one whose own lesson is still missing, one that is itself retired, and
+/// one whose own lesson is still missing, one whose lesson is retired, and
 /// no successor at all -- all of them mean the retired row still owes its
 /// lesson and still blocks.
 fn obligation_carried(metadata: &Value, memories: &[SearchResult], now: i64) -> bool {
-    let Some(successor) = metadata.get("superseded_by").and_then(Value::as_str) else {
+    let Some(successor) = live_successor(metadata, memories, now) else {
         return false;
     };
-    memories.iter().any(|m| {
-        m.id == successor
-            && is_task(m)
-            && !is_retired(&m.payload.metadata, now)
-            && task_status(m) == Status::Done
-            && extraction_exists(memories, &m.id)
-    })
+    is_task(successor)
+        && task_status(successor) == Status::Done
+        && extraction_exists(memories, &successor.id, now)
 }
 
 pub fn task_status(result: &SearchResult) -> Status {
@@ -151,25 +254,6 @@ pub fn task_status(result: &SearchResult) -> Status {
         .and_then(|s| s.as_str())
         .and_then(Status::parse)
         .unwrap_or(Status::Open)
-}
-
-/// Whether any row declares `metadata.extracted_from: ["<task id>"]` -- the
-/// declaration the edge_specs write path materializes as an inbound
-/// EXTRACTED_FROM edge.
-///
-/// Checked off metadata rather than a Cypher query on purpose: `list` is on
-/// the `VectorStore` trait every caller already holds, so the gate stays a
-/// metadata-only scan (section 4) and the trait surface stays frozen.
-pub fn extraction_exists(memories: &[SearchResult], task_id: &str) -> bool {
-    memories.iter().any(|m| {
-        m.id != task_id
-            && m.payload
-                .metadata
-                .get("extracted_from")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().any(|target| target.as_str() == Some(task_id)))
-                .unwrap_or(false)
-    })
 }
 
 /// The age of `metadata.task.<first parseable key>`, in seconds. Crate-visible
@@ -279,7 +363,7 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                     .and_then(|t| t.get("grandfathered"))
                     .and_then(|g| g.as_bool())
                     .unwrap_or(false);
-                if !grandfathered && !extraction_exists(memories, &row.id) {
+                if !grandfathered && !extraction_exists(memories, &row.id, now) {
                     let violation = Violation {
                         id: row.id.clone(),
                         kind: "done_without_extraction",
@@ -1031,6 +1115,173 @@ mod tests {
         assert_eq!(report.counts.retired, 14);
     }
 
+    /// A retired lesson row is history: it discharges nothing. A live task
+    /// whose only lesson is retired still owes one.
+    #[test]
+    fn a_retired_lesson_row_discharges_nothing() {
+        let memories = vec![
+            task(
+                "live-done",
+                json!({ "status": "done", "created_at": iso(DAY) }),
+            ),
+            row(
+                "retired-lesson",
+                "fact",
+                "the lesson for live-done",
+                json!({ "extracted_from": ["live-done"], "valid_to": NOW - 1 }),
+            ),
+        ];
+        let report = evaluate(&memories, NOW);
+        let blocking: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "done_without_extraction")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(
+            blocking,
+            vec!["live-done"],
+            "a retired lesson is history, not a discharge"
+        );
+    }
+
+    /// The successor's lesson has to be alive for the successor to carry the
+    /// retired row's obligation: a retired lesson leaves both rows owing.
+    #[test]
+    fn a_retired_lesson_does_not_carry_a_retired_rows_obligation() {
+        let memories = vec![
+            row(
+                "retired-done",
+                "task",
+                "retired work",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "live-done"
+                }),
+            ),
+            task(
+                "live-done",
+                json!({ "status": "done", "created_at": iso(DAY) }),
+            ),
+            row(
+                "retired-lesson",
+                "fact",
+                "the lesson",
+                json!({ "extracted_from": ["live-done"], "valid_to": NOW - 1 }),
+            ),
+        ];
+        let report = evaluate(&memories, NOW);
+        let mut blocking: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "done_without_extraction")
+            .map(|v| v.id.as_str())
+            .collect();
+        blocking.sort();
+        assert_eq!(
+            blocking,
+            vec!["live-done", "retired-done"],
+            "a retired lesson discharges neither the live task nor the retired row"
+        );
+    }
+
+    /// The obligation follows the chain: a retired row whose successor is
+    /// itself retired is discharged by the live row at the end of the chain,
+    /// because that row is where the work landed.
+    #[test]
+    fn the_extraction_obligation_follows_the_supersession_chain() {
+        let memories = vec![
+            row(
+                "chain-first",
+                "task",
+                "the work, first version",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "chain-second"
+                }),
+            ),
+            row(
+                "chain-second",
+                "task",
+                "the work, second version",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "chain-third"
+                }),
+            ),
+            task(
+                "chain-third",
+                json!({ "status": "done", "created_at": iso(DAY * 3) }),
+            ),
+            row(
+                "live-lesson",
+                "fact",
+                "the lesson",
+                json!({ "extracted_from": ["chain-third"] }),
+            ),
+        ];
+        let report = evaluate(&memories, NOW);
+        let blocking: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "done_without_extraction")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert!(
+            blocking.is_empty(),
+            "the chain ends in a done row that carries the lesson: {:?}",
+            blocking
+        );
+    }
+
+    /// A lesson belongs to the work, not to one row id: the successor of a
+    /// task that was already consolidated keeps that lesson.
+    #[test]
+    fn a_lesson_from_the_work_it_replaced_still_discharges_the_successor() {
+        let memories = vec![
+            row(
+                "work-first",
+                "task",
+                "the work, first version",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "valid_to": NOW - 1,
+                    "superseded_by": "work-second"
+                }),
+            ),
+            row(
+                "work-second",
+                "task",
+                "the work, second version",
+                json!({
+                    "task": { "status": "done", "created_at": iso(DAY * 3) },
+                    "supersedes": "work-first"
+                }),
+            ),
+            row(
+                "the-lesson",
+                "fact",
+                "the lesson for the work",
+                json!({ "extracted_from": ["work-first"] }),
+            ),
+        ];
+        let report = evaluate(&memories, NOW);
+        let blocking: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "done_without_extraction")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert!(
+            blocking.is_empty(),
+            "the work was already consolidated: {:?}",
+            blocking
+        );
+    }
+
     #[test]
     fn any_in_progress_task_blocks_the_gate() {
         let memories = vec![task(
@@ -1324,9 +1575,9 @@ mod tests {
                 }),
             ),
         ];
-        assert!(extraction_exists(&memories, "ns-aaaa"));
-        assert!(!extraction_exists(&memories, "ns-zzzz"));
+        assert!(extraction_exists(&memories, "ns-aaaa", NOW));
+        assert!(!extraction_exists(&memories, "ns-zzzz", NOW));
         // A task never extracts from itself.
-        assert!(!extraction_exists(&memories[..1], "ns-aaaa"));
+        assert!(!extraction_exists(&memories[..1], "ns-aaaa", NOW));
     }
 }

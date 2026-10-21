@@ -196,11 +196,17 @@ neurostrata_task_complete, which requires memory extraction (Lock 2)."*
     "namespace": {"type":"string"},
     "status": {"type":"string","enum":["open","in_progress","blocked","done"]},
     "assignee": {"type":"string"},
-    "ready": {"type":"boolean","description":"open AND not retired AND all blocked_by tasks are done. A retired blocker counts as done -- it is history -- unless a live successor still carries the work. This is `bd ready`."},
-    "include_done": {"type":"boolean","default":false}
+    "ready": {"type":"boolean","description":"open AND not retired AND all blocked_by tasks are done. A retired blocker counts as done -- it is history -- unless the row at the end of its supersession chain still carries the work. This is `bd ready`."},
+    "include_done": {"type":"boolean","default":false},
+    "include_retired": {"type":"boolean","default":false,"description":"Include retired rows (superseded or expired). They come back labelled retired:true -- history, not work."}
   }, "required": ["namespace"] }
 ```
 Kills a separate `task_ready` tool: one filter flag instead.
+
+Retired rows are hidden from the default listing, exactly as the gate does not
+judge them and the snapshot does not offer them: the three surfaces agree that
+a retired row is history. `include_retired: true` shows them for the audit,
+labelled `retired: true`, so nobody reads a superseded claim as live work.
 
 **neurostrata_task_complete** (Q2 — the Lock 2 enforcement point)
 ```json
@@ -377,17 +383,42 @@ replaced it carries the lesson — `metadata.superseded_by` must point at a
 successor that is itself a task, is not retired, is `done`, and already has
 an inbound EXTRACTED_FROM edge. Anything less (a successor that is not a
 task, one that is still open, one whose own lesson is still missing, one
-that is itself retired, or no successor at all) leaves the lesson owed by
-the retired row, which still blocks.
+that is itself retired, or no successor at all) leaves the lesson owed by the
+retired row, which still blocks.
+
+**One successor rule, three surfaces.** "The row that replaced it" means the
+row at the end of the supersession chain, not merely the next link: a work
+that was replaced twice is still carried by the row that replaced it twice.
+The chain is walked bounded and cycle-safe — a namespace is written by many
+hands, so a loop in the lineage is data, not a hang. The same chain decides
+readiness (a retired blocker holds its dependents while the chain still
+carries live work) and the extraction obligation (a retired row is discharged
+by the live row at the end of its chain).
+
+**A lesson belongs to the work, not to one row id.** The row that replaced a
+finished task is the same work under a new id, so the lesson extracted from
+the old id discharges the successor too: `extracted_from` may name any id in
+the task's lineage (the row itself, then the rows it replaced). A *retired*
+lesson discharges nothing — the store hides it from search, and the gate
+refuses to forgive it: the store hides; the gate refuses to forgive.
 
 A retired task row is not offered as claimed or ready work in the snapshot
 (prefix): the gate does not judge it, so an agent must not be sent to
 release a claim that no longer blocks anything.
 
 The same rule governs readiness. A retired blocker is history and no longer
-holds its dependents — unless a live successor still carries the work, in
-which case the dependents still wait for that successor. A retired task row
-is never offered as ready work itself.
+holds its dependents — unless the row at the end of its supersession chain
+still carries the work, in which case the dependents still wait for that row.
+A retired task row is never offered as ready work itself.
+
+**A claim is a lease on the work, not on the row id.** Correcting the text of
+a claimed task does not hand the work to anyone else: `supersede_memory`
+clones the task payload, so the successor inherits the claim — status,
+assignee, session, and the age of the claim. Retiring a row is not releasing
+a claim. The release is an explicit act: `neurostrata_task_update` with
+`status: "open"` clears the assignee and the session (the `InProgress ->
+Open` unclaim edge), and the supersede reply names the successor id and that
+call, so the claim is released deliberately rather than by accident.
 
 The counts describe the namespace's task rows, retired ones included and
 counted apart in `counts.retired`; the violations describe the live ones.

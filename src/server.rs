@@ -291,15 +291,16 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_task_list",
-                        "description": "List tasks in a namespace. ready: true is the actionable backlog (open and every blocker done); done tasks are hidden unless include_done.",
+                        "description": "List tasks in a namespace. ready: true is the actionable backlog (open and every blocker done); done tasks are hidden unless include_done; retired rows (superseded or expired) are history and hidden unless include_retired.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "status": { "type": "string", "enum": ["open", "in_progress", "blocked", "done"], "description": "Only tasks in this state." },
                                 "assignee": { "type": "string", "description": "Only tasks claimed by this assignee." },
-                                "ready": { "type": "boolean", "description": "Only actionable work: open (not retired), with every blocker done. A retired blocker counts as done -- it is history, unless a live successor still carries the work." },
-                                "include_done": { "type": "boolean", "description": "Include finished tasks in the unfiltered listing." }
+                                "ready": { "type": "boolean", "description": "Only actionable work: open (not retired), with every blocker done. A retired blocker counts as done -- it is history, unless the row at the end of its supersession chain still carries the work." },
+                                "include_done": { "type": "boolean", "description": "Include finished tasks in the unfiltered listing." },
+                                "include_retired": { "type": "boolean", "description": "Include retired rows (superseded or expired) in the listing. They come back labelled retired: true -- history, not work." }
                             },
                             "required": ["namespace"]
                         }
@@ -1659,6 +1660,25 @@ async fn handle_supersede_memory(
 
     let new_id = uuid::Uuid::new_v4().to_string();
 
+    // A claim is a lease on the WORK, not on the row id. Correcting the text
+    // of a claimed task does not hand the work to anyone else: the successor
+    // inherits the claim, and the reply names the release path so the claim
+    // is released deliberately rather than by accident.
+    let claim_inherited = old_payload.memory_type == "task"
+        && old_payload
+            .metadata
+            .get("task")
+            .and_then(|t| t.get("status"))
+            .and_then(|s| s.as_str())
+            == Some("in_progress");
+    let claim_assignee = old_payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("assignee"))
+        .and_then(|a| a.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
     // The replacement inherits everything the old row established -- who stored
     // it, what it governs, which files it points at -- because a correction to
     // the text is not a change of subject.
@@ -1864,6 +1884,12 @@ async fn handle_supersede_memory(
         "Superseded {} with {} in namespace {}. The old memory keeps its text and is no longer returned by search; it is still readable by id.",
         id, new_id, namespace
     );
+    if claim_inherited {
+        report.push_str(&format!(
+            " The successor inherits the claim (assignee {}): retiring the old row does not release the work, and the claim still blocks the push gate. To release it, call neurostrata_task_update on {} with status 'open'.",
+            claim_assignee, new_id
+        ));
+    }
     if !replaced.is_empty() {
         report.push_str(&format!(" Replaced metadata: {}.", replaced.join(", ")));
     }
@@ -3450,6 +3476,59 @@ mod tests {
             new_row.metadata.get("valid_to").and_then(|v| v.as_i64()),
             Some(future_ts),
             "future expiry should transfer to replacement"
+        );
+    }
+
+    /// A correction to a claimed task keeps the claim: the work continues
+    /// under the new id, and the reply names the release path so the claim
+    /// is released deliberately rather than by accident.
+    #[tokio::test]
+    async fn superseding_a_claimed_task_inherits_the_claim_and_names_the_release_path() {
+        let dir = std::env::temp_dir().join(format!("ns-supersede-claim-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+        );
+        store.init("probe").await.expect("create the schema");
+        let id = uuid::Uuid::new_v4().to_string();
+
+        let mut claimed = payload("claimed task");
+        claimed.memory_type = "task".to_string();
+        claimed.metadata = serde_json::json!({
+            "task": {
+                "status": "in_progress",
+                "assignee": "agent-a",
+                "session_id": "ses-old",
+                "updated_at": "2026-10-18T00:00:00Z"
+            }
+        });
+        let v = StubEmbedder.embed("claimed task").await.unwrap();
+        store.upsert("probe", &id, v, claimed).await.unwrap();
+
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let reply = handle_supersede_memory(
+            serde_json::json!({ "id": id, "namespace": "probe", "content": "corrected claimed task" }),
+            emb,
+            store.clone(),
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+        let successor = new_id_from(&reply);
+
+        let (_, new_row) = store.get("probe", &successor).await.unwrap().unwrap();
+        assert_eq!(
+            new_row.metadata["task"]["status"],
+            serde_json::json!("in_progress"),
+            "the work continues under the new id"
+        );
+        assert_eq!(
+            new_row.metadata["task"]["assignee"],
+            serde_json::json!("agent-a")
+        );
+        assert!(
+            reply.contains("neurostrata_task_update") && reply.contains(&successor),
+            "the reply must name the release path for the inherited claim: {}",
+            reply
         );
     }
 
