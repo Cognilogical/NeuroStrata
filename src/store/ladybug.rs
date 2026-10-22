@@ -1295,16 +1295,16 @@ fn is_mesh_conflicting(metadata: &Value) -> bool {
 /// dated it.
 const SOURCE_RANK_GAIN: f32 = 0.05;
 
-/// Normalize an evidence path for dedup. RELATES_TO edges have their
-/// endpoints sorted lexicographically; GOVERNS/CONTAINS are order-sensitive.
+/// Normalize an evidence path for dedup: a one-hop undirected relation's endpoints are sorted; a directed relation is order-sensitive.
 fn norm_path(
     edges: &[crate::traits::EvidenceEdge],
     kind: &crate::traits::EvidenceKind,
 ) -> Vec<(String, String, String)> {
+    let relations = &crate::traits::memory_vocabulary()["relations"];
     edges
         .iter()
         .map(|e| {
-            if *kind == crate::traits::EvidenceKind::OneHop && e.relation == "RELATES_TO" {
+            if *kind == crate::traits::EvidenceKind::OneHop && relations[e.relation.as_str()]["direction"] == "undirected" {
                 let (a, b) = if e.source <= e.target {
                     (e.source.clone(), e.target.clone())
                 } else {
@@ -6694,5 +6694,117 @@ eurostrata\src\daemon.rs",
             "the GOVERNS link to the file is in the export: {:?}",
             links
         );
+    }
+
+    /// The dedup key: a one-hop undirected path collapses with its own
+    /// reverse, and a multi-hop path does not. A path's orientation is part of
+    /// its identity, except for a one-hop edge that has no direction.
+    #[test]
+    fn a_one_hop_undirected_path_collapses_but_a_two_hop_path_does_not() {
+        let edge = |source: &str, relation: &str, target: &str| crate::traits::EvidenceEdge {
+            source: source.to_string(),
+            relation: relation.to_string(),
+            target: target.to_string(),
+        };
+        let forward = vec![edge("probe::a", "RELATES_TO", "probe::b")];
+        let reverse = vec![edge("probe::b", "RELATES_TO", "probe::a")];
+        let directed_forward = vec![edge("probe::a", "GOVERNS", "probe::b")];
+        let directed_reverse = vec![edge("probe::b", "GOVERNS", "probe::a")];
+
+        assert_eq!(
+            norm_path(&forward, &crate::traits::EvidenceKind::OneHop),
+            norm_path(&reverse, &crate::traits::EvidenceKind::OneHop),
+            "a one-hop undirected path normalises to the same key either way"
+        );
+        assert_ne!(
+            norm_path(&directed_forward, &crate::traits::EvidenceKind::OneHop),
+            norm_path(&directed_reverse, &crate::traits::EvidenceKind::OneHop),
+            "a one-hop directed path keeps its order"
+        );
+        assert_ne!(
+            norm_path(&forward, &crate::traits::EvidenceKind::Governs2hop),
+            norm_path(&reverse, &crate::traits::EvidenceKind::Governs2hop),
+            "a two-hop path keeps its order"
+        );
+    }
+
+    /// A store whose primary is reached by an INCOMING edge, with a node that
+    /// governs the intermediate:
+    ///
+    ///   probe::mid -RELATES_TO-> probe::primary <-GOVERNS- probe::ruler
+    ///
+    /// `probe::ruler` is two hops from the primary: the primary is reached
+    /// through the intermediate, and the ruler governs the intermediate.
+    async fn incoming_evidence_test_store() -> LadybugStore {
+        let dir =
+            std::env::temp_dir().join(format!("ns-incoming-evidence-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        // The direct match: the target of the intermediate's RELATES_TO edge.
+        store
+            .upsert(
+                "probe",
+                "probe::primary",
+                vec![1.1, 0.0, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        // The intermediate: it relates to the primary, so the edge points at
+        // the primary.
+        store
+            .upsert(
+                "probe",
+                "probe::mid",
+                vec![0.5, 0.0, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({ "related_to": ["probe::primary"] })),
+            )
+            .await
+            .unwrap();
+
+        // The governing node: it governs the intermediate.
+        store
+            .upsert(
+                "probe",
+                "probe::ruler",
+                vec![0.2, 0.0, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({ "governs": ["probe::mid"] })),
+            )
+            .await
+            .unwrap();
+
+        store
+    }
+
+    /// An incoming two-hop path's first hop points at the direct match: the
+    /// intermediate is the edge's source and the direct match its target. The
+    /// outgoing branch builds the same hop the other way round, so the two
+    /// directions have to be pinned separately.
+    #[tokio::test]
+    async fn incoming_two_hop_evidence_points_the_first_hop_at_the_direct_match() {
+        let store = incoming_evidence_test_store().await;
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false)
+            .await
+            .unwrap();
+        let ruler = results.iter().find(|r| r.id == "probe::ruler").unwrap();
+        let two_hop: Vec<_> = ruler
+            .evidence
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::Governs2hop)
+            .collect();
+        assert_eq!(two_hop.len(), 1, "ruler should carry one two-hop path");
+        let path = &two_hop[0].path;
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].source, "probe::mid");
+        assert_eq!(path[0].relation, "RELATES_TO");
+        assert_eq!(path[0].target, "probe::primary");
+        assert_eq!(path[1].source, "probe::ruler");
+        assert_eq!(path[1].relation, "GOVERNS");
+        assert_eq!(path[1].target, "probe::mid");
     }
 }
