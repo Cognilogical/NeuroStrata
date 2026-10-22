@@ -620,14 +620,21 @@ fn unverified_config() -> SystemConfig {
         .enable_checksums(false)
 }
 
-/// Set NEUROSTRATA_STRICT_WAL=1 to refuse the unverified retry. The database
-/// then fails to open rather than replaying records it could not authenticate --
-/// the right choice where an unreadable WAL should be investigated rather than
-/// recovered.
+/// Fail closed by default: an unauthenticated WAL is refused rather than
+/// replayed. Set `NEUROSTRATA_STRICT_WAL=0` (or `NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1`)
+/// to opt into the legacy unverified recovery path. The default is strict so a
+/// corrupt or tampered WAL is investigated, not silently recovered.
 fn strict_wal_verification() -> bool {
-    std::env::var("NEUROSTRATA_STRICT_WAL")
+    if std::env::var("NEUROSTRATA_ALLOW_UNVERIFIED_WAL")
         .map(|v| v == "1")
         .unwrap_or(false)
+    {
+        return false;
+    }
+    match std::env::var("NEUROSTRATA_STRICT_WAL").as_deref() {
+        Ok("0") => false,
+        _ => true,
+    }
 }
 
 fn is_wal_integrity_failure(err: &str) -> bool {
@@ -735,7 +742,7 @@ impl LadybugStore {
 
                 if strict_wal_verification() {
                     return Err(anyhow::anyhow!(
-                        "Refusing to open: the write-ahead log did not verify, and NEUROSTRATA_STRICT_WAL=1 forbids replaying records that cannot be authenticated. The log has been left in place for inspection. Unset the variable to recover the writes without verification."
+                        "Refusing to open: the write-ahead log did not verify. The log has been left in place for inspection. To recover the writes without verification, set NEUROSTRATA_STRICT_WAL=0 (or NEUROSTRATA_ALLOW_UNVERIFIED_WAL=1). See docs/runbooks/wal-recovery.md."
                     ));
                 }
 

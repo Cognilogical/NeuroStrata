@@ -634,6 +634,11 @@ pub(crate) async fn start_daemon_on(
         match vector_store.checkpoint().await {
             Ok(()) => {
                 eprintln!("Checkpoint complete. NeuroStrata Daemon stopped.");
+                // Release the store lock deterministically: drop our handle to
+                // the database so the engine closes its files before exit,
+                // rather than relying on process teardown or stale-lock
+                // reclamation by the next start.
+                drop(vector_store);
                 return Ok(());
             }
             Err(e) => {
@@ -644,6 +649,7 @@ pub(crate) async fn start_daemon_on(
                         "ERROR: final checkpoint failed {} time(s), recent writes may be lost: {}",
                         failures, e
                     );
+                    drop(vector_store);
                     return Err(anyhow::anyhow!(
                         "final checkpoint failed after {} attempt(s): {}",
                         failures,
