@@ -34,7 +34,7 @@ Evidence the current design already adjudicated this: `.agents/skills/neurostrat
 Verified in-repo:
 
 - `neurostrata_get_snapshot` — pre-computed top-N weighted active rules per namespace (zero-shot grounding, `src/store`, documented in `docs/COGNITIVE_ARCHITECTURE.md` §5).
-- `neurostrata_search_memory` — deterministic dense-vector **distance** ranking with a capped usage-and-provenance gain, plus a bounded directed-graph expansion: one hop over `RELATES_TO`/`CONTAINS`/`GOVERNS` and two hops over `GOVERNS` (`src/store/ladybug.rs:1045-1048`, `:1093-1100`, `:1138-1160`, `:1306-1332`; the server asks for five primaries and renders what the store returns — `src/server.rs:1987-1991`). There is **no** lexical/BM25 track and **no** rank fusion — the "hybrid RRF" description carried by earlier versions of this document was false.
+- `neurostrata_search_memory` — deterministic dense-vector **distance** ranking with a capped usage-and-provenance gain, plus a bounded directed-graph expansion: one hop over `RELATES_TO`/`CONTAINS`/`GOVERNS` and two hops over `GOVERNS` (`src/store/ladybug.rs:71`, `:130-135`, `:208-225`, `:453-477`; the server asks for five primaries and renders what the store returns — `src/server.rs:2026-2035`, `:2056`). There is **no** lexical/BM25 track and **no** rank fusion — the "hybrid RRF" description carried by earlier versions of this document was false.
 - Embeddings are **local** by default (`fastembed` in `src/embed.rs`) — a retrieval query costs milliseconds and $0.00. A declared Dendritic Bridge makes the embedding call remote and metered; the ranking arithmetic stays local and deterministic either way.
 - Namespace isolation shrinks the search space (§4, §7): a search runs inside exactly one namespace.
 
@@ -67,10 +67,10 @@ The legitimate pain point is **cognitive load and missed retrievals**, not write
 
 ### R1. Event-driven retrieval prefetch (replaces "reader agent")
 
-Use the graph edges that already exist (`locations`, `governs`, `related_to` — the metadata keys are written by the add/supersede handlers, `src/server.rs:1279-1281`, and `locations` is re-derived into `governs` at `src/server.rs:1023-1060`):
+Use the graph edges that already exist (`locations`, `governs`, `related_to` — the metadata keys are written by the add/supersede handlers, `src/server.rs:1273-1286`, `:1714`, and `locations` is re-derived into `governs` at `src/server.rs:1025-1077`):
 
 - **Session start:** `get_snapshot` (already shipped). Client shims (AGENTS.md / hook) should make it the mandatory first action — already the case in this repo's AGENTS.md.
-- **File-touch trigger (prescription, not implemented — there is no path-matched query path in `src/` today; the store's only retrieval surface is `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)`, `src/traits.rs:163-169`):** when the main agent's client reads/edits a file, a shim or MCP middleware issues a deterministic query: active memories whose `governs`/`locations` edges match the path (exact + directory-prefix), union snapshot for the namespace. Inject as a compact, capped block (≤512 tokens, top-K=5, deduped against what is already in context).
+- **File-touch trigger (prescription, not implemented — there is no path-matched query path in `src/` today; the store's only retrieval surface is `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)`, `src/traits.rs:193-200`):** when the main agent's client reads/edits a file, a shim or MCP middleware issues a deterministic query: active memories whose `governs`/`locations` edges match the path (exact + directory-prefix), union snapshot for the namespace. Inject as a compact, capped block (≤512 tokens, top-K=5, deduped against what is already in context).
 - **No LLM anywhere in this path.** Ranking = the existing deterministic boosted-distance ranking plus bounded graph evidence (§2.2). Trigger = path match. Budget = hard token cap with eviction of stale injections.
 
 Acceptance criteria: prefetch must never exceed cap; every injected memory carries its id; a config flag disables injection entirely.

@@ -10,13 +10,13 @@ Evidence: supplied findings and repository only; no other architect output.
 Goal: lossless, stable shared exports without requiring Git; preserve
 fail-soft writes while exposing missing graph edges.
 
-`src/store/ladybug.rs:1584-1625` prefers metadata.absolute_path, then
+`src/store/ladybug.rs:1992-1994`, `:2008-2014` prefers metadata.absolute_path, then
 canonicalizes location against process CWD. Fixing only the fallback
 leaves stale metadata authoritative. This code derives export output;
 it does not itself demonstrate database mutation.
 
-Lines 1342-1415 replay declarations. Lines 1909-1926 resolve graph nodes,
-not files. Lines 1418-1429 clear every auto-ingestor row in a namespace:
+Lines 1743-1817 replay declarations. Lines 2278-2300 resolve graph nodes,
+not files. Lines 1819-1831 clear every auto-ingestor row in a namespace:
 provenance alone cannot make concurrent branch graphs safe.
 
 ## Recommended design
