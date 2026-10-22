@@ -1649,6 +1649,266 @@ impl VectorStore for LadybugStore {
         .await
     }
 
+    async fn nearest_by_raw_distance(
+        &self,
+        namespace: &str,
+        vector: Vec<f32>,
+        query: crate::traits::RawDistanceQuery,
+    ) -> Result<Vec<crate::traits::RawDistanceCandidate>> {
+        let scope = query.scope;
+        let limit = query.limit;
+        let namespace = namespace.to_string();
+        let is_procedure_scope = matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
+        let proc_trigger = match &scope {
+            crate::traits::DedupCandidateScope::Procedure { trigger } => Some(trigger.clone()),
+            _ => None,
+        };
+
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let vec_str = format!(
+                "[{}]",
+                vector.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(",")
+            );
+            let now = chrono::Utc::now().timestamp();
+
+            const FETCH_MULTIPLIER: usize = 10;
+            let fetch_limit = limit.max(1) * FETCH_MULTIPLIER;
+
+            // Excluded memory types for Domain scope (structural + task + procedure + symbol/code_ast).
+            // Procedure scope restricts to memory_type = 'procedure' instead.
+            let excluded_types_str = if is_procedure_scope {
+                // exclude everything; we filter to procedure in Rust + SQL
+                String::new()
+            } else {
+                let mut excluded = STRUCTURAL_MEMORY_TYPES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+                excluded.push("task".to_string());
+                excluded.push("procedure".to_string());
+                excluded.push("symbol".to_string());
+                excluded.push("code_ast".to_string());
+                excluded
+                    .iter()
+                    .map(|t| format!("'{}'", t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+
+            let type_filter = if is_procedure_scope {
+                "AND m.memory_type = 'procedure'".to_string()
+            } else {
+                format!("AND NOT m.memory_type IN [{}]", excluded_types_str)
+            };
+
+            let search_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' {} RETURN m.id, array_distance(m.embedding, {}) AS dist, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata ORDER BY dist ASC, m.id ASC LIMIT {}",
+                safe_ns, type_filter, vec_str, fetch_limit
+            );
+
+            let result = conn.query(&search_query)?;
+            let mut out = Vec::new();
+            for row in result {
+                if out.len() >= limit {
+                    break;
+                }
+                let id: String = format!("{}", row[0]);
+                let distance: f32 = match &row[1] {
+                    lbug::Value::Float(f) if f.is_finite() && *f >= 0.0 => *f,
+                    lbug::Value::Double(d) if d.is_finite() && *d >= 0.0 => *d as f32,
+                    _ => continue,
+                };
+                let content: String = format!("{}", row[2]);
+                let user_id: String = format!("{}", row[3]);
+                let memory_type: String = format!("{}", row[4]);
+                let agent_name: String = format!("{}", row[5]);
+                let location: String = format!("{}", row[6]);
+                let location_lines: String = format!("{}", row[7]);
+                let metadata_str: String = format!("{}", row[8]);
+                let metadata_val: Value =
+                    serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+
+                // Lifecycle filters (Rust side).
+                if is_retired_at(&metadata_val, now) {
+                    continue;
+                }
+                if is_archived(&metadata_val) {
+                    continue;
+                }
+                if is_mesh_conflicting(&metadata_val) {
+                    continue;
+                }
+                if crate::registry::is_registry_row(&metadata_val) {
+                    continue;
+                }
+                if memory_type != "procedure" && user_id == "auto-ingestor" {
+                    continue;
+                }
+
+                // Procedure scope: trigger match, not lapsed, not spent.
+                if is_procedure_scope {
+                    let trig_ok = proc_trigger
+                        .as_ref()
+                        .map(|t| {
+                            metadata_val
+                                .get("trigger")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s == t)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if !trig_ok {
+                        continue;
+                    }
+                    // lapsed?
+                    if is_retired_at(&metadata_val, now) {
+                        continue;
+                    }
+                    // spent?
+                    if let Some(rf) = metadata_val.get("remaining_fires") {
+                        if !rf.is_null() && rf.as_i64() == Some(0) {
+                            continue;
+                        }
+                    }
+                }
+
+                out.push(crate::traits::RawDistanceCandidate {
+                    id,
+                    raw_distance: distance,
+                    payload: MemoryPayload {
+                        content,
+                        user_id,
+                        memory_type,
+                        agent_name: if agent_name == "unknown" || agent_name.is_empty() {
+                            None
+                        } else {
+                            Some(agent_name)
+                        },
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn find_active_exact_content(
+        &self,
+        namespace: &str,
+        exact_content: &str,
+        scope: crate::traits::DedupCandidateScope,
+    ) -> Result<Vec<crate::traits::ExactContentCandidate>> {
+        let is_procedure_scope = matches!(scope, crate::traits::DedupCandidateScope::Procedure { .. });
+        let proc_trigger = match &scope {
+            crate::traits::DedupCandidateScope::Procedure { trigger } => Some(trigger.clone()),
+            _ => None,
+        };
+        let namespace = namespace.to_string();
+        let exact_content = exact_content.to_string();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_content = escape_ladybug_string(&exact_content);
+            let now = chrono::Utc::now().timestamp();
+
+            let type_filter = if is_procedure_scope {
+                "AND m.memory_type = 'procedure'".to_string()
+            } else {
+                let mut excluded = STRUCTURAL_MEMORY_TYPES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+                excluded.push("task".to_string());
+                excluded.push("procedure".to_string());
+                excluded.push("symbol".to_string());
+                excluded.push("code_ast".to_string());
+                let s = excluded.iter().map(|t| format!("'{}'", t)).collect::<Vec<_>>().join(", ");
+                format!("AND NOT m.memory_type IN [{}]", s)
+            };
+
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.content = '{}' {} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
+                safe_ns, safe_content, type_filter
+            );
+            let result = conn.query(&query)?;
+            let mut out = Vec::new();
+            for row in result {
+                let id: String = format!("{}", row[0]);
+                let content: String = format!("{}", row[1]);
+                let user_id: String = format!("{}", row[2]);
+                let memory_type: String = format!("{}", row[3]);
+                let agent_name: String = format!("{}", row[4]);
+                let location: String = format!("{}", row[5]);
+                let location_lines: String = format!("{}", row[6]);
+                let metadata_str: String = format!("{}", row[7]);
+                let metadata_val: Value =
+                    serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+
+                if is_retired_at(&metadata_val, now) {
+                    continue;
+                }
+                if is_archived(&metadata_val) {
+                    continue;
+                }
+                if is_mesh_conflicting(&metadata_val) {
+                    continue;
+                }
+                if crate::registry::is_registry_row(&metadata_val) {
+                    continue;
+                }
+                if memory_type != "procedure" && user_id == "auto-ingestor" {
+                    continue;
+                }
+
+                if is_procedure_scope {
+                    let trig_ok = proc_trigger
+                        .as_ref()
+                        .map(|t| {
+                            metadata_val
+                                .get("trigger")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s == t)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if !trig_ok {
+                        continue;
+                    }
+                    if is_retired_at(&metadata_val, now) {
+                        continue;
+                    }
+                    if let Some(rf) = metadata_val.get("remaining_fires") {
+                        if !rf.is_null() && rf.as_i64() == Some(0) {
+                            continue;
+                        }
+                    }
+                }
+
+                out.push(crate::traits::ExactContentCandidate {
+                    id,
+                    payload: MemoryPayload {
+                        content,
+                        user_id,
+                        memory_type,
+                        agent_name: if agent_name == "unknown" || agent_name.is_empty() {
+                            None
+                        } else {
+                            Some(agent_name)
+                        },
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();

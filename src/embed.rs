@@ -127,6 +127,7 @@ const MAX_EMBED_TOKENS: usize = 2048;
 
 pub struct FastEmbedder {
     model: Arc<Mutex<TextEmbedding>>,
+    model_name: String,
     dimensions: usize,
 }
 
@@ -162,6 +163,7 @@ impl FastEmbedder {
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
+            model_name: target_model.model_name.clone(),
             dimensions: target_model.dimensions,
         })
     }
@@ -190,6 +192,10 @@ impl Embedder for FastEmbedder {
     fn dimensions(&self) -> usize {
         self.dimensions
     }
+
+    fn embedder_id(&self) -> &str {
+        &self.model_name
+    }
 }
 
 pub struct RemoteEmbedder {
@@ -198,6 +204,7 @@ pub struct RemoteEmbedder {
     api_key: String,
     api_model: String,
     dimensions: usize,
+    model_name: String,
 }
 
 impl RemoteEmbedder {
@@ -216,8 +223,9 @@ impl RemoteEmbedder {
             client,
             base_url,
             api_key,
-            api_model,
+            api_model: api_model.clone(),
             dimensions,
+            model_name: api_model,
         })
     }
 
@@ -282,6 +290,10 @@ impl Embedder for RemoteEmbedder {
 
     fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    fn embedder_id(&self) -> &str {
+        &self.model_name
     }
 }
 
