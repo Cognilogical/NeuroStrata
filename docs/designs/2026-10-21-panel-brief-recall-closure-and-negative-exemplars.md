@@ -149,8 +149,8 @@ Verified against source on 2026-10-21 at `940736f`.
 | The agent learns the vocabulary only from `tool_summaries.memory_type` and the tool description | `src/schemas/memory-vocabulary.v3.json:161` |
 | The mesh is closed over shareable types — `["rule", "fact", "procedure"]`; an unknown `memory_type` is **rejected at import time** with a hard `Err` | `src/synaptic_mesh/import.rs:61`, `:649-655`; contract at `src/synaptic_mesh/record.rs:26-28` |
 | Relations are closed (`GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM`) and custom relations are **not materialized** | `src/schemas/memory-vocabulary.v3.json`, `extensions.custom_relations`; `src/store/ladybug.rs:445-452` |
-| `domain` is written on add (raw, unvalidated) | `src/server.rs:1279-1281` |
-| `domain` is read back and echoed to export; it never filters retrieval | `src/store/ladybug.rs:1854` (read), `:1907` (emitted) |
+| `domain` is written on add (raw, unvalidated) *[changed by the proactive-recall plan: the domain is normalized to a slug on write]* | `src/server.rs:1279-1281` |
+| `domain` is read back and echoed to export; it never filters retrieval *[changed by the proactive-recall plan: it is now an optional soft filter on search]* | `src/store/ladybug.rs:1854` (read), `:1907` (emitted) |
 | The snapshot's straps are computed **before** the cut; then it sorts strictly by `access_count` desc and truncates to 5 | `src/server.rs:1454-1460`, `:1465-1480` |
 | `get_snapshot`'s input schema takes only `namespace` | `src/server.rs:153-161` |
 | `handle_append_log(arguments)` — no `emb`, no `store`; the response is `{appended, file, size_bytes, rolled, tags}` | `src/buffer.rs:129-177`; dispatch `src/server.rs:664` |

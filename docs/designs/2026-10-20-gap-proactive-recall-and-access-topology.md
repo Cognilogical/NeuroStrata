@@ -280,7 +280,7 @@ Verified in this repo on 2026-10-20.
 | New memory gets `access_count: 0` | `src/server.rs:1122` (`stamp_new_memory`) |
 | Snapshot sorts by access_count, truncates to 5 | `src/server.rs:1461-1476` |
 | Search ranks by distance with usage boost; over-fetches | `src/store/ladybug.rs:992`, `src/store/ladybug.rs:1053` |
-| `domain` written on add_memory; echoed to export; never filters retrieval | `src/server.rs:1275`; `src/store/ladybug.rs:1673`, `:1726`; absent from search/snapshot queries |
+| `domain` written on add_memory; echoed to export; never filters retrieval *[changed by the proactive-recall plan: `domain` is normalized to a slug on write, and it is now an optional soft filter on search]* | `src/server.rs:1275`; `src/store/ladybug.rs:1673`, `:1726`; absent from search/snapshot queries |
 | Topic Switch marker written; never read back for recall | `src/buffer.rs:71`; `src/server.rs:370`; the only two `current.md` readers are both test bodies (`src/daemon.rs:1542`, `src/tools/procedure.rs:496`) — no production path reads it |
 | Guard validates actions, not claims | `src/server.rs:382`; `src/guard/validator.rs:43` |
 | Rule honesty: `enforcement` / `guard` fields, checked by the gate | `src/schemas/memory-vocabulary.v3.json` (`memory_types.rule.fields`); `src/task/gate.rs:235-272` |
