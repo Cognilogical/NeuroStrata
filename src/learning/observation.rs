@@ -72,17 +72,17 @@ pub enum LearningOutcomeKind {
 
 pub struct LearningRecorder { root: std::path::PathBuf }
 impl LearningRecorder {
-    pub async fn open(root: std::path::PathBuf) -> Result<Self> {
+    pub async fn open(root: std::path::PathBuf) -> anyhow::Result<Self> {
         // placeholder
         unimplemented!("TODO: create .NeuroStrata/learning directory, initialize JSONL files")
     }
-    pub async fn record_observation(&self, _value: &DecisionObservation) -> Result<()> {
+    pub async fn record_observation(&self, _value: &DecisionObservation) -> anyhow::Result<()> {
         unimplemented!("TODO: implement observation writing")
     }
-    pub async fn record_outcome(&self, _value: &LearningOutcome) -> Result<()> {
+    pub async fn record_outcome(&self, _value: &LearningOutcome) -> anyhow::Result<()> {
         unimplemented!("TODO: implement outcome writing")
     }
-    pub async fn put_payload(&self, _value: &MemoryPayload) -> Result<PayloadHash> {
+    pub async fn put_payload(&self, _value: &MemoryPayload) -> anyhow::Result<PayloadHash> {
         unimplemented!("TODO: implement payload hashing + blob storage")
     }
 }
