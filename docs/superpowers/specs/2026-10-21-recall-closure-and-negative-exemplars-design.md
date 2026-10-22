@@ -111,7 +111,7 @@ elsewhere or is another spec's subject):
 | The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1281`, `is_mesh_conflicting` `:1291`, `is_retired_at` `:2273`; applied at `:114`, `:121`, `:124` |
 | The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1162` (the `>= 0.85` filter), `:1166` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
 | `format_memory` is the rendering path for a returned row | `src/server.rs:2324` |
-| The bus metrics surface serializes the bus's own counters (eight integers) | `src/handlers/bus_metrics.rs:20-23` |
+| The bus metrics surface serializes the bus's own counters (eight integers) *[changed by neurostrata-r30c: composite body now also carries `domain_filter` and `recall`]* | `src/handlers/bus_metrics.rs:20-29` |
 
 ---
 

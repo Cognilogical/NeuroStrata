@@ -52,6 +52,10 @@ pub fn record_domain_query(narrowed: bool, fell_back: bool, single_domain: bool)
 }
 
 pub fn record_recall(namespace: &str, ids: &[String]) {
+    if ids.is_empty() {
+        // An empty recall response does not count toward the rate.
+        return;
+    }
     let mut guard = RECENTLY_RECALLED.lock().expect("recently-recalled lock poisoned");
     let map = guard.get_or_insert_with(HashMap::new);
     let deque = map.entry(namespace.to_string()).or_default();
@@ -69,12 +73,9 @@ pub fn record_promotion(namespace: &str, id: &str) -> bool {
     let mut guard = RECENTLY_RECALLED.lock().expect("recently-recalled lock poisoned");
     let found = if let Some(map) = guard.as_mut() {
         if let Some(deque) = map.get_mut(namespace) {
-            if let Some(pos) = deque.iter().position(|x| x == id) {
-                deque.remove(pos);
-                true
-            } else {
-                false
-            }
+            let before = deque.len();
+            deque.retain(|x| x != id);
+            before != deque.len()
         } else {
             false
         }
@@ -86,4 +87,65 @@ pub fn record_promotion(namespace: &str, id: &str) -> bool {
         RECALL_PROMOTIONS.fetch_add(1, Ordering::Relaxed);
     }
     found
+}
+
+
+#[cfg(test)]
+pub fn reset_counters_for_tests() {
+    DOMAIN_QUERIES_TOTAL.store(0, Ordering::Relaxed);
+    DOMAIN_NARROWED_HITS.store(0, Ordering::Relaxed);
+    DOMAIN_FALLBACK_VECTOR.store(0, Ordering::Relaxed);
+    SINGLE_DOMAIN_BYPASSES.store(0, Ordering::Relaxed);
+    RECALL_RESPONSES.store(0, Ordering::Relaxed);
+    RECALL_PROMOTIONS.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = RECENTLY_RECALLED.lock() {
+        *g = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_counters_start_at_zero() {
+        reset_counters_for_tests();
+        let df = domain_filter_snapshot();
+        assert_eq!(df["domain_queries_total"], 0);
+        assert_eq!(df["domain_narrowed_hits"], 0);
+        assert_eq!(df["domain_fallback_vector"], 0);
+        assert_eq!(df["single_domain_bypasses"], 0);
+        let rc = recall_snapshot();
+        assert_eq!(rc["recall_responses"], 0);
+        assert_eq!(rc["recall_promotions"], 0);
+    }
+
+    #[test]
+    fn a_recalled_id_is_counted_once_when_it_is_promoted() {
+        let ns = "recall-promo-test";
+        let id = "recalled-id";
+        record_recall(ns, &[id.to_string()]);
+        let before = recall_snapshot()["recall_promotions"].as_u64().unwrap();
+        assert!(record_promotion(ns, id));
+        let after = recall_snapshot()["recall_promotions"].as_u64().unwrap();
+        assert_eq!(after, before + 1);
+        assert!(!record_promotion(ns, id));
+        let after2 = recall_snapshot()["recall_promotions"].as_u64().unwrap();
+        assert_eq!(after2, after);
+    }
+
+    #[test]
+    fn the_recalled_id_set_is_bounded() {
+        let ns = "bounded-recall-test";
+        for i in 0..(RECENTLY_RECALLED_CAP + 5) {
+            record_recall(ns, &[format!("bounded-id-{}", i)]);
+        }
+        // The oldest id has aged out.
+        assert!(!record_promotion(ns, "bounded-id-0"));
+        // The newest id is still present.
+        assert!(record_promotion(
+            ns,
+            &format!("bounded-id-{}", RECENTLY_RECALLED_CAP + 4)
+        ));
+    }
 }
