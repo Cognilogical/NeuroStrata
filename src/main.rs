@@ -10,6 +10,7 @@ mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
+mod learning;
 mod parser;
 mod recall_metrics;
 mod registry;
