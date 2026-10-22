@@ -734,7 +734,7 @@ git commit -m "test: the topology fact reaches its governed file and survives a 
 - Consumes: the tightened `rule-honesty` contract from `neurostrata-bzdn`.
 - Produces: one `rule` row that conforms to that contract (the parent's spec §4.4: "This spec writes its own rule rows conforming to the tightened contract from day one"), plus the conformance test that keeps the contract honest.
 
-**This task is gated.** The parent's spec §4.4 makes the rule-honesty hardening land first and separately, because the pre-push gate runs namespace-wide: tightening the validator flags the legacy rule rows until they are backfilled. That work is task `neurostrata-bzdn` (P2, ready, unassigned) and it is **not** this plan's to fold in — a tightening that lands without its backfill would fail the gate.
+**This task is gated.** The parent's spec §4.4 makes the rule-honesty hardening land first and separately, because the pre-push gate runs namespace-wide: tightening the validator flags the legacy rule rows until they are backfilled. That work is task `neurostrata-bzdn` (P2, ready, and now owned by the project owner for the migration ruling) and it is **not** this plan's to fold in — a tightening that lands without its backfill would fail the gate.
 
 Tasks 1–7 do not depend on this task. This task depends on `neurostrata-bzdn` landing. If `neurostrata-bzdn` has not landed when you reach this task, it waits — the blocker is named, tracked and owned; it is not dropped.
 
@@ -746,12 +746,12 @@ Tasks 1–7 do not depend on this task. This task depends on `neurostrata-bzdn` 
 |---|---|---|
 | `NeuroStrata` | 100 | **95** |
 | `keywest.health` | 143 | **143** |
-| `global` | 2 | 1 |
+| `global` | 2 | **2** |
 
-(The gap brief's figure of 86 legacy `NeuroStrata` rows was a point-in-time count; 95 is what the live namespace holds today.) The tightening therefore fails **three** namespaces' strict gates until their rows are corrected — not one — and two owner-ruled ways out exist, neither of them this plan's:
+(The parent spec's figure was 86 `NeuroStrata` rule rows, 84 of them missing `enforcement` (`docs/superpowers/specs/2026-10-21-proactive-recall-and-access-topology-design.md:334`); the live namespace holds 100 live rule rows, 95 of them missing it.) The tightening therefore fails **three** namespaces' strict gates until their rows are corrected — not one — and two owner-ruled ways out exist, neither of them this plan's:
 
 - **Grandfather** the legacy rows by their `valid_from` — migration-free, and the legacy rows stay unchecked, which is the honesty the tightening exists to end.
-- **Backfill** every namespace (`NeuroStrata` 95, `keywest.health` 143, `global` 1) with a truthful `enforcement` — the honest end state, but it writes 239 rows, 143 of them in another project's namespace, and `keywest.health` is not this repo's to decide for.
+- **Backfill** every namespace (`NeuroStrata` 95, `keywest.health` 143, `global` 2) with a truthful `enforcement` — the honest end state, but it writes 240 rows, 143 of them in another project's namespace, and `keywest.health` is not this repo's to decide for.
 
 The plan does not choose between them: the choice changes what a rule *in another project* means, so it is the owner's ruling. It is filed on `neurostrata-bzdn` with this measurement and the two options, and it is why Task 8 waits rather than being dropped.
 
