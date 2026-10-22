@@ -405,6 +405,19 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                 ),
             });
         }
+        if let Some(enf) = rule.get("enforcement").and_then(|e| e.as_str()) {
+            if !matches!(enf, "ENFORCED" | "PARTIAL" | "NOT_ENFORCED") {
+                report.violations.push(Violation {
+                    id: row.id.clone(),
+                    kind: "invalid_enforcement_value",
+                    detail: format!(
+                        "rule '{}' carries an unknown enforcement value '{}'; use ENFORCED, PARTIAL, or NOT_ENFORCED.",
+                        content_short(&row.payload.content), enf
+                    ),
+                });
+                continue;
+            }
+        }
         if rule.get("enforcement").and_then(|e| e.as_str()) != Some("ENFORCED") {
             continue;
         }
