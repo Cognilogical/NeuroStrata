@@ -124,3 +124,15 @@ domain the caller typed, so a value that normalizes to nothing has to be reporte
 skip; the recall derives its domain from tags it has already normalized, and a tag set
 that normalizes to nothing means there was no domain to filter by — so that case lands
 on "no search ran", and the mode is absent rather than naming a skip.
+
+---
+
+## A failed attempt is evidence, not a rule
+
+A `fact` carrying `metadata.attempt` is **evidence of one episode, not a normative rule**. It is returned by a search, it is rendered with its `Attempt [FAILED in …]` line, and its truncated snippet carries the `[FAILED ATTEMPT] ` prefix. A rule is normative; a failed attempt is evidence. The attempt shape is declared at vocabulary version 6 (`fact.fields.attempt`, `src/schemas/memory-vocabulary.v3.json`); a malformed attempt warns but the fact is still written.
+
+## The domain registry
+
+Each namespace has one registry row, a `fact` with `metadata.domain_registry` listing the registered slugs. The first domain write seeds it from the namespace's own rows. A slug that neither the registry nor the namespace's data carries is refused with the registered list and the `register_domain: true` remedy. The registry is a cache, not the truth: it can be stale, and the reconcile repairs it. A non-string `domain` is rejected, not guessed at.
+
+The registry row is excluded from recall and from the snapshot, so it never surfaces as a memory. An imported record's domain is unioned into the local registry after the apply succeeds, so no shared record is ever refused for a domain the local registry has not seen.
