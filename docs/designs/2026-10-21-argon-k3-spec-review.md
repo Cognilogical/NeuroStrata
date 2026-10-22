@@ -295,3 +295,37 @@ the two stale-fact corrections are one edit each in the spec.
 - No live Tebra lookups and no patient/PHI data were involved.
 - The owner's `max_candidates` ruling was treated as settled, by instruction.
 
+---
+
+## 7. Post-review addendum (2026-10-22)
+
+After this review landed, the recall-closure feature (`docs/superpowers/specs/
+2026-10-21-recall-closure-and-negative-exemplars-design.md`) shipped on `main`
+and introduced two interactions with the dedup path that this review did not
+see. They are recorded here rather than in a new review, because neither changes
+the adjudicated verdict; both are clarifications to the implementation contract.
+
+1. **Attempt partition (new).** A `fact` may carry `metadata.attempt` (a failed
+   attempt). The candidate set is partitioned by attempt-presence before any
+   comparison: a failed attempt is compared only against a failed attempt, and a
+   non-attempt only against non-attempts (`src/server.rs` now filters on
+   `crate::attempt::is_failed_attempt` equality inside `embed_dedup_and_upsert`).
+   The canonical exact-match key must include `metadata.attempt` (presence and
+   its four keys) so exact reuse cannot cross the partition. This is now
+   normative in the spec (`Candidate selection and write behavior`,
+   `canonical exact-match key`) and in plan Task 3 Steps 1, 2, 5, 6.
+2. **Registry row (new, store seam).** A fact carrying `metadata.domain_registry`
+   is dropped from every result set at the store seam (`src/store/ladybug.rs`,
+   four filter sites), so it never reaches `nearest_by_raw_distance` or
+   canonical exact-match reuse. It is **not** a new `STRUCTURAL_MEMORY_TYPES`
+   entry (it is a `fact`, not a structural type), so the by-memory-type
+   exclusion list is unchanged; the seam exclusion is what matters. Plan Task 2
+   Step 3 and Step 5 now say so.
+3. **Domain is not part of the canonical key.** The recall-closure feature adds
+   `domain` as a soft filter on search; dedup deliberately detects duplicates
+   across domains, so `domain` is excluded from the canonical key. Stated
+   explicitly in the spec to prevent an implementer from adding it.
+
+No re-review of the spec is required: both seats' findings stand, and these
+three points are additive to the implementation contract they approved.
+
