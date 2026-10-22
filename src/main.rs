@@ -11,6 +11,7 @@ mod handlers;
 mod ingest_jobs;
 mod judgment;
 mod parser;
+mod recall_metrics;
 mod registry;
 mod secrets;
 mod server;

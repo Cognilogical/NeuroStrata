@@ -266,6 +266,16 @@ pub async fn handle_append_log(
             }
         };
 
+        // Domain-filter counters: this search carried a filter (slugs non-empty).
+        let mode = search_outcome.mode;
+        let single_domain =
+            crate::registry::registry_domain_count(&store, &namespace).await <= 1;
+        crate::recall_metrics::record_domain_query(
+            mode == crate::traits::DomainMatchMode::Domain,
+            mode == crate::traits::DomainMatchMode::Vector,
+            single_domain,
+        );
+
         // Keep only direct matches
         let direct_matches: Vec<_> = search_outcome
             .results
@@ -295,7 +305,13 @@ pub async fn handle_append_log(
             })
             .collect();
 
-        let recalled_from_str = match search_outcome.mode {
+        let recalled_ids: Vec<String> = direct_matches
+            .iter()
+            .filter_map(|v| v.get("id").and_then(|x| x.as_str()).map(String::from))
+            .collect();
+        crate::recall_metrics::record_recall(&namespace, &recalled_ids);
+
+        let recalled_from_str = match mode {
             DomainMatchMode::Domain => Some("domain"),
             DomainMatchMode::Vector => Some("vector"),
         };
