@@ -213,11 +213,27 @@ Exclude rows whose metadata marks a SynapticMesh conflict
 reuse, so the dedup path never blocks on, hints toward, or reuses a row whose
 conflict is unresolved.
 
-Apply the type, owner, and conflict exclusions in the query's `WHERE` clause
-rather than filtering after the fetch: the store fetches `FETCH_MULTIPLIER *
-limit` rows (`src/store/ladybug.rs:1011-1012`) and filters in Rust, so
-post-fetch filtering can starve a small `K` in namespaces dense with excluded
-rows.
+Registry rows are excluded by the store seam, not by memory type: a fact
+carrying `metadata.domain_registry` is dropped from every result set alongside
+archived, retired, expired, and mesh-conflicting rows
+(`src/store/ladybug.rs`, four filter sites), so it never reaches
+`nearest_by_raw_distance` or canonical exact-match reuse. The registry row is a
+cache, not a memory an agent can supersede.
+
+The candidate set is partitioned by attempt-presence before any comparison: a
+row carrying a valid `metadata.attempt` (a failed attempt) is compared only
+against another such row, and a row without one only against rows without one.
+A malformed `attempt` is neither a negative exemplar nor a partitioned row - it
+is a plain row. This partition is applied in `nearest_by_raw_distance` and in
+canonical exact-match reuse alike, so a failed attempt never reuses or is
+reused by a non-attempt memory.
+
+Apply the type, owner, conflict, and registry exclusions in the query's `WHERE`
+clause rather than filtering after the fetch: the store fetches
+`FETCH_MULTIPLIER * limit` rows (`src/store/ladybug.rs:1011-1012`) and filters
+in Rust, so post-fetch filtering can starve a small `K` in namespaces dense
+with excluded rows. The attempt partition is applied after the fetch, at the
+server level, because it depends on payload metadata the store does not inspect.
 
 Record the embedder identity and vector dimensions with every raw distance.
 Distance scales are embedder-specific; do not convert distance to cosine using
@@ -230,7 +246,11 @@ Define a canonical exact-match key over namespace, exact UTF-8 content,
 `metadata.contained_by`, and canonicalized `metadata.refs` (`file`, `lines`, and
 `symbol`, sorted by those fields; ignore `source_context`). For `rule`, compare
 `metadata.enforcement` and `metadata.guard`; for `procedure`, compare
-`metadata.trigger`. Exclude usage counters, source provenance, and other mutable
+`metadata.trigger`. For `fact` rows, compare `metadata.attempt` - its presence
+and, when present, its four keys `approach`, `outcome`, `failure_mode`, and
+`context` - so a failed attempt never reuses or is reused by a non-attempt
+memory. `domain` is deliberately not part of the key: dedup detects duplicates
+across domains. Exclude usage counters, source provenance, and other mutable
 metadata. Exact content means byte-for-byte equality; do not normalize
 whitespace or punctuation in ways that could merge distinct rules. Only a key
 match counts as the pre-calibration exact-duplicate case; equal raw distances
@@ -442,8 +462,9 @@ label distributions. Acceptance criteria below are structural and testable.
 - Add unboosted `nearest_by_raw_distance`; test ascending ordering, exact-match
   retrieval, invariance to access-count/source metadata, and exclusion of
   GraphRAG sentinel neighbors, task/structural rows, `symbol`/`code_ast`,
-  `auto-ingestor` rows, and mesh-conflicting rows. Procedure candidates must
-  match trigger and remain unspent/unlapsed.
+  `auto-ingestor` rows, mesh-conflicting rows, and registry rows. Procedure
+  candidates must match trigger and remain unspent/unlapsed. Verify the
+  attempt-partition: a failed attempt is compared only with a failed attempt.
 - Remove the inverted `score >= 0.85` filter and stop interpreting the existing
   `similarity_threshold` as a cosine threshold. Record embedder identity,
   dimensions, and all top-K raw-distance candidates, where K is the configured

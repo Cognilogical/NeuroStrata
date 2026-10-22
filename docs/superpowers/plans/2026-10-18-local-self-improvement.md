@@ -248,12 +248,16 @@ needs.
   ascending before any usage/source boost or GraphRAG expansion. Filter archived,
   retired, expired, `auto-ingestor`, `directory`, `file`, `markdown`,
   `freshness_flag`, `guard_event`, `task`, `procedure`, `symbol`, and `code_ast`
-  rows from Domain scope, plus rows marked mesh-conflicting. Push the type,
-  owner, and conflict exclusions into the query's `WHERE` clause rather than
-  filtering after the fetch: the store fetches `FETCH_MULTIPLIER * limit` rows
+  rows from Domain scope, plus rows marked mesh-conflicting and rows carrying
+  `metadata.domain_registry` (the registry row, dropped at the store seam
+  alongside the other row-class filters). Push the type, owner, conflict, and
+  registry exclusions into the query's `WHERE` clause rather than filtering
+  after the fetch: the store fetches `FETCH_MULTIPLIER * limit` rows
   (`src/store/ladybug.rs:1011-1012`) and filters in Rust, so post-fetch
   filtering can starve a small `max_candidates` in namespaces dense with
-  excluded rows.
+  excluded rows. The attempt partition (failed attempt vs. non-attempt) is
+  applied after the fetch, at the server level, because it depends on payload
+  metadata the store does not inspect.
 - [ ] **Step 4: Implement `Procedure` scope**: require `memory_type == "procedure"`,
   matching `metadata.trigger`, not lapsed, and not spent (`remaining_fires != 0`).
   Domain scope excludes procedures and admits other active non-structural domain
@@ -349,11 +353,18 @@ pub fn model_may_block(
 `canonical_duplicate_key(namespace: &str, payload: &MemoryPayload) -> Result<String>`
 must use the spec's exact field set and byte-preserving content rule. It must
 not treat raw-distance equality or a model score as proof of canonical identity.
+For `fact` rows it must include `metadata.attempt` (presence and, when present,
+its four keys) so a failed attempt never reuses or is reused by a non-attempt
+memory. `domain` is deliberately excluded: dedup detects duplicates across
+domains.
 
 - [ ] **Step 1: Add failing canonical-key tests** for content, type, namespace,
   `location`, `location_lines`, sorted `metadata.governs`, `contained_by`,
   canonicalized `metadata.refs` (`file`, `lines`, `symbol`; ignore
-  `source_context`), rule `enforcement`/`guard`, and procedure `trigger`.
+  `source_context`), rule `enforcement`/`guard`, procedure `trigger`, and
+  `fact` `metadata.attempt` (presence + four keys). Add a cross-partition
+  test: a failed attempt and a non-attempt with identical content/type/location
+  do NOT produce the same key.
 - [ ] **Step 2: Implement deterministic canonical serialization** in
   `src/judgment/canonical.rs`; compare canonical strings, not vector distances.
 - [ ] **Step 3: Add failing policy tests** for allow, allow-with-hint, exact
@@ -375,7 +386,13 @@ not treat raw-distance equality or a model score as proof of canonical identity.
   field. Call the judgment provider only when provider mode is `Jev`: the
   existing `checker.check_duplicates` call (`src/server.rs:1162`) is bypassed
   under `auto`, `heuristic`, `laya-local`, and `none`, so the local path never
-  depends on a remote judgment.
+  depends on a remote judgment. Preserve the attempt-partition filter added by
+  the recall-closure work: `crate::attempt::is_failed_attempt` must match
+  between the incoming payload and each candidate, so a failed attempt is never
+  compared against (or reused by) a non-attempt memory. Also drop registry rows
+  from the candidate set (store seam, already applied alongside the other
+  row-class filters). Canonical exact-match reuse must respect the same
+  attempt partition and must not cross it.
 - [ ] **Step 6: Implement exact reuse**: for an exact key with
   `metadata.extracted_from`, update the existing candidate's metadata
   idempotently, reuse its vector, return its ID, and create no twin row. Find
