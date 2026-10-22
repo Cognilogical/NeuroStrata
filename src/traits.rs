@@ -305,11 +305,11 @@ mod tests {
     /// exactly four relations, the fourth being the extraction edge. v3 keeps
     /// them and adds the rule-honesty fields (A6); v4 adds `procedure` and
     /// keeps every relation as it was; v5 adds the fact `topology` field,
-    /// which is a field and not a relation.
+    /// which is a field and not a relation; v6 adds the fact `attempt` and `domain_registry` fields.
     #[test]
-    fn memory_vocabulary_v5_parses_and_has_exact_relations() {
+    fn memory_vocabulary_v6_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 5);
+        assert_eq!(v["vocabulary_version"], 6);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
@@ -327,6 +327,17 @@ mod tests {
             "self_to_target"
         );
         assert_eq!(rels["EXTRACTED_FROM"]["metadata_key"], "extracted_from");
+        let fact = &v["memory_types"]["fact"]["fields"];
+        assert!(
+            fact.get("attempt").is_some(),
+            "the fact declares the attempt shape: {v}"
+        );
+        assert!(
+            fact.get("domain_registry").is_some(),
+            "the fact declares the registry shape: {v}"
+        );
+        assert_eq!(fact["attempt"]["type"], "object");
+        assert_eq!(fact["domain_registry"]["type"], "object");
     }
 
     #[test]
