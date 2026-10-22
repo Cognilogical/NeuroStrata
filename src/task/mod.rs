@@ -1090,6 +1090,8 @@ pub async fn handle_task_complete(
     // announces it fires below, after the gate, and a refusal must publish
     // nothing.
     let mut inline_lesson: Option<String> = None;
+    let mut pending_registry: Option<Vec<String>> = None;
+    let mut registry_warnings: Vec<String> = Vec::new();
     if !edge {
         if let Some(mem) = &memory {
             if !mem.is_object() {
@@ -1169,6 +1171,27 @@ pub async fn handle_task_complete(
             {
                 return Err(rejection.to_string());
             }
+            // The completion's slug comes from `memory.metadata.domain`: there
+            // is no top-level `domain` argument on this path, so
+            // `register_domain` applies to that field and is a no-op when the
+            // memory carries no domain. The decision precedes the write.
+            if let Some(raw) = meta.get("domain").cloned() {
+                let register_domain = args
+                    .get("register_domain")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match crate::registry::check_domain(&store, &emb, &namespace, &raw, register_domain)
+                    .await
+                {
+                    Ok(check) => {
+                        pending_registry = check.cache;
+                        if let Some(warning) = check.warning {
+                            registry_warnings.push(warning);
+                        }
+                    }
+                    Err(rejection) => return Err(rejection),
+                }
+            }
             let payload = MemoryPayload {
                 content,
                 user_id,
@@ -1186,6 +1209,15 @@ pub async fn handle_task_complete(
                 dedup.as_ref(),
             )
             .await?;
+            // Only now, with the extraction durable: a cache failure is
+            // reported and never undoes the acceptance.
+            if let Some(domains) = pending_registry.take() {
+                if let Some(warning) =
+                    crate::registry::write_registry(&store, &emb, &namespace, &domains).await
+                {
+                    registry_warnings.push(warning);
+                }
+            }
             memories = list_now().await?;
             edge = gate::extraction_exists(&memories, &id, now);
             inline_lesson = Some(report.id);
@@ -1241,12 +1273,17 @@ pub async fn handle_task_complete(
         .map(|m| m.id.clone())
         .collect();
 
-    serde_json::to_string_pretty(&json!({
+    let mut reply = json!({
         "task": task_summary(&id, &completed.payload),
         "extracted_memory_ids": extracted,
         "transition": { "from": task.status().as_str(), "to": "done" },
-    }))
-    .map_err(|e| format!("Internal serialization error: {}", e))
+    });
+    if !registry_warnings.is_empty() {
+        reply["registry_warning"] = json!(registry_warnings.join("; "));
+    }
+
+    serde_json::to_string_pretty(&reply)
+        .map_err(|e| format!("Internal serialization error: {}", e))
 }
 
 // ── tool: neurostrata_task_validate ────────────────────────────────────────
@@ -4198,6 +4235,117 @@ mod tests {
             status_of(&store, "MyProj", &id).await,
             Status::InProgress,
             "the task did NOT complete to done"
+        );
+    }
+
+    // ── Task 3: the completion's write-path registry check ─────────────
+
+    /// Seed the registry cache directly, so the check runs against a cache
+    /// that is already present and (deliberately) missing the slug under test.
+    async fn seed_registry(store: &Arc<dyn VectorStore>, namespace: &str, domains: &[&str]) {
+        let domains: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
+        let content = crate::registry::registry_content(namespace);
+        let vector = StubEmbedder.embed(&content).await.unwrap();
+        store
+            .upsert(
+                namespace,
+                &crate::registry::registry_row_id(namespace),
+                vector,
+                MemoryPayload {
+                    content,
+                    user_id: "system".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: crate::registry::registry_metadata(&domains),
+                },
+            )
+            .await
+            .expect("seed the registry row");
+    }
+
+    async fn registry_of(store: &Arc<dyn VectorStore>, namespace: &str) -> Vec<String> {
+        store
+            .get(namespace, &crate::registry::registry_row_id(namespace))
+            .await
+            .expect("read the registry row")
+            .map(|(_, p)| crate::registry::registry_domains(&p.metadata))
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_completion_with_an_unregistered_domain_is_rejected() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        seed_registry(&store, "MyProj", &["auth"]).await;
+
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": {
+                    "content": "the lesson the task taught",
+                    "metadata": { "domain": "storage" }
+                }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("an unregistered domain must be rejected");
+
+        assert!(err.contains("ERROR [DOMAIN]"), "{}", err);
+        assert!(
+            err.contains(r#"Registered domains: ["auth"]"#),
+            "the rejection names the registered list: {}",
+            err
+        );
+        assert_eq!(
+            status_of(&store, "MyProj", &id).await,
+            Status::InProgress,
+            "a rejected completion does not reach done"
+        );
+        assert_eq!(
+            registry_of(&store, "MyProj").await,
+            vec!["auth".to_string()],
+            "a rejection writes nothing to the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completion_with_register_domain_true_registers_the_domain() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        seed_registry(&store, "MyProj", &["auth"]).await;
+
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "register_domain": true,
+                "memory": {
+                    "content": "the lesson the task taught",
+                    "metadata": { "domain": "storage" }
+                }
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("register_domain accepts the new slug");
+
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["task"]["status"], json!("done"));
+        assert_eq!(
+            registry_of(&store, "MyProj").await,
+            vec!["auth".to_string(), "storage".to_string()]
         );
     }
 

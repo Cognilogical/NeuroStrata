@@ -80,7 +80,7 @@ elsewhere or is another spec's subject):
 ## 2. The substrate (the claims were verified at `c5acd4f`; **this table's** anchors are live against the working tree as of 2026-10-22 — verify each claim at its anchor; the panel did not re-propose it)
 
 > **Anchor scope.** Every anchor in this spec — this table's and the prose anchors in §0,
-> §3, §5, §6, §7, §10 and §12 — is live against the working tree as of `e97d0ab`
+> §3, §5, §6, §7, §10 and §12 — is live against the working tree as of `dc01697`
 > (2026-10-22); the prose anchors were re-derived by the `neurostrata-r30c` plan's first
 > task. Verify each claim at its anchor. The dated spans marked "(at `c5acd4f`)" are the
 > exception: they record what an earlier commit cited and are not live anchors.
@@ -96,21 +96,21 @@ elsewhere or is another spec's subject):
 | A mesh row whose id is not a parseable **UUID is skipped** — ids must be UUIDs | `src/synaptic_mesh/worker.rs:180-183`; `MeshRecord.id: Uuid` at `src/synaptic_mesh/record.rs:24` |
 | Mesh export publishes only `eligibility: shareable`; absent or `private` reads as private | `src/synaptic_mesh/worker.rs:174-179` |
 | Relations are closed; the four keys are hardcoded | `src/store/ladybug.rs:1001-1007` |
-| `domain` is written raw on add *[changed: the domain is normalized to a slug on write]* | `src/server.rs:1281-1282` (raw insert), `:1292-1294` (slug normalization; the comment at `:1288-1291` says the write never guesses a domain) |
+| `domain` is written raw on add *[changed by neurostrata-r30c: the domain is normalized to a slug on write, and the registry check reads the raw value captured before that normalization]* | `src/server.rs:1283-1284` (raw insert), `:1303-1305` (slug normalization; the comment at `:1299-1302` says the write never guesses a domain), `:1290-1298` (the raw-domain capture the check reads), `:1331-1345` (the check) |
 | `domain` is read back and echoed to export; it never filters retrieval *[changed: `domain` is now an optional soft filter on search]* | `src/store/ladybug.rs:2011-2012` (read), `:2064` (emitted) |
-| A row's vector is the embedding of its **content**, unchanged; nothing negates it | `src/server.rs:1147-1150` |
-| The snapshot's straps are computed off the **pre-truncation** list; then sort by `access_count` desc and truncate to 5 | `src/server.rs:1465` (`task_head`), `:1471` (`procedures_due_strap`), `:1476-1490` (the `access_count`-desc sort), `:1491` (`truncate(5)`) |
-| `get_snapshot`'s input schema takes only `namespace`; its handler takes no embedder | `src/server.rs:153-161`, `:1427-1430` |
-| `handle_append_log(arguments)` — no `emb`, no `store`; response `{appended, file, size_bytes, rolled, tags}` *[changed: the handler takes `emb` and `store`; the response carries `recalled` and, when a search ran, `recalled_from`]* | `src/buffer.rs:133-136` (signature), `:304-321` (response); dispatch `src/server.rs:666` |
+| A row's vector is the embedding of its **content**, unchanged; nothing negates it | `src/server.rs:1149-1152` |
+| The snapshot's straps are computed off the **pre-truncation** list; then sort by `access_count` desc and truncate to 5 | `src/server.rs:1504` (`task_head`), `:1510` (`procedures_due_strap`), `:1515-1529` (the `access_count`-desc sort), `:1530` (`truncate(5)`) |
+| `get_snapshot`'s input schema takes only `namespace`; its handler takes no embedder | `src/server.rs:153-161`, `:1466-1469` |
+| `handle_append_log(arguments)` — no `emb`, no `store`; response `{appended, file, size_bytes, rolled, tags}` *[changed: the handler takes `emb` and `store`; the response carries `recalled` and, when a search ran, `recalled_from`]* | `src/buffer.rs:133-136` (signature), `:304-321` (response); dispatch `src/server.rs:668` |
 | A malformed declared shape is a **soft** failure — `WriteShapeWarning`, the write still succeeds — and the warning goes to **stderr**, which an MCP agent never sees | `src/store/ladybug.rs:951` (the `WriteShapeWarning` struct), `:1106-1107` (the stderr emission) |
 | `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)` | `src/traits.rs:175` (`pub trait VectorStore`), `:193-199` (`search`); impl `src/store/ladybug.rs:1581` |
 | `store.get(namespace, id)` and `store.list(namespace, user_id)` exist | `src/traits.rs:223` (`get`), `:220` (`list`) |
-| `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2160` |
-| `create_new_namespace: true` is the established **escape-hatch** precedent for a write that would otherwise be refused | `src/server.rs:117`, `:1219-1224`, `:1238-1239`, `:1313-1315` |
+| `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2089`, `:2745`; `src/store/ladybug.rs:2160` |
+| `create_new_namespace: true` is the established **escape-hatch** precedent for a write that would otherwise be refused *[changed by neurostrata-r30c: `register_domain` is the same shape, and the registry check sits after the namespace-existence check]* | `src/server.rs:117`, `:1221-1226`, `:1240-1241`, `:1324-1326`, `:1331-1345` |
 | Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1264-1270`; the excluded-type list is built at `:76-81` and applied in the query at `:87` |
 | The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1275`, `is_mesh_conflicting` `:1285`, `is_retired_at` `:2267`; applied at `:114`, `:121`, `:124` |
-| The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1160` (the `>= 0.85` filter), `:1164` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
-| `format_memory` is the rendering path for a returned row | `src/server.rs:2276` |
+| The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1162` (the `>= 0.85` filter), `:1166` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
+| `format_memory` is the rendering path for a returned row | `src/server.rs:2315` |
 | The bus metrics surface serializes the bus's own counters (eight integers) | `src/handlers/bus_metrics.rs:20-23` |
 
 ---
@@ -164,7 +164,7 @@ the shape, and an undeclared shape is invisible (§2).
   inverted. Because the content states both the approach and the failure, the row matches
   *"how do we do X"* and *"what went wrong with X"*.
 - **Non-poisoning.** Two rendering rules, both mandatory:
-  1. `format_memory` (`src/server.rs:2276`) prints, immediately after `Type: fact`,
+  1. `format_memory` (`src/server.rs:2315`) prints, immediately after `Type: fact`,
      `Attempt [FAILED in <context>]: tried '<approach>' -> failed with '<failure_mode>' (single episode, not a global rule)`.
   2. Every truncated `snippet` (§3.3, and the parent's `recalled[]`) is prefixed with
      `"[FAILED ATTEMPT] "` **before** truncation, so truncation can never strip the
@@ -238,7 +238,7 @@ metadata, not knowledge. The mechanism is explicit, not borrowed:
   could not reach the registry row anyway — it carries no `EXTRACTED_FROM` edge — but the
   exclusion is applied there too, so the rule is uniform rather than incidental.)
 - **In the snapshot**, the exclusion is a `retain` on the list the snapshot has already
-  fetched — beside the archived and mesh-conflicting retains (`src/server.rs:1452-1454`,
+  fetched — beside the archived and mesh-conflicting retains (`src/server.rs:1491-1493`,
   `:1457`) — so it costs nothing beyond the scan.
 
 The structural-type exclusion is **not** the mechanism: that one is by `memory_type` at
@@ -322,19 +322,20 @@ follows the slug, not the other way round:
 
 - **`neurostrata_add_memory`** — the slug is the top-level `domain` argument. It is
   written into the metadata **raw**, as a JSON value rather than a string
-  (`src/server.rs:1281-1283`), so the registry check reads it as a string and
+  (`src/server.rs:1283-1285`), so the registry check reads it as a string and
   **rejects a non-string `domain`** rather than guessing at it. The check sits between
-  the metadata assembly (`:1292-1296`) and the write (`:1330`).
-  *[changed: the write now normalizes the domain to a slug (`src/server.rs:1292-1296`),
-  so what lands in the store is the slug and not the raw value; a non-string
-  `domain` normalizes to nothing and is still stored verbatim]*
+  the metadata assembly (`:1303-1307`) and the write (`:1357`).
+  *[changed by neurostrata-r30c: the write normalizes the domain to a slug
+  (`src/server.rs:1303-1307`), so what lands in the store is the slug and not the
+  raw value; a non-string `domain` is now rejected by the check (`:1331-1345`),
+  while a string with no usable slug is still stored verbatim]*
 - **`neurostrata_task_complete`** — there is **no** top-level `domain` argument on this
   path. The completion's metadata is the caller's `memory.metadata` object
-  (`src/task/mod.rs:1130-1155`), so the only slug that can exist there is
+  (`src/task/mod.rs:1132-1157`), so the only slug that can exist there is
   `metadata.domain`. `register_domain: true` therefore applies to
   `metadata.domain`; if the completion carries no domain at all, the flag is a no-op
   and no registry row is touched. The same check runs on this path
-  (`src/task/mod.rs:1181-1188` is its write), so a completion cannot smuggle in an
+  (`src/task/mod.rs:1214-1220` is its write), so a completion cannot smuggle in an
   unregistered slug through the back door.
 
 **Why a rejection and not a warning.** The store's shape-warning channel writes to
@@ -374,7 +375,7 @@ does not make it atomic for us: each `VectorStore` call opens its own connection
 **Two processes really can interleave.** The engine admits one writer *at a time*, but
 the loser does not fail — it retries (`WRITE_COLLISION_RETRIES`,
 `src/store/ladybug.rs:2244`, `:844`) — and the CLI's `add` command writes to the same store
-directly (`src/main.rs:2845`, `:2863`). The registry must not assume it is alone in the
+directly (`src/main.rs:2846`, `:2864`). The registry must not assume it is alone in the
 store.
 
 **There is no compare-and-swap to fall back on.** The engine's writes are auto-commit
@@ -462,7 +463,7 @@ there is nothing to show:
 
 - **`Registered domains (N): <slug1>, <slug2>`** — the namespace's registry, as the
   agent sees it (the registry row of §3.2.1). The snapshot fetches the namespace's rows
-  with `store.list` (`src/server.rs:1438-1441`), not `store.search`, so the store's
+  with `store.list` (`src/server.rs:1477-1480`), not `store.search`, so the store's
   per-row filter seam never touches this list — the snapshot's own exclusion is the
   `retain` of §3.2.1. The registry row is therefore either read directly by its
   deterministic id (`store.get`, `src/traits.rs:223`) or captured from the listed rows
@@ -482,7 +483,7 @@ Worst case 3 × 120 characters ≈ 90–100 tokens at session start.
 #### 3.3.4 Invariants
 
 - **`access_count` is never mutated.** The strap reads the list it already has; the only
-  two increments remain `src/server.rs:2050` and `:2706`. A strap hit cannot promote
+  two increments remain `src/server.rs:2089` and `:2745`. A strap hit cannot promote
   itself into the top-5.
 - **Additive.** The top-5 body is byte-identical to today's for any namespace; the strap
   is a new section beside it.
@@ -518,7 +519,7 @@ seat is considered.
 **Where:** two counters in the same module as the domain counters (§3.4.2) —
 `recall_responses`, incremented where the recall response is built (the parent's
 `append_log` path, `src/buffer.rs:133-298`), and `recall_promotions`, incremented where
-`get_memory` increments `access_count` (`src/server.rs:2706`). The join is a **bounded
+`get_memory` increments `access_count` (`src/server.rs:2745`). The join is a **bounded
 in-memory set of recently-recalled ids** in that module: the recall path records the
 ids it returned, the promotion path tests membership and removes the id. The set is
 bounded (the most recent recall responses) and evicted on promotion or on age, so it
@@ -529,7 +530,7 @@ A response whose ids age out of the bounded set before promotion counts as unpro
 so the measured rate is a lower bound.
 **Window:** the counters live in memory and reset when the daemon restarts, exactly as
 the bus's own counters do ("what the bus has done since the daemon started",
-`src/main.rs:111-118`). The operator reads them from a running daemon; a threshold read
+`src/main.rs:112-119`). The operator reads them from a running daemon; a threshold read
 after a restart starts from zero.
 **Who reads it:** the operator, via the metrics surface in §3.4.2 — the body reports
 `"recall": {recall_responses, recall_promotions}`, and the rate is their quotient.
@@ -574,19 +575,19 @@ serializes the result. The bus's eight integers stay exactly where they are, so 
 existing reader of that body keeps working, and the bus itself never learns what a
 domain is.
 
-`neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:117-118` — the
-command declaration; the POST is `src/main.rs:1687-1691`), so it inherits this body without
+`neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:118-119` — the
+command declaration; the POST is `src/main.rs:1688-1692`), so it inherits this body without
 knowing anything about it.
 
 **The counters belong to the daemon process.** The topology has two processes in stdio
 mode: the MCP proxy the client talks to, and the detached daemon that owns the store
-(`src/main.rs:1774-1778`, `:1816-1824`). The proxy forwards every tool call over HTTP
-to the daemon's `/mcp` endpoint (`src/server.rs:907`), so the search path — and
+(`src/main.rs:1775-1779`, `:1817-1825`). The proxy forwards every tool call over HTTP
+to the daemon's `/mcp` endpoint (`src/server.rs:909`), so the search path — and
 therefore every counter increment — executes **in the daemon**, which is the same
 process that serves `/bus/metrics` (`src/daemon.rs:534`, `:539`). The counters are
 process-global atomics in that process, read directly by the handler in it. The proxy
 holds no counter state and reads none; the CLI reads the daemon's body over HTTP, and
-its own doc comment says as much ("Reads the running daemon's bus", `src/main.rs:111-118`).
+its own doc comment says as much ("Reads the running daemon's bus", `src/main.rs:112-119`).
 
 **Who reads it:** the operator and the agent, via `neurostrata-mcp bus-metrics`; the next
 retrieval-related spec reads the recorded numbers.
@@ -631,16 +632,16 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | # | Step | Where |
 |---|---|---|
 | 0 | **[P]** Prerequisite: the rule-honesty hardening + legacy backfill lands | task `neurostrata-bzdn` |
-| 1 | **[P]** Domain slug normalizer, applied on write and on comparison | new helper `src/domain.rs:3-33`; `src/server.rs:1292-1296` (on write); `src/store/ladybug.rs:128-136` (on comparison) |
+| 1 | **[P]** Domain slug normalizer, applied on write and on comparison | new helper `src/domain.rs:3-33`; `src/server.rs:1303-1307` (on write); `src/store/ladybug.rs:128-136` (on comparison) |
 | 2 | **[N]** Registry row helpers: the deterministic v5 id, the lookup, the bootstrap seed (list + normalize + union), the reconcile scan, and the registry update (`store.upsert`) under the process-wide registry mutex, with a bounded compare-and-retry that never fails the write | new module beside the store; `src/traits.rs:220`, `:223`, `:180-186` |
 | 3 | **[P+N]** Vocabulary, **two** bumps in a fixed order: **4 → 5** (P) carries `fact.fields.topology` and lands with the parent's implementation; **5 → 6** (N) carries `fact.fields.attempt` and `fact.fields.domain_registry` and lands with this spec's; the assert at `src/traits.rs:312`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-83`, `:172`, `:175`; `src/traits.rs:312` |
-| 4 | **[N]** The write-path registry check: bootstrap when absent, reconcile when the slug is missing from the cache, reject when it is in neither the cache nor the namespace's data, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1281-1283`, `:1330`; `src/task/mod.rs:1130-1155`, `:1181-1188` |
-| 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:255-271`; `src/store/ladybug.rs:1581`, `:1602-1630`; `src/server.rs:2006-2022` |
-| 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-126`; `src/server.rs:1452-1454`, `:1457` |
-| 7 | **[P]** `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; the recall rides the response | `src/buffer.rs:133`, `:304-321`; `src/server.rs:370-382`, `:665-667`, `:2105` |
-| 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:970`; `src/server.rs:2276`; the parent's `recalled[]` response, built beside `src/buffer.rs:275-285`; `src/server.rs:1153-1175` |
-| 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-161`, `:1476-1499` |
-| 10 | **[N]** The `domain_filter` counters and their surface — process-global atomics in a module beside the search path, incremented in the **daemon** process (which serves both the MCP dispatch and `/bus/metrics`) and read directly by the metrics handler: no signature change, no `AppState` field, no route plumbing | new module beside the search path; `src/handlers/bus_metrics.rs:20-23`; `src/daemon.rs:534`, `:539`; `src/server.rs:907`; `src/main.rs:1774-1778` |
+| 4 | **[N]** The write-path registry check: bootstrap when absent, reconcile when the slug is missing from the cache, reject when it is in neither the cache nor the namespace's data, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1283-1285`, `:1331-1345`, `:1357`; `src/task/mod.rs:1132-1157`, `:1178-1194`, `:1204-1211` |
+| 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:255-271`; `src/store/ladybug.rs:1581`, `:1602-1630`; `src/server.rs:2045-2061` |
+| 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-126`; `src/server.rs:1491-1493`, `:1496` |
+| 7 | **[P]** `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; the recall rides the response | `src/buffer.rs:133`, `:304-321`; `src/server.rs:372-384`, `:667-669`, `:2144` |
+| 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:970`; `src/server.rs:2315`; the parent's `recalled[]` response, built beside `src/buffer.rs:275-285`; `src/server.rs:1155-1177` |
+| 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-161`, `:1515-1538` |
+| 10 | **[N]** The `domain_filter` counters and their surface — process-global atomics in a module beside the search path, incremented in the **daemon** process (which serves both the MCP dispatch and `/bus/metrics`) and read directly by the metrics handler: no signature change, no `AppState` field, no route plumbing | new module beside the search path; `src/handlers/bus_metrics.rs:20-23`; `src/daemon.rs:534`, `:539`; `src/server.rs:909`; `src/main.rs:1775-1779` |
 | 11 | **[N]** The mesh import step unions an imported record's domain into the local registry | `src/synaptic_mesh/import.rs` |
 | 12 | Tests (§6) | `src/server.rs`, `src/buffer.rs`, `src/store/ladybug.rs`, `src/schemas/` |
 | 13 | Docs: the honest-recall note, the registry note; `CHANGELOG.md` | repo docs |
@@ -768,7 +769,7 @@ the registry helpers (2) and the vocabulary declaration (3).
 
 | Metric | Definition | Surface | Threshold | Reader |
 |---|---|---|---|---|
-| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | `"recall": {recall_responses, recall_promotions}` on the metrics surface (§3.4.2); incremented at the recall path (`src/buffer.rs:133-298`) and the promotion path (`src/server.rs:2706`) | < 10% over the daemon's current lifetime with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
+| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | `"recall": {recall_responses, recall_promotions}` on the metrics surface (§3.4.2); incremented at the recall path (`src/buffer.rs:133-298`) and the promotion path (`src/server.rs:2745`) | < 10% over the daemon's current lifetime with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
 | `domain_queries_total` | recall/search calls carrying a domain filter | `"domain_filter"` on the metrics surface — an extra top-level key beside the bus's eight integers (§3.4.2) | — | operator; agent |
 | `domain_narrowed_hits` | filter matched ≥1 row and narrowed the set | as above | — | operator; agent |
 | `domain_fallback_vector` | filter matched 0 rows; fell back to vector | as above | a persistently high rate means the domains are wrong or sparse | operator; the next registry spec |
@@ -851,8 +852,8 @@ and refuted two claims this spec had made:
 
 | Claim as first written | The checker's finding | The fix |
 |---|---|---|
-| "`metadata.attempt` joins the canonical exact-match key" | No canonical exact-match key exists in `src/`. `src/server.rs:1153-1175` is the **semantic** duplicate check — candidates scoring `>= 0.85`, then `checker.check_duplicates(payload, &similar)`. | §3.1.3 now **partitions the duplicate check's candidate set by attempt-presence** — a mechanism that exists — instead of extending a key that does not. |
-| "the registry row is excluded by the same predicate the store already applies to structural rows" | `STRUCTURAL_MEMORY_TYPES` is a fixed `const [&str; 5]` consulted only at query-build time; it has no per-row hook, and its members are `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` — **not** `symbol`. | §3.2.1 now names the real seam: a metadata predicate in the store's per-row filter (`src/store/ladybug.rs:114-126`) and a `retain` on the snapshot's fetched list (`src/server.rs:1452-1454`, `:1457`). |
+| "`metadata.attempt` joins the canonical exact-match key" | No canonical exact-match key exists in `src/`. `src/server.rs:1155-1177` is the **semantic** duplicate check — candidates scoring `>= 0.85`, then `checker.check_duplicates(payload, &similar)`. | §3.1.3 now **partitions the duplicate check's candidate set by attempt-presence** — a mechanism that exists — instead of extending a key that does not. |
+| "the registry row is excluded by the same predicate the store already applies to structural rows" | `STRUCTURAL_MEMORY_TYPES` is a fixed `const [&str; 5]` consulted only at query-build time; it has no per-row hook, and its members are `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` — **not** `symbol`. | §3.2.1 now names the real seam: a metadata predicate in the store's per-row filter (`src/store/ladybug.rs:114-126`) and a `retain` on the snapshot's fetched list (`src/server.rs:1491-1493`, `:1496`). |
 | "the mesh rejects an unknown `memory_type` at import" | The **code** does reject it (`src/synaptic_mesh/import.rs:649-655`); the **comment** directly above it (`src/synaptic_mesh/import.rs:57-60`) says unknown types are "ignored and reported, never applied, never crash". The mesh's own doc contradicts its own code. | Recorded in §2 as a known contradiction; filed as task `neurostrata-wl4i`. The design is safe under either reading. |
 
 The checker's run ended at its step limit with the feasibility pass and the numeric
@@ -874,9 +875,9 @@ cited lines, and surfaced eight more:
 | "under 720 characters" contradicted 6 × 120 = 720 exactly | §3.3.5 now says **at most** 720 characters (≈180 tokens), and anchors the parent's bound to parent §4.1.2. |
 | The ≤120-character bound was stated two ways — "`snippet` ≤ 120 characters" and "≤ 120 characters **including** the prefix" | §3.3.2 now says it once: the snippet's **total** length is ≤ 120 characters, prefix included. The prefix is part of the budget, not added on top of it. **Superseded by the third round** — the bound now reads the same way in §3.3.2, §3.3.5 and §4. |
 | The `domain_filter` counters do not fit a surface that is a bare eight-integer `BusMetrics` with no extension point (`src/handlers/bus_metrics.rs:20-23`) — while the spec also said they do not live inside the bus | §3.4.2 now specifies the composite: the handler serializes the bus metrics to a `serde_json::Value`, inserts `"domain_filter"` as an **extra top-level key**, and serializes that. The bus's eight integers stay exactly where they are, so no existing reader breaks, and the bus never learns what a domain is. |
-| **"The daemon is the only process that can write to the store" was false.** The engine admits one writer at a time, but the loser *retries* (`WRITE_COLLISION_RETRIES`, `src/store/ladybug.rs:2244`, `:844`), and the CLI's `add` command writes to the same store directly (`src/main.rs:2845`, `:2863`) | §3.2.5 was rewritten: an in-process **registry mutex**, plus a **cross-process compare-and-retry** that checks the *whole* pre-write set (not just the new slug) and fails loudly if the bounded retries are exhausted. **Superseded by the third round** — the retries no longer fail the write; the cache framing and the reconcile replaced that rule (§3.2.5, §3.2.3). |
-| `neurostrata_task_complete` has **no top-level `domain` argument** — the completion's metadata is the caller's `memory.metadata` object (`src/task/mod.rs:1130-1155`), so `register_domain` there had no stated source of the slug | §3.2.3 now gives each write path its slug source: `domain` on add_memory, `metadata.domain` on task_complete; the flag follows the slug, and is a no-op when the completion carries no domain. |
-| The `domain` argument is inserted into the metadata **raw**, as a JSON value rather than a string (`src/server.rs:1281-1283`), so the check must not compare a non-string against the registry *[changed: the write now normalizes the domain to a slug (`src/server.rs:1292-1296`), so the raw insert is no longer what is stored]* | §3.2.3 now says the check reads it as a string and **rejects** a non-string `domain` rather than guessing. |
+| **"The daemon is the only process that can write to the store" was false.** The engine admits one writer at a time, but the loser *retries* (`WRITE_COLLISION_RETRIES`, `src/store/ladybug.rs:2244`, `:844`), and the CLI's `add` command writes to the same store directly (`src/main.rs:2846`, `:2864`) | §3.2.5 was rewritten: an in-process **registry mutex**, plus a **cross-process compare-and-retry** that checks the *whole* pre-write set (not just the new slug) and fails loudly if the bounded retries are exhausted. **Superseded by the third round** — the retries no longer fail the write; the cache framing and the reconcile replaced that rule (§3.2.5, §3.2.3). |
+| `neurostrata_task_complete` has **no top-level `domain` argument** — the completion's metadata is the caller's `memory.metadata` object (`src/task/mod.rs:1132-1157`), so `register_domain` there had no stated source of the slug | §3.2.3 now gives each write path its slug source: `domain` on add_memory, `metadata.domain` on task_complete; the flag follows the slug, and is a no-op when the completion carries no domain. |
+| The `domain` argument is inserted into the metadata **raw**, as a JSON value rather than a string (`src/server.rs:1283-1285`), so the check must not compare a non-string against the registry *[changed: the write now normalizes the domain to a slug (`src/server.rs:1303-1307`), so the raw insert is no longer what is stored]* | §3.2.3 now says the check reads it as a string and **rejects** a non-string `domain` rather than guessing. |
 | A row with a **malformed** `metadata.attempt` (accepted with a soft warning, `src/store/ladybug.rs:970`) would be rendered as a negative but partitioned as a positive | §3.1.3 now requires the partition and the `[FAILED ATTEMPT]` prefix to use the **same** predicate: a malformed attempt is neither rendered nor partitioned as a negative. |
 
 The anchors that round never reached were read and verified by the orchestrator against
@@ -897,13 +898,13 @@ the numeric bounds — and found two substantive defects, both in the amended ma
 |---|---|
 | **The compare-and-retry has a real lost-update hole.** When the other writer's write lands *before* ours, our write clobbers its slug; the row we wrote still contains our whole pre-write set, so the check passes and that other process's slug is silently lost. §7's claim that "no slug can vanish from the registry without the caller being told" was **false**. | §3.2 is reframed: **the registry row is a cache of the domains in use; the namespace's own rows are the truth.** A lost cache entry is a miss, not a wrong acceptance and not a corrupted row, and it is repaired by a new **reconcile** path (§3.2.3): when the cache does not hold the slug, the handler re-derives the list from the namespace's rows (the bootstrap's own scan) and, if the slug is there, accepts the write and repairs the cache. The scan runs only on the path that would otherwise have been a rejection. §7's row and §5 step 2 were rewritten to match, and §6's criterion 8 gained the reconcile clause. |
 | There is **no compare-and-swap**: the engine's writes are auto-commit `conn.query` calls, with no transaction wrapper and no `BEGIN`/`COMMIT` anywhere in the store (`src/store/ladybug.rs:816-909`, `:1445-1579`), so a cross-process update cannot be made atomic | §3.2.5 now says so outright, and states that a cache update **never fails the write**: if the bounded retries are exhausted the write still proceeds — the acceptance decision was already made — and the failure is reported in the response's warnings rather than swallowed. |
-| The metrics plumbing was **unstated**: `AppState` (`src/daemon.rs:51-70`) has no counters field, so "the handler takes them as a second argument" would have required the route, the HTTP handler and the handler's own unit test to change | The counters are now **process-global atomics** in their own module, read directly by the handler: no signature change, no `AppState` field, no route plumbing, and the existing unit test keeps compiling. `neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:111-118`), so it inherits the body without knowing anything about it. **Refined by the fourth round** — the owning process is pinned to the daemon (see below). |
+| The metrics plumbing was **unstated**: `AppState` (`src/daemon.rs:51-70`) has no counters field, so "the handler takes them as a second argument" would have required the route, the HTTP handler and the handler's own unit test to change | The counters are now **process-global atomics** in their own module, read directly by the handler: no signature change, no `AppState` field, no route plumbing, and the existing unit test keeps compiling. `neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:112-119`), so it inherits the body without knowing anything about it. **Refined by the fourth round** — the owning process is pinned to the daemon (see below). |
 | The ≤120-character bound was still stated two ways (§4's row and §3.3.5's parent anchor) | Both now say **total, prefix included**. |
 | Cross-connection read visibility after another process's commit could not be verified at the engine level | It is **no longer load-bearing**: the cache framing means a stale cache is repaired by the reconcile, and a failed cache update never fails the write. |
 
 The round also verified what it could and left three items unread: the `BusMetrics`
-derive line above `src/events/subscriber.rs:178`, `src/server.rs:2706` (the
-`recall_hit_rate` promotion path) and `src/server.rs:2050` — all read and confirmed by
+derive line above `src/events/subscriber.rs:178`, `src/server.rs:2745` (the
+`recall_hit_rate` promotion path) and `src/server.rs:2089` — all read and confirmed by
 the orchestrator, along with the store's four filter sites
 (`src/store/ladybug.rs:114-126`, `:277-284`, `:333-340`, `:412-418`).
 
@@ -915,7 +916,7 @@ metrics body is mechanically valid and test-compatible. One finding was load-bea
 
 | The finding | The fix |
 |---|---|
-| **"Process-global" was ambiguous across a two-process topology.** In stdio mode the client talks to an MCP **proxy** process while the daemon is a detached process that owns the store (`src/main.rs:1774-1778`, `:1816-1824`). The proxy forwards every tool call over HTTP to the daemon's `/mcp` (`src/server.rs:907`), so the search path runs in the daemon — but a reader could not tell from the spec which process owned the counters, and the wrong answer reports **zeros silently**. | §3.4.2 and §5 step 10 now **pin the counters to the daemon**: it serves both the MCP dispatch (`src/daemon.rs:534`) and `/bus/metrics` (`:539`), so the atomics are incremented and read in the same process. The proxy holds no counter state; the CLI reads the daemon's body over HTTP, and its own doc comment says so ("Reads the running daemon's bus", `src/main.rs:111-118`). |
+| **"Process-global" was ambiguous across a two-process topology.** In stdio mode the client talks to an MCP **proxy** process while the daemon is a detached process that owns the store (`src/main.rs:1775-1779`, `:1817-1825`). The proxy forwards every tool call over HTTP to the daemon's `/mcp` (`src/server.rs:909`), so the search path runs in the daemon — but a reader could not tell from the spec which process owned the counters, and the wrong answer reports **zeros silently**. | §3.4.2 and §5 step 10 now **pin the counters to the daemon**: it serves both the MCP dispatch (`src/daemon.rs:534`) and `/bus/metrics` (`:539`), so the atomics are incremented and read in the same process. The proxy holds no counter state; the CLI reads the daemon's body over HTTP, and its own doc comment says so ("Reads the running daemon's bus", `src/main.rs:112-119`). |
 | §12 contradicted itself: the second-checker row said the retries "fail loudly", the third-checker row said they never fail the write | The second-checker row is marked **superseded**, with a pointer to the rule that replaced it. |
 | The **acceptance ordering** was only implied — §3.2.3's rejection list and §3.2.5's "the write still proceeds" were reconcilable but never stated as one order | §3.2.3 now fixes the order: the acceptance decision (cache hit ∥ reconcile hit ∥ `register_domain`) is made **before** any registry write, and the registry write's failure never flips an acceptance into a rejection or the reverse. |
 | The **reconcile's normalizer** was unstated — the one place a wrong acceptance could enter, since a never-used slug would match if the reconcile normalized differently from the write path | §3.2.3 now requires the reconcile to call the **same** normalizer function as the write path (§5 step 1), not two implementations that agree today. |
@@ -926,9 +927,9 @@ bare `MATCH` with no row-class filters, so the store's search-time seam never co
 the snapshot (`src/store/ladybug.rs:1849-1859`); the engine has no transaction wrapper
 and no compare-and-swap — its own error text is "Cannot start a new write transaction in
 the system", one write at a time (`:2251`, `:2400-2405`), and the store issues no `BEGIN` or
-`COMMIT`; the CLI's `bus-metrics` is an HTTP client of the daemon (`src/main.rs:111-118`);
+`COMMIT`; the CLI's `bus-metrics` is an HTTP client of the daemon (`src/main.rs:112-119`);
 and the CLI's `add` command does write to the same store directly
-(`src/main.rs:2845-2863`).
+(`src/main.rs:2846-2864`).
 
 **The fifth checker's findings** (session `ses_ea33ba38affe4f7c5AGfN1rZ2B`, a consistency
 sweep with no source re-verification). It mapped every acceptance criterion to a
