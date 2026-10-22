@@ -81,7 +81,7 @@ elsewhere or is another spec's subject):
 
 | Constraint | Anchor |
 |---|---|
-| Vocabulary **v4**; `fact` carries **no** `fields` object today | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69` |
+| Vocabulary **v4**; `fact` carries **no** `fields` object today *[changed: the vocabulary is v5; `fact` carries a `fields.topology` object]* | `src/schemas/memory-vocabulary.v3.json:2`, `:66-72` |
 | `rule.fields` = `enforcement` / `source` / `guard` — the typed-sub-field precedent | `src/schemas/memory-vocabulary.v3.json:39-64` |
 | A semantic change requires a `vocabulary_version` bump; asserted in one place | `src/schemas/memory-vocabulary.v3.json:155`; `src/traits.rs:263` |
 | The agent learns vocabulary **only** from `tool_summaries` and the tool description | `src/schemas/memory-vocabulary.v3.json:158`, `:161`; overlaid onto the tools at `src/server.rs:456-501` |
@@ -90,12 +90,12 @@ elsewhere or is another spec's subject):
 | A mesh row whose id is not a parseable **UUID is skipped** — ids must be UUIDs | `src/synaptic_mesh/worker.rs:180-183`; `MeshRecord.id: Uuid` at `src/synaptic_mesh/record.rs:24` |
 | Mesh export publishes only `eligibility: shareable`; absent or `private` reads as private | `src/synaptic_mesh/worker.rs:174-179` |
 | Relations are closed; the four keys are hardcoded | `src/store/ladybug.rs:455-462` |
-| `domain` is written raw on add | `src/server.rs:1279-1281` |
+| `domain` is written raw on add *[changed: the domain is normalized to a slug on write]* | `src/server.rs:1281-1282` (raw insert), `:1292-1294` (slug normalization; the comment at `:1288-1291` says the write never guesses a domain) |
 | `domain` is read back and echoed to export; it never filters retrieval *[changed: `domain` is now an optional soft filter on search]* | `src/store/ladybug.rs:1995-1996` (read), `:2048` (emitted) |
 | A row's vector is the embedding of its **content**, unchanged; nothing negates it | `src/server.rs:1147-1150` |
 | The snapshot's straps are computed off the **pre-truncation** list; then sort by `access_count` desc and truncate to 5 | `src/server.rs:1454-1460`, `:1465-1480` |
 | `get_snapshot`'s input schema takes only `namespace`; its handler takes no embedder | `src/server.rs:153-161`, `:1416` |
-| `handle_append_log(arguments)` — no `emb`, no `store`; response `{appended, file, size_bytes, rolled, tags}` | `src/buffer.rs:129-177`; dispatch `src/server.rs:664` |
+| `handle_append_log(arguments)` — no `emb`, no `store`; response `{appended, file, size_bytes, rolled, tags}` *[changed: the handler takes `emb` and `store`; the response carries `recalled` and, when a search ran, `recalled_from`]* | `src/buffer.rs:133-136` (signature), `:304-321` (response); dispatch `src/server.rs:666` |
 | A malformed declared shape is a **soft** failure — `WriteShapeWarning`, the write still succeeds — and the warning goes to **stderr**, which an MCP agent never sees | `src/store/ladybug.rs:416`, `:424`, `:529-530` |
 | `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)` | `src/traits.rs:165-172`; impl `src/store/ladybug.rs:1004` |
 | `store.get(namespace, id)` and `store.list(namespace, user_id)` exist | `src/traits.rs:195`, `:192` |
