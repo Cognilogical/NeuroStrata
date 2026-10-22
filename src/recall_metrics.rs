@@ -9,6 +9,58 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use std::sync::MutexGuard;
+
+// Test-only: a process-wide lock that serializes all counter access so that
+// tests asserting on global counter state do not race with concurrent
+// increments from other tests. Re-entrant on the holding thread so that
+// production code called from a test that already holds the lock does not
+// deadlock.
+#[cfg(test)]
+thread_local! {
+    static HOLDING: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+#[cfg(test)]
+pub static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub struct TestLockGuard {
+    _guard: Option<MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl Drop for TestLockGuard {
+    fn drop(&mut self) {
+        // Only the guard that actually acquired the lock resets the
+        // re-entrancy flag; a no-op (re-entrant) guard must not clobber
+        // the flag held by an outer guard.
+        if self._guard.is_some() {
+            HOLDING.set(false);
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn acquire_test_lock() -> TestLockGuard {
+    if HOLDING.get() {
+        return TestLockGuard { _guard: None };
+    }
+    let guard = TEST_LOCK.lock().expect("test lock poisoned");
+    HOLDING.set(true);
+    TestLockGuard { _guard: Some(guard) }
+}
+
+#[cfg(test)]
+fn maybe_acquire() -> Option<MutexGuard<'static, ()>> {
+    if HOLDING.get() {
+        None
+    } else {
+        Some(TEST_LOCK.lock().expect("test lock poisoned"))
+    }
+}
+
 /// Cap on the number of recently-recalled ids retained per namespace.
 pub const RECENTLY_RECALLED_CAP: usize = 32;
 
@@ -23,6 +75,8 @@ static RECENTLY_RECALLED: Mutex<Option<HashMap<String, VecDeque<String>>>> =
     Mutex::new(None);
 
 pub fn domain_filter_snapshot() -> serde_json::Value {
+    #[cfg(test)]
+    let _lock = maybe_acquire();
     json!({
         "domain_queries_total": DOMAIN_QUERIES_TOTAL.load(Ordering::Relaxed),
         "domain_narrowed_hits": DOMAIN_NARROWED_HITS.load(Ordering::Relaxed),
@@ -32,6 +86,8 @@ pub fn domain_filter_snapshot() -> serde_json::Value {
 }
 
 pub fn recall_snapshot() -> serde_json::Value {
+    #[cfg(test)]
+    let _lock = maybe_acquire();
     json!({
         "recall_responses": RECALL_RESPONSES.load(Ordering::Relaxed),
         "recall_promotions": RECALL_PROMOTIONS.load(Ordering::Relaxed),
@@ -39,6 +95,8 @@ pub fn recall_snapshot() -> serde_json::Value {
 }
 
 pub fn record_domain_query(narrowed: bool, fell_back: bool, single_domain: bool) {
+    #[cfg(test)]
+    let _lock = maybe_acquire();
     DOMAIN_QUERIES_TOTAL.fetch_add(1, Ordering::Relaxed);
     if narrowed {
         DOMAIN_NARROWED_HITS.fetch_add(1, Ordering::Relaxed);
@@ -52,6 +110,8 @@ pub fn record_domain_query(narrowed: bool, fell_back: bool, single_domain: bool)
 }
 
 pub fn record_recall(namespace: &str, ids: &[String]) {
+    #[cfg(test)]
+    let _lock = maybe_acquire();
     if ids.is_empty() {
         // An empty recall response does not count toward the rate.
         return;
@@ -70,6 +130,8 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
 }
 
 pub fn record_promotion(namespace: &str, id: &str) -> bool {
+    #[cfg(test)]
+    let _lock = maybe_acquire();
     let mut guard = RECENTLY_RECALLED.lock().expect("recently-recalled lock poisoned");
     let found = if let Some(map) = guard.as_mut() {
         if let Some(deque) = map.get_mut(namespace) {
@@ -92,6 +154,7 @@ pub fn record_promotion(namespace: &str, id: &str) -> bool {
 
 #[cfg(test)]
 pub fn reset_counters_for_tests() {
+    let _lock = acquire_test_lock();
     DOMAIN_QUERIES_TOTAL.store(0, Ordering::Relaxed);
     DOMAIN_NARROWED_HITS.store(0, Ordering::Relaxed);
     DOMAIN_FALLBACK_VECTOR.store(0, Ordering::Relaxed);
@@ -109,6 +172,7 @@ mod tests {
 
     #[test]
     fn the_counters_start_at_zero() {
+        let _guard = acquire_test_lock();
         reset_counters_for_tests();
         let df = domain_filter_snapshot();
         assert_eq!(df["domain_queries_total"], 0);
@@ -122,6 +186,8 @@ mod tests {
 
     #[test]
     fn a_recalled_id_is_counted_once_when_it_is_promoted() {
+        let _guard = acquire_test_lock();
+        reset_counters_for_tests();
         let ns = "recall-promo-test";
         let id = "recalled-id";
         record_recall(ns, &[id.to_string()]);
@@ -136,6 +202,8 @@ mod tests {
 
     #[test]
     fn the_recalled_id_set_is_bounded() {
+        let _guard = acquire_test_lock();
+        reset_counters_for_tests();
         let ns = "bounded-recall-test";
         for i in 0..(RECENTLY_RECALLED_CAP + 5) {
             record_recall(ns, &[format!("bounded-id-{}", i)]);

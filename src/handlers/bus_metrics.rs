@@ -86,6 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_metrics_body_carries_the_bus_counters_and_the_new_sections() {
+        let _guard = crate::recall_metrics::acquire_test_lock();
         let bus = Arc::new(ThalamicBus::new(64));
         let body = handle_bus_metrics(bus.clone()).await;
         let snapshot: serde_json::Value = serde_json::from_str(&body)
