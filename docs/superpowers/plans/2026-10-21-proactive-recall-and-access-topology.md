@@ -34,7 +34,7 @@ Every task's requirements implicitly include this section.
 - **The recall initializes the namespace before searching.** `store.init(&namespace)` first, exactly as `handle_search_memory` does (`src/server.rs:2024`). A search against an uninitialized namespace is not a failed query, it is a missing table.
 - **A test that cannot fail is not a test.** `MockStore::increment_access_count` is no longer a no-op (`src/guard/testkit.rs:306-312`) — it records every id it was asked to increment — so "the recall never moves an `access_count`" is backed by a counter that can fail. The mock must **count** the increments, and the access-count assertions must be backed by the real `LadybugStore` somewhere, not only by the mock.
 - **One binary.** `src/main.rs` is the crate root (`mod` list at `src/main.rs:1-21`), so a new module is registered there and nowhere else.
-- **Baseline.** 656 tests pass. The production binary builds with 14 warnings; the test unit builds with 17. A task that adds a failing test, breaks a passing one, or adds a 15th production warning does not pass.
+- **Baseline.** 659 tests pass. The production binary builds with 14 warnings; the test unit builds with 17. A task that adds a failing test, breaks a passing one, or adds a 15th production warning does not pass.
 - **The supersede path needs no change.** It clones the old payload and replaces only `governs`, `related_to` and `contained_by` (`src/server.rs:1701`, `:1744`), so a stored `domain` is carried over, not rewritten. Correcting a wrong domain means a new write, not a supersede.
 - **Never invent a source fact.** Cite `file:line`. If the code disagrees with this plan, the code wins: fix the plan in the same commit that fixes the code.
 
@@ -229,7 +229,7 @@ Expected: FAIL — `search_with_domain` does not exist.
 
 Add `DomainMatchMode` and `DomainSearchOutcome` to `src/traits.rs`, and add `search_with_domain` to `trait VectorStore` with a body that calls `self.search(namespace, vector, limit, include_tasks, include_archived).await?` and returns `DomainSearchOutcome { results, mode: DomainMatchMode::Vector }`.
 
-The default body is what keeps the blast radius at one implementation. The five `impl VectorStore for` sites are `src/events/bus.rs:66` (`StoreNotAttached`), `src/events/bus.rs:836` (`RecordingStore`), `src/daemon.rs:1321` (`RecordingStore`, in the daemon's test module — the struct is at `:1283`), `src/guard/testkit.rs:92` (`MockStore`) and `src/task/mod.rs:4310` (`ListHidingStore`); the implementors that override the new method are `src/store/ladybug.rs:1586` (`LadybugStore`) and `src/guard/testkit.rs:153` (`MockStore`). A store that cannot filter must say so with `Vector`, never pretend the filter applied.
+The default body is what keeps the blast radius at one implementation. The five `impl VectorStore for` sites other than `LadybugStore` are `src/events/bus.rs:66` (`StoreNotAttached`), `src/events/bus.rs:836` (`RecordingStore`), `src/daemon.rs:1321` (`RecordingStore`, in the daemon's test module — the struct is at `:1283`), `src/guard/testkit.rs:92` (`MockStore`) and `src/task/mod.rs:4310` (`ListHidingStore`); the implementors that override the new method are `src/store/ladybug.rs:1586` (`LadybugStore`) and `src/guard/testkit.rs:153` (`MockStore`). A store that cannot filter must say so with `Vector`, never pretend the filter applied.
 
 - [ ] **Step 4: Run the trait tests**
 
@@ -757,6 +757,8 @@ These counts are a **point-in-time reading of a live database**: another session
 
 The plan does not choose between them: the choice changes what a rule *in another project* means, so it is the owner's ruling. It is filed on `neurostrata-bzdn` with this measurement and the two options, and it is why Task 8 waits rather than being dropped.
 
+(Whether the cross-namespace counts above may live in this repo's docs is a separate owner ruling, tracked as `neurostrata-k7lv`; the two options are stated there.)
+
 - [ ] **Step 1: Confirm the gate**
 
 Run: `neurostrata-mcp task validate NeuroStrata`
@@ -861,6 +863,6 @@ This plan was put to two independent seats on 2026-10-21, each answering the sam
 | Q5 — is `recalled_from: "vector"` honest when nothing was searched? | **UNSOUND** | **AMBIGUOUS** | Both agreed the error case misreports. Resolved by the mode being present **exactly when a search ran** — absent on an untagged turn and absent on a failed search. That also makes the two values land exactly on the closure spec's two counters. |
 | Q6 — coverage of the spec's acceptance criteria; are the anchors real? | **MISSING** (3 gaps) | **MISSING** (4 gaps) | All absorbed: the `export_graph` assertion (AC 5), the ≤3-cap and ≤120-char assertions (AC 3), the free-text-domain → slug-tag round trip (AC 1), the rule row this spec must write (AC 9), and the non-vacuous `access_count` assertions. |
 
-**Anchor corrections applied.** `WriteShapeWarning` is at `src/store/ladybug.rs:935-939` (not `:413-418`); the warnings are emitted at `:1467-1469` (not `:907`); `rule.fields` opens at `src/schemas/memory-vocabulary.v3.json:42`; the five `impl VectorStore for` sites are `src/events/bus.rs:66`, `src/events/bus.rs:836`, `src/daemon.rs:1321`, `src/guard/testkit.rs:92` and `src/task/mod.rs:4310`, and the daemon's `RecordingStore` implements the trait at `:1321` (its struct is at `:1283`). Both seats' anchors were accurate apart from that drift.
+**Anchor corrections applied.** `WriteShapeWarning` is at `src/store/ladybug.rs:935-939` (not `:413-418`); the warnings are emitted at `:1467-1469` (not `:907`); `rule.fields` opens at `src/schemas/memory-vocabulary.v3.json:42`; the five `impl VectorStore for` sites other than `LadybugStore` are `src/events/bus.rs:66`, `src/events/bus.rs:836`, `src/daemon.rs:1321`, `src/guard/testkit.rs:92` and `src/task/mod.rs:4310`, and the daemon's `RecordingStore` implements the trait at `:1321` (its struct is at `:1283`). Both seats' anchors were accurate apart from that drift.
 
 **Spec amendments made in the same commit.** The parent spec's §4.1.2 (the mode's presence rule; direct matches only), §4.3.5 (no mode without a search), §5 (the `recalled_from` contract row), §4.2.4 and §4.3.2 (anchor corrections), §6 step 0 and §10 (the dependency edge, narrowed and named); and the closure spec's §3.4.2 (a call with no mode increments neither domain-filter counter).
