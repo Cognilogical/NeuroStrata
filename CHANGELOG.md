@@ -4,6 +4,24 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [Unreleased] - 2026-10-22
+
+### Added
+
+- **The vocabulary gained its sixth version and two new shapes.** `fact.fields.attempt` and `fact.fields.domain_registry` are declared at vocabulary version 6 (`src/schemas/memory-vocabulary.v3.json`), so the two shapes an agent needs for the recall closure are teachable and checkable rather than ad hoc metadata. `metadata.attempt` records a failed approach (what was tried, why it failed, the constraint it exposed, the scope); `metadata.domain_registry` is the per-namespace registry row.
+- **A domain that is not registered is refused, with the registered list and the remedy.** The first domain write in a namespace seeds the registry from the namespace's own rows; a later write whose slug neither the registry nor the namespace's data carries is refused with `Registered domains: [...]` and `Remedy: pass register_domain: true to add '<slug>'`. The registry is a cache, not the truth, so it can be stale and the reconcile repairs it; a non-string `domain` is rejected, not guessed at. The rejection runs on both write paths (`neurostrata_add_memory` and `neurostrata_task_complete`).
+- **A failed attempt is surfaced three ways, from one predicate.** `src/attempt.rs::is_failed_attempt` is the single predicate behind the store's shape check, the `format_memory` rendering line (`Attempt [FAILED in <scope>]: <what>`), the `[FAILED ATTEMPT] ` snippet prefix (applied before the 120-character truncation), and the duplicate partition (a candidate carrying a valid attempt never blocks a positive fact, and vice versa). The attempt shape warns but never rejects.
+- **The snapshot names the registered domains and carries a domain strap.** `neurostrata_get_snapshot` takes an optional `domain` (string or array); the top five are unchanged, and a bounded strap (at most three entries, at most two per domain) surfaces domain-tagged rows the access-count cut would have hidden, with an explicit zero when empty. The body carries `Registered domains (N): ...`.
+- **The metrics surface gained `domain_filter` and `recall` sections.** Six process-global atomics (`domain_queries_total`, `domain_narrowed_hits`, `domain_fallback_vector`, `single_domain_bypasses`, `recall_responses`, `recall_promotions`) ride on the bus metrics body alongside the bus's own eight integers, plus a bounded, per-namespace recently-recalled id set that is evicted on promotion.
+- **The mesh import unions an imported record's domain into the local registry** after the apply succeeds, so no shared record is ever refused for a domain the local registry has not seen; a registry-write failure is a warning, never a refusal.
+
+### Changed
+
+- Vocabulary version 5 → 6 (`fact.fields.attempt`, `fact.fields.domain_registry`).
+- The static `memory_type` description now teaches the `attempt` and `domain_registry` shapes.
+
+---
+
 ## [Unreleased] - 2026-10-20
 
 ### Added
