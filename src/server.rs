@@ -2247,6 +2247,15 @@ async fn handle_search_memory(
             {
                 let mode = outcome.mode;
                 let results = outcome.results;
+                if domain_requested {
+                    let single_domain =
+                        crate::registry::registry_domain_count(&store, namespace).await <= 1;
+                    crate::recall_metrics::record_domain_query(
+                        mode == crate::traits::DomainMatchMode::Domain,
+                        mode == crate::traits::DomainMatchMode::Vector,
+                        single_domain,
+                    );
+                }
                 if results.is_empty() {
                     "No relevant memories found.".to_string()
                 } else {
@@ -2924,6 +2933,7 @@ async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> Str
             tokio::spawn(async move {
                 let _ = store_clone.increment_access_count(&ns_clone, &id_clone).await;
             });
+            let _ = crate::recall_metrics::record_promotion(namespace, id);
             format_memory(id, &payload)
         }
         Ok(None) => format!(
