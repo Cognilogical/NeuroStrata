@@ -66,10 +66,10 @@ Everything below was verified against source at `b3904d8`. The panel was instruc
 
 | Constraint | Anchor |
 |---|---|
-| Custom memory types are storable today but **invisible** to the agent — it learns vocabulary only from `tool_summaries.memory_type` and the tool description | `src/schemas/memory-vocabulary.v3.json:158-161`, `:145` (`recommended_custom_type_form`); `src/store/ladybug.rs:1446-1461` (stored unchanged), `:4067` (the test) |
-| The relation set is closed and **custom relations are not materialized**; the edge tables are hardcoded to `GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM` | `src/schemas/memory-vocabulary.v3.json:153`; `src/store/ladybug.rs:985-992`; `src/traits.rs:309-330` (a test asserting exactly four) |
+| Custom memory types are storable today but **invisible** to the agent — it learns vocabulary only from `tool_summaries.memory_type` and the tool description | `src/schemas/memory-vocabulary.v3.json:164-167`, `:151` (`recommended_custom_type_form`); `src/store/ladybug.rs:1446-1461` (stored unchanged), `:4067` (the test) |
+| The relation set is closed and **custom relations are not materialized**; the edge tables are hardcoded to `GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM` | `src/schemas/memory-vocabulary.v3.json:159`; `src/store/ladybug.rs:985-992`; `src/traits.rs:309-330` (a test asserting exactly four) |
 | The **mesh is closed** over shareable types — `SHAREABLE_MEMORY_TYPES = ["rule", "fact", "procedure"]` — and an unknown `memory_type` is **rejected at import time** with a hard `Err` | `src/synaptic_mesh/import.rs:61`, `:649-655` (the rejection); `src/synaptic_mesh/record.rs:26-28` (the contract) |
-| `procedure.trigger` is a closed enum with no topic-entry value; `next_due` is honest only for `every-n-days:N`; procedures **never auto-fire** | `src/schemas/memory-vocabulary.v3.json:94-103`; `src/tools/procedure.rs:91`, `:135` |
+| `procedure.trigger` is a closed enum with no topic-entry value; `next_due` is honest only for `every-n-days:N`; procedures **never auto-fire** | `src/schemas/memory-vocabulary.v3.json:100-109`; `src/tools/procedure.rs:91`, `:135` |
 | Procedures surface on the snapshot strap only | `src/server.rs:1471` |
 | `access_count` is incremented **only** by the MCP search handler and the get-memory handler — never by `VectorStore::search` itself | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2144` |
 | New memories are stamped `access_count: 0`; the snapshot sorts by `access_count` and cuts to 5 | `src/server.rs:1125-1132` (`stamp_new_memory`), `:1476-1491` |
@@ -173,7 +173,7 @@ For the same reason, the **domain-scoped snapshot lane** is deferred: in this ph
 }
 ```
 
-**Declared, not conventional.** `memory_types.fact.fields.topology` is added to the vocabulary, mirroring the established `rule.fields.enforcement/source/guard` precedent (`src/schemas/memory-vocabulary.v3.json:42-64`); `vocabulary_version` goes 4 → 5 (`src/schemas/memory-vocabulary.v3.json:2`), the version assert at `src/traits.rs:312` is updated, and `tool_summaries.add` + `tool_summaries.memory_type` (`:158-161`) mention it so the agent **discovers** the shape.
+**Declared, not conventional.** `memory_types.fact.fields.topology` is added to the vocabulary, mirroring the established `rule.fields.enforcement/source/guard` precedent (`src/schemas/memory-vocabulary.v3.json:42-64`); `vocabulary_version` goes 4 → 5 (`src/schemas/memory-vocabulary.v3.json:2`), the version assert at `src/traits.rs:312` is updated, and `tool_summaries.add` + `tool_summaries.memory_type` (`:164-167`) mention it so the agent **discovers** the shape.
 
 #### 4.2.2 The three options, decided
 
@@ -185,7 +185,7 @@ For the same reason, the **domain-scoped snapshot lane** is deferred: in this ph
 
 #### 4.2.3 No new relation
 
-Custom relations are not materialized (`src/schemas/memory-vocabulary.v3.json:153`) and the edge tables are hardcoded (`src/store/ladybug.rs:985-992`, `src/traits.rs:309-330`) — a new relation would be a write-only artifact, the same failure mode as the unread Topic Switch marker.
+Custom relations are not materialized (`src/schemas/memory-vocabulary.v3.json:159`) and the edge tables are hardcoded (`src/store/ladybug.rs:985-992`, `src/traits.rs:309-330`) — a new relation would be a write-only artifact, the same failure mode as the unread Topic Switch marker.
 
 Topology rows bind to code through the **existing** path: `locations` → `metadata.governs` → `GOVERNS` edges (`src/server.rs:1057-1076`). A topology fact therefore reaches the AST file and symbol nodes through the one-hop graph expansion search already performs (`src/store/ladybug.rs:207-215`), whose neighbour query traverses any `(a:Memory)-[e]->(b:Memory)` edge.
 
@@ -281,7 +281,7 @@ Ordered. Each step is independently testable.
 | 0 | **Prerequisite for the rule row and the rule-honesty conformance test:** the `rule-honesty` hardening + legacy backfill lands. It does **not** gate the mechanism — the recall, the filter and the vocabulary change land independently of it | task `neurostrata-bzdn` |
 | 1 | Domain slug normalizer; applied on write (the add path) and on comparison | new helper + `src/server.rs:1281-1283`; `src/store/ladybug.rs:87-201` |
 | 2 | Optional `domain` filter on search (store + MCP tool), with the soft fallback when the filter would empty the candidate set | `src/traits.rs:193-200`, `src/store/ladybug.rs:29-201` (the filter narrows the candidate set after the vector query returns — the store over-fetches and filters in Rust, `src/store/ladybug.rs:113-119`); `src/server.rs:1967` |
-| 3 | Vocabulary: `fact.fields.topology`, version 4 → 5, assert, `tool_summaries` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69`, `:158-161`; `src/traits.rs:312` |
+| 3 | Vocabulary: `fact.fields.topology`, version 4 → 5, assert, `tool_summaries` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-75`, `:164-167`; `src/traits.rs:312` |
 | 4 | Shape check for `metadata.topology` → soft warning | `src/store/ladybug.rs:954`, `:933-939` |
 | 5 | `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; query text = normalized tags joined, embedded once, and the same tags are the domain filter's key set; `recalled` + `recalled_from` in the response | `src/buffer.rs:133`, `:151-160`, `:310-317`; `src/server.rs:374-381`, `:665-666`, `:2105` |
 | 6 | Tests (§7) | `src/buffer.rs`, `src/server.rs`, `src/store/ladybug.rs` |
@@ -373,7 +373,7 @@ The facts below are the substrate **as of `b3904d8`** — what the panel judged.
 |---|---|
 | The mesh rejects an unknown `memory_type` at import | `src/synaptic_mesh/import.rs:61`, `:649-655` (the code); `src/synaptic_mesh/record.rs:26-28` (the contract) |
 | `vocabulary_version` is 4, asserted in one place — *now 5* | `src/schemas/memory-vocabulary.v3.json:2`; `src/traits.rs:312` |
-| `fact` has no `fields` object today — *now carries the declared `fields.topology`* | `src/schemas/memory-vocabulary.v3.json:66-69` |
+| `fact` has no `fields` object today — *now carries the declared `fields.topology`* | `src/schemas/memory-vocabulary.v3.json:66-75` |
 | `neurostrata_append_log` receives only `arguments`; its neighbours receive `emb` + `store` — *the append_log dispatch now receives `emb` + `store` too* | `src/server.rs:665-666` vs `:657-663`, `:668-674` |
 | The append_log input schema has no `namespace` — *it now has an optional `namespace`* | `src/server.rs:374-381` |
 | The snapshot's straps are computed **before** the `access_count` sort and cut | `src/server.rs:1465`, `:1471`, `:1476-1491` |
