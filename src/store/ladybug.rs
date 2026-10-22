@@ -124,6 +124,9 @@ async fn search_inner(
                 if is_mesh_conflicting(&metadata_val) {
                     continue;
                 }
+                if crate::registry::is_registry_row(&metadata_val) {
+                    continue;
+                }
 
                 // Domain filter check: happens AFTER row-class filters and BEFORE usage boost.
                 // The domain_keys set is already normalized (lowercase-kebab).
@@ -282,6 +285,7 @@ async fn search_inner(
                             if !include_tasks && memory_type == "task" { continue; }
                             if !include_archived && is_archived(&metadata_val) { continue; }
                             if is_mesh_conflicting(&metadata_val) { continue; }
+                            if crate::registry::is_registry_row(&metadata_val) { continue; }
 
                             let primary_id: String = format!("{}", row[8]);
                             let relation: String = format!("{}", row[9]);
@@ -338,6 +342,7 @@ async fn search_inner(
                             if !include_tasks && memory_type == "task" { continue; }
                             if !include_archived && is_archived(&metadata_val) { continue; }
                             if is_mesh_conflicting(&metadata_val) { continue; }
+                            if crate::registry::is_registry_row(&metadata_val) { continue; }
 
                             let primary_id: String = format!("{}", row[8]);
                             let relation: String = format!("{}", row[9]);
@@ -416,6 +421,7 @@ async fn search_inner(
                         if !include_tasks && memory_type == "task" { continue; }
                         if !include_archived && is_archived(&metadata_val) { continue; }
                         if is_mesh_conflicting(&metadata_val) { continue; }
+                        if crate::registry::is_registry_row(&metadata_val) { continue; }
 
                         let primary_id: String = format!("{}", row[8]); // m.id (originating primary)
                         let t_id: String = format!("{}", row[9]);     // t.id (intermediate task)
@@ -6806,5 +6812,45 @@ eurostrata\src\daemon.rs",
         assert_eq!(path[1].source, "probe::ruler");
         assert_eq!(path[1].relation, "GOVERNS");
         assert_eq!(path[1].target, "probe::mid");
+    }
+
+    #[tokio::test]
+    async fn the_registry_row_never_appears_in_search_results() {
+        let dir = std::env::temp_dir().join(format!("ns-registry-row-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+
+        store
+            .upsert(
+                "probe",
+                "normal-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let registry_id = crate::registry::registry_row_id("probe");
+        let payload = MemoryPayload {
+            content: crate::registry::registry_content("probe"),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: crate::registry::registry_metadata(&["auth".to_string()]),
+        };
+        store
+            .upsert("probe", &registry_id, query_vec.clone(), payload)
+            .await
+            .unwrap();
+
+        let results = store.search("probe", query_vec, 10, false, false).await.unwrap();
+        assert!(
+            !results.iter().any(|r| r.id == registry_id),
+            "the registry row must never appear in search results"
+        );
     }
 }
