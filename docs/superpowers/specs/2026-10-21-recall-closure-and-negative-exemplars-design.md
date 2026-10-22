@@ -87,10 +87,10 @@ elsewhere or is another spec's subject):
 
 | Constraint | Anchor |
 |---|---|
-| Vocabulary **v4**; `fact` carries **no** `fields` object today *[changed: the vocabulary is v5; `fact` carries a `fields.topology` object]* | `src/schemas/memory-vocabulary.v3.json:2`, `:66-72` |
+| Vocabulary **v4**; `fact` carries **no** `fields` object today *[changed by neurostrata-r30c: the vocabulary is v6 and declares fact.fields.attempt and fact.fields.domain_registry; `fact` also carries `fields.topology`]* | `src/schemas/memory-vocabulary.v3.json:2`, `:66-83` |
 | `rule.fields` = `enforcement` / `source` / `guard` — the typed-sub-field precedent | `src/schemas/memory-vocabulary.v3.json:39-64` |
-| A semantic change requires a `vocabulary_version` bump; asserted in one place | `src/schemas/memory-vocabulary.v3.json:161`; `src/traits.rs:312` |
-| The agent learns vocabulary **only** from `tool_summaries` and the tool description | `src/schemas/memory-vocabulary.v3.json:163` (the `tool_summaries` block), `:167` (the `memory_type` key inside it); overlaid onto the tools at `src/server.rs:456-501` |
+| A semantic change requires a `vocabulary_version` bump; asserted in one place | `src/schemas/memory-vocabulary.v3.json:169`; `src/traits.rs:312` |
+| The agent learns vocabulary **only** from `tool_summaries` and the tool description | `src/schemas/memory-vocabulary.v3.json:171` (the `tool_summaries` block), `:175` (the `memory_type` key inside it); overlaid onto the tools at `src/server.rs:456-501` |
 | The mesh is closed over `["rule","fact","procedure"]`; an unknown `memory_type` is **rejected at import** | `src/synaptic_mesh/import.rs:61`, `:649-655`; contract `src/synaptic_mesh/record.rs:26-28` |
 | The mesh's own import doc **contradicts its code**: the comment says an unknown type is "ignored and reported, never applied, never crash"; the code returns a hard `Err` | doc `src/synaptic_mesh/import.rs:57-60`; code `:649-655`. Task `neurostrata-wl4i` owns the reconciliation (§11). This spec is safe under **either** reading — a `fact` is shareable under both. |
 | A mesh row whose id is not a parseable **UUID is skipped** — ids must be UUIDs | `src/synaptic_mesh/worker.rs:180-183`; `MeshRecord.id: Uuid` at `src/synaptic_mesh/record.rs:24` |
@@ -107,7 +107,7 @@ elsewhere or is another spec's subject):
 | `store.get(namespace, id)` and `store.list(namespace, user_id)` exist | `src/traits.rs:223` (`get`), `:220` (`list`) |
 | `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2160` |
 | `create_new_namespace: true` is the established **escape-hatch** precedent for a write that would otherwise be refused | `src/server.rs:117`, `:1219-1224`, `:1238-1239`, `:1313-1315` |
-| Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1264-1270`; the excluded-type list is built at `:76-81` and applied in the query at `:88` |
+| Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1264-1270`; the excluded-type list is built at `:76-81` and applied in the query at `:87` |
 | The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1275`, `is_mesh_conflicting` `:1285`, `is_retired_at` `:2267`; applied at `:114`, `:121`, `:124` |
 | The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1160` (the `>= 0.85` filter), `:1164` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
 | `format_memory` is the rendering path for a returned row | `src/server.rs:2276` |
@@ -633,7 +633,7 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | 0 | **[P]** Prerequisite: the rule-honesty hardening + legacy backfill lands | task `neurostrata-bzdn` |
 | 1 | **[P]** Domain slug normalizer, applied on write and on comparison | new helper `src/domain.rs:3-33`; `src/server.rs:1292-1296` (on write); `src/store/ladybug.rs:128-136` (on comparison) |
 | 2 | **[N]** Registry row helpers: the deterministic v5 id, the lookup, the bootstrap seed (list + normalize + union), the reconcile scan, and the registry update (`store.upsert`) under the process-wide registry mutex, with a bounded compare-and-retry that never fails the write | new module beside the store; `src/traits.rs:220`, `:223`, `:180-186` |
-| 3 | **[P+N]** Vocabulary, **two** bumps in a fixed order: **4 → 5** (P) carries `fact.fields.topology` and lands with the parent's implementation; **5 → 6** (N) carries `fact.fields.attempt` and `fact.fields.domain_registry` and lands with this spec's; the assert at `src/traits.rs:312`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-75`, `:164`, `:167`; `src/traits.rs:312` |
+| 3 | **[P+N]** Vocabulary, **two** bumps in a fixed order: **4 → 5** (P) carries `fact.fields.topology` and lands with the parent's implementation; **5 → 6** (N) carries `fact.fields.attempt` and `fact.fields.domain_registry` and lands with this spec's; the assert at `src/traits.rs:312`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-83`, `:172`, `:175`; `src/traits.rs:312` |
 | 4 | **[N]** The write-path registry check: bootstrap when absent, reconcile when the slug is missing from the cache, reject when it is in neither the cache nor the namespace's data, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1281-1283`, `:1330`; `src/task/mod.rs:1130-1155`, `:1181-1188` |
 | 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:255-271`; `src/store/ladybug.rs:1581`, `:1602-1630`; `src/server.rs:2006-2022` |
 | 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-126`; `src/server.rs:1452-1454`, `:1457` |
@@ -883,8 +883,8 @@ The anchors that round never reached were read and verified by the orchestrator 
 HEAD: the vocabulary version and its single assert (`src/schemas/memory-vocabulary.v3.json:2`,
 `src/traits.rs:312`), the `rule.fields` precedent
 (`src/schemas/memory-vocabulary.v3.json:39-64`), `fact` having no `fields`
-object (`src/schemas/memory-vocabulary.v3.json:66-75`) *[changed: `fact` now carries a `fields.topology` object — vocabulary v5]*, the bump policy (`src/schemas/memory-vocabulary.v3.json:161`), and the two `tool_summaries` keys (`src/schemas/memory-vocabulary.v3.json:164`,
-`src/schemas/memory-vocabulary.v3.json:167`).
+object (`src/schemas/memory-vocabulary.v3.json:66-83`) *[changed by neurostrata-r30c: the vocabulary is v6 and declares fact.fields.attempt and fact.fields.domain_registry; `fact` also carries `fields.topology`]*, the bump policy (`src/schemas/memory-vocabulary.v3.json:169`), and the two `tool_summaries` keys (`src/schemas/memory-vocabulary.v3.json:172`,
+`src/schemas/memory-vocabulary.v3.json:175`).
 
 **The third checker's findings** (session `ses_ea34460a4ffeIo2Z9ucZgtTT27`, verdict:
 "not yet approvable"). It confirmed the mechanisms it could reach — the registry's
