@@ -7104,7 +7104,247 @@ mod tests {
             line,
             "Path [governs_2hop]: \"probe::primary\" -GOVERNS- \"probe::mid\" \
              \"probe::mid\" <-GOVERNS- \"probe::ruler\"",
+
             "a directed first hop must show the graph's direction"
+        );
+    }
+
+    // ── Snapshot domain strap (Task 6) ────────────────────────────────
+
+    #[tokio::test]
+    async fn the_domain_strap_shows_a_row_the_access_count_cut_would_hide() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+
+        // Five high-access rows that fill the top-5.
+        let mut high_ids = Vec::new();
+        for i in 0..5 {
+            let id = format!("high-{}", i);
+            let mut p = payload(&format!("high access rule {}", i));
+            p.metadata = serde_json::json!({ "access_count": 10 });
+            store
+                .upsert("probe", &id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed high");
+            high_ids.push(id);
+        }
+
+        // One new fact at access_count 0 with a domain: invisible to the top-5.
+        let low_id = "low-domain".to_string();
+        let mut low = payload("a fresh fact in the auth domain");
+        low.memory_type = "fact".to_string();
+        low.metadata = serde_json::json!({ "domain": "auth", "access_count": 0 });
+        store
+            .upsert("probe", &low_id, vec![0.5, 0.6, 0.7, 0.8], low)
+            .await
+            .expect("seed low");
+
+        // Without an explicit domain argument (recent_domain mode).
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store.clone())
+            .await
+            .expect("snapshot");
+        for id in &high_ids {
+            assert!(text.contains(id), "top-5 holds the high row: {text}");
+        }
+        assert!(text.contains(&low_id), "strap holds the low fact: {text}");
+
+        // With an explicit domain argument (explicit mode).
+        let text2 = handle_get_snapshot(
+            serde_json::json!({ "namespace": "probe", "domain": "auth" }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+        assert!(text2.contains(&low_id), "strap holds the low fact (explicit): {text2}");
+    }
+
+    #[tokio::test]
+    async fn a_domain_tagged_row_already_in_the_top_five_is_not_duplicated() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+
+        // Five high-access rows, one of them domain-tagged.
+        let domain_high_id = "high-domain".to_string();
+        for i in 0..5 {
+            let id = if i == 0 { domain_high_id.clone() } else { format!("high-{}", i) };
+            let mut p = payload(&format!("high access rule {}", i));
+            if i == 0 {
+                p.metadata = serde_json::json!({ "domain": "auth", "access_count": 10 });
+            } else {
+                p.metadata = serde_json::json!({ "access_count": 10 });
+            }
+            store
+                .upsert("probe", &id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed high");
+        }
+
+        // A low domain row so the strap is non-empty.
+        let low_id = "low-domain".to_string();
+        let mut low = payload("a fresh fact");
+        low.memory_type = "fact".to_string();
+        low.metadata = serde_json::json!({ "domain": "auth", "access_count": 0 });
+        store
+            .upsert("probe", &low_id, vec![0.5, 0.6, 0.7, 0.8], low)
+            .await
+            .expect("seed low");
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+
+        // The high domain row is in the top-5 and must not appear again in the strap.
+        assert_eq!(
+            text.matches(&domain_high_id).count(),
+            1,
+            "a top-5 id is not duplicated into the strap: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_does_not_mutate_any_access_count() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+
+        for i in 0..3 {
+            let id = format!("row-{}", i);
+            let mut p = payload(&format!("rule {}", i));
+            p.metadata = serde_json::json!({ "access_count": i as i64 + 1, "domain": "auth" });
+            store
+                .upsert("probe", &id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed");
+        }
+
+        let before: Vec<(String, i64)> = store
+            .list("probe", None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let c = r
+                    .payload
+                    .metadata
+                    .get("access_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                (r.id.clone(), c)
+            })
+            .collect();
+
+        let _ = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store.clone())
+            .await
+            .expect("snapshot");
+
+        let after: Vec<(String, i64)> = store
+            .list("probe", None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let c = r
+                    .payload
+                    .metadata
+                    .get("access_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                (r.id.clone(), c)
+            })
+            .collect();
+
+        assert_eq!(before, after, "access counts are unchanged by the snapshot");
+    }
+
+    #[tokio::test]
+    async fn the_strap_is_bounded_and_names_its_mode() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+
+        // Five high-access rows fill the top-5.
+        for i in 0..5 {
+            let id = format!("high-{}", i);
+            let mut p = payload(&format!("high {}", i));
+            p.metadata = serde_json::json!({ "access_count": 10 });
+            store
+                .upsert("probe", &id, vec![0.1, 0.2, 0.3, 0.4], p)
+                .await
+                .expect("seed high");
+        }
+
+        // Four domain-tagged rows in one domain.
+        for i in 0..4 {
+            let id = format!("auth-{}", i);
+            let mut p = payload(&format!("auth fact {}", i));
+            p.memory_type = "fact".to_string();
+            p.metadata = serde_json::json!({ "domain": "auth", "access_count": 0 });
+            store
+                .upsert("probe", &id, vec![0.5, 0.6, 0.7, 0.8], p)
+                .await
+                .expect("seed auth");
+        }
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+
+        assert!(
+            text.contains("Domain strap [mode: recent_domain]"),
+            "mode is named: {text}"
+        );
+        // At most 3 strap entries: count "snippet" occurrences.
+        let snippet_count = text.matches("\"snippet\"").count();
+        assert!(snippet_count <= 3, "strap holds at most 3 entries: {text}");
+        // At most 2 from the one domain.
+        let domain_count = text.matches("\"domain\": \"auth\"").count();
+        assert!(domain_count <= 2, "at most 2 from one domain: {text}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_strap_renders_an_explicit_zero() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let text = handle_get_snapshot(
+            serde_json::json!({ "namespace": "probe", "domain": "auth" }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+        assert!(
+            text.contains("Domain strap [mode: explicit] (0): []"),
+            "empty strap renders explicit zero: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_names_the_registered_domains() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let registry_id = crate::registry::registry_row_id("probe");
+        let vector = StubEmbedder.embed("Domain registry for probe").await.unwrap();
+        let mut p = payload("Domain registry for probe");
+        p.memory_type = "fact".to_string();
+        p.metadata = crate::registry::registry_metadata(&[
+            "auth".to_string(),
+            "database-access".to_string(),
+            "storage".to_string(),
+        ]);
+        store
+            .upsert("probe", &registry_id, vector, p)
+            .await
+            .expect("seed registry row");
+
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        assert!(
+            text.contains("Registered domains (3): auth, database-access, storage"),
+            "registered domains are named: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_namespace_with_no_registry_row_names_zero_domains() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let text = handle_get_snapshot(serde_json::json!({ "namespace": "probe" }), store)
+            .await
+            .expect("snapshot");
+        assert!(
+            text.contains("Registered domains (0): none"),
+            "zero domains named: {text}"
         );
     }
 }
