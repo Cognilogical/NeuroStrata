@@ -12,6 +12,22 @@ use crate::traits::{
     DomainMatchMode, DomainSearchOutcome, MemoryPayload, RelocateOutcome, SearchResult, VectorStore,
 };
 
+/// Read a boolean column out of a query row.
+///
+/// The value has to be read as a typed boolean, never as its rendered form:
+/// lbug renders `Value::Bool(true)` as "True", so comparing the rendering
+/// against "true" is never true and the flag silently reads false.
+///
+/// The debug assert turns a future column-type drift into a loud failure in
+/// test builds instead of another silent inversion.
+fn row_flag_true(value: &lbug::Value) -> bool {
+    debug_assert!(
+        matches!(value, lbug::Value::Bool(_)),
+        "the direction flag must be a typed boolean"
+    );
+    matches!(value, lbug::Value::Bool(true))
+}
+
 /// Internal search routine shared by `search` and `search_with_domain`.
 /// Takes an owned `HashSet<String>` of domain keys (already normalized).
 async fn search_inner(
@@ -269,7 +285,7 @@ async fn search_inner(
 
                             let primary_id: String = format!("{}", row[8]);
                             let relation: String = format!("{}", row[9]);
-                            let outgoing: bool = format!("{}", row[10]) == "true";
+                            let outgoing: bool = row_flag_true(&row[10]);
                             if !supported_labels.contains(&relation.as_str()) { continue; }
 
                             let (src, tgt) = if outgoing {
@@ -329,7 +345,7 @@ async fn search_inner(
                             let f_metadata_str: String = format!("{}", row[11]);
                             let f_metadata: Value =
                                 serde_json::from_str(&f_metadata_str).unwrap_or(Value::Null);
-                            let outgoing: bool = format!("{}", row[12]) == "true";
+                            let outgoing: bool = row_flag_true(&row[12]);
 
                             // Retired intermediate invalidates only that path
                             if is_retired_at(&f_metadata, now) { continue; }
@@ -4439,6 +4455,110 @@ eurostrata\src\daemon.rs",
         let path = &one_hop[0].path;
         assert_eq!(path.len(), 1);
         assert_eq!(path[0].relation, "CONTAINS");
+        assert_eq!(path[0].source, "probe::src/a.rs");
+        assert_eq!(path[0].target, "probe::src/a.rs::run");
+    }
+
+    /// A store whose primary reaches its neighbours by OUTGOING edges only:
+    ///
+    ///   probe::primary -RELATES_TO-> probe::mid <-GOVERNS- probe::ruler
+    ///
+    /// `probe::mid` is the one-hop neighbour; `probe::ruler` is the node that
+    /// governs it, two hops from the primary. The expansion has to report the
+    /// graph's own direction on both paths.
+    async fn outgoing_evidence_test_store() -> LadybugStore {
+        let dir =
+            std::env::temp_dir().join(format!("ns-outgoing-evidence-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        // The one-hop neighbour: the target of the primary's RELATES_TO edge.
+        store
+            .upsert(
+                "probe",
+                "probe::mid",
+                vec![0.5, 0.0, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        // The governing node: it governs the one-hop neighbour.
+        store
+            .upsert(
+                "probe",
+                "probe::ruler",
+                vec![0.2, 0.0, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({ "governs": ["probe::mid"] })),
+            )
+            .await
+            .unwrap();
+
+        // The primary: closest to the query, source of the one-hop edge.
+        store
+            .upsert(
+                "probe",
+                "probe::primary",
+                vec![1.1, 0.0, 0.0, 0.0],
+                retired_test_payload("fact", "agent", json!({ "related_to": ["probe::mid"] })),
+            )
+            .await
+            .unwrap();
+
+        store
+    }
+
+    /// An outgoing edge is reported from the primary towards the neighbour.
+    /// Reading the direction flag off a rendered boolean made it always false,
+    /// which reversed every outgoing path.
+    #[tokio::test]
+    async fn outgoing_one_hop_evidence_points_from_the_primary_to_the_neighbour() {
+        let store = outgoing_evidence_test_store().await;
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false)
+            .await
+            .unwrap();
+        let mid = results.iter().find(|r| r.id == "probe::mid").unwrap();
+        let one_hop: Vec<_> = mid
+            .evidence
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::OneHop)
+            .collect();
+        assert_eq!(one_hop.len(), 1, "mid should carry one one-hop path");
+        let edge = &one_hop[0].path[0];
+        assert_eq!(edge.source, "probe::primary");
+        assert_eq!(edge.relation, "RELATES_TO");
+        assert_eq!(edge.target, "probe::mid");
+    }
+
+    /// The first hop of a two-hop governing path is an outgoing edge too, and
+    /// carries the same direction.
+    #[tokio::test]
+    async fn outgoing_two_hop_evidence_keeps_the_first_hop_directed() {
+        let store = outgoing_evidence_test_store().await;
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false)
+            .await
+            .unwrap();
+        let ruler = results.iter().find(|r| r.id == "probe::ruler").unwrap();
+        let two_hop: Vec<_> = ruler
+            .evidence
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == crate::traits::EvidenceKind::Governs2hop)
+            .collect();
+        assert_eq!(two_hop.len(), 1, "ruler should carry one two-hop path");
+        let path = &two_hop[0].path;
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].source, "probe::primary");
+        assert_eq!(path[0].relation, "RELATES_TO");
+        assert_eq!(path[0].target, "probe::mid");
+        assert_eq!(path[1].source, "probe::ruler");
+        assert_eq!(path[1].relation, "GOVERNS");
+        assert_eq!(path[1].target, "probe::mid");
     }
 
     #[tokio::test]

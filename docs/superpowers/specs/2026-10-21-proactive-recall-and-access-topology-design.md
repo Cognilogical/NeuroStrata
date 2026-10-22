@@ -62,18 +62,18 @@ The observed episode (the brief's §2) is an agent asserting an access-path clai
 
 ## 3. The substrate (verified; this spec does not re-propose it)
 
-Everything below was verified against source at `b3904d8`. The panel was instructed not to re-propose any of it. **The claims are as of that commit; the anchors are live against the working tree as of 2026-10-21 — verify each claim at its anchor.** Where this spec's own implementation changed a row, the row carries a *[changed]* marker naming the section that describes the new behaviour.
+Everything below was verified against source at `b3904d8`. The panel was instructed not to re-propose any of it. **The claims are as of that commit; the anchors are live against the working tree as of 2026-10-22 — verify each claim at its anchor.** Where this spec's own implementation changed a row, the row carries a *[changed]* marker naming the section that describes the new behaviour.
 
 | Constraint | Anchor |
 |---|---|
-| Custom memory types are storable today but **invisible** to the agent — it learns vocabulary only from `tool_summaries.memory_type` and the tool description | `src/schemas/memory-vocabulary.v3.json:164-167`, `:151` (`recommended_custom_type_form`); `src/store/ladybug.rs:1446-1461` (stored unchanged), `:4067` (the test) |
-| The relation set is closed and **custom relations are not materialized**; the edge tables are hardcoded to `GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM` | `src/schemas/memory-vocabulary.v3.json:159`; `src/store/ladybug.rs:985-992`; `src/traits.rs:309-330` (a test asserting exactly four) |
+| Custom memory types are storable today but **invisible** to the agent — it learns vocabulary only from `tool_summaries.memory_type` and the tool description | `src/schemas/memory-vocabulary.v3.json:164-167`, `:151` (`recommended_custom_type_form`); `src/store/ladybug.rs:1462-1477` (stored unchanged), `:4083` (the test) |
+| The relation set is closed and **custom relations are not materialized**; the edge tables are hardcoded to `GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM` | `src/schemas/memory-vocabulary.v3.json:159`; `src/store/ladybug.rs:1001-1008`; `src/traits.rs:309-330` (a test asserting exactly four) |
 | The **mesh is closed** over shareable types — `SHAREABLE_MEMORY_TYPES = ["rule", "fact", "procedure"]` — and an unknown `memory_type` is **rejected at import time** with a hard `Err` | `src/synaptic_mesh/import.rs:61`, `:649-655` (the rejection); `src/synaptic_mesh/record.rs:26-28` (the contract) |
 | `procedure.trigger` is a closed enum with no topic-entry value; `next_due` is honest only for `every-n-days:N`; procedures **never auto-fire** | `src/schemas/memory-vocabulary.v3.json:100-109`; `src/tools/procedure.rs:91`, `:135` |
 | Procedures surface on the snapshot strap only | `src/server.rs:1471` |
-| `access_count` is incremented **only** by the MCP search handler and the get-memory handler — never by `VectorStore::search` itself | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2144` |
+| `access_count` is incremented **only** by the MCP search handler and the get-memory handler — never by `VectorStore::search` itself | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2160` |
 | New memories are stamped `access_count: 0`; the snapshot sorts by `access_count` and cuts to 5 | `src/server.rs:1125-1132` (`stamp_new_memory`), `:1476-1491` |
-| `domain` is written on add and echoed to export, and — as of `b3904d8` — **never filtered retrieval** *[changed: this spec adds the optional domain filter on search (§4.3) and the `domain` argument on `neurostrata_search_memory`]* | `src/server.rs:1281-1283`; `src/store/ladybug.rs:1995-1996` (read), `:2048` (emitted) |
+| `domain` is written on add and echoed to export, and — as of `b3904d8` — **never filtered retrieval** *[changed: this spec adds the optional domain filter on search (§4.3) and the `domain` argument on `neurostrata_search_memory`]* | `src/server.rs:1281-1283`; `src/store/ladybug.rs:2011-2012` (read), `:2064` (emitted) |
 | The Topic Switch marker is written on tagged turns and **never read back**; `current.md` *does* have a production reader — the episodic-pointer echo subscriber scans a buffer file's tail for pointer idempotency (`src/events/subscribers/episodic_pointer_echo.rs:214-215`) — but that reader never reads the Topic Switch marker back. *(The "no production reader" half of this row was already false at `b3904d8`.)* | `src/buffer.rs:70-76`; `src/server.rs:371` |
 | The guard is **action-time only** — there is no claim-time surface | `src/server.rs:384`; `src/guard/validator.rs:43` |
 | `fires_on` is a closed reminder enum; reminders ship as a bootstrap payload, not as a runtime injection | `src/task/wiring.rs:49`, `:135-168`; `src/task/mod.rs:1748-1751` |
@@ -125,9 +125,9 @@ The existing response object (`src/buffer.rs:310-317`: `appended`, `file`, `size
 
 **Bounds:** at most **3** entries; `snippet` at most 120 characters. Worst case context cost ≈ 150 tokens, and only on tagged turns.
 
-**Retrieval:** the recall calls `VectorStore::search_with_domain` **directly** — vector-distance ranked with the capped usage boost (`src/store/ladybug.rs:122-135`), with the domain filter of §4.3 applied as the filter's key set. The store over-fetches and narrows the candidate set in Rust after the vector query returns (`src/store/ladybug.rs:113-119`, `:156-161`), so the filter is a post-query narrowing, not a change to the query itself. Because it queries the store rather than the snapshot, it **bypasses the `access_count` top-5 cut by construction** — which is the §3.3 hole, closed.
+**Retrieval:** the recall calls `VectorStore::search_with_domain` **directly** — vector-distance ranked with the capped usage boost (`src/store/ladybug.rs:138-151`), with the domain filter of §4.3 applied as the filter's key set. The store over-fetches and narrows the candidate set in Rust after the vector query returns (`src/store/ladybug.rs:129-135`, `:172-177`), so the filter is a post-query narrowing, not a change to the query itself. Because it queries the store rather than the snapshot, it **bypasses the `access_count` top-5 cut by construction** — which is the §3.3 hole, closed.
 
-**Only direct matches are recalled.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:509-528`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node carries no `metadata.domain` and a synthetic score of 1.0. The recall therefore keeps only the results whose evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2043-2044`). Without it, a namespace with fewer than three primaries would recall governed nodes it never matched. *(Amended 2026-10-21 after the plan review: Argon's Q3.)*
+**Only direct matches are recalled.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:525-544`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node carries no `metadata.domain` and a synthetic score of 1.0. The recall therefore keeps only the results whose evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2043-2044`). Without it, a namespace with fewer than three primaries would recall governed nodes it never matched. *(Amended 2026-10-21 after the plan review: Argon's Q3.)*
 
 **Query construction:** the query text is the normalized tags joined by a space (e.g. `"auth database"`), embedded **once** — one embedding call per tagged turn, no more. The same normalized tags are the domain filter's key set (§4.3.1), so a tagged turn is searched by both meaning and key in a single pass.
 
@@ -185,13 +185,13 @@ For the same reason, the **domain-scoped snapshot lane** is deferred: in this ph
 
 #### 4.2.3 No new relation
 
-Custom relations are not materialized (`src/schemas/memory-vocabulary.v3.json:159`) and the edge tables are hardcoded (`src/store/ladybug.rs:985-992`, `src/traits.rs:309-330`) — a new relation would be a write-only artifact, the same failure mode as the unread Topic Switch marker.
+Custom relations are not materialized (`src/schemas/memory-vocabulary.v3.json:159`) and the edge tables are hardcoded (`src/store/ladybug.rs:1001-1008`, `src/traits.rs:309-330`) — a new relation would be a write-only artifact, the same failure mode as the unread Topic Switch marker.
 
-Topology rows bind to code through the **existing** path: `locations` → `metadata.governs` → `GOVERNS` edges (`src/server.rs:1057-1076`). A topology fact therefore reaches the AST file and symbol nodes through the one-hop graph expansion search already performs (`src/store/ladybug.rs:207-215`), whose neighbour query traverses any `(a:Memory)-[e]->(b:Memory)` edge.
+Topology rows bind to code through the **existing** path: `locations` → `metadata.governs` → `GOVERNS` edges (`src/server.rs:1057-1076`). A topology fact therefore reaches the AST file and symbol nodes through the one-hop graph expansion search already performs (`src/store/ladybug.rs:223-231`), whose neighbour query traverses any `(a:Memory)-[e]->(b:Memory)` edge.
 
 #### 4.2.4 Validation and cost
 
-`parse_edge_specs` (`src/store/ladybug.rs:954`) gains a shape check for `metadata.topology`; a malformed value raises a `WriteShapeWarning` (the struct is at `:933-939`, the warnings are emitted by the upsert at `:1466-1469`) and the durable `fact` write still succeeds. The claim is worth keeping even when its shape is imperfect; a rejected write would lose it.
+`parse_edge_specs` (`src/store/ladybug.rs:970`) gains a shape check for `metadata.topology`; a malformed value raises a `WriteShapeWarning` (the struct is at `:949-955`, the warnings are emitted by the upsert at `:1482-1485`) and the durable `fact` write still succeeds. The claim is worth keeping even when its shape is imperfect; a rejected write would lose it.
 
 Cost: one vocabulary file edit + the version bump + the assert + two `tool_summaries` strings. **Zero storage migration** — existing facts carry no `metadata.topology` and remain valid.
 
@@ -215,7 +215,7 @@ The read-side normalization is what makes this **migration-free**: legacy free-t
 An optional `domain` filter is added to:
 
 - `neurostrata_search_memory` (`src/server.rs:1967`), and
-- the store's candidate loop (`src/store/ladybug.rs:87-201`).
+- the store's candidate loop (`src/store/ladybug.rs:103-217`).
 
 `VectorStore::search` currently takes `(namespace, vector, limit, include_tasks, include_archived)` (`src/traits.rs:193-200`); the `include_*` flags are the precedent for another parameter.
 
@@ -240,7 +240,7 @@ Recorded for that later phase, so the bootstrap is not re-litigated: **the first
 
 #### 4.3.5 Soft fallback
 
-If a domain filter would empty the candidate set, the filter is **skipped** and the unfiltered candidates are returned — a wrong domain must not blind recall. The store's search is a pure-vector match (`src/store/ladybug.rs:71`); the domain filter of §4.3.2 narrows that candidate set, and the soft fallback is a property of that filter — a code path this spec adds, not one that existed at `b3904d8` (`src/store/ladybug.rs:177-186` is where the mode is chosen). Because a silent fallback would misreport what was searched, the recall response states which mode produced it: `recalled_from: "domain" | "vector"`. *(This field is an orchestrator addition, not a panel decision; it exists because the repo's honesty rules forbid a silent substitution.)* When no search ran, or the search failed, the response carries **no mode at all** (§4.1.2) — an honest silence beats a mode that names a search that never happened. The two values map exactly onto the two domain-filter counters the recall-closure spec defines (`domain_narrowed_hits` / `domain_fallback_vector`): a call with no mode ran no filter and increments neither.
+If a domain filter would empty the candidate set, the filter is **skipped** and the unfiltered candidates are returned — a wrong domain must not blind recall. The store's search is a pure-vector match (`src/store/ladybug.rs:87`); the domain filter of §4.3.2 narrows that candidate set, and the soft fallback is a property of that filter — a code path this spec adds, not one that existed at `b3904d8` (`src/store/ladybug.rs:193-202` is where the mode is chosen). Because a silent fallback would misreport what was searched, the recall response states which mode produced it: `recalled_from: "domain" | "vector"`. *(This field is an orchestrator addition, not a panel decision; it exists because the repo's honesty rules forbid a silent substitution.)* When no search ran, or the search failed, the response carries **no mode at all** (§4.1.2) — an honest silence beats a mode that names a search that never happened. The two values map exactly onto the two domain-filter counters the recall-closure spec defines (`domain_narrowed_hits` / `domain_fallback_vector`): a call with no mode ran no filter and increments neither.
 
 ---
 
@@ -279,10 +279,10 @@ Ordered. Each step is independently testable.
 | # | Step | Where |
 |---|---|---|
 | 0 | **Prerequisite for the rule row and the rule-honesty conformance test:** the `rule-honesty` hardening + legacy backfill lands. It does **not** gate the mechanism — the recall, the filter and the vocabulary change land independently of it | task `neurostrata-bzdn` |
-| 1 | Domain slug normalizer; applied on write (the add path) and on comparison | new helper + `src/server.rs:1281-1283`; `src/store/ladybug.rs:87-201` |
-| 2 | Optional `domain` filter on search (store + MCP tool), with the soft fallback when the filter would empty the candidate set | `src/traits.rs:193-200`, `src/store/ladybug.rs:29-201` (the filter narrows the candidate set after the vector query returns — the store over-fetches and filters in Rust, `src/store/ladybug.rs:113-119`); `src/server.rs:1967` |
+| 1 | Domain slug normalizer; applied on write (the add path) and on comparison | new helper + `src/server.rs:1281-1283`; `src/store/ladybug.rs:103-217` |
+| 2 | Optional `domain` filter on search (store + MCP tool), with the soft fallback when the filter would empty the candidate set | `src/traits.rs:193-200`, `src/store/ladybug.rs:45-217` (the filter narrows the candidate set after the vector query returns — the store over-fetches and filters in Rust, `src/store/ladybug.rs:129-135`); `src/server.rs:1967` |
 | 3 | Vocabulary: `fact.fields.topology`, version 4 → 5, assert, `tool_summaries` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-75`, `:164-167`; `src/traits.rs:312` |
-| 4 | Shape check for `metadata.topology` → soft warning | `src/store/ladybug.rs:954`, `:933-939` |
+| 4 | Shape check for `metadata.topology` → soft warning | `src/store/ladybug.rs:970`, `:949-955` |
 | 5 | `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; query text = normalized tags joined, embedded once, and the same tags are the domain filter's key set; `recalled` + `recalled_from` in the response | `src/buffer.rs:133`, `:151-160`, `:310-317`; `src/server.rs:374-381`, `:665-666`, `:2105` |
 | 6 | Tests (§7) | `src/buffer.rs`, `src/server.rs`, `src/store/ladybug.rs` |
 | 7 | Docs: the honest-recall note; `CHANGELOG.md` entry | repo docs |
@@ -333,7 +333,7 @@ Ordered. Each step is independently testable.
 
 **Lands first relative to this spec's own rule rows:** `neurostrata-bzdn` — the `rule-honesty` hardening plus the legacy backfill (NeuroStrata: 86 rule rows, 84 missing `enforcement`; keywest.health: 137 rows, 137 missing `enforcement`, 102 missing `source`). The dependency is one-directional and narrow: the hardening must land before a rule row written under §4.4 is written, because the tightened contract is what the row must satisfy. It does not gate the mechanism — the recall, the domain filter and the vocabulary bump are implementable against `b3904d8` without it.
 
-**Already landed and orthogonal:** `c446b2c` — episode siblings via `EXTRACTED_FROM` (`EvidenceKind::EpisodeSibling`, `src/store/ladybug.rs:230-233`, `:382-447`).
+**Already landed and orthogonal:** `c446b2c` — episode siblings via `EXTRACTED_FROM` (`EvidenceKind::EpisodeSibling`, `src/store/ladybug.rs:246-249`, `:398-463`).
 
 **Deferred, with the reason recorded:** Q5 (§2.1); the `get_snapshot` topic lane (§4.1.4); the domain-scoped snapshot lane (§4.1.4); the per-namespace domain registry (§4.3.3).
 

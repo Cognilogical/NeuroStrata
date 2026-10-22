@@ -97,7 +97,7 @@ Verified by reading this repo's source on 2026-10-20.
 is **not** a first-class type — it appears under `extensions.existing_custom_types`
 alongside `preference, bootstrap, persona`. And `extensions.custom_memory_types`
 states *"Any nonempty string is accepted unchanged"*, confirmed by
-`src/store/ladybug.rs:3739` (`vocabulary_validation_preserves_custom_memory_types`).
+`src/store/ladybug.rs:3755` (`vocabulary_validation_preserves_custom_memory_types`).
 
 So a `topology`-shaped memory can be written **today** with no core change.
 The real cost is **discoverability, not storage**: the agent only learns
@@ -141,7 +141,7 @@ access-count ranking and the top-5 cut are a *deliberate* design (prune
 unused rules; README "Synaptic Pruning"), but their interaction with
 newly-written knowledge is a real recall hole. Note the search path does not
 share this bias: it over-fetches (`limit * 10`) and ranks by vector distance
-with a usage *boost* of `0.05 * ln(1+n)` (`src/store/ladybug.rs:1053`), so a
+with a usage *boost* of `0.05 * ln(1+n)` (`src/store/ladybug.rs:1069`), so a
 new fact is findable — but only if the agent searches for it.
 
 ### 3.4 The event bus has no topic pulse
@@ -266,12 +266,12 @@ consumer project, vendor, or system named — and it should carry
 
 ## 6. Source anchors
 
-Verified in this repo on 2026-10-20.
+Verified in this repo on 2026-10-20. *(the anchors were re-derived on 2026-10-22)*
 
 | Claim | Anchor |
 |---|---|
 | Vocabulary v4 types; `context` is a custom type; custom types accepted unchanged | `src/schemas/memory-vocabulary.v3.json` (`memory_types`, `extensions.custom_memory_types`, `extensions.existing_custom_types`) |
-| Custom memory types accepted silently | `src/store/ladybug.rs:3739` |
+| Custom memory types accepted silently | `src/store/ladybug.rs:3755` |
 | Relation set; custom relations not materialized | `src/schemas/memory-vocabulary.v3.json` (`relations`, `extensions.custom_relations`) |
 | Vocabulary version bump required for semantic change | `src/schemas/memory-vocabulary.v3.json` (`extensions.version_policy`) |
 | Closed `procedure.trigger` enum | `src/schemas/memory-vocabulary.v3.json` (`memory_types.procedure.fields.trigger`); asserted `src/traits.rs:301` |
@@ -279,8 +279,8 @@ Verified in this repo on 2026-10-20.
 | Procedures surface on snapshot; no runtime auto-fire | `src/server.rs:1456`; `src/tools/procedure.rs:135` |
 | New memory gets `access_count: 0` | `src/server.rs:1122` (`stamp_new_memory`) |
 | Snapshot sorts by access_count, truncates to 5 | `src/server.rs:1461-1476` |
-| Search ranks by distance with usage boost; over-fetches | `src/store/ladybug.rs:992`, `src/store/ladybug.rs:1053` |
-| `domain` written on add_memory; echoed to export; never filters retrieval *[changed by the proactive-recall plan: `domain` is normalized to a slug on write, and it is now an optional soft filter on search]* | `src/server.rs:1275`; `src/store/ladybug.rs:1673`, `:1726`; absent from search/snapshot queries |
+| Search ranks by distance with usage boost; over-fetches | `src/store/ladybug.rs:1008`, `src/store/ladybug.rs:1069` |
+| `domain` written on add_memory; echoed to export; never filters retrieval *[changed by the proactive-recall plan: `domain` is normalized to a slug on write, and it is now an optional soft filter on search]* | `src/server.rs:1275`; `src/store/ladybug.rs:1689`, `:1742`; absent from search/snapshot queries |
 | Topic Switch marker written; never read back for recall | `src/buffer.rs:71`; `src/server.rs:370`; the only two `current.md` readers are both test bodies (`src/daemon.rs:1542`, `src/tools/procedure.rs:496`) — no production path reads it |
 | Guard validates actions, not claims | `src/server.rs:382`; `src/guard/validator.rs:43` |
 | Rule honesty: `enforcement` / `guard` fields, checked by the gate | `src/schemas/memory-vocabulary.v3.json` (`memory_types.rule.fields`); `src/task/gate.rs:235-272` |
