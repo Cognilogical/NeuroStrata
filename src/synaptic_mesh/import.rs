@@ -3200,7 +3200,7 @@ mod tests {
         );
         assert_eq!(
             payload.metadata["topology"], topology,
-            "the access topology crosses the mesh unchanged"
+            "the import preserves the record's metadata verbatim"
         );
     }
 }
