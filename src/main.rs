@@ -10,6 +10,7 @@ mod handlers;
 mod ingest_jobs;
 mod judgment;
 mod parser;
+mod registry;
 mod secrets;
 mod server;
 mod setup;

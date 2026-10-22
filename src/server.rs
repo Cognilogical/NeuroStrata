@@ -113,7 +113,7 @@ pub async fn process_mcp_request(
                                 "content": { "type": "string", "description": "The text of the memory to save." },
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
                                 "project_root": { "type": "string", "description": "The absolute path to the project root directory where the agent is currently working." },
-                                "memory_type": { "type": "string", "description": "Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason); structural types are directory/file/markdown/symbol; custom types remain valid; default context. (This description is overlaid at runtime from src/schemas/memory-vocabulary.v3.json tool_summaries.memory_type; if it has drifted from the shipped vocab, the overlay wins, but the static value should stay in sync so the source is not misleading.)" },
+                                "memory_type": { "type": "string", "description": "Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason), the access path the fact describes; a fact may also carry metadata.attempt (approach, outcome, failure_mode, context) with outcome \"failed\", evidence of one failed episode and not a rule; the namespace's registry row carries metadata.domain_registry.domains, the sorted list of the domain slugs the namespace uses; structural types are directory/file/markdown/symbol; custom types remain valid; default context. (This description is overlaid at runtime from src/schemas/memory-vocabulary.v3.json tool_summaries.memory_type; if it has drifted from the shipped vocab, the overlay wins, but the static value should stay in sync so the source is not misleading.)" },
                                 "create_new_namespace": { "type": "boolean", "description": "Set to true ONLY if you are absolutely certain this is a brand new project namespace that doesn't exist yet." },
                                 "user_id": { "type": "string", "description": "The user making the request." },
                                 "agent_name": { "type": "string", "description": "The name of the agent storing the memory." },
@@ -130,7 +130,8 @@ pub async fn process_mcp_request(
                                     },
                                     "description": "An array of file paths, line numbers, and symbols this memory governs. Memories MUST reference the specific documents they belong to."
                                 },
-                                "domain": { "type": "string", "description": "Optional category or domain this rule belongs to (e.g., 'frontend', 'database', 'devops', 'api'). It is stored normalized to a lowercase-kebab slug ('Database Access' becomes 'database-access'); a value that normalizes to nothing, and any non-string value, is stored exactly as given." },
+                                "domain": { "type": "string", "description": "Optional category or domain this rule belongs to (e.g., 'frontend', 'database', 'devops', 'api'). It is stored normalized to a lowercase-kebab slug ('Database Access' becomes 'database-access'); a value that normalizes to nothing is stored exactly as given, and a non-string value is rejected." },
+                                "register_domain": { "type": "boolean", "description": "Set to true ONLY if the domain is genuinely new for this namespace; the registry rejects any other unregistered domain." },
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory IDs this rule connects to, forming a knowledge graph edge." },
                                 "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                             },
@@ -315,6 +316,7 @@ pub async fn process_mcp_request(
                                 "id": { "type": "string", "description": "The task id to complete." },
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "reason": { "type": "string", "description": "What closed it; recorded on the done transition." },
+                                "register_domain": { "type": "boolean", "description": "Set to true ONLY if memory.metadata.domain is genuinely new for this namespace; the registry rejects any other unregistered domain. It applies to memory.metadata.domain and is a no-op when the memory carries no domain." },
                                 "memory": {
                                     "type": "object",
                                     "description": "Write the extraction inline; it lands with the completion, through the same pipeline as neurostrata_add_memory.",
@@ -1285,10 +1287,19 @@ async fn handle_add_memory(
             meta_obj.insert("related_to".to_string(), related_to.clone());
         }
     }
+    // The registry check reads the domain exactly as the caller gave it,
+    // before the slug normalization below rewrites it: a non-string is
+    // rejected rather than guessed at, and the reconcile must compare like
+    // with like.
+    let raw_domain = metadata.get("domain").cloned();
+    let register_domain = arguments
+        .get("register_domain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     // The stored domain is normalized to its slug -- from the argument or from
     // the caller's own metadata -- so a stored domain is already a key. A
-    // domain with no usable slug, and any non-string domain, is stored exactly
-    // as it was given: the write never guesses a domain.
+    // domain with no usable slug is stored exactly as it was given: the write
+    // never guesses one (the registry check above rejected any non-string).
     if let Some(slug) = crate::domain::domain_key(&metadata) {
         if let Some(meta_obj) = metadata.as_object_mut() {
             meta_obj.insert("domain".to_string(), Value::String(slug));
@@ -1315,6 +1326,22 @@ async fn handle_add_memory(
                 "Error: Namespace '{}' does not exist. SYSTEM ALERT: Your agent overconfidence and inaccuracy score has been flagged and degraded by the telemetry monitor. You MUST use `neurostrata_list_namespaces` to check existing project names before guessing. Existing namespaces are: {:?}. If you are absolutely certain this is a brand new project, you must explicitly pass `create_new_namespace: true` to bypass this lock.",
                 namespace, existing_namespaces
             );
+        }
+
+        // The acceptance decision precedes any registry write. A rejection
+        // returns here, before the memory lands; the cache update is a
+        // post-acceptance side effect below.
+        let mut registry_cache: Option<Vec<String>> = None;
+        let mut check_warning: Option<String> = None;
+        if let Some(raw) = &raw_domain {
+            match crate::registry::check_domain(&store, &emb, namespace, raw, register_domain).await
+            {
+                Ok(check) => {
+                    registry_cache = check.cache;
+                    check_warning = check.warning;
+                }
+                Err(rejection) => return rejection,
+            }
         }
 
         let payload = MemoryPayload {
@@ -1368,6 +1395,18 @@ async fn handle_add_memory(
                         "\nDeferred {} edge[{}] to '{}' ({})",
                         edge.rel_type, edge.declaration_index, edge.declared_target, status
                     ));
+                }
+                if let Some(warning) = check_warning {
+                    msg.push_str(&format!("\nRegistry warning: {}", warning));
+                }
+                // Only now, with the memory durable: a cache failure is
+                // reported and never undoes the acceptance.
+                if let Some(domains) = registry_cache {
+                    if let Some(warning) =
+                        crate::registry::write_registry(&store, &emb, namespace, &domains).await
+                    {
+                        msg.push_str(&format!("\nRegistry warning: {}", warning));
+                    }
                 }
                 msg
             }
@@ -3702,10 +3741,11 @@ mod tests {
     }
 
     /// The write path normalizes a string domain to its slug, so a stored
-    /// domain is already a key. A domain the write cannot read is never
-    /// guessed at: a non-string domain is stored exactly as it was given.
+    /// domain is already a key. A non-string domain is rejected by the
+    /// registry check (see `a_non_string_domain_is_rejected`), so nothing is
+    /// guessed at and nothing is stored.
     #[tokio::test]
-    async fn a_string_domain_is_normalized_on_write_and_a_non_string_domain_is_not() {
+    async fn a_string_domain_is_normalized_on_write() {
         let (store, _) = store_with_one_rule("probe").await;
 
         let added = handle_add_memory(
@@ -3733,29 +3773,6 @@ mod tests {
             stored.payload.metadata["domain"],
             serde_json::json!("database-access")
         );
-
-        let added = handle_add_memory(
-            serde_json::json!({
-                "content": "a rule with a numbered domain",
-                "namespace": "probe",
-                "domain": 42,
-            }),
-            Arc::new(StubEmbedder),
-            store.clone(),
-            None,
-            quiet_bus(),
-        )
-        .await;
-        assert!(added.starts_with("Successfully added memory"), "{}", added);
-
-        let stored = store
-            .list("probe", None)
-            .await
-            .expect("list")
-            .into_iter()
-            .find(|r| r.payload.content == "a rule with a numbered domain")
-            .expect("the memory is stored");
-        assert_eq!(stored.payload.metadata["domain"], serde_json::json!(42));
     }
 
     /// A string domain that has no usable slug is stored exactly as it was
@@ -3820,6 +3837,274 @@ mod tests {
             stored.payload.metadata["domain"],
             serde_json::json!("database-access")
         );
+    }
+
+    // ── Task 3: the write-path domain registry check ───────────────────
+
+    /// Seed one row carrying `domain` exactly as a legacy write left it (raw,
+    /// not normalized), so the bootstrap's and the reconcile's scans are
+    /// exercised against the shape the store really holds.
+    async fn seed_domain_row(
+        store: &Arc<dyn VectorStore>,
+        namespace: &str,
+        content: &str,
+        domain: serde_json::Value,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed(content).await.unwrap();
+        let mut p = payload(content);
+        p.metadata = serde_json::json!({ "domain": domain });
+        store
+            .upsert(namespace, &id, vector, p)
+            .await
+            .expect("seed the row");
+        id
+    }
+
+    async fn seed_row(store: &Arc<dyn VectorStore>, namespace: &str, content: &str) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed(content).await.unwrap();
+        store
+            .upsert(namespace, &id, vector, payload(content))
+            .await
+            .expect("seed the row");
+        id
+    }
+
+    async fn registry_of(store: &Arc<dyn VectorStore>, namespace: &str) -> Option<Vec<String>> {
+        store
+            .get(namespace, &crate::registry::registry_row_id(namespace))
+            .await
+            .expect("read the registry row")
+            .map(|(_, p)| crate::registry::registry_domains(&p.metadata))
+    }
+
+    async fn add_with_domain(
+        store: &Arc<dyn VectorStore>,
+        domain: serde_json::Value,
+        register_domain: Option<bool>,
+    ) -> String {
+        let mut arguments = serde_json::json!({
+            "content": "a rule written under a domain",
+            "namespace": "probe",
+            "domain": domain,
+        });
+        if let Some(register) = register_domain {
+            arguments["register_domain"] = serde_json::json!(register);
+        }
+        handle_add_memory(
+            arguments,
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_write_in_a_namespace_with_no_registry_row_bootstraps_the_registry() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed_domain_row(
+            &store,
+            "probe",
+            "the legacy database rule",
+            serde_json::json!("Database Access"),
+        )
+        .await;
+
+        let reply = add_with_domain(&store, serde_json::json!("Auth"), None).await;
+
+        assert!(reply.starts_with("Successfully added memory"), "{}", reply);
+        assert_eq!(
+            registry_of(&store, "probe").await,
+            Some(vec!["auth".to_string(), "database-access".to_string()]),
+            "the bootstrap grandfathers the namespace's legacy domain and adds the new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_slug_is_rejected_and_nothing_is_written() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed_domain_row(
+            &store,
+            "probe",
+            "the legacy database rule",
+            serde_json::json!("Database Access"),
+        )
+        .await;
+        let boot = add_with_domain(&store, serde_json::json!("Auth"), None).await;
+        assert!(boot.starts_with("Successfully added memory"), "{}", boot);
+
+        let before = store.list("probe", None).await.expect("list").len();
+        let reply = add_with_domain(&store, serde_json::json!("storage"), None).await;
+
+        assert!(reply.contains("ERROR [DOMAIN]"), "{}", reply);
+        assert!(
+            reply.contains("not registered in namespace 'probe'"),
+            "{}",
+            reply
+        );
+        assert!(
+            reply.contains(r#"["auth","database-access"]"#),
+            "the rejection names the registered list: {}",
+            reply
+        );
+        assert!(reply.contains("register_domain: true"), "{}", reply);
+
+        let after = store.list("probe", None).await.expect("list");
+        assert_eq!(after.len(), before, "a rejection writes nothing");
+        assert!(
+            after
+                .iter()
+                .all(|r| r.payload.metadata["domain"] != "storage"),
+            "the rejected row never landed"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_domain_true_accepts_the_slug_and_registers_it() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed_domain_row(
+            &store,
+            "probe",
+            "the legacy database rule",
+            serde_json::json!("Database Access"),
+        )
+        .await;
+        let boot = add_with_domain(&store, serde_json::json!("Auth"), None).await;
+        assert!(boot.starts_with("Successfully added memory"), "{}", boot);
+
+        let reply = add_with_domain(&store, serde_json::json!("storage"), Some(true)).await;
+
+        assert!(reply.starts_with("Successfully added memory"), "{}", reply);
+        assert_eq!(
+            registry_of(&store, "probe").await,
+            Some(vec![
+                "auth".to_string(),
+                "database-access".to_string(),
+                "storage".to_string()
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slug_the_namespace_already_carries_is_accepted_by_the_reconcile() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed_domain_row(
+            &store,
+            "probe",
+            "the legacy database rule",
+            serde_json::json!("Database Access"),
+        )
+        .await;
+        let boot = add_with_domain(&store, serde_json::json!("Auth"), None).await;
+        assert!(boot.starts_with("Successfully added memory"), "{}", boot);
+
+        // A cache that lost the slug the namespace's own rows still carry: the
+        // next write of that slug must be accepted, not rejected.
+        let registry_id = crate::registry::registry_row_id("probe");
+        let (vector, mut row) = store
+            .get("probe", &registry_id)
+            .await
+            .expect("read the registry row")
+            .expect("the bootstrap wrote it");
+        row.metadata = crate::registry::registry_metadata(&["auth".to_string()]);
+        store
+            .upsert("probe", &registry_id, vector, row)
+            .await
+            .expect("stale the cache");
+
+        let reply = add_with_domain(&store, serde_json::json!("database-access"), None).await;
+
+        assert!(reply.starts_with("Successfully added memory"), "{}", reply);
+        assert_eq!(
+            registry_of(&store, "probe").await,
+            Some(vec!["auth".to_string(), "database-access".to_string()]),
+            "the reconcile repaired the cache"
+        );
+
+        // And a deleted registry row re-bootstraps from the namespace's rows.
+        store
+            .delete("probe", &registry_id)
+            .await
+            .expect("delete the cache");
+        let reply = add_with_domain(&store, serde_json::json!("database-access"), None).await;
+        assert!(reply.starts_with("Successfully added memory"), "{}", reply);
+        assert_eq!(
+            registry_of(&store, "probe").await,
+            Some(vec!["auth".to_string(), "database-access".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_string_domain_is_rejected() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed_row(&store, "probe", "the legacy rule").await;
+
+        let before = store.list("probe", None).await.expect("list").len();
+        let reply = add_with_domain(&store, serde_json::json!(42), None).await;
+
+        assert!(reply.contains("ERROR [DOMAIN]"), "{}", reply);
+        assert!(
+            reply.contains("Registered domains: []"),
+            "the rejection names the registered list: {}",
+            reply
+        );
+        assert!(
+            reply.contains("not a string"),
+            "the rejection says what is wrong: {}",
+            reply
+        );
+        assert_eq!(
+            store.list("probe", None).await.expect("list").len(),
+            before,
+            "nothing is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_domain_with_no_usable_slug_is_stored_as_it_was_given() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed_row(&store, "probe", "the legacy rule").await;
+
+        let reply = add_with_domain(&store, serde_json::json!("!!!"), None).await;
+
+        assert!(reply.starts_with("Successfully added memory"), "{}", reply);
+        let stored = store
+            .list("probe", None)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| r.payload.content == "a rule written under a domain")
+            .expect("the memory is stored");
+        assert_eq!(stored.payload.metadata["domain"], serde_json::json!("!!!"));
+        assert_eq!(
+            registry_of(&store, "probe").await,
+            None,
+            "a slugless domain is not governed by the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_with_no_domain_touches_no_registry_row() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        seed_row(&store, "probe", "the legacy rule").await;
+
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "a rule with no domain",
+                "namespace": "probe",
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+
+        assert!(reply.starts_with("Successfully added memory"), "{}", reply);
+        assert_eq!(registry_of(&store, "probe").await, None);
     }
 
     #[tokio::test]
