@@ -1254,12 +1254,29 @@ async fn apply_effective(
         location_lines: String::new(),
         metadata: Value::Object(metadata),
     };
+    let imported_domain = crate::domain::domain_key(&payload.metadata);
     if let Err(e) = store.upsert(namespace, id, vector, payload).await {
         return Disposition::Ignored(format!("store upsert failed for {id}: {e}"));
     }
     // A successful apply supersedes any prior conflict registration (the
     // row is no longer suppressed).
     let _ = conflict::clear_conflict(root, namespace, id);
+    // Union the imported record's domain into the local registry (a cache).
+    // A failure here is a warning, never a refusal: the row is already stored.
+    if let Some(domain) = imported_domain {
+        if let Some(warning) = crate::registry::write_registry(
+            &store,
+            &emb,
+            namespace,
+            std::slice::from_ref(&domain),
+        )
+        .await
+        {
+            tracing::warn!(
+                "registry union failed for imported record {id} in {namespace}: {warning}"
+            );
+        }
+    }
     Disposition::Applied
 }
 
@@ -3201,6 +3218,49 @@ mod tests {
         assert_eq!(
             payload.metadata["topology"], topology,
             "the import preserves the record's metadata verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_imported_records_domain_is_unioned_into_the_local_registry() {
+        let (_base, mesh) = mesh_with_commit("domainunion");
+        let id = Uuid::new_v4();
+        let mut value = record_value(
+            "synaptic-mesh-record/v1",
+            id,
+            "probe",
+            "fact",
+            "active",
+            None,
+            json!({"text": "auth fact"}),
+        );
+        value["metadata"]["domain"] = json!("auth");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+
+        let store = fresh_store("domainunion").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("the full-tree replay applies");
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+
+        store.init("probe").await.unwrap();
+        let reg_id = crate::registry::registry_row_id("probe");
+        let (_, payload) = store
+            .get("probe", &reg_id)
+            .await
+            .unwrap()
+            .expect("registry row present after import");
+        let domains = crate::registry::registry_domains(&payload.metadata);
+        assert!(
+            domains.contains(&"auth".to_string()),
+            "domains: {domains:?}"
         );
     }
 }
