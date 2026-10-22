@@ -1,3 +1,4 @@
+mod attempt;
 mod buffer;
 mod config;
 mod crash;
