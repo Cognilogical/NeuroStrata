@@ -107,8 +107,8 @@ elsewhere or is another spec's subject):
 | `store.get(namespace, id)` and `store.list(namespace, user_id)` exist | `src/traits.rs:223` (`get`), `:220` (`list`) |
 | `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2089`, `:2745`; `src/store/ladybug.rs:2160` |
 | `create_new_namespace: true` is the established **escape-hatch** precedent for a write that would otherwise be refused *[changed by neurostrata-r30c: `register_domain` is the same shape, and the registry check sits after the namespace-existence check]* | `src/server.rs:117`, `:1221-1226`, `:1240-1241`, `:1324-1326`, `:1331-1345` |
-| Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1264-1270`; the excluded-type list is built at `:76-81` and applied in the query at `:87` |
-| The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1275`, `is_mesh_conflicting` `:1285`, `is_retired_at` `:2267`; applied at `:114`, `:121`, `:124` |
+| Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1270-1276`; the excluded-type list is built at `:76-81` and applied in the query at `:87` |
+| The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1281`, `is_mesh_conflicting` `:1291`, `is_retired_at` `:2273`; applied at `:114`, `:121`, `:124` |
 | The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1162` (the `>= 0.85` filter), `:1166` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
 | `format_memory` is the rendering path for a returned row | `src/server.rs:2315` |
 | The bus metrics surface serializes the bus's own counters (eight integers) | `src/handlers/bus_metrics.rs:20-23` |
@@ -229,17 +229,17 @@ metadata, not knowledge. The mechanism is explicit, not borrowed:
 
 - **In the store**, the exclusion is a metadata predicate at the store's per-row filter
   seam — beside `is_retired_at`, `is_archived` and `is_mesh_conflicting`
-  (`src/store/ladybug.rs:114-126`) — applied at **all four** filter sites: the base
-  search (`:114-126`), the one-hop expansion (`:277-284`) and the two-hop govern
-  expansion (`:333-340`), plus the episode-sibling pass (`:412-418`). A row whose
+  (`src/store/ladybug.rs:114-127`) — applied at **all four** filter sites: the base
+  search (`:114-127`), the one-hop expansion (`:286-288`) and the two-hop govern
+  expansion (`:343-345`), plus the episode-sibling pass (`:423-424`). A row whose
   metadata carries `domain_registry` is dropped at each of them, so it never consumes a
   *result* slot. It may consume one **over-fetch** slot (`fetch_limit = limit * 10`,
   `:52-53`), the same cost class as any other filtered row. (The sibling pass
   could not reach the registry row anyway — it carries no `EXTRACTED_FROM` edge — but the
   exclusion is applied there too, so the rule is uniform rather than incidental.)
 - **In the snapshot**, the exclusion is a `retain` on the list the snapshot has already
-  fetched — beside the archived and mesh-conflicting retains (`src/server.rs:1491-1493`,
-  `:1457`) — so it costs nothing beyond the scan.
+  fetched — beside the archived and mesh-conflicting retains (`src/server.rs:1492`,
+  `:1496`, `:1498`) — so it costs nothing beyond the scan.
 
 The structural-type exclusion is **not** the mechanism: that one is by `memory_type` at
 query-build time (`src/store/ladybug.rs:76-84`, `:86-89`) over a fixed five-member
@@ -637,7 +637,7 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | 3 | **[P+N]** Vocabulary, **two** bumps in a fixed order: **4 → 5** (P) carries `fact.fields.topology` and lands with the parent's implementation; **5 → 6** (N) carries `fact.fields.attempt` and `fact.fields.domain_registry` and lands with this spec's; the assert at `src/traits.rs:312`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-83`, `:172`, `:175`; `src/traits.rs:312` |
 | 4 | **[N]** The write-path registry check: bootstrap when absent, reconcile when the slug is missing from the cache, reject when it is in neither the cache nor the namespace's data, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1283-1285`, `:1331-1345`, `:1357`; `src/task/mod.rs:1132-1157`, `:1178-1194`, `:1204-1211` |
 | 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:255-271`; `src/store/ladybug.rs:1581`, `:1602-1630`; `src/server.rs:2045-2061` |
-| 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-126`; `src/server.rs:1491-1493`, `:1496` |
+| 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-127`; `src/server.rs:1492`, `:1496`, `:1498` |
 | 7 | **[P]** `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; the recall rides the response | `src/buffer.rs:133`, `:304-321`; `src/server.rs:372-384`, `:667-669`, `:2144` |
 | 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:970`; `src/server.rs:2315`; the parent's `recalled[]` response, built beside `src/buffer.rs:275-285`; `src/server.rs:1155-1177` |
 | 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-161`, `:1515-1538` |
@@ -853,7 +853,7 @@ and refuted two claims this spec had made:
 | Claim as first written | The checker's finding | The fix |
 |---|---|---|
 | "`metadata.attempt` joins the canonical exact-match key" | No canonical exact-match key exists in `src/`. `src/server.rs:1155-1177` is the **semantic** duplicate check — candidates scoring `>= 0.85`, then `checker.check_duplicates(payload, &similar)`. | §3.1.3 now **partitions the duplicate check's candidate set by attempt-presence** — a mechanism that exists — instead of extending a key that does not. |
-| "the registry row is excluded by the same predicate the store already applies to structural rows" | `STRUCTURAL_MEMORY_TYPES` is a fixed `const [&str; 5]` consulted only at query-build time; it has no per-row hook, and its members are `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` — **not** `symbol`. | §3.2.1 now names the real seam: a metadata predicate in the store's per-row filter (`src/store/ladybug.rs:114-126`) and a `retain` on the snapshot's fetched list (`src/server.rs:1491-1493`, `:1496`). |
+| "the registry row is excluded by the same predicate the store already applies to structural rows" | `STRUCTURAL_MEMORY_TYPES` is a fixed `const [&str; 5]` consulted only at query-build time; it has no per-row hook, and its members are `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` — **not** `symbol`. | §3.2.1 now names the real seam: a metadata predicate in the store's per-row filter (`src/store/ladybug.rs:114-127`) and a `retain` on the snapshot's fetched list (`src/server.rs:1492`, `:1496`, `:1498`). |
 | "the mesh rejects an unknown `memory_type` at import" | The **code** does reject it (`src/synaptic_mesh/import.rs:649-655`); the **comment** directly above it (`src/synaptic_mesh/import.rs:57-60`) says unknown types are "ignored and reported, never applied, never crash". The mesh's own doc contradicts its own code. | Recorded in §2 as a known contradiction; filed as task `neurostrata-wl4i`. The design is safe under either reading. |
 
 The checker's run ended at its step limit with the feasibility pass and the numeric
@@ -906,7 +906,7 @@ The round also verified what it could and left three items unread: the `BusMetri
 derive line above `src/events/subscriber.rs:178`, `src/server.rs:2745` (the
 `recall_hit_rate` promotion path) and `src/server.rs:2089` — all read and confirmed by
 the orchestrator, along with the store's four filter sites
-(`src/store/ladybug.rs:114-126`, `:277-284`, `:333-340`, `:412-418`).
+(`src/store/ladybug.rs:114-127`, `:286-288`, `:343-345`, `:423-424`).
 
 **The fourth checker's findings** (session `ses_ea33e9db5ffeaMQuQQ8FCjYh4s`, verdict:
 "not yet approvable"). It confirmed that the cache framing restores the registry's

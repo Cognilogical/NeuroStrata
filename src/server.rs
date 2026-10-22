@@ -1494,6 +1494,8 @@ async fn handle_get_snapshot(
     // Conflicting mesh rows are suppressed from the snapshot's effective
     // view too (same rationale as search_memory).
     all_memories.retain(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload));
+    // The registry row is metadata, not knowledge: never serve it.
+    all_memories.retain(|r| !crate::registry::is_registry_row(&r.payload.metadata));
 
     // Counted from the list the snapshot already had to fetch, so this
     // costs nothing beyond the scan.
@@ -6094,6 +6096,31 @@ mod tests {
         assert!(
             !text.contains(&conflicting_id),
             "the conflicting row is never served, even under include_archived: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_snapshot_body_holds_no_registry_row() {
+        let (store, _live_id) = store_with_one_rule("probe").await;
+        let registry_id = crate::registry::registry_row_id("probe");
+        let vector = StubEmbedder.embed("Domain registry for probe").await.unwrap();
+        let mut p = payload("Domain registry for probe");
+        p.memory_type = "fact".to_string();
+        p.metadata = crate::registry::registry_metadata(&["auth".to_string()]);
+        store
+            .upsert("probe", &registry_id, vector, p)
+            .await
+            .expect("seed the registry row");
+
+        let text = handle_get_snapshot(
+            serde_json::json!({ "namespace": "probe" }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+        assert!(
+            !text.contains(&registry_id),
+            "the registry row is absent from the snapshot body: {text}"
         );
     }
 
