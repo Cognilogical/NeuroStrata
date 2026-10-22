@@ -83,4 +83,44 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn the_metrics_body_carries_the_bus_counters_and_the_new_sections() {
+        let bus = Arc::new(ThalamicBus::new(64));
+        let body = handle_bus_metrics(bus.clone()).await;
+        let snapshot: serde_json::Value = serde_json::from_str(&body)
+            .expect("the body is the metrics object, not prose about it");
+
+        for field in [
+            "events_emitted",
+            "dispatcher_handled",
+            "subscribers",
+            "queue_depth",
+            "drops_oldest",
+            "subscriber_panics",
+            "subscriber_timeouts",
+            "recursion_blocks",
+        ] {
+            assert!(
+                body.contains(&format!("\"{}\" ", field)) || body.contains(&format!("\"{}\"", field)),
+                "{field} must be in the body an operator reads: {body}"
+            );
+        }
+
+        let df = snapshot.get("domain_filter").expect("domain_filter section present");
+        for key in [
+            "domain_queries_total",
+            "domain_narrowed_hits",
+            "domain_fallback_vector",
+            "single_domain_bypasses",
+        ] {
+            assert!(df.get(key).unwrap().is_number(), "{key} must be a number: {body}");
+        }
+
+        let rc = snapshot.get("recall").expect("recall section present");
+        for key in ["recall_responses", "recall_promotions"] {
+            assert!(rc.get(key).unwrap().is_number(), "{key} must be a number: {body}");
+        }
+    }
+
 }

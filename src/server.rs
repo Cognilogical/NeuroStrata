@@ -7357,4 +7357,89 @@ mod tests {
             "zero domains named: {text}"
         );
     }
+
+    #[tokio::test]
+    async fn a_domain_filtered_search_counts_the_filter() {
+        let (store, _auth, _data) = store_with_two_domains("probe-counts").await;
+        let before_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
+            .as_u64()
+            .unwrap();
+        let _ = handle_search_memory(
+            serde_json::json!({ "namespace": "probe-counts", "query": "rules", "domain": "auth" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let after_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(after_total, before_total + 1);
+
+        let before_none = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
+            .as_u64()
+            .unwrap();
+        let _ = handle_search_memory(
+            serde_json::json!({ "namespace": "probe-counts", "query": "rules" }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let after_none = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(after_none, before_none);
+    }
+
+    #[tokio::test]
+    async fn a_search_in_a_single_domain_namespace_counts_a_bypass_not_a_narrowing_hit() {
+        let (store, _) = store_with_one_rule("single-domain-ns").await;
+        let before_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
+            .as_u64()
+            .unwrap();
+        let before_bypass = crate::recall_metrics::domain_filter_snapshot()["single_domain_bypasses"]
+            .as_u64()
+            .unwrap();
+        let before_narrowed = crate::recall_metrics::domain_filter_snapshot()["domain_narrowed_hits"]
+            .as_u64()
+            .unwrap();
+
+        // filter that does not match -> Vector mode, no narrowing hit
+        let _ = handle_search_memory(
+            serde_json::json!({ "namespace": "single-domain-ns", "query": "rules", "domain": "no-such-domain" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let after_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
+            .as_u64()
+            .unwrap();
+        let after_bypass = crate::recall_metrics::domain_filter_snapshot()["single_domain_bypasses"]
+            .as_u64()
+            .unwrap();
+        let after_narrowed = crate::recall_metrics::domain_filter_snapshot()["domain_narrowed_hits"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(after_total, before_total + 1);
+        assert_eq!(after_bypass, before_bypass + 1);
+        assert_eq!(after_narrowed, before_narrowed);
+    }
+
+    #[tokio::test]
+    async fn a_promotion_of_a_recalled_id_is_counted() {
+        let (store, id) = store_with_one_rule("promo-ns").await;
+        crate::recall_metrics::record_recall("promo-ns", &[id.clone()]);
+        let before = crate::recall_metrics::recall_snapshot()["recall_promotions"]
+            .as_u64()
+            .unwrap();
+        let _ = handle_get_memory(
+            serde_json::json!({ "namespace": "promo-ns", "id": id }),
+            store,
+        )
+        .await;
+        let after = crate::recall_metrics::recall_snapshot()["recall_promotions"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(after, before + 1);
+    }
+
 }
