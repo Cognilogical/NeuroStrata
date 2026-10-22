@@ -971,9 +971,6 @@ const TOPOLOGY_KEYS: [&str; 5] = [
     "reason",
 ];
 
-#[allow(dead_code)]
-const ATTEMPT_KEYS: [&str; 4] = crate::attempt::ATTEMPT_KEYS;
-
 /// Validates a memory payload's metadata shape and extracts edge specs.
 /// Returns the valid edge specs and any shape warnings (never rejects the write).
 fn parse_edge_specs(
@@ -4393,6 +4390,103 @@ eurostrata\src\daemon.rs",
     /// The access-attempt shape check (vocabulary v6).
     mod attempt {
         use super::*;
+
+        fn well_formed_attempt() -> Value {
+            json!({
+                "approach": "retry with backoff",
+                "outcome": "failed",
+                "failure_mode": "timeout",
+                "context": "under load"
+            })
+        }
+
+        fn fact_with_attempt(attempt: Value) -> MemoryPayload {
+            MemoryPayload {
+                content: "c".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: json!({ "attempt": attempt }),
+            }
+        }
+
+        #[test]
+        fn a_well_formed_attempt_writes_without_a_warning() {
+            let (specs, warnings) = parse_edge_specs(&fact_with_attempt(well_formed_attempt()));
+            assert!(specs.is_empty(), "the check never touches the edge specs");
+            assert!(
+                !warnings.iter().any(|w| w.field == "metadata.attempt"),
+                "a well-formed attempt raises no warning: {warnings:?}"
+            );
+            assert!(
+                warnings.is_empty(),
+                "the payload carries nothing else that could warn: {warnings:?}"
+            );
+        }
+
+        #[test]
+        fn a_malformed_attempt_warns_at_parse_edge_specs_level() {
+            // missing key
+            let mut missing = well_formed_attempt();
+            missing.as_object_mut().unwrap().remove("context");
+            let (specs, warnings) = parse_edge_specs(&fact_with_attempt(missing));
+            assert!(specs.is_empty(), "the check never touches the edge specs");
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].field, "metadata.attempt");
+            assert_eq!(
+                warnings[0].why,
+                "metadata.attempt is missing the required key \"context\""
+            );
+            assert_eq!(
+                warnings[0].skipped,
+                "the attempt shape check; the fact is still written"
+            );
+
+            // not an object
+            for attempt in [json!("not-an-object"), json!(["approach"]), Value::Null] {
+                let (_, warnings) = parse_edge_specs(&fact_with_attempt(attempt));
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert_eq!(warnings[0].field, "metadata.attempt");
+                assert_eq!(warnings[0].why, "metadata.attempt must be an object");
+            }
+
+            // non-string key
+            let mut not_a_string = well_formed_attempt();
+            not_a_string["approach"] = json!(42);
+            let (_, warnings) = parse_edge_specs(&fact_with_attempt(not_a_string));
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].field, "metadata.attempt");
+            assert_eq!(
+                warnings[0].why,
+                "metadata.attempt key \"approach\" must be a string"
+            );
+
+            // empty string
+            let mut empty = well_formed_attempt();
+            empty["approach"] = json!("   ");
+            let (_, warnings) = parse_edge_specs(&fact_with_attempt(empty));
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert_eq!(warnings[0].field, "metadata.attempt");
+            assert_eq!(
+                warnings[0].why,
+                "metadata.attempt key \"approach\" must be a non-empty string"
+            );
+        }
+
+        #[test]
+        fn an_attempt_on_a_memory_that_is_not_a_fact_is_not_checked() {
+            let p = MemoryPayload {
+                memory_type: "rule".into(),
+                ..fact_with_attempt(json!("not-an-object"))
+            };
+            let (_, warnings) = parse_edge_specs(&p);
+            assert!(
+                warnings.is_empty(),
+                "the field is declared on a fact alone: {warnings:?}"
+            );
+        }
 
         #[tokio::test]
         async fn a_malformed_attempt_warns_and_the_write_still_succeeds() {

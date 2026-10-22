@@ -873,4 +873,168 @@ mod tests {
             assert!(parsed.get("recalled_from").is_none(), "recalled_from must be absent when no search ran: {}", result);
         }
     }
+
+    #[tokio::test]
+    async fn a_recalled_negative_exemplar_is_prefixed_and_bounded() {
+        let root = scratch("recall-neg-prefix");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        let fact_id = "neg-1";
+        let long_content = "x".repeat(200);
+        let payload = crate::traits::MemoryPayload {
+            content: long_content,
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "domain": "database-access",
+                "attempt": {
+                    "approach": "retry with backoff",
+                    "outcome": "failed",
+                    "failure_mode": "timeout",
+                    "context": "under load"
+                }
+            }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on db",
+                "project_root": root.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let recalled = parsed.get("recalled").unwrap().as_array().unwrap();
+        assert_eq!(recalled.len(), 1);
+        let snippet = recalled[0].get("snippet").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            snippet.starts_with("[FAILED ATTEMPT] "),
+            "snippet must start with the failed-attempt prefix: {}",
+            snippet
+        );
+        assert!(
+            snippet.chars().count() <= 120,
+            "snippet exceeds 120 chars: {} (len={})",
+            snippet,
+            snippet.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recalled_negative_exemplar_shorter_than_the_prefix_budget_keeps_the_prefix() {
+        let root = scratch("recall-neg-short");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        let fact_id = "neg-short";
+        let payload = crate::traits::MemoryPayload {
+            content: "hi".to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "domain": "database-access",
+                "attempt": {
+                    "approach": "retry with backoff",
+                    "outcome": "failed",
+                    "failure_mode": "timeout",
+                    "context": "under load"
+                }
+            }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on db",
+                "project_root": root.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let recalled = parsed.get("recalled").unwrap().as_array().unwrap();
+        assert_eq!(recalled.len(), 1);
+        let snippet = recalled[0].get("snippet").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            snippet.starts_with("[FAILED ATTEMPT] "),
+            "prefix must never be dropped: {}",
+            snippet
+        );
+        assert!(
+            snippet.chars().count() <= 120,
+            "snippet exceeds 120 chars: {} (len={})",
+            snippet,
+            snippet.chars().count()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recalled_positive_fact_is_not_prefixed() {
+        let root = scratch("recall-pos-no-prefix");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+        store.init("probe").await.unwrap();
+
+        let fact_id = "pos-1";
+        let payload = crate::traits::MemoryPayload {
+            content: "Use connection pooling for database access".to_string(),
+            user_id: "tester".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({ "domain": "database-access" }),
+        };
+        store
+            .upsert("probe", fact_id, vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let result = handle_append_log(
+            json!({
+                "content": "working on db",
+                "project_root": root.display().to_string(),
+                "tags": ["database-access"],
+                "namespace": "probe",
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let recalled = parsed.get("recalled").unwrap().as_array().unwrap();
+        assert_eq!(recalled.len(), 1);
+        let snippet = recalled[0].get("snippet").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            !snippet.starts_with("[FAILED ATTEMPT] "),
+            "positive fact must not be prefixed: {}",
+            snippet
+        );
+    }
 }
