@@ -7360,6 +7360,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_domain_filtered_search_counts_the_filter() {
+        let _guard = crate::recall_metrics::acquire_test_lock();
         let (store, _auth, _data) = store_with_two_domains("probe-counts").await;
         let before_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
             .as_u64()
@@ -7392,6 +7393,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_search_in_a_single_domain_namespace_counts_a_bypass_not_a_narrowing_hit() {
+        let _guard = crate::recall_metrics::acquire_test_lock();
         let (store, _) = store_with_one_rule("single-domain-ns").await;
         let before_total = crate::recall_metrics::domain_filter_snapshot()["domain_queries_total"]
             .as_u64()
@@ -7426,6 +7428,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_promotion_of_a_recalled_id_is_counted() {
+        let _guard = crate::recall_metrics::acquire_test_lock();
         let (store, id) = store_with_one_rule("promo-ns").await;
         crate::recall_metrics::record_recall("promo-ns", &[id.clone()]);
         let before = crate::recall_metrics::recall_snapshot()["recall_promotions"]
