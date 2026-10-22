@@ -734,11 +734,26 @@ git commit -m "test: the topology fact reaches its governed file and survives a 
 - Consumes: the tightened `rule-honesty` contract from `neurostrata-bzdn`.
 - Produces: one `rule` row that conforms to that contract (the parent's spec §4.4: "This spec writes its own rule rows conforming to the tightened contract from day one"), plus the conformance test that keeps the contract honest.
 
-**This task is gated.** The parent's spec §4.4 makes the rule-honesty hardening land first and separately, because the pre-push gate runs namespace-wide: tightening the validator flags the 86 legacy NeuroStrata rule rows until they are backfilled. That work is task `neurostrata-bzdn` (P2, ready, unassigned) and it is **not** this plan's to fold in — a tightening that lands without its backfill would fail the gate.
+**This task is gated.** The parent's spec §4.4 makes the rule-honesty hardening land first and separately, because the pre-push gate runs namespace-wide: tightening the validator flags the legacy rule rows until they are backfilled. That work is task `neurostrata-bzdn` (P2, ready, unassigned) and it is **not** this plan's to fold in — a tightening that lands without its backfill would fail the gate.
 
 Tasks 1–7 do not depend on this task. This task depends on `neurostrata-bzdn` landing. If `neurostrata-bzdn` has not landed when you reach this task, it waits — the blocker is named, tracked and owned; it is not dropped.
 
 **Blocking dependency: `neurostrata-bzdn`.** Task 8 — the AC-9 rule row plus its conformance test — is gated on task `neurostrata-bzdn` (the rule-honesty hardening plus the rule backfill). The concrete next action when it unblocks: write the rule row under spec §4.4 and add the conformance test.
+
+**The gate's measured blast radius (2026-10-21, from the live database — `neurostrata-mcp export-graph`).** The tightening `neurostrata-bzdn` proposes (the rule check at `src/task/gate.rs:398-425`, the wire registry at `src/task/wiring.rs:56-133` and `:171-177`) requires every live `rule` row to carry a valid `metadata.enforcement`. Measured on the live database:
+
+| Namespace | live `rule` rows | rows with no `metadata.enforcement` |
+|---|---|---|
+| `NeuroStrata` | 100 | **95** |
+| `keywest.health` | 143 | **143** |
+| `global` | 2 | 1 |
+
+(The gap brief's figure of 86 legacy `NeuroStrata` rows was a point-in-time count; 95 is what the live namespace holds today.) The tightening therefore fails **three** namespaces' strict gates until their rows are corrected — not one — and two owner-ruled ways out exist, neither of them this plan's:
+
+- **Grandfather** the legacy rows by their `valid_from` — migration-free, and the legacy rows stay unchecked, which is the honesty the tightening exists to end.
+- **Backfill** every namespace (`NeuroStrata` 95, `keywest.health` 143, `global` 1) with a truthful `enforcement` — the honest end state, but it writes 239 rows, 143 of them in another project's namespace, and `keywest.health` is not this repo's to decide for.
+
+The plan does not choose between them: the choice changes what a rule *in another project* means, so it is the owner's ruling. It is filed on `neurostrata-bzdn` with this measurement and the two options, and it is why Task 8 waits rather than being dropped.
 
 - [ ] **Step 1: Confirm the gate**
 
@@ -824,7 +839,7 @@ git commit -m "docs: the honest-recall note and the changelog entry"
 - The vocabulary is at version 5, the assert at `src/traits.rs:312` says 5, and `fact.fields.topology` is declared and surfaced in both `tool_summaries` keys.
 - `neurostrata_append_log` returns `recalled` on every response and `recalled_from` on every response where a search ran, with at most three entries and a 120-character snippet cap.
 - `neurostrata_search_memory` behaves exactly as before when no `domain` argument is given.
-- The plan's nine tasks are committed, and the CHANGELOG and `docs/recall.md` describe what shipped.
+- Eight of the plan's nine tasks are committed, and the CHANGELOG and `docs/recall.md` describe what shipped. The ninth — Task 8, the AC-9 rule row plus its conformance test — waits on `neurostrata-bzdn`: the blocker is named in Task 8 above together with its measured cross-namespace blast radius and the owner ruling it needs, it is tracked, and it is owned.
 - The vocabulary bump belongs to this plan; the next bump (5 → 6) belongs to `neurostrata-r30c`.
 
 ---
