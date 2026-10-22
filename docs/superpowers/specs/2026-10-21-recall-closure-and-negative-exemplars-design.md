@@ -362,7 +362,7 @@ carries the original row's already-validated domain forward.
   applies a shared `rule`/`fact`/`procedure` that carries a valid `metadata.domain`, the
   import step **unions that slug into the local registry row**, so an imported row's
   domain is legal locally and no shared record is ever refused for a domain the local
-  registry has not seen.
+  registry has not seen. (`src/synaptic_mesh/import.rs:1257-1279`)
 
 #### 3.2.5 The registry update: serialized, retried, and never load-bearing
 
@@ -642,7 +642,7 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:979`; `src/server.rs:2324`; the parent's `recalled[]` response, built beside `src/buffer.rs:277-287`; `src/server.rs:1163-1175` |
 | 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-162`, `:1520-1707` |
 | 10 | **[N]** The `domain_filter` counters and their surface — process-global atomics in a module beside the search path, incremented in the **daemon** process (which serves both the MCP dispatch and `/bus/metrics`) and read directly by the metrics handler: no signature change, no `AppState` field, no route plumbing | new module beside the search path; `src/handlers/bus_metrics.rs:20-23`; `src/daemon.rs:534`, `:539`; `src/server.rs:909`; `src/main.rs:1775-1779` |
-| 11 | **[N]** The mesh import step unions an imported record's domain into the local registry | `src/synaptic_mesh/import.rs` |
+| 11 | **[N]** The mesh import step unions an imported record's domain into the local registry | `src/synaptic_mesh/import.rs:1257-1279` (`apply_effective`) |
 | 12 | Tests (§6) | `src/server.rs`, `src/buffer.rs`, `src/store/ladybug.rs`, `src/schemas/` |
 | 13 | Docs: the honest-recall note, the registry note; `CHANGELOG.md` | repo docs |
 
@@ -677,7 +677,8 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 9. The registry row never appears in search results or in the snapshot's top-5 body, and
    `get_snapshot` renders `Registered domains (3): auth, database-access, storage`.
 10. The registry row is not exported to the mesh (`eligibility: private`), and an
-    imported shared record's domain is unioned into the local registry.
+    imported shared record's domain is unioned into the local registry
+    (`src/synaptic_mesh/import.rs:1257-1279`).
 11. **The acceptance decision precedes any registry write.** A cache update that fails —
     an exhausted retry, a store error — never converts an accepted write into a
     rejection, nor a rejection into an acceptance; it is reported as a warning.
