@@ -62,7 +62,7 @@ The observed episode (the brief's §2) is an agent asserting an access-path clai
 
 ## 3. The substrate (verified; this spec does not re-propose it)
 
-Everything below was verified against source at `b3904d8`. The panel was instructed not to re-propose any of it.
+Everything below was verified against source at `b3904d8`. The panel was instructed not to re-propose any of it. **It is the substrate as of that commit**: where this spec's own implementation changed a row, the row carries a *[changed]* marker naming the section that describes the new behaviour.
 
 | Constraint | Anchor |
 |---|---|
@@ -73,8 +73,8 @@ Everything below was verified against source at `b3904d8`. The panel was instruc
 | Procedures surface on the snapshot strap only | `src/server.rs:1471` |
 | `access_count` is incremented **only** by the MCP search handler and the get-memory handler — never by `VectorStore::search` itself | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2144` |
 | New memories are stamped `access_count: 0`; the snapshot sorts by `access_count` and cuts to 5 | `src/server.rs:1125-1132` (`stamp_new_memory`), `:1476-1491` |
-| `domain` is written on add and echoed to export, and **never filters retrieval** | `src/server.rs:1281-1283`; `src/store/ladybug.rs:1995-1996` (read), `:2048` (emitted) |
-| The Topic Switch marker is written on tagged turns and **never read back**; `current.md` has no production reader | `src/buffer.rs:70-76`; `src/server.rs:371` |
+| `domain` is written on add and echoed to export, and — as of `b3904d8` — **never filtered retrieval** *[changed: this spec adds the optional domain filter on search (§4.3) and the `domain` argument on `neurostrata_search_memory`]* | `src/server.rs:1281-1283`; `src/store/ladybug.rs:1995-1996` (read), `:2048` (emitted) |
+| The Topic Switch marker is written on tagged turns and **never read back**; `current.md` *does* have a production reader — the episodic-pointer echo subscriber scans a buffer file's tail for pointer idempotency (`src/events/subscribers/episodic_pointer_echo.rs:214-215`) — but that reader never reads the Topic Switch marker back. *(The "no production reader" half of this row was already false at `b3904d8`.)* | `src/buffer.rs:70-76`; `src/server.rs:371` |
 | The guard is **action-time only** — there is no claim-time surface | `src/server.rs:384`; `src/guard/validator.rs:43` |
 | `fires_on` is a closed reminder enum; reminders ship as a bootstrap payload, not as a runtime injection | `src/task/wiring.rs:49`, `:135-168`; `src/task/mod.rs:1748-1751` |
 
@@ -125,7 +125,7 @@ The existing response object (`src/buffer.rs:310-317`: `appended`, `file`, `size
 
 **Bounds:** at most **3** entries; `snippet` at most 120 characters. Worst case context cost ≈ 150 tokens, and only on tagged turns.
 
-**Retrieval:** the recall calls `VectorStore::search` **directly** — vector-distance ranked with the capped usage boost (`src/store/ladybug.rs:122-135`), with the domain filter of §4.3 applied. Because it queries the store rather than the snapshot, it **bypasses the `access_count` top-5 cut by construction** — which is the §3.3 hole, closed.
+**Retrieval:** the recall calls `VectorStore::search_with_domain` **directly** — vector-distance ranked with the capped usage boost (`src/store/ladybug.rs:122-135`), with the domain filter of §4.3 applied as the filter's key set. The store over-fetches and narrows the candidate set in Rust after the vector query returns (`src/store/ladybug.rs:113-119`, `:156-161`), so the filter is a post-query narrowing, not a change to the query itself. Because it queries the store rather than the snapshot, it **bypasses the `access_count` top-5 cut by construction** — which is the §3.3 hole, closed.
 
 **Only direct matches are recalled.** The store returns primaries *and* bounded graph expansions — one-hop, episode siblings, two-hop governs (`src/store/ladybug.rs:509-528`). An expansion row is context for a matched row, not the matched fact: a governed AST `file` node carries no `metadata.domain` and a synthetic score of 1.0. The recall therefore keeps only the results whose evidence carries `EvidenceKind::DirectMatch` — the same test the search handler uses to decide what counts as a direct hit (`src/server.rs:2043-2044`). Without it, a namespace with fewer than three primaries would recall governed nodes it never matched. *(Amended 2026-10-21 after the plan review: Argon's Q3.)*
 
@@ -142,13 +142,13 @@ The existing response object (`src/buffer.rs:310-317`: `appended`, `file`, `size
 
 A `get_snapshot` topic strap (the other seat's proposal) is **not** in this phase. It would duplicate the recall path, and it would require teaching the agent a new mid-session protocol. Revisit only if the `append_log` seat is shown insufficient by observation (§11).
 
-For the same reason, the **domain-scoped snapshot lane** is deferred: in this phase the `access_count: 0` bypass comes from `VectorStore::search` (used by the recall and by `search_memory`'s domain filter), not from a new snapshot lane.
+For the same reason, the **domain-scoped snapshot lane** is deferred: in this phase the `access_count: 0` bypass comes from `VectorStore::search_with_domain` (used by the recall and by `search_memory`'s domain filter), not from a new snapshot lane.
 
 #### 4.1.5 Plumbing
 
-- The dispatch at `src/server.rs:665-666` currently passes only `arguments`. It must pass `emb.clone()` and `store.clone()` — exactly as its neighbours already do (`task_setup` at `:657-663`, `guard_validate` at `:668-674`).
+- The dispatch at `src/server.rs:665-666` passed only `arguments` before this spec; it now passes `emb.clone()` and `store.clone()` — exactly as its neighbours already do (`task_setup` at `:657-663`, `guard_validate` at `:668-674`). *(Implemented by the plan's Task 6.)*
 - `handle_append_log(arguments, emb, store)` gains the two parameters.
-- **Namespace:** the `neurostrata_append_log` `inputSchema` (`src/server.rs:374-381`) has `content`, `project_root`, `tags` — **no `namespace`**. Add an optional `namespace` property; when absent, fall back to `project_root.file_name()`, resolved through `resolve_namespace(&store, …)` (`src/server.rs:2105`). Without this the handler cannot know which namespace to search.
+- **Namespace:** the `neurostrata_append_log` `inputSchema` (`src/server.rs:374-381`) has `content`, `project_root`, `tags` and an **optional `namespace`**; when the `namespace` is absent — or blank — the handler falls back to `project_root.file_name()`, resolved through `resolve_namespace(&store, …)` (`src/server.rs:2105`). Without it the handler cannot know which namespace to search. *(Implemented by the plan's Task 6.)*
 
 ---
 
@@ -233,14 +233,14 @@ Recorded for that later phase, so the bootstrap is not re-litigated: **the first
 
 | Option | Why not |
 |---|---|
-| Ride the episodic tag | `current.md` has no production reader (the brief's §6). |
+| Ride the episodic tag | `current.md`'s one production reader — the episodic-pointer echo subscriber (§3) — scans its tail for pointer idempotency and never reads the Topic Switch marker back, so there is nothing to ride. |
 | Parse `current.md` at search time | Couples the daemon's DB engine to client filesystem paths (`project_root`). |
 | A namespace convention | `namespace` already exists; it does not address **within-namespace** topic separation, which is the actual case. |
 | A new vocabulary term | `domain` already exists; a new term forks the write-side convention for zero gain. |
 
 #### 4.3.5 Soft fallback
 
-If a domain filter would empty the candidate set, the filter is **skipped** and the unfiltered candidates are returned — a wrong domain must not blind recall. The store's search is a pure-vector match (`src/store/ladybug.rs:71`); the domain filter proposed in §4.3.2 narrows that candidate set, and the soft fallback is a property of that new filter, not an existing code path. Because a silent fallback would misreport what was searched, the recall response states which mode produced it: `recalled_from: "domain" | "vector"`. *(This field is an orchestrator addition, not a panel decision; it exists because the repo's honesty rules forbid a silent substitution.)* When no search ran, or the search failed, the response carries **no mode at all** (§4.1.2) — an honest silence beats a mode that names a search that never happened. The two values map exactly onto the two domain-filter counters the recall-closure spec defines (`domain_narrowed_hits` / `domain_fallback_vector`): a call with no mode ran no filter and increments neither.
+If a domain filter would empty the candidate set, the filter is **skipped** and the unfiltered candidates are returned — a wrong domain must not blind recall. The store's search is a pure-vector match (`src/store/ladybug.rs:71`); the domain filter of §4.3.2 narrows that candidate set, and the soft fallback is a property of that filter — a code path this spec adds, not one that existed at `b3904d8` (`src/store/ladybug.rs:177-186` is where the mode is chosen). Because a silent fallback would misreport what was searched, the recall response states which mode produced it: `recalled_from: "domain" | "vector"`. *(This field is an orchestrator addition, not a panel decision; it exists because the repo's honesty rules forbid a silent substitution.)* When no search ran, or the search failed, the response carries **no mode at all** (§4.1.2) — an honest silence beats a mode that names a search that never happened. The two values map exactly onto the two domain-filter counters the recall-closure spec defines (`domain_narrowed_hits` / `domain_fallback_vector`): a call with no mode ran no filter and increments neither.
 
 ---
 
@@ -280,7 +280,7 @@ Ordered. Each step is independently testable.
 |---|---|---|
 | 0 | **Prerequisite for the rule row and the rule-honesty conformance test:** the `rule-honesty` hardening + legacy backfill lands. It does **not** gate the mechanism — the recall, the filter and the vocabulary change land independently of it | task `neurostrata-bzdn` |
 | 1 | Domain slug normalizer; applied on write (the add path) and on comparison | new helper + `src/server.rs:1281-1283`; `src/store/ladybug.rs:87-201` |
-| 2 | Optional `domain` filter on search (store + MCP tool), with the soft fallback when the filter would empty the candidate set | `src/traits.rs:193-200`, `src/store/ladybug.rs:29-201` (the filter narrows the vector query at `:71`); `src/server.rs:1967` |
+| 2 | Optional `domain` filter on search (store + MCP tool), with the soft fallback when the filter would empty the candidate set | `src/traits.rs:193-200`, `src/store/ladybug.rs:29-201` (the filter narrows the candidate set after the vector query returns — the store over-fetches and filters in Rust, `src/store/ladybug.rs:113-119`); `src/server.rs:1967` |
 | 3 | Vocabulary: `fact.fields.topology`, version 4 → 5, assert, `tool_summaries` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-69`, `:158-161`; `src/traits.rs:312` |
 | 4 | Shape check for `metadata.topology` → soft warning | `src/store/ladybug.rs:954`, `:933-939` |
 | 5 | `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; query text = normalized tags joined, embedded once, and the same tags are the domain filter's key set; `recalled` + `recalled_from` in the response | `src/buffer.rs:133`, `:151-160`, `:310-317`; `src/server.rs:374-381`, `:665-666`, `:2105` |
@@ -367,15 +367,17 @@ record of why each was parked at the time; the resolutions live in
 
 **Adjudicated facts** (verified by the orchestrator before being put to the panel):
 
+The facts below are the substrate **as of `b3904d8`** — what the panel judged. This spec's own implementation changed five of them since; each changed row says so.
+
 | Fact | Anchor |
 |---|---|
 | The mesh rejects an unknown `memory_type` at import | `src/synaptic_mesh/import.rs:61`, `:649-655` (the code); `src/synaptic_mesh/record.rs:26-28` (the contract) |
-| `vocabulary_version` is 4, asserted in one place | `src/schemas/memory-vocabulary.v3.json:2`; `src/traits.rs:312` |
-| `fact` has no `fields` object today | `src/schemas/memory-vocabulary.v3.json:66-69` |
-| `neurostrata_append_log` receives only `arguments`; its neighbours receive `emb` + `store` | `src/server.rs:665-666` vs `:657-663`, `:668-674` |
-| The append_log input schema has no `namespace` | `src/server.rs:374-381` |
+| `vocabulary_version` is 4, asserted in one place — *now 5* | `src/schemas/memory-vocabulary.v3.json:2`; `src/traits.rs:312` |
+| `fact` has no `fields` object today — *now carries the declared `fields.topology`* | `src/schemas/memory-vocabulary.v3.json:66-69` |
+| `neurostrata_append_log` receives only `arguments`; its neighbours receive `emb` + `store` — *the append_log dispatch now receives `emb` + `store` too* | `src/server.rs:665-666` vs `:657-663`, `:668-674` |
+| The append_log input schema has no `namespace` — *it now has an optional `namespace`* | `src/server.rs:374-381` |
 | The snapshot's straps are computed **before** the `access_count` sort and cut | `src/server.rs:1465`, `:1471`, `:1476-1491` |
-| `VectorStore::search` takes no domain filter | `src/traits.rs:193-200` |
+| `VectorStore::search` takes no domain filter — *the trait now has `search_with_domain`, whose default implementation ignores the key set and reports `Vector`; `LadybugStore` overrides it to apply the filter* | `src/traits.rs:193-200` |
 | `access_count` is incremented only by the two MCP handlers | `src/server.rs:2050`, `:2706` |
 
 **Brief.** `docs/designs/2026-10-20-gap-proactive-recall-and-access-topology.md` · **Panel verdicts:** `docs/designs/2026-10-20-argon-k3-panel-verdicts.md` · **External review:** `docs/designs/2026-10-20-external-review-hyperskill.md`
