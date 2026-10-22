@@ -1144,7 +1144,11 @@ pub(crate) async fn embed_dedup_and_upsert(
     namespace: &str,
     payload: &MemoryPayload,
     dedup: Option<&Arc<crate::judgment::DeduplicationChecker>>,
-) -> Result<crate::traits::UpsertReport, String> {
+) -> Result<crate::judgment::policy::MemoryWriteReport, String> {
+    use crate::judgment::canonical::canonical_duplicate_key;
+    use crate::judgment::policy::{DedupDecision, DedupHint, MemoryWriteReport};
+    use crate::traits::{DedupCandidateScope, RawDistanceQuery};
+
     store
         .init(namespace)
         .await
@@ -1153,42 +1157,166 @@ pub(crate) async fn embed_dedup_and_upsert(
         .embed(&payload.content)
         .await
         .map_err(|_| "Failed to generate embedding.".to_string())?;
-    // Check for duplicates if deduplication is enabled
+
+    let incoming_key = canonical_duplicate_key(namespace, payload)
+        .map_err(|e| format!("Failed to compute canonical key: {}", e))?;
+
+    // Determine scope.
+    let scope = if payload.memory_type == "procedure" {
+        let trigger = payload
+            .metadata
+            .get("trigger")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        DedupCandidateScope::Procedure { trigger }
+    } else {
+        DedupCandidateScope::Domain
+    };
+
+    let incoming_is_attempt = crate::attempt::is_failed_attempt(&payload.metadata);
+
+    let mut decision = DedupDecision::Allowed;
+    let mut dedup_hint = None;
+    let mut linked_existing_id = None;
+
+    // Exact-content candidates (independent of vector rank).
+    if let Ok(exact_candidates) = store
+        .find_active_exact_content(namespace, &payload.content, scope.clone())
+        .await
+    {
+        for ec in exact_candidates {
+            if let Ok(cand_key) = canonical_duplicate_key(namespace, &ec.payload) {
+                if cand_key == incoming_key {
+                    let has_extracted = ec
+                        .payload
+                        .metadata
+                        .get("extracted_from")
+                        .map(|v| !v.is_null())
+                        .unwrap_or(false);
+                    if has_extracted {
+                        linked_existing_id = Some(ec.id.clone());
+                        decision = DedupDecision::LinkedExisting;
+                        // Update existing candidate's metadata idempotently:
+                        // merge extracted_from ids, reuse its vector, no twin row.
+                        if let Ok(Some((existing_vec, mut existing_payload))) =
+                            store.get(namespace, &ec.id).await
+                        {
+                            // merge extracted_from from incoming
+                            let incoming_ids: Vec<String> = payload
+                                .metadata
+                                .get("extracted_from")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                                .unwrap_or_default();
+                            let meta = existing_payload.metadata.as_object_mut();
+                            if let Some(m) = meta {
+                                let arr = m
+                                    .entry("extracted_from".to_string())
+                                    .or_insert_with(|| serde_json::json!([]));
+                                if let Some(a) = arr.as_array_mut() {
+                                    for tid in &incoming_ids {
+                                        if !a.iter().any(|x| x.as_str() == Some(tid)) {
+                                            a.push(serde_json::json!(tid));
+                                        }
+                                    }
+                                }
+                            }
+                            // Also carry other metadata? Keep existing; idempotent.
+                            let _ = store
+                                .upsert(namespace, &ec.id, existing_vec, existing_payload)
+                                .await;
+                        }
+                    } else {
+                        decision = DedupDecision::BlockedExact;
+                    }
+                    // No new row for exact reuse / bare exact duplicate.
+                    return Ok(MemoryWriteReport {
+                        upsert: None,
+                        decision,
+                        dedup_hint,
+                        linked_existing_id,
+                    });
+                }
+            }
+        }
+    }
+
+    // Raw-distance candidates (model judgment path).
     if let Some(checker) = dedup {
-        if let Ok(candidates) = store
-            .search(namespace, vector.clone(), 5, false, false)
+        let limit = checker.config.max_candidates.max(1);
+        if let Ok(raw_candidates) = store
+            .nearest_by_raw_distance(
+                namespace,
+                vector.clone(),
+                RawDistanceQuery {
+                    limit,
+                    scope: scope.clone(),
+                },
+            )
             .await
         {
-            // Filter to only high-similarity candidates
-            let incoming_is_attempt = crate::attempt::is_failed_attempt(&payload.metadata);
-            let similar: Vec<_> = candidates
+            // Attempt partition + registry filter (registry already at store seam).
+            let filtered: Vec<_> = raw_candidates
                 .into_iter()
-                .filter(|c| c.score >= 0.85)
                 .filter(|c| {
                     crate::attempt::is_failed_attempt(&c.payload.metadata) == incoming_is_attempt
                 })
                 .collect();
 
-            if !similar.is_empty() {
-                // Ask the judgment provider if this is a duplicate
-                if let Some(duplicates) = checker.check_duplicates(payload, &similar).await {
+            if !filtered.is_empty() {
+                // Convert to SearchResult for the judgment provider.
+                let search_results: Vec<crate::traits::SearchResult> = filtered
+                    .iter()
+                    .map(|c| crate::traits::SearchResult {
+                        id: c.id.clone(),
+                        score: c.raw_distance,
+                        payload: c.payload.clone(),
+                        evidence: None,
+                    })
+                    .collect();
+
+                if let Some(duplicates) = checker.check_duplicates(payload, &search_results).await {
                     if !duplicates.is_empty() {
                         let dup = &duplicates[0];
-                        return Err(format!(
-                            "Potential duplicate detected: Memory is similar to existing memory {} (confidence: {:.2}). Use neurostrata_supersede_memory to update the existing memory instead.",
-                            dup.existing_memory_id, dup.confidence
-                        ));
+                        let raw_dist = filtered
+                            .iter()
+                            .find(|c| c.id == dup.existing_memory_id)
+                            .map(|c| c.raw_distance)
+                            .unwrap_or(0.0);
+                        decision = DedupDecision::AllowedWithHint;
+                        dedup_hint = Some(DedupHint {
+                            candidate_id: dup.existing_memory_id.clone(),
+                            raw_distance: raw_dist,
+                            confidence: Some(dup.confidence),
+                        });
                     }
                 }
             }
         }
     }
 
+    // Write unless blocked.
+    if matches!(decision, DedupDecision::BlockedExact | DedupDecision::BlockedModel) {
+        return Ok(MemoryWriteReport {
+            upsert: None,
+            decision,
+            dedup_hint,
+            linked_existing_id,
+        });
+    }
+
     let new_id = uuid::Uuid::new_v4().to_string();
-    store
+    let report = store
         .upsert(namespace, &new_id, vector, payload.clone())
         .await
-        .map_err(|_| "Failed to store memory in database.".to_string())
+        .map_err(|_| "Failed to store memory in database.".to_string())?;
+    Ok(MemoryWriteReport {
+        upsert: Some(report),
+        decision,
+        dedup_hint,
+        linked_existing_id,
+    })
 }
 
 // A memory is durable only once checkpointed -- WAL replay restores the catalog
@@ -1372,23 +1500,48 @@ async fn handle_add_memory(
         .await
         {
             Ok(report) => {
-                // Emit site 1. The write is already durable, so the pulse is
-                // fire-and-forget: a bus that cannot take it must not turn a
-                // stored memory into a failed call.
+                use crate::judgment::policy::DedupDecision;
+                let upsert = report.upsert.clone();
+                let linked_id = report.linked_existing_id.clone();
+                let decision = report.decision;
+
+                // Exact reuse / blocked exact duplicate: no new row, no Created pulse.
+                if upsert.is_none() {
+                    match decision {
+                        DedupDecision::LinkedExisting => {
+                            let id = linked_id.unwrap_or_default();
+                            return format!("Reused existing memory for namespace: {}\nMemory ID: {}", namespace, id);
+                        }
+                        DedupDecision::BlockedExact => {
+                            return format!(
+                                "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
+                            );
+                        }
+                        DedupDecision::BlockedModel => {
+                            return format!(
+                                "Blocked by promoted model. Use neurostrata_supersede_memory or neurostrata_archive_memory."
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+
+                let upsert = upsert.unwrap();
+                // Emit site 1 only for a newly inserted memory.
                 bus.emit(
                     ThalamicPulse::Created {
-                        id: report.id.clone(),
+                        id: upsert.id.clone(),
                         namespace: namespace.to_string(),
                         kind: payload.memory_type.clone(),
                     },
                     &RecursionToken::root(),
                 );
                 let mut msg = format!("Successfully added memory for namespace: {}", namespace);
-                msg.push_str(&format!("\nMemory ID: {}", report.id));
+                msg.push_str(&format!("\nMemory ID: {}", upsert.id));
                 if adopted_governs {
                     msg.push_str(" (governs set from the Governs line in your content)");
                 }
-                for edge in &report.deferred_edges {
+                for edge in &upsert.deferred_edges {
                     let status = match &edge.resolution {
                         crate::traits::TargetResolution::Missing => "missing".to_string(),
                         crate::traits::TargetResolution::Ambiguous(candidates) => {
@@ -4333,8 +4486,11 @@ mod tests {
         domain: serde_json::Value,
         register_domain: Option<bool>,
     ) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CTR: AtomicUsize = AtomicUsize::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
         let mut arguments = serde_json::json!({
-            "content": "a rule written under a domain",
+            "content": format!("a rule written under a domain: {} #{}", domain, n),
             "namespace": "probe",
             "domain": domain,
         });
@@ -4525,7 +4681,7 @@ mod tests {
             .await
             .expect("list")
             .into_iter()
-            .find(|r| r.payload.content == "a rule written under a domain")
+            .find(|r| r.payload.content.starts_with("a rule written under a domain"))
             .expect("the memory is stored");
         assert_eq!(stored.payload.metadata["domain"], serde_json::json!("!!!"));
         assert_eq!(

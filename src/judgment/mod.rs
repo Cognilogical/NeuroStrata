@@ -1,4 +1,6 @@
+pub mod canonical;
 pub mod circuit_breaker;
+pub mod policy;
 pub mod provider;
 pub mod typesafe_jev;
 
@@ -68,7 +70,7 @@ impl Default for CircuitBreakerConfig {
 
 /// The main deduplication checker that orchestrates the process.
 pub struct DeduplicationChecker {
-    config: DeduplicationConfig,
+    pub config: DeduplicationConfig,
     provider: Box<dyn JudgmentProvider>,
     circuit_breaker: circuit_breaker::CircuitBreaker,
 }

@@ -144,6 +144,13 @@ pub trait Embedder: Send + Sync {
 
     /// Get the expected dimension of the embeddings (e.g., 768 for nomic-embed-text)
     fn dimensions(&self) -> usize;
+
+    /// Stable identity of the embedder (model + provider). Used to scope
+    /// raw-distance dedup candidates and observations. Defaults to "unknown"
+    /// for test stubs; production embedders override with a real id.
+    fn embedder_id(&self) -> &str {
+        "unknown"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +173,35 @@ pub struct EdgeResolutionStatus {
 pub struct UpsertReport {
     pub id: String,
     pub deferred_edges: Vec<EdgeResolutionStatus>,
+}
+
+/// A candidate returned by the unboosted raw-distance dedup query.
+#[derive(Debug, Clone)]
+pub struct RawDistanceCandidate {
+    pub id: String,
+    pub raw_distance: f32,
+    pub payload: MemoryPayload,
+}
+
+/// A candidate returned by the exact-content dedup lookup.
+#[derive(Debug, Clone)]
+pub struct ExactContentCandidate {
+    pub id: String,
+    pub payload: MemoryPayload,
+}
+
+/// Scope for a dedup candidate query.
+#[derive(Debug, Clone)]
+pub enum DedupCandidateScope {
+    Domain,
+    Procedure { trigger: String },
+}
+
+/// Query parameters for `nearest_by_raw_distance`.
+#[derive(Debug, Clone)]
+pub struct RawDistanceQuery {
+    pub limit: usize,
+    pub scope: DedupCandidateScope,
 }
 
 /// The core interface for vector storage and retrieval.
@@ -198,6 +234,29 @@ pub trait VectorStore: Send + Sync {
         include_tasks: bool,
         include_archived: bool,
     ) -> Result<Vec<SearchResult>>;
+
+    /// Unboosted raw-distance dedup candidate query. Returns up to `query.limit`
+    /// active domain-memory candidates ordered by the unboosted distance metric.
+    /// Default: empty (stores that cannot filter stay honest).
+    async fn nearest_by_raw_distance(
+        &self,
+        _namespace: &str,
+        _vector: Vec<f32>,
+        _query: RawDistanceQuery,
+    ) -> Result<Vec<RawDistanceCandidate>> {
+        Ok(Vec::new())
+    }
+
+    /// Exact UTF-8 content lookup over eligible active rows, independent of
+    /// vector rank. Default: empty.
+    async fn find_active_exact_content(
+        &self,
+        _namespace: &str,
+        _exact_content: &str,
+        _scope: DedupCandidateScope,
+    ) -> Result<Vec<ExactContentCandidate>> {
+        Ok(Vec::new())
+    }
 
     /// Delete a specific memory by its ID.
     async fn delete(&self, namespace: &str, id: &str) -> Result<()>;

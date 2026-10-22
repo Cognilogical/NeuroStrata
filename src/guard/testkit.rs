@@ -7,7 +7,8 @@
 
 use crate::domain::domain_key;
 use crate::traits::{
-    DomainMatchMode, DomainSearchOutcome, Embedder, MemoryPayload, RelocateOutcome, SearchResult,
+    DedupCandidateScope, DomainMatchMode, DomainSearchOutcome, Embedder, ExactContentCandidate,
+    MemoryPayload, RawDistanceCandidate, RawDistanceQuery, RelocateOutcome, SearchResult,
     UpsertReport, VectorStore,
 };
 use anyhow::Result;
@@ -239,6 +240,44 @@ impl VectorStore for MockStore {
             results: chosen_primaries,
             mode,
         })
+    }
+
+    async fn nearest_by_raw_distance(
+        &self,
+        namespace: &str,
+        _vector: Vec<f32>,
+        query: RawDistanceQuery,
+    ) -> Result<Vec<RawDistanceCandidate>> {
+        let rows = self.rows.lock().expect("mock store lock");
+        let mut out = Vec::new();
+        for r in rows.iter().filter(|r| r.namespace == namespace) {
+            if out.len() >= query.limit {
+                break;
+            }
+            out.push(RawDistanceCandidate {
+                id: r.id.clone(),
+                raw_distance: 0.0,
+                payload: r.payload.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn find_active_exact_content(
+        &self,
+        namespace: &str,
+        exact_content: &str,
+        _scope: DedupCandidateScope,
+    ) -> Result<Vec<ExactContentCandidate>> {
+        let rows = self.rows.lock().expect("mock store lock");
+        Ok(rows
+            .iter()
+            .filter(|r| r.namespace == namespace && r.payload.content == exact_content)
+            .map(|r| ExactContentCandidate {
+                id: r.id.clone(),
+                payload: r.payload.clone(),
+            })
+            .collect())
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {

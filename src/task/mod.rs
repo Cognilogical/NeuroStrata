@@ -1220,7 +1220,13 @@ pub async fn handle_task_complete(
             }
             memories = list_now().await?;
             edge = gate::extraction_exists(&memories, &id, now);
-            inline_lesson = Some(report.id);
+            let lesson_id = report
+                .upsert
+                .as_ref()
+                .map(|u| u.id.clone())
+                .or(report.linked_existing_id.clone())
+                .unwrap_or_default();
+            inline_lesson = Some(lesson_id);
         }
     }
 
