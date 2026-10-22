@@ -740,18 +740,20 @@ Tasks 1–7 do not depend on this task. This task depends on `neurostrata-bzdn` 
 
 **Blocking dependency: `neurostrata-bzdn`.** Task 8 — the AC-9 rule row plus its conformance test — is gated on task `neurostrata-bzdn` (the rule-honesty hardening plus the rule backfill). The concrete next action when it unblocks: write the rule row under spec §4.4 and add the conformance test.
 
-**The gate's measured blast radius (2026-10-21, from the live database — `neurostrata-mcp export-graph`).** The tightening `neurostrata-bzdn` proposes (the rule check at `src/task/gate.rs:398-425`, the wire registry at `src/task/wiring.rs:56-133` and `:171-177`) requires every live `rule` row to carry a valid `metadata.enforcement`. Measured on the live database:
+**The gate's measured blast radius (measured 2026-10-22T01:51:32Z — `neurostrata-mcp export-graph`, live rows only: `superseded` false, no `valid_to` expiry).** The tightening `neurostrata-bzdn` proposes (the rule check at `src/task/gate.rs:398-425`, the wire registry at `src/task/wiring.rs:56-133` and `:171-177`) requires every live `rule` row to carry a valid `metadata.enforcement`. Measured on the live database:
 
 | Namespace | live `rule` rows | rows with no `metadata.enforcement` |
 |---|---|---|
-| `NeuroStrata` | 100 | **95** |
-| `keywest.health` | 143 | **143** |
+| `NeuroStrata` | 102 | **96** |
+| `keywest.health` | 147 | **147** |
 | `global` | 2 | **2** |
 
-(The parent spec's figure was 86 `NeuroStrata` rule rows, 84 of them missing `enforcement` (`docs/superpowers/specs/2026-10-21-proactive-recall-and-access-topology-design.md:334`); the live namespace holds 100 live rule rows, 95 of them missing it.) The tightening therefore fails **three** namespaces' strict gates until their rows are corrected — not one — and two owner-ruled ways out exist, neither of them this plan's:
+These counts are a **point-in-time reading of a live database**: another session was writing rule rows throughout this session's own working window — the `keywest.health` count went 143 → 147 inside it — so the absolute numbers drift and a reader must re-measure rather than trust them. The conclusion does not drift: every namespace's rule set is affected, and the excepted rows are a handful, not a migration policy.
+
+(The parent spec's figure was 86 `NeuroStrata` rule rows, 84 of them missing `enforcement` (`docs/superpowers/specs/2026-10-21-proactive-recall-and-access-topology-design.md:334`); the live namespace holds 102 live rule rows, 96 of them missing it.) The tightening therefore fails **three** namespaces' strict gates until their rows are corrected — not one — and two owner-ruled ways out exist, neither of them this plan's:
 
 - **Grandfather** the legacy rows by their `valid_from` — migration-free, and the legacy rows stay unchecked, which is the honesty the tightening exists to end.
-- **Backfill** every namespace (`NeuroStrata` 95, `keywest.health` 143, `global` 2) with a truthful `enforcement` — the honest end state, but it writes 240 rows, 143 of them in another project's namespace, and `keywest.health` is not this repo's to decide for.
+- **Backfill** every namespace (`NeuroStrata` 96, `keywest.health` 147, `global` 2) with a truthful `enforcement` — the honest end state, but it writes 245 rows, 147 of them in another project's namespace, and `keywest.health` is not this repo's to decide for.
 
 The plan does not choose between them: the choice changes what a rule *in another project* means, so it is the owner's ruling. It is filed on `neurostrata-bzdn` with this measurement and the two options, and it is why Task 8 waits rather than being dropped.
 
