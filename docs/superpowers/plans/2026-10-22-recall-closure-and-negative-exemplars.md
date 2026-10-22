@@ -251,6 +251,7 @@ The registry row is a **cache**, not the truth: the namespace's own rows are the
   - `register_domain_true_accepts_the_slug_and_registers_it` — the same write with `register_domain: true` succeeds; the registry lists `["auth", "database-access", "storage"]`.
   - `a_slug_the_namespace_already_carries_is_accepted_by_the_reconcile` — delete the registry row, write `domain: "database-access"`, and the write succeeds (the reconcile finds the slug in the namespace's own rows) and the registry row is repaired.
   - `a_non_string_domain_is_rejected` — `domain: 42` is refused with a message naming the registered list; nothing is written.
+  - `a_domain_with_no_usable_slug_is_stored_as_it_was_given` — `domain: "!!!"` does not normalize to a slug; the write succeeds, the value is stored raw, and no registry row is touched.
   - `a_write_with_no_domain_touches_no_registry_row` — the write succeeds and the namespace still has no registry row.
 
   In `src/task/mod.rs`'s test module:
@@ -271,7 +272,7 @@ The registry row is a **cache**, not the truth: the namespace's own rows are the
   The decision is made **before** any registry write, and in this order:
 
   1. `raw_domain` that is not a string → `Err` with the rejection text (the non-string rejection; criterion 13).
-  2. Normalize with `crate::domain::normalize_domain_slug`; a slug that does not normalize → `Err` (a domain with no usable slug is not a domain).
+  2. Normalize with `crate::domain::normalize_domain_slug`. A slug that does not normalize (a string with no usable slug) is **not governed by the registry**: the check returns `DomainCheck { cache: None, warning: None }` and the write stores it exactly as the parent stored it. It has no slug to register, and refusing it would leave the caller with no remedy.
   3. Read the registry row: `store.get(namespace, &registry_row_id(namespace))`.
   4. **Absent** → the bootstrap: `store.list(namespace, None)`, normalize every row's `metadata.domain` with the same normalizer, union with the incoming slug, and return `DomainCheck { cache: Some(unioned), warning: None }`. The write always succeeds — the bootstrap errs toward registering more.
   5. **Present and the slug is in the cache** → `DomainCheck { cache: None, warning: None }` (the hot path: one read, no write).
@@ -318,7 +319,7 @@ The registry row is a **cache**, not the truth: the namespace's own rows are the
 
 - [ ] **Step 8: Add `mod registry;` to `src/main.rs`**
 
-  Alphabetically, between `mod recall_metrics;` (Task 7 — add it in the same edit if Task 7 lands first) and `mod secrets;`.
+  Between `mod parser;` and `mod secrets;` — alphabetical at this point in the sequence. Task 7 later inserts `mod recall_metrics;` between `mod parser;` and `mod registry;`, so the final order is alphabetical.
 
 - [ ] **Step 9: Run the tests to verify they pass**
 
