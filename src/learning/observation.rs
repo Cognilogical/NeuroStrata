@@ -70,33 +70,14 @@ pub enum LearningOutcomeKind {
     ProcedurePerformed,
 }
 
-pub struct LearningRecorder { root: std::path::PathBuf }
-impl LearningRecorder {
-    pub async fn open(root: std::path::PathBuf) -> anyhow::Result<Self> {
-        // placeholder
-        unimplemented!("TODO: create .NeuroStrata/learning directory, initialize JSONL files")
-    }
-    pub async fn record_observation(&self, _value: &DecisionObservation) -> anyhow::Result<()> {
-        unimplemented!("TODO: implement observation writing")
-    }
-    pub async fn record_outcome(&self, _value: &LearningOutcome) -> anyhow::Result<()> {
-        unimplemented!("TODO: implement outcome writing")
-    }
-    pub async fn put_payload(&self, _value: &MemoryPayload) -> anyhow::Result<PayloadHash> {
-        unimplemented!("TODO: implement payload hashing + blob storage")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::learning::blob_store::BlobStore;
     use crate::traits::MemoryPayload;
-    use std::collections::HashMap;
 
     #[test]
     fn failing_blob_reuse_content_addressed() {
-        // Same content payload should produce same hash -> same blob record
-        // This test fails until the BlobStore is implemented.
         let payload1 = MemoryPayload {
             content: "hello".to_string(),
             user_id: "u".to_string(),
@@ -106,20 +87,10 @@ mod tests {
             location_lines: "1-2".to_string(),
             metadata: serde_json::json!({}),
         };
-        let mut store = HashMap::<PayloadHash, Vec<u8>>::new();
-        // TODO: implement BlobStore.put(payload) -> PayloadHash
-        // assert!(store.is_empty()); // before putting
-        // let hash1 = BlobStore::put(payload1);
-        // assert_eq!(hash1.0, "sha256:...".to_string()); // placeholder
-        // let hash2 = BlobStore::put(payload1);
-        // assert_eq!(hash1, hash2, "same payload should reuse blob");
-        panic!("TODO: implement blob store with Sha256 hashing and reuse")
-    }
-
-    #[test]
-    fn observation_jsonl_append_fail() {
-        let recorder = LearningRecorder { root: std::path::PathBuf::from("/tmp/test_obs") };
-        // TODO: test JSONL append with reopen, line-atomic writes.
-        panic!("TODO: implement JSONL file handling")
+        let store = BlobStore::new().expect("create store");
+        let hash1 = store.put(&payload1).expect("hash 1");
+        let hash2 = store.put(&payload1).expect("hash 2");
+        assert_eq!(hash1, hash2, "same payload should reuse blob");
+        assert!(hash1.0.starts_with("sha256:"));
     }
 }

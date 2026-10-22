@@ -41,6 +41,8 @@ reqwest = { version = "0.13", features = ["json"] }
 # The crash breadcrumb needs the signal and file syscalls directly; it was
 # already in the tree as a transitive dependency, so this adds no download.
 libc = "0.2"
+sha2 = "0.10"
+hex = "0.4"
 
 # native-tls (pulled in by reqwest, ureq and hf-hub) only needs OpenSSL on
 # platforms without a system TLS stack: Windows uses SChannel and Apple targets
