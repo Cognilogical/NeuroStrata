@@ -21,7 +21,8 @@ it does not itself demonstrate database mutation.
 
 Lines 1743-1817 replay declarations. Lines 2278-2300 resolve graph nodes,
 not files. Lines 1819-1831 clear every auto-ingestor row in a namespace:
-provenance alone cannot make concurrent branch graphs safe.
+provenance alone cannot make concurrent branch graphs safe. *(the anchors
+were re-derived; 2026-10-21)*
 
 ## Recommended design
 
