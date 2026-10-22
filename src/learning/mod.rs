@@ -1,6 +1,7 @@
 pub mod observation;
 pub mod recorder;
 pub mod blob_store;
+pub mod labels;
 
 pub use observation::{
     CandidateSource, DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind,
