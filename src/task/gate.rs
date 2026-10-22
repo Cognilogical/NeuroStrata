@@ -418,6 +418,40 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                 continue;
             }
         }
+        if let Some(enf) = rule.get("enforcement").and_then(|e| e.as_str()) {
+            match enf {
+                "ENFORCED" => {}
+                "PARTIAL" => {
+                    let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
+                    if guard.is_empty() || !known.contains(&guard) {
+                        report.violations.push(Violation {
+                            id: row.id.clone(),
+                            kind: "partial_without_guard",
+                            detail: format!(
+                                "rule '{}' claims PARTIAL but names no real guard.",
+                                content_short(&row.payload.content)
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                "NOT_ENFORCED" => {
+                    let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
+                    if !guard.is_empty() {
+                        report.violations.push(Violation {
+                            id: row.id.clone(),
+                            kind: "not_enforced_with_guard",
+                            detail: format!(
+                                "rule '{}' claims NOT_ENFORCED but names a guard.",
+                                content_short(&row.payload.content)
+                            ),
+                        });
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
         if rule.get("enforcement").and_then(|e| e.as_str()) != Some("ENFORCED") {
             continue;
         }
