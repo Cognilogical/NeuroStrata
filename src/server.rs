@@ -2456,25 +2456,25 @@ fn render_path(ev: &crate::traits::SearchEvidence, orig: &str) -> String {
     let mut current = orig;
 
     for edge in &ev.path {
-        let (next, arrow, rel) =
-            if ev.kind == crate::traits::EvidenceKind::OneHop && edge.relation == "RELATES_TO" {
-                // RELATES_TO is undirected; use --RELATES_TO-- literal
-                let next = if edge.source == current {
-                    &edge.target
-                } else {
-                    &edge.source
-                };
-                (next.as_str(), " --RELATES_TO-- ", &edge.relation)
-            } else if edge.source == current {
+        // We are standing on one endpoint; the segment runs to the other one.
+        let forward = edge.source == current;
+        if !forward && edge.target != current {
+            continue;
+        }
+        let next = if forward { edge.target.as_str() } else { edge.source.as_str() };
+        // The vocabulary declares the direction: an undirected relation has no
+        // arrow, so the connector marks it instead.
+        let connector =
+            if crate::traits::memory_vocabulary()["relations"][edge.relation.as_str()]["direction"] == "undirected" {
+                format!(" --{}-- ", edge.relation)
+            } else if forward {
                 // Forward: source -> target
-                (edge.target.as_str(), " -", &edge.relation)
-            } else if edge.target == current {
-                // Reverse: target <- source
-                (edge.source.as_str(), " <-", &edge.relation)
+                format!(" -{}- ", edge.relation)
             } else {
-                continue;
+                // Reverse: target <- source
+                format!(" <-{}- ", edge.relation)
             };
-        parts.push(format!("\"{}\"{}{}- \"{}\"", current, arrow, rel, next));
+        parts.push(format!("\"{}\"{}\"{}\"", current, connector, next));
         current = next;
     }
     parts.join(" ")
@@ -4727,30 +4727,21 @@ mod tests {
 
     #[test]
     fn search_evidence_tries_later_shorter_paths() {
-        // Long path that doesn't fit: starts at a primary, chains through many nodes,
-        // ends at result.id (terminal check).
-        let long_path: Vec<EvidenceEdge> = {
-            let mut edges = Vec::new();
-            edges.push(EvidenceEdge {
-                source: "origin-long".into(),
+        // Long path that doesn't fit: a two-hop path whose ids are long
+        // enough that the rendered line exceeds the byte budget.
+        let long_id = "a-very-long-namespace-identifier-".repeat(3);
+        let long_path = vec![
+            EvidenceEdge {
+                source: long_id.clone(),
                 relation: "RELATES_TO".into(),
-                target: "long-id-0".into(),
-            });
-            for i in 0..18 {
-                edges.push(EvidenceEdge {
-                    source: format!("long-id-{}", i),
-                    relation: "RELATES_TO".into(),
-                    target: format!("long-id-{}", i + 1),
-                });
-            }
-            // Last edge ends at target-id (terminal check requires this)
-            edges.push(EvidenceEdge {
-                source: "long-id-18".into(),
-                relation: "RELATES_TO".into(),
+                target: format!("{}-mid", long_id),
+            },
+            EvidenceEdge {
+                source: format!("{}-mid", long_id),
+                relation: "GOVERNS".into(),
                 target: "target-id".into(),
-            });
-            edges
-        };
+            },
+        ];
         // Short path that fits: single edge from primary to result.id
         let short_path = vec![EvidenceEdge {
             source: "a".into(),
@@ -4763,7 +4754,7 @@ mod tests {
             "rule",
             Some(vec![
                 SearchEvidence {
-                    kind: EvidenceKind::OneHop,
+                    kind: EvidenceKind::Governs2hop,
                     path: long_path,
                     explanation: "long".into(),
                 },
@@ -4776,7 +4767,7 @@ mod tests {
         );
         let suffix_result = render_evidence_suffix(&r, 200);
         let suffix = suffix_result.expect("should get a suffix");
-        // The short path has node "a" — the long path has "origin-long"
+        // The short path has node "a" — the long path has "a-very-long-..."
         assert!(
             suffix.contains("\"a\""),
             "should use the shorter path that fits"
@@ -6029,7 +6020,7 @@ mod tests {
     /// The printed path carries the graph's own direction. The store's
     /// orientation fix (task neurostrata-ttmr) changes the one-hop line only
     /// for a directed relation -- RELATES_TO is drawn undirected there
-    /// (src/server.rs:2460) -- so this pins an outgoing GOVERNS edge's text.
+    /// (src/server.rs:2468) -- so this pins an outgoing GOVERNS edge's text.
     #[tokio::test]
     async fn an_outgoing_directed_edge_is_printed_from_the_primary() {
         let dir =
@@ -6178,9 +6169,193 @@ mod tests {
         // rendered as a self-contained "from -relation- to" pair.
         assert_eq!(
             line,
-            "Path [governs_2hop]: \"probe::primary\" -RELATES_TO- \"probe::mid\" \
+            "Path [governs_2hop]: \"probe::primary\" --RELATES_TO-- \"probe::mid\" \
              \"probe::mid\" <-GOVERNS- \"probe::ruler\"",
             "the two-hop path must run from the direct match to the neighbour"
+        );
+    }
+
+    /// An undirected relation is printed once, with a connector that says so.
+    /// The relation's declared direction decides the connector, not the kind of
+    /// path the relation appears in.
+    #[tokio::test]
+    async fn an_undirected_relation_is_printed_once_with_an_undirected_connector() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-undirected-render-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
+            .expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        // The neighbour: an edge target must exist before the row that
+        // declares the edge, or the edge is skipped as a write-shape warning.
+        store
+            .upsert(
+                "probe",
+                "probe::neighbour",
+                vec![0.5, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the neighbour".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The direct match: RELATES_TO is declared undirected in the vocabulary.
+        store
+            .upsert(
+                "probe",
+                "probe::primary",
+                vec![1.1, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the direct match".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "related_to": ["probe::neighbour"] }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false)
+            .await
+            .unwrap();
+        let text = render_search_results(&results);
+        let line = text
+            .lines()
+            .find(|l| l.contains("Path [one_hop]:"))
+            .expect("the neighbour must carry the one-hop path");
+        assert_eq!(
+            line,
+            "Path [one_hop]: \"probe::primary\" --RELATES_TO-- \"probe::neighbour\"",
+            "an undirected relation is printed once, with an undirected connector"
+        );
+    }
+
+    /// The renderer walks the path from the origin. An edge the walk is not
+    /// standing on is not part of it, so it is dropped rather than drawn as a
+    /// segment the graph does not contain.
+    #[test]
+    fn a_path_edge_the_walk_is_not_standing_on_is_dropped() {
+        let ev = SearchEvidence {
+            kind: EvidenceKind::OneHop,
+            path: vec![
+                EvidenceEdge {
+                    source: "probe::a".into(),
+                    relation: "RELATES_TO".into(),
+                    target: "probe::b".into(),
+                },
+                EvidenceEdge {
+                    source: "probe::x".into(),
+                    relation: "RELATES_TO".into(),
+                    target: "probe::y".into(),
+                },
+            ],
+            explanation: "a path with one disconnected edge".into(),
+        };
+        assert_eq!(
+            render_path(&ev, "probe::a"),
+            "\"probe::a\" --RELATES_TO-- \"probe::b\"",
+            "the edge the walk is not standing on is dropped"
+        );
+    }
+
+    /// The two-hop line shows the first hop's orientation when the relation
+    /// is directed. The graph is
+    ///
+    ///   probe::primary -GOVERNS-> probe::mid <-GOVERNS- probe::ruler
+    ///
+    /// so the printed path runs from the direct match to the intermediate with
+    /// a forward arrow and from the intermediate to the neighbour with a
+    /// backward one -- the graph's own directions on both hops.
+    #[tokio::test]
+    async fn a_two_hop_path_with_a_directed_first_hop_shows_its_orientation() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-two-hop-directed-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
+            .expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        // The intermediate: the target of both GOVERNS edges.
+        store
+            .upsert(
+                "probe",
+                "probe::mid",
+                vec![0.5, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the intermediate".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The neighbour: it governs the intermediate.
+        store
+            .upsert(
+                "probe",
+                "probe::ruler",
+                vec![0.2, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the neighbour".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "governs": ["probe::mid"] }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The direct match: it governs the intermediate too.
+        store
+            .upsert(
+                "probe",
+                "probe::primary",
+                vec![1.1, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the direct match".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "governs": ["probe::mid"] }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false)
+            .await
+            .unwrap();
+        let text = render_search_results(&results);
+        let line = text
+            .lines()
+            .find(|l| l.contains("Path [governs_2hop]:"))
+            .expect("the neighbour must carry the two-hop path");
+        assert_eq!(
+            line,
+            "Path [governs_2hop]: \"probe::primary\" -GOVERNS- \"probe::mid\" \
+             \"probe::mid\" <-GOVERNS- \"probe::ruler\"",
+            "a directed first hop must show the graph's direction"
         );
     }
 }
