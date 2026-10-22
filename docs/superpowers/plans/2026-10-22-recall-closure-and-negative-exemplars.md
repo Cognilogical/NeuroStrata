@@ -431,7 +431,7 @@ A negative exemplar is a `fact` carrying a declared `metadata.attempt`. It is re
 
   ```rust
   pub const ATTEMPT_KEYS: [&str; 4];       // ["approach", "outcome", "failure_mode", "context"]
-  pub const FAILED_ATTEMPT_PREFIX: &str;   // "[FAILED ATTEMPT] " (16 characters)
+  pub const FAILED_ATTEMPT_PREFIX: &str;   // "[FAILED ATTEMPT] " (17 characters)
   pub fn attempt_defects(metadata: &serde_json::Value) -> Vec<String>;  // empty when absent or valid
   pub fn is_failed_attempt(metadata: &serde_json::Value) -> bool;       // true only for a valid failed attempt
   ```

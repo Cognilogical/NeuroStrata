@@ -3114,6 +3114,226 @@ mod tests {
         assert!(!out.contains("Attempt [FAILED in"), "{}", out);
     }
 
+    struct RecordingProvider {
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+        last_candidate_count: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::judgment::JudgmentProvider for RecordingProvider {
+        async fn judge_duplicates(
+            &self,
+            _new_memory: &crate::traits::MemoryPayload,
+            candidates: &[crate::traits::SearchResult],
+        ) -> anyhow::Result<Vec<crate::judgment::DuplicateJudgment>> {
+            *self.calls.lock().unwrap() += 1;
+            *self.last_candidate_count.lock().unwrap() = candidates.len();
+            Ok(vec![])
+        }
+        async fn health_check(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_negative_exemplar_never_blocks_a_positive_fact() {
+        use crate::guard::testkit::MockStore;
+        use std::sync::Arc;
+
+        // Incoming: positive fact (no attempt). Candidate: negative exemplar (valid attempt).
+        // Partition must drop the candidate, so the provider is never called.
+        {
+            let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+            let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+            store.init("probe").await.unwrap();
+
+            // seed a negative exemplar candidate
+            let neg_payload = payload("same subject");
+            let mut neg_payload = neg_payload;
+            neg_payload.memory_type = "fact".to_string();
+            neg_payload.metadata = serde_json::json!({
+                "attempt": {
+                    "approach": "retry",
+                    "outcome": "failed",
+                    "failure_mode": "timeout",
+                    "context": "ctx"
+                }
+            });
+            store
+                .upsert("probe", "neg-1", vec![0.0; 4], neg_payload)
+                .await
+                .unwrap();
+
+            let calls = Arc::new(std::sync::Mutex::new(0usize));
+            let last = Arc::new(std::sync::Mutex::new(0usize));
+            let provider = Box::new(RecordingProvider {
+                calls: calls.clone(),
+                last_candidate_count: last.clone(),
+            });
+            let mut cfg = crate::config::DeduplicationConfig {
+                judgment_api_key: Some("test".to_string()),
+                timeout_seconds: 5,
+                similarity_threshold: 0.85,
+                confidence_threshold: 0.5,
+                max_candidates: 5,
+                cb_failure_threshold: 3,
+                cb_backoff_initial_seconds: 1,
+                cb_backoff_max_seconds: 60,
+            };
+            let _ = &mut cfg;
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+
+            let incoming = payload("same subject");
+            let mut incoming = incoming;
+            incoming.memory_type = "fact".to_string();
+            // no attempt
+
+            let res = embed_dedup_and_upsert(
+                &store,
+                &emb,
+                "probe",
+                &incoming,
+                Some(&checker),
+            )
+            .await;
+            assert!(res.is_ok(), "write should succeed: {:?}", res);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                0,
+                "provider must not be called when candidate is a negative exemplar and incoming is positive"
+            );
+        }
+
+        // Incoming: negative exemplar. Candidate: positive fact. Partition drops it.
+        {
+            let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+            let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+            store.init("probe").await.unwrap();
+
+            let pos_payload = payload("same subject");
+            let mut pos_payload = pos_payload;
+            pos_payload.memory_type = "fact".to_string();
+            store
+                .upsert("probe", "pos-1", vec![0.0; 4], pos_payload)
+                .await
+                .unwrap();
+
+            let calls = Arc::new(std::sync::Mutex::new(0usize));
+            let last = Arc::new(std::sync::Mutex::new(0usize));
+            let provider = Box::new(RecordingProvider {
+                calls: calls.clone(),
+                last_candidate_count: last.clone(),
+            });
+            let cfg = crate::config::DeduplicationConfig {
+                judgment_api_key: Some("test".to_string()),
+                timeout_seconds: 5,
+                similarity_threshold: 0.85,
+                confidence_threshold: 0.5,
+                max_candidates: 5,
+                cb_failure_threshold: 3,
+                cb_backoff_initial_seconds: 1,
+                cb_backoff_max_seconds: 60,
+            };
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+
+            let mut incoming = payload("same subject");
+            incoming.memory_type = "fact".to_string();
+            incoming.metadata = serde_json::json!({
+                "attempt": {
+                    "approach": "retry",
+                    "outcome": "failed",
+                    "failure_mode": "timeout",
+                    "context": "ctx"
+                }
+            });
+
+            let res = embed_dedup_and_upsert(
+                &store,
+                &emb,
+                "probe",
+                &incoming,
+                Some(&checker),
+            )
+            .await;
+            assert!(res.is_ok(), "write should succeed: {:?}", res);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                0,
+                "provider must not be called when incoming is a negative exemplar and candidate is positive"
+            );
+        }
+
+        // Same-attempt candidates are still handed to the provider.
+        {
+            let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+            let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+            store.init("probe").await.unwrap();
+
+            let mut cand = payload("same subject");
+            cand.memory_type = "fact".to_string();
+            cand.metadata = serde_json::json!({
+                "attempt": {
+                    "approach": "retry",
+                    "outcome": "failed",
+                    "failure_mode": "timeout",
+                    "context": "ctx"
+                }
+            });
+            store
+                .upsert("probe", "att-1", vec![0.0; 4], cand)
+                .await
+                .unwrap();
+
+            let calls = Arc::new(std::sync::Mutex::new(0usize));
+            let last = Arc::new(std::sync::Mutex::new(0usize));
+            let provider = Box::new(RecordingProvider {
+                calls: calls.clone(),
+                last_candidate_count: last.clone(),
+            });
+            let cfg = crate::config::DeduplicationConfig {
+                judgment_api_key: Some("test".to_string()),
+                timeout_seconds: 5,
+                similarity_threshold: 0.85,
+                confidence_threshold: 0.5,
+                max_candidates: 5,
+                cb_failure_threshold: 3,
+                cb_backoff_initial_seconds: 1,
+                cb_backoff_max_seconds: 60,
+            };
+            let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
+
+            let mut incoming = payload("same subject");
+            incoming.memory_type = "fact".to_string();
+            incoming.metadata = serde_json::json!({
+                "attempt": {
+                    "approach": "retry2",
+                    "outcome": "failed",
+                    "failure_mode": "timeout2",
+                    "context": "ctx2"
+                }
+            });
+
+            let res = embed_dedup_and_upsert(
+                &store,
+                &emb,
+                "probe",
+                &incoming,
+                Some(&checker),
+            )
+            .await;
+            assert!(res.is_ok(), "write should succeed: {:?}", res);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                1,
+                "provider must be called for same-attempt candidates"
+            );
+            assert_eq!(*last.lock().unwrap(), 1, "the candidate must be handed over");
+        }
+    }
+
     /// Embeds deterministically from the text, so two different strings can
     /// never collide. That is the whole point of the assertions below.
     struct StubEmbedder;

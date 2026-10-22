@@ -171,4 +171,20 @@ impl DeduplicationChecker {
     pub async fn health_check(&self) -> bool {
         self.provider.health_check().await.unwrap_or(false)
     }
+
+    /// Test-only constructor allowing injection of a custom provider.
+    #[cfg(test)]
+    pub fn new_with_provider(config: DeduplicationConfig, provider: Box<dyn JudgmentProvider>) -> Self {
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: config.cb_failure_threshold,
+            initial_backoff_ms: config.cb_backoff_initial_seconds * 1000,
+            max_backoff_ms: config.cb_backoff_max_seconds * 1000,
+            backoff_multiplier: 2.0,
+        };
+        Self {
+            config,
+            provider,
+            circuit_breaker: circuit_breaker::CircuitBreaker::new(cb_config),
+        }
+    }
 }
