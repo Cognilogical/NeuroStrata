@@ -14,7 +14,7 @@
   - parses `answers[*].probability` (NOT `{type:noul,noul:...}` as brief stated)
 - Enable signal: `config.judgment_api_key.is_some()` (`mod.rs:79,110`); mock otherwise.
 - Config: `judgment_api_key: Option<String>` plaintext in
-  `~/.config/neurostrata/config.json` (`src/config.rs:13`).
+  `~/.config/neurostrata/config.json` (the field at `src/config.rs:13`; the path is built at `src/config.rs:99-102`).
 - Circuit breaker, timeout, confidence threshold already present ✓
 - No Laya references in tree.
 
