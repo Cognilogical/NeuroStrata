@@ -30,7 +30,7 @@ questions. Nothing here is parked.
 `vocabulary_version` **4 → 5** bump and this spec owns **5 → 6** for `attempt` and
 `domain_registry`. This spec's premise when it was written ("`topology` is unbuilt, so
 all three ride one bump") is now stale: `topology` ships with version 5, and this
-spec's two fields ship with version 6. The single assert at `src/traits.rs:263` moves
+spec's two fields ship with version 6. The single assert at `src/traits.rs:312` moves
 with each bump, and there is no third bump.
 
 **The through-line, unchanged:** nothing new where something already exists. The topic
@@ -79,10 +79,11 @@ elsewhere or is another spec's subject):
 
 ## 2. The substrate (the claims were verified at `c5acd4f`; **this table's** anchors are live against the working tree as of 2026-10-22 — verify each claim at its anchor; the panel did not re-propose it)
 
-> **Anchor scope.** Only this table's anchors are live against the working tree. The prose
-> anchors in §3, §5 and §12 are as of `c5acd4f` — 30 of them — and are re-derived against
-> the working tree by the `neurostrata-r30c` plan's first task, before that plan implements
-> anything. Do not treat a stale §3/§5/§12 anchor as a live one.
+> **Anchor scope.** Every anchor in this spec — this table's and the prose anchors in §0,
+> §3, §5, §6, §7, §10 and §12 — is live against the working tree as of `e97d0ab`
+> (2026-10-22); the prose anchors were re-derived by the `neurostrata-r30c` plan's first
+> task. Verify each claim at its anchor. The dated spans marked "(at `c5acd4f`)" are the
+> exception: they record what an earlier commit cited and are not live anchors.
 
 | Constraint | Anchor |
 |---|---|
@@ -178,9 +179,11 @@ the shape, and an undeclared shape is invisible (§2).
   X, while two attempts about the same approach are still compared with each other.
   The partition uses the **same** predicate as the `[FAILED ATTEMPT]` prefix: a row whose
   `metadata.attempt` is malformed is neither rendered as a negative nor partitioned as
-  one — it is a plain row (the store accepts a malformed attempt with a soft warning,
-  `src/store/ladybug.rs:1066-1095`). Rendering and partitioning must not disagree, or a row
-  would be shown to the agent as a failure while being compared against successes.
+  one — it is a plain row (the store accepts a malformed attempt with a soft warning:
+  `src/store/ladybug.rs:970` — the `parse_edge_specs` seam where that check lands; the
+  `WriteShapeWarning` at `:951-955`, emitted to stderr at `:1106-1107`). Rendering and
+  partitioning must not disagree, or a row would be shown to the agent as a failure while
+  being compared against successes.
 
 #### 3.1.4 Validation
 
@@ -571,8 +574,9 @@ serializes the result. The bus's eight integers stay exactly where they are, so 
 existing reader of that body keeps working, and the bus itself never learns what a
 domain is.
 
-`neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:117-118`),
-so it inherits this body without knowing anything about it.
+`neurostrata-mcp bus-metrics` is an HTTP client of the daemon (`src/main.rs:117-118` — the
+command declaration; the POST is `src/main.rs:1687-1691`), so it inherits this body without
+knowing anything about it.
 
 **The counters belong to the daemon process.** The topology has two processes in stdio
 mode: the MCP proxy the client talks to, and the detached daemon that owns the store
@@ -649,7 +653,7 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
    SynapticMesh export/import round-trip (`memory_type` stays `fact`).
 2. A `fact` with a malformed `metadata.attempt` is **written** and emits a
    `WriteShapeWarning`.
-3. `vocabulary_version` is 6, `src/traits.rs:263` asserts 6, and the vocabulary declares
+3. `vocabulary_version` is 6, `src/traits.rs:312` asserts 6, and the vocabulary declares
    `fact.fields.topology`, `fact.fields.attempt` and `fact.fields.domain_registry`
    (`topology` shipped with the parent's 4 → 5 bump; this spec's two fields ship with 6).
 4. A search for *"how do we do X"* in a namespace holding both a positive `fact` about X
@@ -717,7 +721,7 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | The mesh imports a record with an unseen domain | The slug is unioned into the local registry | No shared record is refused for a local vocabulary gap. |
 | The registry row matches a vector query | It is dropped at the store's per-row filter seam, so it never occupies a result slot; at worst it uses one over-fetch slot | No registry content is ever returned to an agent. |
 | The mesh's unknown-type policy is reconciled the other way (`neurostrata-wl4i`) | The negative exemplar is a `fact`, which is shareable under either reading | The design does not depend on the unresolved contradiction. |
-| The vocabulary bump breaks a consumer | One assert at `src/traits.rs:263` | Localized, compile-time, greppable. |
+| The vocabulary bump breaks a consumer | One assert at `src/traits.rs:312` | Localized, compile-time, greppable. |
 
 ---
 
@@ -764,7 +768,7 @@ the registry helpers (2) and the vocabulary declaration (3).
 
 | Metric | Definition | Surface | Threshold | Reader |
 |---|---|---|---|---|
-| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | `"recall": {recall_responses, recall_promotions}` on the metrics surface (§3.4.2); incremented at the recall path (`src/buffer.rs:129-177`) and the promotion path (`src/server.rs:2652`) | < 10% over the daemon's current lifetime with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
+| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | `"recall": {recall_responses, recall_promotions}` on the metrics surface (§3.4.2); incremented at the recall path (`src/buffer.rs:133-298`) and the promotion path (`src/server.rs:2706`) | < 10% over the daemon's current lifetime with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
 | `domain_queries_total` | recall/search calls carrying a domain filter | `"domain_filter"` on the metrics surface — an extra top-level key beside the bus's eight integers (§3.4.2) | — | operator; agent |
 | `domain_narrowed_hits` | filter matched ≥1 row and narrowed the set | as above | — | operator; agent |
 | `domain_fallback_vector` | filter matched 0 rows; fell back to vector | as above | a persistently high rate means the domains are wrong or sparse | operator; the next registry spec |
@@ -838,7 +842,7 @@ E.1–E.3 and named E.4 as a task.
 |---|---|
 | The brief cited the closed relation loop at `src/store/ladybug.rs:445-452` (at `c5acd4f`) | It is the four-key relation array at `:1000-1008`; `:986-998` is the `metadata` root check. (Argon) |
 | The brief cited `increment_access_count` at `src/store/ladybug.rs:1993` (at `c5acd4f`) | It is at `:2160`. (Argon) |
-| `src/synaptic_mesh/record.rs:26-28` names `structural` as a mesh memory type | The binding set is three (`src/synaptic_mesh/import.rs:61`); `structural` is rejected at import. Doc corrected in commit `c5acd4f`. (K3) |
+| `src/synaptic_mesh/record.rs:26-28` (at `c5acd4f`) names `structural` as a mesh memory type | The binding set is three (`src/synaptic_mesh/import.rs:61`); `structural` is rejected at import. Doc corrected in commit `c5acd4f`. (K3) |
 | A mesh row may carry a non-UUID id | Rows whose id fails `Uuid::parse_str` are skipped (`src/synaptic_mesh/worker.rs:180-183`) — the registry row therefore uses a deterministic **UUID v5**. (Argon) |
 
 **The checker's findings** (session `ses_ea3515449fferHzlPrObOKwd9E`). The checker
