@@ -4,7 +4,7 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
-## [Unreleased] - 2026-10-22
+## [1.11.0] - 2026-10-22
 
 ### Added
 
