@@ -17,11 +17,13 @@ now see what it touched.
 
 `recalled` is always there. Every response in the append's response family carries it,
 the successful one and the failed one alike (`src/buffer.rs:199`, `:316`) — it is an
-array, and an empty array means *nothing matched*, not that the recall failed or was
-forgotten. The caller never has to distinguish an absent key from an honest zero. (The
-refusals that precede the append — a missing argument, an entry the secret scan rejects,
-a disabled buffer — are plain strings and are not part of that family
-(`src/buffer.rs:138-150`, `:162-169`).)
+array, and an empty array is not by itself a verdict. An empty array *with* a
+`recalled_from` means a search ran and matched nothing. An empty array *without* one
+means no search produced rows: either no search ran (an untagged turn) or the search
+failed — the array alone does not separate those two. The caller never has to
+distinguish an absent key from an honest zero. (The refusals that precede the append —
+a missing argument, an entry the secret scan rejects, a disabled buffer — are plain
+strings and are not part of that family (`src/buffer.rs:138-150`, `:162-169`).)
 
 Each entry is a pointer with five keys: `id`, `memory_type`, `domain`, `score` and
 `snippet` (`src/buffer.rs:278-284`). The snippet is the first 120 characters of the

@@ -214,7 +214,7 @@ back — so this may be a *wiring* problem, not a *design* problem. Does topic
 linkage ride the episodic tag, a `domain` filter on search, a namespace
 convention, or a declared vocabulary term? If it rides `domain`, note that
 `domain` is currently free-text with no validation and no filter — it would
-need both.
+need both. *[changed by the proactive-recall plan: `domain` is normalized to a slug on write, and it is now an optional soft filter on search]*
 
 **Q5 — Negative exemplars (added by the external review).** What represents
 "we tried this here, and it went wrong"? NeuroStrata's vocabulary has no type

@@ -91,7 +91,7 @@ elsewhere or is another spec's subject):
 | Mesh export publishes only `eligibility: shareable`; absent or `private` reads as private | `src/synaptic_mesh/worker.rs:174-179` |
 | Relations are closed; the four keys are hardcoded | `src/store/ladybug.rs:455-462` |
 | `domain` is written raw on add | `src/server.rs:1279-1281` |
-| `domain` is read back and echoed to export; it never filters retrieval | `src/store/ladybug.rs:1854`, `:1907` |
+| `domain` is read back and echoed to export; it never filters retrieval *[changed: `domain` is now an optional soft filter on search]* | `src/store/ladybug.rs:1995-1996` (read), `:2048` (emitted) |
 | A row's vector is the embedding of its **content**, unchanged; nothing negates it | `src/server.rs:1147-1150` |
 | The snapshot's straps are computed off the **pre-truncation** list; then sort by `access_count` desc and truncate to 5 | `src/server.rs:1454-1460`, `:1465-1480` |
 | `get_snapshot`'s input schema takes only `namespace`; its handler takes no embedder | `src/server.rs:153-161`, `:1416` |

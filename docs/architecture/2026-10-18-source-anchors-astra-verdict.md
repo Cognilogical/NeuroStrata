@@ -10,8 +10,12 @@ Evidence: supplied findings and repository only; no other architect output.
 Goal: lossless, stable shared exports without requiring Git; preserve
 fail-soft writes while exposing missing graph edges.
 
-`src/store/ladybug.rs:1992-1994`, `:2008-2014` prefers metadata.absolute_path, then
-canonicalizes location against process CWD. Fixing only the fallback
+`src/store/ladybug.rs:1584-1625` prefers metadata.absolute_path, then
+canonicalizes location against process CWD. *(the cited code is gone: the
+export now resolves the path through the source-anchor registry —
+`crate::source_context::export_absolute_path`, `src/source_context.rs:42-99`
+— and `dunce` is no longer called from any file in `src/`; 2026-10-21)*
+Fixing only the fallback
 leaves stale metadata authoritative. This code derives export output;
 it does not itself demonstrate database mutation.
 

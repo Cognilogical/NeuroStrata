@@ -12,9 +12,9 @@
   - hardcoded `base_url = https://api.typesafe.ai/v1`
   - POSTs `/evaluate` with `{model:"jev-1.13", questions:{...}}`
   - parses `answers[*].probability` (NOT `{type:noul,noul:...}` as brief stated)
-- Enable signal: `config.judgment_api_key.is_some()` (`mod.rs:79,110`); mock otherwise.
+- Enable signal: `config.judgment_api_key.is_some()` (`mod.rs:79,108`); mock otherwise. *(the enable-signal check now reads `src/judgment/mod.rs:79` and `:110`; 2026-10-21)*
 - Config: `judgment_api_key: Option<String>` plaintext in
-  `~/.config/neurostrata/config.json` (the field at `src/config.rs:13`; the path is built at `src/config.rs:99-102`).
+  `~/.config/neurostrata/config.json` (`src/config.rs:11`). *(the field is at `src/config.rs:13` and the path is built at `src/config.rs:99-102`; 2026-10-21)*
 - Circuit breaker, timeout, confidence threshold already present ✓
 - No Laya references in tree.
 
