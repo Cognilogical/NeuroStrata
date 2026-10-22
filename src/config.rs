@@ -5,67 +5,57 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Provider selection mode for deduplication.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupProviderMode {
+    Auto,
+    Heuristic,
+    LayaLocal,
+    Jev,
+    None,
+}
+
 #[derive(Debug, Deserialize, serde::Serialize, Clone)]
 pub struct DeduplicationConfig {
-    /// API key for judgment model (TypeSafe Jev or compatible)
-    /// Presence of key enables deduplication, absence disables it
+    #[serde(default)]
+    pub provider: DedupProviderMode,
+    pub judgment_api_key_env: Option<String>,
     #[serde(default)]
     pub judgment_api_key: Option<String>,
-
-    /// Request timeout in seconds
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
-
-    /// Similarity threshold for candidate selection (0.0-1.0)
     #[serde(default = "default_similarity_threshold")]
     pub similarity_threshold: f32,
-
-    /// Confidence threshold to consider something a duplicate (0.0-1.0)
     #[serde(default = "default_confidence_threshold")]
     pub confidence_threshold: f32,
-
-    /// Maximum number of candidates to check
     #[serde(default = "default_max_candidates")]
     pub max_candidates: usize,
-
-    /// Circuit breaker: failures before opening
     #[serde(default = "default_cb_failure_threshold")]
     pub cb_failure_threshold: u32,
-
-    /// Circuit breaker: initial backoff in seconds
     #[serde(default = "default_cb_backoff_initial")]
     pub cb_backoff_initial_seconds: u64,
-
-    /// Circuit breaker: maximum backoff in seconds
     #[serde(default = "default_cb_backoff_max")]
     pub cb_backoff_max_seconds: u64,
 }
 
-fn default_timeout() -> u64 {
-    5
-}
-fn default_similarity_threshold() -> f32 {
-    0.85
-}
-fn default_confidence_threshold() -> f32 {
-    0.8
-}
-fn default_max_candidates() -> usize {
-    5
-}
-fn default_cb_failure_threshold() -> u32 {
-    3
-}
-fn default_cb_backoff_initial() -> u64 {
-    30
-}
-fn default_cb_backoff_max() -> u64 {
-    3600
+fn default_timeout() -> u64 { 5 }
+fn default_similarity_threshold() -> f32 { 0.85 }
+fn default_confidence_threshold() -> f32 { 0.8 }
+fn default_max_candidates() -> usize { 5 }
+fn default_cb_failure_threshold() -> u32 { 3 }
+fn default_cb_backoff_initial() -> u64 { 30 }
+fn default_cb_backoff_max() -> u64 { 3600 }
+
+impl Default for DedupProviderMode {
+    fn default() -> Self { Self::Auto }
 }
 
 impl Default for DeduplicationConfig {
     fn default() -> Self {
         Self {
+            provider: DedupProviderMode::Auto,
+            judgment_api_key_env: None,
             judgment_api_key: None,
             timeout_seconds: default_timeout(),
             similarity_threshold: default_similarity_threshold(),
@@ -106,7 +96,6 @@ impl Config {
         let home_dir = dirs::home_dir().context("Could not find home directory")?;
         let config_path = Self::default_path()?;
 
-        // If config doesn't exist, create default
         if !config_path.exists() {
             let default_config = Config {
                 db_path: home_dir
@@ -140,8 +129,6 @@ impl Config {
             .with_context(|| format!("Could not read config at {}", path.display()))?;
         let mut config: Config = serde_json::from_str(&content)?;
 
-        // If they have a legacy config where db_path points to an existing directory (from LanceDB),
-        // we need to append a filename so LadybugDB doesn't crash.
         if config.db_path.is_dir() {
             config.db_path = config.db_path.join("ladybug.db");
         }
@@ -194,10 +181,7 @@ impl Config {
             file.write_all(b"\n")?;
             if let Some(permissions) = existing_permissions {
                 file.set_permissions(permissions).with_context(|| {
-                    format!(
-                        "Could not preserve config permissions at {}",
-                        path.display()
-                    )
+                    format!("Could not preserve config permissions at {}", path.display())
                 })?;
             }
             file.sync_all()?;
@@ -272,7 +256,6 @@ mod tests {
     #[test]
     fn config_without_project_contexts_deserializes_empty_registry() {
         let config: Config = serde_json::from_str(r#"{"db_path":"db"}"#).unwrap();
-
         assert!(config.project_contexts.is_empty());
     }
 
@@ -283,7 +266,8 @@ mod tests {
         fs::create_dir(&marker).unwrap();
         let regular_file = root.join("file");
         fs::write(&regular_file, "not a directory").unwrap();
-        let mut config = Config::load_from(&write_config(&root)).unwrap();
+        let config_path = write_config(&root);
+        let mut config = Config::load_from(&config_path).unwrap();
 
         assert!(config.bind_project_context("", &marker).is_err());
         assert!(config.bind_project_context("  \t", &marker).is_err());
@@ -350,7 +334,7 @@ mod tests {
         fs::create_dir(&marker).unwrap();
 
         let mut config = Config::load_from(&config_path).unwrap();
-        assert!(config.bind_project_context("bad", &root).is_err());
+        assert!(config.bind_project_context("bad", &marker).is_err());
         assert!(config.unbind_project_context("unknown").is_err());
 
         assert_eq!(fs::read(&config_path).unwrap(), original);
@@ -421,5 +405,88 @@ mod tests {
         let path = root.join("config.json");
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    // Task 5 Step 1: provider selection config tests. These tests FAIL until
+    // Step 2 adds `provider` and `judgment_api_key_env` to DeduplicationConfig.
+    // They are written first so the spec's sequence is honored.
+
+    /// Old JSON with a literal `judgment_api_key` must deserialize safely for
+    /// one compatibility release WITHOUT auto-selecting Jev.
+    #[test]
+    fn dedup_provider_config_legacy_literal_key_does_not_auto_select_jev() {
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","deduplication":{"judgment_api_key":"old-literal-key"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.deduplication.judgment_api_key.as_deref(),
+            Some("old-literal-key")
+        );
+        assert_ne!(
+            config.deduplication.provider,
+            DedupProviderMode::Jev,
+            "legacy literal key must not auto-select Jev"
+        );
+    }
+
+    /// Default config without a key must select `auto` (not Jev, not None).
+    #[test]
+    fn dedup_provider_config_default_auto_without_key() {
+        let config: Config = serde_json::from_str(r#"{"db_path":"test.db"}"#).unwrap();
+        assert_eq!(config.deduplication.provider, DedupProviderMode::Auto);
+        assert!(config.deduplication.judgment_api_key.is_none());
+        assert!(config.deduplication.judgment_api_key_env.is_none());
+    }
+
+    /// Explicit `jev` with an env var reference.
+    #[test]
+    fn dedup_provider_config_explicit_jev_with_env_key() {
+        std::env::set_var("TYPESAFE_API_KEY", "env-key-123");
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","deduplication":{"provider":"jev","judgment_api_key_env":"TYPESAFE_API_KEY"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.deduplication.provider, DedupProviderMode::Jev);
+        assert_eq!(
+            config.deduplication.judgment_api_key_env.as_deref(),
+            Some("TYPESAFE_API_KEY")
+        );
+        std::env::remove_var("TYPESAFE_API_KEY");
+    }
+
+    /// Explicit `jev` without a key must NOT auto-failover.
+    #[test]
+    fn dedup_provider_config_jev_without_key_does_not_failover() {
+        std::env::remove_var("TYPESAFE_API_KEY");
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","deduplication":{"provider":"jev"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.deduplication.provider, DedupProviderMode::Jev);
+        assert!(config.deduplication.judgment_api_key.is_none());
+        assert!(config.deduplication.judgment_api_key_env.is_none());
+    }
+
+    /// `none` disables dedup learning entirely.
+    #[test]
+    fn dedup_provider_config_none_disables_dedup_learning() {
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","deduplication":{"provider":"none"}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.deduplication.provider, DedupProviderMode::None);
+    }
+
+    /// `similarity_threshold` is deprecated and must not be applied to raw
+    /// distance.
+    #[test]
+    fn dedup_provider_config_similarity_threshold_deprecated() {
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","deduplication":{"similarity_threshold":0.95}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.deduplication.similarity_threshold, 0.95);
+        assert_eq!(config.deduplication.provider, DedupProviderMode::Auto);
     }
 }

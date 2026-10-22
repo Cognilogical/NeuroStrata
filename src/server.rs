@@ -3500,6 +3500,8 @@ mod tests {
                 last_candidate_count: last.clone(),
             });
             let mut cfg = crate::config::DeduplicationConfig {
+                provider: crate::config::DedupProviderMode::Jev,
+                judgment_api_key_env: None,
                 judgment_api_key: Some("test".to_string()),
                 timeout_seconds: 5,
                 similarity_threshold: 0.85,
@@ -3554,6 +3556,8 @@ mod tests {
                 last_candidate_count: last.clone(),
             });
             let cfg = crate::config::DeduplicationConfig {
+                provider: crate::config::DedupProviderMode::Auto,
+                judgment_api_key_env: None,
                 judgment_api_key: Some("test".to_string()),
                 timeout_seconds: 5,
                 similarity_threshold: 0.85,
@@ -3620,6 +3624,8 @@ mod tests {
                 last_candidate_count: last.clone(),
             });
             let cfg = crate::config::DeduplicationConfig {
+                provider: crate::config::DedupProviderMode::Auto,
+                judgment_api_key_env: None,
                 judgment_api_key: Some("test".to_string()),
                 timeout_seconds: 5,
                 similarity_threshold: 0.85,
