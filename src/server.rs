@@ -6025,4 +6025,67 @@ mod tests {
             assert_eq!(parsed.get("recalled_from").and_then(|v| v.as_str()), Some("domain"));
         }
     }
+
+    /// The printed path carries the graph's own direction. The store's
+    /// orientation fix (task neurostrata-ttmr) changes the one-hop line only
+    /// for a directed relation -- RELATES_TO is drawn undirected there
+    /// (src/server.rs:2460) -- so this pins an outgoing GOVERNS edge's text.
+    #[tokio::test]
+    async fn an_outgoing_directed_edge_is_printed_from_the_primary() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-outgoing-render-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
+            .expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        // The target first: an edge target must exist before the row that
+        // declares the edge, or the edge is skipped as a write-shape warning.
+        store
+            .upsert(
+                "probe",
+                "probe::target.rs",
+                vec![0.1, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "a file".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "file".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The rule governs the file: the edge points from the rule to the file.
+        store
+            .upsert(
+                "probe",
+                "probe::rule-1",
+                vec![1.1, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "a rule".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "governs": ["probe::target.rs"] }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false)
+            .await
+            .unwrap();
+        let text = render_search_results(&results);
+        assert!(
+            text.contains("\"probe::rule-1\" -GOVERNS- \"probe::target.rs\""),
+            "an outgoing edge must print from the primary: {}",
+            text
+        );
+    }
 }

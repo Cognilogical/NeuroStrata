@@ -136,7 +136,7 @@ which:
 
 ## 2. The substrate (verified; do not re-propose it)
 
-Verified against source on 2026-10-21 at `940736f`.
+Verified against source on 2026-10-21 at `940736f`. *(the anchors were re-derived on 2026-10-22)*
 
 | Constraint | Anchor |
 |---|---|
@@ -148,17 +148,17 @@ Verified against source on 2026-10-21 at `940736f`.
 | A semantic vocabulary change requires a `vocabulary_version` bump | `src/schemas/memory-vocabulary.v3.json:155`; asserted at `src/traits.rs:263` |
 | The agent learns the vocabulary only from `tool_summaries.memory_type` and the tool description | `src/schemas/memory-vocabulary.v3.json:161` |
 | The mesh is closed over shareable types — `["rule", "fact", "procedure"]`; an unknown `memory_type` is **rejected at import time** with a hard `Err` | `src/synaptic_mesh/import.rs:61`, `:649-655`; contract at `src/synaptic_mesh/record.rs:26-28` |
-| Relations are closed (`GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM`) and custom relations are **not materialized** | `src/schemas/memory-vocabulary.v3.json`, `extensions.custom_relations`; `src/store/ladybug.rs:445-452` |
+| Relations are closed (`GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM`) and custom relations are **not materialized** | `src/schemas/memory-vocabulary.v3.json`, `extensions.custom_relations`; `src/store/ladybug.rs:461-468` |
 | `domain` is written on add (raw, unvalidated) *[changed by the proactive-recall plan: the domain is normalized to a slug on write]* | `src/server.rs:1279-1281` |
-| `domain` is read back and echoed to export; it never filters retrieval *[changed by the proactive-recall plan: it is now an optional soft filter on search]* | `src/store/ladybug.rs:1854` (read), `:1907` (emitted) |
+| `domain` is read back and echoed to export; it never filters retrieval *[changed by the proactive-recall plan: it is now an optional soft filter on search]* | `src/store/ladybug.rs:1870` (read), `:1923` (emitted) |
 | The snapshot's straps are computed **before** the cut; then it sorts strictly by `access_count` desc and truncates to 5 | `src/server.rs:1454-1460`, `:1465-1480` |
 | `get_snapshot`'s input schema takes only `namespace` | `src/server.rs:153-161` |
 | `handle_append_log(arguments)` — no `emb`, no `store`; the response is `{appended, file, size_bytes, rolled, tags}` *[changed by the proactive-recall plan: the handler takes the embedder and the store; the response carries `recalled`]* | `src/buffer.rs:129-177`; dispatch `src/server.rs:664` |
 | `append_log`'s input schema has `content`, `project_root`, `tags` — **no `namespace`** | `src/server.rs:373-380` |
-| A malformed declared shape is a **soft** failure: `parse_edge_specs` emits a `WriteShapeWarning` and the durable write still succeeds | `src/store/ladybug.rs:416`, `:424`, `:529` |
-| `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)` — the `include_*` flags are the precedent for another parameter | `src/traits.rs:165-172`; impl `src/store/ladybug.rs:1004` |
+| A malformed declared shape is a **soft** failure: `parse_edge_specs` emits a `WriteShapeWarning` and the durable write still succeeds | `src/store/ladybug.rs:432`, `:440`, `:545` |
+| `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)` — the `include_*` flags are the precedent for another parameter | `src/traits.rs:165-172`; impl `src/store/ladybug.rs:1020` |
 | A task's extracted memory defaults to `memory_type: "fact"` when the caller names none | `src/task/mod.rs:1110-1116` |
-| `access_count` is incremented only by the MCP search handler and the get-memory handler — never by `VectorStore::search` itself | `src/server.rs:2019`, `:2652`; `src/store/ladybug.rs:1993` |
+| `access_count` is incremented only by the MCP search handler and the get-memory handler — never by `VectorStore::search` itself | `src/server.rs:2019`, `:2652`; `src/store/ladybug.rs:2009` |
 
 ---
 

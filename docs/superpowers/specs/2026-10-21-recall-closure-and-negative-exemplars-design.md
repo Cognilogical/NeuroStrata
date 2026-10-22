@@ -77,7 +77,12 @@ elsewhere or is another spec's subject):
 
 ---
 
-## 2. The substrate (the claims were verified at `c5acd4f`; the anchors are live against the working tree as of 2026-10-21 — verify each claim at its anchor; the panel did not re-propose it)
+## 2. The substrate (the claims were verified at `c5acd4f`; **this table's** anchors are live against the working tree as of 2026-10-22 — verify each claim at its anchor; the panel did not re-propose it)
+
+> **Anchor scope.** Only this table's anchors are live against the working tree. The prose
+> anchors in §3, §5 and §12 are as of `c5acd4f` — 30 of them — and are re-derived against
+> the working tree by the `neurostrata-r30c` plan's first task, before that plan implements
+> anything. Do not treat a stale §3/§5/§12 anchor as a live one.
 
 | Constraint | Anchor |
 |---|---|
@@ -89,20 +94,20 @@ elsewhere or is another spec's subject):
 | The mesh's own import doc **contradicts its code**: the comment says an unknown type is "ignored and reported, never applied, never crash"; the code returns a hard `Err` | doc `src/synaptic_mesh/import.rs:57-60`; code `:649-655`. Task `neurostrata-wl4i` owns the reconciliation (§11). This spec is safe under **either** reading — a `fact` is shareable under both. |
 | A mesh row whose id is not a parseable **UUID is skipped** — ids must be UUIDs | `src/synaptic_mesh/worker.rs:180-183`; `MeshRecord.id: Uuid` at `src/synaptic_mesh/record.rs:24` |
 | Mesh export publishes only `eligibility: shareable`; absent or `private` reads as private | `src/synaptic_mesh/worker.rs:174-179` |
-| Relations are closed; the four keys are hardcoded | `src/store/ladybug.rs:985-991` |
+| Relations are closed; the four keys are hardcoded | `src/store/ladybug.rs:1001-1007` |
 | `domain` is written raw on add *[changed: the domain is normalized to a slug on write]* | `src/server.rs:1281-1282` (raw insert), `:1292-1294` (slug normalization; the comment at `:1288-1291` says the write never guesses a domain) |
-| `domain` is read back and echoed to export; it never filters retrieval *[changed: `domain` is now an optional soft filter on search]* | `src/store/ladybug.rs:1995-1996` (read), `:2048` (emitted) |
+| `domain` is read back and echoed to export; it never filters retrieval *[changed: `domain` is now an optional soft filter on search]* | `src/store/ladybug.rs:2011-2012` (read), `:2064` (emitted) |
 | A row's vector is the embedding of its **content**, unchanged; nothing negates it | `src/server.rs:1147-1150` |
 | The snapshot's straps are computed off the **pre-truncation** list; then sort by `access_count` desc and truncate to 5 | `src/server.rs:1465` (`task_head`), `:1471` (`procedures_due_strap`), `:1476-1490` (the `access_count`-desc sort), `:1491` (`truncate(5)`) |
 | `get_snapshot`'s input schema takes only `namespace`; its handler takes no embedder | `src/server.rs:153-161`, `:1427-1430` |
 | `handle_append_log(arguments)` — no `emb`, no `store`; response `{appended, file, size_bytes, rolled, tags}` *[changed: the handler takes `emb` and `store`; the response carries `recalled` and, when a search ran, `recalled_from`]* | `src/buffer.rs:133-136` (signature), `:304-321` (response); dispatch `src/server.rs:666` |
-| A malformed declared shape is a **soft** failure — `WriteShapeWarning`, the write still succeeds — and the warning goes to **stderr**, which an MCP agent never sees | `src/store/ladybug.rs:935` (the `WriteShapeWarning` struct), `:1090-1091` (the stderr emission) |
-| `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)` | `src/traits.rs:175` (`pub trait VectorStore`), `:193-199` (`search`); impl `src/store/ladybug.rs:1565` |
+| A malformed declared shape is a **soft** failure — `WriteShapeWarning`, the write still succeeds — and the warning goes to **stderr**, which an MCP agent never sees | `src/store/ladybug.rs:951` (the `WriteShapeWarning` struct), `:1106-1107` (the stderr emission) |
+| `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)` | `src/traits.rs:175` (`pub trait VectorStore`), `:193-199` (`search`); impl `src/store/ladybug.rs:1581` |
 | `store.get(namespace, id)` and `store.list(namespace, user_id)` exist | `src/traits.rs:223` (`get`), `:220` (`list`) |
-| `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2144` |
+| `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2050`, `:2706`; `src/store/ladybug.rs:2160` |
 | `create_new_namespace: true` is the established **escape-hatch** precedent for a write that would otherwise be refused | `src/server.rs:117`, `:1219-1224`, `:1238-1239`, `:1313-1315` |
-| Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1248-1254`; the excluded-type list is built at `:60-65` and applied in the query at `:72` |
-| The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1259`, `is_mesh_conflicting` `:1269`, `is_retired_at` `:2251`; applied at `:98`, `:105`, `:108` |
+| Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1264-1270`; the excluded-type list is built at `:76-81` and applied in the query at `:88` |
+| The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1275`, `is_mesh_conflicting` `:1285`, `is_retired_at` `:2267`; applied at `:114`, `:121`, `:124` |
 | The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1160` (the `>= 0.85` filter), `:1164` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
 | `format_memory` is the rendering path for a returned row | `src/server.rs:2276` |
 | The bus metrics surface serializes the bus's own counters (eight integers) | `src/handlers/bus_metrics.rs:20-23` |
