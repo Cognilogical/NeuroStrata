@@ -99,13 +99,13 @@ elsewhere or is another spec's subject):
 | `domain` is written raw on add *[changed by neurostrata-r30c: the domain is normalized to a slug on write, and the registry check reads the raw value captured before that normalization]* | `src/server.rs:1283-1284` (raw insert), `:1303-1305` (slug normalization; the comment at `:1299-1302` says the write never guesses a domain), `:1290-1298` (the raw-domain capture the check reads), `:1331-1345` (the check) |
 | `domain` is read back and echoed to export; it never filters retrieval *[changed: `domain` is now an optional soft filter on search]* | `src/store/ladybug.rs:2011-2012` (read), `:2064` (emitted) |
 | A row's vector is the embedding of its **content**, unchanged; nothing negates it | `src/server.rs:1149-1152` |
-| The snapshot's straps are computed off the **pre-truncation** list; then sort by `access_count` desc and truncate to 5 | `src/server.rs:1504` (`task_head`), `:1510` (`procedures_due_strap`), `:1515-1529` (the `access_count`-desc sort), `:1530` (`truncate(5)`) |
-| `get_snapshot`'s input schema takes only `namespace`; its handler takes no embedder | `src/server.rs:153-161`, `:1466-1469` |
+| The snapshot's straps are computed off the **pre-truncation** list; then sort by `access_count` desc and truncate to 5 | `src/server.rs:1520` (`task_head`), `:1526` (`procedures_due_strap`), `:1531-1547` (the `access_count`-desc sort), `:1699` (`truncate(5)`) |
+| `get_snapshot`'s input schema gains an optional `domain`; its handler takes no embedder | `src/server.rs:153-162`, `:1474-1477` |
 | `handle_append_log(arguments)` — no `emb`, no `store`; response `{appended, file, size_bytes, rolled, tags}` *[changed: the handler takes `emb` and `store`; the response carries `recalled` and, when a search ran, `recalled_from`]* | `src/buffer.rs:133-136` (signature), `:304-321` (response); dispatch `src/server.rs:668` |
 | A malformed declared shape is a **soft** failure — `WriteShapeWarning`, the write still succeeds — and the warning goes to **stderr**, which an MCP agent never sees | `src/store/ladybug.rs:951` (the `WriteShapeWarning` struct), `:1106-1107` (the stderr emission) |
 | `VectorStore::search(namespace, vector, limit, include_tasks, include_archived)` | `src/traits.rs:175` (`pub trait VectorStore`), `:193-199` (`search`); impl `src/store/ladybug.rs:1581` |
 | `store.get(namespace, id)` and `store.list(namespace, user_id)` exist | `src/traits.rs:223` (`get`), `:220` (`list`) |
-| `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2089`, `:2745`; `src/store/ladybug.rs:2160` |
+| `access_count` is incremented only by the MCP search handler and the get-memory handler | `src/server.rs:2261`, `:2925`; `src/store/ladybug.rs:2160` |
 | `create_new_namespace: true` is the established **escape-hatch** precedent for a write that would otherwise be refused *[changed by neurostrata-r30c: `register_domain` is the same shape, and the registry check sits after the namespace-existence check]* | `src/server.rs:117`, `:1221-1226`, `:1240-1241`, `:1324-1326`, `:1331-1345` |
 | Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1270-1276`; the excluded-type list is built at `:76-81` and applied in the query at `:87` |
 | The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1281`, `is_mesh_conflicting` `:1291`, `is_retired_at` `:2273`; applied at `:114`, `:121`, `:124` |
@@ -238,8 +238,8 @@ metadata, not knowledge. The mechanism is explicit, not borrowed:
   could not reach the registry row anyway — it carries no `EXTRACTED_FROM` edge — but the
   exclusion is applied there too, so the rule is uniform rather than incidental.)
 - **In the snapshot**, the exclusion is a `retain` on the list the snapshot has already
-  fetched — beside the archived and mesh-conflicting retains (`src/server.rs:1492`,
-  `:1496`, `:1498`) — so it costs nothing beyond the scan.
+  fetched — beside the archived and mesh-conflicting retains (`src/server.rs:1500`,
+  `:1504`, `:1512`) — so it costs nothing beyond the scan.
 
 The structural-type exclusion is **not** the mechanism: that one is by `memory_type` at
 query-build time (`src/store/ladybug.rs:76-84`, `:86-89`) over a fixed five-member
@@ -463,7 +463,7 @@ there is nothing to show:
 
 - **`Registered domains (N): <slug1>, <slug2>`** — the namespace's registry, as the
   agent sees it (the registry row of §3.2.1). The snapshot fetches the namespace's rows
-  with `store.list` (`src/server.rs:1477-1480`), not `store.search`, so the store's
+  with `store.list` (`src/server.rs:1484-1487`), not `store.search`, so the store's
   per-row filter seam never touches this list — the snapshot's own exclusion is the
   `retain` of §3.2.1. The registry row is therefore either read directly by its
   deterministic id (`store.get`, `src/traits.rs:223`) or captured from the listed rows
@@ -483,7 +483,7 @@ Worst case 3 × 120 characters ≈ 90–100 tokens at session start.
 #### 3.3.4 Invariants
 
 - **`access_count` is never mutated.** The strap reads the list it already has; the only
-  two increments remain `src/server.rs:2089` and `:2745`. A strap hit cannot promote
+  two increments remain `src/server.rs:2261` and `:2925`. A strap hit cannot promote
   itself into the top-5.
 - **Additive.** The top-5 body is byte-identical to today's for any namespace; the strap
   is a new section beside it.
@@ -519,7 +519,7 @@ seat is considered.
 **Where:** two counters in the same module as the domain counters (§3.4.2) —
 `recall_responses`, incremented where the recall response is built (the parent's
 `append_log` path, `src/buffer.rs:133-298`), and `recall_promotions`, incremented where
-`get_memory` increments `access_count` (`src/server.rs:2745`). The join is a **bounded
+`get_memory` increments `access_count` (`src/server.rs:2925`). The join is a **bounded
 in-memory set of recently-recalled ids** in that module: the recall path records the
 ids it returned, the promotion path tests membership and removes the id. The set is
 bounded (the most recent recall responses) and evicted on promotion or on age, so it
@@ -637,10 +637,10 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | 3 | **[P+N]** Vocabulary, **two** bumps in a fixed order: **4 → 5** (P) carries `fact.fields.topology` and lands with the parent's implementation; **5 → 6** (N) carries `fact.fields.attempt` and `fact.fields.domain_registry` and lands with this spec's; the assert at `src/traits.rs:312`; `tool_summaries.add` and `tool_summaries.memory_type` | `src/schemas/memory-vocabulary.v3.json:2`, `:66-83`, `:172`, `:175`; `src/traits.rs:312` |
 | 4 | **[N]** The write-path registry check: bootstrap when absent, reconcile when the slug is missing from the cache, reject when it is in neither the cache nor the namespace's data, `register_domain: true` to override — on both write paths, each taking its slug from its own source (`domain` on add_memory, `metadata.domain` on task_complete) | `src/server.rs:1283-1285`, `:1331-1345`, `:1357`; `src/task/mod.rs:1132-1157`, `:1178-1194`, `:1204-1211` |
 | 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:255-271`; `src/store/ladybug.rs:1581`, `:1602-1630`; `src/server.rs:2045-2061` |
-| 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-127`; `src/server.rs:1492`, `:1496`, `:1498` |
+| 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-127`; `src/server.rs:1500`, `:1504`, `:1512` |
 | 7 | **[P]** `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; the recall rides the response | `src/buffer.rs:133`, `:304-321`; `src/server.rs:372-384`, `:667-669`, `:2144` |
 | 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:979`; `src/server.rs:2324`; the parent's `recalled[]` response, built beside `src/buffer.rs:277-287`; `src/server.rs:1163-1175` |
-| 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-161`, `:1515-1538` |
+| 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-162`, `:1520-1707` |
 | 10 | **[N]** The `domain_filter` counters and their surface — process-global atomics in a module beside the search path, incremented in the **daemon** process (which serves both the MCP dispatch and `/bus/metrics`) and read directly by the metrics handler: no signature change, no `AppState` field, no route plumbing | new module beside the search path; `src/handlers/bus_metrics.rs:20-23`; `src/daemon.rs:534`, `:539`; `src/server.rs:909`; `src/main.rs:1775-1779` |
 | 11 | **[N]** The mesh import step unions an imported record's domain into the local registry | `src/synaptic_mesh/import.rs` |
 | 12 | Tests (§6) | `src/server.rs`, `src/buffer.rs`, `src/store/ladybug.rs`, `src/schemas/` |
@@ -769,7 +769,7 @@ the registry helpers (2) and the vocabulary declaration (3).
 
 | Metric | Definition | Surface | Threshold | Reader |
 |---|---|---|---|---|
-| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | `"recall": {recall_responses, recall_promotions}` on the metrics surface (§3.4.2); incremented at the recall path (`src/buffer.rs:133-298`) and the promotion path (`src/server.rs:2745`) | < 10% over the daemon's current lifetime with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
+| `recall_hit_rate` | recalled ids later promoted via `get_memory` ÷ recall responses | `"recall": {recall_responses, recall_promotions}` on the metrics surface (§3.4.2); incremented at the recall path (`src/buffer.rs:133-298`) and the promotion path (`src/server.rs:2925`) | < 10% over the daemon's current lifetime with ≥50 tagged turns → tighten the budget | operator; the next retrieval spec |
 | `domain_queries_total` | recall/search calls carrying a domain filter | `"domain_filter"` on the metrics surface — an extra top-level key beside the bus's eight integers (§3.4.2) | — | operator; agent |
 | `domain_narrowed_hits` | filter matched ≥1 row and narrowed the set | as above | — | operator; agent |
 | `domain_fallback_vector` | filter matched 0 rows; fell back to vector | as above | a persistently high rate means the domains are wrong or sparse | operator; the next registry spec |
@@ -903,8 +903,8 @@ the numeric bounds — and found two substantive defects, both in the amended ma
 | Cross-connection read visibility after another process's commit could not be verified at the engine level | It is **no longer load-bearing**: the cache framing means a stale cache is repaired by the reconcile, and a failed cache update never fails the write. |
 
 The round also verified what it could and left three items unread: the `BusMetrics`
-derive line above `src/events/subscriber.rs:178`, `src/server.rs:2745` (the
-`recall_hit_rate` promotion path) and `src/server.rs:2089` — all read and confirmed by
+derive line above `src/events/subscriber.rs:178`, `src/server.rs:2925` (the
+`recall_hit_rate` promotion path) and `src/server.rs:2261` — all read and confirmed by
 the orchestrator, along with the store's four filter sites
 (`src/store/ladybug.rs:114-127`, `:286-288`, `:343-345`, `:423-424`).
 

@@ -156,7 +156,8 @@ pub async fn process_mcp_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'." }
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'." },
+                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain slug(s) to surface in the domain strap, regardless of access_count." }
                             },
                             "required": ["namespace"]
                         }
@@ -1501,6 +1502,12 @@ async fn handle_get_snapshot(
     // Conflicting mesh rows are suppressed from the snapshot's effective
     // view too (same rationale as search_memory).
     all_memories.retain(|r| !crate::synaptic_mesh::conflict::is_conflicting(&r.payload));
+    // Capture the registry row's domains before the retain below drops it.
+    let registered_domains: Vec<String> = all_memories
+        .iter()
+        .find(|r| crate::registry::is_registry_row(&r.payload.metadata))
+        .map(|r| crate::registry::registry_domains(&r.payload.metadata))
+        .unwrap_or_default();
     // The registry row is metadata, not knowledge: never serve it.
     all_memories.retain(|r| !crate::registry::is_registry_row(&r.payload.metadata));
 
@@ -1536,6 +1543,159 @@ async fn handle_get_snapshot(
             .unwrap_or(0);
         b_count.cmp(&a_count)
     });
+
+    // The top-5 ids are captured BEFORE the strap so a row appears once.
+    let top5_ids: Vec<String> = all_memories.iter().take(5).map(|r| r.id.clone()).collect();
+
+    // Domain strap mode.
+    let domain_arg = arguments.get("domain");
+    let (mode, requested_slugs) = match domain_arg {
+        None => ("recent_domain", Vec::new()),
+        Some(Value::String(s)) => {
+            let slugs = crate::domain::normalize_domain_slug(s).into_iter().collect();
+            ("explicit", slugs)
+        }
+        Some(Value::Array(arr)) => {
+            let slugs: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(crate::domain::normalize_domain_slug)
+                .collect();
+            ("explicit", slugs)
+        }
+        _ => ("explicit", Vec::new()),
+    };
+
+    // Build strap candidates off the pre-truncation list.
+    let mut candidates: Vec<&crate::traits::SearchResult> = all_memories
+        .iter()
+        .filter(|r| !top5_ids.contains(&r.id))
+        .filter(|r| {
+            !matches!(
+                r.payload.memory_type.as_str(),
+                "directory" | "file" | "markdown" | "freshness_flag" | "guard_event" | "task" | "procedure"
+            )
+        })
+        .filter(|r| crate::domain::domain_key(&r.payload.metadata).is_some())
+        .collect();
+    if mode == "explicit" {
+        candidates.retain(|r| {
+            let slug = crate::domain::domain_key(&r.payload.metadata).unwrap();
+            requested_slugs.contains(&slug)
+        });
+    }
+    candidates.sort_by(|a, b| {
+        let va = a
+            .payload
+            .metadata
+            .get("valid_from")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let vb = b
+            .payload
+            .metadata
+            .get("valid_from")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        vb.cmp(&va)
+            .then_with(|| {
+                let aac = a
+                    .payload
+                    .metadata
+                    .get("access_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let bac = b
+                    .payload
+                    .metadata
+                    .get("access_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                bac.cmp(&aac)
+            })
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    // Select at most 3, with per-domain cap 2 in recent_domain mode.
+    let mut selected: Vec<&crate::traits::SearchResult> = Vec::new();
+    let mut selected_domains: Vec<String> = Vec::new();
+    for r in &candidates {
+        if selected.len() >= 3 {
+            break;
+        }
+        let slug = crate::domain::domain_key(&r.payload.metadata).unwrap();
+        if mode == "recent_domain" {
+            let count = selected_domains.iter().filter(|d| *d == &slug).count();
+            if count >= 2 {
+                continue;
+            }
+        }
+        selected.push(r);
+        selected_domains.push(slug);
+    }
+
+    let strap_entries: Vec<Value> = selected
+        .iter()
+        .map(|r| {
+            let slug = crate::domain::domain_key(&r.payload.metadata).unwrap();
+            let prefix = if crate::attempt::is_failed_attempt(&r.payload.metadata) {
+                crate::attempt::FAILED_ATTEMPT_PREFIX
+            } else {
+                ""
+            };
+            let budget = 120usize.saturating_sub(prefix.chars().count());
+            let snippet = format!(
+                "{}{}",
+                prefix,
+                r.payload.content.chars().take(budget).collect::<String>()
+            );
+            let valid_from = r
+                .payload
+                .metadata
+                .get("valid_from")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let access_count = r
+                .payload
+                .metadata
+                .get("access_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            serde_json::json!({
+                "id": r.id,
+                "memory_type": r.payload.memory_type,
+                "domain": slug,
+                "valid_from": valid_from,
+                "access_count": access_count,
+                "snippet": snippet,
+            })
+        })
+        .collect();
+
+    let domain_strap = if strap_entries.is_empty() {
+        format!("Domain strap [mode: {}] (0): []", mode)
+    } else {
+        match serde_json::to_string_pretty(&strap_entries) {
+            Ok(body) => format!(
+                "Domain strap [mode: {}] ({}):\n{}",
+                mode,
+                strap_entries.len(),
+                body
+            ),
+            Err(e) => format!("Domain strap [mode: {}]: unreadable ({}).", mode, e),
+        }
+    };
+
+    let registered_domains_line = if registered_domains.is_empty() {
+        "Registered domains (0): none".to_string()
+    } else {
+        format!(
+            "Registered domains ({}): {}",
+            registered_domains.len(),
+            registered_domains.join(", ")
+        )
+    };
+
     all_memories.truncate(5);
 
     let body = if all_memories.is_empty() {
@@ -1544,7 +1704,10 @@ async fn handle_get_snapshot(
         serde_json::to_string_pretty(&all_memories)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
-    let snapshot = format!("{}\n{}\n{}", task_head, procedures, body);
+    let snapshot = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        task_head, procedures, registered_domains_line, domain_strap, body
+    );
 
     Ok(match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
