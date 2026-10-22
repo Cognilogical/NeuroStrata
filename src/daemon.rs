@@ -1,4 +1,4 @@
-use crate::config::DeduplicationConfig;
+use crate::config::{DeduplicationConfig, DedupProviderMode};
 use crate::events::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
@@ -456,10 +456,15 @@ pub(crate) async fn start_daemon_on(
 ) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    // Initialize deduplication checker if config provided
-    // The presence of a judgment API key is the enable signal - no redundant config
+    // Initialize deduplication checker if config provided.
+    // The `provider: DedupProviderMode::None` alone disables dedup learning;
+    // otherwise the provider selection mode determines which provider to use.
     let deduplication_checker = if let Some(config) = deduplication_config {
-        if config.judgment_api_key.is_some() {
+        // `none` mode disables dedup, baseline write path is allowed
+        if config.provider == DedupProviderMode::None {
+            tracing::debug!("Deduplication explicitly disabled via provider: none");
+            None
+        } else {
             match DeduplicationChecker::new(config) {
                 Ok(checker) => {
                     tracing::info!("Memory deduplication enabled with judgment model");
@@ -467,14 +472,10 @@ pub(crate) async fn start_daemon_on(
                 }
                 Err(e) => {
                     tracing::warn!("Failed to initialize deduplication checker: {}", e);
+                    // Provider errors allow the baseline write path
                     None
                 }
             }
-        } else {
-            tracing::debug!(
-                "Deduplication config present but no judgment API key - feature disabled"
-            );
-            None
         }
     } else {
         None
