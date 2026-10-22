@@ -78,11 +78,6 @@ pub async fn check_domain(
     raw_domain: &Value,
     register_domain: bool,
 ) -> Result<DomainCheck, String> {
-    // A JSON null is how "no domain" arrives from a JS caller; it reads as
-    // absent everywhere else (`domain_key`), so it is not a non-string domain.
-    if raw_domain.is_null() {
-        return Ok(ungoverned());
-    }
     let raw = match raw_domain.as_str() {
         Some(raw) => raw,
         None => {
