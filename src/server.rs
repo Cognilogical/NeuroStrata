@@ -1159,7 +1159,14 @@ pub(crate) async fn embed_dedup_and_upsert(
             .await
         {
             // Filter to only high-similarity candidates
-            let similar: Vec<_> = candidates.into_iter().filter(|c| c.score >= 0.85).collect();
+            let incoming_is_attempt = crate::attempt::is_failed_attempt(&payload.metadata);
+            let similar: Vec<_> = candidates
+                .into_iter()
+                .filter(|c| c.score >= 0.85)
+                .filter(|c| {
+                    crate::attempt::is_failed_attempt(&c.payload.metadata) == incoming_is_attempt
+                })
+                .collect();
 
             if !similar.is_empty() {
                 // Ask the judgment provider if this is a duplicate
@@ -2315,10 +2322,18 @@ fn render_anchor(anchor: &Value) -> String {
 /// One rendering of a memory, shared by search and get, so a record reads the
 /// same however the agent reached it.
 fn format_memory(id: &str, payload: &MemoryPayload) -> String {
-    let mut out = format!(
-        "--- Memory ID: {} ---\nType: {}\nContent: {}",
-        id, payload.memory_type, payload.content
-    );
+    let mut out = format!("--- Memory ID: {} ---\nType: {}", id, payload.memory_type);
+    if crate::attempt::is_failed_attempt(&payload.metadata) {
+        let attempt = payload.metadata.get("attempt").unwrap();
+        let context = attempt.get("context").and_then(|v| v.as_str()).unwrap_or("");
+        let approach = attempt.get("approach").and_then(|v| v.as_str()).unwrap_or("");
+        let failure_mode = attempt.get("failure_mode").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!(
+            "\nAttempt [FAILED in {}]: tried '{}' -> failed with '{}' (single episode, not a global rule)",
+            context, approach, failure_mode
+        ));
+    }
+    out.push_str(&format!("\nContent: {}", payload.content));
     if !payload.location.is_empty() {
         out.push_str(&format!("\nFile Location: {}", payload.location));
         if !payload.location_lines.is_empty() {
@@ -3058,6 +3073,45 @@ mod tests {
 
         assert!(!out.contains("Governs"));
         assert!(!out.contains("Related Nodes"));
+    }
+
+    #[test]
+    fn a_failed_attempt_renders_the_attempt_line() {
+        let mut p = payload("tried X");
+        p.memory_type = "fact".to_string();
+        p.metadata = serde_json::json!({
+            "attempt": {
+                "approach": "retry with backoff",
+                "outcome": "failed",
+                "failure_mode": "timeout",
+                "context": "under load"
+            }
+        });
+
+        let out = format_memory("abc-123", &p);
+
+        assert!(
+            out.contains("Attempt [FAILED in under load]: tried 'retry with backoff' -> failed with 'timeout' (single episode, not a global rule)"),
+            "{}",
+            out
+        );
+    }
+
+    #[test]
+    fn a_malformed_attempt_renders_no_attempt_line() {
+        let mut p = payload("tried X");
+        p.memory_type = "fact".to_string();
+        p.metadata = serde_json::json!({
+            "attempt": {
+                "approach": "retry with backoff",
+                "outcome": "failed",
+                "failure_mode": "timeout"
+            }
+        });
+
+        let out = format_memory("abc-123", &p);
+
+        assert!(!out.contains("Attempt [FAILED in"), "{}", out);
     }
 
     /// Embeds deterministically from the text, so two different strings can

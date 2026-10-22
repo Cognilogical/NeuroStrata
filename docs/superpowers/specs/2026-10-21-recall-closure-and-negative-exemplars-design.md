@@ -110,7 +110,7 @@ elsewhere or is another spec's subject):
 | Structural types are excluded from recall candidates **by type, at query-build time** — the set is `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` (not `symbol`), and it is a fixed `const [&str; 5]` with **no per-row hook** | definition `src/store/ladybug.rs:1270-1276`; the excluded-type list is built at `:76-81` and applied in the query at `:87` |
 | The store's **per-row metadata filter seam** — `is_retired_at`, `is_archived`, `is_mesh_conflicting` — is where a metadata-keyed row class is dropped, so it never consumes a *result* slot (it may consume one over-fetch slot: `fetch_limit = limit * 10`) | `is_archived` `src/store/ladybug.rs:1281`, `is_mesh_conflicting` `:1291`, `is_retired_at` `:2273`; applied at `:114`, `:121`, `:124` |
 | The duplicate check is **semantic**: candidates scoring `>= 0.85` are handed to the judgment provider. There is **no canonical exact-match key** anywhere in `src/` | `src/server.rs:1162` (the `>= 0.85` filter), `:1166` (`checker.check_duplicates(payload, &similar)`); `SearchResult` carries each candidate's payload at `src/traits.rs:58-66` |
-| `format_memory` is the rendering path for a returned row | `src/server.rs:2315` |
+| `format_memory` is the rendering path for a returned row | `src/server.rs:2324` |
 | The bus metrics surface serializes the bus's own counters (eight integers) | `src/handlers/bus_metrics.rs:20-23` |
 
 ---
@@ -164,7 +164,7 @@ the shape, and an undeclared shape is invisible (§2).
   inverted. Because the content states both the approach and the failure, the row matches
   *"how do we do X"* and *"what went wrong with X"*.
 - **Non-poisoning.** Two rendering rules, both mandatory:
-  1. `format_memory` (`src/server.rs:2315`) prints, immediately after `Type: fact`,
+  1. `format_memory` (`src/server.rs:2324`) prints, immediately after `Type: fact`,
      `Attempt [FAILED in <context>]: tried '<approach>' -> failed with '<failure_mode>' (single episode, not a global rule)`.
   2. Every truncated `snippet` (§3.3, and the parent's `recalled[]`) is prefixed with
      `"[FAILED ATTEMPT] "` **before** truncation, so truncation can never strip the
@@ -180,14 +180,14 @@ the shape, and an undeclared shape is invisible (§2).
   The partition uses the **same** predicate as the `[FAILED ATTEMPT]` prefix: a row whose
   `metadata.attempt` is malformed is neither rendered as a negative nor partitioned as
   one — it is a plain row (the store accepts a malformed attempt with a soft warning:
-  `src/store/ladybug.rs:970` — the `parse_edge_specs` seam where that check lands; the
+  `src/store/ladybug.rs:979` — the `parse_edge_specs` seam where that check lands; the
   `WriteShapeWarning` at `:951-955`, emitted to stderr at `:1106-1107`). Rendering and
   partitioning must not disagree, or a row would be shown to the agent as a failure while
   being compared against successes.
 
 #### 3.1.4 Validation
 
-`parse_edge_specs` (`src/store/ladybug.rs:970`) gains a shape check for
+`parse_edge_specs` (`src/store/ladybug.rs:979`) gains a shape check for
 `metadata.attempt` on `fact` rows: an object with non-empty `approach`, `failure_mode`,
 `context`, and `outcome == "failed"`. A malformed value raises a `WriteShapeWarning`
 (`:951-955`, emitted `:1106-1107`) and **the durable write still succeeds** — a claim is worth
@@ -639,7 +639,7 @@ Ordered. Each step is independently testable. Steps marked **[P]** are the paren
 | 5 | **[P]** Optional domain filter on search (store + MCP tool) with the soft fallback and the explicit mode | `src/traits.rs:255-271`; `src/store/ladybug.rs:1581`, `:1602-1630`; `src/server.rs:2045-2061` |
 | 6 | **[N]** Registry row excluded from recall results and from the snapshot body — a metadata predicate at the store's per-row filter seam, and a `retain` on the snapshot's fetched list | `src/store/ladybug.rs:114-127`; `src/server.rs:1492`, `:1496`, `:1498` |
 | 7 | **[P]** `handle_append_log(arguments, emb, store)`; dispatch widening; `namespace` in the input schema; the recall rides the response | `src/buffer.rs:133`, `:304-321`; `src/server.rs:372-384`, `:667-669`, `:2144` |
-| 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:970`; `src/server.rs:2315`; the parent's `recalled[]` response, built beside `src/buffer.rs:275-285`; `src/server.rs:1155-1177` |
+| 8 | **[N]** The `metadata.attempt` shape check → soft warning; the `[FAILED ATTEMPT]` rendering in `format_memory` and in every truncated snippet; the duplicate-check candidate set partitioned by attempt-presence | `src/store/ladybug.rs:979`; `src/server.rs:2324`; the parent's `recalled[]` response, built beside `src/buffer.rs:277-287`; `src/server.rs:1163-1175` |
 | 9 | **[N]** The snapshot domain strap: the `domain` input, the two modes, the selection, the explicit zero, the `Registered domains (N)` header | `src/server.rs:153-161`, `:1515-1538` |
 | 10 | **[N]** The `domain_filter` counters and their surface — process-global atomics in a module beside the search path, incremented in the **daemon** process (which serves both the MCP dispatch and `/bus/metrics`) and read directly by the metrics handler: no signature change, no `AppState` field, no route plumbing | new module beside the search path; `src/handlers/bus_metrics.rs:20-23`; `src/daemon.rs:534`, `:539`; `src/server.rs:909`; `src/main.rs:1775-1779` |
 | 11 | **[N]** The mesh import step unions an imported record's domain into the local registry | `src/synaptic_mesh/import.rs` |
@@ -852,7 +852,7 @@ and refuted two claims this spec had made:
 
 | Claim as first written | The checker's finding | The fix |
 |---|---|---|
-| "`metadata.attempt` joins the canonical exact-match key" | No canonical exact-match key exists in `src/`. `src/server.rs:1155-1177` is the **semantic** duplicate check — candidates scoring `>= 0.85`, then `checker.check_duplicates(payload, &similar)`. | §3.1.3 now **partitions the duplicate check's candidate set by attempt-presence** — a mechanism that exists — instead of extending a key that does not. |
+| "`metadata.attempt` joins the canonical exact-match key" | No canonical exact-match key exists in `src/`. `src/server.rs:1163-1175` is the **semantic** duplicate check — candidates scoring `>= 0.85`, then `checker.check_duplicates(payload, &similar)`. | §3.1.3 now **partitions the duplicate check's candidate set by attempt-presence** — a mechanism that exists — instead of extending a key that does not. |
 | "the registry row is excluded by the same predicate the store already applies to structural rows" | `STRUCTURAL_MEMORY_TYPES` is a fixed `const [&str; 5]` consulted only at query-build time; it has no per-row hook, and its members are `directory`, `file`, `markdown`, `freshness_flag`, `guard_event` — **not** `symbol`. | §3.2.1 now names the real seam: a metadata predicate in the store's per-row filter (`src/store/ladybug.rs:114-127`) and a `retain` on the snapshot's fetched list (`src/server.rs:1492`, `:1496`, `:1498`). |
 | "the mesh rejects an unknown `memory_type` at import" | The **code** does reject it (`src/synaptic_mesh/import.rs:649-655`); the **comment** directly above it (`src/synaptic_mesh/import.rs:57-60`) says unknown types are "ignored and reported, never applied, never crash". The mesh's own doc contradicts its own code. | Recorded in §2 as a known contradiction; filed as task `neurostrata-wl4i`. The design is safe under either reading. |
 
@@ -878,7 +878,7 @@ cited lines, and surfaced eight more:
 | **"The daemon is the only process that can write to the store" was false.** The engine admits one writer at a time, but the loser *retries* (`WRITE_COLLISION_RETRIES`, `src/store/ladybug.rs:2244`, `:844`), and the CLI's `add` command writes to the same store directly (`src/main.rs:2846`, `:2864`) | §3.2.5 was rewritten: an in-process **registry mutex**, plus a **cross-process compare-and-retry** that checks the *whole* pre-write set (not just the new slug) and fails loudly if the bounded retries are exhausted. **Superseded by the third round** — the retries no longer fail the write; the cache framing and the reconcile replaced that rule (§3.2.5, §3.2.3). |
 | `neurostrata_task_complete` has **no top-level `domain` argument** — the completion's metadata is the caller's `memory.metadata` object (`src/task/mod.rs:1132-1157`), so `register_domain` there had no stated source of the slug | §3.2.3 now gives each write path its slug source: `domain` on add_memory, `metadata.domain` on task_complete; the flag follows the slug, and is a no-op when the completion carries no domain. |
 | The `domain` argument is inserted into the metadata **raw**, as a JSON value rather than a string (`src/server.rs:1283-1285`), so the check must not compare a non-string against the registry *[changed: the write now normalizes the domain to a slug (`src/server.rs:1303-1307`), so the raw insert is no longer what is stored]* | §3.2.3 now says the check reads it as a string and **rejects** a non-string `domain` rather than guessing. |
-| A row with a **malformed** `metadata.attempt` (accepted with a soft warning, `src/store/ladybug.rs:970`) would be rendered as a negative but partitioned as a positive | §3.1.3 now requires the partition and the `[FAILED ATTEMPT]` prefix to use the **same** predicate: a malformed attempt is neither rendered nor partitioned as a negative. |
+| A row with a **malformed** `metadata.attempt` (accepted with a soft warning, `src/store/ladybug.rs:979`) would be rendered as a negative but partitioned as a positive | §3.1.3 now requires the partition and the `[FAILED ATTEMPT]` prefix to use the **same** predicate: a malformed attempt is neither rendered nor partitioned as a negative. |
 
 The anchors that round never reached were read and verified by the orchestrator against
 HEAD: the vocabulary version and its single assert (`src/schemas/memory-vocabulary.v3.json:2`,

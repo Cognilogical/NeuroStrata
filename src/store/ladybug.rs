@@ -971,6 +971,9 @@ const TOPOLOGY_KEYS: [&str; 5] = [
     "reason",
 ];
 
+#[allow(dead_code)]
+const ATTEMPT_KEYS: [&str; 4] = crate::attempt::ATTEMPT_KEYS;
+
 /// Validates a memory payload's metadata shape and extracts edge specs.
 /// Returns the valid edge specs and any shape warnings (never rejects the write).
 fn parse_edge_specs(
@@ -1097,6 +1100,20 @@ fn parse_edge_specs(
                     skipped: "the topology shape check; the fact is still written".to_string(),
                 });
             }
+        }
+    }
+
+    // (F) attempt shape. Declared on a `fact` (a failed episode recorded on a
+    // fact). Soft check: a malformed attempt warns and the fact is still
+    // written.
+    if payload.memory_type.trim() == "fact" {
+        let defects = crate::attempt::attempt_defects(&payload.metadata);
+        if payload.metadata.get("attempt").is_some() && !defects.is_empty() {
+            warnings.push(WriteShapeWarning {
+                field: "metadata.attempt".to_string(),
+                why: format!("metadata.attempt {}", defects.join("; ")),
+                skipped: "the attempt shape check; the fact is still written".to_string(),
+            });
         }
     }
 
@@ -4369,6 +4386,40 @@ eurostrata\src\daemon.rs",
                 stored.1.metadata["topology"]["component"],
                 json!("api-gateway"),
                 "the topology is stored exactly as it was given"
+            );
+        }
+    }
+
+    /// The access-attempt shape check (vocabulary v6).
+    mod attempt {
+        use super::*;
+
+        #[tokio::test]
+        async fn a_malformed_attempt_warns_and_the_write_still_succeeds() {
+            let store = retired_test_store().await;
+            store
+                .upsert(
+                    "probe",
+                    "probe::fact",
+                    vec![0.0; 4],
+                    retired_test_payload(
+                        "fact",
+                        "agent",
+                        json!({ "attempt": { "approach": "retry", "outcome": "failed", "failure_mode": "timeout" } }),
+                    ),
+                )
+                .await
+                .expect("a malformed attempt is a warning, not a rejection");
+
+            let stored = store
+                .get("probe", "probe::fact")
+                .await
+                .unwrap()
+                .expect("the fact is stored");
+            assert_eq!(
+                stored.1.metadata["attempt"]["approach"],
+                json!("retry"),
+                "the attempt is stored exactly as it was given"
             );
         }
     }

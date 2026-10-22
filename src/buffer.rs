@@ -274,7 +274,17 @@ pub async fn handle_append_log(
             .take(3)
             .map(|res| {
                 let domain = crate::domain::domain_key(&res.payload.metadata);
-                let snippet = res.payload.content.chars().take(120).collect::<String>();
+                let prefix = if crate::attempt::is_failed_attempt(&res.payload.metadata) {
+                    crate::attempt::FAILED_ATTEMPT_PREFIX
+                } else {
+                    ""
+                };
+                let budget = 120usize.saturating_sub(prefix.chars().count());
+                let snippet = format!(
+                    "{}{}",
+                    prefix,
+                    res.payload.content.chars().take(budget).collect::<String>()
+                );
                 json!({
                     "id": res.id,
                     "memory_type": res.payload.memory_type,
