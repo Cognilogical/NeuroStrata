@@ -1,20 +1,89 @@
-// TODO: Step 2 — implement LearningRecorder
-// placeholder so crate compiles
-use crate::learning::observation::{DecisionObservation, LearningOutcome, PayloadHash};
-use crate::traits::MemoryPayload;
+use anyhow::{Context, Result};
+use std::fs::OpenOptions;
+use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
+use std::path::Path;
 
-pub struct LearningRecorder { root: PathBuf }
+use crate::learning::observation::{
+    DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind, PayloadHash,
+};
+
+pub struct LearningRecorder {
+    root: PathBuf,
+    connection_id: String,
+}
+
 impl LearningRecorder {
-    pub async fn open(_root: PathBuf) -> anyhow::Result<Self> { todo!() }
-    pub async fn record_observation(&self, _value: &DecisionObservation) -> anyhow::Result<()> { todo!() }
-    pub async fn record_outcome(&self, _value: &LearningOutcome) -> anyhow::Result<()> { todo!() }
-    pub async fn put_payload(&self, _value: &MemoryPayload) -> anyhow::Result<PayloadHash> { todo!() }
+    pub async fn open(root: PathBuf, connection_id: Option<String>) -> Result<Self> {
+        std::fs::create_dir_all(&root)?;
+        let conn_id = connection_id.unwrap_or_else(|| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            root.as_os_str().hash(&mut h);
+            format!("conn-{}", h.finish())
+        });
+        Ok(Self {
+            root,
+            connection_id: conn_id,
+        })
+    }
+
+    pub async fn record_observation(&self, value: &DecisionObservation) -> Result<()> {
+        let month = chrono::Local::now().format("%Y%m").to_string();
+        let path = self.root.join(format!("observations-{}.jsonl", month));
+        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        let line = serde_json::to_string(value)?;
+        f.write_all(line.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.flush()?;
+        Ok(())
+    }
+
+    pub async fn record_outcome(&self, value: &LearningOutcome) -> Result<()> {
+        let month = chrono::Local::now().format("%Y%m").to_string();
+        let path = self.root.join(format!("outcomes-{}.jsonl", month));
+        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        let line = serde_json::to_string(value)?;
+        f.write_all(line.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.flush()?;
+        Ok(())
+    }
+
+    pub async fn record_blob_hash(&self, _payload_hash: &PayloadHash, _input: &crate::traits::MemoryPayload) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::learning::BlobStore;
+    use crate::traits::MemoryPayload;
+    use serde_json::json;
+
     #[test]
-    fn jsonl_append_reopen_atomic() { panic!("TODO: JSONL append reopen") }
+    fn failing_blob_reuse_content_addressed() {
+        let payload1 = MemoryPayload {
+            content: "hello".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "src/lib.rs".to_string(),
+            location_lines: "1-2".to_string(),
+            metadata: json!({}),
+        };
+        let store = BlobStore::new().expect("create store");
+        let hash1 = store.put(&payload1).expect("hash 1");
+        let hash2 = store.put(&payload1).expect("hash 2");
+        assert_eq!(hash1, hash2, "same payload should reuse blob");
+        assert!(hash1.0.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn observation_jsonl_append_fail() {
+        panic!("TODO: implement JSONL file handling");
+    }
 }
