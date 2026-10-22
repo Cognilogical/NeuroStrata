@@ -2391,23 +2391,23 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                 }
                 let first = &ev.path[0];
                 let second = &ev.path[1];
-                // Validate connectivity: first edge's endpoint == second edge's source or target
-                let intermediate = if first.source == second.target {
-                    first.target.as_str()
-                } else if first.target == second.target {
+                // The intermediate is the node the two edges share: the endpoint
+                // of the first edge that is also an endpoint of the second.
+                let intermediate = if first.source == second.source
+                    || first.source == second.target
+                {
                     first.source.as_str()
-                } else if first.source == second.source {
+                } else if first.target == second.source || first.target == second.target
+                {
                     first.target.as_str()
-                } else if first.target == second.source {
-                    first.source.as_str()
                 } else {
                     continue;
                 };
-                // Originating primary is the other endpoint of first edge
-                let orig = if first.source != intermediate {
-                    first.source.as_str()
-                } else {
+                // The originating primary is the other endpoint of the first edge.
+                let orig = if first.source == intermediate {
                     first.target.as_str()
+                } else {
+                    first.source.as_str()
                 };
                 // Validate terminal is result.id
                 if second.source != result.id && second.target != result.id {
@@ -6086,6 +6086,101 @@ mod tests {
             text.contains("\"probe::rule-1\" -GOVERNS- \"probe::target.rs\""),
             "an outgoing edge must print from the primary: {}",
             text
+        );
+    }
+
+    /// A two-hop path must be walked from the direct match, and its second
+    /// edge must not be dropped: the neighbour the evidence is about has to
+    /// appear in the printed path.
+    ///
+    /// The graph is
+    ///
+    ///   probe::primary -RELATES_TO-> probe::mid <-GOVERNS- probe::ruler
+    ///
+    /// so the printed path has to run from the direct match, through the
+    /// intermediate, to the neighbour that governs the intermediate.
+    #[tokio::test]
+    async fn a_two_hop_path_is_printed_from_the_primary_to_the_neighbour() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-two-hop-render-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::ladybug::LadybugStore::for_testing(&dir, 4)
+            .expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        // The intermediate: an edge target must exist before the row that
+        // declares the edge, or the edge is skipped as a write-shape warning.
+        store
+            .upsert(
+                "probe",
+                "probe::mid",
+                vec![0.5, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the intermediate".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The neighbour: it governs the intermediate, so it is two hops away.
+        store
+            .upsert(
+                "probe",
+                "probe::ruler",
+                vec![0.2, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the neighbour".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "governs": ["probe::mid"] }),
+                },
+            )
+            .await
+            .unwrap();
+
+        // The direct match: one hop from the intermediate.
+        store
+            .upsert(
+                "probe",
+                "probe::primary",
+                vec![1.1, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "the direct match".to_string(),
+                    user_id: "tester".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "related_to": ["probe::mid"] }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let results = store
+            .search("probe", vec![1.1, 0.0, 0.0, 0.0], 1, false, false)
+            .await
+            .unwrap();
+        let text = render_search_results(&results);
+        let line = text
+            .lines()
+            .find(|l| l.contains("Path [governs_2hop]:"))
+            .expect("the neighbour must carry a two-hop path");
+        // The intermediate is printed by both segments: a path segment is
+        // rendered as a self-contained "from -relation- to" pair.
+        assert_eq!(
+            line,
+            "Path [governs_2hop]: \"probe::primary\" -RELATES_TO- \"probe::mid\" \
+             \"probe::mid\" <-GOVERNS- \"probe::ruler\"",
+            "the two-hop path must run from the direct match to the neighbour"
         );
     }
 }
