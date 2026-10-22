@@ -62,7 +62,7 @@ The observed episode (the brief's §2) is an agent asserting an access-path clai
 
 ## 3. The substrate (verified; this spec does not re-propose it)
 
-Everything below was verified against source at `b3904d8`. The panel was instructed not to re-propose any of it. **It is the substrate as of that commit**: where this spec's own implementation changed a row, the row carries a *[changed]* marker naming the section that describes the new behaviour.
+Everything below was verified against source at `b3904d8`. The panel was instructed not to re-propose any of it. **The claims are as of that commit; the anchors are live against the working tree as of 2026-10-21 — verify each claim at its anchor.** Where this spec's own implementation changed a row, the row carries a *[changed]* marker naming the section that describes the new behaviour.
 
 | Constraint | Anchor |
 |---|---|
