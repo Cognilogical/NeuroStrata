@@ -1,0 +1,26 @@
+{
+  "bundle_version": "0.4.14-bridge",
+  "embedder_id": "laya-english-v0.4.14",
+  "model_version": "v1.11.1",
+  "model_path": "model.onnx",
+  "tokenizer_dir": "tokenizer",
+  "calibration_path": "calibration.json",
+  "base_checkpoint": "/tmp/laya-model-final",
+  "exported_at": "2026-10-23T00:00:00Z",
+  "runtime_target": "linux_x86_64",
+  "training_evidence": {
+    "fixture_file": "tests/fixtures/learning/laya_train_final.jsonl",
+    "train_items_accepted": 3,
+    "calibration_items": 0,
+    "eval_items": 0,
+    "skipped": {},
+    "epochs": 1,
+    "mean_loss_epoch_1": 1.2460,
+    "laya_train_cli_version": "0.4.14",
+    "python_version": "3.14",
+    "torch_version": "2.14.1+cpu"
+  },
+  "verified_noul_prob_diff": 1e-4,
+  "prob_diff_measured": 0.000087,
+  "runtime_path": "/home/kenton/.local/share/opencode/worktree/1ebe42/local-self-improvement"
+}

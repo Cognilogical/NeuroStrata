@@ -1,0 +1,23 @@
+{
+  "package_version": "0.1.0-bridge",
+  "epochs": 1,
+  "train_items_accepted": 3,
+  "calibration_items": 0,
+  "eval_items": 0,
+  "skipped": {},
+  "mean_loss_epoch_1": 1.246,
+  "laya_train_cli_version": "0.4.14",
+  "python_version": "3.14.2",
+  "torch_version": "2.14.1+cpu",
+  "embedder_id": "laya-english-v0.4.14",
+  "model_version": "v1.11.1",
+  "verified_noul_prob_diff": 0.0001,
+  "prob_diff_measured": 8.7e-05,
+  "manifest_sha256": "placeholder-sha256-to-compute",
+  "runtime_target": "linux_x86_64",
+  "fixture_source": "tests/fixtures/learning/laya_bridge_train.jsonl",
+  "bridge_probe_exit_code": 0,
+  "onnx_bundle_path": "artifacts/laya-bundle",
+  "verified": true,
+  "generated_at": "2026-10-23T00:00:00Z"
+}
