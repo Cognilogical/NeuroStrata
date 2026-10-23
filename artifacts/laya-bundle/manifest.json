@@ -6,7 +6,7 @@
   "tokenizer_dir": "tokenizer",
   "calibration_path": "calibration.json",
   "base_checkpoint": "/tmp/laya-model-final",
-  "exported_at": "2026-10-23T00:00:00Z",
+  "exported_at": "2026-10-23T14:48:00Z",
   "runtime_target": "linux_x86_64",
   "training_evidence": {
     "fixture_file": "tests/fixtures/learning/laya_train_final.jsonl",
@@ -19,6 +19,11 @@
     "laya_train_cli_version": "0.4.14",
     "python_version": "3.14",
     "torch_version": "2.14.1+cpu"
+  },
+  "onnx_export": {
+    "status": "stub_valid",
+    "reason": "torch.export fails on laya DecisionModel.forward marker_pos indexing (upstream bug)",
+    "needs_for_phase2": "fix upstream torch.export compatibility or pre-export via laya.export_onnx.py"
   },
   "verified_noul_prob_diff": 1e-4,
   "prob_diff_measured": 0.000087,
