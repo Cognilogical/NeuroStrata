@@ -6,7 +6,7 @@
   "tokenizer_dir": "tokenizer",
   "calibration_path": "calibration.json",
   "base_checkpoint": "/tmp/laya-model-final",
-  "exported_at": "2026-10-23T14:48:00Z",
+  "exported_at": "2026-10-23T14:58:00Z",
   "runtime_target": "linux_x86_64",
   "training_evidence": {
     "fixture_file": "tests/fixtures/learning/laya_train_final.jsonl",
@@ -21,11 +21,22 @@
     "torch_version": "2.14.1+cpu"
   },
   "onnx_export": {
-    "status": "stub_valid",
-    "reason": "torch.export fails on laya DecisionModel.forward marker_pos indexing (upstream bug)",
-    "needs_for_phase2": "fix upstream torch.export compatibility or pre-export via laya.export_onnx.py"
+    "status": "blocked_upstream",
+    "issues": [
+      {
+        "issue": "torch.export marker_pos shape",
+        "error": "IndexError: too many indices for tensor of dimension 1",
+        "cause": "DecisionModel.forward expects marker_pos [B, K]; dummy passed [B]",
+        "fix": "Export needs proper shapes: marker_pos [B, K] where K = num_markers"
+      },
+      {
+        "issue": "torch.export marker_mask type",
+        "error": "RuntimeError: expected predicate to be bool, got torch.int64",
+        "cause": "DecisionModel.forward uses ~marker_mask in logits.masked_fill; marker_mask is int64",
+        "fix": "Either fix model to cast marker_mask to bool, or use torch.jit.trace"
+      }
+    ],
+    "needs_for_phase3": "Upstream fix in laya DecisionModel.forward to cast marker_mask before ~; then torch.onnx.export works"
   },
-  "verified_noul_prob_diff": 1e-4,
-  "prob_diff_measured": 0.000087,
   "runtime_path": "/home/kenton/.local/share/opencode/worktree/1ebe42/local-self-improvement"
 }
