@@ -1,0 +1,3 @@
+{"observation_id":"obs-gold-1","candidate_id":"cand-1","expected_duplicate":true,"tier":"ShippedAnchorGold","source":"human_adjudication","evidence_hash":"sha256:abc123","created_at":1792650000}
+{"observation_id":"obs-gold-2","candidate_id":"cand-2","expected_duplicate":false,"tier":"ShippedAnchorGold","source":"human_adjudication","evidence_hash":"sha256:def456","created_at":1792650060}
+{"observation_id":"obs-gold-3","candidate_id":"cand-3","expected_duplicate":true,"tier":"ShippedAnchorGold","source":"human_adjudication","evidence_hash":"sha256:789abc","created_at":1792650120}

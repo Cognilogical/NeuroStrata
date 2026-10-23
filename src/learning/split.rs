@@ -30,9 +30,9 @@ impl DatasetSplits {
 
     pub fn insert(&mut self, observation_id: &str, split: Split) {
         match split {
-            Split::Train => self.train.insert(observation_id.to_string()),
-            Split::Calibration => self.calibration.insert(observation_id.to_string()),
-            Split::Eval => self.eval.insert(observation_id.to_string()),
+            Split::Train => { let _ = self.train.insert(observation_id.to_string()); }
+            Split::Calibration => { let _ = self.calibration.insert(observation_id.to_string()); }
+            Split::Eval => { let _ = self.eval.insert(observation_id.to_string()); }
         }
     }
 
@@ -44,7 +44,7 @@ impl DatasetSplits {
 }
 
 /// Which dataset split an observation belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Split {
     Train,
     Calibration,
