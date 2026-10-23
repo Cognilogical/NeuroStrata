@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::path::Path;
 
+use futures::executor::block_on;
+
 use crate::learning::observation::{
     DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind, PayloadHash,
 };
@@ -88,7 +90,7 @@ mod tests {
         // we close and reopen before the second flush completes.
         let tmpdir = std::env::temp_dir().join("ns_learn_test");
         std::fs::create_dir_all(&tmpdir).unwrap();
-        let rec = LearningRecorder::open(tmpdir.clone(), None).unwrap();
+        let rec = futures::executor::block_on(LearningRecorder::open(tmpdir.clone(), None)).unwrap();
         let v1 = DecisionObservation {
             schema_version: 1,
             observation_id: "obs-1".into(),
@@ -110,12 +112,12 @@ mod tests {
             shadow_model_version: None,
             decision: crate::judgment::DedupDecision::Allowed,
         };
-        rec.record_observation(&v1).unwrap();
+        block_on(rec.record_observation(&v1)).unwrap();
         // Reopen separately to ensure append semantics, no pre-existing data
         // from previous test runs.
         let tmpdir2 = std::env::temp_dir().join("ns_learn_test_2");
         std::fs::create_dir_all(&tmpdir2).unwrap();
-        let rec2 = LearningRecorder::open(tmpdir2, None).unwrap();
+        let rec2 = block_on(LearningRecorder::open(tmpdir2, None)).unwrap();
         let v2 = DecisionObservation {
             schema_version: 1,
             observation_id: "obs-2".into(),
@@ -137,7 +139,7 @@ mod tests {
             shadow_model_version: None,
             decision: crate::judgment::DedupDecision::BlockedExact,
         };
-        rec2.record_observation(&v2).unwrap();
+        block_on(rec2.record_observation(&v2)).unwrap();
         assert!(true);
         let _ = tmpdir;
         let _ = tmpdir2;

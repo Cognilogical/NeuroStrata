@@ -7,7 +7,7 @@ use crate::judgment::laya_onnx::{LocalTrainingRuntime, ModelVersion};
 
 
 /// Training job state machine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrainingJobState {
     WaitingForData,
