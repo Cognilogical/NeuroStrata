@@ -138,7 +138,7 @@ mod tests {
         // Step 3: verify that no connected component crosses train/calibration/eval
         let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string()];
         let memory_ids = vec![HashSet::from(["mid-1".to_string()]), HashSet::from(["mid-1".to_string()])]; // shared memory ID
-        let payload_hashes = vec![HashSet::from(), HashSet::from()];
+        let payload_hashes = vec![HashSet::from(["ph-1".to_string()]), HashSet::from(["ph-1".to_string()])];
         let supersession_lineages = vec![None, None];
         let governance_targets = vec![None, None];
         let time_windows = vec![1000, 2000];
