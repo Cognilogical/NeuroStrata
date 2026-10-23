@@ -130,9 +130,12 @@ mod tests {
     fn failing_build_dedup_dataset_empty_root() {
         // Step 1: Add failing tests proving observations remain immutable when
         // label rules change and absence of follow-up yields no DerivedLabel.
+        // (Dataset build is async; test function signature matches the async API.)
+        use futures::executor::block_on;
         let tmpdir = std::env::temp_dir().join("ns_learn_test");
         let _ = std::fs::remove_dir_all(&tmpdir);
-        let report = build_dedup_dataset(&tmpdir, &tmpdir.join("out")).expect("build dataset");
+        let report = block_on(build_dedup_dataset(&tmpdir, &tmpdir.join("out")))
+            .expect("build dataset");
         assert_eq!(report.train_rows, 0);
         assert_eq!(report.gold_calib_rows, 0);
         assert_eq!(report.gold_eval_rows, 0);
@@ -157,10 +160,11 @@ mod tests {
     fn gold_fixtures_disjoint() {
         // Step 4: separately adjudicated gold fixtures with disjoint
         // gold_calib and gold_eval partitions; tests reject overlap or weak labels.
-        use std::collections::HashSet;
-        let calib_ids: HashSet<&str> = ["obs-gold-1", "obs-gold-2"].into_iter().collect();
-        let eval_ids: HashSet<&str> = ["obs-gold-eval-1", "obs-gold-eval-2"].into_iter().collect();
-        let overlap: HashSet<&&str> = &calib_ids.intersection(&eval_ids).collect();
+        let calib_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["obs-gold-1".into(), "obs-gold-2".into()]);
+        let eval_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["obs-gold-eval-1".into(), "obs-gold-eval-2".into()]);
+        let overlap: std::collections::HashSet<&String> = calib_ids.intersection(&eval_ids).collect();
         assert!(overlap.is_empty(), "gold calib and eval must not overlap");
     }
 }

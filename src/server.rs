@@ -3495,10 +3495,11 @@ mod tests {
 
             let calls = Arc::new(std::sync::Mutex::new(0usize));
             let last = Arc::new(std::sync::Mutex::new(0usize));
-            let provider = Box::new(RecordingProvider {
-                calls: calls.clone(),
-                last_candidate_count: last.clone(),
-            });
+            let provider: Arc<dyn crate::judgment::JudgmentProvider> =
+                Arc::new(RecordingProvider {
+                    calls: calls.clone(),
+                    last_candidate_count: last.clone(),
+                });
             let mut cfg = crate::config::DeduplicationConfig {
                 provider: crate::config::DedupProviderMode::Jev,
                 judgment_api_key_env: None,
@@ -3551,10 +3552,11 @@ mod tests {
 
             let calls = Arc::new(std::sync::Mutex::new(0usize));
             let last = Arc::new(std::sync::Mutex::new(0usize));
-            let provider = Box::new(RecordingProvider {
-                calls: calls.clone(),
-                last_candidate_count: last.clone(),
-            });
+            let provider: Arc<dyn crate::judgment::JudgmentProvider> =
+                Arc::new(RecordingProvider {
+                    calls: calls.clone(),
+                    last_candidate_count: last.clone(),
+                });
             let cfg = crate::config::DeduplicationConfig {
                 provider: crate::config::DedupProviderMode::Auto,
                 judgment_api_key_env: None,
@@ -3619,10 +3621,11 @@ mod tests {
 
             let calls = Arc::new(std::sync::Mutex::new(0usize));
             let last = Arc::new(std::sync::Mutex::new(0usize));
-            let provider = Box::new(RecordingProvider {
-                calls: calls.clone(),
-                last_candidate_count: last.clone(),
-            });
+            let provider: Arc<dyn crate::judgment::JudgmentProvider> =
+                Arc::new(RecordingProvider {
+                    calls: calls.clone(),
+                    last_candidate_count: last.clone(),
+                });
             let cfg = crate::config::DeduplicationConfig {
                 provider: crate::config::DedupProviderMode::Auto,
                 judgment_api_key_env: None,
