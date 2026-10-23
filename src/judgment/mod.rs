@@ -3,6 +3,11 @@ pub mod circuit_breaker;
 pub mod policy;
 pub mod provider;
 pub mod typesafe_jev;
+pub mod laya_onnx;
+
+pub use policy::{CalibrationTier, DedupDecision};
+
+pub use laya_onnx::{ModelVersion, RuntimeState};
 
 use anyhow::Result;
 use async_trait::async_trait;
