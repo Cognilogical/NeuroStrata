@@ -1,0 +1,2 @@
+{"state":"ready","questions":[{"id":"q1","text":"test question 1"}],"gold":[0.8,0.2]}
+{"state":"ready","questions":[{"id":"q2","text":"test question 2"}],"gold":[0.3,0.7]}
