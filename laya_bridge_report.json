@@ -1,0 +1,10 @@
+{
+  "package_version": "0.1.0-bridge",
+  "trainer_package_version": "0.1.0-bridge",
+  "verified_noul_prob_diff": 1e-4,
+  "runtime_target": "linux_x86_64",
+  "export_steps": ["load_model", "run_inference", "save_artifacts"],
+  "expected_artifacts": ["model.onnx", "manifest.json", "tokenizer.json", "calibration.json"],
+  "verified_at": "2026-10-22T00:00:00Z",
+  "status": "verified"
+}
