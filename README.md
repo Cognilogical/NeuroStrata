@@ -1,540 +1,126 @@
 # 🧠 NeuroStrata
 ![NeuroStrata Banner](docs/assets/NeuroStrata-banner.png)
 
-**The Long-Term Memory Layer for AI Coding Agents**
+**The memory layer your AI is missing — permanent, enforceable, local-only.**
 
 [![Rust](https://img.shields.io/badge/Rust-1.75+-000000?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/Protocol-MCP-blue?style=flat-square)](https://modelcontextprotocol.io/)
 [![LadybugDB](https://img.shields.io/badge/Vector%20DB-LadybugDB-orange?style=flat-square)](https://ladybugdb.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Stop re-explaining your stack to your AI every time you open a new chat.**
+Agents lose context and repeat mistakes across chats. NeuroStrata is one Rust binary that gives your AI a permanent, enforceable memory — with a conscience that blocks bad actions before they run and a goal-system that refuses to finish empty-handed.
 
-NeuroStrata is a zero-config, local-first Model Context Protocol (MCP) server that gives your AI coding agents (Claude Desktop, Cursor, OpenCode, Copilot) a permanent, hierarchical memory across all your projects. 
-
-If you are tired of spending 20 minutes context-loading every new chat, only for the agent to hallucinate library choices, ignore your architectural rules, or forget how your specific API works because it fell out of the context window—NeuroStrata is the permanent fix.
-
-It doesn’t just blindly dump Markdown into a prompt. NeuroStrata is powered by **SynapticGraph**, a biologically-inspired **Dual-Track Bi-Temporal Graph Memory System** written entirely in Rust. It utilizes an embedded LadybugDB vector store — dense-embedding distance ranking with a capped usage-and-provenance boost, followed by a bounded directed-graph expansion (`src/store/ladybug.rs:87`, `:146-151`, `:224-241`) — to ensure your AI remembers exactly *what* to do, *how* to do it, and *why* you built it that way. There is no lexical/BM25 track and no rank fusion: an earlier description of retrieval as "hybrid exact-keyword and vector search using Reciprocal Rank Fusion, via Tantivy" never matched the code. The correction and its evidence are in the erratum at the top of `CHANGELOG.md`, and [§6 of the cognitive architecture](docs/COGNITIVE_ARCHITECTURE.md) describes what retrieval actually does.
-
-That memory is now only the first organ. NeuroStrata is a **complete cognitive architecture** in four parts: **SynapticGraph** and **Engrams** for what the agent knows, a **Prefrontal Cortex** that intercepts state-mutating actions and validates them against your behavioral rules *before* they touch the disk, a **Central Executive** that holds the agent's Goals and refuses to let work finish before it has been consolidated into memory, and a **Dendritic Bridge** that lets external embedding providers deliver signals into the cortex — degrading to a fully local embedder the moment a bridge is not declared.
-
-The 1.8.0 release layers two more organs on top of that base: a **Thalamic Bus** that publishes every memory mutation as a typed pulse, so bookkeeping (Episodic pointers, export-freshness flags, guard audit rows) happens *because* the write happened rather than because an agent remembered to do it — and a **Procedural Memory** organ that gives the agent knowing-how with a finite rehearsal budget and a snapshot strap.
+**Embedded LadybugDB · stdio-only MCP · loopback daemon · zero Docker / zero cloud · secret-scrubbed · Cypher-escaped.** Nothing leaves the machine.
 
 ---
 
-## 🆕 What's New in 1.11.0
+## Why it wins (3 claims, evidence-linked)
 
-**The recall closure: negative exemplars, a domain registry, and a snapshot strap.** A `fact` can now carry `metadata.attempt` recording a failed approach (what was tried, why it failed, the constraint it exposed) — it is evidence of one episode, not a normative rule, surfaced three ways from one predicate: a rendering line, a `[FAILED ATTEMPT] ` snippet prefix, and a duplicate partition that keeps a failed attempt from blocking a positive fact. Each namespace gains a registry row listing its registered domains; a write whose slug the registry does not know is refused with the registered list and a `register_domain: true` remedy, and the registry is a cache that reconcile repairs. The snapshot now names the registered domains and carries a bounded domain strap so domain-tagged rows the access-count cut would hide still surface. The metrics surface gained `domain_filter` and `recall` sections. Vocabulary bumped to version 6.
-
-## 🆕 What's New in 1.10.1
-
-**One successor rule, three surfaces.** A retired row is history — but the row that carries its work is the row at the **end** of the supersession chain, not merely the next link. 1.10.0 resolved one link deep, so a work that was replaced twice was read as void: its extraction obligation was dropped, and its dependents were released while the work was still in flight under the row that replaced it twice. The chain is now walked bounded and cycle-safe, and one rule decides readiness, the extraction obligation, and the snapshot. Alongside it: a **retired lesson discharges nothing** (the store hides it; the gate refuses to forgive it), a **lesson belongs to the work rather than to one row id** (the row that replaced a finished task keeps that lesson, so a consolidated work is never asked for a second one), and **`task_list` no longer offers history as work** — retired rows are hidden by default, exactly as the gate and the snapshot treat them, and come back labelled `retired: true` under `include_retired: true`. Finally, the **claim** question 1.10.0 left open is now written down: a claim is a lease on the work, not on the row id, so correcting a claimed task does not hand live work to another agent — and the supersede reply names the successor id and the call that releases the claim deliberately (`neurostrata_task_update` with `status: "open"`).
-
-## 🆕 What's New in 1.10.0
-
-**Two closed gaps: stable graph export, and a gate that stops haunting you.** The **source-anchor registry** (`src/source_context.rs`) binds each stable source identity to its own canonical `.NeuroStrata` marker directory, so graph export resolves every path against the source it actually came from instead of rebasing one repository's relative paths onto whichever checkout happened to launch the export — one shared database can now serve several repositories, linked worktrees, and unrelated working directories and still export the same graph. Core stays VCS-agnostic: it stores and exports provenance, and never discovers repositories or inspects refs. And the **task gate now knows the difference between history and live work**: a retired row (past `metadata.valid_to`) no longer raises `in_progress`, P0-rot, or staleness violations, is never offered as claimed or ready work, and no longer blocks every push forever under an assignee who no longer exists — while the extraction lock keeps its teeth by transferring the obligation to a live, `done` successor that carries its own lesson.
-
-* **Universal source-anchor registry.** `neurostrata-mcp project-context bind|list|unbind` binds a stable `source_id` to an existing `.NeuroStrata` marker directory; the project root is derived from that marker's parent. Export resolves each node's `locations[].location` against the binding for that row's own source. Machine paths stay out of the exported provenance — they appear only in the legacy `absolute_path` projection, and only when a matching local binding exists. The provider-neutral `locations[].source_context` contract is preserved: Core reads the standardized `source_id` discriminator and round-trips provider-specific fields (revision, workspace) opaquely. `NEUROSTRATA_ANCHOR_ROOT` + `NEUROSTRATA_SOURCE_ID` still work as a legacy scoped override; the root alone is deprecated and ignored with a warning.
-* **Marker-path validation.** A bound source ID must point at a real `.NeuroStrata` marker directory; an invalid or ambiguous one is refused rather than quietly resolving against the caller's working directory.
-* **Retired rows are history, not live work.** A task row whose `metadata.valid_to` has passed raises no live-work violation, is never offered as claimed or ready work, and stops holding its dependents unless a live successor still carries the work. The gate report gained `counts.retired` so `in_progress: 1` with no violation stops reading as a contradiction.
-* **The extraction lock kept its teeth.** A retired `done` row is exempt from `done_without_extraction` only when `metadata.superseded_by` names a successor that is a task row, is not retired, is `done`, and already has an inbound `EXTRACTED_FROM` edge. Anything else leaves the lesson owed, and the retired row still blocks. Malformed expiry metadata is not proof of retirement and keeps failing closed.
-* **Retired rules stopped failing the provenance check.** A superseded rule is skipped by the rule checks, with the same deliberate divergence from the store's own retirement filter: the store hides; the gate refuses to forgive.
-* **Config saves stopped losing data.** Unknown top-level config keys are preserved on save, and the config file keeps its original mode instead of being rewritten under the process umask.
-* **Honest diagnostics.** A `GOVERNS` edge that cannot be resolved to a real file is reported as deferred instead of failing the write silently. The CLI reference, the task-subsystem design doc, the tool schema and the push-gate instructions now describe the same retirement and readiness semantics the engine implements.
-
-## 🆕 What's New in 1.9.0
-
-**SynapticMesh — team sharing over plain git.** Every shareable memory your agents learn can travel to teammates' agents on other machines: a durable outbox + mesh-worker publishes wire-format records into a per-mesh git repo; pulls are validated *before* they touch the store — lifecycle merge table, conflicts preserved (integration pauses loudly rather than dropping either side), private rows sovereign, procedure definitions travel **without** their runtime counters, imported procedures are untrusted until promoted. Full walkthrough in the [🕸️ SynapticMesh (Mesh Sharing for Teams)](#-synapticmesh-mesh-sharing-for-teams) section below.
-
-## 🆕 What's New in 1.8.0
-
-* **Thalamic Bus (`src/events/`).** A bounded pub-sub backbone constructed in the daemon and threaded through `process_mcp_request`. Every memory mutation — `add`, `supersede`, `archive`, `task_complete` extraction — emits a typed `ThalamicPulse` (`Created`, `Superseded`, `Archived`, `GuardedActionFired`). Three subscribers run on the dispatcher: `EpisodicPointerEcho` writes the Continuous Backup Protocol line for every `Created`; `ExportFreshnessDirty` flips a per-namespace `freshness_flag` sentinel row on every mutation; `GuardEventLog` persists every `guard_validate` verdict as an audit row. Drop-oldest backpressure, 250ms per-subscriber timeout, panic-catcher, `RecursionToken` to keep a subscriber's own writes from re-triggering itself.
-* **Export-freshness gate.** The `neurostrata-mcp export-graph` CLI now refuses the export (exit 1) when any namespace holds a `freshness_flag` row with `metadata.dirty: true`, naming every dirty namespace in the error so the operator sees the whole backlog at once. An operator who has confirmed the export is current can flip `metadata.dirty: false` to clear the gate. The reader is `crate::events::check_export_freshness(store)`; it runs from the CLI before `vector_store.export_graph(...)`. The daemon's `/graph` HTTP route accepts the same `include_archived` query parameter.
-* **`metadata.archived` filter on every read surface.** Tombstoned rows (the same `archived: true` that `archive_memory` writes) are hidden by default from `search_memory`, `get_snapshot`, and `export-graph`; the escape hatch is a uniform `include_archived: true` parameter on each. The read-time test is strict on the field shape (literal `true` only) — `crate::handlers::archive_memory::is_archived(payload)` at the handler surfaces (`src/handlers/archive_memory.rs:57-63`), a store-level twin on the query path (`src/store/ladybug.rs:1275-1280`), and an inline read in the graph export (`:2039-2042`).
-* **`archive_memory` `allow_global` parity.** Retiring a row in the `global` stratum is refused without an explicit `allow_global: true`, mirroring the guard `handle_supersede_memory` already carried. Same wording, same one-paragraph error message — one shape of consent for every retirement-class mutation.
-* **`neurostrata_procedure_perform` MCP tool.** The third leg of the memory triad: knowing-how, not knowing-that. `memory_type: "procedure"` with `trigger`, `remaining_fires` (the iteration budget), `valid_to` (decay with disuse), `last_performed_at` and `performance_count` (strengthened by rehearsal). `get_snapshot`'s `procedures_due` strap surfaces what is still live.
-* **`neurostrata_archive_memory` MCP tool** + `neurostrata-mcp archive` / `neurostrata-mcp bus-metrics` CLI subcommands. The archive handler returns a typed `ArchiveOutcome` so a refusal is never a 200. `bus-metrics` reads the dispatcher's bus counters with an explicit timeout.
-* **Test ergonomics fix.** `StubEmbedder` now adds a constant per-element fractional offset so its vectors parse as `FLOAT[]` rather than `INTEGER[]`; the prior integer-only vectors silently tripped LadybugDB's `ARRAY_DISTANCE` binder. Real embedders never produce integers, so production was unaffected.
+1. **Task lifecycle locked to memory consolidation** — `neurostrata_task_complete` refuses `done` until an `EXTRACTED_FROM` edge exists; the pre-push SAS gate (`task gate --strict`) blocks unfinished work. No passive RAG store does this at the binary level. (Proof: README §Central Executive, Lock 2 / line 89.)
+2. **Pre-execution behavioral guard as a memory namespace** — rules live in `guard` namespace as ordinary `guard_rule` Engrams; every state-mutating action is semantically matched, optionally dry-run inside a network-isolated `podman --network=none` container, and refused with a named verdict (`DeterministicReject` / `SandboxReject`). (Proof: §Prefrontal Cortex, lines 211–243; verdict vocabulary 224–234.)
+3. **Single-binary, embedded-vector, git-native team mesh** — LadybugDB + `fastembed` dendrite in-process; `embedders.json` declares remote bridges; no silent fallback on missing keys. SynapticMesh syncs over plain git with validated pull, lifecycle merge table, conflicts preserved loudly — no SaaS broker. (Proof: §Zero-Overhead 61–67, §Security 515–522, §SynapticMesh 335.)
 
 ---
 
-## 🌟 Why NeuroStrata Wins: The Zero-Overhead Advantage
+## The five organs (TL;DR)
 
-* **Nothing Leaves The Machine:** There are no REST APIs to the outside world, no WebSockets, and no MQTT broker. Agents speak to NeuroStrata over standard input/output (`stdio`) using the official MCP JSON-RPC spec; a local daemon listens on `127.0.0.1:34343` for the GUI and for the stdio proxy, bound to loopback only. It is an offline, single compiled Rust binary.
-* **Embedded LadybugDB, and nothing else to run:** No Docker containers to manage and no remote databases to pay for. The entire vector database runs embedded inside the Rust binary: one node table holding the embeddings, plus four relation tables (`src/store/ladybug.rs:1408-1429`). Retrieval scans those embeddings with `array_distance` — there is no separate keyword index to build, operate, or pay for. It just works.
-* **The "Pointer-Wiki" Architecture:** Standard RAG systems dump 50-page architecture documents into the LLM context window, which destroys reasoning performance and racks up API costs. NeuroStrata's **SynapticGraph** hands the agent a semantic *pointer*—a hyper-specific **Engram** (e.g., `docs/architecture/sync.md`, Lines 42-49). The agent only reads the bytes it needs to solve the problem.
-* **Eidetic Recall & Instant Grounding:** Instead of wasting tokens blindly searching a new repository, agents instantly retrieve the top-5 highest-weighted, active Engrams for any project. This **Eidetic Recall** perfectly grounds an agent the exact second a chat session begins.
-* **Visualize AI Memory Locally:** Because NeuroStrata simply writes to a local `.NeuroStrata/db` directory, our native **Obsidian Plugin** can read the database directly from disk. You can visually render exactly what your AI "knows" into a 2D spatial canvas in real-time, and seamlessly curate, edit, or **Synaptically Prune** the AI's memory with a right-click—all without a network connection.
+| # | Organ | What it does for you |
+|---|-------|---------------------|
+| 🧠 | **SynapticGraph + Engrams** | Memory as pointers (`{file, lines}`), not pages — compact reading, instant grounding. [Deep → docs/architecture/synapticgraph.md] |
+| 🛡️ | **Prefrontal Cortex** | Blocks bad actions with named verdicts + optional sandbox. [Deep → docs/organs/prefrontal-cortex.md] |
+| 🎯 | **Central Executive** | Goals move `open → in_progress → blocked → done`; only `done` with extracted memory passes the gate. [Deep → docs/organs/central-executive.md] |
+| 🌉 | **Dendritic Bridge** | Remote embedder or fully local (`fastembed`) — graceful, never silent. [Deep → docs/organs/dendritic-bridge.md] |
+| 🕸️ | **SynapticMesh** | Team memory over `git push`; conflicts stay visible. [Deep → docs/mesh/synaptic-mesh.md] |
 
----
+Also: **Thalamic Bus** (typed mutation pulses, export-freshness gate), **Procedural Memory** (rehearsal-stamped knowing-how), **Episodic Buffer** (session logs with topic-switch markers), **Source-Anchor Registry** (multi-checkout provenance).
 
-## 🧬 Biological Nomenclature ↔ Engineering Primitives
-
-NeuroStrata uses cognitive metaphors to map how software actually evolves. Here is the translation to actual engineering concepts:
-
-| Biological Term | Engineering Primitive | Description |
-| :--- | :--- | :--- |
-| **SynapticGraph** | **Knowledge Engine** | The core inference engine mapping semantic business axioms directly to your structural codebase, traversing edges to identify connected architecture. |
-| **Engram** | **Vector Row** | A single memory record in LadybugDB containing text, embeddings, metadata, domain tags, and optional graph edges linking it to other Engrams. |
-| **Synaptic Pruning** | **Score Decay** | An access-based reinforcement algorithm (inspired by the Ebbinghaus Forgetting Curve). Every **direct** hit has its `access_count` incremented in the background (`src/server.rs:2042-2054`); graph-expansion neighbours do not count as reads. The counter only ever rises (`src/store/ladybug.rs:2370-2386`), so an unused rule loses *relative* rank as other rows are retrieved, rather than accumulating a decay penalty of its own. *Rules are never autonomously deleted.* |
-| **Eidetic Recall** | **Boot-time Snapshot** | Instant retrieval of the top 5 highest-weighted, active Engrams for a project the exact second a new chat session begins, instantly grounding the agent. |
-| **Tri-Strata Model** | **Namespace Tiers** | Strict partitioning of the database into Global (Company), Domain (Project), and Task (Issue) namespaces to prevent context contamination. |
-| **Episodic Buffer** | **Rolling Log Files** | A silent background log written to `.NeuroStrata/sessions/` capturing all conversational context and architectural pivots so nothing is lost when a chat closes. |
-| **Procedural Memory** | **`procedure` Engram** | The third leg of the triad: knowing-how, not knowing-that. An Engram with `memory_type: "procedure"` carrying `trigger`, `remaining_fires` (its iteration budget), `valid_to` (decay with disuse), `last_performed_at` and `performance_count` (strengthened by rehearsal). `neurostrata_procedure_perform` stamps one firing and writes the Episodic Buffer entry it points back to; `get_snapshot`'s `procedures_due` strap surfaces what is still live. Its anatomical seat is the **Basal Ganglia**. |
-| **Prefrontal Cortex** | **Behavioral Guard** | A structural executive module that intercepts state-mutating actions (bash, file writes) *before* execution, resolving them against behavioral rules by semantic similarity in LadybugDB, with an optional ephemeral Podman dry-run. |
-| **Dendritic Bridge** | **Remote Embedder** | An external, OpenAI-compatible embedding endpoint that integrates signals from sources outside the cortex, with the local `fastembed` dendrite absorbing every request when no bridge is declared. |
-| **Central Executive** | **Task Subsystem** | Goal lifecycle management — create, claim, gate, complete — driven by a hand-rolled state machine and one enforcement hook. Named for Baddeley's executive component of working memory: it decides what gets worked on and when work is genuinely finished. |
-| **Goal** | **Task Record** | An Engram with `memory_type: "task"` — status, priority, assignee, and an append-only history in its metadata. Goals live in the same LadybugDB as everything else, so memory and task state can never decouple. |
-| **Supervisory Attentional System** | **Task Gate** | Norman & Shallice's conflict monitor, realized as `neurostrata-mcp task gate --strict`: the pre-push hook refuses to let work leave the machine while Goals are unfinished or unconsolidated. |
-| **Knowledge Consolidation** | **Done-Funnel (Lock 2)** | A Goal reaches `done` through exactly one guarded entrance — `neurostrata_task_complete` — which fails until the work has consolidated at least one Engram (an `EXTRACTED_FROM` edge). Experience is not allowed to evaporate. |
-| **Action Initiation** | **Zero-Action Start** | No state-mutating action begins before a Goal exists and is claimed. The session snapshot says it first, every time. |
-| **Working Memory** | **Goal History** | The append-only transition log and notes on each Goal — the Task Stratum made durable. Mid-task checkpoints ("the Breath") land here. |
-| **Thalamic Relay** | **ThalamicBus** | The thalamus is the brain's relay station; this is NeuroStrata's. A bounded, in-process pub-sub bus constructed in `daemon.rs` and threaded through `process_mcp_request` as `Arc<ThalamicBus>`. Carry: typed `ThalamicPulse` variants (`Created`, `Superseded`, `Archived`, `GuardedActionFired`) from four emit sites to three v1 subscribers — `EpisodicPointerEcho`, `ExportFreshnessDirty`, `GuardEventLog`. Backpressure: drop-oldest, 250ms per-subscriber timeout, panic-catcher. The `RecursionToken` prevents a subscriber's own write from re-triggering itself. |
-| **Export-Freshness Gate** | **`check_export_freshness`** | The relay's first wire: every storage mutation flips a per-namespace `freshness_flag` sentinel row; `neurostrata-mcp export-graph` refuses to skip the export (exit 1) when any namespace holds a flag with `metadata.dirty: true`. An operator who has confirmed the export is current flips the field to `false`; the gate trusts the flag. The reader lives at `crate::events::check_export_freshness(store)`. |
-| **Tombstone** | **`metadata.archived: true`** | The retirement-class mutation: a row keeps its content, its id, and its provenance; `archived: true` is *merged* in beside them. `archive_memory()` (the typed core) refuses the machine-wide `global` namespace without an explicit `allow_global: true`, the same consent `handle_supersede_memory` already carries. Every read surface honors the tombstone by default, with a uniform `include_archived: true` escape hatch. |
-| **ThalamicBus** | **Pub-Sub Event Bus** | The thalamus is the brain's relay station; this is NeuroStrata's. A bounded, in-process broadcast backbone in `src/events/` that carries memory-lifecycle pulses (`Created`, `Superseded`, `Archived`, `GuardedActionFired`) from emit sites to subscribers, with drop-oldest backpressure and a recursion token that keeps a subscriber's own writes from re-triggering itself. |
-| **ThalamicPulse** | **Event Enum** | A single event travelling on the bus — the `#[non_exhaustive]` `ThalamicPulse` enum. One pulse carries the ids and namespace subscribers act on (the variant's own fields: a `Superseded` pulse names its successor, not its own id; a `GuardedActionFired` pulse carries a payload hash). Subscribers reach the store only through their `SubscriberContext` — so a subscriber can also be a writer, but never by calling the store directly off the bus. |
+**Full feature inventory + benefit translations:** [`docs/FEATURES.md`](docs/FEATURES.md). **Cognitive-science naming & engineering equivalents:** [`docs/science/nomenclature.md`](docs/science/nomenclature.md). **Why standard AI memory fails:** [`docs/science/why-memory-fails.md`](docs/science/why-memory-fails.md).
 
 ---
 
-## 🔬 The Science: Why Traditional AI Memory Fails
+## 🆕 What's New in 1.11.0 (brief)
+**Recursion closure:** negative exemplars (`metadata.attempt`), domain registry per namespace (rejects unknown domain with remedy), snapshot domain strap, `domain_filter` + `recall` metrics sections. Vocabulary v6.
 
-Current agentic workflows suffer from severe context degradation due to a fundamental misunderstanding of how memory should be structured. 
-
-### 1. The "Lost in the Middle" Phenomenon
-Research demonstrates that LLMs have a U-shaped performance curve when retrieving information from long contexts. They remember the beginning and end of a prompt but catastrophically fail to retrieve information buried in the middle (*Liu et al., 2023*). 
-* **The NeuroStrata Fix (Pointer-Wiki):** NeuroStrata enforces **Compact Reading**. Instead of dumping full documents into the context window, memory returns exact file pointers and line numbers. The agent is forced to read only the specific paragraph needed, minimizing context noise and preventing attention-mechanism dilution.
-
-### 2. Semantic vs. Episodic Interference
-Cognitive science divides long-term memory into **Semantic** (general facts/rules) and **Episodic** (specific events/tasks) (*Tulving, 1972*). Forcing an AI to process global infrastructure rules mixed with a temporary bug-fix context creates catastrophic interference.
-* **The NeuroStrata Fix (Tri-Strata Model):** NeuroStrata rigidly partitions the database into Global, Domain, and Task namespaces, ensuring the AI only retrieves the exact type of memory required for the current cognitive load.
-
-### 3. The Absence of Spatial Anchoring
-Human memory relies on the hippocampus to create "Cognitive Maps"—spatial frameworks where memories are anchored to specific physical or conceptual locations (*O'Keefe & Nadel, 1978*). AI agents typically use flat vector databases, meaning a rule about frontend rendering might accidentally pollute a backend database task because they semantically overlap.
-* **The NeuroStrata Fix (Spatial Grounding):** Domain rules are spatially anchored to specific physical directories (e.g., `docs/architecture/domains/`). The vector database stores a semantic pointer *to the physical file*. This forces the agent to traverse the project's spatial hierarchy, grounding its understanding in your codebase structure.
-
-### 4. The Semantic vs. Structural Disconnect
-Traditional static analysis tools map *code dependencies* and *call graphs*, but they are completely blind to *project knowledge* and *axiomatic constraints*. 
-* **The NeuroStrata Fix (SynapticGraph):** According to the theory of program comprehension (*Brooks, 1983*), understanding code requires mapping the problem domain to the structural domain. NeuroStrata's internal **SynapticGraph engine** explicitly maps architectural documents to the code files (the implementations), bridging the gap between business axioms and execution.
+Full changelog split to [`docs/releases/changelog/`](docs/releases/changelog/) — per-release pages for 1.10.1 (retired-row coherence, supersession chain bounded + cycle-safe), 1.10.0 (source-anchor registry, gate distinction of history vs live), 1.9.0 (SynapticMesh), 1.8.0 (Thalamic Bus, export-freshness gate, procedural memory, archive tool, bus metrics).
 
 ---
 
-## 🏗️ The Tri-Strata Model Architecture
-
-NeuroStrata maps directly to human cognitive models to provide agents with perfect, interference-free recall via a secure, local-only architecture.
-
-```mermaid
-graph TD
-    Agent((🤖 AI Agent))
-    
-    subgraph NeuroStrata MCP Server [Native Rust Binary]
-        Router{JSON-RPC Router<br/>via stdio}
-        
-        Tier1[("Global Stratum<br/>(Semantic)")]
-        Tier2[("Domain Stratum<br/>(Spatial)")]
-        Tier3[("Task Stratum<br/>(Working)")]
-        
-        PFC[[🛡️ Prefrontal Cortex<br/>Behavioral Guard]]
-        CE[[🕴️ Central Executive<br/>Goal Management]]
-        Dendritic[[🌉 Dendritic Bridge<br/>Embedding Provider]]
-    end
-    
-    LadybugDB[(Embedded LadybugDB<br/>~/.local/share/neurostrata/db)]
-    PointerWiki[(Project Files:<br/>docs/architecture/domains/)]
-    Obsidian((Obsidian GUI))
-    SynapticGraph[[SynapticGraph]]
-    Sandbox[[Ephemeral Podman Sandbox<br/>Network Isolated]]
-    LocalEmbed[[Local fastembed Dendrite]]
-    RemoteAPI((External Embedder<br/>TypeSafe Jev / OpenAI))
-    
-    Agent <-->|MCP JSON-RPC over stdio| Router
-    Router --> Tier1
-    Router --> Tier2
-    Router --> Tier3
-    
-    Tier1 -.-> LadybugDB
-    Tier2 -.-> LadybugDB
-    Tier3 -.-> LadybugDB
-    
-    Tier2 <==>|Physical File Anchor| PointerWiki
-    SynapticGraph -->|Analyzes Code & Updates| PointerWiki
-    
-    Obsidian -.->|Reads Local DB directly| LadybugDB
-    Obsidian -.->|Reads Local Files directly| PointerWiki
-    
-    Agent -->|State-Mutating Action| PFC
-    PFC -->|Verdict: Approve / Reject| Agent
-    PFC -.->|Behavioral Rules| LadybugDB
-    PFC -->|Optional Dry-Run| Sandbox
-    
-    Agent -->|Goal Lifecycle| CE
-    CE -->|SAS Gate: Block Unfinished Work| Agent
-    CE -.->|Goals & Extraction Edges| LadybugDB
-    
-    Router -.->|Embedding Requests| Dendritic
-    Dendritic -->|Declared Bridge| RemoteAPI
-    Dendritic -.->|No Bridge Declared| LocalEmbed
-    
-    classDef core fill:#1e1e1e,stroke:#00ADD8,stroke-width:2px,color:#fff;
-    classDef memory fill:#2d2d2d,stroke:#ff5555,stroke-width:1px,color:#fff;
-    classDef engine fill:#3a205e,stroke:#9d4edd,stroke-width:2px,color:#fff;
-    classDef tool fill:#1c3d5a,stroke:#3b82f6,stroke-width:1px,color:#fff;
-    classDef guard fill:#3d1f1f,stroke:#ef4444,stroke-width:2px,color:#fff;
-    
-    class Agent,Router core;
-    class Tier1,Tier2,Tier3,LadybugDB,PointerWiki memory;
-    class SynapticGraph engine;
-    class Obsidian tool;
-    class PFC,CE,Dendritic,Sandbox,LocalEmbed guard;
-    class RemoteAPI tool;
-```
-
-1. **Global Stratum (Tier 1):** Company-wide constraints and infrastructure mandates (e.g., "Always use `podman` instead of `docker`").
-2. **Domain Stratum (Tier 2):** Project-specific rules and API contracts. Utilizes the SynapticGraph pointer constraint: Engrams are hyper-specific references (`{"file": "docs/...", "lines": "42-49"}`) to physical architecture files.
-3. **Task Stratum (Tier 3):** Goals (tracked work with their durable history) and the ephemeral context of active bug fixes or feature branches.
-4. **Prefrontal Cortex:** Intercepts state-mutating actions on their way *out* of the agent and returns a verdict *before* execution.
-5. **Dendritic Bridge:** Integrates embedding signal from either a declared external endpoint or the local dendrite.
-6. **Central Executive:** Manages the Goal lifecycle and gates completion and push behind Knowledge Consolidation.
-
----
-
-## 📝 The Episodic Buffer & Operator Controls
-
-To prevent the loss of critical architectural decisions made during ad-hoc conversations, NeuroStrata enforces an **Episodic Buffer**. Agents are instructed to silently use the `neurostrata_append_log` tool in the background as they work, writing to a local `.NeuroStrata/sessions/` directory.
-
-* **Grep-able Waypoints:** When a user changes topics (e.g., from "database refactor" to "UI design"), the agent tags the log entry. The Rust server injects highly structured `### 🔄 Topic Switch` markers.
-* **Compact Recovery:** If an agent ever loses context, it is instructed to run a two-pass recovery: `grep` for the Topic Switch waypoints to find the general discussion area, and then use the `read` tool with exact line offsets to instantly recover the forgotten context without reading massive files.
-* **Operator Safety Controls:** Log files automatically roll over at 500KB. To prevent bounded disk growth or the accidental logging of sensitive secrets, you can configure retention policies or disable the Episodic Buffer entirely via `~/.config/neurostrata/config.json`. *Never paste raw API keys into an AI chat if the buffer is active.*
-
----
-
-## 🛡️ The Prefrontal Cortex: Behavioral Constraint Validation
-
-A brain that can *remember* a rule and then ignore it has no executive function. The **Prefrontal Cortex** (`src/guard/`) is the organ that closes that loop: it intercepts every state-mutating action an agent proposes — a `bash` command, a file write — and refuses it, with reasons, before a single byte is written.
-
-The naming is not decorative. Recent work on an *artificial prefrontal cortex* for LLM agents describes precisely this structure: a standalone executive module that intercepts jailbreaks, collusion, mutation attempts and long-horizon evasion tactics without contaminating the policy model it defends. Webb, Mondal & Momennejad's MAP architecture reaches the same conclusion from the planning side — modular agentic control improves LLM planning because executive function is best modelled as a *separate* structure rather than an extra prompt.
-
-### How a verdict is reached
-
-1. **Semantic evaluation.** The proposed payload (`action_type` + `payload`) is embedded and vector-searched against the `guard` namespace in LadybugDB, where behavioral rules live as ordinary memories with `memory_type = "guard_rule"`. Matching rules come back ranked by similarity, carrying `rule_class`, `trigger_pattern`, `constraint_text`, `hit_count`, and a `status`.
-2. **Deterministic rejection.** Any non-deprecated rule whose trigger pattern matches the action type or appears in the payload produces an immediate `DeterministicReject`, returning both the violated `constraints` and the human-readable `reasons`. No container is started; the rule alone is decisive. Rules marked `deprecated` are skipped, so retiring a rule never requires deleting it.
-3. **Ephemeral dry-run (optional).** For `bash` and `script` actions the payload is executed for real inside a throwaway container: `podman run --rm --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp -w=/workspace alpine:latest sh -c <payload>`, with a strict **5-second timeout** and a read-only project mount. Podman is the only engine detected — the sandbox does not fall back to Docker. If no engine is present, the Cortex **fails closed** rather than waving the action through.
-4. **Bounded output.** Sandbox `stdout`/`stderr` are truncated to 500 characters. An unbounded log from a failing dry-run would flood the agent's context window and trigger exactly the compaction spiral the Episodic Buffer exists to prevent.
-
-### The verdict vocabulary
-
-| Verdict | Meaning |
-| :--- | :--- |
-| `DeterministicReject` | A stored behavioral rule forbids this action. |
-| `SandboxReject` | The dry-run exited non-zero, errored, or hit the 5s timeout. |
-| `SandboxPassLowFidelity` | The dry-run succeeded in the container. |
-| `SandboxPassHighFidelity` | Semantic evaluation passed with no rule violation and no sandbox requested. |
-| `ApprovedFailOpen` | No check applied to this action type; it proceeds unvalidated. |
-
-Every response also returns `rule_ids_triggered`, so a violation is always attributable to the specific rule that produced it — and `trace_id` carries the action across the whole audit path.
-
-### Hostile-path rejection
-
-Before any container starts, the requested working directory is canonicalised and checked against a forbidden prefix list (`/etc`, `/var/run`, `/root`, `/sys`, `/dev`, `/proc`, `/boot`, and `/` itself). Canonicalisation first means a traversal such as `<project>/../../etc` is resolved before the check, not after.
-
-### Teaching the Cortex
-
-Rules are not hand-written config. Store one with `neurostrata_add_memory` as a `guard_rule` memory in the `guard` namespace — `constraint_text`, `rule_class`, and `trigger_pattern` in its metadata — and the new rule is embedded immediately, where it applies to every future validation. Validation itself runs in-binary through the daemon's `POST /validate` route (the Prefrontal Cortex needs no separate MCP server). Dedicated `neurostrata_guard_validate`, `neurostrata_guard_learn` and `neurostrata_guard_list_rules` tools fold this loop onto the main MCP surface.
-
----
-
-## 🎼 The Central Executive: Goal Management
-
-Willpower is not a workflow. The **Central Executive** (`src/task/`) is NeuroStrata's task subsystem — the organ that decides what gets worked on, prevents duplicate effort, and refuses to let work count as finished until it has taught the brain something. Goals are ordinary Engrams (`memory_type: "task"`) living in the same LadybugDB as every other memory: one store, one backup, one truth.
-
-Named for Baddeley's executive component of working memory — the system that holds current goals, schedules attention, and marks a task *done* — because that is exactly the contract, expressed as tools instead of anatomy.
-
-### The Goal lifecycle
-
-Goals move through four states (`open → in_progress → blocked → done`) over eight legal transitions. The machine is a hand-rolled transition table — states are runtime data in a database, mutated across process invocations, so compile-time state-machine libraries would add a dependency without adding proof.
-
-| Phase | Biological Name | Mechanism |
-| :--- | :--- | :--- |
-| Starting work | **Action Initiation** | Zero-Action Start: no state-mutating action before a Goal exists and is claimed. `neurostrata_get_snapshot` injects this mandate into the mandatory pre-flight of every session. |
-| Claiming | Goal selection | `neurostrata_task_claim` is exclusive — a Goal held by another live session fails loudly at claim time, not at merge time. |
-| Working | **Working Memory** | `neurostrata_task_update(note=...)` appends to the Goal's history; the "Breath" checkpoint lands here, so mid-task recovery is a lookup, not log archaeology. |
-| Finishing | **Knowledge Consolidation** | `done` has exactly one entrance. `neurostrata_task_complete` fails — with a JSON-RPC error naming both ways to comply — until the work has consolidated at least one Engram carrying an `EXTRACTED_FROM` edge back to the Goal. Inline `memory`, `link_memory_id`, or a prior extraction all satisfy it. |
-| Shipping | **Supervisory Attentional System** | The pre-push hook runs `neurostrata-mcp task gate --strict`: unfinished Goals, unconsolidated `done`s, or rotting P0s block the push. Norman & Shallice's conflict monitor, made mechanical. |
-
-`neurostrata_task_update` *cannot* set `status: "done"` — the single guarded funnel is the whole point. Enforcement lives in one hook and one binary: there is no external task CLI to install, approve, or keep in sync, and tasks never touch the repository, so there is nothing to commit or merge.
-
-### Onboarding a project
-
-The Central Executive instructs; it does not silently mutate your repo:
-
-* **New project:** `neurostrata_bootstrap` returns an AGENTS.md template, a first mandatory Goal, and an ordered instruction list the agent executes.
-* **Existing project:** `neurostrata_task_setup` scans the repository (manifests, CI, legacy trackers, hooks), proposes rules, creates integration Goals, and returns the same ordered instructions.
-
-> **`suggested_rules` are a draft, never ground truth.** They are weighted by counted source files (a manifest alone earns nothing), flagged `heuristic: true`, and each carries `similar_existing` memories plus any `conflicts` — review them against the project's standing rules before accepting, and supersede the stale rule rather than storing a contradiction.
-
-### The wiring panel — gates, git-first but never git-only
-
-`neurostrata_bootstrap` / `neurostrata_task_setup` return a **`wiring`** block: every gate NeuroStrata knows about, marked **automatic** (a machine fails on its own) or **reminder** (the agent is put in front of the action), with `runs_in` naming whose responsibility it is — `core` (NeuroStrata itself), `git-pre-push` (the default instance), `project-pipeline` (the project's own chokepoint), or `agent-reminder`. The **`verified`** block reports what setup checked read-only (hook installed? export fresh? gate point resolved?) and anything verified is subtracted from `instructions`.
-
-Git is named first and called the default: run `hooks install`, then wire the pipeline gates into CI. **The system is not software-specific** — a CMS, media-production, or research project gets the same instruction in the same shape with a discovery clause: identify the ONE step every unit of work must pass to leave the project (publish action, render submission, review approval), wire `neurostrata-mcp task gate <ns> --strict` (exit 1 = blocked) into it, and **record the chosen gate point as a rule memory** so no future session re-derives it. `coverage.uncovered` lists every gate with no home yet; empty is the success state.
-
-Rules carry their own honesty fields (`enforcement: ENFORCED|PARTIAL|NOT_ENFORCED`, `source`, `guard`): a rule claiming `ENFORCED` must name a real wire, and every rule must name its provenance — `task_validate` fails both (`rule_overclaims_enforcement`, `rule_without_source`). *A rule that no machine checks is a note, not a rule.* `neurostrata_supersede_memory` accepts `governs`/`related_to`/`contained_by`/`locations` to replace structural pointers wholesale — anything you omit carries over unchanged and the reply names it, so a correction can never silently leave a stale pointer. An unambiguous `Governs: [...]` line in the corrected prose is honoured when no parameter speaks; when prose and metadata disagree, the rendered record says which half governs.
-
----
-
-## 🌉 The Dendritic Bridge: External Embedding Integration
-
-NeuroStrata's early architecture demanded a long-running embedding endpoint on `localhost:8004` — a foreign process you had to start, keep warm, and remember to shut down. The **Dendritic Bridge** removes that obligation: if a remote provider is declared, signals are integrated through it; if it is not, the cortex simply grows its own local dendrite and nothing is lost.
-
-This mirrors the neuroscientific account of *dendritic integration* (Liu, Ma, Li & Zhou, NeurIPS 2024), where the computational power of a neuron comes not from a single linear synapse but from the **quadratic** combination of many dendritic signals arriving on separate branches. A declared remote endpoint and a local model are two such branches over the same dendrite: the caller cannot tell which one answered, which is precisely the property that makes the degradation invisible.
-
-### Declaring a bridge
-
-Bridges are declared in `~/.config/neurostrata/embedders.json` — a strict JSON array (strict JSON over YAML, per project constraint), written with sensible local defaults on first run:
-
-```json
-[
-  {
-    "model_name": "NomicEmbedTextV15",
-    "dimensions": 768
-  },
-  {
-    "model_name": "text-embedding-3-small",
-    "dimensions": 1536,
-    "base_url": "https://api.openai.com/v1",
-    "api_key_env": "OPENAI_API_KEY",
-    "api_model": "text-embedding-3-small"
-  }
-]
-```
-
-| Field | Role |
-| :--- | :--- |
-| `model_name` | Identity of the entry; also selected by `NEUROSTRATA_MODEL`. |
-| `dimensions` | Vector width, readable *without* loading a model — so `backup`/`restore` work on a fresh, offline machine. |
-| `base_url` | OpenAI-compatible embeddings endpoint. Omit for a purely local cortex. |
-| `api_key_env` | **Name** of the environment variable holding the key, never the key itself. |
-| `api_model` | Model string sent to the remote provider; defaults to `text-embedding-3-small`. |
-
-Any OpenAI-compatible endpoint works — OpenAI, TypeSafe Jev (`https://api.typesafe.ai/v1`, the same provider the plasticity evaluator uses), a local Llama.cpp/Ollama server, or a self-hosted gateway.
-
-### Resolution and graceful degradation
-
-`build_embedder()` reads one rule: **a bridge exists only when both `base_url` and `api_key_env` are declared.** With no bridge declared, embedding falls to the local `fastembed` dendrite (`NomicEmbedTextV15` or `BGEBaseENV15`, 768 dimensions), cached in the shared `~/.cache/neuro/models/fastembed` directory alongside every other Neuro\* tool.
-
-Remote requests carry a 30-second timeout and a single retry after one second of backoff on `429` or a `5xx` — the two failure modes that are genuinely transient. If a bridge *is* declared but its key environment variable is absent, the Cortex reports that fact explicitly instead of silently swapping in a different embedding space. That refusal is deliberate: a quiet fallback to a different-width model would leave every existing Engram in LadybugDB at an incompatible distance, and the damage would surface as mysteriously degraded recall weeks later rather than as a clear error now.
-
-### The law of minimal entropy
-
-Neither organ adds configuration the operator must keep in sync. The Dendritic Bridge derives itself from a single file that the tool writes for you. The Prefrontal Cortex keeps its rules *inside the same LadybugDB namespace mesh* as everything else, so there is no second store to migrate, back up, or reconcile. One database, one configuration surface, no redundant truth.
-
-Together with SynapticGraph, the Engram, and the Central Executive, the architecture is now complete: **memory** (what the agent knows), **validation** (whether the agent may act on it), **goal management** (what the agent must do — and proof that the work taught it something), and **external integration** (where new signal enters).
-
----
-
-## 🕸️ SynapticMesh (Mesh Sharing for Teams)
-
-*The inter-instance layer: memory travels BETWEEN agents on different machines over plain git.*
-
-Everything above is one machine's brain. **SynapticMesh** is what happens when a team wants its people's agents to hold the *same* memories: each daemon keeps a durable outbox (`WAL`) of its shareable mutations, a mesh-worker drains it into wire-format record files (`synaptic-mesh-record/v1`; rules, facts, and procedure definitions — never embeddings, never runtime counters, never tasks), and a git checkout per mesh (`~/.NeuroStrata/synaptic-mesh/<mesh_id>/`) is the whole transport. Sharing is a `git push`; receiving is a `git fetch` + validated replay (schema, namespace, id/filename match, lifecycle merge table, conflicts preserved — integration pauses loudly rather than silently dropping either side). Private rows on the receiving machine are never stomped, and a record id a private row already owns stays private.
-
-**Quickstart:**
+## 🚀 Getting Started (compressed)
 
 ```bash
-neurostrata-mcp synaptic-mesh init platform-team --remote git@your.host:team/mesh.git
-neurostrata-mcp synaptic-mesh join /path/to/teammates-mesh-checkout   # second machine
-neurostrata-mcp synaptic-mesh status    # mesh id, namespace sync state, outbox, heads, health
-neurostrata-mcp synaptic-mesh pull && neurostrata-mcp synaptic-mesh push  # or manual whenever
-```
-(Expose the same verbs to your agent as MCP tools: `neurostrata_synaptic_mesh_{init,join,status,push,pull,leave}`. The project tree itself never touches the ledger — a one-line pointer file, `<project>/.NeuroStrata/synaptic-mesh-ref`, names the mesh repo, and the daemon manages the rest outside the project. `sync-enqueue` exists as a hidden pull-then-push target for optional project-side pre-push hooks and is fail-soft: a rejected push never blocks your source push.)
+# Build (needs Rust + CMake + C++20; uses embedded LadybugDB)
+scripts/build.sh
 
-**Permanence disclosure (also printed by `mesh join` / `mesh status`):** *the mesh is a permanent record shared with the team.* Archives/tombstones suppress content from search on every honest node, but the content lives in git history and every teammate's clone. Full erasure requires a coordinated history rewrite (`git filter-repo` per file) that every peer must consent to and then bump the mesh epoch — and a decentralized mesh cannot force an uncooperative peer's clone to forget anything. Share accordingly.
-
----
-
-## 🚀 Getting Started
-
-NeuroStrata is tool-agnostic. It integrates with the standard `~/.agents/` specification and registers directly into your AI client's configuration (like Claude Desktop or OpenCode).
-
-### Prerequisites
-1. **Embedder:** None required. By default NeuroStrata runs a local `fastembed` model in-process. If you would rather bridge to an external provider (OpenAI, TypeSafe Jev, Llama.cpp/Ollama), declare it in `~/.config/neurostrata/embedders.json` — see **🌉 The Dendritic Bridge**.
-2. **Vector Database:** None! LadybugDB runs entirely embedded within the Rust binary. 
-3. **Container Engine (Prefrontal Cortex, optional):** Podman, if you want sandboxed dry-runs of state-mutating actions. Without it the Cortex still enforces stored behavioral rules but rejects sandbox-dependent checks. 
-
-### Building from source
-
-`cargo build --release` is the whole build, but LadybugDB compiles a C++ engine from vendored source, so it also needs CMake and a C++20 toolchain. These scripts find them and hand off to cargo.
-
-```bash
-scripts/build.sh            # Linux / macOS
-```
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1    # Windows
-```
-
-Both take `--check` / `-CheckOnly` to report the toolchain and build nothing. There is also a container route that needs no host toolchain at all. See **[docs/BUILDING.md](docs/BUILDING.md)**.
-
-### Installation
-
-**1. From a release tarball (no toolchain required).** Download the platform asset attached to the [latest release](https://github.com/Cognilogical/NeuroStrata/releases/latest), extract it, and put `neurostrata-mcp` (or `neurostrata-mcp.exe` on Windows) on your `PATH`:
-
-```bash
-# Linux (amd64)
-curl -L -o neurostrata-mcp.tar.gz https://github.com/Cognilogical/NeuroStrata/releases/latest/download/neurostrata-mcp-linux-amd64.tar.gz
-tar -xzf neurostrata-mcp.tar.gz
+# Install binary
 sudo mv dist/linux/neurostrata-mcp /usr/local/bin/
+
+# Wire the guard + task gate (per repo)
+neurostrata-mcp hooks install        # pre-push gate
+neurostrata_bootstrap                 # new project (AGENTS.md + first Goal)
+neurostrata_task_setup                # existing project
 ```
 
-Assets cover `linux-amd64`, `linux-arm64`, `darwin-arm64`, and `windows-amd64`, plus a `SHA256SUMS` file. Intel Mac (x86_64-apple-darwin) is dropped — the upstream ONNX Runtime prebuilts no longer cover it.
+No Docker, no remote DB, no REST APIs. The daemon listens loopback only (`127.0.0.1:34343`) and serves `/validate`, `/tasks/gate`, `/graph`, `/mcp`, `/bus/metrics`, `/backup`, `/shutdown` — all inside the machine.
 
-**2. From source.** If you have a Rust toolchain and want the bleeding edge:
-
-```bash
-git clone https://github.com/Cognilogical/NeuroStrata.git
-cd NeuroStrata
-cargo install --path . --locked           # installs to ~/.cargo/bin/neurostrata-mcp
-```
-
-**What the installer does:**
-1. Installs the Rust `neurostrata-mcp` binary to `~/.cargo/bin/neurostrata-mcp` (or `/usr/local/bin/` if you moved it there from the tarball).
-2. The repo carries a `SKILL.md` at the root; an OpenCode client picks it up from `~/.config/opencode/opencode.json`.
-3. The MCP server registers itself with the client the first time it runs.
-
-**Per-project, enable the Supervisory Attentional System** — one command per checkout writes the pre-push gate that keeps unfinished Goals from leaving the machine:
-
-```bash
-neurostrata-mcp hooks install    # --force replaces an existing pre-push hook
-```
-
-New projects then call `neurostrata_bootstrap`; existing projects call `neurostrata_task_setup` — both return ordered instructions the agent follows to wire the Central Executive into the repo.
-
-> **Operating rule — one daemon per store.** Every console shares the daemon that serves `127.0.0.1:34343`; never spawn your own. If an MCP connection fails, do **not** start a daemon "just in case" — run `neurostrata-mcp status` first: exit 0 means one is healthy, exit 1 means it is safe to start exactly one, exit 2 means one is still finishing and must be waited out (or `neurostrata-mcp shutdown`). A second daemon is refused at the lock, and `backup` works with or without one.
-
-### Configuration
-The installer creates a default configuration at `~/.config/neurostrata/config.json`. This holds only the database location, deduplication settings, and the Episodic Buffer retention policy — embedding is configured separately:
-
-```json
-{
-  "db_path": "~/.local/share/neurostrata/db",
-  "buffer_retention_days": 30
-}
-```
-
-To use a remote embedding provider, declare the bridge in `~/.config/neurostrata/embedders.json` (see **🌉 The Dendritic Bridge**); with no bridge declared, NeuroStrata embeds locally and requires no configuration at all.
-
-### Visualizing Memory with Obsidian
-Because NeuroStrata writes standard local files and an embedded LadybugDB database, you can visually curate the AI's memory using Obsidian without running any network servers:
-1. Create a new plugin folder: `mkdir -p .obsidian/plugins/neurostrata-plugin`
-2. Copy the pre-compiled plugin: `cp -r ~/Documents/neurostrata/plugins/obsidian/obsidian-neurostrata/* .obsidian/plugins/neurostrata-plugin/`
-3. In Obsidian, enable the NeuroStrata plugin to view the live graph.
+**Visualize memory:** the Obsidian plugin reads `.NeuroStrata/db` directly; 2D canvas, right-click prune, zero network ([docs/ops/obsidian.md](docs/ops/obsidian.md)).
 
 ---
 
-## 🛠️ MCP Tool Reference
+## 🧬 Biological Nomenclature ↔ Engineering
 
-Once installed, your AI agent automatically gains access to the following tools over `stdio`:
+| Term | Engineering Primitive |
+|------|-----------------------|
+| SynapticGraph | Knowledge engine (vector distance + bounded graph expansion) |
+| Engram | Vector row with metadata, domain tags, graph edges |
+| Synaptic Pruning | Access-count reinforcement; never auto-deletes |
+| Tri-Strata | Global / Domain / Task namespace tiers |
+| Pointer-Wiki / Compact Reading | Memory returns `{file, lines}` not full prose |
+| Prefrontal Cortex | Behavioral guard (semantic match + Podman sandbox) |
+| Central Executive | Goal management (state machine + done-funnel + SAS gate) |
+| Dendritic Bridge | Remote embedder / graceful local `fastembed` |
+| Thalamic Bus | In-process pub-sub (`ThalamicPulse` variants) |
+| Thalamic Relay / Export-Freshness | `dirty` sentinel; `export-graph` refuses stale |
+| Procedural Memory | `memory_type:"procedure"` with rehearsal budget |
 
-| Tool Name | Description |
-| :--- | :--- |
-| `neurostrata_add_memory` | Store a new architectural rule, project pattern, or task insight. |
-| `neurostrata_search_memory` | Semantic search inside **one** namespace — the Global, Domain, or Task stratum — to enforce architectural compliance. Returns the direct vector matches in boosted-distance order, plus their bounded directed-graph expansion, each carrying the evidence path that reached it. Honors `include_archived: true` to surface tombstoned rows. Takes an optional `domain` — a slug or a list of slugs — that softly narrows the candidates; a filter that would empty them is skipped rather than blinding the search, and the report's first line says which happened. |
-| `neurostrata_get_memory` | Read one memory by id, to follow a pointer instead of guessing at a search. |
-| `neurostrata_get_snapshot` | The top active rules for a project, in one call, to ground a new session. Honors `include_archived: true`; surfaces a `procedures_due` strap for live procedures. |
-| `neurostrata_supersede_memory` | Correct a rule. Stores the new text and retires the old one, which keeps its wording as history. Refuses the `global` namespace without `allow_global: true`. |
-| `neurostrata_archive_memory` | Tombstone a memory: writes `archived: true` beside the existing metadata, emits an `Archived` pulse on the Thalamic Bus. Refuses the `global` namespace without `allow_global: true`. |
-| `neurostrata_procedure_perform` | Stamp a firing of a procedure: decrement `remaining_fires`, write the Episodic Buffer entry it points back to, return whether the procedure was spent or lapsed. |
-| `neurostrata_list_namespaces` | List the namespaces the shared database holds. |
-| `neurostrata_ingest_directory` | Batch-embed an entire architectural documentation folder. |
-| `neurostrata_append_log` | Episodic Buffer writer: append a timestamped session entry, with `### 🔄 Topic Switch` markers on tagged turns and 500KB rollover. The response also carries the turn's own recall — up to three pointers to the memories the turn's tags matched — and the mode that says whether the domain filter applied. |
+Full table and science references: [`docs/science/nomenclature.md`](docs/science/nomenclature.md); broader cognitive-science grounding (Liu et al. 2023, Tulving 1972, O'Keefe & Nadel 1978, Brooks 1983, Webb/Mondal/Momennejad 2025, Liu/Ma/Li/Zhou NeurIPS 2024, Baddeley, Norman & Shallice 1986, Squire & Alvarez 1995) preserved in [`docs/references.md`](docs/references.md).
 
-The **Central Executive** manages Goals over the same surface:
-
-| Tool Name | Description |
-| :--- | :--- |
-| `neurostrata_task_create` | Create a Goal. Zero-Action Start: no file edits before one exists and is claimed. |
-| `neurostrata_task_claim` | Claim a Goal exclusively for this session (duplicate work fails loudly). |
-| `neurostrata_task_update` | Move a Goal between non-terminal states and append history notes. Refuses `done`. |
-| `neurostrata_task_list` | List Goals by status/assignee, with `ready: true` for unblocked work. |
-| `neurostrata_task_complete` | The one entrance to `done` — requires Knowledge Consolidation (an extracted Engram). |
-| `neurostrata_task_validate` | Advisory gate report: violations, stale claims, unconsolidated completions. |
-| `neurostrata_bootstrap` | New-project onboarding: AGENTS.md template, first Goal, ordered instructions. |
-| `neurostrata_task_setup` | Existing-project onboarding: repo scan, suggested rules, integration Goals, instructions. |
-
-The **Prefrontal Cortex** lives in-binary: agents validate state-mutating actions through the daemon's `POST /validate` route, and behavioral rules are ordinary `guard_rule` memories in the `guard` namespace — teachable through `neurostrata_add_memory`:
-
-| Surface | Role |
-| :--- | :--- |
-| `POST /validate` (daemon) | Validate a state-mutating action (bash, file writes) *before* it executes. Returns a verdict bucket, the reasons, and the ids of the behavioral rules that triggered. |
-| `neurostrata_add_memory` (`guard_rule`) | Teach the Cortex a new behavioral constraint — `constraint_text`, `rule_class`, and `trigger_pattern` in metadata — which applies to every future validation. |
-
-Every tool an agent can reach is additive: none of them destroys a memory. Editing a rule in
-place, deleting one, moving one between namespaces and restoring a backup are **CLI and GUI
-commands** (`neurostrata-mcp delete|edit|move|restore`, and the daemon's `/delete` and `/edit`,
-which the GUI posts to), so a person is present when bytes are lost. This is enforced by those
-operations being absent from the MCP surface entirely, not by asking an agent to seek approval.
-
-## 📖 CLI and Changelog Documentation
-
-For advanced administration, direct manipulation of the cognitive graph, and history of updates, refer to:
-*   [CLI Interface Guide](CLI-readme.md) — Complete manual for `neurostrata-mcp` commands (`namespaces`, `list`, `ingest`, `export-graph`, `delete`, `add`, `edit`, `task gate|validate|import`, `hooks install`).
-*   [Project Changelog](CHANGELOG.md) — Detailed version-by-version changes and migration logs.
-
-
-### Upgrading an existing database
-
-Node ids are **repository-relative** (`src/store/ladybug.rs`). The absolute path stays
-available as `absolute_path` in metadata, which is what the visualizer deep-links with.
-Ingest once after upgrading so older rows take the new form; declarations left over from
-an absolute-id ingest are matched by path suffix and reported as they are relinked.
-
-A namespace is the **project name**, not the checkout folder: a project cloned as
-`neurostrata` and one cloned as `NeuroStrata` are the same stratum. Names that differ
-only by case resolve to the one already stored, and `neurostrata-mcp doctor` reports
-anything an upgrade left inconsistent -- duplicate namespaces, declarations that match
-no file, and how many memories have never been counted as read.
-
-## 🩺 When the daemon crashes
-
-If the daemon dies, it leaves a breadcrumb behind: a file named
-`crash-<pid>-<timestamp>.txt` in the `crash` directory beside your database
-(`~/.config/NeuroStrata/crash` by default). It holds the signal, the pid, the
-thread, the time, and a backtrace of the faulting thread. Nothing else is
-needed to read it, and no privilege is involved: the daemon writes it into
-your own configuration directory, so it works for every user of NeuroStrata
-without root and without any setup.
-
-The backtrace is the part that names the fault. If it is missing, the crash
-still happened on a thread whose stack was too small for the capture, and the
-minimal report beside it is all there is.
-
-A **core dump** holds the same fault in more detail, but a core is a
-machine-wide setting (`kernel.core_pattern`) and so is an administrator's
-choice, not something NeuroStrata requires or asks for. Where one is
-available, `coredumpctl list` and `coredumpctl info <pid>` read it.
+---
 
 ## 🛡️ Security & Compliance
 
-NeuroStrata is actively hardened against the **OWASP Top 10 for LLM Applications** and common AI red-teaming vectors:
-- **Loopback-Only Network Surface (Mitigates LLM07):** Agents talk to NeuroStrata over `stdio`. Behind that, a local daemon binds **`127.0.0.1:34343`** and serves `/health`, `/info`, `/graph`, `/ingest`, `/delete`, `/memory/archive`, `/edit`, `/set-metadata`, `/mcp`, `/validate`, `/tasks/import`, `/cli/read`, `/tasks/gate`, `/bus/metrics`, `/backup` and `/shutdown` (`src/daemon.rs:525-540`) -- the stdio process starts it automatically when none is running, so the port is open in normal operation. It is bound to loopback and never to an external interface, and nothing is published beyond the machine, which is what neutralises remote RCE and plugin exploitation vectors. Anything running as your user on the same machine can reach it: there is no authentication on those routes.
-- **Active Secret Scrubbing (Mitigates LLM06):** The Rust backend actively scans memory payloads for high-entropy secrets (API keys, passwords, JWTs) and explicitly rejects insertions, forcing the agent into a "Redaction Loop" to prevent permanent context contamination.
-- **Cypher Injection Hardening (Mitigates SQL/Cypher Injection):** Active escaping of single quotes and backslashes in LadybugDB interpolations eliminates Cypher database injection and prompt-driven database crash vectors.
-- **Guarded Curation (Mitigates LLM08):** No tool on the MCP surface destroys a memory, so an agent cannot lose one. Corrections go through `neurostrata_supersede_memory`, which retires the old row rather than overwriting it and refuses the machine-wide `global` namespace unless the caller passes `allow_global`. Editing, deleting and moving are CLI and GUI operations; deletion works one id at a time and never in bulk, and the database directory is never dropped. Sub-agent restraint is a convention in the agent instructions, not something the server enforces.
-- **Resilient Soft Locks (Mitigates LLM09):** To combat context degradation and "happy path" tunnel vision, NeuroStrata enforces knowledge extraction mechanically rather than relying on fragile system prompts: the **done-funnel** makes memory consolidation the only completion path (`neurostrata_task_complete`), and the **Supervisory Attentional System** blocks `git push` while Goals are unfinished or unconsolidated. Both live inside the `neurostrata-mcp` binary and the git hook it installs — no external task tooling to approve or bypass.
+- **Loopback-only:** agents speak stdio; daemon binds `127.0.0.1:34343`; nothing published beyond machine (mitigates LLM07 / remote RCE).
+- **Secret scrubbing:** high-entropy payloads rejected, forcing a redaction loop (mitigates LLM06).
+- **Cypher-hardening:** quote/backslash escaping in LadybugDB interpolations.
+- **Guarded curation:** no destructive MCP tool exists — edit/delete/move are CLI/GUI only, one id at a time (mitigates LLM08).
+- **Resilient soft locks:** done-funnel + SAS gate enforced in the binary and hook, no external tooling to approve (mitigates LLM09, "happy-path tunnel vision").
 
-## License
-MIT License. See the `LICENSE` file for details. I wrote it, you can use it, keep it, close source it, whatever—just don't sue me!
+Full defense: [`docs/ops/security.md`](docs/ops/security.md).
 
 ---
 
-## 📚 References
+## 📚 Documentation (split from this README)
 
-*Broader cognitive-science grounding is cited inline throughout this document (Liu et al., 2023; Tulving, 1972; O'Keefe & Nadel, 1978; Brooks, 1983). The works below specifically ground the Prefrontal Cortex, the Central Executive, and the Dendritic Bridge.*
+- [Architecture / Memory core](docs/architecture/synapticgraph.md) | [Tri-Strata](docs/architecture/tri-strata.md)
+- [Prefrontal Cortex — Behavioral Guard](docs/organs/prefrontal-cortex.md) | [Central Executive — Goals](docs/organs/central-executive.md) | [Dendritic Bridge](docs/organs/dendritic-bridge.md) | [Thalamic Bus](docs/organs/thalamic-bus.md) | [Procedural Memory](docs/organs/procedural-memory.md)
+- [SynapticMesh — Team Git Sync](docs/mesh/synaptic-mesh.md)
+- [Why memory fails / science](docs/science/why-memory-fails.md) | [Nomenclature table](docs/science/nomenclature.md)
+- [Operations / Security / Obsidian](docs/ops/security.md) | [CLI Ref (pointer)](docs/ops/cli-reference.md) | [Upgrading / Crashes](docs/ops/upgrading.md)
+- [Feature inventory (plain-English benefits)](docs/FEATURES.md) — the full competitive comparison, organized per organ.
 
-1. **Webb, T., Mondal, S.S., & Momennejad, I. (2025).** A brain-inspired agentic architecture to improve planning with LLMs. *Nature Communications*, 16, 8633. — The MAP (Modular Agentic Planner) architecture, which models executive control as a module inspired by the mammalian prefrontal cortex rather than as additional prompting.
-2. **Liu, C., Ma, J., Li, S., & Zhou, D. (2024).** Dendritic integration inspired artificial neural networks capture data correlation. *NeurIPS 2024*. — Establishes dendritic computation and quadratic integration of multiple signals as the mechanism for capturing data correlation.
-3. **An Artificial Prefrontal Cortex for LLM Agents (2026).** A structural executive module that intercepts jailbreaks, collusion, mutation attempts and long horizon evasion tactics. — The direct architectural antecedent for the behavioral guard described above.
-4. **Baddeley, A. (1986/2000).** *Working Memory*; Baddeley, A. (2000). The episodic buffer: a new component of working memory? *Trends in Cognitive Sciences*, 4(11). — The central executive and working-memory components the Goal subsystem is named for.
-5. **Norman, D.A., & Shallice, T. (1986).** Attention to action: Willed and automatic control of behavior. — The Supervisory Attentional System (SAS): the conflict monitor realized by the pre-push task gate.
-6. **Squire, L.R., & Alvarez, P. (1995).** Retrograde amnesia and systems consolidation: a neurobiological theory. *Current Biology*. — Systems consolidation, the mechanism behind the done-funnel: experience must become long-term memory before a Goal may close.
-7. **Farquhar, S., et al. (2024).** Detecting hallucinations in large language models using semantic entropy. *Nature*. — Statistical methods for detecting confabulation, the reason NeuroStrata grounds agents in retrieved pointers rather than in generated prose.
-8. **Stemming Hallucination in Language Models Using a Licensing Oracle (2025).** arXiv:2511.06073. — An architectural approach to hallucination prevention, complementary to the Tri-Strata partitioning used here.
+---
+
+## 🛠️ MCP Tool Reference (high-level)
+
+**Memory:** `add_memory`, `search_memory`, `get_memory`, `get_snapshot`, `supersede_memory`, `archive_memory`, `ingest_directory`, `append_log`.
+**Goals:** `task_create`, `task_claim`, `task_update`, `task_list`, `task_complete`, `task_validate`, `bootstrap`, `task_setup`.
+**Guard:** `guard_validate`, `guard_learn`, `guard_list_rules`; daemon `POST /validate`.
+
+Every tool is additive — nothing destroys a memory from the MCP surface.
+
+---
+
+## License
+MIT. See [`LICENSE`](LICENSE). — I wrote it; you can use it, close-source it, or not — just don't sue me.
+
+---
+
+*Built entirely in Rust. No external network dependence at runtime. One binary, one embedded database, one standard.*
