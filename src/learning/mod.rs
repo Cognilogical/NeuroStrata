@@ -6,6 +6,11 @@ pub mod split;
 pub mod dataset;
 pub mod model_bundle;
 pub mod runtime;
+pub mod trainer;
+pub mod evaluator;
+pub mod calibration;
+pub mod status;
+pub mod control;
 
 pub use observation::{
     CandidateSource, DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind,
@@ -18,3 +23,6 @@ pub use split::{split_observations, DatasetSplits, Split};
 pub use dataset::{build_dedup_dataset, DatasetBuildReport, DatasetManifest, DistancePolicy};
 pub use model_bundle::ModelBundle;
 pub use runtime::{LearningRuntimeManager, ModelVersion, RuntimeState};
+pub use trainer::{EvaluationReport, TrainingJobState};
+pub use evaluator::{EvaluationReport as EvaluatorReport, SuiteReport};
+pub use calibration::TemperatureFitter;
