@@ -1724,18 +1724,25 @@ pub(crate) const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
 # The hook IS the gate. It runs on every push on ANY git host, so it is the
 # required default; CI is vendor-specific and only a defense-in-depth extra.
 # Install once with:  bash scripts/install-hooks.sh
+# (`neurostrata-mcp hooks install` writes these exact bytes into the
+# directory git actually runs hooks from, core.hooksPath honored — one
+# hook text for both install paths, so they cannot drift.)
 
-command -v neurostrata-mcp >/dev/null || exit 0
-[ -n "$NEUROSTRATA_SKIP_GATE" ] && exit 0
+command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
+if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
+    echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
+    exit 0
+fi
 
 NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
-# --strict maps an unavailable database to a blocking exit too, so the exit
-# code below is the gate's verdict: a failed gate fails the push.
+# --strict maps an unavailable database to a blocking exit too, so a 1
+# below is always a verdict: violations, or a database that could not be
+# checked under --strict. The hook blocks on the verdict code only.
 neurostrata-mcp task gate "$NAMESPACE" --strict
 code=$?
-if [ $code -ne 0 ]; then
+if [ $code -eq 1 ]; then
     echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
     exit 1
 fi
@@ -1753,7 +1760,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
     done
 fi
 
-exit 0
+exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
 "#;
 
 /// The scaffolded `scripts/install-hooks.sh`: tracks the hook in the repo
@@ -1795,7 +1802,7 @@ echo "Verify: neurostrata_task_setup should report verified.hook_installed: true
 /// instead made the two disagree: a `core.hooksPath` in the global config made
 /// the installer write to the global path while this reported unhooked
 /// (FINDING-bootstrap-wiring-nudge fix round 1).
-fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
     let configured = std::process::Command::new("git")
         .args(["config", "--get", "core.hooksPath"])
         .current_dir(root)

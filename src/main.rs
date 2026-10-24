@@ -334,7 +334,8 @@ pub(crate) enum TaskCommands {
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub(crate) enum HooksCommands {
-    /// Write .git/hooks/pre-push: the only hook the task system keeps
+    /// Write the pre-push hook into the directory git runs hooks from
+    /// (core.hooksPath honored): the only hook the task system keeps
     Install {
         /// Replace a pre-push hook NeuroStrata did not write
         #[arg(long)]
@@ -580,39 +581,6 @@ fn daemon_busy(probe: DaemonProbe, lock_held: bool) -> bool {
     lock_held && probe != DaemonProbe::Responsive
 }
 
-/// The pre-push hook, section 5.2 verbatim. Installed by `hooks install`.
-///
-/// One hook is the whole enforcement surface: tasks live in LadybugDB, never
-/// in the repo, so there is nothing to commit, sync, or rebuild. Blocks only
-/// on exit 1 -- an unavailable database (exit 2) passes here; `task gate
-/// --strict` maps its own infra failure to exit 1 instead of 2 (section 5.1).
-///
-/// Mesh piggyback (spec §"Hooks"), slice 7 decision: the mesh enqueue is
-/// deliberately NOT installed into this hook. Hooks are unreliable (spec:
-/// not inherited by clones, conflict with hook managers), rewriting this
-/// const would not retrofit already-installed hooks, and the gate stays
-/// single-purpose. `neurostrata-mcp mesh sync-enqueue` (hidden CLI,
-/// pull-then-push, one line, always exit 0) is the hook TARGET for sites
-/// that opt in; manual wiring line, if wanted:
-///   printf '\nneurostrata-mcp mesh sync-enqueue >/dev/null 2>&1 || true\n' >> .git/hooks/pre-push
-/// Manual push/pull remains first-class either way.
-const PRE_PUSH_HOOK: &str = r#"#!/bin/bash
-# NeuroStrata task gate. One hook is the whole enforcement surface:
-# tasks live in LadybugDB, never in the repo, so there is nothing to
-# commit, sync, or rebuild.
-command -v neurostrata-mcp >/dev/null || exit 0
-[ -n "$NEUROSTRATA_SKIP_GATE" ] && exit 0
-
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-neurostrata-mcp task gate "$NAMESPACE" --strict
-code=$?
-if [ $code -eq 1 ]; then
-    echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
-    exit 1
-fi
-exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-"#;
-
 /// The gate's exit code: verdict known -> 0/1; verdict unavailable -> strict
 /// blocks (1), otherwise 2 (section 5.1). The hook only blocks on 1, so the
 /// non-strict infra path warns and lets the push through.
@@ -630,12 +598,13 @@ fn gate_exit_code(ok: Option<bool>, strict: bool) -> i32 {
     }
 }
 
-/// The gate CLI's half of the SKIP_GATE definition: which values of
-/// NEUROSTRATA_SKIP_GATE count as "skip the gate". The installed pre-push
-/// hook carries the same definition in shell; the two homes must never
-/// drift (the Task 4 tests pin both).
+/// The gate CLI's half of the SKIP_GATE definition: the escape hatch is
+/// honored only for the exact value "1" — "0", "false", "yes", and empty
+/// all run the gate. The installed pre-push hook carries the same
+/// definition in shell; the two homes must never drift (the Task 4 tests
+/// pin both).
 fn skip_gate_value_skips(value: Option<&str>) -> bool {
-    value.map(|v| !v.is_empty()).unwrap_or(false)
+    value == Some("1")
 }
 
 /// The enclosing git work tree, or None outside one.
@@ -704,15 +673,28 @@ fn cli_ingest_root(dir: &str) -> String {
 
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
 
-/// What `hooks install` writes, and where — extracted from the command arm
-/// so the install behavior is testable without driving the CLI. Returns the
-/// installed hook's path; `Err` carries the user-facing refusal (a pre-push
-/// hook NeuroStrata did not write, and no `--force`).
+/// What `hooks install` writes, and where: the scaffolded hook text — the
+/// same bytes the task-setup payload ships — into the directory git
+/// actually runs hooks from (`git_hooks_dir`, which honors
+/// `core.hooksPath`). One hook text, one resolution; there is no second
+/// copy in this binary. Returns the installed hook's path; `Err` carries
+/// the user-facing refusal (a pre-push hook NeuroStrata did not write,
+/// and no `--force`).
+///
+/// Mesh piggyback (spec §"Hooks"), slice 7 decision: the mesh enqueue is
+/// deliberately NOT installed into this hook. Hooks are unreliable (spec:
+/// not inherited by clones, conflict with hook managers), rewriting the
+/// hook would not retrofit already-installed hooks, and the gate stays
+/// single-purpose. `neurostrata-mcp mesh sync-enqueue` (hidden CLI,
+/// pull-then-push, one line, always exit 0) is the hook TARGET for sites
+/// that opt in; manual wiring line, if wanted:
+///   printf '\nneurostrata-mcp mesh sync-enqueue >/dev/null 2>&1 || true\n' >> .git/hooks/pre-push
+/// Manual push/pull remains first-class either way.
 fn install_pre_push_hook(
     root: &std::path::Path,
     force: bool,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let hooks_dir = root.join(".git/hooks");
+    let hooks_dir = crate::task::git_hooks_dir(root);
     if !hooks_dir.is_dir() {
         std::fs::create_dir_all(&hooks_dir)?;
     }
@@ -728,7 +710,7 @@ fn install_pre_push_hook(
             target.display()
         );
     }
-    std::fs::write(&target, PRE_PUSH_HOOK)?;
+    std::fs::write(&target, crate::task::SCAFFOLDED_PRE_PUSH_HOOK)?;
     set_hook_executable(&target)?;
     Ok(target)
 }
@@ -1274,28 +1256,6 @@ mod tests {
         );
     }
 
-    /// Section 5.2 verbatim: blocks on violations only, skips on the escape
-    /// hatch, and lets 0 and 2 pass.
-    #[test]
-    fn the_pre_push_hook_is_the_documented_script() {
-        assert!(PRE_PUSH_HOOK.starts_with("#!/bin/bash\n"));
-        assert!(PRE_PUSH_HOOK.contains("command -v neurostrata-mcp >/dev/null || exit 0"));
-        assert!(PRE_PUSH_HOOK.contains("[ -n \"$NEUROSTRATA_SKIP_GATE\" ] && exit 0"));
-        assert!(
-            PRE_PUSH_HOOK.contains("NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")")
-        );
-        assert!(PRE_PUSH_HOOK.contains("neurostrata-mcp task gate \"$NAMESPACE\" --strict"));
-        assert!(PRE_PUSH_HOOK.contains("code=$?"));
-        assert!(PRE_PUSH_HOOK.contains("if [ $code -eq 1 ]; then"));
-        assert!(PRE_PUSH_HOOK.contains("NEUROSTRATA_SKIP_GATE=1 git push"));
-        assert!(PRE_PUSH_HOOK
-            .contains("exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking"));
-        assert!(
-            !PRE_PUSH_HOOK.contains("$code -eq 2"),
-            "2 never blocks in the hook itself"
-        );
-    }
-
     // ── Task 4: one hook installer, honest SKIP_GATE ─────────────────────
     //
     // The five tests below pin the unified gate/hook enforcement chain:
@@ -1568,6 +1528,10 @@ mod tests {
                 behavior
             );
         }
+        assert!(
+            !hook.contains("$code -eq 2"),
+            "2 never blocks in the hook itself"
+        );
     }
 
     #[test]
@@ -2563,7 +2527,11 @@ async fn run() -> anyhow::Result<()> {
                         std::env::var("NEUROSTRATA_SKIP_GATE").ok().as_deref(),
                     ) {
                         eprintln!(
-                            "[neurostrata:gate] NEUROSTRATA_SKIP_GATE is set; skipping the gate for '{}'.",
+                            "[neurostrata:gate] NEUROSTRATA_SKIP_GATE=1 is set; skipping the gate for '{}'.",
+                            namespace
+                        );
+                        println!(
+                            "Task gate: skipped in '{}' (NEUROSTRATA_SKIP_GATE=1).",
                             namespace
                         );
                         return Ok(());
