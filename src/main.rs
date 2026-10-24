@@ -406,16 +406,25 @@ fn skew_verdict(info: Option<&serde_json::Value>, own: (u64, u64)) -> Skew {
 }
 
 /// The gate's identity check (Task 1, J9): before the gate trusts a
-/// /tasks/gate answer, the answering process must prove it is the
-/// daemon build this binary expects. /health answering proves only
+/// /tasks/gate answer, the answering process's build fingerprint must
+/// match the build this binary expects. /health answering proves only
 /// that *something* is listening on the fixed port -- a squatter
-/// answers it too, and since the bearer landed it would also harvest
-/// the token the gate sends. So the gate fetches /info -- with the
-/// token, so only the token-holder's daemon can answer -- and compares
-/// the build fingerprint before any gate request is made. On mismatch
-/// the refusal names the expected and reported fingerprints, because
+/// answers it too. So the gate fetches /info and compares the build
+/// fingerprint before any gate request is made. On mismatch the
+/// refusal names the expected and reported fingerprints, because
 /// "an old daemon" and "another process on the port" need different
 /// operator actions.
+///
+/// What the fingerprint proves, and what it does not: the comparison
+/// proves build identity only -- the fingerprint is computable from
+/// the readable binary; it is not a secret. The /info probe itself
+/// carries the bearer (fetch_daemon_info sends it), so the probe MAY
+/// expose the bearer to a squatter before the comparison runs. That
+/// exposure is accepted because the bearer alone unlocks nothing
+/// destructive (DR-5 leak containment).
+/// INVARIANT: the operator token is never sent to a daemon whose
+/// fingerprint has not been verified; the bearer is expendable by
+/// design (DR-5 leak containment).
 fn gate_verify_daemon(info: Option<&serde_json::Value>, own: (u64, u64)) -> Result<(), String> {
     match skew_verdict(info, own) {
         Skew::InSync(_) => Ok(()),
