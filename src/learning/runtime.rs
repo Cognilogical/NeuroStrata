@@ -22,7 +22,9 @@ impl LearningRuntimeManager {
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
-        RuntimeState::Ready
+        // R10: The local Laya training runtime is not provisioned in this build.
+        // Report Unavailable honestly rather than claiming Ready.
+        RuntimeState::Unavailable
     }
 
     /// Return the local training runtime configuration.
