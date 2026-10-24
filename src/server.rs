@@ -1729,7 +1729,7 @@ async fn handle_get_snapshot(
     let namespace = namespace.as_str();
 
     let mut all_memories = store
-        .list(namespace, None)
+        .list(namespace, None, None)
         .await
         .map_err(|_| "Failed to list memories or namespace does not exist.".to_string())?;
 
@@ -2593,7 +2593,7 @@ pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &
                     let mut best_len = 0usize;
                     for candidate in &candidates {
                         let held = store
-                            .list(candidate, None)
+                            .list(candidate, None, None)
                             .await
                             .map(|m| m.len())
                             .unwrap_or(0);
@@ -3032,7 +3032,7 @@ async fn handle_guard_validate(
     );
     if mutating {
         // Determine whether this namespace is task-enabled.
-        if let Ok(memories) = store.list(&namespace, None).await {
+        if let Ok(memories) = store.list(&namespace, None, None).await {
             let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
             if has_any_task {
                 let has_in_progress = memories
@@ -4508,7 +4508,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -4541,7 +4541,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -4572,7 +4572,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -4684,7 +4684,7 @@ mod tests {
         let boot = add_with_domain(&store, serde_json::json!("Auth"), None).await;
         assert!(boot.starts_with("Successfully added memory"), "{}", boot);
 
-        let before = store.list("probe", None).await.expect("list").len();
+        let before = store.list("probe", None, None).await.expect("list").len();
         let reply = add_with_domain(&store, serde_json::json!("storage"), None).await;
 
         assert!(reply.contains("ERROR [DOMAIN]"), "{}", reply);
@@ -4700,7 +4700,7 @@ mod tests {
         );
         assert!(reply.contains("register_domain: true"), "{}", reply);
 
-        let after = store.list("probe", None).await.expect("list");
+        let after = store.list("probe", None, None).await.expect("list");
         assert_eq!(after.len(), before, "a rejection writes nothing");
         assert!(
             after
@@ -4790,7 +4790,7 @@ mod tests {
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         seed_row(&store, "probe", "the legacy rule").await;
 
-        let before = store.list("probe", None).await.expect("list").len();
+        let before = store.list("probe", None, None).await.expect("list").len();
         let reply = add_with_domain(&store, serde_json::json!(42), None).await;
 
         assert!(reply.contains("ERROR [DOMAIN]"), "{}", reply);
@@ -4805,7 +4805,7 @@ mod tests {
             reply
         );
         assert_eq!(
-            store.list("probe", None).await.expect("list").len(),
+            store.list("probe", None, None).await.expect("list").len(),
             before,
             "nothing is written"
         );
@@ -4820,7 +4820,7 @@ mod tests {
 
         assert!(reply.starts_with("Successfully added memory"), "{}", reply);
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -5507,7 +5507,7 @@ mod tests {
         let (store, _) = store_with_one_rule("probe").await;
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
 
-        let before = store.list("probe", None).await.unwrap().len();
+        let before = store.list("probe", None, None).await.unwrap().len();
 
         let reply = handle_add_memory(
             serde_json::json!({
@@ -5523,7 +5523,7 @@ mod tests {
         .await;
         assert!(reply.contains("ERROR [SECURITY]"), "got {}", reply);
 
-        let after = store.list("probe", None).await.unwrap().len();
+        let after = store.list("probe", None, None).await.unwrap().len();
         assert_eq!(before, after, "no memory should be stored after rejection");
     }
 
@@ -6045,7 +6045,7 @@ mod tests {
         assert!(added.starts_with("Successfully added memory"), "{}", added);
 
         let stored = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .expect("list")
             .into_iter()
@@ -6235,7 +6235,7 @@ mod tests {
                 // The id is the store's, not a fresh uuid: the whole point of
                 // the pulse is that a subscriber can read that row back.
                 let stored: Vec<String> = store
-                    .list("probe", None)
+                    .list("probe", None, None)
                     .await
                     .expect("list")
                     .into_iter()
@@ -7526,7 +7526,7 @@ mod tests {
         }
 
         let before: Vec<(String, i64)> = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .unwrap()
             .iter()
@@ -7546,7 +7546,7 @@ mod tests {
             .expect("snapshot");
 
         let after: Vec<(String, i64)> = store
-            .list("probe", None)
+            .list("probe", None, None)
             .await
             .unwrap()
             .iter()

@@ -366,7 +366,7 @@ mod tests {
         // namespaces sharing one id would leave one of these reads answering
         // with the other namespace's row.
         let ids_in_a: Vec<String> = store
-            .list("a", None)
+            .list("a", None, None)
             .await
             .expect("a lists")
             .into_iter()
@@ -398,14 +398,14 @@ mod tests {
         );
 
         let ids_in_a: Vec<String> = store
-            .list("a", None)
+            .list("a", None, None)
             .await
             .expect("a lists")
             .into_iter()
             .map(|r| r.id)
             .collect();
         let ids_in_b: Vec<String> = store
-            .list("b", None)
+            .list("b", None, None)
             .await
             .expect("b lists")
             .into_iter()

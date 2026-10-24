@@ -1687,7 +1687,7 @@ mod tests {
 
     async fn row_count(store: &std::sync::Arc<dyn VectorStore>, ns: &str) -> usize {
         store.init(ns).await.unwrap();
-        store.list(ns, None).await.unwrap().len()
+        store.list(ns, None, None).await.unwrap().len()
     }
 
     // ---- contract tests ----------------------------------------------------
@@ -2852,7 +2852,7 @@ mod tests {
         assert_eq!(x.metadata["mesh"]["lifecycle_state"], json!("superseded"));
 
         // A new record Z exists with the edited content, referencing X.
-        let all = store.list("probe", None).await.unwrap();
+        let all = store.list("probe", None, None).await.unwrap();
         assert_eq!(
             all.len(),
             2,
@@ -2956,7 +2956,7 @@ mod tests {
 
         // The preserved edit is a NEW row whose content is the structured
         // definition, not a string wrapper.
-        let all = store.list(&namespace, None).await.unwrap();
+        let all = store.list(&namespace, None, None).await.unwrap();
         assert_eq!(all.len(), 2, "superseded X + preserved edit Z");
         let z = all
             .iter()
@@ -3076,7 +3076,7 @@ mod tests {
             "{disposition:?}"
         );
 
-        let all = store.list(&namespace, None).await.unwrap();
+        let all = store.list(&namespace, None, None).await.unwrap();
         let z = all
             .iter()
             .find(|r| r.id != id.to_string())

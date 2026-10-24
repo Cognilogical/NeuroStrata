@@ -753,7 +753,7 @@ impl ReadSource {
 
     async fn list(&self, namespace: &str) -> anyhow::Result<Vec<SearchResult>> {
         match self {
-            ReadSource::Direct(s) => s.list(namespace, None).await,
+            ReadSource::Direct(s) => s.list(namespace, None, None).await,
             ReadSource::Daemon => {
                 let res = daemon_http_client()
                     .post("http://127.0.0.1:34343/cli/read")

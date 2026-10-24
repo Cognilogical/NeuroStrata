@@ -283,8 +283,10 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// until something replays them (bead neurostrata-sij).
     async fn relink_edges(&self, namespace: &str) -> Result<usize>;
 
-    /// List all memories
-    async fn list(&self, namespace: &str, user_id: Option<&str>) -> Result<Vec<SearchResult>>;
+    /// List all memories, optionally filtered by user_id and/or memory_type.
+    /// Pushing filters into the query (rather than filtering in Rust) avoids
+    /// deserialising every row in large namespaces (R15).
+    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>>;
 
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;

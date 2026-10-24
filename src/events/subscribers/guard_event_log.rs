@@ -252,7 +252,7 @@ mod tests {
     /// Every audit row in a namespace, oldest first.
     async fn audit_rows(store: &LadybugStore, namespace: &str) -> Vec<MemoryPayload> {
         store
-            .list(namespace, None)
+            .list(namespace, None, None)
             .await
             .expect("the namespace lists")
             .into_iter()

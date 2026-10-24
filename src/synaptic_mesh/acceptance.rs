@@ -109,7 +109,7 @@ mod tests {
 
     async fn row_count(store: &Arc<dyn VectorStore>, ns: &str) -> usize {
         store.init(ns).await.unwrap();
-        store.list(ns, None).await.unwrap().len()
+        store.list(ns, None, None).await.unwrap().len()
     }
 
     async fn fresh_store(label: &str) -> Arc<dyn VectorStore> {
