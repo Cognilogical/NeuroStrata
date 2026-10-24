@@ -12,6 +12,57 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
+/// Load or create the per-user daemon bearer token. Stored at
+/// `~/.config/neurostrata/daemon.token` with mode 0600.
+pub(crate) fn load_or_create_daemon_token() -> String {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    let config_dir = home.join(".config").join("neurostrata");
+    let _ = std::fs::create_dir_all(&config_dir);
+    let token_path = config_dir.join("daemon.token");
+    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let trimmed = existing.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    // Generate a new token
+    let token = uuid::Uuid::new_v4().to_string();
+    let _ = std::fs::write(&token_path, &token);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+    }
+    token
+}
+
+/// Axum middleware that enforces bearer-token authentication on all routes
+/// except `/health`. The expected token is read from `AppState::daemon_token`.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // /health is unauthenticated so liveness probes work.
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let provided = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match provided {
+        Some(tok) if tok == state.daemon_token => next.run(req).await,
+        _ => {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::UNAUTHORIZED)
+                .body(axum::body::Body::from("unauthorized"))
+                .unwrap()
+        }
+    }
+}
+
 /// How often the daemon flushes to durable storage. Anything written between
 /// checkpoints is lost if the process is killed, so this bounds the damage.
 const CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -67,6 +118,9 @@ struct AppState {
     guard_validator: Arc<crate::guard::GuardValidator>,
     /// The build this process was started from, for /info.
     build: BuildInfo,
+    /// Per-user bearer token for authenticating HTTP requests. Generated on
+    /// daemon startup and persisted to ~/.config/neurostrata/daemon.token.
+    daemon_token: String,
 }
 
 #[derive(Deserialize)]
@@ -486,7 +540,11 @@ pub(crate) async fn start_daemon_on(
         vector_store.clone(),
         embedder.clone(),
         "guard",
-    ));
+    ).await);
+
+    // Generate or load the per-user daemon bearer token. Stored at
+    // ~/.config/neurostrata/daemon.token (mode 0600) so CLI clients can read it.
+    let daemon_token = load_or_create_daemon_token();
 
     // The thalamic bus, built before anything can serve -- a request that
     // lands on the first accepted connection emits into a wired bus or
@@ -520,6 +578,7 @@ pub(crate) async fn start_daemon_on(
             pid: std::process::id(),
             started_at: chrono::Utc::now().timestamp(),
         },
+        daemon_token: daemon_token.clone(),
     };
 
     let app = Router::new()
@@ -539,7 +598,11 @@ pub(crate) async fn start_daemon_on(
         .route("/tasks/gate", post(handle_tasks_gate))
         .route("/bus/metrics", post(handle_bus_metrics))
         .route("/shutdown", post(handle_shutdown))
-        .with_state(state);
+        .with_state(state.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            auth_middleware,
+        ));
 
     // Bound the loss window for anything that kills us without warning.
     //
@@ -1680,7 +1743,18 @@ impl crate::traits::AsAny for RecordingStore {
             None,
         ));
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                    headers.insert(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
+        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
 
         // Wait for the listener to answer at all; a daemon that could not
         // bind fails its own join below rather than hanging here.
@@ -1744,7 +1818,18 @@ impl crate::traits::AsAny for RecordingStore {
             None,
         ));
         let base = format!("http://{addr}");
-        let client = reqwest::Client::new();
+        let mut headers = reqwest::header::HeaderMap::new();
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                    headers.insert(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
+        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
 
         // Wait for the listener to answer at all; a daemon that could not bind
         // fails its own join below rather than hanging here.

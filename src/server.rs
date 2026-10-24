@@ -928,12 +928,24 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
     let mut reader = BufReader::new(stdin).lines();
     let mut writer = stdout;
 
+    let mut headers = reqwest::header::HeaderMap::new();
+    let home = dirs::home_dir().unwrap_or_default();
+    let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+    if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+    }
     let client = reqwest::Client::builder()
         // Separate from the overall bound on purpose. A port with nothing behind
         // it hangs rather than refusing on this machine -- the same behaviour
         // DaemonProbe in main.rs exists to describe -- so without this, a daemon
         // that is not running is indistinguishable from one that is merely slow,
         // and the wait is the whole timeout rather than a few seconds.
+        .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(proxy_timeout())
         .build()
@@ -2979,7 +2991,7 @@ async fn build_guard_validator(
             namespace, what
         ));
     }
-    let validator = GuardValidator::new(store, embedder, namespace);
+    let validator = GuardValidator::new(store, embedder, namespace).await;
     Ok((validator, namespace.to_string()))
 }
 

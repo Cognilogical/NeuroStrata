@@ -406,7 +406,7 @@ fn skew_verdict(info: Option<&serde_json::Value>, own: (u64, u64)) -> Skew {
 }
 
 async fn fetch_daemon_info() -> Option<serde_json::Value> {
-    let res = reqwest::Client::new()
+    let res = daemon_http_client()
         .get("http://127.0.0.1:34343/info")
         .send()
         .await
@@ -502,7 +502,7 @@ fn lock_path_for(db_path: &str) -> std::path::PathBuf {
 }
 
 async fn probe_daemon() -> DaemonProbe {
-    match reqwest::Client::new()
+    match daemon_http_client()
         .get("http://127.0.0.1:34343/health")
         .timeout(std::time::Duration::from_millis(500))
         .send()
@@ -740,7 +740,7 @@ impl ReadSource {
         match self {
             ReadSource::Direct(s) => s.list_namespaces().await,
             ReadSource::Daemon => {
-                let res = reqwest::Client::new()
+                let res = daemon_http_client()
                     .post("http://127.0.0.1:34343/cli/read")
                     .json(&serde_json::json!({ "op": "namespaces" }))
                     .send()
@@ -755,7 +755,7 @@ impl ReadSource {
         match self {
             ReadSource::Direct(s) => s.list(namespace, None).await,
             ReadSource::Daemon => {
-                let res = reqwest::Client::new()
+                let res = daemon_http_client()
                     .post("http://127.0.0.1:34343/cli/read")
                     .json(&serde_json::json!({ "op": "list", "namespace": namespace }))
                     .send()
@@ -1621,6 +1621,26 @@ mod tests {
 /// in a refusal an operator has to be able to copy.
 const DAEMON_ADDR: &str = "127.0.0.1:34343";
 
+/// Build an HTTP client that carries the daemon's bearer token (if available)
+/// in its default headers, so CLI proxy calls authenticate against the daemon.
+fn daemon_http_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let home = dirs::home_dir().unwrap_or_default();
+    let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+    if let Ok(token) = std::fs::read_to_string(&token_path) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+    }
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// How long `bus-metrics` waits for the daemon's answer. Same ten seconds the
 /// other POSTs in this file use, and for the same reason an unbound port on
 /// this machine hangs rather than refuses: untimed, this command can hang with
@@ -1691,7 +1711,7 @@ async fn run_bus_metrics(
         return Ok(BUS_METRICS_FAILURE_EXIT);
     }
 
-    let res = match reqwest::Client::new()
+    let res = match daemon_http_client()
         .post(format!("http://{addr}/bus/metrics"))
         .timeout(BUS_METRICS_TIMEOUT)
         .send()
@@ -1798,7 +1818,7 @@ async fn run() -> anyhow::Result<()> {
                 eprintln!(
                     "NeuroStrata daemon is starting (lock held); waiting for it to answer..."
                 );
-                let client = reqwest::Client::new();
+                let client = daemon_http_client();
                 for _ in 0..1200 {
                     // up to 2 minutes
                     if client
@@ -1839,7 +1859,7 @@ async fn run() -> anyhow::Result<()> {
             // refusing -- the behaviour DaemonProbe exists to describe -- so an
             // untimed send here could spend the whole "30 seconds max" inside
             // one call.
-            let client = reqwest::Client::new();
+            let client = daemon_http_client();
             for _ in 0..300 {
                 // 30 seconds max
                 if client
@@ -1953,7 +1973,7 @@ async fn run() -> anyhow::Result<()> {
                     DaemonProbe::Responsive => {}
                 }
 
-                let client = reqwest::Client::new();
+                let client = daemon_http_client();
                 // A busy daemon may not answer this either. That is not a
                 // failure: the request is queued, so fall through to the wait.
                 if probe != DaemonProbe::Absent {
@@ -2097,7 +2117,7 @@ async fn run() -> anyhow::Result<()> {
                 // The database is single-writer. When a daemon holds it, ask the
                 // daemon to do the work rather than fighting it for the lock.
                 if daemon_running {
-                    let res = reqwest::Client::new()
+                    let res = daemon_http_client()
                         .post("http://127.0.0.1:34343/backup")
                         .json(&serde_json::json!({ "dir": dir }))
                         .send()
@@ -2242,7 +2262,7 @@ async fn run() -> anyhow::Result<()> {
                     let outcome: Result<serde_json::Value, String> = if probe
                         == DaemonProbe::Responsive
                     {
-                        match reqwest::Client::new()
+                        match daemon_http_client()
                             .post("http://127.0.0.1:34343/tasks/gate")
                             .json(&serde_json::json!({
                                 "namespace": namespace,
@@ -2341,7 +2361,7 @@ async fn run() -> anyhow::Result<()> {
                 // Advisory twin of the gate (section 4): always exits 0.
                 TaskCommands::Validate { namespace } => {
                     let fetched = if probe == DaemonProbe::Responsive {
-                        match reqwest::Client::new()
+                        match daemon_http_client()
                             .post("http://127.0.0.1:34343/mcp")
                             .json(&serde_json::json!({
                                 "jsonrpc": "2.0",
@@ -2418,7 +2438,7 @@ async fn run() -> anyhow::Result<()> {
                     from_beads,
                 } => {
                     let summary_json: serde_json::Value = if daemon_running {
-                        let res = reqwest::Client::new()
+                        let res = daemon_http_client()
                             .post("http://127.0.0.1:34343/tasks/import")
                             .json(&serde_json::json!({ "namespace": namespace, "from_beads": from_beads }))
                             .send()
@@ -2609,7 +2629,7 @@ async fn run() -> anyhow::Result<()> {
                                     .append_pair("source_id", &anchor.source_id);
                             }
                         }
-                        let res = reqwest::Client::new().get(url).send().await?;
+                        let res = daemon_http_client().get(url).send().await?;
                         let status = res.status();
                         let body = res.text().await.unwrap_or_default();
                         if !status.is_success() {

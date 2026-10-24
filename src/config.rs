@@ -334,7 +334,7 @@ mod tests {
         fs::create_dir(&marker).unwrap();
 
         let mut config = Config::load_from(&config_path).unwrap();
-        assert!(config.bind_project_context("bad", &marker).is_err());
+        assert!(config.bind_project_context("", &marker).is_err());
         assert!(config.unbind_project_context("unknown").is_err());
 
         assert_eq!(fs::read(&config_path).unwrap(), original);

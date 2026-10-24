@@ -17,15 +17,13 @@ pub struct GuardValidator {
 }
 
 impl GuardValidator {
-    pub fn new(store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>, namespace: &str) -> Self {
+    pub async fn new(store: Arc<dyn VectorStore>, embedder: Arc<dyn Embedder>, namespace: &str) -> Self {
         let semantic = SemanticEvaluator::new(store, embedder, namespace);
-        let sandbox = SandboxEvaluator::new();
+        let sandbox = SandboxEvaluator::new().await;
 
         Self {
             semantic,
-            sandbox: tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(sandbox)
-            }),
+            sandbox,
             namespace: namespace.to_string(),
         }
     }
@@ -153,13 +151,17 @@ impl GuardValidator {
 
     /// Check if a rule's trigger pattern matches the action
     fn matches_trigger(trigger_pattern: &str, action_type: &str, payload: &str) -> bool {
-        // Simple pattern matching - can be enhanced with regex or more sophisticated matching
+        // A rule fires when its trigger pattern matches the action type (the
+        // action type contains the pattern, not the reverse) or appears in the
+        // payload. The previous implementation used `pattern.contains(action)`,
+        // which caused any rule whose trigger_pattern mentioned an action type
+        // (e.g. "bash rm -rf") to fire on EVERY action of that type (e.g.
+        // every "bash" command), bricking validation.
         let pattern_lower = trigger_pattern.to_lowercase();
         let action_lower = action_type.to_lowercase();
         let payload_lower = payload.to_lowercase();
 
-        // Check if trigger matches action type or appears in payload
-        pattern_lower.contains(&action_lower) || payload_lower.contains(&pattern_lower)
+        action_lower.contains(&pattern_lower) || payload_lower.contains(&pattern_lower)
     }
 
     /// Add a new behavioral rule to the guard namespace
@@ -206,7 +208,7 @@ mod tests {
     /// semantic evaluator requires -- the same path production writes.
     async fn validator_with(rules: Vec<BehavioralRule>) -> (Arc<MockStore>, GuardValidator) {
         let store = Arc::new(MockStore::new());
-        let validator = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS);
+        let validator = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS).await;
         for r in rules {
             validator.add_rule(r).await.expect("seed the rule");
         }
@@ -363,7 +365,7 @@ mod tests {
             Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp database"));
         store.init(NS).await.expect("create the schema");
 
-        let validator = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS);
+        let validator = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS).await;
         validator
             .add_rule(rule("rule.fires", "rm -rf", "never rm -rf", "active"))
             .await

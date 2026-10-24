@@ -1349,6 +1349,23 @@ fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
 
+/// Validates a Cypher relation (edge) type name before it is interpolated
+/// into a query string. Relation types are compile-time constants today, but
+/// this guard prevents a future code path that accepts user-supplied relation
+/// names from becoming a Cypher-injection vector. Returns `true` only for
+/// names matching `^[A-Z][A-Z0-9_]*$`.
+fn is_valid_relation_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// How many edges go into one relinking statement. The pairs are written into
 /// the query text, so this is what bounds how large that text can get.
 const RELINK_BATCH: usize = 500;
@@ -1372,6 +1389,9 @@ fn create_missing_edges(
     rel_type: &str,
     pairs: &[(String, String)],
 ) -> Result<usize> {
+    if !is_valid_relation_name(rel_type) {
+        anyhow::bail!("invalid relation name for Cypher interpolation: {:?}", rel_type);
+    }
     let existing = conn.query(&format!(
         "MATCH (x:Memory)-[:{}]->(y:Memory) RETURN x.id, y.id",
         rel_type
@@ -1583,6 +1603,17 @@ impl VectorStore for LadybugStore {
                         }
                     }
                 };
+                if !is_valid_relation_name(edge.rel_type) {
+                    deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                        rel_type: edge.rel_type.to_string(),
+                        declared_target: edge.target_id.clone(),
+                        declaration_index: edge.declaration_index,
+                        resolution: crate::traits::TargetResolution::Failed(
+                            "invalid relation name for Cypher interpolation".to_string(),
+                        ),
+                    });
+                    continue;
+                }
                 let target_safe = escape_ladybug_string(&target);
                 let (from, to) = if edge.points_at_target {
                     (safe_id.as_str(), target_safe.as_str())
