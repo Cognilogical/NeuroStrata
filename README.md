@@ -16,8 +16,7 @@ One compiled Rust binary carrying an embedded graph-and-vector store (LadybugDB,
 
 ## Three things no other memory system does
 
-**Closing work requires teaching.** A goal moves through `open → in_progress → blocked → done`, but `done` has exactly one guarded entrance. The binary refuses the transition unless the goal produced a recorded lesson — a graph edge linking the work to a stored memory. A pre-push hook then blocks `git push` while unfinished or unconsolidated goals remain. A reminder in a prompt cannot enforce that. The binary does.
-
+**Closing work requires teaching.** A goal moves through `open → in_progress → blocked → done`, but `done` has exactly one guarded entrance. The binary refuses the transition unless the goal produced a recorded lesson — a graph edge linking the work to a stored memory. That check lives in the binary itself, so it fires whether or not you use git. If you do use git, a pre-push hook adds a second gate that blocks `git push` while unfinished or unconsolidated goals remain. A reminder in a prompt cannot enforce that. The binary does.
 **Rules are a namespace, not a config file.** Operational rules live as ordinary memory records in the same embedded database as everything else. Every proposed `bash` command or file write is embedded and semantically matched against those rules before execution. Close matches are rejected outright. Borderline cases are dry-run inside an isolated `podman --network=none` container before any byte reaches disk. You teach once. Enforcement applies across every session, agent, and worktree.
 
 **Team memory travels over git.** Sharing constraints across machines or teammates needs no hosted API or message broker. Approved memories write to a durable local log, serialize into deterministic wire records, and push through standard `git push`. Incoming records pass strict schema, namespace, and lifecycle validation. Conflicts are preserved loudly, never silently resolved. Private rows stay on your disk. Your team shares context the same way it shares code.
@@ -62,7 +61,8 @@ Stop acting as the continuity layer between agent sessions.
 # Build (Rust + CMake + C++20 for the vendored LadybugDB engine)
 scripts/build.sh
 
-# Wire the guard and task gate into this repo
+# Wire the guard and task gate into this repo (hooks install is git-only;
+# the done-funnel and guard still enforce without git)
 neurostrata-mcp hooks install
 neurostrata_bootstrap          # new project
 # neurostrata_task_setup        # existing project
