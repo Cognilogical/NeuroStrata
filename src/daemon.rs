@@ -2231,7 +2231,7 @@ impl crate::traits::AsAny for RecordingStore {
         let base = scratch_root("t2-mesh-base");
         std::fs::create_dir_all(&base).unwrap();
         let missing = scratch_root("t2-mesh-missing");
-        let out = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+        let out = crate::synaptic_mesh::mesh_service::handle_mesh_tool_call_with_base(
             "neurostrata_synaptic_mesh_status",
             &serde_json::json!({ "project_root": missing.display().to_string() }),
             &base,
@@ -2256,7 +2256,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&base).unwrap();
         let project = scratch_root("t2-noroot-project");
         std::fs::create_dir_all(&project).unwrap();
-        let init = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+        let init = crate::synaptic_mesh::mesh_service::handle_mesh_tool_call_with_base(
             "neurostrata_synaptic_mesh_init",
             &serde_json::json!({
                 "name": "noroot-mesh",
@@ -2269,7 +2269,7 @@ impl crate::traits::AsAny for RecordingStore {
         assert!(init.contains("mesh created"), "init reply: {init}");
 
         std::env::set_var(PROJECT_ROOT_ENV, &project);
-        let out = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+        let out = crate::synaptic_mesh::mesh_service::handle_mesh_tool_call_with_base(
             "neurostrata_synaptic_mesh_status",
             &serde_json::json!({}),
             &base,
