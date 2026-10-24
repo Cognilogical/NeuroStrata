@@ -1005,6 +1005,76 @@ pub async fn handle_task_complete(
     let reason = arg_str(&args, "reason").unwrap_or("").to_string();
     let link_memory_id = arg_str(&args, "link_memory_id").map(|s| s.to_string());
     let memory = args.get("memory").cloned();
+
+    // M3: optional inline follow_up_tasks. Validate everything before any
+    // mutation so a bad entry cannot leave the parent half-completed.
+    let mut follow_up_specs: Vec<(String, Option<String>, String, i64, Vec<String>)> = Vec::new();
+    if let Some(fu) = args.get("follow_up_tasks") {
+        if !fu.is_null() {
+            let arr = match fu.as_array() {
+                Some(a) => a,
+                None => {
+                    return Err("ERROR: 'follow_up_tasks' must be an array.".to_string());
+                }
+            };
+            for (i, item) in arr.iter().enumerate() {
+                if !item.is_object() {
+                    return Err(format!("ERROR: follow_up_tasks[{}] must be an object.", i));
+                }
+                let title = match item.get("title").and_then(|t| t.as_str()) {
+                    Some(t) => match check_title(t) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err(format!("ERROR: follow_up_tasks[{}].title: {}", i, e))
+                        }
+                    },
+                    None => {
+                        return Err(format!(
+                            "ERROR: follow_up_tasks[{}] requires a non-empty 'title'.",
+                            i
+                        ))
+                    }
+                };
+                let description = item
+                    .get("description")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+                    .filter(|s| !s.is_empty());
+                let task_type = match item.get("task_type").and_then(|t| t.as_str()) {
+                    None => "task".to_string(),
+                    Some(t) if ["task", "bug", "feature", "epic"].contains(&t) => t.to_string(),
+                    Some(t) => {
+                        return Err(format!(
+                            "ERROR: follow_up_tasks[{}].task_type '{}' invalid.",
+                            i, t
+                        ))
+                    }
+                };
+                let priority = match item.get("priority") {
+                    None => 2i64,
+                    Some(Value::Number(n))
+                        if n
+                            .as_i64()
+                            .map(|p| (0..=4).contains(&p))
+                            .unwrap_or(false) =>
+                    {
+                        n.as_i64().unwrap_or(2)
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "ERROR: follow_up_tasks[{}].priority must be an integer 0-4.",
+                            i
+                        ))
+                    }
+                };
+                let labels = match string_list(item, "labels") {
+                    Ok(v) => v,
+                    Err(e) => return Err(format!("ERROR: follow_up_tasks[{}].labels: {}", i, e)),
+                };
+                follow_up_specs.push((title, description, task_type, priority, labels));
+            }
+        }
+    }
     let actor = task
         .task_field("assignee")
         .and_then(|v| v.as_str())
@@ -1258,13 +1328,48 @@ pub async fn handle_task_complete(
 
     // With the edge in place the ExtractionRequired guard is satisfied.
     let ctx = Ctx {
-        reason,
+        reason: reason.clone(),
         extraction_edge_exists: true,
         actor,
         session: String::new(),
     };
     let completed = apply(&task, Status::Done, &ctx).map_err(|e| format!("ERROR: {}", e))?;
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+
+    // M3: spawn follow-up tasks now that the parent is done. Each inherits
+    // the caller's user/agent defaults and carries spawned_from + related_to.
+    let follow_user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
+    let follow_agent = arg_str(&args, "agent_name").map(|s| s.to_string());
+    let mut follow_up_created_ids: Vec<String> = Vec::new();
+    for (title, description, task_type, priority, labels) in &follow_up_specs {
+        let mut task_meta = Map::new();
+        task_meta.insert("priority".to_string(), json!(*priority));
+        task_meta.insert("task_type".to_string(), json!(task_type));
+        task_meta.insert("spawned_from".to_string(), json!(id.as_str()));
+        if !labels.is_empty() {
+            task_meta.insert("labels".to_string(), json!(labels));
+        }
+        if let Some(d) = description {
+            task_meta.insert("description".to_string(), json!(d));
+        }
+        let mut top_level = Map::new();
+        top_level.insert("related_to".to_string(), json!([id.as_str()]));
+        match store_new_task(
+            &store,
+            &emb,
+            &namespace,
+            title,
+            &follow_user_id,
+            follow_agent.as_deref(),
+            task_meta,
+            top_level,
+        )
+        .await
+        {
+            Ok((new_id, _payload)) => follow_up_created_ids.push(new_id),
+            Err(e) => return Err(e),
+        }
+    }
 
     let extracted: Vec<String> = memories
         .iter()
@@ -1280,9 +1385,29 @@ pub async fn handle_task_complete(
         .map(|m| m.id.clone())
         .collect();
 
+    // M3: task_intent_signals from reason + memory.content
+    let mut scan_text = reason.clone();
+    if let Some(mem) = &memory {
+        if let Some(c) = mem.get("content").and_then(|v| v.as_str()) {
+            scan_text.push(' ');
+            scan_text.push_str(c);
+        }
+    }
+    let signals: Vec<Value> = crate::task::intent::detect_task_intents(&scan_text)
+        .into_iter()
+        .map(|s| {
+            json!({
+                "marker": s.marker,
+                "excerpt": s.excerpt,
+            })
+        })
+        .collect();
+
     let mut reply = json!({
         "task": task_summary(&id, &completed.payload),
         "extracted_memory_ids": extracted,
+        "follow_up_tasks_created": follow_up_created_ids,
+        "task_intent_signals": signals,
         "transition": { "from": task.status().as_str(), "to": "done" },
     });
     if !registry_warnings.is_empty() {
