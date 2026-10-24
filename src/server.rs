@@ -1524,6 +1524,12 @@ async fn handle_add_memory(
         }
     }
     stamp_new_memory(&mut metadata);
+    // A procedure born on this node is locally authored: stamp it so the
+    // fire gate can tell authorship from import (Program Task 3). The
+    // stamp overwrites any caller-supplied trust value.
+    if memory_type == "procedure" {
+        crate::tools::procedure::stamp_local_trust(&mut metadata);
+    }
 
     // Honour an unambiguous Governs line in the prose (guinea-pig Option 2):
     // a declared pointer that is written but never honoured is the worst of

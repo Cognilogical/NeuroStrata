@@ -74,12 +74,49 @@ fn last_episodic_pointer(metadata: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether the fire gate blocks this row. Only the imported state
-/// (`trust == "untrusted"`) refuses a firing; a local record carrying `trusted`,
-/// `promoted`, or no trust key at all is executable. Anything unreadable also
-/// fires, because an unreadable field must not brick a live procedure.
+/// Whether this row arrived through the mesh import funnel. The funnel
+/// writes a `mesh` provenance object onto every row it applies (see
+/// `synaptic_mesh::import`), and no local write path writes one, so the
+/// object's presence is the provenance signal the gate discriminates on.
+fn has_import_provenance(metadata: &Value) -> bool {
+    metadata
+        .get("mesh")
+        .map(|m| m.is_object())
+        .unwrap_or(false)
+}
+
+/// Whether the fire gate blocks this row. The trust stamp is
+/// authoritative, and what an absent or unknown stamp means depends on
+/// provenance (Program Task 3):
+///
+/// - `untrusted` never fires, wherever the row came from.
+/// - `trusted`, `promoted`, and `local` fire: each is an affirmative
+///   decision (manifest policy, local promotion, local authorship).
+/// - Absent or unknown stamp on a LOCAL row (no import provenance)
+///   fires: absent stamp + no provenance = local authorship, the
+///   doctrine this gate has always kept — an unreadable field must not
+///   brick a live local procedure.
+/// - Absent or unknown stamp on a row WITH import provenance does not
+///   fire: for a mesh-sourced row, a missing stamp is missing evidence,
+///   not authorship.
 fn is_untrusted(metadata: &Value) -> bool {
-    metadata.get("trust").and_then(|v| v.as_str()) == Some("untrusted")
+    match metadata.get("trust").and_then(|v| v.as_str()) {
+        Some("untrusted") => true,
+        Some("trusted") | Some("promoted") | Some("local") => false,
+        _ => has_import_provenance(metadata),
+    }
+}
+
+/// Stamp a locally created procedure row as locally authored. The
+/// creation paths (add_memory, task_complete's inline extraction) call
+/// this when they mint a procedure: authorship is a fact about the
+/// write path, so the stamp overwrites any caller-supplied trust
+/// value. The mesh import funnel never calls this — imported rows take
+/// the manifest's stamp instead (Program Task 3).
+pub(crate) fn stamp_local_trust(metadata: &mut Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("trust".to_string(), json!("local"));
+    }
 }
 
 /// When this procedure is next owed.
