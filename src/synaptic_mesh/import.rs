@@ -3513,7 +3513,7 @@ mod tests {
             .await
             .unwrap()
             .expect("row applied");
-        assert_eq!(payload.created_by, "node-peer-1", "the claim is preserved");
+        assert_eq!(payload.user_id, "node-peer-1", "the claim is preserved");
         let mesh_meta = payload.metadata.get("mesh").expect("mesh provenance");
         assert_eq!(mesh_meta["origin"], json!("mesh-import"));
         assert_eq!(mesh_meta["claimed_created_by"], json!("node-peer-1"));
