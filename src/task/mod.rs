@@ -639,6 +639,26 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         obj.insert("session_id".to_string(), json!(session));
     }
 
+    // Atomicity guard: re-read the task before saving. If another session
+    // claimed it in the meantime (session_id changed), abort rather than
+    // overwriting their claim. Best-effort; true CAS needs store-level
+    // conditional writes (R7 follow-up).
+    let (fresh_task, _) = match load_task(&store, &namespace, &id).await {
+        Ok(found) => found,
+        Err(_) => (task.clone(), vector.clone()),
+    };
+    let fresh_holder = fresh_task
+        .task_field("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !fresh_holder.is_empty() && fresh_holder != session && fresh_holder != holder {
+        return format!(
+            "ERROR: task {} was claimed by another session ('{}') while this claim was in progress. Retry the claim.",
+            id, fresh_holder
+        );
+    }
+
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
