@@ -2756,7 +2756,7 @@ impl crate::traits::AsAny for RecordingStore {
             (&root_a, "anchor-mesh-a", "aa"),
             (&root_b, "anchor-mesh-b", "bb"),
         ] {
-            let init = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+            let init = crate::synaptic_mesh::mesh_service::handle_mesh_tool_call_with_base(
                 "neurostrata_synaptic_mesh_init",
                 &serde_json::json!({
                     "name": name,
