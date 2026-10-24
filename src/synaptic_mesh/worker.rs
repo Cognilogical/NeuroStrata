@@ -119,8 +119,9 @@ pub fn drain_once(
 
     // ONE commit per drain, not per record. Author = node_id (the same node
     // id the manifest's created_by carries).
-    if report.applied > 0 {
-        let message = format!("synaptic-mesh: {} record(s)", report.applied);
+    if report.applied > 0 || report.already_applied > 0 {
+        let n = report.applied + report.already_applied;
+        let message = format!("synaptic-mesh: {} record(s)", n);
         match mesh.commit_all(&message, node_id) {
             Ok(did_commit) => report.committed = did_commit,
             Err(e) => return Err(format!("mesh commit failed: {e}")),

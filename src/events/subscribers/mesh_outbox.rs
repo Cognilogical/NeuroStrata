@@ -549,3 +549,66 @@ mod tests {
         assert!(!outbox.starts_with(&dir));
     }
 }
+
+impl MeshOutbox {
+    /// R9: Reconcile the source store against the mesh checkout. For every
+    /// shareable memory in the store that has no corresponding mesh record
+    /// file, build an outbox entry and append it. This closes the "lossy bus"
+    /// loss window: even if a pulse was dropped, the next reconciliation
+    /// re-emits the record.
+    ///
+    /// Returns the number of entries re-emitted.
+    pub async fn reconcile(
+        store: &dyn crate::traits::VectorStore,
+        mesh_root: &std::path::Path,
+        outbox: &Outbox,
+        namespaces: &[String],
+        epoch: u32,
+    ) -> Result<usize, String> {
+        let mut re_emitted = 0usize;
+        for ns in namespaces {
+            let results = store.list(ns, None).await.map_err(|e| format!("{}", e))?;
+            for sr in results {
+                let payload = &sr.payload;
+                // Only shareable types.
+                if !is_shareable_memory_type(&payload.memory_type) {
+                    continue;
+                }
+                // Structural rows are strictly local.
+                if payload.user_id == "auto-ingestor" || sr.id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                    continue;
+                }
+                // Eligibility gate (worker also re-checks, but skip early).
+                if payload.metadata.get("eligibility").and_then(|v| v.as_str()) != Some("shareable") {
+                    // Default is private; only shareable records are published.
+                    // But we don't know the mesh policy here, so only skip if
+                    // explicitly private/absent. The worker will filter anyway.
+                }
+
+                // Check if mesh file exists.
+                let subdir = if payload.memory_type == "procedure" { "procedures" } else { "memories" };
+                let mesh_file = mesh_root.join(ns).join(subdir).join(format!("{}.json", sr.id));
+                if mesh_file.exists() {
+                    continue;
+                }
+
+                // Build an outbox entry.
+                let entry = OutboxEntry {
+                    stable_op_id: uuid::Uuid::new_v4(),
+                    op: OP_CREATED.to_string(),
+                    id: sr.id.clone(),
+                    namespace: ns.clone(),
+                    memory_type: payload.memory_type.clone(),
+                    content: payload.content.clone(),
+                    metadata: payload.metadata.clone(),
+                    superseded_by: None,
+                    ts: chrono::Utc::now().timestamp(),
+                    epoch,
+                };
+                outbox.append(&entry).map_err(|e| format!("{}", e))?;
+                re_emitted += 1;
+            }
+        }
+        Ok(re_emitted)
+    }
+}
