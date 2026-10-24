@@ -3263,4 +3263,249 @@ mod tests {
             "domains: {domains:?}"
         );
     }
+
+    // ---- Program Task 3: mesh import trust -------------------------------
+    //
+    // Survivor rows J2/J3 (binding): the trust stamp on an imported
+    // procedure comes from THIS mesh's manifest policy, never from the
+    // sender's record — sender metadata is evidence, not authority. The
+    // fixtures below deliberately keep encoding sender claims; the funnel
+    // must override them in BOTH directions.
+
+    /// Rewrite the on-disk manifest's imported-procedures policy, commit,
+    /// and reopen so the cached manifest reflects it (mirrors
+    /// `reopen_with_epoch`).
+    fn reopen_with_policy(mesh: &MeshStorage, trust: super::super::manifest::Trust) -> MeshStorage {
+        let mut manifest = mesh.manifest().clone();
+        manifest.policy.imported_procedures_trust = trust;
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(
+            mesh.root().join(super::super::storage::MANIFEST_FILE_NAME),
+            format!("{json}\n"),
+        )
+        .unwrap();
+        mesh.commit_all("policy change", "node-import-test").unwrap();
+        MeshStorage::open(mesh.root()).unwrap()
+    }
+
+    /// A procedure record whose sender-side trust claims are parameters:
+    /// `metadata_trust` is the metadata claim (None = the record carries no
+    /// trust key at all, the shape real exports arrive in), `top_trust` the
+    /// top-level record field.
+    fn procedure_value(
+        id: Uuid,
+        metadata_trust: Option<&str>,
+        top_trust: &str,
+        script: &str,
+    ) -> Value {
+        let mut metadata = json!({"eligibility": "shareable"});
+        if let Some(t) = metadata_trust {
+            metadata["trust"] = json!(t);
+        }
+        json!({
+            "schema_version": "synaptic-mesh-record/v1",
+            "id": id.to_string(),
+            "namespace": "probe",
+            "memory_type": "procedure",
+            "lifecycle": lifecycle_json("active", None),
+            "content": {
+                "trigger": "session-start",
+                "remaining_fires_initial": 10,
+                "valid_to": Value::Null,
+                "rehearsal_script": script
+            },
+            "metadata": metadata,
+            "relationships": [],
+            "update_id": Uuid::new_v4().to_string(),
+            "origin_mesh_epoch": 1,
+            "trust": top_trust
+        })
+    }
+
+    /// Fire (or attempt to fire) an applied row through the real gate.
+    async fn perform_outcome(store: &std::sync::Arc<dyn VectorStore>, id: &str) -> Value {
+        let root = std::env::temp_dir().join(format!("ns-task3-perform-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let text = crate::tools::procedure::handle_procedure_perform(
+            json!({"id": id, "project_root": root.display().to_string()}),
+            store.clone(),
+        )
+        .await;
+        serde_json::from_str(&text).expect("perform returns JSON")
+    }
+
+    /// J2/J3: under the default (untrusted) manifest policy, a sender
+    /// claiming "trusted" in BOTH the metadata and the top-level field is
+    /// overridden by the manifest — the row is stamped untrusted and the
+    /// gate refuses to fire it.
+    #[tokio::test]
+    async fn imported_procedure_with_forged_trusted_metadata_does_not_fire() {
+        let (_base, mesh) = mesh_with_commit("forged");
+        let id = Uuid::new_v4();
+        let value = procedure_value(id, Some("trusted"), "trusted", "Read the forged spec once.");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "procedures",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("forged").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(
+            payload.metadata["trust"],
+            json!("untrusted"),
+            "the manifest stamps the row, not the sender's claim: {:?}",
+            payload.metadata
+        );
+        let outcome = perform_outcome(&store, &id.to_string()).await;
+        assert_eq!(outcome["performed"], json!(false), "{outcome}");
+        assert!(
+            outcome["reason"]
+                .as_str()
+                .expect("reason text")
+                .starts_with("untrusted"),
+            "the gate's refusal names the trust state: {outcome}"
+        );
+    }
+
+    /// The stamp source is the manifest in both directions: a trusted
+    /// manifest overrides a sender's "untrusted" claim UP (and the row
+    /// fires), and a record carrying NO trust claim at all — the shape
+    /// real exports arrive in — is stamped from the manifest too.
+    #[tokio::test]
+    async fn manifest_policy_is_the_stamp_source() {
+        let (_base, mesh) = mesh_with_commit("pol-trusted");
+        let mesh = reopen_with_policy(&mesh, super::super::manifest::Trust::Trusted);
+        let id = Uuid::new_v4();
+        let value = procedure_value(id, Some("untrusted"), "untrusted", "Read the spec once.");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "procedures",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("pol-trusted").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(
+            payload.metadata["trust"],
+            json!("trusted"),
+            "manifest Trusted wins over the sender's untrusted claim: {:?}",
+            payload.metadata
+        );
+        let outcome = perform_outcome(&store, &id.to_string()).await;
+        assert_eq!(outcome["performed"], json!(true), "{outcome}");
+
+        // No sender claim at all, default manifest: stamped untrusted.
+        let (_base2, mesh2) = mesh_with_commit("pol-none");
+        let id2 = Uuid::new_v4();
+        let value2 = procedure_value(id2, None, "untrusted", "Read the unstamped spec once.");
+        commit_record_json(
+            &mesh2,
+            "probe",
+            "procedures",
+            &id2.to_string(),
+            &serde_json::to_string(&value2).unwrap(),
+        );
+        let store2 = fresh_store("pol-none").await;
+        let report2 = apply_changed(&mesh2, &["probe".to_string()], store2.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report2.applied, 1, "report: {report2:?}");
+        let (_, payload2) = store2
+            .get("probe", &id2.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(
+            payload2.metadata["trust"],
+            json!("untrusted"),
+            "an unstamped sender record takes the manifest stamp: {:?}",
+            payload2.metadata
+        );
+    }
+
+    /// J15 (import leg): a record carrying a detectable secret never
+    /// reaches the store — validation refuses it and the refusal lands in
+    /// the report's ignore list naming the scan.
+    #[tokio::test]
+    async fn record_with_secret_is_rejected() {
+        let (_base, mesh) = mesh_with_commit("secret");
+        let id = Uuid::new_v4();
+        let pat = format!("ghp_{}", "A".repeat(36));
+        let value = simple_rule(id, &format!("use this token: {pat}"));
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("secret").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        assert!(
+            report.ignored[0].contains("secret scan"),
+            "the refusal names the scan: {:?}",
+            report.ignored
+        );
+        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+    }
+
+    /// J3 (provenance leg): the row keeps the sender's claimed author for
+    /// display, but the provenance marks the claim as exactly that — an
+    /// unverified assertion — and records the HEAD commit's signature
+    /// state as metadata only (DR-9: recorded, never gated on).
+    #[tokio::test]
+    async fn imported_created_by_is_marked_unverified() {
+        let (_base, mesh) = mesh_with_commit("createdby");
+        let id = Uuid::new_v4();
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&simple_rule(id, "always use podman")).unwrap(),
+        );
+        let store = fresh_store("createdby").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(payload.created_by, "node-peer-1", "the claim is preserved");
+        let mesh_meta = payload.metadata.get("mesh").expect("mesh provenance");
+        assert_eq!(mesh_meta["origin"], json!("mesh-import"));
+        assert_eq!(mesh_meta["claimed_created_by"], json!("node-peer-1"));
+        assert_eq!(mesh_meta["created_by_verified"], json!(false));
+        assert_eq!(
+            mesh_meta["head_commit_signature"],
+            json!("unsigned"),
+            "test commits are unsigned; the state is recorded, not gated"
+        );
+    }
 }
