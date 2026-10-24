@@ -132,11 +132,12 @@ pub async fn handle_mesh_pull(
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
 ) -> String {
-    let project_root = arguments
-        .get("project_root")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    // The same per-request resolution the other mesh tools apply (Task 2 /
+    // J6): canonicalize the caller's root; never consume the verbatim string.
+    let project_root = match super::mesh_service::resolve_mesh_project_root(arguments) {
+        Ok(root) => root,
+        Err(e) => return e,
+    };
 
     let pointer = match MeshStorage::read_pointer(&project_root) {
         Ok(p) => p,
