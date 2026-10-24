@@ -630,6 +630,14 @@ fn gate_exit_code(ok: Option<bool>, strict: bool) -> i32 {
     }
 }
 
+/// The gate CLI's half of the SKIP_GATE definition: which values of
+/// NEUROSTRATA_SKIP_GATE count as "skip the gate". The installed pre-push
+/// hook carries the same definition in shell; the two homes must never
+/// drift (the Task 4 tests pin both).
+fn skip_gate_value_skips(value: Option<&str>) -> bool {
+    value.map(|v| !v.is_empty()).unwrap_or(false)
+}
+
 /// The enclosing git work tree, or None outside one.
 fn git_toplevel() -> Option<std::path::PathBuf> {
     let out = std::process::Command::new("git")
@@ -695,6 +703,35 @@ fn cli_ingest_root(dir: &str) -> String {
 }
 
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
+
+/// What `hooks install` writes, and where — extracted from the command arm
+/// so the install behavior is testable without driving the CLI. Returns the
+/// installed hook's path; `Err` carries the user-facing refusal (a pre-push
+/// hook NeuroStrata did not write, and no `--force`).
+fn install_pre_push_hook(
+    root: &std::path::Path,
+    force: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    let hooks_dir = root.join(".git/hooks");
+    if !hooks_dir.is_dir() {
+        std::fs::create_dir_all(&hooks_dir)?;
+    }
+    let target = hooks_dir.join("pre-push");
+    // Overwriting our own hook needs no flag: --force is for
+    // a pre-push somebody else wrote.
+    let ours = std::fs::read_to_string(&target)
+        .map(|content| content.contains("NeuroStrata task gate"))
+        .unwrap_or(false);
+    if target.exists() && !ours && !force {
+        anyhow::bail!(
+            "{} already exists and was not written by NeuroStrata.\nRe-run with --force to replace it with the NeuroStrata task gate:\n  neurostrata-mcp hooks install --force",
+            target.display()
+        );
+    }
+    std::fs::write(&target, PRE_PUSH_HOOK)?;
+    set_hook_executable(&target)?;
+    Ok(target)
+}
 
 /// Mark a freshly-written hook file as executable. Git on POSIX runs a hook
 /// only when the mode bit is set; on Windows it uses the filename
@@ -2248,10 +2285,9 @@ async fn run() -> anyhow::Result<()> {
                     }
 
                     // Both policies print the escape hatch (section 5.1).
-                    if std::env::var("NEUROSTRATA_SKIP_GATE")
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false)
-                    {
+                    if skip_gate_value_skips(
+                        std::env::var("NEUROSTRATA_SKIP_GATE").ok().as_deref(),
+                    ) {
                         eprintln!(
                             "[neurostrata:gate] NEUROSTRATA_SKIP_GATE is set; skipping the gate for '{}'.",
                             namespace
@@ -2530,34 +2566,19 @@ async fn run() -> anyhow::Result<()> {
                         );
                         std::process::exit(1);
                     }
-                    let hooks_dir = root.join(".git/hooks");
-                    if !hooks_dir.is_dir() {
-                        std::fs::create_dir_all(&hooks_dir)?;
+                    match install_pre_push_hook(&root, force) {
+                        Ok(target) => {
+                            println!(
+                                "Installed the NeuroStrata task gate at {}.",
+                                target.display()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
                     }
-                    let target = hooks_dir.join("pre-push");
-                    // Overwriting our own hook needs no flag: --force is for
-                    // a pre-push somebody else wrote.
-                    let ours = std::fs::read_to_string(&target)
-                        .map(|content| content.contains("NeuroStrata task gate"))
-                        .unwrap_or(false);
-                    if target.exists() && !ours && !force {
-                        eprintln!(
-                            "{} already exists and was not written by NeuroStrata.",
-                            target.display()
-                        );
-                        eprintln!(
-                            "Re-run with --force to replace it with the NeuroStrata task gate:"
-                        );
-                        eprintln!("  neurostrata-mcp hooks install --force");
-                        std::process::exit(1);
-                    }
-                    std::fs::write(&target, PRE_PUSH_HOOK)?;
-                    set_hook_executable(&target)?;
-                    println!(
-                        "Installed the NeuroStrata task gate at {}.",
-                        target.display()
-                    );
-                    return Ok(());
                 }
             },
             other => {

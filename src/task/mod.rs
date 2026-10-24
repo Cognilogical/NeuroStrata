@@ -1718,7 +1718,7 @@ pub async fn handle_bootstrap(
 /// runnable hook flips it — an agent extends this file instead of inventing a
 /// workflow. Both invocations are host-agnostic (GitHub, GitLab, Gitea, a bare
 /// repo over SSH), which is the whole reason the hook is the default.
-const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
+pub(crate) const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata task gate — scaffolded by neurostrata-bootstrap / task_setup.
 #
 # The hook IS the gate. It runs on every push on ANY git host, so it is the
