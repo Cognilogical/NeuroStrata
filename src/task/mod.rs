@@ -4017,8 +4017,99 @@ mod tests {
         assert_eq!(payload.metadata["task"]["session_id"], json!("ses_a"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_claims_exactly_one_wins() {
+        let real = store_with_namespace("MyProj").await;
+        let id = create_task(&real, "MyProj", "the work", 2).await;
+        // SlowGetStore widens the load -> decide -> upsert window so the two
+        // claims genuinely overlap; without a per-task claim lock both win.
+        let store: Arc<dyn VectorStore> = Arc::new(SlowGetStore {
+            inner: real.clone(),
+        });
+        let a = tokio::spawn(handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+            store.clone(),
+        ));
+        let b = tokio::spawn(handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-b", "session_id": "ses_b" }),
+            store.clone(),
+        ));
+        let replies = [a.await.unwrap(), b.await.unwrap()];
+        let wins = replies
+            .iter()
+            .filter(|r| r.contains("\"claimed\": true"))
+            .count();
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent claim may win: {:?}",
+            replies
+        );
+        let loser = replies
+            .iter()
+            .find(|r| !r.contains("\"claimed\": true"))
+            .expect("the loser replied");
+        assert!(loser.starts_with("ERROR: task"), "{}", loser);
+        assert!(
+            loser.contains("claimed by agent-"),
+            "the loser is told who holds the task: {}",
+            loser
+        );
+
+        let (_, payload) = real.get("MyProj", &id).await.unwrap().unwrap();
+        let holder = payload.metadata["task"]["session_id"].as_str().unwrap();
+        assert!(
+            holder == "ses_a" || holder == "ses_b",
+            "the persisted holder is the winner: {}",
+            holder
+        );
+        assert_eq!(
+            payload.metadata["task"]["history"].as_array().unwrap().len(),
+            1,
+            "only the winning claim is persisted"
+        );
+    }
+
     #[tokio::test]
-    async fn re_claiming_from_the_same_session_is_idempotent() {
+    async fn empty_session_claim_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+
+        for args in [
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a" }),
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "" }),
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "   " }),
+        ] {
+            let reply = handle_task_claim(args, store.clone()).await;
+            assert!(reply.starts_with("ERROR:"), "{}", reply);
+            assert!(
+                reply.contains("session_id"),
+                "the refusal names the requirement: {}",
+                reply
+            );
+        }
+
+        assert_eq!(
+            status_of(&store, "MyProj", &id).await,
+            Status::Open,
+            "a refused claim changes nothing"
+        );
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert!(
+            payload.metadata["task"].get("session_id").is_none(),
+            "no empty session is persisted: {:?}",
+            payload.metadata["task"]
+        );
+        assert!(
+            payload.metadata["task"]["history"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "no transition is persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_session_reclaim_is_idempotent() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         let args = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
@@ -4088,7 +4179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claiming_a_done_task_names_the_legal_transition_instead() {
+    async fn claim_after_completion_still_refused() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         // Hand-edit the status: the machine still refuses done -> in_progress.
@@ -4607,6 +4698,116 @@ mod tests {
                 assert_eq!(lesson.metadata["extracted_from"], json!([old_id.as_str()]));
             }
             other => panic!("expected Superseded, got {:?}", other),
+        }
+    }
+
+    /// Wraps a real store and delays every task-row `get` briefly, widening
+    /// the claim handler's load -> decide -> upsert window so two spawned
+    /// claims overlap deterministically instead of racing by scheduler luck.
+    struct SlowGetStore {
+        inner: Arc<dyn VectorStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for SlowGetStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+        async fn relink_edges(&self, namespace: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace).await
+        }
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            self.inner.list(namespace, user_id).await
+        }
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            let found = self.inner.get(namespace, id).await?;
+            if let Some((_, payload)) = &found {
+                if payload.metadata.get("task").is_some() {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+            }
+            Ok(found)
+        }
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(
+                    include_retired,
+                    include_archived,
+                    project_contexts,
+                    anchor_override,
+                )
+                .await
+        }
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl crate::traits::AsAny for SlowGetStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
