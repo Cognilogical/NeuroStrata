@@ -366,9 +366,9 @@ mod tests {
     /// keeps every relation as it was; v5 adds the fact `topology` field,
     /// which is a field and not a relation; v6 adds the fact `attempt` and `domain_registry` fields.
     #[test]
-    fn memory_vocabulary_v6_parses_and_has_exact_relations() {
+    fn memory_vocabulary_v7_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 6);
+        assert_eq!(v["vocabulary_version"], 7);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));

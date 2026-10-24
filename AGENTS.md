@@ -41,10 +41,17 @@ NeuroStrata has two distinct work-related concepts:
 **How to create a procedure** (no `procedure_create` tool exists): `neurostrata_add_memory` with `memory_type: "procedure"` and metadata fields `trigger` (`session-start` | `before-edit` | `after-mutation` | `every-n-sessions:N` | `every-n-days:N`), `remaining_fires`, `valid_to`, `performance_count`, `last_performed_at`, `last_episodic_pointer`. Then stamp each firing with `neurostrata_procedure_perform`.
 
 **Do not ask for `task_type: "recurring"`** — the enum is `task | bug | feature | epic`. The rejection error itself points at this section.
+
 - **Lock 3 (The "Breath" Prompt):** If a task takes more than 3-5 steps, the agent must pause, summarize the current state, and record it on the Goal (`neurostrata_task_update` note — its Working Memory history) before proceeding.
 - **Continuous Backup Protocol:** Silently use `neurostrata_append_log` to maintain a running log of the conversation. Pass tags (e.g., "auth, database") when a topic switch occurs.
 - **MANDATORY PRE-FLIGHT HOOK (Zero-Trust Policy):** You are strictly BLOCKED from using `write`, `edit`, or `bash` (except for task-tracking commands) on a new task until you have FIRST executed `neurostrata_get_snapshot` to fetch the architectural rules for this project, OR `neurostrata_search_memory` using nouns/keywords from the user's prompt. You suffer from the "Unknown Unknowns" bias: you do not know when you are missing a constraint. Therefore, you must NEVER assume you know the architectural constraints of a codebase just because you read the code. The memory database is the ultimate ground truth. **You MUST call the memory tools as your very first action on every new task.**
 - **Retrieval Protocol (MANDATORY):** Every time you start a new session, or if a user asks about previous system design, YOU MUST proactively use `neurostrata_search_memory` or grep `.NeuroStrata/sessions/*` (if local fallback is needed) to retrieve the context before answering or coding.
+
+## 3c. Task recognition (heuristic)
+A statement of future/deferred work is a TASK, not a note:
+- Explicit tags: `TODO:`, `FIXME:`, `follow-up:`, `next step:`, `action item:`, `remaining work:`.
+- Modal deferral: `we should also`, `later we need to`, `still need to`, `must also fix`, `need to follow up`, `filed follow-up`, `defer`/`deferred`.
+When you see one in user/agent speech, logs, or memory content, capture it with `neurostrata_task_create` (namespace, title) instead of letting it evaporate. The lexical detector surfaces these as `task_intent_signals` in `neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
 
 ## 3b. SynapticMesh (inter-instance memory — honesty rules)
 

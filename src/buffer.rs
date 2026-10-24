@@ -197,6 +197,7 @@ pub async fn handle_append_log(
                 "rolled": false,
                 "tags": tags,
                 "recalled": [],
+                "task_intent_signals": [],
             });
             return resp.to_string();
         }
@@ -237,14 +238,14 @@ pub async fn handle_append_log(
             Ok(v) => v,
             Err(_) => {
                 tracing::warn!("Failed to generate embedding for recall");
-                return success_response(&outcome, &tags, vec![], None);
+                return success_response(&outcome, &tags, vec![], None, vec![]);
             }
         };
 
         // Initialize namespace before searching
         if let Err(e) = store.init(&namespace).await {
             tracing::warn!("Failed to initialize namespace for recall: {}", e);
-            return success_response(&outcome, &tags, vec![], None);
+            return success_response(&outcome, &tags, vec![], None, vec![]);
         }
 
         // Run the recall search
@@ -262,7 +263,7 @@ pub async fn handle_append_log(
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!("Recall search failed: {}", e);
-                return success_response(&outcome, &tags, vec![], None);
+                return success_response(&outcome, &tags, vec![], None, vec![]);
             }
         };
 
@@ -320,7 +321,17 @@ pub async fn handle_append_log(
     };
 
     // Build the success response
-    success_response(&outcome, &tags, recalled, recalled_from)
+    let signals: Vec<Value> = crate::task::intent::detect_task_intents(&content)
+        .into_iter()
+        .map(|s| {
+            json!({
+                "marker": s.marker,
+                "excerpt": s.excerpt,
+                "action": "Call neurostrata_task_create(namespace, title) so this work does not evaporate."
+            })
+        })
+        .collect();
+    success_response(&outcome, &tags, recalled, recalled_from, signals)
 }
 
 /// Builds the append_log success response — one shape for every successful append.
@@ -332,6 +343,7 @@ fn success_response(
     tags: &[String],
     recalled: Vec<Value>,
     recalled_from: Option<&str>,
+    task_intent_signals: Vec<Value>,
 ) -> String {
     let mut resp = json!({
         "appended": true,
@@ -340,6 +352,7 @@ fn success_response(
         "rolled": outcome.rolled,
         "tags": tags,
         "recalled": recalled,
+        "task_intent_signals": task_intent_signals,
     });
     if let Some(mode) = recalled_from {
         resp["recalled_from"] = json!(mode);

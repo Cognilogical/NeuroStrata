@@ -164,6 +164,11 @@ pub const REMINDER_WIRES: &[Reminder] = &[
         fires_on: "before-edit",
         text: "claim or create a Goal before editing; edits with no task close with no memory extracted",
     },
+    Reminder {
+        id: "task-capture-on-intent",
+        fires_on: "during-work",
+        text: "when speech or a log entry contains a task-shaped statement (TODO:, 'later we need to', 'we should also', ...), capture it with neurostrata_task_create instead of letting it evaporate",
+    },
 ];
 
 /// Every id a rule may name in its `guard` field (A6). A dangling guard is
