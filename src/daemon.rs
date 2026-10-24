@@ -12,55 +12,205 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-/// Load or create the per-user daemon bearer token. Stored at
-/// `~/.config/neurostrata/daemon.token` with mode 0600.
-pub(crate) fn load_or_create_daemon_token() -> String {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    let config_dir = home.join(".config").join("neurostrata");
-    let _ = std::fs::create_dir_all(&config_dir);
-    let token_path = config_dir.join("daemon.token");
-    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+/// The daemon's token directory: `~/.config/neurostrata`, the directory
+/// that also holds `embedders.json`.
+fn token_config_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join(".config").join("neurostrata")
+}
+
+/// A fresh token: 32 random bytes from the OS CSPRNG, hex-encoded
+/// (64 chars). The bytes are two v4 UUIDs' raw bytes; uuid draws v4
+/// randomness from the operating system's RNG (getrandom). Never a
+/// clock, a counter, or a hash of anything guessable.
+fn generate_token() -> String {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Load a token file, or create it holding a fresh token at mode 0600.
+///
+/// Lockout recovery (the documented path): stop the daemon, delete
+/// `daemon.token` and `operator.token` from this directory, restart --
+/// both are regenerated, and the operator reads the new values from the
+/// files. No token value is ever logged or returned by any route.
+fn load_or_create_token_file(path: &Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
         let trimmed = existing.trim().to_string();
         if !trimmed.is_empty() {
             return trimmed;
         }
     }
-    // Generate a new token
-    let token = uuid::Uuid::new_v4().to_string();
-    let _ = std::fs::write(&token_path, &token);
+    let token = generate_token();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, &token);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     token
 }
 
-/// Axum middleware that enforces bearer-token authentication on all routes
-/// except `/health`. The expected token is read from `AppState::daemon_token`.
+/// Load or create the per-user daemon bearer <redacted> Stored at
+/// `~/.config/neurostrata/daemon.token` with mode 0600.
+pub(crate) fn load_or_create_daemon_token() -> String {
+    load_or_create_token_file(&token_config_dir().join("daemon.token"))
+}
+
+/// Load or create the daemon's operator token (DR-5): the second token
+/// file, required in addition to the bearer on the destructive routes
+/// (/delete, /shutdown, /backup). Stored at
+/// `~/.config/neurostrata/operator.token` with mode 0600.
+///
+/// What the split does and does not do: it retires the
+/// leaked-single-credential case -- a leaked bearer alone cannot delete,
+/// shut down, or back up -- and nothing more. Any process running as
+/// the operator's UID can read both files, so against a local attacker
+/// the operator token is a second file, not a second factor. Same-UID
+/// local processes remain trusted by design (loopback architecture).
+pub(crate) fn load_or_create_operator_token() -> String {
+    load_or_create_token_file(&token_config_dir().join("operator.token"))
+}
+
+/// Read a token file's contents for a client: the trimmed value, or None
+/// when no usable token is there. Creation is the daemon's job; clients
+/// only read.
+pub(crate) fn read_token_file(name: &str) -> Option<String> {
+    let content = std::fs::read_to_string(token_config_dir().join(name)).ok()?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Constant-time equality for credential comparison: a wrong token must
+/// not leak how much of it was right through response timing.
+fn token_eq(provided: &str, expected: &str) -> bool {
+    let a = provided.as_bytes();
+    let b = expected.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Whether a Host or Origin authority names this machine: `127.0.0.1`,
+/// `localhost`, or `[::1]`, with any port (or none).
+fn is_loopback_host(value: &str) -> bool {
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if value == "::1" {
+        "::1"
+    } else {
+        value.split(':').next().unwrap_or(value)
+    };
+    matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost")
+}
+
+fn forbidden(body: &'static str) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::FORBIDDEN)
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+fn unauthorized() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::UNAUTHORIZED)
+        .body(axum::body::Body::from(
+            "unauthorized -- the daemon requires the bearer token from daemon.token \
+             in its config directory; if you are locked out, stop the daemon, delete \
+             daemon.token and operator.token there, and restart (they are regenerated)",
+        ))
+        .unwrap()
+}
+
+/// Axum middleware that decides whether a caller may use the daemon at
+/// all -- the one place caller trust is decided (Task 1). Rules, in
+/// order:
+/// 1. The `Host` header must name loopback -- otherwise **403**. A
+///    DNS-rebinding page makes the browser send the attacker's hostname
+///    here; a local tool never does.
+/// 2. An `Origin` header, when present, must name loopback -- otherwise
+///    **403**. Browsers send Origin on cross-origin POSTs; a local tool
+///    that sends one sends its own loopback origin.
+/// 3. Every route except `/health` requires `Authorization: Bearer
+///    <daemon token>` -- missing or wrong is **401**.
+/// 4. The destructive routes (/delete, /shutdown, /backup) additionally
+///    require the operator token in `X-NeuroStrata-Operator` -- missing
+///    or wrong is **403**.
+///
+/// The threat split (DR-5): the tokens are a browser/DNS-rebinding
+/// defense plus single-credential leak containment; same-UID local
+/// processes remain trusted by design (loopback architecture).
 async fn auth_middleware(
     State(state): State<AppState>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let headers = req.headers();
+
+    // Rules 1-2 bind every route, /health included: a rebinding page is
+    // refused before any handler runs.
+    if let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !is_loopback_host(host) {
+            return forbidden("forbidden -- Host must name loopback");
+        }
+    }
+    if let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        let authority = origin.split("://").nth(1).unwrap_or(origin);
+        if !is_loopback_host(authority) {
+            return forbidden("forbidden -- Origin must name loopback");
+        }
+    }
+
     // /health is unauthenticated so liveness probes work.
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
-    let provided = req
-        .headers()
+
+    let provided = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match provided {
-        Some(tok) if tok == state.daemon_token => next.run(req).await,
-        _ => {
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::UNAUTHORIZED)
-                .body(axum::body::Body::from("unauthorized"))
-                .unwrap()
+        Some(tok) if token_eq(tok, &state.daemon_token) => {}
+        _ => return unauthorized(),
+    }
+
+    if matches!(req.uri().path(), "/delete" | "/shutdown" | "/backup") {
+        let operator = headers
+            .get("x-neurostrata-operator")
+            .and_then(|v| v.to_str().ok());
+        match operator {
+            Some(tok) if token_eq(tok, &state.operator_token) => {}
+            _ => {
+                return forbidden(
+                    "forbidden -- this route also requires the operator token \
+                     (X-NeuroStrata-Operator; see operator.token in the config directory)",
+                )
+            }
         }
     }
+
+    next.run(req).await
 }
 
 /// How often the daemon flushes to durable storage. Anything written between
@@ -121,6 +271,10 @@ struct AppState {
     /// Per-user bearer token for authenticating HTTP requests. Generated on
     /// daemon startup and persisted to ~/.config/neurostrata/daemon.token.
     daemon_token: String,
+    /// The operator token (DR-5), required in addition to the bearer on
+    /// the destructive routes (/delete, /shutdown, /backup). Persisted to
+    /// ~/.config/neurostrata/operator.token.
+    operator_token: String,
 }
 
 #[derive(Deserialize)]
@@ -559,6 +713,9 @@ pub(crate) async fn start_daemon_on(
     // Generate or load the per-user daemon bearer token. Stored at
     // ~/.config/neurostrata/daemon.token (mode 0600) so CLI clients can read it.
     let daemon_token = load_or_create_daemon_token();
+    // The operator token (DR-5), same directory and mode: the destructive
+    // routes require it in addition to the bearer.
+    let operator_token = load_or_create_operator_token();
 
     // The thalamic bus, built before anything can serve -- a request that
     // lands on the first accepted connection emits into a wired bus or
@@ -593,10 +750,11 @@ pub(crate) async fn start_daemon_on(
             started_at: chrono::Utc::now().timestamp(),
         },
         daemon_token: daemon_token.clone(),
+        operator_token: operator_token.clone(),
     };
 
     let app = Router::new()
-        .route("/health", get(|| async { "OK" }))
+        .route("/health", get(|| async { "ok" }))
         .route("/info", get(handle_info))
         .route("/graph", get(handle_get_graph))
         .route("/ingest", post(handle_ingest))
@@ -1794,6 +1952,18 @@ impl crate::traits::AsAny for RecordingStore {
                 }
             }
         }
+        // The helper client is the operator's own client: it also carries
+        // the operator token, so the destructive routes (its /shutdown
+        // cleanup above all) keep working under the operator tier.
+        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        if let Ok(operator) = std::fs::read_to_string(&operator_path) {
+            let trimmed = operator.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(trimmed) {
+                    headers.insert("x-neurostrata-operator", val);
+                }
+            }
+        }
         let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
 
         let response = client
@@ -1875,6 +2045,18 @@ impl crate::traits::AsAny for RecordingStore {
             if !trimmed.is_empty() {
                 if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
                     headers.insert(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
+        // The helper client is the operator's own client: it also carries
+        // the operator token, so the destructive routes (its /shutdown
+        // cleanup above all) keep working under the operator tier.
+        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        if let Ok(operator) = std::fs::read_to_string(&operator_path) {
+            let trimmed = operator.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(trimmed) {
+                    headers.insert("x-neurostrata-operator", val);
                 }
             }
         }
