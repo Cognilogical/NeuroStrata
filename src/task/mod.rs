@@ -17,7 +17,7 @@ use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
 use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 // ── small helpers shared by every handler ──────────────────────────────────
 
@@ -519,6 +519,32 @@ pub async fn handle_task_create(
 
 // ── tool: neurostrata_task_claim ───────────────────────────────────────────
 
+/// Per-task claim locks: task id -> the lock serializing that task's claim
+/// sequence. Weak entries so a lock is dropped once no claim holds it; dead
+/// entries are pruned on each call, so the map tracks live claims, not every
+/// task ever claimed.
+static CLAIM_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+/// The lock `handle_task_claim` holds across its whole load -> decide ->
+/// upsert sequence. Claim's only production caller runs inside the daemon's
+/// MCP dispatch (`process_mcp_request`); stdio processes are pure proxies
+/// and never execute the handler, so this process-global registry serializes
+/// all claim traffic in the shipped topology. The store's upsert API has no
+/// conditional write to build a CAS on, so the process lock is the smallest
+/// honest atomicity mechanism.
+fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let registry = CLAIM_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut map = registry.lock().expect("claim lock registry poisoned");
+    map.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = map.get(task_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    map.insert(task_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
 pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match required_str(&args, "id") {
         Ok(v) => v.to_string(),
@@ -528,13 +554,24 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Ok(v) => v,
         Err(e) => return e,
     };
+    // A claim without a session has no holder identity to exclude others
+    // with: refuse before any state is read or written, and never persist
+    // an empty session_id.
+    let session = match required_str(&args, "session_id") {
+        Ok(v) => v.to_string(),
+        Err(e) => return e,
+    };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
     if let Err(e) = check_namespace(&namespace) {
         return e;
     }
 
     let assignee = arg_str(&args, "assignee").unwrap_or("unknown").to_string();
-    let session = arg_str(&args, "session_id").unwrap_or("").to_string();
+
+    // Serialize the whole load -> decide -> upsert sequence per task: two
+    // concurrent claims on one task can no longer both observe it unclaimed.
+    let lock = claim_lock(&id);
+    let _claim_guard = lock.lock().await;
 
     let (mut task, vector) = match load_task(&store, &namespace, &id).await {
         Ok(found) => found,
@@ -639,25 +676,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         obj.insert("session_id".to_string(), json!(session));
     }
 
-    // Atomicity guard: re-read the task before saving. If another session
-    // claimed it in the meantime (session_id changed), abort rather than
-    // overwriting their claim. Best-effort; true CAS needs store-level
-    // conditional writes (R7 follow-up).
-    let (fresh_task, _) = match load_task(&store, &namespace, &id).await {
-        Ok(found) => found,
-        Err(_) => (task.clone(), vector.clone()),
-    };
-    let fresh_holder = fresh_task
-        .task_field("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if !fresh_holder.is_empty() && fresh_holder != session && fresh_holder != holder {
-        return format!(
-            "ERROR: task {} was claimed by another session ('{}') while this claim was in progress. Retry the claim.",
-            id, fresh_holder
-        );
-    }
+    // No re-read guard here: the per-task claim lock above is held across
+    // this save, so no claim-path writer can interleave between the load
+    // and the upsert. (The R7 best-effort re-read this replaces could only
+    // ever fire for an out-of-process claim writer, and none exists — every
+    // claim enters through this handler in the daemon process.)
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
