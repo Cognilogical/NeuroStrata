@@ -7,6 +7,7 @@
 //! sections 1 through 3 and 6 through 8.
 
 pub mod gate;
+pub mod intent;
 pub mod machine;
 pub mod wiring;
 
@@ -1342,6 +1343,7 @@ pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
     });
 
     let mut out = String::from("Zero-Action Start: claim or create a task before editing.\n");
+    out.push_str("Task recognition: a statement of future/deferred work ('TODO:', 'we should also', 'later we need to', 'remaining work:', ...) is a task, not a note — capture it with neurostrata_task_create.\n");
     if claimed.is_empty() && ready.is_empty() {
         out.push_str("No tasks are claimed or ready in this namespace.\n");
         return out;
@@ -1428,6 +1430,17 @@ writes one Episodic Buffer entry per firing.
   `neurostrata_procedure_perform`.
 - `task_create` rejects `task_type: "recurring"` -- the rejection error
   itself points at this section.
+
+## 6. Task recognition (heuristic)
+A statement of future/deferred work is a TASK, not a note:
+- Explicit tags: `TODO:`, `FIXME:`, `follow-up:`, `next step:`, `action item:`,
+  `remaining work:`.
+- Modal deferral: `we should also`, `later we need to`, `still need to`,
+  `must also fix`, `need to follow up`, `filed follow-up`, `defer`/`deferred`.
+When you see one in user/agent speech, logs, or memory content, capture it
+with `neurostrata_task_create` (namespace, title) instead of letting it
+evaporate. The lexical detector surfaces these as `task_intent_signals` in
+`neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
 "#,
         ns = namespace
     )

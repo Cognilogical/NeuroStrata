@@ -1,5 +1,5 @@
 {
-  "vocabulary_version": 6,
+  "vocabulary_version": 7,
   "relations": {
     "GOVERNS": {
       "direction": "directed",
@@ -169,9 +169,9 @@
     "version_policy": "Increment vocabulary_version for semantic changes."
   },
   "tool_summaries": {
-    "add": "Vocabulary v2: rule/fact/task; metadata governs, contained_by, related_to and extracted_from accept target-ID arrays; a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason), the access path the fact describes; a fact may also carry metadata.attempt (approach, outcome, failure_mode, context) with outcome \"failed\", evidence of one failed episode and not a rule; the namespace's registry row carries metadata.domain_registry.domains, the sorted list of the domain slugs the namespace uses; custom types remain valid.",
+    "add": "Vocabulary v7: rule/fact/task; metadata governs, contained_by, related_to and extracted_from accept target-ID arrays; a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason), the access path the fact describes; a fact may also carry metadata.attempt (approach, outcome, failure_mode, context) with outcome \"failed\", evidence of one failed episode and not a rule; the namespace's registry row carries metadata.domain_registry.domains, the sorted list of the domain slugs the namespace uses; custom types remain valid.",
     "search": "Expanded matches add bounded, directed evidence paths; RELATES_TO is undirected; memory_type 'task' is excluded unless include_tasks is true.",
-    "ingest": "Vocabulary v2: directory/file/markdown containers and symbols; code_ast remains the stored symbol type.",
+    "ingest": "Vocabulary v7: directory/file/markdown containers and symbols; code_ast remains the stored symbol type.",
     "memory_type": "Use rule or fact; task for tracked work; procedure for a knowing-how routine that fires on a trigger or a repetition budget (perform it with neurostrata_procedure_perform); a fact may carry metadata.topology (component, target_system, channel, credential_boundary, reason); a fact may also carry metadata.attempt (approach, outcome, failure_mode, context) with outcome \"failed\", evidence of one failed episode and not a rule; the namespace's registry row carries metadata.domain_registry.domains, the sorted list of the domain slugs the namespace uses; structural types are directory/file/markdown/symbol; custom types remain valid; default context."
   }
 }

@@ -106,7 +106,7 @@ pub async fn process_mcp_request(
                 "tools": [
                     {
                         "name": "neurostrata_add_memory",
-                        "description": "Store an architectural rule, project pattern, or task insight.",
+                        "description": "Store an architectural rule, project pattern, or task insight. Task recognition: if the content contains a task-shaped statement (TODO:, 'we should also', 'later we need to', 'remaining work:', 'defer'/'deferred'), consider neurostrata_task_create instead of or in addition to storing it as a memory.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -243,7 +243,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_task_create",
-                        "description": "Create a tracked unit of work. Zero-Action Start: no file edits before a task exists and is claimed by this session.",
+                        "description": "Create a tracked unit of work. Zero-Action Start: no file edits before a task exists and is claimed by this session. Task recognition: a statement of future/deferred work (TODO:, FIXME:, 'we should also', 'later we need to', 'remaining work:', 'defer'/'deferred') is a task, not a note — capture it here instead of letting it evaporate.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -1567,6 +1567,17 @@ async fn handle_add_memory(
                         crate::registry::write_registry(&store, &emb, namespace, &domains).await
                     {
                         msg.push_str(&format!("\nRegistry warning: {}", warning));
+                    }
+                }
+                // TASK NUDGE: advisory when a non-task/procedure memory's content
+                // carries task-shaped markers.
+                if memory_type != "task" && memory_type != "procedure" {
+                    let signals = crate::task::intent::detect_task_intents(content);
+                    if let Some(sig) = signals.first() {
+                        msg.push_str(&format!(
+                            "\nTASK NUDGE: content matched task-intent marker '{}' (\"{}\"). If this is tracked or follow-up work rather than a timeless rule/fact, record it via neurostrata_task_create (namespace: '{}').",
+                            sig.marker, sig.excerpt, namespace
+                        ));
                     }
                 }
                 msg
@@ -2925,10 +2936,51 @@ async fn handle_guard_validate(
         .unwrap_or(false);
 
     let (validator, namespace) =
-        match build_guard_validator(&arguments, store, embedder, "validate").await {
+        match build_guard_validator(&arguments, store.clone(), embedder, "validate").await {
             Ok(v) => v,
             Err(e) => return e,
         };
+
+    // Zero-Action Start (honest): in a task-enabled namespace, a mutating
+    // action requires at least one claimed (in_progress) task. Read-only
+    // actions and namespaces with no task rows at all are exempt.
+    let mutating = !matches!(
+        action_type.to_lowercase().as_str(),
+        "read" | "read_file" | "get" | "list" | "search" | "query" | "view" | "cat" | "inspect"
+    );
+    if mutating {
+        // Determine whether this namespace is task-enabled.
+        if let Ok(memories) = store.list(&namespace, None).await {
+            let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
+            if has_any_task {
+                let has_in_progress = memories
+                    .iter()
+                    .any(|m| crate::task::gate::is_task(m) && crate::task::gate::task_status(m) == crate::task::machine::Status::InProgress);
+                if !has_in_progress {
+                    let trace_id = format!(
+                        "guard-validate-{}-{}",
+                        std::process::id(),
+                        chrono::Utc::now().timestamp_millis()
+                    );
+                    let body = serde_json::json!({
+                        "trace_id": trace_id,
+                        "verdict": {
+                            "bucket": "DeterministicReject",
+                            "reasons": ["Zero-Action Start: no claimed (in_progress) task in this namespace. Claim or create a task before editing."],
+                            "constraints": []
+                        },
+                        "rule_ids_triggered": []
+                    });
+                    return format!(
+                        "namespace: {}\ntrace_id: {}\n{}",
+                        namespace,
+                        trace_id,
+                        serde_json::to_string_pretty(&body).unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
 
     let trace_id = format!(
         "guard-validate-{}-{}",
