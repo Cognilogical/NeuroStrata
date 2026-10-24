@@ -107,10 +107,11 @@ fn is_untrusted(metadata: &Value) -> bool {
     }
 }
 
-/// Stamp a locally created procedure row as locally authored. The
-/// creation paths (add_memory, task_complete's inline extraction) call
-/// this when they mint a procedure: authorship is a fact about the
-/// write path, so the stamp overwrites any caller-supplied trust
+/// Stamp a locally created procedure row as locally authored. Every
+/// creation path calls this when it mints a procedure — add_memory,
+/// task_complete's inline extraction, and the CLI `Add` command (whose
+/// memory_type is a free-form argument): authorship is a fact about
+/// the write path, so the stamp overwrites any caller-supplied trust
 /// value. The mesh import funnel never calls this — imported rows take
 /// the manifest's stamp instead (Program Task 3).
 pub(crate) fn stamp_local_trust(metadata: &mut Value) {
