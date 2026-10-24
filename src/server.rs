@@ -3415,8 +3415,10 @@ mod tests {
                     break;
                 }
                 let lower = trimmed.to_ascii_lowercase();
-                if let Some(v) = lower.strip_prefix("authorization:") {
-                    auth = v.trim().to_string();
+                if lower.starts_with("authorization:") {
+                    // The value is compared exactly, so take it from the
+                    // original line -- only the name match is folded.
+                    auth = trimmed["authorization:".len()..].trim().to_string();
                 }
                 if let Some(v) = lower.strip_prefix("content-length:") {
                     content_length = v.trim().parse().unwrap_or(0);
