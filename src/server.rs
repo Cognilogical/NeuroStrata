@@ -329,6 +329,7 @@ pub async fn process_mcp_request(
                                     },
                                     "required": ["content"]
                                 },
+                                "follow_up_tasks": { "type": "array", "items": { "type": "object", "properties": { "title": { "type": "string" }, "description": { "type": "string" }, "task_type": { "type": "string", "enum": ["task", "bug", "feature", "epic"] }, "priority": { "type": "integer", "enum": [0,1,2,3,4] }, "labels": { "type": "array", "items": { "type": "string" } } }, "required": ["title"] }, "description": "Optional list of follow-up tasks to create after this task is done. Each becomes an open task with spawned_from=parent and a related_to edge." },
                                 "link_memory_id": { "type": "string", "description": "Bind an already-written memory to this task via EXTRACTED_FROM. Its vector is reused as-is; linking never re-embeds." }
                             },
                             "required": ["id", "namespace"]
