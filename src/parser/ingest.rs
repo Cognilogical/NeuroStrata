@@ -286,18 +286,18 @@ fn run_producer(
 
         let node_id = qualified_id(&namespace, &node_path);
 
-        // If the consumer has dropped (e.g. it errored), stop walking.
-        if tx
-            .try_send(IngestItem::NodeUpsert {
-                node_id,
-                node_path: node_path.clone(),
-                contained_by,
-                mem_type: mem_type.to_string(),
-                abs_path,
-            })
-            .is_err()
-        {
-            return Ok(());
+        // Apply backpressure: if the channel is full, block until space is
+        // available rather than silently dropping the item. If the consumer
+        // has dropped (e.g. it errored), propagate the failure instead of
+        // reporting success over a partial ingest.
+        if let Err(e) = tx.blocking_send(IngestItem::NodeUpsert {
+            node_id,
+            node_path: node_path.clone(),
+            contained_by,
+            mem_type: mem_type.to_string(),
+            abs_path,
+        }) {
+            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
         }
 
         if !is_file {
@@ -371,16 +371,13 @@ fn run_producer(
 
                     if !pending.is_empty() {
                         let path_display = path.display().to_string();
-                        if tx
-                            .try_send(IngestItem::ParsedSymbols {
-                                node_path,
-                                lang_name: lang_name.clone(),
-                                symbols: pending,
-                                path_display,
-                            })
-                            .is_err()
-                        {
-                            return Ok(());
+                        if let Err(e) = tx.blocking_send(IngestItem::ParsedSymbols {
+                            node_path,
+                            lang_name: lang_name.clone(),
+                            symbols: pending,
+                            path_display,
+                        }) {
+                            return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                         }
                     }
                 }

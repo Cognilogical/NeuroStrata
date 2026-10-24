@@ -1449,8 +1449,10 @@ impl VectorStore for LadybugStore {
 
         let _namespace = _namespace.to_string();
         let dimensions = self.dimensions;
-        let _turn = self.write_lock.lock().await;
-        let outcome = self.with_conn(move |conn| {
+        // Use write_with_deadline so the write lock is held INSIDE the
+        // spawn_blocking closure (see R5). Holding an async lock across
+        // with_conn releases it on timeout while the C++ call is still running.
+        let outcome = self.write_with_deadline("initializing schema", move |conn| {
 
             let create_node_table = format!(
                 "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
@@ -2820,6 +2822,27 @@ impl crate::traits::IntakeStore for LadybugStore {
             let new_version = cas_version + 1;
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let safe_updated = escape_ladybug_string(&now);
+
+            // For "created" disposition, verify the task_id refers to a real task
+            // in the Memory table (memory_type = 'task') in the same namespace.
+            // Reject missing/blank/wrong-namespace/non-task IDs.
+            if disposition == crate::task::intake::Disposition::Created {
+                if safe_task_id.is_empty() {
+                    return Err(anyhow::anyhow!("task_id is required for 'created' disposition"));
+                }
+                let task_check = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' AND m.memory_type = 'task' RETURN m.id",
+                    safe_task_id, safe_ns
+                );
+                let mut task_result = conn.query(&task_check)?;
+                if task_result.next().is_none() {
+                    return Err(anyhow::anyhow!(
+                        "task_id '{}' does not refer to an existing task in namespace '{}'",
+                        task_id_for_closure.as_deref().unwrap_or(""),
+                        namespace
+                    ));
+                }
+            }
 
             // CAS: only update if cas_version matches
             let query = format!(
