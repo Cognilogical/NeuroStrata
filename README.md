@@ -68,7 +68,7 @@ neurostrata_bootstrap          # new project
 # neurostrata_task_setup        # existing project
 ```
 
-The daemon listens on loopback only (`127.0.0.1:34343`) and serves `/validate`, `/tasks/gate`, `/graph`, `/mcp`, `/bus/metrics`, `/backup`, `/shutdown` — all inside the machine. An Obsidian plugin reads `.NeuroStrata/db` directly for a 2D memory canvas with zero network.
+The daemon listens on loopback only (`127.0.0.1:34343`) and serves `/validate`, `/tasks/gate`, `/graph`, `/mcp`, `/bus/metrics`, `/backup`, `/shutdown` — all inside the machine.
 
 ## Deep documentation
 
