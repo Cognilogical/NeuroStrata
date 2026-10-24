@@ -139,7 +139,7 @@ async fn existing_ids(
     namespace: &str,
 ) -> Result<HashSet<String>, String> {
     store
-        .list(namespace, None)
+        .list(namespace, None, None)
         .await
         .map(|rows| rows.into_iter().map(|r| r.id).collect())
         .map_err(|e| format!("Failed to list memories for id allocation: {}", e))
@@ -905,7 +905,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let memories = match store.list(&namespace, None).await {
+    let memories = match store.list(&namespace, None, None).await {
         Ok(m) => m,
         Err(e) => {
             return format!(
@@ -1104,7 +1104,7 @@ pub async fn handle_task_complete(
 
     let list_now = || async {
         store
-            .list(&namespace, None)
+            .list(&namespace, None, None)
             .await
             .map_err(|e| format!("Failed to list memories in '{}': {}", namespace, e))
     };
@@ -2607,7 +2607,7 @@ pub async fn import_beads(
     let mut summary = ImportSummary::default();
 
     let rows = store
-        .list(namespace, None)
+        .list(namespace, None, None)
         .await
         .map_err(|e| format!("ERROR: could not list '{}': {}", namespace, e))?;
     let mut seen_bead_ids: HashSet<String> = rows
@@ -4255,7 +4255,7 @@ mod tests {
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
 
-        let before = store.list("MyProj", None).await.unwrap().len();
+        let before = store.list("MyProj", None, None).await.unwrap().len();
         let reply = handle_task_complete(
             json!({
                 "namespace": "MyProj",
@@ -4276,7 +4276,7 @@ mod tests {
         let extracted = parsed["extracted_memory_ids"].as_array().unwrap();
         assert_eq!(extracted.len(), 1);
 
-        let after = store.list("MyProj", None).await.unwrap();
+        let after = store.list("MyProj", None, None).await.unwrap();
         assert_eq!(after.len(), before + 1, "one memory was written");
         let written = after
             .iter()
@@ -4370,7 +4370,7 @@ mod tests {
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
 
-        let before = store.list("MyProj", None).await.unwrap().len();
+        let before = store.list("MyProj", None, None).await.unwrap().len();
         let err = handle_task_complete(
             json!({
                 "namespace": "MyProj",
@@ -4394,7 +4394,7 @@ mod tests {
                 && err.contains("must be an array of task ids"),
             "the rejection must name the malformed key, not the generic Lock-2 block: {err}"
         );
-        let after = store.list("MyProj", None).await.unwrap();
+        let after = store.list("MyProj", None, None).await.unwrap();
         assert_eq!(after.len(), before, "the intended memory was NOT created");
         assert_eq!(
             status_of(&store, "MyProj", &id).await,
@@ -4658,8 +4658,9 @@ mod tests {
             &self,
             namespace: &str,
             user_id: Option<&str>,
+            memory_type: Option<&str>,
         ) -> anyhow::Result<Vec<SearchResult>> {
-            let rows = self.inner.list(namespace, user_id).await?;
+            let rows = self.inner.list(namespace, user_id, memory_type).await?;
             Ok(rows
                 .into_iter()
                 .filter(|r| r.payload.metadata.get("extracted_from").is_none())
@@ -4766,7 +4767,7 @@ impl crate::traits::AsAny for ListHidingStore {
         // The write itself did land -- this is the case the pulse would have
         // lied about, not a path that failed earlier.
         let lesson_count = real
-            .list("MyProj", None)
+            .list("MyProj", None, None)
             .await
             .unwrap()
             .iter()
@@ -4843,7 +4844,7 @@ impl crate::traits::AsAny for ListHidingStore {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
-        let before = store.list("MyProj", None).await.unwrap().len();
+        let before = store.list("MyProj", None, None).await.unwrap().len();
 
         let err = handle_task_complete(
             json!({
@@ -4859,7 +4860,7 @@ impl crate::traits::AsAny for ListHidingStore {
         .await
         .expect_err("a secret must not be stored as an extraction");
         assert!(err.contains("ERROR [SECURITY]"), "{}", err);
-        assert_eq!(store.list("MyProj", None).await.unwrap().len(), before);
+        assert_eq!(store.list("MyProj", None, None).await.unwrap().len(), before);
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
@@ -5716,7 +5717,7 @@ impl crate::traits::AsAny for ListHidingStore {
         );
 
         // The tasks really exist, in creation order.
-        let rows = store.list("proj", None).await.unwrap();
+        let rows = store.list("proj", None, None).await.unwrap();
         let tasks: Vec<_> = rows
             .iter()
             .filter(|r| r.payload.memory_type == "task")
@@ -5789,7 +5790,7 @@ impl crate::traits::AsAny for ListHidingStore {
             "the broken line is counted, not fatal"
         );
 
-        let rows = store.list("proj", None).await.unwrap();
+        let rows = store.list("proj", None, None).await.unwrap();
         let tasks: Vec<_> = rows
             .iter()
             .filter(|r| r.payload.memory_type == "task")
@@ -5854,7 +5855,7 @@ impl crate::traits::AsAny for ListHidingStore {
         assert_eq!(second.created, 0, "re-runs skip everything");
         assert_eq!(second.skipped_existing, 2);
 
-        let rows = store.list("proj", None).await.unwrap();
+        let rows = store.list("proj", None, None).await.unwrap();
         let tasks: Vec<_> = rows
             .iter()
             .filter(|r| r.payload.memory_type == "task")

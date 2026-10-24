@@ -246,7 +246,7 @@ async fn derived_domains(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
 ) -> Result<Vec<String>, String> {
-    let rows = store.list(namespace, None).await.map_err(|e| {
+    let rows = store.list(namespace, None, None).await.map_err(|e| {
         format!(
             "ERROR [DOMAIN]: the rows of namespace '{}' could not be listed: {}. Nothing was written.",
             namespace, e

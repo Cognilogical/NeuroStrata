@@ -651,7 +651,7 @@ pub fn self_test() -> SelfTestReport {
 /// Runs the engine against a store: one `list`, no embedder, milliseconds.
 pub async fn run(store: &Arc<dyn VectorStore>, namespace: &str) -> Result<GateReport, String> {
     let memories = store
-        .list(namespace, None)
+        .list(namespace, None, None)
         .await
         .map_err(|e| format!("could not list tasks in '{}': {}", namespace, e))?;
     Ok(evaluate(&memories, chrono::Utc::now().timestamp()))

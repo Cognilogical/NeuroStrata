@@ -99,6 +99,7 @@ impl VectorStore for StoreNotAttached {
         &self,
         _namespace: &str,
         _user_id: Option<&str>,
+        _memory_type: Option<&str>,
     ) -> anyhow::Result<Vec<SearchResult>> {
         Err(Self::err())
     }
@@ -879,6 +880,7 @@ mod tests {
             &self,
             _namespace: &str,
             _user_id: Option<&str>,
+            _memory_type: Option<&str>,
         ) -> anyhow::Result<Vec<SearchResult>> {
             Err(anyhow!("recording store: unused by this test"))
         }

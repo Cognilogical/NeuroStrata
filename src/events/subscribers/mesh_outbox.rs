@@ -567,7 +567,7 @@ impl MeshOutbox {
     ) -> Result<usize, String> {
         let mut re_emitted = 0usize;
         for ns in namespaces {
-            let results = store.list(ns, None).await.map_err(|e| format!("{}", e))?;
+            let results = store.list(ns, None, None).await.map_err(|e| format!("{}", e))?;
             for sr in results {
                 let payload = &sr.payload;
                 // Only shareable types.

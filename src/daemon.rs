@@ -915,7 +915,7 @@ async fn handle_cli_read(
             "list" => {
                 let ns = req.namespace.unwrap_or_default();
                 let rows =
-                    state.vector_store.list(&ns, None).await.map_err(|e| {
+                    state.vector_store.list(&ns, None, None).await.map_err(|e| {
                         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
                     })?;
                 serde_json::json!({ "rows": rows })
@@ -1450,6 +1450,7 @@ mod tests {
             &self,
             _namespace: &str,
             _user_id: Option<&str>,
+            _memory_type: Option<&str>,
         ) -> anyhow::Result<Vec<SearchResult>> {
             Ok(Vec::new())
         }
