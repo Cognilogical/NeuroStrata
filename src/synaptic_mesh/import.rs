@@ -1526,6 +1526,22 @@ fn run_ok(root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
     )
 }
 
+/// Program Task 3 (c): classify procedure rows written before stamping
+/// existed, discriminating on mesh provenance. An unstamped procedure
+/// with no import provenance is local authorship → stamped `local`. An
+/// unstamped procedure WITH import provenance is stamped `untrusted`,
+/// so it stays unfired until local promotion — the backfill never
+/// launders an import into a local by silence. Already-stamped rows
+/// and non-procedure rows are untouched, so the pass is idempotent.
+/// Returns `(stamped_local, stamped_untrusted)` counts; the daemon
+/// triggers this once at store open and logs them.
+pub async fn backfill_imported_procedure_trust(
+    store: &std::sync::Arc<dyn VectorStore>,
+) -> (usize, usize) {
+    let _ = store;
+    todo!("program Task 3 step 2: provenance backfill")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3507,5 +3523,79 @@ mod tests {
             json!("unsigned"),
             "test commits are unsigned; the state is recorded, not gated"
         );
+    }
+
+    async fn seed_row(store: &std::sync::Arc<dyn VectorStore>, id: &str, memory_type: &str, metadata: Value) {
+        store
+            .upsert(
+                "probe",
+                id,
+                emb().embed(id).await.unwrap(),
+                MemoryPayload {
+                    content: format!("row {id}"),
+                    user_id: "me".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn trust_stamp_of(store: &std::sync::Arc<dyn VectorStore>, id: &str) -> Value {
+        let (_, payload) = store
+            .get("probe", id)
+            .await
+            .unwrap()
+            .expect("row present");
+        payload
+            .metadata
+            .get("trust")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// (c) Backfill: unstamped rows are classified by provenance —
+    /// no mesh provenance → local; mesh provenance → untrusted (stays
+    /// unfired). Stamped rows and non-procedures are untouched, and a
+    /// second pass changes nothing.
+    #[tokio::test]
+    async fn backfill_stamps_by_provenance() {
+        let store = fresh_store("backfill").await;
+        store.init("probe").await.unwrap();
+        seed_row(&store, "proc-local", "procedure", json!({"trigger": "session-start"})).await;
+        seed_row(
+            &store,
+            "proc-imported",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "mesh": {"mesh_id": "mesh-alpha", "update_id": "u-1", "origin": "mesh-import"}
+            }),
+        )
+        .await;
+        seed_row(&store, "proc-promoted", "procedure", json!({"trust": "promoted"})).await;
+        seed_row(&store, "rule-plain", "rule", json!({})).await;
+
+        let (local, imported) = backfill_imported_procedure_trust(&store).await;
+        assert_eq!((local, imported), (1, 1), "one of each class stamped");
+        assert_eq!(trust_stamp_of(&store, "proc-local").await, json!("local"));
+        assert_eq!(trust_stamp_of(&store, "proc-imported").await, json!("untrusted"));
+        assert_eq!(
+            trust_stamp_of(&store, "proc-promoted").await,
+            json!("promoted"),
+            "an existing stamp is never rewritten"
+        );
+        assert_eq!(
+            trust_stamp_of(&store, "rule-plain").await,
+            Value::Null,
+            "non-procedure rows are not stamped"
+        );
+
+        let (local2, imported2) = backfill_imported_procedure_trust(&store).await;
+        assert_eq!((local2, imported2), (0, 0), "idempotent: nothing left to classify");
     }
 }
