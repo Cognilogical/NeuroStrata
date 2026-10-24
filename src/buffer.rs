@@ -58,6 +58,14 @@ pub(crate) fn scan_for_append(content: &str, tags: &[String]) -> Option<String> 
 
 /// Append one entry (and its optional topic-switch marker) to the buffer.
 /// `max_bytes` is injectable so tests do not have to write 500KB.
+///
+/// Path discipline (Task 2 / J22): the sessions directory is canonicalized
+/// and must lie inside the canonical project root before anything opens —
+/// a `.NeuroStrata` or `sessions` symlink planted in the tree cannot
+/// redirect the write out of the project. The session file itself is
+/// opened with `O_NOFOLLOW` on Unix, and a final component that is a
+/// symlink is a loud error with nothing written: the pre-open check names
+/// the refusal, and the flag closes the check-to-open race.
 pub(crate) fn append_entry(
     project_root: &Path,
     content: &str,
@@ -67,7 +75,36 @@ pub(crate) fn append_entry(
 ) -> std::io::Result<Outcome> {
     let sessions = project_root.join(".NeuroStrata").join("sessions");
     std::fs::create_dir_all(&sessions)?;
+    let canonical_root = std::fs::canonicalize(project_root)?;
+    let sessions = std::fs::canonicalize(&sessions)?;
+    if !sessions.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refused: the sessions directory {} resolves to {}, outside \
+                 the project root {} — nothing was written",
+                project_root
+                    .join(".NeuroStrata")
+                    .join("sessions")
+                    .display(),
+                sessions.display(),
+                canonical_root.display()
+            ),
+        ));
+    }
     let current = sessions.join("current.md");
+    if let Ok(link) = std::fs::symlink_metadata(&current) {
+        if link.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refused: the session file {} is a symlink — the episodic \
+                     buffer never writes through a link; nothing was written",
+                    current.display()
+                ),
+            ));
+        }
+    }
 
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let mut entry = String::new();
@@ -90,10 +127,7 @@ pub(crate) fn append_entry(
     }
 
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&current)?;
+    let mut file = open_session_file(&current)?;
     file.write_all(entry.as_bytes())?;
     let size_bytes = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
 
@@ -102,6 +136,44 @@ pub(crate) fn append_entry(
         size_bytes,
         rolled,
     })
+}
+
+/// Open the session file for appending. On Unix the open carries
+/// `O_NOFOLLOW`, so a symlink swapped in after `append_entry`'s pre-open
+/// check still cannot be written through — the kernel refuses it (ELOOP)
+/// and the refusal is translated into the same words as the check's.
+#[cfg(unix)]
+fn open_session_file(current: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW);
+    options.open(current).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refused: the session file {} is a symlink — the episodic \
+                     buffer never writes through a link; nothing was written",
+                    current.display()
+                ),
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// Open the session file for appending (non-Unix: `append_entry`'s
+/// pre-open symlink check is the guard; there is no `O_NOFOLLOW` to add).
+#[cfg(not(unix))]
+fn open_session_file(current: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(current)
 }
 
 /// Delete rolled `session-*.md` files older than the retention window.

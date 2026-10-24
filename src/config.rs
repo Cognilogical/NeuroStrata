@@ -79,6 +79,14 @@ pub struct Config {
     #[serde(default)]
     pub project_contexts: HashMap<String, PathBuf>,
 
+    /// Directories outside the served project root that daemon callers may
+    /// name — backup destinations, beads files, ingest trees (Task 2 / J6).
+    /// Empty by default: a caller-supplied path must resolve inside the
+    /// project root. This list is the ONLY escape hatch, and every path
+    /// refusal the daemon issues names this key.
+    #[serde(default)]
+    pub allowed_external_dirs: Vec<PathBuf>,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -106,6 +114,7 @@ impl Config {
                     .join("ladybug.db"),
                 deduplication: DeduplicationConfig::default(),
                 project_contexts: HashMap::new(),
+                allowed_external_dirs: Vec::new(),
                 extra: HashMap::new(),
             };
 
@@ -259,6 +268,26 @@ mod tests {
         assert!(config.project_contexts.is_empty());
     }
 
+    /// Task 2 (J6): the caller-path allowlist defaults to empty — a config
+    /// that never names `allowed_external_dirs` permits nothing outside the
+    /// project root — and parses as a list of paths when present.
+    #[test]
+    fn allowed_external_dirs_defaults_empty_and_parses() {
+        let config: Config = serde_json::from_str(r#"{"db_path":"db"}"#).unwrap();
+        assert!(
+            config.allowed_external_dirs.is_empty(),
+            "unconfigured means no external directory is permitted"
+        );
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"db","allowed_external_dirs":["/srv/backups","/mnt/beads"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.allowed_external_dirs,
+            vec![PathBuf::from("/srv/backups"), PathBuf::from("/mnt/beads")]
+        );
+    }
+
     #[test]
     fn bind_project_context_requires_nonempty_id_and_existing_marker() {
         let root = temp_dir("validation");
@@ -388,6 +417,7 @@ mod tests {
             db_path: PathBuf::from("test.db"),
             deduplication: DeduplicationConfig::default(),
             project_contexts: HashMap::new(),
+            allowed_external_dirs: Vec::new(),
             extra: HashMap::new(),
         };
 
