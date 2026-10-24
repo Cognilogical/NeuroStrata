@@ -440,6 +440,54 @@ mod tests {
         assert!(scan_for_append("plain entry", &[]).is_none());
     }
 
+    /// J22 (Task 2): a session file replaced by a symlink out of the project
+    /// must refuse loudly and write nothing through the link — the buffer is
+    /// an audit trail, and a silent write through a planted link would put
+    /// session content wherever the link points.
+    #[cfg(unix)]
+    #[test]
+    fn append_log_through_symlink_writes_nothing() {
+        let root = scratch("symlink");
+        let sessions = root.join(".NeuroStrata").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let outside = scratch("symlink-target");
+        let target = outside.join("loot.md");
+        std::fs::write(&target, "original\n").unwrap();
+        std::os::unix::fs::symlink(&target, sessions.join("current.md")).unwrap();
+
+        let err = append_entry(&root, "must not land", &[], 500 * 1024, 30)
+            .expect_err("a symlinked session file is refused, not written through");
+        assert!(
+            err.to_string().contains("symlink"),
+            "the refusal names the symlink: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "the link target is untouched"
+        );
+    }
+
+    /// J22 pin: the normal path still appends, entry after entry, into the
+    /// project's own sessions directory.
+    #[test]
+    fn append_log_normal_path_appends() {
+        let root = scratch("normal");
+        append_entry(&root, "first entry", &[], 500 * 1024, 30).unwrap();
+        let outcome = append_entry(&root, "second entry", &[], 500 * 1024, 30).unwrap();
+        let text = std::fs::read_to_string(&outcome.file).unwrap();
+        assert!(text.contains("first entry"), "the first entry persists: {text}");
+        assert!(
+            text.contains("second entry"),
+            "the second entry appends: {text}"
+        );
+        assert!(
+            outcome.file.starts_with(&root.display().to_string()),
+            "the buffer file lives under the project root: {}",
+            outcome.file
+        );
+    }
+
     #[tokio::test]
     async fn disabled_mode_is_a_no_op() {
         let root = scratch("off");

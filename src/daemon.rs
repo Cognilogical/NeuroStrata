@@ -2071,4 +2071,281 @@ impl crate::traits::AsAny for RecordingStore {
             Some(std::time::Duration::from_secs(60))
         );
     }
+
+    /// Spawn the real daemon with `PROJECT_ROOT_ENV` pinned at `root` (the
+    /// caller holds `ENV_LOCK`), then build the authenticated client only
+    /// after `/health` answers — startup creates the token file before it
+    /// binds, so by then the file exists to read. Building the client first
+    /// is the fresh-HOME race that keeps the archive-route test red at this
+    /// baseline. The env var is removed once startup has resolved the root:
+    /// the daemon serves the root it captured, not the variable.
+    async fn spawn_daemon_serving(
+        root: &Path,
+    ) -> (
+        String,
+        reqwest::Client,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        std::env::set_var(PROJECT_ROOT_ENV, root);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let daemon = tokio::spawn(start_daemon_on(
+            addr.clone(),
+            Arc::new(StubEmbedder { dimensions: 8 }),
+            Arc::new(RecordingStore::default()),
+            None,
+        ));
+        let base = format!("http://{addr}");
+        let bare = reqwest::Client::new();
+        let mut serving = false;
+        for _ in 0..500 {
+            if bare
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                serving = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(serving, "daemon never started serving on {addr}");
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        let token = std::fs::read_to_string(&token_path)
+            .expect("the daemon created its token file before serving");
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())).unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        (base, client, daemon)
+    }
+
+    async fn stop_daemon(
+        client: &reqwest::Client,
+        base: &str,
+        daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        client.post(format!("{base}/shutdown")).send().await.unwrap();
+        daemon.await.unwrap().unwrap();
+    }
+
+    /// Task 2 (J6 path leg): a caller-named backup destination outside the
+    /// served project root is refused before any use, and the refusal names
+    /// the path, the root, and the `allowed_external_dirs` escape hatch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_to_path_outside_root_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2-backup-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2-backup-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": outside.display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a backup destination outside the project root is a refusal, not a write"
+        );
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains(&outside.display().to_string()),
+            "the refusal names the offending path: {body}"
+        );
+        assert!(
+            body.contains("allowed_external_dirs"),
+            "the refusal names the config key that changes the policy: {body}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 pin: a backup destination inside the served root succeeds
+    /// exactly as it did before the policy existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_inside_root_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2-backup-inside-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let dest = root.join("snapshots");
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": dest.display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.text().await.unwrap();
+        assert!(body.contains("Backed up to"), "the handler's own answer: {body}");
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 (Review Focus #4, first half): a symlink planted inside the
+    /// root that points outside it does not smuggle the backup out — the
+    /// canonicalized target governs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn symlinked_backup_destination_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2-backup-link-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2-backup-link-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": root.join("escape").display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "the canonical target governs, not the spelling inside the root"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 (J6): a mesh tool call naming a project root that cannot be
+    /// resolved on this machine is refused as foreign — today the verbatim
+    /// string flows into the service and the call answers as if the root
+    /// were merely unjoined.
+    #[test]
+    fn mesh_tool_foreign_project_root_is_refused() {
+        let base = scratch_root("t2-mesh-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let missing = scratch_root("t2-mesh-missing");
+        let out = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_status",
+            &serde_json::json!({ "project_root": missing.display().to_string() }),
+            &base,
+        );
+        assert!(
+            out.starts_with("error:"),
+            "a foreign project_root is a refusal, not an empty-project answer: {out}"
+        );
+        assert!(
+            out.contains("project_root") && out.contains("cannot be resolved"),
+            "the refusal names the check and the offending value: {out}"
+        );
+    }
+
+    /// Task 2 (J19) zero-change pin, mesh leg: a mesh tool call that carries
+    /// no `project_root` resolves the root the same way the daemon does —
+    /// the environment's project — not the process's working directory.
+    #[test]
+    fn request_without_project_root_uses_startup_root() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = scratch_root("t2-noroot-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let project = scratch_root("t2-noroot-project");
+        std::fs::create_dir_all(&project).unwrap();
+        let init = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_init",
+            &serde_json::json!({
+                "name": "noroot-mesh",
+                "namespace": ["nr"],
+                "project_root": project.display().to_string(),
+                "node_id": "nr-node"
+            }),
+            &base,
+        );
+        assert!(init.contains("mesh created"), "init reply: {init}");
+
+        std::env::set_var(PROJECT_ROOT_ENV, &project);
+        let out = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_status",
+            &serde_json::json!({}),
+            &base,
+        );
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        assert!(
+            out.contains("noroot-mesh"),
+            "no project_root → the resolved (env) project's status answers: {out}"
+        );
+    }
+
+    /// Task 2 (J19), echo leg end-to-end: a memory written for a second
+    /// project through the daemon's /mcp leaves its pointer echo in THAT
+    /// project's buffer — not in the startup project's, where every echo
+    /// lands today.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_projects_memory_echoes_into_its_own_buffer() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root_a = scratch_root("t2-echo-a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let root_b = scratch_root("t2-echo-b");
+        std::fs::create_dir_all(root_b.join(".NeuroStrata")).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root_a).await;
+
+        let res = client
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "neurostrata_add_memory",
+                    "arguments": {
+                        "content": "anchor probe for the second project",
+                        "namespace": "anchor-b",
+                        "project_root": root_b.display().to_string(),
+                        "memory_type": "fact"
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.text().await.unwrap();
+        assert!(!body.contains("ERROR"), "the write itself succeeds: {body}");
+
+        let buffer_b = root_b
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut echoed = String::new();
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&buffer_b) {
+                if text.contains("pointer echo") {
+                    echoed = text;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            echoed.contains("pointer echo"),
+            "the pointer lands in the second project's own buffer: {echoed:?}"
+        );
+        let buffer_a = root_a
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        if let Ok(text_a) = std::fs::read_to_string(&buffer_a) {
+            assert!(
+                !text_a.contains("pointer echo"),
+                "the startup project's buffer must not absorb the second project's echo: {text_a}"
+            );
+        }
+        stop_daemon(&client, &base, daemon).await;
+    }
 }
