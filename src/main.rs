@@ -1777,6 +1777,14 @@ fn cli_add_payload(
     content: &str,
     location: Option<String>,
 ) -> crate::traits::MemoryPayload {
+    let mut metadata = serde_json::json!({});
+    // A procedure minted from the CLI is locally authored, exactly as
+    // if add_memory had written it (Program Task 3): the type is a
+    // free-form CLI argument, so this is a creation path like any
+    // other, and the stamp belongs on it from birth.
+    if memory_type == "procedure" {
+        crate::tools::procedure::stamp_local_trust(&mut metadata);
+    }
     crate::traits::MemoryPayload {
         content: content.to_string(),
         memory_type: memory_type.to_string(),
@@ -1784,7 +1792,7 @@ fn cli_add_payload(
         user_id: "system".to_string(),
         agent_name: Some("NeuroStrata".to_string()),
         location_lines: String::new(),
-        metadata: serde_json::json!({}),
+        metadata,
     }
 }
 
