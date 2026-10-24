@@ -760,6 +760,110 @@ mod tests {
         );
     }
 
+    /// Program Task 3 (d): the fail-closed half of the gate applies ONLY
+    /// to rows carrying import provenance. An imported row whose stamp
+    /// is absent — or holds a value outside the known set — must not
+    /// fire: for a mesh-sourced row, a missing stamp is not local
+    /// authorship, it is missing evidence.
+    #[tokio::test]
+    async fn unstamped_imported_row_does_not_fire() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-imported-plain",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "remaining_fires": 3,
+                "mesh": {"mesh_id": "mesh-alpha", "update_id": "u-1", "origin": "mesh-import"}
+            }),
+        )
+        .await;
+        seed(
+            &store,
+            "probe",
+            "proc-imported-unknown",
+            "procedure",
+            json!({
+                "trust": "sender-invented-value",
+                "trigger": "session-start",
+                "remaining_fires": 3,
+                "mesh": {"mesh_id": "mesh-alpha", "update_id": "u-2", "origin": "mesh-import"}
+            }),
+        )
+        .await;
+        let root = scratch("imported-unstamped");
+
+        for id in ["proc-imported-plain", "proc-imported-unknown"] {
+            let reply: Value = serde_json::from_str(
+                &handle_procedure_perform(
+                    json!({ "id": id, "project_root": root.display().to_string() }),
+                    store.clone(),
+                )
+                .await,
+            )
+            .expect("json");
+            assert_eq!(
+                reply["performed"],
+                json!(false),
+                "{id} carries import provenance without a known stamp and must not fire: {reply}"
+            );
+            assert!(
+                reply["reason"]
+                    .as_str()
+                    .expect("reason text")
+                    .starts_with("untrusted"),
+                "{id}: the refusal names the trust state: {reply}"
+            );
+            let meta = stored(&store, "probe", id).await.metadata;
+            assert!(
+                meta.get("last_performed_at").is_none(),
+                "{id}: refusal is not a rehearsal"
+            );
+        }
+    }
+
+    /// Program Task 3: a procedure seeded in the exact shape the repo's
+    /// own AGENTS.md §3a documents — add_memory fields, NO trust field —
+    /// still fires. Stamping happens at creation, but rows in the
+    /// documented local shape keep firing exactly as before.
+    #[tokio::test]
+    async fn section_3a_shaped_procedure_fires() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-3a",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "remaining_fires": 3,
+                "valid_to": Value::Null,
+                "performance_count": 0,
+                "last_performed_at": Value::Null,
+                "last_episodic_pointer": Value::Null
+            }),
+        )
+        .await;
+        let root = scratch("section-3a");
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-3a", "project_root": root.display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(
+            reply["performed"],
+            json!(true),
+            "the documented local procedure shape must fire: {reply}"
+        );
+        assert_eq!(reply["remaining_fires"], json!(2));
+    }
+
     /// The refusal has to teach the fix: it names the trust state, the
     /// promotion verb, and the target value — and says plainly that
     /// set-metadata replaces the metadata object, so the full object has to
