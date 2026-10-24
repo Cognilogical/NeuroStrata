@@ -3278,6 +3278,112 @@ mod tests {
         assert_eq!(z.payload.metadata["eligibility"], json!("shareable"));
     }
 
+    /// Program Task 3 (fix round, M-2): under a Trusted manifest the
+    /// supersession candidate takes the manifest stamp, but the
+    /// preserved edit keeps the funnel's own "untrusted" — its apply
+    /// passes no stamp. This pins that threading: handing the preserved
+    /// record the manifest stamp turns this test red.
+    #[tokio::test]
+    async fn preserved_edit_stays_untrusted_under_a_trusted_manifest() {
+        let root = scratch("dirb-trusted");
+        let mesh_id = "mesh-dirb".to_string();
+        let namespace = "probe".to_string();
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+
+        let definition = json!({
+            "trigger": "session-start",
+            "remaining_fires_initial": 5,
+            "valid_to": "2027-01-01T00:00:00Z",
+            "rehearsal_script": { "steps": ["read spec", "act"] },
+        });
+        let local_payload = MemoryPayload {
+            content: definition.to_string(),
+            user_id: "node-local".to_string(),
+            memory_type: "procedure".to_string(),
+            agent_name: Some("node-local".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "mesh": {
+                    "update_id": Uuid::new_v4().to_string(),
+                    "origin": "node-local",
+                    "lifecycle_state": "active",
+                },
+            }),
+        };
+
+        let cand = MeshRecord {
+            schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+            id,
+            namespace: namespace.clone(),
+            memory_type: "procedure".to_string(),
+            lifecycle: Lifecycle {
+                state: LifecycleState::Superseded,
+                created_at: chrono::Utc::now(),
+                created_by: "node-peer-1".to_string(),
+                superseded_by: Some(replacement),
+                archived_at: None,
+                tombstoned_at: None,
+            },
+            content: json!({
+                "trigger": "every-n-days:7",
+                "remaining_fires_initial": 1,
+                "valid_to": Value::Null,
+                "rehearsal_script": "the replacement",
+            }),
+            metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            relationships: vec![],
+            update_id: Uuid::new_v4(),
+            origin_mesh_epoch: 1,
+            trust: Trust::Untrusted,
+        };
+
+        let store = fresh_store("dirb-trusted").await;
+        store.init(&namespace).await.unwrap();
+        let disposition = preserve_superseded_edit(
+            &root,
+            &mesh_id,
+            &id.to_string(),
+            &namespace,
+            LifecycleState::Active,
+            &local_payload,
+            &cand,
+            store.clone(),
+            emb(),
+            Trust::Trusted,
+            "unsigned",
+        )
+        .await;
+        assert!(
+            matches!(disposition, Disposition::Applied),
+            "{disposition:?}"
+        );
+
+        let all = store.list(&namespace, None).await.unwrap();
+        assert_eq!(all.len(), 2, "superseded X + preserved edit Z");
+        let x = all
+            .iter()
+            .find(|r| r.id == id.to_string())
+            .expect("the supersession row");
+        assert_eq!(
+            x.payload.metadata["trust"],
+            json!("trusted"),
+            "the candidate takes the manifest stamp: {:?}",
+            x.payload.metadata
+        );
+        let z = all
+            .iter()
+            .find(|r| r.id != id.to_string())
+            .expect("the preserved edit record");
+        assert_eq!(
+            z.payload.metadata["trust"],
+            json!("untrusted"),
+            "the preserved edit keeps the funnel's own stamp: {:?}",
+            z.payload.metadata
+        );
+    }
+
     /// No silent drop: an unresolved conflict keeps the accepted projection,
     /// preserves the candidate durably outside the checkout, does NOT advance
     /// the cursor (re-presented next pull), and never applies the losing
@@ -3657,6 +3763,59 @@ mod tests {
             report.ignored[0].contains("secret scan"),
             "the refusal names the scan: {:?}",
             report.ignored
+        );
+        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+    }
+
+    /// Program Task 3 (fix round, M-1): the scanner builds its location
+    /// from the record's own metadata key names, and those keys are
+    /// sender-controlled — a crafted key could ride the ignore report
+    /// verbatim. The report names the scan category and which half of
+    /// the record matched, never the raw location and never the value.
+    #[tokio::test]
+    async fn secret_scan_report_never_echoes_sender_key_names() {
+        let (_base, mesh) = mesh_with_commit("secret-key");
+        let id = Uuid::new_v4();
+        let evil_key = format!("ghp_{}", "K".repeat(36));
+        let secret_value = format!("ghp_{}", "V".repeat(36));
+        let mut value = simple_rule(id, "a perfectly ordinary rule");
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("eligibility".to_string(), json!("shareable"));
+        metadata.insert("trust".to_string(), json!("untrusted"));
+        metadata.insert(
+            evil_key.clone(),
+            json!({ "nested": secret_value.clone() }),
+        );
+        value["metadata"] = Value::Object(metadata);
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("secret-key").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        let entry = &report.ignored[0];
+        assert!(
+            entry.contains("secret scan"),
+            "the refusal still names the scan: {entry}"
+        );
+        assert!(
+            entry.contains("github_pat"),
+            "the refusal names the scan category: {entry}"
+        );
+        assert!(
+            !entry.contains(&evil_key),
+            "the report must not echo a sender-controlled key name: {entry}"
+        );
+        assert!(
+            !entry.contains(&secret_value),
+            "the report must not echo the secret value: {entry}"
         );
         assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
     }

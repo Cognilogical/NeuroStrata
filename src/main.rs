@@ -1615,6 +1615,31 @@ mod tests {
         assert!(matches!(skew_verdict(Some(&info), (7, 9)), Skew::Stale(_)));
         assert!(matches!(skew_verdict(Some(&info), (6, 8)), Skew::Stale(_)));
     }
+
+    /// Program Task 3 (fix round, I-1): the CLI `Add` command takes a
+    /// free-form memory_type, so it is a procedure creation path like
+    /// add_memory and task_complete's extraction — a procedure it mints
+    /// is locally authored and must carry the stamp from birth.
+    #[test]
+    fn cli_add_stamps_a_procedure_as_locally_authored() {
+        let payload = cli_add_payload("procedure", "run the gate before every push", None);
+        assert_eq!(
+            payload.metadata["trust"],
+            serde_json::json!("local"),
+            "a CLI-minted procedure is local authorship: {:?}",
+            payload.metadata
+        );
+    }
+
+    #[test]
+    fn cli_add_leaves_other_types_unstamped() {
+        let payload = cli_add_payload("fact", "just a fact", None);
+        assert!(
+            payload.metadata.get("trust").is_none(),
+            "non-procedure rows gain no trust key: {:?}",
+            payload.metadata
+        );
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -1743,6 +1768,24 @@ async fn run_bus_metrics(
 
     print_bus_metrics_to(out, &body)?;
     Ok(0)
+}
+
+/// Build the payload the CLI `Add` command upserts, as a function so
+/// the construction is testable (the same pattern as `run_bus_metrics`).
+fn cli_add_payload(
+    memory_type: &str,
+    content: &str,
+    location: Option<String>,
+) -> crate::traits::MemoryPayload {
+    crate::traits::MemoryPayload {
+        content: content.to_string(),
+        memory_type: memory_type.to_string(),
+        location: location.unwrap_or_default(),
+        user_id: "system".to_string(),
+        agent_name: Some("NeuroStrata".to_string()),
+        location_lines: String::new(),
+        metadata: serde_json::json!({}),
+    }
 }
 
 /// The tokio runtime, built by hand rather than by `#[tokio::main]`.
@@ -2876,15 +2919,7 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let vector = embedder.embed(&content).await?;
-                        let payload = crate::traits::MemoryPayload {
-                            content: content.clone(),
-                            memory_type: memory_type.clone(),
-                            location: location.unwrap_or_default(),
-                            user_id: "system".to_string(),
-                            agent_name: Some("NeuroStrata".to_string()),
-                            location_lines: "".to_string(),
-                            metadata: serde_json::json!({}),
-                        };
+                        let payload = cli_add_payload(&memory_type, &content, location);
                         let id = uuid::Uuid::new_v4().to_string();
                         vector_store
                             .upsert(&namespace, &id, vector, payload)
