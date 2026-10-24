@@ -19,10 +19,11 @@ fn token_config_dir() -> PathBuf {
     home.join(".config").join("neurostrata")
 }
 
-/// A fresh token: 32 random bytes from the OS CSPRNG, hex-encoded
-/// (64 chars). The bytes are two v4 UUIDs' raw bytes; uuid draws v4
-/// randomness from the operating system's RNG (getrandom). Never a
-/// clock, a counter, or a hash of anything guessable.
+/// A fresh token: two v4 UUIDs' raw bytes, hex-encoded (64 chars) --
+/// ~244 bits of CSPRNG entropy (122 per UUID after the version and
+/// variant bits). uuid draws v4 randomness from the operating system's
+/// RNG (getrandom). Never a clock, a counter, or a hash of anything
+/// guessable.
 fn generate_token() -> String {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -36,10 +37,26 @@ fn generate_token() -> String {
 /// `daemon.token` and `operator.token` from this directory, restart --
 /// both are regenerated, and the operator reads the new values from the
 /// files. No token value is ever logged or returned by any route.
+/// Tighten an existing token file to 0600 when it is looser. Token
+/// files predate the atomic-0600 creation below in some installs; a
+/// group- or world-readable token hands the credential to exactly the
+/// readers the file exists to exclude.
+#[cfg(unix)]
+fn tighten_token_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.permissions().mode() & 0o077 != 0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
 fn load_or_create_token_file(path: &Path) -> String {
     if let Ok(existing) = std::fs::read_to_string(path) {
         let trimmed = existing.trim().to_string();
         if !trimmed.is_empty() {
+            #[cfg(unix)]
+            tighten_token_permissions(path);
             return trimmed;
         }
     }
@@ -47,11 +64,27 @@ fn load_or_create_token_file(path: &Path) -> String {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(path, &token);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Mode 0600 at creation, atomically: the file never exists at a
+        // looser mode, not even for the write-then-chmod window.
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| f.write_all(token.as_bytes()));
+        if created.is_err() {
+            let _ = std::fs::write(path, &token);
+            tighten_token_permissions(path);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, &token);
     }
     token
 }
@@ -106,7 +139,10 @@ fn token_eq(provided: &str, expected: &str) -> bool {
 }
 
 /// Whether a Host or Origin authority names this machine: `127.0.0.1`,
-/// `localhost`, or `[::1]`, with any port (or none).
+/// `localhost`, or `[::1]`, with any port (or none). An absent Host is
+/// not passed here at all (the middleware skips the check): hyper
+/// rejects Host-less HTTP/1.1 before routing, and the *hostname* --
+/// never the port -- is the rebinding defense.
 fn is_loopback_host(value: &str) -> bool {
     let host = if let Some(rest) = value.strip_prefix('[') {
         rest.split(']').next().unwrap_or(rest)
@@ -2271,6 +2307,16 @@ impl crate::traits::AsAny for RecordingStore {
         assert_eq!(health.status(), axum::http::StatusCode::OK);
         let body = health.text().await.unwrap();
         assert_eq!(body, "ok", "/health must answer liveness only, got: {body}");
+
+        // Open is not unguarded: rules 1-2 bind /health too, so a
+        // hostile Host gets 403 -- a rebinding page is not a probe.
+        let hostile_host = client
+            .get(format!("{base}/health"))
+            .header(reqwest::header::HOST, "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hostile_host.status(), axum::http::StatusCode::FORBIDDEN);
 
         stop_test_daemon(&base, daemon).await;
     }
