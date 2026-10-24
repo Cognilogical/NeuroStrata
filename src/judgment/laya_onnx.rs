@@ -73,14 +73,15 @@ impl JudgmentProvider for LayaOnnxProvider {
         // is acquired first so concurrent requests are bounded.
         let _permit = self.inference_semaphore.acquire().await.unwrap();
         let n = candidates.len();
-        // Phase-0: no-op judgments. Full ONNX parity deferred to Task 1.
+        // R10: Inference is not implemented in this build.
         let _ = (&new_memory, n);
-        Ok(vec![])
+        Err(anyhow!("Laya ONNX inference is not available in this build"))
     }
 
     /// Health check - verify the provider is operational.
     async fn health_check(&self) -> Result<bool> {
-        Ok(true)
+        // R10: Provider is not operational.
+        Ok(false)
     }
 
     /// Provider name for logging/metrics.
