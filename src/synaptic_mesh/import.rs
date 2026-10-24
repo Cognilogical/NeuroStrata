@@ -679,14 +679,26 @@ pub fn validate_record(
     }
     // Secret scan (J15, import leg): the same scanner every local write
     // path answers to, run over the record's content and metadata before
-    // anything is applied. The refusal names the scan category/location,
-    // never the secret itself.
+    // anything is applied. The refusal names the scan category and
+    // which half of the record matched, never the secret itself — and
+    // never the scanner's raw location either: locations are built
+    // from the record's own metadata key names, which are
+    // sender-controlled and could carry secret-shaped text of their
+    // own into the operator-visible report (fix round, M-1).
     let content_scan_text = serde_json::to_string(&record.content)
         .map_err(|e| format!("unparseable MeshRecord content ({e})"))?;
     if let Some(rejection) =
         crate::secrets::scan_entry_point(&content_scan_text, &record.metadata, "mesh_import")
     {
-        return Err(format!("secret scan rejected the record: {rejection}"));
+        let surface = if rejection.location.starts_with("mesh_import.metadata") {
+            "record metadata"
+        } else {
+            "record content"
+        };
+        return Err(format!(
+            "secret scan rejected the record: {} detected in {surface}",
+            rejection.category
+        ));
     }
     Ok(record)
 }
