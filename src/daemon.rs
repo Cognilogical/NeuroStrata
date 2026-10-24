@@ -1758,18 +1758,7 @@ impl crate::traits::AsAny for RecordingStore {
             None,
         ));
         let base = format!("http://{addr}");
-        let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
-            let trimmed = token.trim();
-            if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
-                    headers.insert(reqwest::header::AUTHORIZATION, val);
-                }
-            }
-        }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::new();
 
         // Wait for the listener to answer at all; a daemon that could not
         // bind fails its own join below rather than hanging here.
@@ -1788,6 +1777,24 @@ impl crate::traits::AsAny for RecordingStore {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(serving, "daemon never started serving on {addr}");
+
+        // The authenticated client is built only AFTER the daemon answers:
+        // the daemon creates daemon.token during startup, and reading the
+        // file before then races creation -- on a fresh HOME (CI) the file
+        // does not exist yet, the client goes out tokenless, and every
+        // authenticated route answers 401.
+        let mut headers = reqwest::header::HeaderMap::new();
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                    headers.insert(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
+        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
 
         let response = client
             .post(format!("{base}/bus/metrics"))
@@ -1833,18 +1840,7 @@ impl crate::traits::AsAny for RecordingStore {
             None,
         ));
         let base = format!("http://{addr}");
-        let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
-            let trimmed = token.trim();
-            if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
-                    headers.insert(reqwest::header::AUTHORIZATION, val);
-                }
-            }
-        }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::new();
 
         // Wait for the listener to answer at all; a daemon that could not bind
         // fails its own join below rather than hanging here.
@@ -1863,6 +1859,27 @@ impl crate::traits::AsAny for RecordingStore {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(serving, "daemon never started serving on {addr}");
+
+        // The authenticated client is built only AFTER the daemon answers:
+        // the daemon creates daemon.token during startup, and reading the
+        // file before then races creation -- on a fresh HOME (CI) the file
+        // does not exist yet, the client goes out tokenless, and every
+        // authenticated route answers 401. That race is the baseline-red
+        // folded into Task 1: the archive-route test failed 401-for-404 in
+        // CI while passing wherever a token file already existed.
+        let mut headers = reqwest::header::HeaderMap::new();
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                    headers.insert(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
+        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+
         (base, client, daemon)
     }
 
@@ -1872,6 +1889,231 @@ impl crate::traits::AsAny for RecordingStore {
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
         spawn_test_daemon_with(Arc::new(RecordingStore::default())).await
+    }
+
+    /// A client with NO default credentials: whatever a trust test asserts
+    /// was set by the test itself, never smuggled in by a helper's defaults.
+    fn bare_client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    /// The contents of one of the daemon's token files, or "" if it cannot
+    /// be read -- the same read every first-party client performs.
+    fn token_file(name: &str) -> String {
+        let home = dirs::home_dir().unwrap_or_default();
+        std::fs::read_to_string(home.join(".config").join("neurostrata").join(name))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn bearer(token: &str) -> reqwest::header::HeaderValue {
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap()
+    }
+
+    /// Stop a spawned test daemon the way an authorized operator would:
+    /// bearer + operator headers on /shutdown, then require the task to
+    /// finish. (Against a daemon without the operator tier the extra header
+    /// is ignored, so the same cleanup works on both sides of the change.)
+    async fn stop_test_daemon(
+        base: &str,
+        daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let client = bare_client();
+        let _ = client
+            .post(format!("{base}/shutdown"))
+            .header(reqwest::header::AUTHORIZATION, bearer(&token_file("daemon.token")))
+            .header("x-neurostrata-operator", token_file("operator.token"))
+            .send()
+            .await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    /// Task 1: no credential at all is a 401 on authenticated routes --
+    /// a representative read route and /mcp, the product's primary surface.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_without_token_is_401() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+
+        let info = client.get(format!("{base}/info")).send().await.unwrap();
+        assert_eq!(info.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let mcp = client
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: a wrong credential is the same 401 as none -- the refusal
+    /// must not distinguish "no token" from "wrong token".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_with_wrong_token_is_401() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+
+        let info = client
+            .get(format!("{base}/info"))
+            .header(reqwest::header::AUTHORIZATION, bearer("not-the-daemon-token"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(info.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1 (DR-5): the destructive routes refuse a bearer-only caller
+    /// with 403, and accept bearer+operator. The bearer alone must not be
+    /// able to delete, shut down, or back up: a leaked single credential
+    /// cannot do the irreversible things.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destructive_routes_require_the_operator_token() {
+        let store = Arc::new(RecordingStore::holding("trust-test", "m1", "fact"));
+        let (base, _authed, daemon) = spawn_test_daemon_with(store).await;
+        let client = bare_client();
+        let daemon_token = token_file("daemon.token");
+        let operator_token = token_file("operator.token");
+
+        for (route, body) in [
+            ("/delete", serde_json::json!({"namespace": "trust-test", "id": "m1"})),
+            ("/backup", serde_json::json!({"dir": "/tmp/ns-trust-backup"})),
+        ] {
+            let refused = client
+                .post(format!("{base}{route}"))
+                .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                refused.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "{route} with the bearer alone must be 403"
+            );
+        }
+
+        let refused_shutdown = client
+            .post(format!("{base}/shutdown"))
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused_shutdown.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "/shutdown with the bearer alone must be 403"
+        );
+        let health = client.get(format!("{base}/health")).send().await.unwrap();
+        assert!(
+            health.status().is_success(),
+            "the daemon must survive a refused shutdown"
+        );
+
+        let deleted = client
+            .post(format!("{base}/delete"))
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .header("x-neurostrata-operator", operator_token)
+            .json(&serde_json::json!({"namespace": "trust-test", "id": "m1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted.status(),
+            axum::http::StatusCode::OK,
+            "bearer + operator must delete"
+        );
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: the DNS-rebinding leg. A request whose Host is not loopback
+    /// is refused before any handler runs -- even with a valid token -- and
+    /// a browser Origin from a hostile site is refused on the same terms.
+    /// A loopback Origin (a local tool) is not the browser attack and
+    /// passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hostile_host_and_origin_are_403_even_with_a_valid_token() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+        let daemon_token = token_file("daemon.token");
+
+        let hostile_host = client
+            .get(format!("{base}/info"))
+            .header(reqwest::header::HOST, "evil.example")
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hostile_host.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let hostile_origin = client
+            .post(format!("{base}/mcp"))
+            .header(reqwest::header::ORIGIN, "https://evil.example")
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hostile_origin.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let loopback_origin = client
+            .get(format!("{base}/info"))
+            .header(reqwest::header::ORIGIN, "http://127.0.0.1:34343")
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            loopback_origin.status(),
+            axum::http::StatusCode::OK,
+            "a loopback Origin is a local tool, not a rebinding page"
+        );
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: /health stays unauthenticated -- liveness probes (the
+    /// watchdog, setup's curl) carry no credential -- and it answers
+    /// liveness ONLY: status 200, body exactly "ok", no version, no data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_is_open_and_minimal() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+
+        let health = client.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(health.status(), axum::http::StatusCode::OK);
+        let body = health.text().await.unwrap();
+        assert_eq!(body, "ok", "/health must answer liveness only, got: {body}");
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: both token files exist with owner-only permissions. The
+    /// whole design is "a page cannot read the filesystem"; a world- or
+    /// group-readable token file would give the credential to exactly the
+    /// readers it exists to exclude.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_files_have_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let home = dirs::home_dir().unwrap_or_default();
+        for name in ["daemon.token", "operator.token"] {
+            let path = home.join(".config").join("neurostrata").join(name);
+            let metadata = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{name} must exist once the daemon runs: {e}"));
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "{name} must be mode 0600"
+            );
+        }
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// `POST /memory/archive` must reach the one handler the MCP tool surface
