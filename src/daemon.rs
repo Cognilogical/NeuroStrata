@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -121,6 +122,14 @@ struct AppState {
     /// Per-user bearer token for authenticating HTTP requests. Generated on
     /// daemon startup and persisted to ~/.config/neurostrata/daemon.token.
     daemon_token: String,
+    /// Per-request project-root anchors (Task 2 / J19): requests resolve
+    /// their root through this cache instead of every anchor being the
+    /// startup root.
+    anchors: Arc<ProjectAnchors>,
+    /// The `allowed_external_dirs` allowlist (Task 2 / J6), loaded from the
+    /// operator's config at startup: the only directories outside the
+    /// project root a caller may name.
+    allowed_external_dirs: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -216,9 +225,27 @@ pub(crate) fn build_thalamic_bus(
     dimensions: usize,
     project_root: impl Into<PathBuf>,
 ) -> Arc<ThalamicBus> {
+    build_thalamic_bus_with_anchors(
+        vector_store,
+        dimensions,
+        ProjectAnchors::new(project_root.into()),
+    )
+}
+
+/// [`build_thalamic_bus`] over a shared [`ProjectAnchors`]: the pointer
+/// echo resolves each pulse's project through the same cache the daemon
+/// state holds, so a root a request teaches is the root the echo writes to.
+pub(crate) fn build_thalamic_bus_with_anchors(
+    vector_store: Arc<dyn VectorStore>,
+    dimensions: usize,
+    anchors: Arc<ProjectAnchors>,
+) -> Arc<ThalamicBus> {
     let bus = Arc::new(ThalamicBus::new(BUS_CAPACITY));
     bus.attach_store(vector_store);
-    bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
+    bus.register(Box::new(EpisodicPointerEcho::with_anchors(
+        anchors.startup_root().to_path_buf(),
+        anchors,
+    )));
     bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
     bus.register(Box::new(GuardEventLog::new(dimensions)));
     bus
@@ -265,6 +292,230 @@ pub(crate) fn daemon_bus(
     build_thalamic_bus(vector_store, dimensions, resolve_project_root())
 }
 
+/// One project's anchor, resolved once and shared: the canonical root every
+/// surface for that project must agree on, and the mesh directory its
+/// pointer names (if the project has joined one).
+#[derive(Debug)]
+pub(crate) struct RootAnchor {
+    root: PathBuf,
+    mesh_dir: Option<PathBuf>,
+}
+
+impl RootAnchor {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn mesh_dir(&self) -> Option<&Path> {
+        self.mesh_dir.as_deref()
+    }
+}
+
+/// Daemon state for Task 2 (J19): project anchors resolved PER REQUEST from
+/// the request's project root, cached by canonical root path — instead of
+/// every anchor being bound once to the daemon's startup root.
+///
+/// Two maps, because the two consumers ask different questions. The mesh
+/// surfaces ask by root ("what is this project's mesh anchor?"), keyed by
+/// the canonical root so two spellings of one project share one anchor.
+/// The pointer echo asks by namespace ("which project's buffer does this
+/// pulse belong to?") — pulses carry namespaces, not roots — and learns the
+/// pairing from requests that carry both (see `handle_mcp`). A namespace no
+/// request has named resolves to the startup root, which is exactly the
+/// pre-Task-2 behavior for a single-project daemon.
+pub(crate) struct ProjectAnchors {
+    startup_root: PathBuf,
+    by_root: Mutex<HashMap<PathBuf, Arc<RootAnchor>>>,
+    by_namespace: Mutex<HashMap<String, PathBuf>>,
+}
+
+impl ProjectAnchors {
+    /// The startup anchor is `root` canonicalized; an unresolvable root
+    /// (a scratch tree tests have not created yet) is kept verbatim rather
+    /// than failing startup over it.
+    pub(crate) fn new(root: PathBuf) -> Arc<Self> {
+        let startup_root = std::fs::canonicalize(&root).unwrap_or(root);
+        let anchors = Arc::new(Self {
+            startup_root,
+            by_root: Mutex::new(HashMap::new()),
+            by_namespace: Mutex::new(HashMap::new()),
+        });
+        let _ = anchors.anchor_for(None);
+        anchors
+    }
+
+    pub(crate) fn startup_root(&self) -> &Path {
+        &self.startup_root
+    }
+
+    /// The anchor for `requested`, or the startup anchor when the request
+    /// carries no root. A named root must canonicalize — a root that does
+    /// not exist on this machine is a refusal, never a verbatim string
+    /// flowing downstream.
+    pub(crate) fn anchor_for(
+        &self,
+        requested: Option<&Path>,
+    ) -> Result<Arc<RootAnchor>, String> {
+        let canonical = match requested {
+            None => self.startup_root.clone(),
+            Some(raw) => std::fs::canonicalize(raw).map_err(|e| {
+                format!(
+                    "project root {} cannot be resolved ({e}); caller paths are \
+                     canonicalized before use, so pass a project root that exists \
+                     on this machine",
+                    raw.display()
+                )
+            })?,
+        };
+        if let Some(existing) = self
+            .by_root
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&canonical)
+        {
+            return Ok(existing.clone());
+        }
+        let mesh_dir = crate::synaptic_mesh::storage::MeshStorage::read_pointer(&canonical)
+            .ok()
+            .flatten()
+            .map(|(_, dir, _)| dir);
+        let anchor = Arc::new(RootAnchor {
+            root: canonical.clone(),
+            mesh_dir,
+        });
+        self.by_root
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(canonical, anchor.clone());
+        Ok(anchor)
+    }
+
+    /// Record that `namespace` is served from `root` (a request carried
+    /// both). Best-effort: an unresolvable root teaches nothing.
+    pub(crate) fn note_namespace_root(&self, namespace: &str, root: &Path) {
+        if let Ok(anchor) = self.anchor_for(Some(root)) {
+            self.by_namespace
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(namespace.to_string(), anchor.root.clone());
+        }
+    }
+
+    /// The root a namespace's pulses anchor to: the root a request taught,
+    /// or the startup root when none did.
+    pub(crate) fn root_for_namespace(&self, namespace: &str) -> PathBuf {
+        self.by_namespace
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(namespace)
+            .cloned()
+            .unwrap_or_else(|| self.startup_root.clone())
+    }
+}
+
+/// The caller-path policy (Task 2 / J6): may the daemon act on this
+/// caller-supplied path? Canonicalize-then-check, following the guard
+/// sandbox's pattern: an existing path is judged by its canonical form (so
+/// a symlink planted inside the root that points outside it is governed by
+/// its TARGET, not its spelling); a path that does not exist yet — a backup
+/// destination — is judged by its nearest existing ancestor plus a
+/// remainder of plain relative components (no `..`, so the remainder
+/// cannot climb out of the canonical ancestor). The resolved path must lie
+/// inside `root` or inside an `allowed_external_dirs` entry; anything else
+/// is a refusal naming the path, the root, and the config key.
+pub(crate) fn check_caller_path(
+    raw: &Path,
+    root: &Path,
+    allowlist: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let resolved = resolve_caller_path(raw)?;
+    if resolved.starts_with(&canonical_root) {
+        return Ok(resolved);
+    }
+    for entry in allowlist {
+        let canonical_entry =
+            std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+        if resolved.starts_with(&canonical_entry) {
+            return Ok(resolved);
+        }
+    }
+    Err(format!(
+        "refused: {} resolves to {}, which is outside the project root {}; \
+         to permit it, add the directory to allowed_external_dirs in \
+         ~/.config/neurostrata/config.json",
+        raw.display(),
+        resolved.display(),
+        canonical_root.display()
+    ))
+}
+
+/// Resolve `raw` to the canonical path it names, per [`check_caller_path`].
+fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(raw))
+            .unwrap_or_else(|_| raw.to_path_buf())
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return Ok(canonical);
+    }
+    // Walk up to the nearest existing ancestor; the components below it
+    // must each be one plain name. `file_name` is `None` for `..`, `.`,
+    // and the filesystem root, so a remainder spelled with `..` ends here
+    // as a refusal rather than being joined onto the canonical ancestor.
+    let mut cursor = absolute.clone();
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
+            let mut resolved = canonical;
+            for name in remainder.iter().rev() {
+                resolved.push(name);
+            }
+            return Ok(resolved);
+        }
+        match (cursor.file_name().map(|n| n.to_os_string()), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                remainder.push(name);
+                cursor = parent.to_path_buf();
+            }
+            _ => {
+                return Err(format!(
+                    "refused: {} cannot be resolved — it has no existing ancestor \
+                     on this machine, or its non-existent remainder is not plain \
+                     relative components",
+                    raw.display()
+                ))
+            }
+        }
+    }
+}
+
+/// The `allowed_external_dirs` allowlist from the operator's config file.
+/// Fail-soft toward EMPTY (never toward permissive): an unreadable config
+/// permits nothing outside the project root, and says so in the log.
+fn load_allowed_external_dirs() -> Vec<PathBuf> {
+    let Ok(path) = crate::config::Config::default_path() else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        return Vec::new();
+    }
+    match crate::config::Config::load_from(&path) {
+        Ok(config) => config.allowed_external_dirs,
+        Err(e) => {
+            tracing::warn!(
+                "could not read {} for allowed_external_dirs; treating the \
+                 allowlist as empty: {e}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// How often the mesh-worker drains the outbox when no mutation wakes it first.
 const MESH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -279,8 +530,11 @@ fn wire_mesh_publish(
     bus: &Arc<ThalamicBus>,
     vector_store: Arc<dyn VectorStore>,
     embedder: Arc<dyn Embedder>,
+    anchors: &ProjectAnchors,
 ) {
-    let project_root = resolve_project_root();
+    // The publish wiring serves the startup project: its root comes from
+    // the anchor cache (Task 2), the one resolution every surface shares.
+    let project_root = anchors.startup_root().to_path_buf();
     let mesh_dir = match crate::synaptic_mesh::storage::MeshStorage::read_pointer(&project_root) {
         Ok(Some((_mesh_id, dir, _remote))) => dir,
         Ok(None) => return,
@@ -522,6 +776,31 @@ pub(crate) async fn start_daemon_on(
     vector_store: Arc<dyn VectorStore>,
     deduplication_config: Option<DeduplicationConfig>,
 ) -> anyhow::Result<()> {
+    let anchors = ProjectAnchors::new(resolve_project_root());
+    let allowed_external_dirs = load_allowed_external_dirs();
+    start_daemon_on_with_policy(
+        bind_addr,
+        embedder,
+        vector_store,
+        deduplication_config,
+        anchors,
+        allowed_external_dirs,
+    )
+    .await
+}
+
+/// [`start_daemon_on`] with the caller-path policy supplied instead of
+/// loaded: production loads the anchors from the resolved root and the
+/// allowlist from the operator's config; tests inject both so no test
+/// depends on the machine's real config file.
+pub(crate) async fn start_daemon_on_with_policy(
+    bind_addr: String,
+    embedder: Arc<dyn Embedder>,
+    vector_store: Arc<dyn VectorStore>,
+    deduplication_config: Option<DeduplicationConfig>,
+    anchors: Arc<ProjectAnchors>,
+    allowed_external_dirs: Vec<PathBuf>,
+) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     // Initialize deduplication checker if config provided.
@@ -565,14 +844,18 @@ pub(crate) async fn start_daemon_on(
     // reports its metrics, never into a bus under construction. The
     // embedder's width is read here because `embedder` moves into the
     // state below.
-    let bus = daemon_bus(vector_store.clone(), embedder.dimensions());
+    let bus = build_thalamic_bus_with_anchors(
+        vector_store.clone(),
+        embedder.dimensions(),
+        anchors.clone(),
+    );
 
     // The mesh publish path, wired only when this project has joined a mesh.
     // Must run after the bus exists (so the subscriber can register) and
     // before the HTTP server binds (so no request can miss an emitted pulse).
     // The store + embedder thread through for the session-start/periodic
     // pull triggers (spec §Triggers): fail-soft, timeout-capped spawns.
-    wire_mesh_publish(&bus, vector_store.clone(), embedder.clone());
+    wire_mesh_publish(&bus, vector_store.clone(), embedder.clone(), &anchors);
 
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -593,6 +876,8 @@ pub(crate) async fn start_daemon_on(
             started_at: chrono::Utc::now().timestamp(),
         },
         daemon_token: daemon_token.clone(),
+        anchors,
+        allowed_external_dirs,
     };
 
     let app = Router::new()
@@ -814,10 +1099,29 @@ async fn handle_get_graph(
     })))
 }
 
+/// The caller-path policy as a handler refusal (Task 2 / J6): the path is
+/// validated through [`check_caller_path`] BEFORE any use, against the
+/// daemon's startup root and the configured allowlist.
+fn caller_path_refusal(
+    state: &AppState,
+    raw: &str,
+) -> Result<PathBuf, (axum::http::StatusCode, String)> {
+    check_caller_path(
+        Path::new(raw),
+        state.anchors.startup_root(),
+        &state.allowed_external_dirs,
+    )
+    .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e))
+}
+
 async fn handle_ingest(
     State(state): State<AppState>,
     Json(req): Json<IngestReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // The walk reads whatever directory the caller named; the path policy
+    // decides whether this daemon may read it at all (Task 2 / J6).
+    let dir = caller_path_refusal(&state, &req.dir)?;
+    let dir = dir.to_string_lossy().into_owned();
     // The shipped schema, the same one the CLI and the MCP tool use. This route
     // carried its own inline copy declaring rust and nothing else, so the GUI --
     // which is this route's main caller -- built a graph with no Python, Go,
@@ -838,7 +1142,7 @@ async fn handle_ingest(
         .ingests
         .run(
             &namespace,
-            &req.dir,
+            &dir,
             schema,
             state.embedder.clone(),
             state.vector_store.clone(),
@@ -857,9 +1161,12 @@ async fn handle_backup(
     State(state): State<AppState>,
     Json(req): Json<BackupReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
+    // The snapshot lands wherever the caller named; the path policy
+    // decides whether this daemon may write there (Task 2 / J6).
+    let dir = caller_path_refusal(&state, &req.dir)?;
     state
         .vector_store
-        .export_database(&req.dir)
+        .export_database(&dir.to_string_lossy())
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(format!("Backed up to {}", req.dir))
@@ -879,11 +1186,14 @@ async fn handle_tasks_import(
     State(state): State<AppState>,
     Json(req): Json<ImportReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
+    // The import reads whatever file the caller named; the path policy
+    // decides whether this daemon may read it at all (Task 2 / J6).
+    let from_beads = caller_path_refusal(&state, &req.from_beads)?;
     let summary = crate::task::import_beads(
         state.vector_store.clone(),
         state.embedder.clone(),
         &req.namespace,
-        &req.from_beads,
+        &from_beads.to_string_lossy(),
     )
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -1090,10 +1400,40 @@ async fn handle_set_metadata(
 }
 
 // Handle a single MCP JSON-RPC line
+/// Teach the anchor cache from one MCP request (Task 2 / J19): a tool call
+/// that carries a `project_root` resolves that root's anchor; one that
+/// carries a `namespace` as well records the pairing the pointer echo
+/// consults, keyed by the RESOLVED namespace — the spelling pulses carry —
+/// not the caller's. Best-effort by design — teaching never fails a
+/// request; an unresolvable root simply teaches nothing.
+async fn note_request_anchors(state: &AppState, request: &serde_json::Value) {
+    if request.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return;
+    }
+    let Some(arguments) = request.get("params").and_then(|p| p.get("arguments")) else {
+        return;
+    };
+    let Some(root) = arguments.get("project_root").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let root = Path::new(root);
+    match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(namespace) => {
+            let resolved =
+                crate::server::resolve_namespace(&state.vector_store, namespace).await;
+            state.anchors.note_namespace_root(&resolved, root);
+        }
+        None => {
+            let _ = state.anchors.anchor_for(Some(root));
+        }
+    }
+}
+
 async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
+    note_request_anchors(&state, &request).await;
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
         let response = crate::server::process_mcp_request(
             rpc_req,
@@ -2346,6 +2686,241 @@ impl crate::traits::AsAny for RecordingStore {
                 "the startup project's buffer must not absorb the second project's echo: {text_a}"
             );
         }
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 (J6): a not-yet-existing backup destination spelled with `..`
+    /// is refused — the remainder below the nearest existing ancestor must
+    /// be plain relative components, so a spelling cannot climb out of the
+    /// canonical ancestor it was judged against.
+    #[test]
+    fn nonexistent_destination_with_dotdot_is_refused() {
+        let root = scratch_root("t2-dotdot-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let sneaky = root.join("new").join("..").join("..").join("escape");
+        let err = check_caller_path(&sneaky, &root, &[]).expect_err("a `..` remainder refuses");
+        assert!(
+            err.contains("cannot be resolved"),
+            "the refusal says which check failed: {err}"
+        );
+    }
+
+    /// Task 2 (J6): a not-yet-existing destination with a plain remainder
+    /// resolves to the canonical ancestor plus the remainder — the normal
+    /// first-backup shape.
+    #[test]
+    fn nonexistent_destination_plain_remainder_succeeds() {
+        let root = scratch_root("t2-plain-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let dest = root.join("backups").join("2026-10-24");
+        let resolved = check_caller_path(&dest, &root, &[]).expect("a plain remainder resolves");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&root).unwrap().join("backups").join("2026-10-24"),
+            "the resolved path is the canonical root plus the plain remainder"
+        );
+    }
+
+    /// Task 2 (J6): a destination outside the root succeeds when its
+    /// directory is on the `allowed_external_dirs` allowlist — the one
+    /// escape hatch, and the shape the operator's backup flow uses.
+    #[test]
+    fn backup_to_allowlisted_dir_succeeds() {
+        let root = scratch_root("t2-allow-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let external = scratch_root("t2-allow-external");
+        std::fs::create_dir_all(&external).unwrap();
+        let dest = external.join("snapshot");
+        let resolved = check_caller_path(&dest, &root, &[external.clone()])
+            .expect("an allowlisted directory permits the destination");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&external).unwrap().join("snapshot")
+        );
+    }
+
+    /// Task 2 (J19): two projects each get their OWN mesh anchor from the
+    /// daemon-state cache — keyed by canonical root, so a second resolution
+    /// of the same project returns the same anchor — and the echo follows
+    /// the cache per namespace, with no cross-talk between the projects.
+    #[tokio::test]
+    async fn second_project_root_gets_its_own_mesh_anchor() {
+        const DIMENSIONS: usize = 8;
+        let base = scratch_root("t2-anchor-base");
+        std::fs::create_dir_all(&base).unwrap();
+        let root_a = scratch_root("t2-anchor-a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let root_b = scratch_root("t2-anchor-b");
+        std::fs::create_dir_all(&root_b).unwrap();
+        for (project, name, ns) in [
+            (&root_a, "anchor-mesh-a", "aa"),
+            (&root_b, "anchor-mesh-b", "bb"),
+        ] {
+            let init = crate::synaptic_mesh::handle_mesh_tool_call_with_base(
+                "neurostrata_synaptic_mesh_init",
+                &serde_json::json!({
+                    "name": name,
+                    "namespace": [ns],
+                    "project_root": project.display().to_string(),
+                    "node_id": format!("{ns}-node")
+                }),
+                &base,
+            );
+            assert!(init.contains("mesh created"), "init {name}: {init}");
+        }
+
+        let anchors = ProjectAnchors::new(root_a.clone());
+        let anchor_a = anchors.anchor_for(Some(&root_a)).unwrap();
+        let anchor_b = anchors.anchor_for(Some(&root_b)).unwrap();
+        assert_eq!(anchor_a.root(), std::fs::canonicalize(&root_a).unwrap());
+        assert_eq!(anchor_b.root(), std::fs::canonicalize(&root_b).unwrap());
+        assert!(
+            anchor_a.mesh_dir().is_some() && anchor_b.mesh_dir().is_some(),
+            "both projects are joined: {anchor_a:?} {anchor_b:?}"
+        );
+        assert_ne!(
+            anchor_a.mesh_dir(),
+            anchor_b.mesh_dir(),
+            "each project's anchor names its own mesh"
+        );
+        assert!(
+            Arc::ptr_eq(&anchor_a, &anchors.anchor_for(Some(&root_a)).unwrap()),
+            "the cache returns the same anchor for the same canonical root"
+        );
+        assert_eq!(
+            anchors.anchor_for(None).unwrap().root(),
+            anchor_a.root(),
+            "a rootless request resolves to the startup project's anchor"
+        );
+
+        // The echo leg: a pulse for the second project's namespace lands in
+        // its buffer; an untaught namespace lands in the startup project's.
+        let store = Arc::new(RecordingStore::default());
+        let bus = build_thalamic_bus_with_anchors(store, DIMENSIONS, anchors.clone());
+        anchors.note_namespace_root("ns-b", &root_b);
+        bus.emit(
+            ThalamicPulse::Created {
+                id: "t2-b1".into(),
+                namespace: "ns-b".into(),
+                kind: "fact".into(),
+            },
+            &RecursionToken::root(),
+        );
+        bus.emit(
+            ThalamicPulse::Created {
+                id: "t2-a1".into(),
+                namespace: "ns-a".into(),
+                kind: "fact".into(),
+            },
+            &RecursionToken::root(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while bus.metrics().dispatcher_handled < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the dispatcher stalled: {:?}",
+                bus.metrics()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let text_b = std::fs::read_to_string(
+            root_b.join(".NeuroStrata").join("sessions").join("current.md"),
+        )
+        .expect("the second project's buffer carries its echo");
+        assert!(text_b.contains("t2-b1"), "its own pointer: {text_b}");
+        assert!(
+            !text_b.contains("t2-a1"),
+            "no cross-talk from the startup project: {text_b}"
+        );
+        let text_a = std::fs::read_to_string(
+            root_a.join(".NeuroStrata").join("sessions").join("current.md"),
+        )
+        .expect("the startup project's buffer carries the untaught namespace's echo");
+        assert!(text_a.contains("t2-a1"), "its own pointer: {text_a}");
+        assert!(
+            !text_a.contains("t2-b1"),
+            "no cross-talk from the second project: {text_a}"
+        );
+    }
+
+    /// Spawn the real daemon over an injected caller-path policy (no env,
+    /// no machine config): the allowlist leg of the backup route.
+    async fn spawn_daemon_with_policy(
+        root: &Path,
+        allowlist: Vec<PathBuf>,
+    ) -> (
+        String,
+        reqwest::Client,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let daemon = tokio::spawn(start_daemon_on_with_policy(
+            addr.clone(),
+            Arc::new(StubEmbedder { dimensions: 8 }),
+            Arc::new(RecordingStore::default()),
+            None,
+            ProjectAnchors::new(root.to_path_buf()),
+            allowlist,
+        ));
+        let base = format!("http://{addr}");
+        let bare = reqwest::Client::new();
+        let mut serving = false;
+        for _ in 0..500 {
+            if bare
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                serving = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(serving, "daemon never started serving on {addr}");
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        let token = std::fs::read_to_string(&token_path)
+            .expect("the daemon created its token file before serving");
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())).unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        (base, client, daemon)
+    }
+
+    /// Task 2 (J6), route level: with the destination's directory on the
+    /// allowlist, the backup route serves a path outside the project root —
+    /// the operator's backup flow shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_route_honours_the_allowlist() {
+        let root = scratch_root("t2-route-allow-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let external = scratch_root("t2-route-allow-external");
+        std::fs::create_dir_all(&external).unwrap();
+        let (base, client, daemon) =
+            spawn_daemon_with_policy(&root, vec![external.clone()]).await;
+        let dest = external.join("snapshot");
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": dest.display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::OK,
+            "an allowlisted destination is served: {}",
+            res.text().await.unwrap_or_default()
+        );
         stop_daemon(&client, &base, daemon).await;
     }
 }
