@@ -6,6 +6,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// Trait for downcasting VectorStore to concrete implementations.
+pub trait AsAny {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// The shipped vocabulary schema, embedded at compile time. v2 adds the
 /// `task` memory type and the EXTRACTED_FROM relation that carries the
 /// extraction edge behind the completion gate (Lock 2).
@@ -208,9 +213,12 @@ pub struct RawDistanceQuery {
 /// By making this a trait, we can swap between Embedded Qdrant,
 /// Remote Qdrant, LadybugDB, or SQLite-VSS.
 #[async_trait]
-pub trait VectorStore: Send + Sync {
+pub trait VectorStore: Send + Sync + AsAny {
     /// Ensure the necessary collections/tables exist.
     async fn init(&self, namespace: &str) -> Result<()>;
+
+    /// Downcast support for store-specific capabilities (e.g., IntakeStore).
+    fn as_any(&self) -> &dyn std::any::Any;
 
     /// Insert or update a memory with its associated vector and metadata.
     async fn upsert(
@@ -353,6 +361,49 @@ pub trait VectorStore: Send + Sync {
     fn is_dirty(&self) -> bool {
         true
     }
+}
+
+/// Trait for durable task intake ledger operations (PQTH).
+/// Separate from VectorStore because intake uses operational tables, not memory rows.
+#[async_trait::async_trait]
+pub trait IntakeStore: Send + Sync {
+    /// Create intake receipt and candidate(s) atomically.
+    async fn create_receipt(
+        &self,
+        request: crate::task::intake::CreateReceiptRequest,
+    ) -> Result<crate::task::intake::CreateReceiptResult, String>;
+
+    /// List receipts with pagination.
+    async fn list_receipts(
+        &self,
+        request: crate::task::intake::ListReceiptsRequest,
+    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeReceipt>, String>;
+
+    /// List candidates with filters and pagination.
+    async fn list_candidates(
+        &self,
+        request: crate::task::intake::ListCandidatesRequest,
+    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeCandidate>, String>;
+
+    /// Resolve a candidate with CAS (atomic compare-and-swap).
+    async fn resolve_candidate(
+        &self,
+        request: crate::task::intake::ResolveCandidateRequest,
+    ) -> Result<crate::task::intake::ResolveCandidateResult, String>;
+
+    /// Get a single receipt by ID.
+    async fn get_receipt(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::task::intake::IntakeReceipt>, String>;
+
+    /// Get a single candidate by ID.
+    async fn get_candidate(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::task::intake::IntakeCandidate>, String>;
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 //! sections 1 through 3 and 6 through 8.
 
 pub mod gate;
+pub mod intake;
 pub mod intent;
 pub mod machine;
 pub mod wiring;
@@ -4687,7 +4688,17 @@ mod tests {
         async fn checkpoint(&self) -> anyhow::Result<()> {
             self.inner.checkpoint().await
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
+
+impl crate::traits::AsAny for ListHidingStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
     /// The ordering invariant the emit site carries: a `Superseded` published
     /// on the inline path claims the task gave way to a lesson. If the Lock 2

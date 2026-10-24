@@ -437,7 +437,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_archive_memory",
-                        "description": "Mark a memory as archived by writing a tombstone beside it. The row keeps its content, id and metadata; archived is merged in rather than replacing what was there. Metadata-only: no retrieval path filters on it yet, so an archived memory still appears in search_memory in 1.8.0.",
+                        "description": "Mark a memory as archived by writing a tombstone beside it. The row keeps its content, id and metadata; archived is merged in rather than replacing what it was there. Metadata-only: no retrieval path filters on it yet, so an archived memory still appears in search_memory in 1.8.0.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -445,6 +445,54 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') the memory lives in." }
                             },
                             "required": ["id", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_intake",
+                        "description": "Submit text for durable task intake. Runs M2 lexical detection to find task-shaped statements, creates an immutable receipt (source_kind, source_revision, source_digest), and spawns candidate(s) with review_state=pending. Returns receipt and candidates. Explicit zeros when no candidates.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "source_kind": { "type": "string", "enum": ["conversation", "manual", "imported", "tool"], "description": "Origin of the intake. Defaults to conversation." },
+                                "source_revision": { "type": "string", "description": "Revision identifier (git commit, timestamp, etc.) for traceability." },
+                                "source_digest": { "type": "string", "description": "Content hash for idempotency; same digest = same receipt." },
+                                "text": { "type": "string", "description": "Raw text to analyze for task intents." },
+                                "title": { "type": "string", "description": "Optional explicit title (for manual intake)." },
+                                "description": { "type": "string", "description": "Optional explicit description (for manual intake)." }
+                            },
+                            "required": ["namespace", "source_revision", "source_digest", "text"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_intake_list",
+                        "description": "List intake receipts or candidates with filters and pagination. Always returns explicit zeros for count/total/offset/limit. Candidates are NOT in task_list, memory recall, graph export, or mesh.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "mode": { "type": "string", "enum": ["receipts", "candidates"], "description": "What to list. Defaults to candidates." },
+                                "review_state": { "type": "string", "enum": ["pending", "in_review", "accepted", "dismissed"], "description": "Filter candidates by review state." },
+                                "disposition": { "type": "string", "enum": ["pending", "created", "linked", "dismissed"], "description": "Filter candidates by disposition." },
+                                "limit": { "type": "integer", "description": "Max items to return. Default 50." },
+                                "offset": { "type": "integer", "description": "Pagination offset. Default 0." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_task_intake_resolve",
+                        "description": "Resolve a candidate with CAS (compare-and-swap). Disposition: created (spawns task), linked (attaches to existing task), dismissed. Requires cas_version for optimistic concurrency. Returns updated candidate and task_created flag.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "candidate_id": { "type": "string", "description": "The candidate id to resolve." },
+                                "disposition": { "type": "string", "enum": ["created", "linked", "dismissed"], "description": "Resolution outcome." },
+                                "task_id": { "type": "string", "description": "Task id when disposition is created or linked." },
+                                "cas_version": { "type": "integer", "description": "Expected cas_version for optimistic concurrency." }
+                            },
+                            "required": ["namespace", "candidate_id", "disposition", "cas_version"]
                         }
                     }
                 ]
@@ -649,6 +697,27 @@ pub async fn process_mcp_request(
                         "neurostrata_task_validate" => {
                             result_text =
                                 crate::task::handle_task_validate(arguments, store.clone()).await;
+                        }
+                        "neurostrata_task_intake" => {
+                            result_text = crate::task::intake::handle_intake(
+                                arguments,
+                                store.clone(),
+                            )
+                            .await;
+                        }
+                        "neurostrata_task_intake_list" => {
+                            result_text = crate::task::intake::handle_intake_list(
+                                arguments,
+                                store.clone(),
+                            )
+                            .await;
+                        }
+                        "neurostrata_task_intake_resolve" => {
+                            result_text = crate::task::intake::handle_intake_resolve(
+                                arguments,
+                                store.clone(),
+                            )
+                            .await;
                         }
                         "neurostrata_bootstrap" => {
                             result_text = crate::task::handle_bootstrap(
@@ -5769,7 +5838,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_twenty_seven_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -5812,6 +5881,9 @@ mod tests {
                 "neurostrata_guard_learn",
                 "neurostrata_guard_list_rules",
                 "neurostrata_archive_memory",
+                "neurostrata_task_intake",
+                "neurostrata_task_intake_list",
+                "neurostrata_task_intake_resolve",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.
