@@ -455,8 +455,10 @@ mod tests {
         std::fs::write(&target, "original\n").unwrap();
         std::os::unix::fs::symlink(&target, sessions.join("current.md")).unwrap();
 
-        let err = append_entry(&root, "must not land", &[], 500 * 1024, 30)
-            .expect_err("a symlinked session file is refused, not written through");
+        let err = match append_entry(&root, "must not land", &[], 500 * 1024, 30) {
+            Ok(_) => panic!("a symlinked session file is refused, not written through"),
+            Err(e) => e,
+        };
         assert!(
             err.to_string().contains("symlink"),
             "the refusal names the symlink: {err}"
