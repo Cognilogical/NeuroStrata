@@ -1296,6 +1296,280 @@ mod tests {
         );
     }
 
+    // ── Task 4: one hook installer, honest SKIP_GATE ─────────────────────
+    //
+    // The five tests below pin the unified gate/hook enforcement chain:
+    // `hooks install` writes the scaffolded hook text (the one the
+    // task-setup payload ships) into the directory git actually runs
+    // hooks from, SKIP_GATE skips only for exactly "1" in both of its
+    // homes, and a missing gate binary is announced, never silent.
+
+    /// Run git in `root`, isolated from the developer's own global/system
+    /// config so a personal `core.hooksPath` cannot change what is
+    /// asserted. Returns the command's output.
+    #[cfg(unix)]
+    fn t4_git(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git runs")
+    }
+
+    #[cfg(unix)]
+    fn t4_git_ok(root: &std::path::Path, args: &[&str]) {
+        let out = t4_git(root, args);
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A fresh git repo in a temp dir, with a commit-ready identity.
+    #[cfg(unix)]
+    fn t4_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("ns-t4-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        t4_git_ok(&root, &["init", "-q", "-b", "main"]);
+        t4_git_ok(&root, &["config", "user.email", "t4@example.invalid"]);
+        t4_git_ok(&root, &["config", "user.name", "Task 4 Test"]);
+        root
+    }
+
+    /// `t4_repo` plus a bare remote and one seed commit, ready to push.
+    #[cfg(unix)]
+    fn t4_repo_with_remote(tag: &str) -> std::path::PathBuf {
+        let root = t4_repo(tag);
+        let remote = root.join("remote.git");
+        t4_git_ok(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        t4_git_ok(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        std::fs::write(root.join("file.txt"), "task 4\n").unwrap();
+        t4_git_ok(&root, &["add", "file.txt"]);
+        t4_git_ok(&root, &["commit", "-q", "-m", "task 4 seed"]);
+        root
+    }
+
+    /// A stub `neurostrata-mcp` whose exit code is STUB_GATE_EXIT; every
+    /// invocation appends a line to the marker file, so a test can prove
+    /// the hook actually ran the gate.
+    #[cfg(unix)]
+    fn t4_stub_bin(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("stub-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = root.join("gate-ran.marker");
+        let stub = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\nexit ${{STUB_GATE_EXIT:-0}}\n",
+            marker.display()
+        );
+        let stub_path = bin.join("neurostrata-mcp");
+        std::fs::write(&stub_path, stub).unwrap();
+        let mut perms = std::fs::metadata(&stub_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub_path, perms).unwrap();
+        (bin, marker)
+    }
+
+    /// Push `main` to origin with `path` as the push process's PATH.
+    #[cfg(unix)]
+    fn t4_push(
+        root: &std::path::Path,
+        path: &str,
+        stub_gate_exit: Option<&str>,
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["push", "origin", "main"])
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("PATH", path);
+        if let Some(code) = stub_gate_exit {
+            cmd.env("STUB_GATE_EXIT", code);
+        }
+        cmd.output().expect("git push runs")
+    }
+
+    /// Task 4, Step 1: with `core.hooksPath` set, `hooks install` writes
+    /// the hook there — and git actually runs it from there on push; with
+    /// it unset, the hook lands in `.git/hooks`.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_install_honors_hooks_path() {
+        let root = t4_repo_with_remote("hookspath");
+        t4_git_ok(&root, &["config", "core.hooksPath", ".githooks"]);
+        let target = install_pre_push_hook(&root, false).expect("install succeeds");
+        assert_eq!(target, root.join(".githooks").join("pre-push"));
+        assert!(target.is_file(), "the hook lands where git looks for it");
+        assert!(
+            !root.join(".git").join("hooks").join("pre-push").exists(),
+            "with core.hooksPath set, .git/hooks is not git's hooks dir"
+        );
+
+        // git runs the installed hook on push: a failing stub gate
+        // blocks the push (and leaves its marker); a passing one lets
+        // the same push through.
+        let (stub_bin, marker) = t4_stub_bin(&root);
+        let path = format!("{}:/usr/bin:/bin", stub_bin.display());
+        let blocked = t4_push(&root, &path, Some("1"));
+        assert!(
+            !blocked.status.success(),
+            "a failing gate must fail the push: {}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        assert!(marker.exists(), "the hook ran the gate on push");
+        assert!(
+            String::from_utf8_lossy(&blocked.stderr).contains("Push blocked"),
+            "the hook's verdict reaches the pusher: {}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        let clean = t4_push(&root, &path, Some("0"));
+        assert!(
+            clean.status.success(),
+            "a passing gate lets the push through: {}",
+            String::from_utf8_lossy(&clean.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Unset: the default .git/hooks. (Skipped where the ambient
+        // config already sets a hooksPath — git_hooks_dir would be
+        // right to honor it, exactly as the installer honors it.)
+        let root = t4_repo("hooksdefault");
+        let ambient = std::process::Command::new("git")
+            .args(["config", "--get", "core.hooksPath"])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ambient {
+            let target = install_pre_push_hook(&root, false).expect("install succeeds");
+            assert_eq!(target, root.join(".git").join("hooks").join("pre-push"));
+            assert!(target.is_file());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Task 4, Step 1: the installed bytes ARE the scaffolded hook — the
+    /// text the task-setup payload ships — in both install locations.
+    #[cfg(unix)]
+    #[test]
+    fn installed_hook_is_the_scaffolded_one() {
+        use std::os::unix::fs::PermissionsExt;
+        for (tag, hooks_path) in [("bytes-default", None), ("bytes-custom", Some(".githooks"))] {
+            let root = t4_repo(tag);
+            if let Some(hp) = hooks_path {
+                t4_git_ok(&root, &["config", "core.hooksPath", hp]);
+            }
+            let target = install_pre_push_hook(&root, false).expect("install succeeds");
+            let bytes = std::fs::read(&target).unwrap();
+            assert_eq!(
+                bytes,
+                crate::task::SCAFFOLDED_PRE_PUSH_HOOK.as_bytes(),
+                "hooks install must write the scaffolded hook text byte for byte ({})",
+                tag
+            );
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert!(
+                mode & 0o111 != 0,
+                "the installed hook is executable ({})",
+                tag
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Task 4, Step 1: SKIP_GATE has ONE definition in both homes — the
+    /// gate CLI's predicate and the installed hook's shell test: only the
+    /// exact value "1" skips; "0", "false", "yes", and empty all run the
+    /// gate. (That the CLI *logs* the skip — stderr plus its stdout
+    /// report line — is the gate arm's half of the same contract.)
+    #[test]
+    fn skip_gate_only_exactly_one() {
+        assert!(!skip_gate_value_skips(None), "unset runs the gate");
+        assert!(!skip_gate_value_skips(Some("")), "empty runs the gate");
+        assert!(!skip_gate_value_skips(Some("0")), "\"0\" runs the gate");
+        assert!(
+            !skip_gate_value_skips(Some("false")),
+            "\"false\" runs the gate"
+        );
+        assert!(!skip_gate_value_skips(Some("yes")), "\"yes\" runs the gate");
+        assert!(!skip_gate_value_skips(Some("01")), "\"01\" is not \"1\"");
+        assert!(
+            !skip_gate_value_skips(Some(" 1")),
+            "whitespace is not trimmed into a skip"
+        );
+        assert!(skip_gate_value_skips(Some("1")), "exactly \"1\" skips");
+
+        let hook = crate::task::SCAFFOLDED_PRE_PUSH_HOOK;
+        assert!(
+            hook.contains("[ \"$NEUROSTRATA_SKIP_GATE\" = \"1\" ]"),
+            "the hook's skip test is the exact-match form"
+        );
+        assert!(
+            !hook.contains("[ -n \"$NEUROSTRATA_SKIP_GATE\" ]"),
+            "the hook must not skip on any non-empty value"
+        );
+    }
+
+    /// Task 4, Step 1: the installed hook, when `neurostrata-mcp` is not
+    /// on PATH, announces that the gate did NOT run and lets the push
+    /// proceed — never the old silent `exit 0`.
+    #[cfg(unix)]
+    #[test]
+    fn missing_binary_warns_loudly() {
+        let root = t4_repo_with_remote("nobinary");
+        install_pre_push_hook(&root, false).expect("install succeeds");
+        // A PATH with git but no neurostrata-mcp anywhere on it.
+        let out = t4_push(&root, "/usr/bin:/bin", None);
+        assert!(
+            out.status.success(),
+            "a missing gate binary must not block the push: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("warning: neurostrata-mcp not found — gate NOT run for this push"),
+            "the skip-by-absence is announced, never silent: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Task 4, Step 1: the parallel PRE_PUSH_HOOK const is removed by
+    /// this task; the scaffolded hook (the surviving text) must carry
+    /// every behavior the const had, so the removal loses nothing. The
+    /// list below is the const's complete behavior inventory at the Task
+    /// 4 branch point. Two const behaviors are deliberately NOT in it —
+    /// they are the defects this task removes, replaced and pinned by
+    /// their own tests: silent exit when the binary is missing (now the
+    /// loud warning, `missing_binary_warns_loudly`) and skip on any
+    /// non-empty SKIP_GATE (now exactly "1", `skip_gate_only_exactly_one`).
+    /// Everything else must be present in the scaffold verbatim.
+    #[test]
+    fn const_and_scaffold_diff_is_empty_or_ported() {
+        let hook = crate::task::SCAFFOLDED_PRE_PUSH_HOOK;
+        for behavior in [
+            "#!/bin/bash",
+            "command -v neurostrata-mcp",
+            "NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
+            "neurostrata-mcp task gate \"$NAMESPACE\" --strict",
+            "code=$?",
+            "if [ $code -eq 1 ]; then",
+            "echo \"Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push\" >&2",
+            "exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking",
+        ] {
+            assert!(
+                hook.contains(behavior),
+                "behavior the removed const had is missing from the scaffold: {}",
+                behavior
+            );
+        }
+    }
+
     #[test]
     fn the_gate_and_hook_commands_parse_with_their_flags() {
         let cli =
