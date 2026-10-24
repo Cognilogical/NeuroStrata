@@ -314,7 +314,8 @@ fn wire_mesh_publish(
             return;
         }
     }
-    tokio::spawn(mesh_drain_loop(project_root.clone(), wake));
+    let store_for_drain = vector_store.clone();
+    tokio::spawn(mesh_drain_loop(project_root.clone(), wake, store_for_drain));
 
     // Session start (spec §Triggers): ONE best-effort pull + validation,
     // never blocking startup beyond a 5s timeout and never crashing it.
@@ -441,7 +442,7 @@ fn auto_pull_interval_for_policy(
 /// entry (the `Notify` edge). A drain is synchronous git + file I/O, so it is
 /// called directly rather than awaited — the mesh repo is tiny and the
 /// interval is seconds, so it never meaningfully blocks the executor.
-async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>) {
+async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>, store: Arc<dyn VectorStore>) {
     let mut interval = tokio::time::interval(MESH_DRAIN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -449,14 +450,14 @@ async fn mesh_drain_loop(project_root: PathBuf, wake: Arc<tokio::sync::Notify>) 
             _ = interval.tick() => {}
             _ = wake.notified() => {}
         }
-        drain_mesh_once(&project_root);
+        drain_mesh_once(&project_root, &store).await;
     }
 }
 
 /// One drain of the served project's mesh. Re-resolves the pointer each tick
 /// so a leave/rejoin during a session is picked up; every failure is a logged
 /// no-op, never a daemon crash.
-fn drain_mesh_once(project_root: &std::path::Path) {
+async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorStore>) {
     use crate::synaptic_mesh::{
         mesh_service::resolve_node_id,
         outbox::{outbox_dir_for, Outbox},
@@ -476,6 +477,8 @@ fn drain_mesh_once(project_root: &std::path::Path) {
             return;
         }
     };
+    let namespaces = mesh.manifest().namespaces.clone();
+    let epoch = mesh.manifest().epoch;
     let outbox = match Outbox::open(&outbox_dir_for(&mesh_dir)) {
         Ok(o) => o,
         Err(e) => {
@@ -483,6 +486,17 @@ fn drain_mesh_once(project_root: &std::path::Path) {
             return;
         }
     };
+
+    // R9: source-to-mesh reconciliation — re-emit any shareable memory in the
+    // store that has no corresponding mesh record file. Closes the lossy-bus
+    // loss window: dropped pulses are re-discovered on the next drain.
+    let _ = crate::events::subscribers::mesh_outbox::MeshOutbox::reconcile(
+        store.as_ref(),
+        &mesh_dir,
+        &outbox,
+        &namespaces,
+        epoch,
+    ).await;
     match drain_once(&outbox, &mesh, &node_id) {
         Ok(report) if report.pending_seen > 0 => {
             tracing::debug!(
