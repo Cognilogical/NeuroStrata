@@ -1455,6 +1455,14 @@ impl VectorStore for LadybugStore {
             let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory)";
             conn.query(create_extracted_table).ok();
 
+            // PQTH: Intake receipts table (operational, not memory rows)
+            let create_receipts_table = "CREATE NODE TABLE IntakeReceipt (id STRING, namespace STRING, source_kind STRING, source_revision STRING, source_digest STRING, detected_intents STRING, raw_text STRING, created_at STRING, PRIMARY KEY (id))";
+            conn.query(create_receipts_table).ok();
+
+            // PQTH: Intake candidates table (operational, not memory rows)
+            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version LONG, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
+            conn.query(create_candidates_table).ok();
+
             Ok(())
         })
         .await;
@@ -1467,6 +1475,10 @@ impl VectorStore for LadybugStore {
         // Creating the tables is itself a write worth flushing.
         self.dirty.mark();
         outcome
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     async fn upsert(
@@ -2471,6 +2483,518 @@ impl VectorStore for LadybugStore {
             Ok(())
         })
         .await
+    }
+}
+
+impl crate::traits::AsAny for LadybugStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// IntakeStore implementation for LadybugStore (PQTH durable intake ledger).
+#[async_trait::async_trait]
+impl crate::traits::IntakeStore for LadybugStore {
+    async fn create_receipt(
+        &self,
+        request: crate::task::intake::CreateReceiptRequest,
+    ) -> Result<crate::task::intake::CreateReceiptResult, String> {
+        let namespace = request.namespace.clone();
+        let source_digest = request.source_digest.clone();
+        let text = request.text.clone();
+        let source_kind = request.source_kind;
+        let source_revision = request.source_revision.clone();
+
+        // Generate receipt ID deterministically from namespace + source_digest
+        let receipt_id = crate::task::intake::generate_receipt_id(&namespace, &source_digest);
+
+        // Process text through M2 lexical detector
+        let detected_intents = crate::task::intake::process_intake_text(&text);
+
+        // Create candidates from detected intents
+        let candidates = crate::task::intake::create_candidates_from_intents(
+            &namespace,
+            &receipt_id,
+            &request,
+            detected_intents.clone(),
+        );
+
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        // Clone values needed for both receipt construction and safe strings
+        let source_revision_for_receipt = source_revision.clone();
+        let source_digest_for_receipt = source_digest.clone();
+        let detected_intents_for_receipt = detected_intents.clone();
+        let text_for_receipt = text.clone();
+        let now_for_receipt = now.clone();
+
+        let receipt = crate::task::intake::IntakeReceipt {
+            id: receipt_id.clone(),
+            namespace: namespace.clone(),
+            source_kind,
+            source_revision: source_revision_for_receipt,
+            source_digest: source_digest_for_receipt,
+            detected_intents: detected_intents_for_receipt,
+            raw_text: text_for_receipt,
+            created_at: now_for_receipt,
+        };
+
+        // Serialize detected intents for storage
+        let intents_json = serde_json::to_string(&detected_intents).unwrap_or_default();
+        let safe_intents = escape_ladybug_string(&intents_json);
+        let safe_raw_text = escape_ladybug_string(&text);
+        let safe_receipt_id = escape_ladybug_string(&receipt_id);
+        let safe_ns = escape_ladybug_string(&namespace);
+        let safe_source_kind = format!("{:?}", source_kind).to_lowercase();
+        let safe_source_revision = escape_ladybug_string(&source_revision);
+        let safe_source_digest = escape_ladybug_string(&source_digest);
+        let safe_created_at = escape_ladybug_string(&now);
+
+        // Transactional write: receipt + candidates atomically
+        let candidates_clone = candidates.clone();
+        self.write_with_deadline("creating intake receipt and candidates", move |conn| {
+            // Insert receipt
+            let receipt_query = format!(
+                "MERGE (r:IntakeReceipt {{id: '{}'}})
+                 ON CREATE SET r.namespace = '{}', r.source_kind = '{}', r.source_revision = '{}',
+                     r.source_digest = '{}', r.detected_intents = '{}', r.raw_text = '{}', r.created_at = '{}'",
+                safe_receipt_id, safe_ns, safe_source_kind, safe_source_revision,
+                safe_source_digest, safe_intents, safe_raw_text, safe_created_at
+            );
+            conn.query(&receipt_query)?;
+
+            // Insert candidates
+            for cand in &candidates_clone {
+                let safe_cand_id = escape_ladybug_string(&cand.id);
+                let safe_receipt_id = escape_ladybug_string(&cand.receipt_id);
+                let safe_title = escape_ladybug_string(&cand.title);
+                let safe_desc = cand.description.as_ref().map(|d| escape_ladybug_string(d)).unwrap_or_default();
+                let safe_review_state = format!("{:?}", cand.review_state).to_lowercase();
+                let safe_disposition = format!("{:?}", cand.disposition).to_lowercase();
+                let safe_task_id = cand.task_id.as_ref().map(|t| escape_ladybug_string(t)).unwrap_or_default();
+                let safe_created = escape_ladybug_string(&cand.created_at);
+                let safe_updated = escape_ladybug_string(&cand.updated_at);
+
+                let cand_query = format!(
+                    "MERGE (c:IntakeCandidate {{id: '{}'}})
+                     ON CREATE SET c.namespace = '{}', c.receipt_id = '{}', c.title = '{}',
+                         c.description = '{}', c.review_state = '{}', c.disposition = '{}',
+                         c.task_id = '{}', c.cas_version = {}, c.created_at = '{}', c.updated_at = '{}'",
+                    safe_cand_id, safe_ns, safe_receipt_id, safe_title, safe_desc,
+                    safe_review_state, safe_disposition, safe_task_id, cand.cas_version,
+                    safe_created, safe_updated
+                );
+                conn.query(&cand_query)?;
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("Failed to create intake receipt: {}", e))?;
+
+        let candidate_count = candidates.len();
+        Ok(crate::task::intake::CreateReceiptResult {
+            receipt,
+            candidates,
+            candidate_count,
+        })
+    }
+
+    async fn list_receipts(
+        &self,
+        request: crate::task::intake::ListReceiptsRequest,
+    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeReceipt>, String> {
+        let namespace = request.namespace.clone();
+        let limit = request.limit.unwrap_or(50);
+        let offset = request.offset.unwrap_or(0);
+
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+
+            // Get total count
+            let count_query = format!(
+                "MATCH (r:IntakeReceipt) WHERE r.namespace = '{}' RETURN count(r)",
+                safe_ns
+            );
+            let total: i64 = conn
+                .query(&count_query)?
+                .next()
+                .and_then(|row| format!("{}", row[0]).parse().ok())
+                .unwrap_or(0);
+
+            // Get paginated results
+            let query = format!(
+                "MATCH (r:IntakeReceipt) WHERE r.namespace = '{}' RETURN r.id, r.namespace, r.source_kind, r.source_revision, r.source_digest, r.detected_intents, r.raw_text, r.created_at ORDER BY r.created_at DESC LIMIT {} OFFSET {}",
+                safe_ns, limit, offset
+            );
+            let mut results = Vec::new();
+            for row in conn.query(&query)? {
+                let id: String = format!("{}", row[0]);
+                let ns: String = format!("{}", row[1]);
+                let source_kind_str: String = format!("{}", row[2]);
+                let source_revision: String = format!("{}", row[3]);
+                let source_digest: String = format!("{}", row[4]);
+                let detected_intents_str: String = format!("{}", row[5]);
+                let raw_text: String = format!("{}", row[6]);
+                let created_at: String = format!("{}", row[7]);
+
+                let source_kind = match source_kind_str.as_str() {
+                    "conversation" => crate::task::intake::SourceKind::Conversation,
+                    "manual" => crate::task::intake::SourceKind::Manual,
+                    "imported" => crate::task::intake::SourceKind::Imported,
+                    "tool" => crate::task::intake::SourceKind::Tool,
+                    _ => crate::task::intake::SourceKind::Conversation,
+                };
+
+                let detected_intents: Vec<crate::task::intake::DetectedIntent> =
+                    serde_json::from_str(&detected_intents_str).unwrap_or_default();
+
+                results.push(crate::task::intake::IntakeReceipt {
+                    id,
+                    namespace: ns,
+                    source_kind,
+                    source_revision,
+                    source_digest,
+                    detected_intents,
+                    raw_text,
+                    created_at,
+                });
+            }
+
+            Ok(crate::task::intake::IntakeListResponse {
+                namespace,
+                count: results.len(),
+                total: total as usize,
+                offset,
+                limit,
+                items: results,
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to list receipts: {}", e))
+    }
+
+    async fn list_candidates(
+        &self,
+        request: crate::task::intake::ListCandidatesRequest,
+    ) -> Result<crate::task::intake::IntakeListResponse<crate::task::intake::IntakeCandidate>, String> {
+        let namespace = request.namespace.clone();
+        let limit = request.limit.unwrap_or(50);
+        let offset = request.offset.unwrap_or(0);
+        let review_state_filter = request.review_state;
+        let disposition_filter = request.disposition;
+
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+
+            // Build WHERE clause for filters
+            let mut where_clauses = vec![format!("c.namespace = '{}'", safe_ns)];
+            if let Some(rs) = review_state_filter {
+                where_clauses.push(format!("c.review_state = '{}'", format!("{:?}", rs).to_lowercase()));
+            }
+            if let Some(d) = disposition_filter {
+                where_clauses.push(format!("c.disposition = '{}'", format!("{:?}", d).to_lowercase()));
+            }
+            let where_clause = where_clauses.join(" AND ");
+
+            // Get total count
+            let count_query = format!(
+                "MATCH (c:IntakeCandidate) WHERE {} RETURN count(c)",
+                where_clause
+            );
+            let total: i64 = conn
+                .query(&count_query)?
+                .next()
+                .and_then(|row| format!("{}", row[0]).parse().ok())
+                .unwrap_or(0);
+
+            // Get paginated results
+            let query = format!(
+                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at ORDER BY c.created_at DESC LIMIT {} OFFSET {}",
+                where_clause, limit, offset
+            );
+            let mut results = Vec::new();
+            for row in conn.query(&query)? {
+                let id: String = format!("{}", row[0]);
+                let ns: String = format!("{}", row[1]);
+                let receipt_id: String = format!("{}", row[2]);
+                let title: String = format!("{}", row[3]);
+                let description: String = format!("{}", row[4]);
+                let review_state_str: String = format!("{}", row[5]);
+                let disposition_str: String = format!("{}", row[6]);
+                let task_id: String = format!("{}", row[7]);
+                let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
+                let created_at: String = format!("{}", row[9]);
+                let updated_at: String = format!("{}", row[10]);
+
+                let review_state = match review_state_str.as_str() {
+                    "pending" => crate::task::intake::ReviewState::Pending,
+                    "inreview" => crate::task::intake::ReviewState::InReview,
+                    "accepted" => crate::task::intake::ReviewState::Accepted,
+                    "dismissed" => crate::task::intake::ReviewState::Dismissed,
+                    _ => crate::task::intake::ReviewState::Pending,
+                };
+
+                let disposition = match disposition_str.as_str() {
+                    "pending" => crate::task::intake::Disposition::Pending,
+                    "created" => crate::task::intake::Disposition::Created,
+                    "linked" => crate::task::intake::Disposition::Linked,
+                    "dismissed" => crate::task::intake::Disposition::Dismissed,
+                    _ => crate::task::intake::Disposition::Pending,
+                };
+
+                results.push(crate::task::intake::IntakeCandidate {
+                    id,
+                    namespace: ns,
+                    receipt_id,
+                    title,
+                    description: if description.is_empty() { None } else { Some(description) },
+                    review_state,
+                    disposition,
+                    task_id: if task_id.is_empty() { None } else { Some(task_id) },
+                    cas_version: cas_version as u64,
+                    created_at,
+                    updated_at,
+                });
+            }
+
+            Ok(crate::task::intake::IntakeListResponse {
+                namespace,
+                count: results.len(),
+                total: total as usize,
+                offset,
+                limit,
+                items: results,
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to list candidates: {}", e))
+    }
+
+    async fn resolve_candidate(
+        &self,
+        request: crate::task::intake::ResolveCandidateRequest,
+    ) -> Result<crate::task::intake::ResolveCandidateResult, String> {
+        let namespace = request.namespace.clone();
+        let candidate_id = request.candidate_id.clone();
+        let disposition = request.disposition;
+        let task_id = request.task_id.clone();
+        let task_id_for_closure = task_id.clone();
+        let cas_version = request.cas_version;
+
+        self.write_with_deadline("resolving intake candidate", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_cand_id = escape_ladybug_string(&candidate_id);
+            let safe_disposition = format!("{:?}", disposition).to_lowercase();
+            let safe_task_id = task_id_for_closure.as_ref().map(|t| escape_ladybug_string(t)).unwrap_or_default();
+            let new_version = cas_version + 1;
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let safe_updated = escape_ladybug_string(&now);
+
+            // CAS: only update if cas_version matches
+            let query = format!(
+                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' AND c.cas_version = {} SET c.disposition = '{}', c.task_id = '{}', c.cas_version = {}, c.updated_at = '{}', c.review_state = '{}' RETURN c.id",
+                safe_cand_id, safe_ns, cas_version, safe_disposition, safe_task_id, new_version, safe_updated,
+                if disposition == crate::task::intake::Disposition::Dismissed { "dismissed" } else { "accepted" }
+            );
+            let mut result = conn.query(&query)?;
+
+            if result.next().is_none() {
+                // Check if candidate exists but version mismatch
+                let check_query = format!(
+                    "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.cas_version",
+                    safe_cand_id, safe_ns
+                );
+                let mut check_result = conn.query(&check_query)?;
+                if let Some(row) = check_result.next() {
+                    let current_version: i64 = format!("{}", row[0]).parse().unwrap_or(0);
+                    return Err(anyhow::anyhow!("CAS conflict: expected version {}, found {}", cas_version, current_version));
+                }
+                return Err(anyhow::anyhow!("Candidate not found: {}", candidate_id));
+            }
+
+            // Fetch updated candidate
+            let fetch_query = format!(
+                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at",
+                safe_cand_id, safe_ns
+            );
+            let mut fetch_result = conn.query(&fetch_query)?;
+            let row = fetch_result.next().ok_or_else(|| anyhow::anyhow!("Candidate not found after update: {}", candidate_id))?;
+
+            let id: String = format!("{}", row[0]);
+            let ns: String = format!("{}", row[1]);
+            let receipt_id: String = format!("{}", row[2]);
+            let title: String = format!("{}", row[3]);
+            let description: String = format!("{}", row[4]);
+            let review_state_str: String = format!("{}", row[5]);
+            let disposition_str: String = format!("{}", row[6]);
+            let task_id_db: String = format!("{}", row[7]);
+            let cas_version_db: i64 = format!("{}", row[8]).parse().unwrap_or(new_version as i64);
+            let created_at: String = format!("{}", row[9]);
+            let updated_at: String = format!("{}", row[10]);
+
+            let review_state = match review_state_str.as_str() {
+                "pending" => crate::task::intake::ReviewState::Pending,
+                "inreview" => crate::task::intake::ReviewState::InReview,
+                "accepted" => crate::task::intake::ReviewState::Accepted,
+                "dismissed" => crate::task::intake::ReviewState::Dismissed,
+                _ => crate::task::intake::ReviewState::Pending,
+            };
+
+            let disposition_enum = match disposition_str.as_str() {
+                "pending" => crate::task::intake::Disposition::Pending,
+                "created" => crate::task::intake::Disposition::Created,
+                "linked" => crate::task::intake::Disposition::Linked,
+                "dismissed" => crate::task::intake::Disposition::Dismissed,
+                _ => crate::task::intake::Disposition::Pending,
+            };
+
+            let candidate = crate::task::intake::IntakeCandidate {
+                id,
+                namespace: ns,
+                receipt_id,
+                title,
+                description: if description.is_empty() { None } else { Some(description) },
+                review_state,
+                disposition: disposition_enum,
+                task_id: if task_id_db.is_empty() { None } else { Some(task_id_db) },
+                cas_version: cas_version_db as u64,
+                created_at,
+                updated_at,
+            };
+
+            Ok(crate::task::intake::ResolveCandidateResult {
+                candidate: candidate.clone(),
+                task_created: disposition == crate::task::intake::Disposition::Created,
+                task_id: task_id_for_closure.clone(),
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to resolve candidate: {}", e))
+    }
+
+    async fn get_receipt(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::task::intake::IntakeReceipt>, String> {
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
+
+            let query = format!(
+                "MATCH (r:IntakeReceipt) WHERE r.id = '{}' AND r.namespace = '{}' RETURN r.id, r.namespace, r.source_kind, r.source_revision, r.source_digest, r.detected_intents, r.raw_text, r.created_at",
+                safe_id, safe_ns
+            );
+            let mut result = conn.query(&query)?;
+
+            if let Some(row) = result.next() {
+                let receipt_id: String = format!("{}", row[0]);
+                let ns: String = format!("{}", row[1]);
+                let source_kind_str: String = format!("{}", row[2]);
+                let source_revision: String = format!("{}", row[3]);
+                let source_digest: String = format!("{}", row[4]);
+                let detected_intents_str: String = format!("{}", row[5]);
+                let raw_text: String = format!("{}", row[6]);
+                let created_at: String = format!("{}", row[7]);
+
+                let source_kind = match source_kind_str.as_str() {
+                    "conversation" => crate::task::intake::SourceKind::Conversation,
+                    "manual" => crate::task::intake::SourceKind::Manual,
+                    "imported" => crate::task::intake::SourceKind::Imported,
+                    "tool" => crate::task::intake::SourceKind::Tool,
+                    _ => crate::task::intake::SourceKind::Conversation,
+                };
+
+                let detected_intents: Vec<crate::task::intake::DetectedIntent> =
+                    serde_json::from_str(&detected_intents_str).unwrap_or_default();
+
+                Ok(Some(crate::task::intake::IntakeReceipt {
+                    id: receipt_id,
+                    namespace: ns,
+                    source_kind,
+                    source_revision,
+                    source_digest,
+                    detected_intents,
+                    raw_text,
+                    created_at,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| format!("Failed to get receipt: {}", e))
+    }
+
+    async fn get_candidate(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<crate::task::intake::IntakeCandidate>, String> {
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
+
+            let query = format!(
+                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at",
+                safe_id, safe_ns
+            );
+            let mut result = conn.query(&query)?;
+
+            if let Some(row) = result.next() {
+                let cand_id: String = format!("{}", row[0]);
+                let ns: String = format!("{}", row[1]);
+                let receipt_id: String = format!("{}", row[2]);
+                let title: String = format!("{}", row[3]);
+                let description: String = format!("{}", row[4]);
+                let review_state_str: String = format!("{}", row[5]);
+                let disposition_str: String = format!("{}", row[6]);
+                let task_id: String = format!("{}", row[7]);
+                let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
+                let created_at: String = format!("{}", row[9]);
+                let updated_at: String = format!("{}", row[10]);
+
+                let review_state = match review_state_str.as_str() {
+                    "pending" => crate::task::intake::ReviewState::Pending,
+                    "inreview" => crate::task::intake::ReviewState::InReview,
+                    "accepted" => crate::task::intake::ReviewState::Accepted,
+                    "dismissed" => crate::task::intake::ReviewState::Dismissed,
+                    _ => crate::task::intake::ReviewState::Pending,
+                };
+
+                let disposition = match disposition_str.as_str() {
+                    "pending" => crate::task::intake::Disposition::Pending,
+                    "created" => crate::task::intake::Disposition::Created,
+                    "linked" => crate::task::intake::Disposition::Linked,
+                    "dismissed" => crate::task::intake::Disposition::Dismissed,
+                    _ => crate::task::intake::Disposition::Pending,
+                };
+
+                Ok(Some(crate::task::intake::IntakeCandidate {
+                    id: cand_id,
+                    namespace: ns,
+                    receipt_id,
+                    title,
+                    description: if description.is_empty() { None } else { Some(description) },
+                    review_state,
+                    disposition,
+                    task_id: if task_id.is_empty() { None } else { Some(task_id) },
+                    cas_version: cas_version as u64,
+                    created_at,
+                    updated_at,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+        .map_err(|e| format!("Failed to get candidate: {}", e))
     }
 }
 

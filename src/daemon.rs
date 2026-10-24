@@ -1421,7 +1421,17 @@ mod tests {
         fn is_dirty(&self) -> bool {
             false
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
+
+impl crate::traits::AsAny for RecordingStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
     /// A throwaway project root, named like the subscriber tests' scratch
     /// directories so an earlier run's leftover can never be read as this

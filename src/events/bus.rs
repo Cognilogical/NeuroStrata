@@ -133,6 +133,16 @@ impl VectorStore for StoreNotAttached {
     async fn checkpoint(&self) -> anyhow::Result<()> {
         Err(Self::err())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl crate::traits::AsAny for StoreNotAttached {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// The bounded pulse queue.
@@ -909,7 +919,17 @@ mod tests {
         async fn checkpoint(&self) -> anyhow::Result<()> {
             Err(anyhow!("recording store: unused by this test"))
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
+
+impl crate::traits::AsAny for RecordingStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
     /// Calls `ctx.store.get` once per pulse and records the outcome: the
     /// observable difference between an attached store and the stand-in.

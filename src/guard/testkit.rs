@@ -357,6 +357,16 @@ impl VectorStore for MockStore {
     async fn checkpoint(&self) -> Result<()> {
         Ok(())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl crate::traits::AsAny for MockStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// An embedder that produces a fixed-size vector without touching a model.

@@ -1,3 +1,6 @@
+// Increase recursion limit for large JSON literals in tools/list
+#![recursion_limit = "256"]
+
 mod attempt;
 mod buffer;
 mod config;
