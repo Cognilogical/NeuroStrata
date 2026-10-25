@@ -7908,4 +7908,522 @@ eurostrata\src\daemon.rs",
             "the registry row must never appear in search results"
         );
     }
+
+    // ── Task 7 (C5): (namespace, id) row identity, audit/quarantine, ────────
+    // ── escaping ladder. RED for the remediation program's Phase B. ─────────
+
+    fn t7_payload(content: &str) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "agent".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        }
+    }
+
+    async fn t7_store() -> LadybugStore {
+        let dir = std::env::temp_dir().join(format!("ns-t7-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+        store
+    }
+
+    async fn t7_count_where(store: &LadybugStore, where_clause: &str) -> i64 {
+        let query = format!("MATCH (m:Memory) WHERE {} RETURN count(m)", where_clause);
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                let n = rows
+                    .next()
+                    .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(-1))
+                    .unwrap_or(-1);
+                Ok(n)
+            })
+            .await
+            .expect("count rows")
+    }
+
+    /// The DDL the pre-Task-7 binary creates: PRIMARY KEY (id), namespace a
+    /// plain property set ON CREATE. Seeding with it builds a genuine
+    /// old-binary store, not a caricature of one.
+    const T7_OLD_DDL: &str = "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[4], PRIMARY KEY (id))";
+
+    fn t7_raw_open(path: &std::path::Path) -> (Database, Connection) {
+        let cfg = SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024);
+        let db = Database::new(path, cfg).expect("raw open");
+        let conn = Connection::new(&db).expect("raw connection");
+        (db, conn)
+    }
+
+    /// Seed one row the way the OLD upsert writes it: MERGE on {id} alone,
+    /// namespace assigned ON CREATE.
+    fn t7_old_shape_insert(conn: &Connection, namespace: &str, id: &str, content: &str) {
+        let query = format!(
+            "MERGE (m:Memory {{id: '{}'}}) ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = 'agent', m.memory_type = 'fact', m.agent_name = 'a', m.location = '', m.location_lines = '', m.metadata = '{{}}', m.embedding = [0.0,0.0,0.0,0.0] ON MATCH SET m.content = '{}'",
+            escape_ladybug_string(id),
+            escape_ladybug_string(namespace),
+            escape_ladybug_string(content),
+            escape_ladybug_string(content),
+        );
+        conn.query(&query).expect("old-shape insert");
+    }
+
+    #[tokio::test]
+    async fn same_id_two_namespaces_coexist() {
+        let store = t7_store().await;
+        store
+            .upsert("ns-a", "shared-id", vec![0.0; 4], t7_payload("content-a"))
+            .await
+            .expect("upsert in ns-a");
+        store
+            .upsert("ns-b", "shared-id", vec![0.0; 4], t7_payload("content-b"))
+            .await
+            .expect("the same id in ns-b is a different row, not an overwrite");
+
+        let (_, a) = store
+            .get("ns-a", "shared-id")
+            .await
+            .unwrap()
+            .expect("ns-a row exists");
+        let (_, b) = store
+            .get("ns-b", "shared-id")
+            .await
+            .unwrap()
+            .expect("ns-b row exists");
+        assert_eq!(a.content, "content-a");
+        assert_eq!(b.content, "content-b");
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'shared-id'").await,
+            2,
+            "two rows carry the shared id, one per namespace"
+        );
+
+        // Re-writing ns-a must leave ns-b byte-identical.
+        let mut a2 = t7_payload("content-a2");
+        a2.metadata = json!({"round": 2});
+        store
+            .upsert("ns-a", "shared-id", vec![0.0; 4], a2)
+            .await
+            .unwrap();
+        let (_, b_after) = store
+            .get("ns-b", "shared-id")
+            .await
+            .unwrap()
+            .expect("ns-b row still exists");
+        assert_eq!(b_after.content, "content-b");
+        assert_eq!(b_after.metadata, json!({}));
+    }
+
+    #[tokio::test]
+    async fn old_binary_rows_are_found_not_duplicated() {
+        let path = std::env::temp_dir().join(format!("ns-t7-old-{}", uuid::Uuid::new_v4()));
+        {
+            let (_db, conn) = t7_raw_open(&path);
+            conn.query(T7_OLD_DDL).expect("old DDL");
+            t7_old_shape_insert(&conn, "legacy-ns", "legacy-id", "old content");
+        }
+        let store = LadybugStore::for_testing(&path, 4).expect("open old store");
+        store.init("legacy-ns").await.expect("init over old store");
+
+        store
+            .upsert(
+                "legacy-ns",
+                "legacy-id",
+                vec![0.0; 4],
+                t7_payload("new content"),
+            )
+            .await
+            .expect("upsert matches the old row");
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'legacy-id'").await,
+            1,
+            "the old row was found, not duplicated"
+        );
+        let (_, got) = store
+            .get("legacy-ns", "legacy-id")
+            .await
+            .unwrap()
+            .expect("row readable");
+        assert_eq!(got.content, "new content");
+    }
+
+    #[tokio::test]
+    async fn null_namespace_rows_backfill_or_quarantine_never_block() {
+        let path = std::env::temp_dir().join(format!("ns-t7-null-{}", uuid::Uuid::new_v4()));
+        // Phase 1: seed two rows whose namespace property is NULL (omitted
+        // at CREATE) — one carries its namespace in metadata, one carries
+        // nothing — then drop the store so the reopen runs the audit.
+        {
+            let seed_store = LadybugStore::for_testing(&path, 4).expect("open temp database");
+            seed_store.init("probe").await.expect("create the schema");
+            for (id, metadata) in [
+                ("orphan-with-meta", r#"{"namespace":"recovered-ns"}"#),
+                ("orphan-no-meta", "{}"),
+            ] {
+                let create = format!(
+                    "CREATE (m:Memory {{id: '{}', content: 'c', user_id: 'u', memory_type: 'note', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                    id,
+                    escape_ladybug_string(metadata),
+                );
+                seed_store
+                    .with_conn(move |conn| {
+                        conn.query(&create)?;
+                        Ok(())
+                    })
+                    .await
+                    .expect("seed a null-namespace row");
+            }
+            assert_eq!(
+                t7_count_where(&seed_store, "m.namespace IS NULL").await,
+                2,
+                "both seeded rows are null-namespace before the audit"
+            );
+        }
+        // Phase 2: reopen. Init runs the audit; the store opens regardless.
+        let store = LadybugStore::for_testing(&path, 4).expect("reopen the store");
+        store.init("probe").await.expect("init must not be blocked");
+
+        // The backfilled row is a normal row now: readable, and a fresh
+        // upsert matches it instead of duplicating it.
+        let (_, got) = store
+            .get("recovered-ns", "orphan-with-meta")
+            .await
+            .unwrap()
+            .expect("backfilled row is readable in its namespace");
+        assert_eq!(got.content, "c");
+        store
+            .upsert(
+                "recovered-ns",
+                "orphan-with-meta",
+                vec![0.0; 4],
+                t7_payload("updated"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'orphan-with-meta'").await,
+            1,
+            "upsert after backfill matched, not duplicated"
+        );
+
+        // The quarantined row never blocks anything, but a write aimed at
+        // its id refuses loudly instead of forking the identity.
+        let res = store
+            .upsert("any-ns", "orphan-no-meta", vec![0.0; 4], t7_payload("fork"))
+            .await;
+        assert!(res.is_err(), "a write to a quarantined id must refuse");
+        let err = res.err().unwrap().to_string();
+        assert!(
+            err.contains("quarantine"),
+            "refusal names the quarantine: {err}"
+        );
+        assert_eq!(
+            t7_count_where(&store, "m.namespace IS NULL").await,
+            1,
+            "the quarantined row itself is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_at_init_never_blocks_open() {
+        let path = std::env::temp_dir().join(format!("ns-t7-init-{}", uuid::Uuid::new_v4()));
+        {
+            let (_db, conn) = t7_raw_open(&path);
+            conn.query(T7_OLD_DDL).expect("old DDL");
+            conn.query(
+                "CREATE (m:Memory {id: 'pre-orphan', content: 'c', user_id: 'u', memory_type: 'note', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})",
+            )
+            .expect("seed a null-namespace row before first init");
+        }
+        let store = LadybugStore::for_testing(&path, 4).expect("open store");
+        // Init runs the audit; a store holding an unclassifiable row opens.
+        store.init("probe").await.expect("init must not be blocked");
+        // The quarantined row refuses writes by id, and ordinary work
+        // proceeds on the same store.
+        let res = store
+            .upsert("any-ns", "pre-orphan", vec![0.0; 4], t7_payload("fork"))
+            .await;
+        assert!(res.is_err(), "a write to a quarantined id must refuse");
+        assert!(
+            res.err().unwrap().to_string().contains("quarantine"),
+            "refusal names the quarantine"
+        );
+        store
+            .upsert("probe", "fresh", vec![0.0; 4], t7_payload("fine"))
+            .await
+            .expect("the store works with a quarantined row present");
+    }
+
+    #[tokio::test]
+    async fn rollback_drill_old_merge_against_dual_namespace_store() {
+        let store = t7_store().await;
+        store
+            .upsert("ns-a", "shared-id", vec![0.0; 4], t7_payload("content-a"))
+            .await
+            .unwrap();
+        store
+            .upsert("ns-b", "shared-id", vec![0.0; 4], t7_payload("content-b"))
+            .await
+            .unwrap();
+
+        // The drill: an old binary's upsert statement, verbatim shape,
+        // against a store where the id legitimately exists twice. Which
+        // row it binds (or that it errors) is OBSERVED and printed for the
+        // rollback record — the assertions below only pin that the drill
+        // cannot create or destroy rows.
+        let drill = format!(
+            "MERGE (m:Memory {{id: 'shared-id'}}) ON CREATE SET m.namespace = 'ns-a', m.content = 'drill-write', m.user_id = 'agent', m.memory_type = 'fact', m.agent_name = 'a', m.location = '', m.location_lines = '', m.metadata = '{{}}', m.embedding = [0.0,0.0,0.0,0.0] ON MATCH SET m.content = 'drill-write'"
+        );
+        let outcome = store
+            .with_conn(move |conn| {
+                conn.query(&drill)?;
+                Ok(())
+            })
+            .await;
+        let (_, a) = store.get("ns-a", "shared-id").await.unwrap().unwrap();
+        let (_, b) = store.get("ns-b", "shared-id").await.unwrap().unwrap();
+        eprintln!(
+            "ROLLBACK DRILL: old-shape MERGE outcome={:?} ns-a content={:?} ns-b content={:?}",
+            outcome.as_ref().map(|_| "ok"),
+            a.content,
+            b.content
+        );
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'shared-id'").await,
+            2,
+            "the drill neither created nor destroyed a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn adversarial_content_round_trips_byte_identical() {
+        let store = t7_store().await;
+        let cases = [
+            "it's a test",
+            "back\\slash and C:\\path\\to",
+            "'}'); DETACH DELETE (m) //",
+            "line one\nline two\r\nline three\ttabbed",
+            "unicode: héllo → 世界 ✓",
+            "trailing backslash\\",
+            "' OR '1'='1",
+        ];
+        for (i, content) in cases.iter().enumerate() {
+            let id = format!("adv-{i}");
+            let mut payload = t7_payload(content);
+            payload.metadata = json!({"note": "meta 'quoted'\nnewline \\ backslash"});
+            store
+                .upsert("vault", &id, vec![0.0; 4], payload)
+                .await
+                .unwrap_or_else(|e| panic!("upsert of case {i} must not error: {e}"));
+            let (_, got) = store
+                .get("vault", &id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("case {i} must be readable"));
+            assert_eq!(&got.content, content, "case {i} round-trips byte-identical");
+            assert_eq!(
+                got.metadata["note"],
+                json!("meta 'quoted'\nnewline \\ backslash"),
+                "case {i} metadata round-trips byte-identical"
+            );
+        }
+        assert_eq!(
+            t7_count_where(&store, "m.namespace = 'vault'").await,
+            cases.len() as i64,
+            "no injected statement created or destroyed rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn adversarial_ids_refuse_or_round_trip() {
+        let store = t7_store().await;
+        // Legal-but-tricky ids round-trip byte-identical, including the
+        // engine-minted qualified shape (namespace::path, with slashes).
+        for id in ["a:b.c-d_e", "probe::src/a.rs::run", "a:", "..x"] {
+            store
+                .upsert("probe", id, vec![0.0; 4], t7_payload("ok"))
+                .await
+                .unwrap_or_else(|e| panic!("legal id {id:?} must be accepted: {e}"));
+            let (_, got) = store
+                .get("probe", id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("legal id {id:?} must be readable"));
+            assert_eq!(got.content, "ok");
+        }
+        // Illegal ids are refused by the DR-2 allowlist before any query.
+        for id in [
+            "bad id",
+            "bad'id",
+            "bad\\id",
+            "bad\nid",
+            "",
+            "üñï",
+            &"a".repeat(129),
+        ] {
+            let res = store.upsert("probe", id, vec![0.0; 4], t7_payload("no")).await;
+            assert!(res.is_err(), "illegal id {id:?} must be refused");
+            let err = res.err().unwrap().to_string();
+            assert!(
+                err.contains("ERROR [ID]"),
+                "refusal for {id:?} names the id rule: {err}"
+            );
+        }
+        // Illegal namespaces are refused by DR-1 the same way.
+        for ns in ["bad ns", ".lead", "a/b", "", &"a".repeat(65)] {
+            let res = store.upsert(ns, "fine-id", vec![0.0; 4], t7_payload("no")).await;
+            assert!(res.is_err(), "illegal namespace {ns:?} must be refused");
+            let err = res.err().unwrap().to_string();
+            assert!(
+                err.contains("ERROR [NAMESPACE]"),
+                "refusal for namespace {ns:?} names the rule: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nul_is_refused_at_the_store_boundary() {
+        let store = t7_store().await;
+        let res = store
+            .upsert("probe", "nul-content", vec![0.0; 4], t7_payload("a\u{0}b"))
+            .await;
+        assert!(res.is_err(), "NUL in content must be refused");
+        let err = res.err().unwrap().to_string();
+        assert!(err.contains("NUL"), "refusal names the NUL: {err}");
+        assert!(
+            store.get("probe", "nul-content").await.unwrap().is_none(),
+            "nothing was written"
+        );
+        let mut payload = t7_payload("clean");
+        payload.metadata = json!({"k": "a\u{0}b"});
+        let res = store.upsert("probe", "nul-meta", vec![0.0; 4], payload).await;
+        assert!(res.is_err(), "NUL in metadata must be refused");
+        let err = res.err().unwrap().to_string();
+        assert!(err.contains("NUL"), "refusal names the NUL: {err}");
+        let res = store.get("probe", "a\u{0}b").await;
+        assert!(res.is_err(), "NUL in a lookup id must be refused");
+        let err = res.err().unwrap().to_string();
+        assert!(err.contains("NUL"), "refusal names the NUL: {err}");
+    }
+
+    #[tokio::test]
+    async fn edge_merge_binds_within_namespace() {
+        let store = t7_store().await;
+        store
+            .upsert("ns-a", "shared", vec![0.0; 4], t7_payload("a-target"))
+            .await
+            .unwrap();
+        store
+            .upsert("ns-b", "shared", vec![0.0; 4], t7_payload("b-target"))
+            .await
+            .unwrap();
+        let mut rule = t7_payload("the rule");
+        rule.metadata = json!({"governs": ["shared"]});
+        store.upsert("ns-a", "rule-a", vec![0.0; 4], rule).await.unwrap();
+
+        // Exactly one GOVERNS edge leaves rule-a, and it lands on ns-a's
+        // row — never on the same-id twin in ns-b.
+        let targets = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (a:Memory {id: 'rule-a'})-[:GOVERNS]->(b:Memory) RETURN b.namespace",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    out.push(format!("{}", row[0]));
+                }
+                Ok(out)
+            })
+            .await
+            .expect("read the edges back");
+        assert_eq!(targets, vec!["ns-a".to_string()]);
+    }
+
+    // ── Engine capability probes (Task 7 Step A). These are not behavior ────
+    // ── tests: each prints its verdict and returns; the verdict decides ─────
+    // ── which rung of the escaping ladder the implementation takes. ────────
+
+    #[test]
+    fn probe_lbug_param_binding_merge_and_array() {
+        use lbug::{LogicalType, Value};
+        let path = std::env::temp_dir().join(format!("ns-t7-probe-bind-{}", uuid::Uuid::new_v4()));
+        let (_db, conn) = t7_raw_open(&path);
+        conn.query(
+            "CREATE NODE TABLE Probe (id STRING, namespace STRING, content STRING, embedding FLOAT[4], PRIMARY KEY (id))",
+        )
+        .expect("probe DDL");
+        let emb = || {
+            Value::Array(
+                LogicalType::Float,
+                vec![
+                    Value::Float(0.5),
+                    Value::Float(0.25),
+                    Value::Float(0.0),
+                    Value::Float(1.0),
+                ],
+            )
+        };
+        let verdict = (|| -> Result<String, lbug::Error> {
+            let mut merge = conn.prepare(
+                "MERGE (m:Probe {id: $id}) ON CREATE SET m.namespace = $ns, m.content = $content, m.embedding = $emb ON MATCH SET m.content = $content, m.embedding = $emb",
+            )?;
+            conn.execute(
+                &mut merge,
+                vec![
+                    ("id", Value::String("x".to_string())),
+                    ("ns", Value::String("probe".to_string())),
+                    ("content", Value::String("bound 'quoted' content".to_string())),
+                    ("emb", emb()),
+                ],
+            )?;
+            conn.execute(
+                &mut merge,
+                vec![
+                    ("id", Value::String("x".to_string())),
+                    ("ns", Value::String("probe".to_string())),
+                    ("content", Value::String("second write".to_string())),
+                    ("emb", emb()),
+                ],
+            )?;
+            let mut read = conn.prepare(
+                "MATCH (m:Probe) WHERE m.id = $id RETURN m.content, m.embedding",
+            )?;
+            let mut seen = String::new();
+            for row in conn.execute(&mut read, vec![("id", Value::String("x".to_string()))])? {
+                seen = format!("{} | {}", row[0], row[1]);
+            }
+            Ok(seen)
+        })();
+        match verdict {
+            Ok(seen) => eprintln!("PROBE BINDING: supported — readback: {seen}"),
+            Err(e) => eprintln!("PROBE BINDING: unsupported — {e}"),
+        }
+    }
+
+    #[test]
+    fn probe_lbug_composite_primary_key() {
+        let path = std::env::temp_dir().join(format!("ns-t7-probe-pk-{}", uuid::Uuid::new_v4()));
+        let (_db, conn) = t7_raw_open(&path);
+        let verdict = (|| -> Result<i64, lbug::Error> {
+            conn.query(
+                "CREATE NODE TABLE CP (namespace STRING, id STRING, content STRING, PRIMARY KEY (namespace, id))",
+            )?;
+            conn.query("CREATE (:CP {namespace: 'a', id: 'x', content: 'one'})")?;
+            conn.query("CREATE (:CP {namespace: 'b', id: 'x', content: 'two'})")?;
+            let mut rows = conn.query("MATCH (m:CP) RETURN count(m)")?;
+            Ok(rows
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(-1))
+                .unwrap_or(-1))
+        })();
+        match verdict {
+            Ok(n) => eprintln!("PROBE COMPOSITE PK: supported — rows held: {n}"),
+            Err(e) => eprintln!("PROBE COMPOSITE PK: unsupported — {e}"),
+        }
+    }
 }
