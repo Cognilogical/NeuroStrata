@@ -2521,6 +2521,16 @@ impl VectorStore for LadybugStore {
     }
 
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
+        // Task 7: the store boundary validates the move's identity before
+        // any store access, as it does a write's. NUL is refused by name
+        // on every caller-supplied input, and the destination must pass
+        // DR-1: a relocate that minted a row under a namespace the
+        // validators refuse everywhere else would strand the row there,
+        // unreachable by any later upsert.
+        reject_nul("id", id)?;
+        reject_nul("namespace", from)?;
+        reject_nul("namespace", to)?;
+        crate::domain::validate_namespace(to).map_err(anyhow::Error::msg)?;
         if from == to {
             return Ok(RelocateOutcome::SameNamespace);
         }
@@ -2541,8 +2551,14 @@ impl VectorStore for LadybugStore {
         let pk_ready = self.pk_ready();
         let payload = payload.clone();
         self.write_with_deadline("moving a memory", move |conn| {
-            // One statement, so there is no moment at which the memory exists in
-            // neither namespace, and the row keeps its id, vector and edges.
+            // The single-statement forms (the in-place SET below on a
+            // pk-column table, and the legacy SET at the bottom) move the
+            // row in one statement: no moment at which the memory exists
+            // in neither namespace, and the row keeps its id, vector and
+            // edges. The fresh-table fallback cannot claim that — it
+            // recreates before it deletes, so the row briefly
+            // exists in both namespaces instead (never in neither), as
+            // its own comment states.
             // With the pk column present the derived key must move with
             // the row (bound, B1): a relocate that left the old
             // namespace's pk behind would strand the row — pk lookups in
@@ -2577,11 +2593,18 @@ impl VectorStore for LadybugStore {
                     Err(e) if e.to_string().contains("primary key") => {}
                     Err(e) => return Err(e.into()),
                 }
-                // Delete and recreate under the new namespace's key,
-                // replaying the row's edges so the move keeps them, as
-                // the single-statement form did. The whole sequence runs
-                // under the writer's turn, so no other writer observes
-                // the row mid-move.
+                // Recreate under the new namespace's key, then delete
+                // the old row: the new row is created FIRST and the
+                // captured edges are replayed onto it, and only then is
+                // the old row deleted. The order is the atomicity story
+                // — no engine transaction spans these statements, so
+                // every intermediate state must be loss-free on its own:
+                // a crash or error anywhere before the final delete
+                // leaves the memory in both namespaces at worst (a
+                // duplicate a later relocate or delete can clean up),
+                // never in neither, and never with a prefix of its
+                // edges. The whole sequence runs under the writer's
+                // turn, so no other writer observes the row mid-move.
                 let mut edges: Vec<(&'static str, bool, String)> = Vec::new();
                 for rel in MEMORY_REL_TABLES {
                     for outgoing in [true, false] {
@@ -2602,15 +2625,18 @@ impl VectorStore for LadybugStore {
                             vec![("pk", lbug::Value::String(old_pk.clone()))],
                         )?;
                         for row in rows {
-                            edges.push((rel, outgoing, format!("{}", row[0])));
+                            let other_pk = format!("{}", row[0]);
+                            // A self-edge's other end is the moved row
+                            // itself, and the outgoing pass already
+                            // captured it; the incoming pass skips it, or
+                            // the replay below would create it twice.
+                            if !outgoing && other_pk == old_pk {
+                                continue;
+                            }
+                            edges.push((rel, outgoing, other_pk));
                         }
                     }
                 }
-                let mut stmt = conn.prepare("MATCH (m:Memory {pk: $pk}) DETACH DELETE m")?;
-                conn.execute(
-                    &mut stmt,
-                    vec![("pk", lbug::Value::String(old_pk.clone()))],
-                )?;
                 let vec_str = format!(
                     "[{}]",
                     vector
@@ -2689,6 +2715,15 @@ impl VectorStore for LadybugStore {
                         ],
                     )?;
                 }
+                // The old row goes LAST, once the new row and every
+                // replayed edge exist. DETACH takes the old row's
+                // original edges with it, leaving exactly the replayed
+                // set on the new row.
+                let mut stmt = conn.prepare("MATCH (m:Memory {pk: $pk}) DETACH DELETE m")?;
+                conn.execute(
+                    &mut stmt,
+                    vec![("pk", lbug::Value::String(old_pk.clone()))],
+                )?;
                 return Ok(RelocateOutcome::Moved);
             }
             let query = format!(
@@ -4747,6 +4782,178 @@ eurostrata\src\daemon.rs",
             store.relocate("rule", "probe", "probe").await.unwrap(),
             RelocateOutcome::SameNamespace
         );
+    }
+
+    /// Create one edge of `rel` between two rows addressed by pk, raw —
+    /// for graph shapes the metadata declarations cannot express (a
+    /// self-edge; an incoming edge in a second table).
+    async fn t7_create_edge(store: &LadybugStore, rel: &str, from_pk: &str, to_pk: &str) {
+        let query = format!(
+            "MATCH (a:Memory {{pk: '{}'}}), (b:Memory {{pk: '{}'}}) CREATE (a)-[:{}]->(b)",
+            escape_ladybug_string(from_pk),
+            escape_ladybug_string(to_pk),
+            rel,
+        );
+        store
+            .with_conn(move |conn| {
+                conn.query(&query)?;
+                Ok(())
+            })
+            .await
+            .expect("create the edge");
+    }
+
+    /// Every (from_pk, to_pk) pair joined by an edge of `rel`, sorted.
+    async fn t7_edge_pairs(store: &LadybugStore, rel: &str) -> Vec<(String, String)> {
+        let query = format!("MATCH (a:Memory)-[:{}]->(b:Memory) RETURN a.pk, b.pk", rel);
+        let mut pairs = store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    out.push((format!("{}", row[0]), format!("{}", row[1])));
+                }
+                Ok(out)
+            })
+            .await
+            .expect("read the edge pairs");
+        pairs.sort();
+        pairs
+    }
+
+    /// The fresh-table fallback (pk IS the primary key, so the in-place
+    /// SET is refused) recreates before it deletes, and a self-edge —
+    /// matched by both the outgoing and the incoming capture pass — must
+    /// be replayed exactly once, remapped onto the new key.
+    #[tokio::test]
+    async fn relocate_on_a_fresh_table_keeps_a_self_edge_exactly_once() {
+        let store = t7_store().await;
+        store
+            .upsert("probe", "mover", vec![0.0; 4], t7_payload("mover"))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "subject", vec![0.0; 4], t7_payload("subject"))
+            .await
+            .unwrap();
+        let old_pk = memory_pk("probe", "mover");
+        t7_create_edge(&store, "RELATES_TO", &old_pk, &old_pk).await;
+        t7_create_edge(
+            &store,
+            "GOVERNS",
+            &old_pk,
+            &memory_pk("probe", "subject"),
+        )
+        .await;
+
+        assert_eq!(
+            store.relocate("mover", "probe", "global").await.unwrap(),
+            RelocateOutcome::Moved
+        );
+
+        let new_pk = memory_pk("global", "mover");
+        assert!(
+            store.get("global", "mover").await.unwrap().is_some(),
+            "the row is in its new namespace"
+        );
+        assert!(
+            store.get("probe", "mover").await.unwrap().is_none(),
+            "and no copy is left behind"
+        );
+        assert_eq!(
+            t7_edge_pairs(&store, "RELATES_TO").await,
+            vec![(new_pk.clone(), new_pk.clone())],
+            "exactly one self-edge survives, bound to the new pk"
+        );
+        assert_eq!(
+            t7_edge_pairs(&store, "GOVERNS").await,
+            vec![(new_pk, memory_pk("probe", "subject"))],
+            "the ordinary outgoing edge came along exactly once"
+        );
+    }
+
+    /// The fallback's replay covers both directions across all four rel
+    /// tables; every edge survives the move exactly once.
+    #[tokio::test]
+    async fn relocate_on_a_fresh_table_keeps_edges_in_both_directions_across_tables() {
+        let store = t7_store().await;
+        for id in ["mover", "north", "south"] {
+            store
+                .upsert("probe", id, vec![0.0; 4], t7_payload(id))
+                .await
+                .unwrap();
+        }
+        let mover = memory_pk("probe", "mover");
+        let north = memory_pk("probe", "north");
+        let south = memory_pk("probe", "south");
+        // Outgoing in two tables, incoming in two more.
+        t7_create_edge(&store, "RELATES_TO", &mover, &north).await;
+        t7_create_edge(&store, "GOVERNS", &mover, &south).await;
+        t7_create_edge(&store, "CONTAINS", &north, &mover).await;
+        t7_create_edge(&store, "EXTRACTED_FROM", &south, &mover).await;
+
+        assert_eq!(
+            store.relocate("mover", "probe", "global").await.unwrap(),
+            RelocateOutcome::Moved
+        );
+
+        let moved = memory_pk("global", "mover");
+        assert_eq!(
+            t7_edge_pairs(&store, "RELATES_TO").await,
+            vec![(moved.clone(), north.clone())]
+        );
+        assert_eq!(
+            t7_edge_pairs(&store, "GOVERNS").await,
+            vec![(moved.clone(), south.clone())]
+        );
+        assert_eq!(
+            t7_edge_pairs(&store, "CONTAINS").await,
+            vec![(north, moved.clone())]
+        );
+        assert_eq!(
+            t7_edge_pairs(&store, "EXTRACTED_FROM").await,
+            vec![(south, moved)]
+        );
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'mover'").await,
+            1,
+            "one mover row, in the new namespace"
+        );
+    }
+
+    /// Relocate validates its identity inputs at the store boundary: an
+    /// illegal destination namespace or a NUL-bearing id is refused
+    /// before any mutation, and the row stays where it was.
+    #[tokio::test]
+    async fn relocate_refuses_an_illegal_destination_and_a_nul_id() {
+        let store = t7_store().await;
+        store
+            .upsert("probe", "stayer", vec![0.0; 4], t7_payload("stayer"))
+            .await
+            .unwrap();
+
+        let err = store
+            .relocate("stayer", "probe", "bad ns")
+            .await
+            .expect_err("a destination namespace with a space is refused");
+        assert!(
+            err.to_string().contains("ERROR [NAMESPACE]"),
+            "the refusal names the violated rule: {err}"
+        );
+        let err = store
+            .relocate("sta\u{0}yer", "probe", "global")
+            .await
+            .expect_err("a NUL-bearing id is refused");
+        assert!(
+            err.to_string().contains("ERROR [NUL]"),
+            "the refusal names the refused byte: {err}"
+        );
+
+        assert!(
+            store.get("probe", "stayer").await.unwrap().is_some(),
+            "the row is unmoved"
+        );
+        assert_eq!(t7_count_where(&store, "m.id = 'stayer'").await, 1);
     }
 
     #[test]
