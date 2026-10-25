@@ -2943,13 +2943,17 @@ impl crate::traits::AsAny for RecordingStore {
             body_b.contains("Successfully added memory"),
             "the teaching write succeeds: {body_b}"
         );
+        // create_new_namespace: true here too — the namespace-existence
+        // lock is project-scoped, so from root_c's registry view the
+        // namespace is new even though root_b's call created it. The
+        // write bypasses that lock; what must NOT succeed is its teach.
         let body_c = mcp_add_memory(
             &client,
             &base,
             "second caller's write",
             "divert-ns",
             Some(&root_c),
-            false,
+            true,
         )
         .await;
         assert!(
