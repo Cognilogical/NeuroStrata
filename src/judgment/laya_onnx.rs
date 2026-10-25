@@ -21,18 +21,18 @@ use crate::traits::{MemoryPayload, SearchResult};
 /// runtime system. In this build the provider is a validated stub: no ONNX
 /// session is created, so it reports `Unavailable` (see module docs).
 pub struct LayaOnnxProvider {
-    /// Path to the validated ONNX bundle directory (manifest + checkpoint).
+    /// Path to the validated ONNX bundle directory (manifest.json).
     bundle_root: PathBuf,
-    /// ONNX Runtime inference semaphore, bounding concurrent CPU inference.
+    /// Semaphore bounding concurrent callers of this provider.
     inference_semaphore: Arc<Semaphore>,
     /// The last-known runtime state of this provider.
     state: crate::judgment::RuntimeState,
 }
 
 impl LayaOnnxProvider {
-    /// Load an ONNX bundle from `bundle_dir`, attaching it to the inference
-    /// semaphore. Validates the bundle layout (manifest, checkpoint paths,
-    /// embedder identity) before attaching.
+    /// Load an ONNX bundle from `bundle_dir`, attaching it to the given
+    /// semaphore. Validates the bundle's manifest first: `manifest.json`
+    /// must exist, parse as JSON, and declare an `embedder_id`.
     pub fn load(bundle_dir: &Path, semaphore: Arc<Semaphore>) -> Result<Self> {
         // Phase-0 spike validation: ensure the bundle root exists and has the
         // minimum expected artifacts. Full manifest parsing deferred to bridge.
@@ -75,8 +75,8 @@ impl JudgmentProvider for LayaOnnxProvider {
         new_memory: &MemoryPayload,
         candidates: &[SearchResult],
     ) -> Result<Vec<DuplicateJudgment>> {
-        // Inference runs inside spawn_blocking under the semaphore; the permit
-        // is acquired first so concurrent requests are bounded.
+        // Acquire the provider's semaphore permit first, so concurrent
+        // requests are bounded.
         let _permit = self.inference_semaphore.acquire().await.unwrap();
         let n = candidates.len();
         // R10: Inference is not implemented in this build.
