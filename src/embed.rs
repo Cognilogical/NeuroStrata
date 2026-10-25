@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -121,27 +122,155 @@ fn configured_model() -> Result<AcceptableEmbedder> {
 
 /// Resolve an embedders.json model name to the fastembed model it names.
 ///
-/// Extraction seam (Task 9): this preserves today's behavior exactly —
-/// an unrecognized name silently falls back to NomicEmbedTextV15. The
-/// unknown-name refusal is pinned by tests against this seam and lands
-/// on it; nothing else resolves model names.
+/// An unrecognized name refuses (J29): the previous behavior silently
+/// substituted NomicEmbedTextV15, so a typo in embedders.json ran a
+/// different model than the configuration named. The error names the
+/// requested name and the acceptable list — the models this build of
+/// fastembed can actually load.
 fn resolve_embedding_model(model_name: &str) -> Result<EmbeddingModel> {
-    Ok(EmbeddingModel::from_str(model_name).unwrap_or(EmbeddingModel::NomicEmbedTextV15))
+    EmbeddingModel::from_str(model_name).map_err(|_| {
+        let acceptable = TextEmbedding::list_supported_models()
+            .iter()
+            .map(|info| format!("{:?}", info.model))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!(
+            "unknown embedder model '{model_name}': this build cannot load a model by that name \
+             and no fallback is substituted — set model_name in embedders.json to one of the \
+             acceptable models: {acceptable}"
+        )
+    })
 }
 
-/// The artifact-pin gate for one model's artifact directory (Task 9).
-///
-/// Placeholder seam: accepts everything today. The pin comparison —
-/// refuse when `recorded_pin` does not match the artifact set in
-/// `model_dir`, record a PIN-CANDIDATE when it is None — is pinned by
-/// tests against this seam and lands on it.
-#[allow(dead_code)]
-fn enforce_artifact_pin(
-    _model_dir: &Path,
-    _recorded_pin: Option<&str>,
-    _model_name: &str,
-) -> Result<()> {
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The DR-7 artifact pin over one model's snapshot directory: every file
+/// present (recursively; the snapshot layout nests some models' graph
+/// under an `onnx/` subdir), hashed by content. The pin is the SHA-256
+/// hex of the concatenation of `"<file-sha256>  <relative-path>\n"` lines
+/// sorted by relative path — a pin over the ONNX file alone would let a
+/// swapped tokenizer walk past it. The PIN-CANDIDATE adoption record is
+/// the one exclusion: it is this gate's own output, not a model artifact.
+fn compute_artifact_pin(model_dir: &Path) -> Result<String> {
+    let mut rel_paths: Vec<String> = Vec::new();
+    collect_artifact_files(model_dir, model_dir, &mut rel_paths)?;
+    if rel_paths.is_empty() {
+        anyhow::bail!(
+            "no embedder artifacts found in {} — the model cache is empty or incomplete",
+            model_dir.display()
+        );
+    }
+    rel_paths.sort();
+    let mut listing = String::new();
+    for rel in &rel_paths {
+        let bytes = fs::read(model_dir.join(rel))
+            .with_context(|| format!("failed to read embedder artifact {rel}"))?;
+        listing.push_str(&format!("{}  {}\n", sha256_hex(&bytes), rel));
+    }
+    Ok(sha256_hex(listing.as_bytes()))
+}
+
+fn collect_artifact_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read model cache directory {}", dir.display()))?
+    {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_artifact_files(root, &path, out)?;
+        } else if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .expect("walk stays under the root")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            if rel != "PIN-CANDIDATE" {
+                out.push(rel);
+            }
+        }
+    }
     Ok(())
+}
+
+/// The artifact-pin gate for one model's snapshot directory (Task 9).
+///
+/// With a recorded pin, the artifact set must hash to it or the load
+/// refuses. With no pin, the load proceeds and the computed pin is
+/// recorded through the channels that exist today — a PIN-CANDIDATE
+/// file in the model's cache directory and one `eprintln!` line. It is
+/// deliberately not a `tracing` record: no subscriber is installed until
+/// Task 19 (J26), so a tracing adoption record would be discarded.
+fn enforce_artifact_pin(
+    model_dir: &Path,
+    recorded_pin: Option<&str>,
+    model_name: &str,
+) -> Result<()> {
+    let computed = compute_artifact_pin(model_dir)?;
+    match recorded_pin {
+        Some(pin) => {
+            if pin.trim() == computed {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "embedder artifact pin mismatch for model '{model_name}': the artifact set \
+                     in {} does not match the artifact_pin recorded in embedders.json \
+                     (recorded {}, computed {}) — refusing to load; if the model cache was \
+                     legitimately refreshed, update artifact_pin to the computed value or \
+                     remove it to re-adopt",
+                    model_dir.display(),
+                    pin.trim(),
+                    computed
+                );
+            }
+        }
+        None => {
+            let candidate = model_dir.join("PIN-CANDIDATE");
+            fs::write(&candidate, format!("{computed}\n")).with_context(|| {
+                format!(
+                    "failed to write artifact pin candidate {}",
+                    candidate.display()
+                )
+            })?;
+            eprintln!(
+                "No artifact_pin recorded for embedder model '{model_name}': computed pin \
+                 {computed} over the artifact set in {} and wrote it to {} — record it as \
+                 artifact_pin in embedders.json to pin this model",
+                model_dir.display(),
+                candidate.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The model's snapshot directory under the shared fastembed cache root,
+/// in the Hugging Face hub layout fastembed downloads into:
+/// `models--<org>--<repo>/snapshots/<revision>`, the revision named by
+/// `refs/main`. None when the model has not been downloaded yet.
+fn model_snapshot_dir(cache_root: &Path, model: &EmbeddingModel) -> Option<PathBuf> {
+    let code = TextEmbedding::get_model_info(model).ok()?.model_code.clone();
+    let repo_dir = cache_root.join(format!("models--{}", code.replace('/', "--")));
+    let snapshots = repo_dir.join("snapshots");
+    if let Ok(revision) = fs::read_to_string(repo_dir.join("refs").join("main")) {
+        let candidate = snapshots.join(revision.trim());
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&snapshots)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    if dirs.len() == 1 {
+        dirs.pop()
+    } else {
+        None
+    }
 }
 
 /// The embedding width of the configured model, without loading the model.
@@ -176,6 +305,20 @@ impl FastEmbedder {
                 .context("Failed to create shared model cache directory")?;
         }
 
+        // Artifact pin (Task 9 / DR-7): when the model's snapshot is
+        // already cached, the pin gate runs before fastembed touches it,
+        // so a mismatched artifact set never reaches the loader. A
+        // missing snapshot means a first download; the gate then runs
+        // after the load, before the embedder is handed out.
+        let snapshot_dir = model_snapshot_dir(&cache_dir, &model_enum);
+        if let Some(dir) = &snapshot_dir {
+            enforce_artifact_pin(
+                dir,
+                target_model.artifact_pin.as_deref(),
+                &target_model.model_name,
+            )?;
+        }
+
         eprintln!(
             "Initializing FastEmbedder with model: {} using cache: {:?}",
             target_model.model_name, cache_dir
@@ -191,6 +334,27 @@ impl FastEmbedder {
                 .with_max_length(MAX_EMBED_TOKENS)
                 .with_show_download_progress(true),
         )?;
+
+        if snapshot_dir.is_none() {
+            match model_snapshot_dir(&cache_dir, &model_enum) {
+                Some(dir) => enforce_artifact_pin(
+                    &dir,
+                    target_model.artifact_pin.as_deref(),
+                    &target_model.model_name,
+                )?,
+                None => {
+                    if target_model.artifact_pin.is_some() {
+                        anyhow::bail!(
+                            "embedder model '{}' has an artifact_pin recorded in embedders.json \
+                             but no artifact directory was found under {} after load — refusing \
+                             to run it unpinned",
+                            target_model.model_name,
+                            cache_dir.display()
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
@@ -238,6 +402,39 @@ pub struct RemoteEmbedder {
     model_name: String,
 }
 
+/// Validate a remote embedder base_url before any request is built from
+/// it (J23): it must parse as a URL with a host, and its scheme must be
+/// https — http is accepted only for loopback hosts. Refusals name the
+/// host only, never the full URL (which can carry userinfo) and never
+/// the API key.
+fn validate_remote_base_url(base_url: &str) -> Result<()> {
+    let url = reqwest::Url::parse(base_url).map_err(|_| {
+        anyhow::anyhow!(
+            "remote embedder base_url does not parse as a URL with a host — refusing; \
+             base_url must use https (http is accepted only for loopback hosts)"
+        )
+    })?;
+    let host = url.host_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "remote embedder base_url has no host — refusing; \
+             base_url must use https (http is accepted only for loopback hosts)"
+        )
+    })?;
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        scheme => anyhow::bail!(
+            "remote embedder base_url host '{host}' uses scheme '{scheme}' — refusing; \
+             base_url must use https (http is accepted only for loopback hosts)"
+        ),
+    }
+}
+
 impl RemoteEmbedder {
     pub fn new(
         base_url: String,
@@ -245,6 +442,8 @@ impl RemoteEmbedder {
         api_model: String,
         dimensions: usize,
     ) -> Result<Self> {
+        validate_remote_base_url(&base_url)?;
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -310,8 +509,14 @@ impl RemoteEmbedder {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("API error {}: {}", status, body));
+            // The response body is dropped, never embedded in the error
+            // (J23): it is remote-controlled text that can echo request
+            // data, and an error string ends up in logs. The status is
+            // the whole report.
+            return Err(anyhow::anyhow!(
+                "remote embedder returned HTTP {}",
+                status.as_u16()
+            ));
         }
 
         let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
