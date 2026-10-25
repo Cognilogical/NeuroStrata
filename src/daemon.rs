@@ -714,6 +714,13 @@ pub(crate) async fn start_daemon_on(
 ) -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+    // Program Task 3 (c): classify procedure rows written before trust
+    // stamping existed, once at store open, before anything serves.
+    // Provenance decides: unstamped + no mesh provenance is local
+    // authorship; unstamped + imported stays unfired. Counts are logged
+    // inside the pass when it stamps anything.
+    crate::synaptic_mesh::import::backfill_imported_procedure_trust(&vector_store).await;
+
     // Initialize deduplication checker if config provided.
     // The `provider: DedupProviderMode::None` alone disables dedup learning;
     // otherwise the provider selection mode determines which provider to use.

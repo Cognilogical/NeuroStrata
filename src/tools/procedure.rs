@@ -74,12 +74,50 @@ fn last_episodic_pointer(metadata: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether the fire gate blocks this row. Only the imported state
-/// (`trust == "untrusted"`) refuses a firing; a local record carrying `trusted`,
-/// `promoted`, or no trust key at all is executable. Anything unreadable also
-/// fires, because an unreadable field must not brick a live procedure.
+/// Whether this row arrived through the mesh import funnel. The funnel
+/// writes a `mesh` provenance object onto every row it applies (see
+/// `synaptic_mesh::import`), and no local write path writes one, so the
+/// object's presence is the provenance signal the gate discriminates on.
+fn has_import_provenance(metadata: &Value) -> bool {
+    metadata
+        .get("mesh")
+        .map(|m| m.is_object())
+        .unwrap_or(false)
+}
+
+/// Whether the fire gate blocks this row. The trust stamp is
+/// authoritative, and what an absent or unknown stamp means depends on
+/// provenance (Program Task 3):
+///
+/// - `untrusted` never fires, wherever the row came from.
+/// - `trusted`, `promoted`, and `local` fire: each is an affirmative
+///   decision (manifest policy, local promotion, local authorship).
+/// - Absent or unknown stamp on a LOCAL row (no import provenance)
+///   fires: absent stamp + no provenance = local authorship, the
+///   doctrine this gate has always kept — an unreadable field must not
+///   brick a live local procedure.
+/// - Absent or unknown stamp on a row WITH import provenance does not
+///   fire: for a mesh-sourced row, a missing stamp is missing evidence,
+///   not authorship.
 fn is_untrusted(metadata: &Value) -> bool {
-    metadata.get("trust").and_then(|v| v.as_str()) == Some("untrusted")
+    match metadata.get("trust").and_then(|v| v.as_str()) {
+        Some("untrusted") => true,
+        Some("trusted") | Some("promoted") | Some("local") => false,
+        _ => has_import_provenance(metadata),
+    }
+}
+
+/// Stamp a locally created procedure row as locally authored. Every
+/// creation path calls this when it mints a procedure — add_memory,
+/// task_complete's inline extraction, and the CLI `Add` command (whose
+/// memory_type is a free-form argument): authorship is a fact about
+/// the write path, so the stamp overwrites any caller-supplied trust
+/// value. The mesh import funnel never calls this — imported rows take
+/// the manifest's stamp instead (Program Task 3).
+pub(crate) fn stamp_local_trust(metadata: &mut Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("trust".to_string(), json!("local"));
+    }
 }
 
 /// When this procedure is next owed.
@@ -758,6 +796,110 @@ mod tests {
             meta.get("trust").is_none(),
             "firing must not invent a trust key on a local row"
         );
+    }
+
+    /// Program Task 3 (d): the fail-closed half of the gate applies ONLY
+    /// to rows carrying import provenance. An imported row whose stamp
+    /// is absent — or holds a value outside the known set — must not
+    /// fire: for a mesh-sourced row, a missing stamp is not local
+    /// authorship, it is missing evidence.
+    #[tokio::test]
+    async fn unstamped_imported_row_does_not_fire() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-imported-plain",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "remaining_fires": 3,
+                "mesh": {"mesh_id": "mesh-alpha", "update_id": "u-1", "origin": "mesh-import"}
+            }),
+        )
+        .await;
+        seed(
+            &store,
+            "probe",
+            "proc-imported-unknown",
+            "procedure",
+            json!({
+                "trust": "sender-invented-value",
+                "trigger": "session-start",
+                "remaining_fires": 3,
+                "mesh": {"mesh_id": "mesh-alpha", "update_id": "u-2", "origin": "mesh-import"}
+            }),
+        )
+        .await;
+        let root = scratch("imported-unstamped");
+
+        for id in ["proc-imported-plain", "proc-imported-unknown"] {
+            let reply: Value = serde_json::from_str(
+                &handle_procedure_perform(
+                    json!({ "id": id, "project_root": root.display().to_string() }),
+                    store.clone(),
+                )
+                .await,
+            )
+            .expect("json");
+            assert_eq!(
+                reply["performed"],
+                json!(false),
+                "{id} carries import provenance without a known stamp and must not fire: {reply}"
+            );
+            assert!(
+                reply["reason"]
+                    .as_str()
+                    .expect("reason text")
+                    .starts_with("untrusted"),
+                "{id}: the refusal names the trust state: {reply}"
+            );
+            let meta = stored(&store, "probe", id).await.metadata;
+            assert!(
+                meta.get("last_performed_at").is_none(),
+                "{id}: refusal is not a rehearsal"
+            );
+        }
+    }
+
+    /// Program Task 3: a procedure seeded in the exact shape the repo's
+    /// own AGENTS.md §3a documents — add_memory fields, NO trust field —
+    /// still fires. Stamping happens at creation, but rows in the
+    /// documented local shape keep firing exactly as before.
+    #[tokio::test]
+    async fn section_3a_shaped_procedure_fires() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-3a",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "remaining_fires": 3,
+                "valid_to": Value::Null,
+                "performance_count": 0,
+                "last_performed_at": Value::Null,
+                "last_episodic_pointer": Value::Null
+            }),
+        )
+        .await;
+        let root = scratch("section-3a");
+
+        let reply: Value = serde_json::from_str(
+            &handle_procedure_perform(
+                json!({ "id": "proc-3a", "project_root": root.display().to_string() }),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("json");
+        assert_eq!(
+            reply["performed"],
+            json!(true),
+            "the documented local procedure shape must fire: {reply}"
+        );
+        assert_eq!(reply["remaining_fires"], json!(2));
     }
 
     /// The refusal has to teach the fix: it names the trust state, the

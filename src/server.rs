@@ -1538,6 +1538,12 @@ async fn handle_add_memory(
         }
     }
     stamp_new_memory(&mut metadata);
+    // A procedure born on this node is locally authored: stamp it so the
+    // fire gate can tell authorship from import (Program Task 3). The
+    // stamp overwrites any caller-supplied trust value.
+    if memory_type == "procedure" {
+        crate::tools::procedure::stamp_local_trust(&mut metadata);
+    }
 
     // Honour an unambiguous Governs line in the prose (guinea-pig Option 2):
     // a declared pointer that is written but never honoured is the worst of
@@ -6323,6 +6329,97 @@ mod tests {
             }
             other => panic!("expected Created, got {:?}", other),
         }
+    }
+
+    /// Program Task 3 (a): a procedure created through add_memory is
+    /// stamped trust="local" at creation — a caller-supplied trust value
+    /// is overwritten, because local authorship is a fact about the
+    /// write path, not a claim the caller gets to make. The stamped row
+    /// fires through the gate; a non-procedure row gains no trust key.
+    #[tokio::test]
+    async fn locally_created_procedure_carries_local_stamp() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let (bus, _seen) = recording_bus();
+
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "rehearse the release checklist",
+                "namespace": "probe",
+                "memory_type": "procedure",
+                "metadata": {
+                    "trust": "untrusted",
+                    "trigger": "session-start",
+                    "remaining_fires": 2
+                }
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            bus.clone(),
+        )
+        .await;
+        assert!(
+            reply.starts_with("Successfully added memory"),
+            "{reply}"
+        );
+
+        let rows = store.list("probe", None, None).await.expect("list");
+        let proc_row = rows
+            .iter()
+            .find(|r| r.payload.memory_type == "procedure")
+            .expect("the procedure row was stored");
+        assert_eq!(
+            proc_row.payload.metadata["trust"],
+            serde_json::json!("local"),
+            "creation stamps local authorship over the caller's claim: {:?}",
+            proc_row.payload.metadata
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("ns-task3-local-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("scratch root");
+        let outcome_text = crate::tools::procedure::handle_procedure_perform(
+            serde_json::json!({
+                "id": proc_row.id,
+                "project_root": root.display().to_string()
+            }),
+            store.clone(),
+        )
+        .await;
+        let outcome: Value = serde_json::from_str(&outcome_text).expect("perform returns JSON");
+        assert_eq!(
+            outcome["performed"],
+            serde_json::json!(true),
+            "a locally created procedure fires: {outcome}"
+        );
+
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "a plain local rule about stamping",
+                "namespace": "probe",
+                "memory_type": "rule",
+                "metadata": {}
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            None,
+            bus,
+        )
+        .await;
+        assert!(
+            reply.starts_with("Successfully added memory"),
+            "{reply}"
+        );
+        let rows = store.list("probe", None, None).await.expect("list");
+        let rule_row = rows
+            .iter()
+            .find(|r| r.payload.content == "a plain local rule about stamping")
+            .expect("the rule row was stored");
+        assert!(
+            rule_row.payload.metadata.get("trust").is_none(),
+            "non-procedure rows gain no trust stamp: {:?}",
+            rule_row.payload.metadata
+        );
     }
 
     /// Emit site 2: a correction is two rows moving, and the pulse has to name
