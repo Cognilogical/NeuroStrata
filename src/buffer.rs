@@ -5,7 +5,7 @@
 //! at 500KB, and pruning rolled files past the retention window.
 
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::domain::normalize_domain_slug;
@@ -56,13 +56,61 @@ pub(crate) fn scan_for_append(content: &str, tags: &[String]) -> Option<String> 
         .map(|r| r.to_string())
 }
 
+/// The J22 refusal, in one place so the pre-creation judgment and the
+/// post-creation verification in [`append_entry`] speak identically.
+fn sessions_outside_root(
+    sessions_path: &Path,
+    resolved: &Path,
+    canonical_root: &Path,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "refused: the sessions directory {} resolves to {}, outside \
+             the project root {} — nothing was written",
+            sessions_path.display(),
+            resolved.display(),
+            canonical_root.display()
+        ),
+    )
+}
+
+/// Where `path` would resolve, judged without creating anything: the
+/// nearest existing ancestor canonicalized, the remainder rejoined as
+/// plain components — the `check_caller_path` pattern (daemon.rs). A
+/// remainder component with no plain file name (`..`, `.`) cannot be
+/// judged this way and yields `None`.
+fn judged_resolution(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path.to_path_buf();
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
+            let mut resolved = canonical;
+            for name in remainder.iter().rev() {
+                resolved.push(name);
+            }
+            return Some(resolved);
+        }
+        match (cursor.file_name().map(|n| n.to_os_string()), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                remainder.push(name);
+                cursor = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Append one entry (and its optional topic-switch marker) to the buffer.
 /// `max_bytes` is injectable so tests do not have to write 500KB.
 ///
 /// Path discipline (Task 2 / J22): the sessions directory is canonicalized
 /// and must lie inside the canonical project root before anything opens —
 /// a `.NeuroStrata` or `sessions` symlink planted in the tree cannot
-/// redirect the write out of the project. The session file itself is
+/// redirect the write out of the project. Containment is judged BEFORE
+/// anything is created (fix round / M-1), so the refusal never follows a
+/// planted link into creating directories outside the project on its way
+/// to claiming nothing was written. The session file itself is
 /// opened with `O_NOFOLLOW` on Unix, and a final component that is a
 /// symlink is a loud error with nothing written: the pre-open check names
 /// the refusal, and the flag closes the check-to-open race.
@@ -73,23 +121,31 @@ pub(crate) fn append_entry(
     max_bytes: u64,
     retention_days: u64,
 ) -> std::io::Result<Outcome> {
-    let sessions = project_root.join(".NeuroStrata").join("sessions");
-    std::fs::create_dir_all(&sessions)?;
+    let sessions_path = project_root.join(".NeuroStrata").join("sessions");
+    // Judge containment before creating anything (M-1): canonicalize the
+    // nearest existing ancestor of the sessions path and judge the
+    // remainder. When the root itself does not exist yet, nothing beneath
+    // it exists either — no link can have been planted — and the
+    // post-creation check below remains the authority.
+    if let Ok(canonical_root) = std::fs::canonicalize(project_root) {
+        if let Some(judged) = judged_resolution(&sessions_path) {
+            if !judged.starts_with(&canonical_root) {
+                return Err(sessions_outside_root(
+                    &sessions_path,
+                    &judged,
+                    &canonical_root,
+                ));
+            }
+        }
+    }
+    std::fs::create_dir_all(&sessions_path)?;
     let canonical_root = std::fs::canonicalize(project_root)?;
-    let sessions = std::fs::canonicalize(&sessions)?;
+    let sessions = std::fs::canonicalize(&sessions_path)?;
     if !sessions.starts_with(&canonical_root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "refused: the sessions directory {} resolves to {}, outside \
-                 the project root {} — nothing was written",
-                project_root
-                    .join(".NeuroStrata")
-                    .join("sessions")
-                    .display(),
-                sessions.display(),
-                canonical_root.display()
-            ),
+        return Err(sessions_outside_root(
+            &sessions_path,
+            &sessions,
+            &canonical_root,
         ));
     }
     let current = sessions.join("current.md");
