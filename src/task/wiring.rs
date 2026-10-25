@@ -74,8 +74,8 @@ pub const AUTOMATIC_WIRES: &[Wire] = &[
     Wire {
         id: "zero-action-start",
         runs_in: RunsIn::Core,
-        blocks: true,
-        reason: "no state-mutating action before a Goal exists and is claimed",
+        blocks: false,
+        reason: "no state-mutating action before a Goal exists and is claimed (advisory; no interception point for arbitrary actions)",
     },
     Wire {
         id: "single-daemon-lock",
