@@ -8613,9 +8613,12 @@ eurostrata\src\daemon.rs",
         assert_eq!(targets, vec!["ns-a".to_string()]);
     }
 
-    // ── Engine capability probes (Task 7 Step A). These are not behavior ────
-    // ── tests: each prints its verdict and returns; the verdict decides ─────
-    // ── which rung of the escaping ladder the implementation takes. ────────
+    // ── Engine capability probes (Task 7 Step A). Each probe ASSERTS the ────
+    // ── capability it tests, so the verdict IS the test result: pass means ──
+    // ── supported, and failure carries the engine's own error text. (The ───
+    // ── print-form originals were unreadable in CI, which discards the ──────
+    // ── output of passing tests.) The verdicts decide which rung of the ────
+    // ── escaping ladder and which DDL the implementation takes. ────────────
 
     #[test]
     fn probe_lbug_param_binding_merge_and_array() {
@@ -8626,7 +8629,7 @@ eurostrata\src\daemon.rs",
         conn.query(
             "CREATE NODE TABLE Probe (id STRING, namespace STRING, content STRING, embedding FLOAT[4], PRIMARY KEY (id))",
         )
-        .expect("probe DDL");
+        .expect("PROBE BINDING unsupported: probe DDL failed");
         let emb = || {
             Value::Array(
                 LogicalType::Float,
@@ -8638,7 +8641,11 @@ eurostrata\src\daemon.rs",
                 ],
             )
         };
-        let verdict = (|| -> Result<String, lbug::Error> {
+        // The capability under test, end to end: a MERGE whose pattern key
+        // and SET values are all bound $parameters, executed twice (ON
+        // CREATE, then ON MATCH), including a FLOAT[4] array parameter —
+        // then read back through a bound WHERE parameter.
+        let run = (|| -> Result<Vec<Vec<Value>>, lbug::Error> {
             let mut merge = conn.prepare(
                 "MERGE (m:Probe {id: $id}) ON CREATE SET m.namespace = $ns, m.content = $content, m.embedding = $emb ON MATCH SET m.content = $content, m.embedding = $emb",
             )?;
@@ -8663,16 +8670,41 @@ eurostrata\src\daemon.rs",
             let mut read = conn.prepare(
                 "MATCH (m:Probe) WHERE m.id = $id RETURN m.content, m.embedding",
             )?;
-            let mut seen = String::new();
+            let mut rows = Vec::new();
             for row in conn.execute(&mut read, vec![("id", Value::String("x".to_string()))])? {
-                seen = format!("{} | {}", row[0], row[1]);
+                rows.push(row);
             }
-            Ok(seen)
+            Ok(rows)
         })();
-        match verdict {
-            Ok(seen) => eprintln!("PROBE BINDING: supported — readback: {seen}"),
-            Err(e) => eprintln!("PROBE BINDING: unsupported — {e}"),
-        }
+        let rows = run.expect("PROBE BINDING unsupported");
+        assert_eq!(
+            rows.len(),
+            1,
+            "PROBE BINDING: the second bound MERGE must MATCH the first row, not create a second"
+        );
+        let row = &rows[0];
+        assert!(
+            matches!(&row[0], Value::String(s) if s == "second write"),
+            "PROBE BINDING: ON MATCH SET must carry the second bound content, got {:?}",
+            row[0]
+        );
+        let floats: Vec<f32> = match &row[1] {
+            Value::Array(_, vals) | Value::List(_, vals) => vals
+                .iter()
+                .map(|v| match v {
+                    Value::Float(f) => *f,
+                    Value::Double(d) => *d as f32,
+                    other => panic!("PROBE BINDING: embedding element not numeric: {other:?}"),
+                })
+                .collect(),
+            other => panic!("PROBE BINDING: embedding did not round-trip as an array: {other:?}"),
+        };
+        assert_eq!(
+            floats,
+            vec![0.5, 0.25, 0.0, 1.0],
+            "PROBE BINDING: FLOAT[4] array parameter must round-trip element-for-element"
+        );
+        eprintln!("PROBE BINDING: supported — asserted via bound MERGE + FLOAT[4] round-trip");
     }
 
     #[test]
@@ -8680,21 +8712,33 @@ eurostrata\src\daemon.rs",
         let path = std::env::temp_dir().join(format!("ns-t7-probe-pk-{}", uuid::Uuid::new_v4()));
         let _db = t7_raw_db(&path);
         let conn = Connection::new(&_db).expect("raw connection");
-        let verdict = (|| -> Result<i64, lbug::Error> {
-            conn.query(
-                "CREATE NODE TABLE CP (namespace STRING, id STRING, content STRING, PRIMARY KEY (namespace, id))",
-            )?;
-            conn.query("CREATE (:CP {namespace: 'a', id: 'x', content: 'one'})")?;
-            conn.query("CREATE (:CP {namespace: 'b', id: 'x', content: 'two'})")?;
-            let mut rows = conn.query("MATCH (m:CP) RETURN count(m)")?;
-            Ok(rows
-                .next()
-                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(-1))
-                .unwrap_or(-1))
-        })();
-        match verdict {
-            Ok(n) => eprintln!("PROBE COMPOSITE PK: supported — rows held: {n}"),
-            Err(e) => eprintln!("PROBE COMPOSITE PK: unsupported — {e}"),
-        }
+        // The capability under test: PRIMARY KEY (namespace, id) in the
+        // DDL, two rows sharing the id component under different
+        // namespaces, and an exact duplicate pair refused by the key.
+        conn.query(
+            "CREATE NODE TABLE CP (namespace STRING, id STRING, content STRING, PRIMARY KEY (namespace, id))",
+        )
+        .expect("PROBE COMPOSITE PK unsupported: composite-PK DDL failed");
+        conn.query("CREATE (:CP {namespace: 'a', id: 'x', content: 'one'})")
+            .expect("PROBE COMPOSITE PK unsupported: first row refused");
+        conn.query("CREATE (:CP {namespace: 'b', id: 'x', content: 'two'})")
+            .expect("PROBE COMPOSITE PK unsupported: a row sharing only the id component was refused");
+        let dup = conn.query("CREATE (:CP {namespace: 'a', id: 'x', content: 'three'})");
+        assert!(
+            dup.is_err(),
+            "PROBE COMPOSITE PK: an exact duplicate (namespace, id) pair must be refused"
+        );
+        let mut rows = conn
+            .query("MATCH (m:CP) RETURN count(m)")
+            .expect("PROBE COMPOSITE PK: count query failed");
+        let n = rows
+            .next()
+            .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(-1))
+            .unwrap_or(-1);
+        assert_eq!(
+            n, 2,
+            "PROBE COMPOSITE PK: the table must hold exactly the two distinct pairs"
+        );
+        eprintln!("PROBE COMPOSITE PK: supported — asserted via DDL + shared component + duplicate refusal");
     }
 }
