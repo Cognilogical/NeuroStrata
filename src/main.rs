@@ -406,6 +406,39 @@ fn skew_verdict(info: Option<&serde_json::Value>, own: (u64, u64)) -> Skew {
     }
 }
 
+/// The gate's identity check (Task 1, J9): before the gate trusts a
+/// /tasks/gate answer, the answering process's build fingerprint must
+/// match the build this binary expects. /health answering proves only
+/// that *something* is listening on the fixed port -- a squatter
+/// answers it too. So the gate fetches /info and compares the build
+/// fingerprint before any gate request is made. On mismatch the
+/// refusal names the expected and reported fingerprints, because
+/// "an old daemon" and "another process on the port" need different
+/// operator actions.
+///
+/// What the fingerprint proves, and what it does not: the comparison
+/// proves build identity only -- the fingerprint is computable from
+/// the readable binary; it is not a secret. The /info probe itself
+/// carries the bearer (fetch_daemon_info sends it), so the probe MAY
+/// expose the bearer to a squatter before the comparison runs. That
+/// exposure is accepted because the bearer alone unlocks nothing
+/// destructive (DR-5 leak containment).
+/// INVARIANT: the operator token is never sent to a daemon whose
+/// fingerprint has not been verified; the bearer is expendable by
+/// design (DR-5 leak containment).
+fn gate_verify_daemon(info: Option<&serde_json::Value>, own: (u64, u64)) -> Result<(), String> {
+    match skew_verdict(info, own) {
+        Skew::InSync(_) => Ok(()),
+        Skew::Stale(detail) => Err(format!(
+            "refusing to trust the daemon on 127.0.0.1:34343: this binary's build \
+             fingerprint is {:016x}/{}, and the answering process is a different \
+             build ({}) -- it may be a stale daemon or another process squatting \
+             on the port",
+            own.0, own.1, detail
+        )),
+    }
+}
+
 async fn fetch_daemon_info() -> Option<serde_json::Value> {
     let res = daemon_http_client()
         .get("http://127.0.0.1:34343/info")
@@ -2095,28 +2128,70 @@ mod tests {
         assert!(matches!(skew_verdict(Some(&info), (7, 9)), Skew::Stale(_)));
         assert!(matches!(skew_verdict(Some(&info), (6, 8)), Skew::Stale(_)));
     }
+
+    /// Task 1 (J9): the gate trusts a daemon only when /info reports the
+    /// build fingerprint of the binary on disk. A foreign fingerprint is
+    /// refused with a message naming both, and a daemon that cannot
+    /// identify itself at all is refused too -- /health answering is not
+    /// identity, and a squatter answers /health.
+    #[test]
+    fn the_gate_verifies_daemon_identity_before_trusting_it() {
+        let own = (7u64, 8u64);
+        let good = serde_json::json!({ "version": "1.11.0", "exe_hash": 7u64, "exe_len": 8u64, "started_at": 1 });
+        assert!(gate_verify_daemon(Some(&good), own).is_ok());
+
+        let foreign = serde_json::json!({ "version": "9.9.9", "exe_hash": 0xdeadu64, "exe_len": 1u64, "started_at": 2 });
+        let err = gate_verify_daemon(Some(&foreign), own).unwrap_err();
+        assert!(
+            err.contains("000000000000dead") && err.contains("0000000000000007"),
+            "the refusal must name the reported and expected fingerprints: {err}"
+        );
+
+        assert!(gate_verify_daemon(None, own).is_err());
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
 /// in a refusal an operator has to be able to copy.
 const DAEMON_ADDR: &str = "127.0.0.1:34343";
 
-/// Build an HTTP client that carries the daemon's bearer token (if available)
-/// in its default headers, so CLI proxy calls authenticate against the daemon.
-fn daemon_http_client() -> reqwest::Client {
+/// The auth headers every CLI HTTP call carries: the daemon bearer, and
+/// -- for the destructive-class commands -- the operator token (DR-5).
+fn daemon_auth_headers(with_operator: bool) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
-    let home = dirs::home_dir().unwrap_or_default();
-    let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-    if let Ok(token) = std::fs::read_to_string(&token_path) {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
-                headers.insert(reqwest::header::AUTHORIZATION, val);
+    if let Some(token) = daemon::read_token_file("daemon.token") {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+    }
+    if with_operator {
+        if let Some(operator) = daemon::read_token_file("operator.token") {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&operator) {
+                headers.insert(
+                    reqwest::header::HeaderName::from_static("x-neurostrata-operator"),
+                    val,
+                );
             }
         }
     }
+    headers
+}
+
+/// Build an HTTP client that carries the daemon's bearer token (if available)
+/// in its default headers, so CLI proxy calls authenticate against the daemon.
+fn daemon_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .default_headers(headers)
+        .default_headers(daemon_auth_headers(false))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The daemon HTTP client plus the operator token, for the CLI commands
+/// whose routes are destructive-class (/shutdown, /backup): the daemon
+/// refuses those with the bearer alone.
+fn daemon_operator_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .default_headers(daemon_auth_headers(true))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -2453,7 +2528,9 @@ async fn run() -> anyhow::Result<()> {
                     DaemonProbe::Responsive => {}
                 }
 
-                let client = daemon_http_client();
+                // /shutdown is destructive-class: the operator client, or
+                // the daemon refuses the request (DR-5).
+                let client = daemon_operator_client();
                 // A busy daemon may not answer this either. That is not a
                 // failure: the request is queued, so fall through to the wait.
                 if probe != DaemonProbe::Absent {
@@ -2597,7 +2674,8 @@ async fn run() -> anyhow::Result<()> {
                 // The database is single-writer. When a daemon holds it, ask the
                 // daemon to do the work rather than fighting it for the lock.
                 if daemon_running {
-                    let res = daemon_http_client()
+                    // /backup is destructive-class: bearer + operator (DR-5).
+                    let res = daemon_operator_client()
                         .post("http://127.0.0.1:34343/backup")
                         .json(&serde_json::json!({ "dir": dir }))
                         .send()
@@ -2745,30 +2823,52 @@ async fn run() -> anyhow::Result<()> {
                     let outcome: Result<serde_json::Value, String> = if probe
                         == DaemonProbe::Responsive
                     {
-                        match daemon_http_client()
-                            .post("http://127.0.0.1:34343/tasks/gate")
-                            .json(&serde_json::json!({
-                                "namespace": namespace,
-                                "strict": strict,
-                            }))
-                            .timeout(std::time::Duration::from_secs(10))
-                            .send()
-                            .await
-                        {
-                            Ok(resp) if resp.status().is_success() => match resp.text().await {
-                                Ok(body) => serde_json::from_str::<serde_json::Value>(&body)
-                                    .map_err(|e| {
-                                        format!("the daemon's gate reply could not be read: {}", e)
-                                    }),
+                        // Identity before trust (Task 1, J9): verify the
+                        // answering process is the expected daemon build
+                        // via /info before sending the gate request or
+                        // believing its answer -- a squatter on the port
+                        // answers /health too, and would harvest the
+                        // bearer token the gate request carries.
+                        match gate_verify_daemon(
+                            fetch_daemon_info().await.as_ref(),
+                            daemon::exe_fingerprint(),
+                        ) {
+                            Err(e) => Err(e),
+                            Ok(()) => match daemon_http_client()
+                                .post("http://127.0.0.1:34343/tasks/gate")
+                                .json(&serde_json::json!({
+                                    "namespace": namespace,
+                                    "strict": strict,
+                                }))
+                                .timeout(std::time::Duration::from_secs(10))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    match resp.text().await {
+                                        Ok(body) => {
+                                            serde_json::from_str::<serde_json::Value>(&body)
+                                                .map_err(|e| {
+                                                    format!(
+                                                        "the daemon's gate reply could not be read: {}",
+                                                        e
+                                                    )
+                                                })
+                                        }
+                                        Err(e) => Err(format!(
+                                            "the daemon's gate reply could not be read: {}",
+                                            e
+                                        )),
+                                    }
+                                }
+                                Ok(resp) => Err(format!(
+                                    "the daemon answered {} on /tasks/gate",
+                                    resp.status()
+                                )),
                                 Err(e) => {
-                                    Err(format!("the daemon's gate reply could not be read: {}", e))
+                                    Err(format!("the request to the daemon failed: {}", e))
                                 }
                             },
-                            Ok(resp) => Err(format!(
-                                "the daemon answered {} on /tasks/gate",
-                                resp.status()
-                            )),
-                            Err(e) => Err(format!("the request to the daemon failed: {}", e)),
                         }
                     } else {
                         match Config::from_default_path() {

@@ -71,13 +71,42 @@ fn save_project_path(path: String) {
 /// stopped mid-walk without ever reaching relink_edges. What the user saw was a
 /// graph frozen half-built with no GOVERNS edges, a daemon still answering
 /// /health, and no error anywhere (bead neurostrata-zbw).
+/// Read one of the daemon's token files (`daemon.token`,
+/// `operator.token`) from the daemon's config directory.
+///
+/// The backend is a first-party local client running as the operator's
+/// UID -- the class the daemon's threat model (Task 1, DR-5) trusts by
+/// design -- so it holds both tokens and attaches them to its daemon
+/// requests. The web-ui holds NO token material: it never reads these
+/// files, holds no token, and reaches the daemon only through these
+/// backend commands.
+fn daemon_token_file(name: &str) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let content = fs::read_to_string(home.join(".config").join("neurostrata").join(name)).ok()?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Client, String> {
+    // The daemon requires its bearer on every route but /health; attach
+    // it as a default header so every backend call authenticates.
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = daemon_token_file("daemon.token") {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+    }
     reqwest::blocking::Client::builder()
         // Separate from the call's own bound: a port with nothing behind it
         // hangs rather than refusing here, so without this a daemon that is not
         // running is indistinguishable from one that is merely busy.
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(timeout)
+        .default_headers(headers)
         .build()
         .map_err(|e| e.to_string())
 }
@@ -225,11 +254,18 @@ fn delete_memory(namespace: String, id: String) -> Result<String, String> {
     ensure_daemon()?;
     
     let client = daemon_client(QUERY_TIMEOUT)?;
-    let resp = client.post("http://127.0.0.1:34343/delete")
+    // /delete is destructive-class on the daemon: it additionally
+    // requires the operator token (Task 1, DR-5). The backend holds it
+    // as a first-party same-UID client; the web-ui never sees it.
+    let mut request = client.post("http://127.0.0.1:34343/delete")
         .json(&serde_json::json!({
             "namespace": namespace,
             "id": id
-        }))
+        }));
+    if let Some(operator) = daemon_token_file("operator.token") {
+        request = request.header("x-neurostrata-operator", operator);
+    }
+    let resp = request
         .send()
         .map_err(|e| e.to_string())?;
 

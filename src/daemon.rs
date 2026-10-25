@@ -12,55 +12,241 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-/// Load or create the per-user daemon bearer token. Stored at
-/// `~/.config/neurostrata/daemon.token` with mode 0600.
-pub(crate) fn load_or_create_daemon_token() -> String {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-    let config_dir = home.join(".config").join("neurostrata");
-    let _ = std::fs::create_dir_all(&config_dir);
-    let token_path = config_dir.join("daemon.token");
-    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+/// The daemon's token directory: `~/.config/neurostrata`, the directory
+/// that also holds `embedders.json`.
+fn token_config_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join(".config").join("neurostrata")
+}
+
+/// A fresh token: two v4 UUIDs' raw bytes, hex-encoded (64 chars) --
+/// ~244 bits of CSPRNG entropy (122 per UUID after the version and
+/// variant bits). uuid draws v4 randomness from the operating system's
+/// RNG (getrandom). Never a clock, a counter, or a hash of anything
+/// guessable.
+fn generate_token() -> String {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Load a token file, or create it holding a fresh token at mode 0600.
+///
+/// Lockout recovery (the documented path): stop the daemon, delete
+/// `daemon.token` and `operator.token` from this directory, restart --
+/// both are regenerated, and the operator reads the new values from the
+/// files. No token value is ever logged or returned by any route.
+/// Tighten an existing token file to 0600 when it is looser. Token
+/// files predate the atomic-0600 creation below in some installs; a
+/// group- or world-readable token hands the credential to exactly the
+/// readers the file exists to exclude.
+#[cfg(unix)]
+fn tighten_token_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        if metadata.permissions().mode() & 0o077 != 0 {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+fn load_or_create_token_file(path: &Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
         let trimmed = existing.trim().to_string();
         if !trimmed.is_empty() {
+            #[cfg(unix)]
+            tighten_token_permissions(path);
             return trimmed;
         }
     }
-    // Generate a new token
-    let token = uuid::Uuid::new_v4().to_string();
-    let _ = std::fs::write(&token_path, &token);
+    let token = generate_token();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Mode 0600 at creation, atomically: the file never exists at a
+        // looser mode, not even for the write-then-chmod window.
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| f.write_all(token.as_bytes()));
+        if created.is_err() {
+            let _ = std::fs::write(path, &token);
+            tighten_token_permissions(path);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, &token);
     }
     token
 }
 
-/// Axum middleware that enforces bearer-token authentication on all routes
-/// except `/health`. The expected token is read from `AppState::daemon_token`.
+/// Load or create the per-user daemon bearer <redacted> Stored at
+/// `~/.config/neurostrata/daemon.token` with mode 0600.
+pub(crate) fn load_or_create_daemon_token() -> String {
+    load_or_create_token_file(&token_config_dir().join("daemon.token"))
+}
+
+/// Load or create the daemon's operator token (DR-5): the second token
+/// file, required in addition to the bearer on the destructive routes
+/// (/delete, /shutdown, /backup). Stored at
+/// `~/.config/neurostrata/operator.token` with mode 0600.
+///
+/// What the split does and does not do: it retires the
+/// leaked-single-credential case -- a leaked bearer alone cannot delete,
+/// shut down, or back up -- and nothing more. Any process running as
+/// the operator's UID can read both files, so against a local attacker
+/// the operator token is a second file, not a second factor. Same-UID
+/// local processes remain trusted by design (loopback architecture).
+pub(crate) fn load_or_create_operator_token() -> String {
+    load_or_create_token_file(&token_config_dir().join("operator.token"))
+}
+
+/// Read a token file's contents for a client: the trimmed value, or None
+/// when no usable token is there. Creation is the daemon's job; clients
+/// only read.
+pub(crate) fn read_token_file(name: &str) -> Option<String> {
+    let content = std::fs::read_to_string(token_config_dir().join(name)).ok()?;
+    let trimmed = content.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Constant-time equality for credential comparison: a wrong token must
+/// not leak how much of it was right through response timing.
+fn token_eq(provided: &str, expected: &str) -> bool {
+    let a = provided.as_bytes();
+    let b = expected.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Whether a Host or Origin authority names this machine: `127.0.0.1`,
+/// `localhost`, or `[::1]`, with any port (or none). An absent Host is
+/// not passed here at all (the middleware skips the check): hyper
+/// rejects Host-less HTTP/1.1 before routing, and the *hostname* --
+/// never the port -- is the rebinding defense.
+fn is_loopback_host(value: &str) -> bool {
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else if value == "::1" {
+        "::1"
+    } else {
+        value.split(':').next().unwrap_or(value)
+    };
+    matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost")
+}
+
+fn forbidden(body: &'static str) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::FORBIDDEN)
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+fn unauthorized() -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(axum::http::StatusCode::UNAUTHORIZED)
+        .body(axum::body::Body::from(
+            "unauthorized -- the daemon requires the bearer token from daemon.token \
+             in its config directory; if you are locked out, stop the daemon, delete \
+             daemon.token and operator.token there, and restart (they are regenerated)",
+        ))
+        .unwrap()
+}
+
+/// Axum middleware that decides whether a caller may use the daemon at
+/// all -- the one place caller trust is decided (Task 1). Rules, in
+/// order:
+/// 1. The `Host` header must name loopback -- otherwise **403**. A
+///    DNS-rebinding page makes the browser send the attacker's hostname
+///    here; a local tool never does.
+/// 2. An `Origin` header, when present, must name loopback -- otherwise
+///    **403**. Browsers send Origin on cross-origin POSTs; a local tool
+///    that sends one sends its own loopback origin.
+/// 3. Every route except `/health` requires `Authorization: Bearer
+///    <daemon token>` -- missing or wrong is **401**.
+/// 4. The destructive routes (/delete, /shutdown, /backup) additionally
+///    require the operator token in `X-NeuroStrata-Operator` -- missing
+///    or wrong is **403**.
+///
+/// The threat split (DR-5): the tokens are a browser/DNS-rebinding
+/// defense plus single-credential leak containment; same-UID local
+/// processes remain trusted by design (loopback architecture).
 async fn auth_middleware(
     State(state): State<AppState>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let headers = req.headers();
+
+    // Rules 1-2 bind every route, /health included: a rebinding page is
+    // refused before any handler runs.
+    if let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !is_loopback_host(host) {
+            return forbidden("forbidden -- Host must name loopback");
+        }
+    }
+    if let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        let authority = origin.split("://").nth(1).unwrap_or(origin);
+        if !is_loopback_host(authority) {
+            return forbidden("forbidden -- Origin must name loopback");
+        }
+    }
+
     // /health is unauthenticated so liveness probes work.
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
-    let provided = req
-        .headers()
+
+    let provided = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match provided {
-        Some(tok) if tok == state.daemon_token => next.run(req).await,
-        _ => {
-            axum::response::Response::builder()
-                .status(axum::http::StatusCode::UNAUTHORIZED)
-                .body(axum::body::Body::from("unauthorized"))
-                .unwrap()
+        Some(tok) if token_eq(tok, &state.daemon_token) => {}
+        _ => return unauthorized(),
+    }
+
+    if matches!(req.uri().path(), "/delete" | "/shutdown" | "/backup") {
+        let operator = headers
+            .get("x-neurostrata-operator")
+            .and_then(|v| v.to_str().ok());
+        match operator {
+            Some(tok) if token_eq(tok, &state.operator_token) => {}
+            _ => {
+                return forbidden(
+                    "forbidden -- this route also requires the operator token \
+                     (X-NeuroStrata-Operator; see operator.token in the config directory)",
+                )
+            }
         }
     }
+
+    next.run(req).await
 }
 
 /// How often the daemon flushes to durable storage. Anything written between
@@ -121,6 +307,10 @@ struct AppState {
     /// Per-user bearer token for authenticating HTTP requests. Generated on
     /// daemon startup and persisted to ~/.config/neurostrata/daemon.token.
     daemon_token: String,
+    /// The operator token (DR-5), required in addition to the bearer on
+    /// the destructive routes (/delete, /shutdown, /backup). Persisted to
+    /// ~/.config/neurostrata/operator.token.
+    operator_token: String,
 }
 
 #[derive(Deserialize)]
@@ -559,6 +749,9 @@ pub(crate) async fn start_daemon_on(
     // Generate or load the per-user daemon bearer token. Stored at
     // ~/.config/neurostrata/daemon.token (mode 0600) so CLI clients can read it.
     let daemon_token = load_or_create_daemon_token();
+    // The operator token (DR-5), same directory and mode: the destructive
+    // routes require it in addition to the bearer.
+    let operator_token = load_or_create_operator_token();
 
     // The thalamic bus, built before anything can serve -- a request that
     // lands on the first accepted connection emits into a wired bus or
@@ -593,10 +786,11 @@ pub(crate) async fn start_daemon_on(
             started_at: chrono::Utc::now().timestamp(),
         },
         daemon_token: daemon_token.clone(),
+        operator_token: operator_token.clone(),
     };
 
     let app = Router::new()
-        .route("/health", get(|| async { "OK" }))
+        .route("/health", get(|| async { "ok" }))
         .route("/info", get(handle_info))
         .route("/graph", get(handle_get_graph))
         .route("/ingest", post(handle_ingest))
@@ -1758,18 +1952,7 @@ impl crate::traits::AsAny for RecordingStore {
             None,
         ));
         let base = format!("http://{addr}");
-        let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
-            let trimmed = token.trim();
-            if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
-                    headers.insert(reqwest::header::AUTHORIZATION, val);
-                }
-            }
-        }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::new();
 
         // Wait for the listener to answer at all; a daemon that could not
         // bind fails its own join below rather than hanging here.
@@ -1788,6 +1971,36 @@ impl crate::traits::AsAny for RecordingStore {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(serving, "daemon never started serving on {addr}");
+
+        // The authenticated client is built only AFTER the daemon answers:
+        // the daemon creates daemon.token during startup, and reading the
+        // file before then races creation -- on a fresh HOME (CI) the file
+        // does not exist yet, the client goes out tokenless, and every
+        // authenticated route answers 401.
+        let mut headers = reqwest::header::HeaderMap::new();
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                    headers.insert(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
+        // The helper client is the operator's own client: it also carries
+        // the operator token, so the destructive routes (its /shutdown
+        // cleanup above all) keep working under the operator tier.
+        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        if let Ok(operator) = std::fs::read_to_string(&operator_path) {
+            let trimmed = operator.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(trimmed) {
+                    headers.insert("x-neurostrata-operator", val);
+                }
+            }
+        }
+        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
 
         let response = client
             .post(format!("{base}/bus/metrics"))
@@ -1833,18 +2046,7 @@ impl crate::traits::AsAny for RecordingStore {
             None,
         ));
         let base = format!("http://{addr}");
-        let mut headers = reqwest::header::HeaderMap::new();
-        let home = dirs::home_dir().unwrap_or_default();
-        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-        if let Ok(token) = std::fs::read_to_string(&token_path) {
-            let trimmed = token.trim();
-            if !trimmed.is_empty() {
-                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
-                    headers.insert(reqwest::header::AUTHORIZATION, val);
-                }
-            }
-        }
-        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::new();
 
         // Wait for the listener to answer at all; a daemon that could not bind
         // fails its own join below rather than hanging here.
@@ -1863,6 +2065,39 @@ impl crate::traits::AsAny for RecordingStore {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(serving, "daemon never started serving on {addr}");
+
+        // The authenticated client is built only AFTER the daemon answers:
+        // the daemon creates daemon.token during startup, and reading the
+        // file before then races creation -- on a fresh HOME (CI) the file
+        // does not exist yet, the client goes out tokenless, and every
+        // authenticated route answers 401. That race is the baseline-red
+        // folded into Task 1: the archive-route test failed 401-for-404 in
+        // CI while passing wherever a token file already existed.
+        let mut headers = reqwest::header::HeaderMap::new();
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_path = home.join(".config").join("neurostrata").join("daemon.token");
+        if let Ok(token) = std::fs::read_to_string(&token_path) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
+                    headers.insert(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
+        // The helper client is the operator's own client: it also carries
+        // the operator token, so the destructive routes (its /shutdown
+        // cleanup above all) keep working under the operator tier.
+        let operator_path = home.join(".config").join("neurostrata").join("operator.token");
+        if let Ok(operator) = std::fs::read_to_string(&operator_path) {
+            let trimmed = operator.trim();
+            if !trimmed.is_empty() {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(trimmed) {
+                    headers.insert("x-neurostrata-operator", val);
+                }
+            }
+        }
+        let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+
         (base, client, daemon)
     }
 
@@ -1872,6 +2107,241 @@ impl crate::traits::AsAny for RecordingStore {
         tokio::task::JoinHandle<anyhow::Result<()>>,
     ) {
         spawn_test_daemon_with(Arc::new(RecordingStore::default())).await
+    }
+
+    /// A client with NO default credentials: whatever a trust test asserts
+    /// was set by the test itself, never smuggled in by a helper's defaults.
+    fn bare_client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    /// The contents of one of the daemon's token files, or "" if it cannot
+    /// be read -- the same read every first-party client performs.
+    fn token_file(name: &str) -> String {
+        let home = dirs::home_dir().unwrap_or_default();
+        std::fs::read_to_string(home.join(".config").join("neurostrata").join(name))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn bearer(token: &str) -> reqwest::header::HeaderValue {
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap()
+    }
+
+    /// Stop a spawned test daemon the way an authorized operator would:
+    /// bearer + operator headers on /shutdown, then require the task to
+    /// finish. (Against a daemon without the operator tier the extra header
+    /// is ignored, so the same cleanup works on both sides of the change.)
+    async fn stop_test_daemon(
+        base: &str,
+        daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let client = bare_client();
+        let _ = client
+            .post(format!("{base}/shutdown"))
+            .header(reqwest::header::AUTHORIZATION, bearer(&token_file("daemon.token")))
+            .header("x-neurostrata-operator", token_file("operator.token"))
+            .send()
+            .await;
+        daemon.await.unwrap().unwrap();
+    }
+
+    /// Task 1: no credential at all is a 401 on authenticated routes --
+    /// a representative read route and /mcp, the product's primary surface.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_without_token_is_401() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+
+        let info = client.get(format!("{base}/info")).send().await.unwrap();
+        assert_eq!(info.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let mcp = client
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: a wrong credential is the same 401 as none -- the refusal
+    /// must not distinguish "no token" from "wrong token".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_with_wrong_token_is_401() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+
+        let info = client
+            .get(format!("{base}/info"))
+            .header(reqwest::header::AUTHORIZATION, bearer("not-the-daemon-token"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(info.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1 (DR-5): the destructive routes refuse a bearer-only caller
+    /// with 403, and accept bearer+operator. The bearer alone must not be
+    /// able to delete, shut down, or back up: a leaked single credential
+    /// cannot do the irreversible things.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn destructive_routes_require_the_operator_token() {
+        let store = Arc::new(RecordingStore::holding("trust-test", "m1", "fact"));
+        let (base, _authed, daemon) = spawn_test_daemon_with(store).await;
+        let client = bare_client();
+        let daemon_token = token_file("daemon.token");
+        let operator_token = token_file("operator.token");
+
+        for (route, body) in [
+            ("/delete", serde_json::json!({"namespace": "trust-test", "id": "m1"})),
+            ("/backup", serde_json::json!({"dir": "/tmp/ns-trust-backup"})),
+        ] {
+            let refused = client
+                .post(format!("{base}{route}"))
+                .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                refused.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "{route} with the bearer alone must be 403"
+            );
+        }
+
+        let refused_shutdown = client
+            .post(format!("{base}/shutdown"))
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused_shutdown.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "/shutdown with the bearer alone must be 403"
+        );
+        let health = client.get(format!("{base}/health")).send().await.unwrap();
+        assert!(
+            health.status().is_success(),
+            "the daemon must survive a refused shutdown"
+        );
+
+        let deleted = client
+            .post(format!("{base}/delete"))
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .header("x-neurostrata-operator", operator_token)
+            .json(&serde_json::json!({"namespace": "trust-test", "id": "m1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted.status(),
+            axum::http::StatusCode::OK,
+            "bearer + operator must delete"
+        );
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: the DNS-rebinding leg. A request whose Host is not loopback
+    /// is refused before any handler runs -- even with a valid token -- and
+    /// a browser Origin from a hostile site is refused on the same terms.
+    /// A loopback Origin (a local tool) is not the browser attack and
+    /// passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hostile_host_and_origin_are_403_even_with_a_valid_token() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+        let daemon_token = token_file("daemon.token");
+
+        let hostile_host = client
+            .get(format!("{base}/info"))
+            .header(reqwest::header::HOST, "evil.example")
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hostile_host.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let hostile_origin = client
+            .post(format!("{base}/mcp"))
+            .header(reqwest::header::ORIGIN, "https://evil.example")
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hostile_origin.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let loopback_origin = client
+            .get(format!("{base}/info"))
+            .header(reqwest::header::ORIGIN, "http://127.0.0.1:34343")
+            .header(reqwest::header::AUTHORIZATION, bearer(&daemon_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            loopback_origin.status(),
+            axum::http::StatusCode::OK,
+            "a loopback Origin is a local tool, not a rebinding page"
+        );
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: /health stays unauthenticated -- liveness probes (the
+    /// watchdog, setup's curl) carry no credential -- and it answers
+    /// liveness ONLY: status 200, body exactly "ok", no version, no data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_is_open_and_minimal() {
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let client = bare_client();
+
+        let health = client.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(health.status(), axum::http::StatusCode::OK);
+        let body = health.text().await.unwrap();
+        assert_eq!(body, "ok", "/health must answer liveness only, got: {body}");
+
+        // Open is not unguarded: rules 1-2 bind /health too, so a
+        // hostile Host gets 403 -- a rebinding page is not a probe.
+        let hostile_host = client
+            .get(format!("{base}/health"))
+            .header(reqwest::header::HOST, "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hostile_host.status(), axum::http::StatusCode::FORBIDDEN);
+
+        stop_test_daemon(&base, daemon).await;
+    }
+
+    /// Task 1: both token files exist with owner-only permissions. The
+    /// whole design is "a page cannot read the filesystem"; a world- or
+    /// group-readable token file would give the credential to exactly the
+    /// readers it exists to exclude.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_files_have_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let home = dirs::home_dir().unwrap_or_default();
+        for name in ["daemon.token", "operator.token"] {
+            let path = home.join(".config").join("neurostrata").join(name);
+            let metadata = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{name} must exist once the daemon runs: {e}"));
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "{name} must be mode 0600"
+            );
+        }
+        stop_test_daemon(&base, daemon).await;
     }
 
     /// `POST /memory/archive` must reach the one handler the MCP tool surface

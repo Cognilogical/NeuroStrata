@@ -922,24 +922,20 @@ async fn answer_with_error(
     }
 }
 
-pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = BufReader::new(stdin).lines();
-    let mut writer = stdout;
-
+/// The proxy's HTTP client. It carries the daemon bearer token (read
+/// from the token file the daemon maintains) in its default headers:
+/// without it, every forwarded /mcp call is a 401 against the daemon's
+/// auth middleware -- the Task 1 F1 regression, in which the product's
+/// primary client surface went dark the moment the daemon learned to
+/// authenticate.
+fn proxy_client() -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
-    let home = dirs::home_dir().unwrap_or_default();
-    let token_path = home.join(".config").join("neurostrata").join("daemon.token");
-    if let Ok(token) = std::fs::read_to_string(&token_path) {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", trimmed)) {
-                headers.insert(reqwest::header::AUTHORIZATION, val);
-            }
+    if let Some(token) = crate::daemon::read_token_file("daemon.token") {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
         }
     }
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         // Separate from the overall bound on purpose. A port with nothing behind
         // it hangs rather than refusing on this machine -- the same behaviour
         // DaemonProbe in main.rs exists to describe -- so without this, a daemon
@@ -949,7 +945,28 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(proxy_timeout())
         .build()
-        .unwrap();
+        .unwrap()
+}
+
+/// One forwarding attempt: POST the JSON-RPC request to the daemon's
+/// /mcp endpoint with the proxy client. The startup-wait loop in
+/// `start_mcp_proxy` retries this on connect errors while the daemon is
+/// still starting.
+async fn forward_mcp_request(
+    client: &reqwest::Client,
+    url: &str,
+    request: &Value,
+) -> reqwest::Result<reqwest::Response> {
+    client.post(url).json(request).send().await
+}
+
+pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::new(stdin).lines();
+    let mut writer = stdout;
+
+    let client = proxy_client();
 
     // Whether anything has ever answered on the port. Until something has, a
     // daemon we spawned ourselves is presumed to be still starting; after it
@@ -988,11 +1005,8 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
         // reports every tool as broken.
         let waiting_since = std::time::Instant::now();
         let response = loop {
-            let attempt = client
-                .post("http://127.0.0.1:34343/mcp")
-                .json(&request)
-                .send()
-                .await;
+            let attempt =
+                forward_mcp_request(&client, "http://127.0.0.1:34343/mcp", &request).await;
 
             let still_starting = should_wait_for_startup(
                 daemon_has_answered,
@@ -3373,6 +3387,69 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// Task 1 (F1/FM-2 regression): the stdio proxy's client must carry
+    /// the daemon bearer token, or every proxied MCP session is a 401
+    /// against the token-enforcing daemon -- the proxy is the product's
+    /// primary client surface. A recording stub stands in for the daemon
+    /// and captures the Authorization header of the forwarded request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_forwards_the_daemon_bearer_token() {
+        use std::io::{BufRead, Read, Write};
+
+        // The token the daemon would have created and the proxy must read.
+        let expected = crate::daemon::load_or_create_daemon_token();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut auth = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    break;
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if lower.starts_with("authorization:") {
+                    // The value is compared exactly, so take it from the
+                    // original line -- only the name match is folded.
+                    auth = trimmed["authorization:".len()..].trim().to_string();
+                }
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if content_length > 0 {
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+            }
+            let response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            reader.get_mut().write_all(response.as_bytes()).unwrap();
+            auth
+        });
+
+        let client = proxy_client();
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let url = format!("http://{addr}/mcp");
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+        let auth = stub.join().unwrap();
+        assert_eq!(
+            auth,
+            format!("Bearer {expected}"),
+            "the proxy must forward the daemon bearer token"
+        );
+    }
 
     #[test]
     fn locations_preserve_opaque_source_context_without_interpreting_it() {
