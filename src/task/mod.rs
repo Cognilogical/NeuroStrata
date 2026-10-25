@@ -1746,6 +1746,13 @@ if [ $code -eq 1 ]; then
     echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
     exit 1
 fi
+# A 2 here is never a verdict: under --strict the gate itself exits
+# only 0 or 1, so a 2 means the binary that answered was stale,
+# foreign, or died before it could report. Announced, never silent —
+# and it still does not block (0 and 2 pass, per the exit line below).
+if [ $code -eq 2 ]; then
+    echo "warning: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push; proceeding without it" >&2
+fi
 
 # ── project guards (add yours here) ────────────────────────────────────────
 # Add the path of each local guard; it runs before every push on every host.
