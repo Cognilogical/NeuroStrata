@@ -5736,7 +5736,7 @@ impl crate::traits::AsAny for ListHidingStore {
     }
 
     #[tokio::test]
-    async fn setup_on_a_clean_project_suggests_the_plain_hook_and_no_conflicts() {
+    async fn setup_on_a_clean_project_suggests_the_plain_hook_and_flags_the_seeded_overlap() {
         let root = std::env::temp_dir().join(format!("ns-setup-clean-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
         std::fs::write(root.join("package.json"), "{}").unwrap();
@@ -5750,7 +5750,19 @@ impl crate::traits::AsAny for ListHidingStore {
         .await;
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
 
-        assert_eq!(parsed["conflicts"], json!([]));
+        // R16 made ARRAY_DISTANCE bind whole-number vectors (the stub
+        // embedder's), so the setup search now finds the seeded rule and the
+        // overlap is reported -- the binder working as intended, not a
+        // conflict-free project. Pre-R16 the query errored and setup
+        // swallowed it, so this expectation read as no conflicts.
+        let conflicts = parsed["conflicts"].as_array().expect("conflicts list");
+        assert_eq!(conflicts.len(), 1, "conflicts: {:?}", parsed["conflicts"]);
+        assert_eq!(conflicts[0]["kind"], json!("suggested_rule_overlap"));
+        assert_eq!(conflicts[0]["existing"], json!("always use podman"));
+        assert_eq!(
+            conflicts[0]["suggestion"],
+            json!("JavaScript/TypeScript project: install from the lockfile and keep the package scripts (test, lint) green before pushing.")
+        );
         assert_eq!(parsed["tasks_created"], json!([]));
         assert_eq!(
             parsed["instructions"][0]["cmd"],
