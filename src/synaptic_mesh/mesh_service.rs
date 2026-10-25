@@ -719,14 +719,38 @@ pub fn handle_mesh_tool_call(name: &str, arguments: &Value) -> String {
     handle_mesh_tool_call_with_base(name, arguments, &conventional_base_root())
 }
 
+/// Resolve the project root a mesh tool call acts on (Task 2 / J6): the
+/// caller's `project_root` is canonicalized, and the canonical path is the
+/// ONLY value the service may use — never the verbatim string, whose `..`
+/// spellings and symlink aliases would each name a different anchor for
+/// the same project. A root that cannot be canonicalized does not exist on
+/// this machine and is refused as foreign. No `project_root` at all
+/// resolves the way the daemon resolves its own root (environment, then
+/// working directory), so the fallback and the daemon can never disagree
+/// about which project a rootless call means.
+pub fn resolve_mesh_project_root(arguments: &Value) -> Result<PathBuf, String> {
+    match arguments.get("project_root").and_then(|v| v.as_str()) {
+        Some(raw) => std::fs::canonicalize(raw).map_err(|e| {
+            format!(
+                "error: project_root {raw} cannot be resolved ({e}); the mesh \
+                 tools act on the canonical project root, so pass a project \
+                 root that exists on this machine"
+            )
+        }),
+        None => {
+            let resolved = crate::daemon::resolve_project_root();
+            Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
+        }
+    }
+}
+
 /// Test-seam variant: same dispatch, explicit base root. Tests pass a scratch
 /// dir so a mesh never lands under the developer's real home.
 pub fn handle_mesh_tool_call_with_base(name: &str, arguments: &Value, base_root: &Path) -> String {
-    let project_root = arguments
-        .get("project_root")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let project_root = match resolve_mesh_project_root(arguments) {
+        Ok(root) => root,
+        Err(e) => return e,
+    };
     let node_id = arguments
         .get("node_id")
         .and_then(|v| v.as_str())
@@ -939,6 +963,34 @@ mod tests {
         let out = handle_mesh_tool_call("neurostrata_synaptic_mesh_bogus", &json!({}));
         assert!(out.starts_with("error:"), "reply: {out}");
         assert!(out.contains("unknown"));
+    }
+
+    /// Task 2 (J6): the service acts on the CANONICAL project root, never
+    /// the caller's verbatim spelling — a path spelled through a
+    /// subdirectory and back (`sub/../`) names the same project and gets
+    /// the same answer as the canonical spelling.
+    #[test]
+    fn mesh_project_root_spelling_resolves_to_the_canonical_project() {
+        let base = scratch("canon-base");
+        let project = scratch("canon-proj");
+        let init = handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_init",
+            &json!({"name": "canon-mesh", "namespace": ["c"], "project_root": project, "node_id": "cn"}),
+            &base,
+        );
+        assert!(init.contains("mesh created"), "init reply: {init}");
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let spelled = format!("{}/../", sub.display());
+        let status = handle_mesh_tool_call_with_base(
+            "neurostrata_synaptic_mesh_status",
+            &json!({"project_root": spelled}),
+            &base,
+        );
+        assert!(
+            status.contains("canon-mesh"),
+            "the canonical project answers, whatever the spelling: {status}"
+        );
     }
 
     #[test]
