@@ -14,10 +14,7 @@
       "allow": [
         { "url": "^vscode://.*" },
         { "url": "^cursor://.*" },
-        { "url": "^obsidian://.*" },
-        { "url": "^https?://.*" },
-        { "url": "^file://.*" },
-        { "url": "^/.*" }
+        { "url": "^https?://.*" }
       ]
     }
   ]
