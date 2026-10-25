@@ -2655,9 +2655,16 @@ impl crate::traits::AsAny for RecordingStore {
             .unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
         let body = res.text().await.unwrap();
-        assert!(!body.contains("ERROR"), "the write itself succeeds: {body}");
+        assert!(
+            body.contains("Successfully added memory"),
+            "the write itself succeeds: {body}"
+        );
 
         let buffer_b = root_b
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        let buffer_a = root_a
             .join(".NeuroStrata")
             .join("sessions")
             .join("current.md");
@@ -2672,14 +2679,22 @@ impl crate::traits::AsAny for RecordingStore {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            echoed.contains("pointer echo"),
-            "the pointer lands in the second project's own buffer: {echoed:?}"
-        );
-        let buffer_a = root_a
-            .join(".NeuroStrata")
-            .join("sessions")
-            .join("current.md");
+        if !echoed.contains("pointer echo") {
+            // Name where the echo actually went before failing: the bus
+            // metrics say whether a pulse was dispatched at all, and the
+            // startup buffer says whether it landed in the wrong project.
+            let metrics = client
+                .post(format!("{base}/bus/metrics"))
+                .send()
+                .await
+                .and_then(|r| r.text().await)
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let text_a = std::fs::read_to_string(&buffer_a).unwrap_or_default();
+            panic!(
+                "the pointer lands in the second project's own buffer: {echoed:?}; \
+                 bus metrics: {metrics}; startup project's buffer: {text_a:?}"
+            );
+        }
         if let Ok(text_a) = std::fs::read_to_string(&buffer_a) {
             assert!(
                 !text_a.contains("pointer echo"),
