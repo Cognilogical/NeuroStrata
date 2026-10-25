@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +19,11 @@ pub struct AcceptableEmbedder {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_model: Option<String>,
+    /// Optional SHA-256 pin over the model's downloaded artifact set
+    /// (Task 9 / DR-7). Absent = unpinned: the computed pin is recorded
+    /// as a PIN-CANDIDATE at load instead of being enforced.
+    #[serde(default)]
+    pub artifact_pin: Option<String>,
 }
 
 fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
@@ -52,6 +57,7 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
             base_url: None,
             api_key_env: None,
             api_model: None,
+            artifact_pin: None,
         },
         AcceptableEmbedder {
             model_name: "BGEBaseENV15".to_string(),
@@ -59,6 +65,7 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
             base_url: None,
             api_key_env: None,
             api_model: None,
+            artifact_pin: None,
         },
     ];
 
@@ -112,6 +119,31 @@ fn configured_model() -> Result<AcceptableEmbedder> {
         .clone())
 }
 
+/// Resolve an embedders.json model name to the fastembed model it names.
+///
+/// Extraction seam (Task 9): this preserves today's behavior exactly —
+/// an unrecognized name silently falls back to NomicEmbedTextV15. The
+/// unknown-name refusal is pinned by tests against this seam and lands
+/// on it; nothing else resolves model names.
+fn resolve_embedding_model(model_name: &str) -> Result<EmbeddingModel> {
+    Ok(EmbeddingModel::from_str(model_name).unwrap_or(EmbeddingModel::NomicEmbedTextV15))
+}
+
+/// The artifact-pin gate for one model's artifact directory (Task 9).
+///
+/// Placeholder seam: accepts everything today. The pin comparison —
+/// refuse when `recorded_pin` does not match the artifact set in
+/// `model_dir`, record a PIN-CANDIDATE when it is None — is pinned by
+/// tests against this seam and lands on it.
+#[allow(dead_code)]
+fn enforce_artifact_pin(
+    _model_dir: &Path,
+    _recorded_pin: Option<&str>,
+    _model_name: &str,
+) -> Result<()> {
+    Ok(())
+}
+
 /// The embedding width of the configured model, without loading the model.
 ///
 /// Backup and restore need only this number to open the store. Loading the model
@@ -135,8 +167,7 @@ impl FastEmbedder {
     pub fn new() -> Result<Self> {
         let target_model = configured_model()?;
 
-        let model_enum = EmbeddingModel::from_str(&target_model.model_name)
-            .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
+        let model_enum = resolve_embedding_model(&target_model.model_name)?;
 
         let cache_dir = find_existing_cache_dir();
 
