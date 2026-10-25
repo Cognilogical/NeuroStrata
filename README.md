@@ -44,7 +44,7 @@ Want different infrastructure? Declare an embedding bridge in `embedders.json` �
 
 LadybugDB is the embedded engine. All vectors, graph edges, and source pointers live inside it. Two optional judgment layers sit on top, but neither replaces the database:
 
-- **Laya** is the local ONNX judgment interface. Its duplicate-judgment path currently returns empty results. That is not a bug — it is proof that embedded retrieval operates independently and never blocks on local model weights. The system works fully offline with zero judgment-layer output.
+- **Laya** is the local ONNX judgment interface. Inference is not implemented in this build: the provider validates a model bundle's manifest, but its duplicate-judgment call returns an error (`Laya ONNX inference is not available in this build`), its health check reports not operational, and no code path in the shipped binary constructs it. Embedded retrieval and writes proceed without it — judgment providers are optional, and a provider failure never blocks the baseline write path. The system works fully offline with zero judgment-layer output.
 - **Jev** provides optional remote duplicate judgments via `typesafe.ai`. These are judgments, not embeddings. They do not change the vector space and need no cloud account for core operation. Declaring a bridge changes which judgments feed ranking; it never moves the database.
 
 Neither Laya nor Jev takes ownership of your data. The database stays local, sovereign, and intact regardless of which judgment layers are configured.
@@ -80,7 +80,7 @@ The daemon listens on loopback only (`127.0.0.1:34343`) and serves `/validate`, 
 - `src/task/gate.rs` — SAS pre-push gate: in-progress tasks, done-without-extraction, P0 open > 24 h.
 - `src/guard/semantic.rs`, `src/guard/sandbox.rs` — `guard_rule` namespace, semantic match, podman `--network=none` dry-run, verdict vocabulary.
 - `src/embed.rs` — local fastembed plus fail-closed remote bridge resolution via `embedders.json`.
-- `src/judgment/laya_onnx.rs`, `src/judgment/typesafe_jev.rs` — local Laya stub (empty output) and optional remote Jev duplicate judgments.
+- `src/judgment/laya_onnx.rs`, `src/judgment/typesafe_jev.rs` — local Laya provider (manifest validation only; inference unavailable in this build) and optional remote Jev duplicate judgments.
 - `src/synaptic_mesh/` — git transport, `synaptic-mesh-record/v1` wire format, ff-only pull, conflict preservation.
 - `src/daemon.rs` — loopback-only daemon (`127.0.0.1:34343`).
 - `src/secrets.rs`, `src/store/ladybug.rs` — secret scrubbing and Cypher escaping.

@@ -1,6 +1,6 @@
 # 🖌️ NeuroStrata UI User Guide (Obsidian Integration)
 
-The NeuroStrata Obsidian plugin provides a native, seamless interface for curating and visualizing your AI's 3-Tier Dual-Temporal-Memory directly within your knowledge base. It connects securely to the Dual-Mode NeuroStrata Go Server (`http://localhost:8005/api/memory`) to ensure your Obsidian notes and your AI's latent space remain perfectly synchronized.
+The NeuroStrata Obsidian plugin provides a native, seamless interface for curating and visualizing your AI's 3-Tier Dual-Temporal-Memory directly within your knowledge base. It connects securely to the NeuroStrata daemon (`http://127.0.0.1:34343`) to ensure your Obsidian notes and your AI's latent space remain perfectly synchronized.
 
 ---
 
@@ -14,7 +14,7 @@ The **NeuroStrata Inspector** is a dedicated sidebar panel that gives you full x
 **Key Features:**
 * **Namespace Filtering:** Instantly filter memories by their 3 Tiers. View all `global` infrastructure mandates, or drill down into specific Domain rules (e.g., `nibble_server`) or Task contexts.
 * **Live Semantic Search:** Type a natural language query into the inspector search bar to instantly find matching architectural rules or prior decisions across the database.
-* **Full CRUD Control:** Did an agent hallucinate a rule? Did a project requirement change? You can edit the text of any memory directly in the sidebar, and the plugin will automatically re-embed and save it back to Qdrant. You can also permanently delete obsolete memories with a single click.
+* **Full CRUD Control:** Did an agent hallucinate a rule? Did a project requirement change? You can edit the text of any memory directly in the sidebar, and the plugin will automatically re-embed and save it back to LadybugDB. You can also permanently delete obsolete memories with a single click.
 
 ---
 
@@ -28,7 +28,7 @@ While agents can save memories autonomously, you can also easily inject human in
 **Key Features:**
 * **"Create NeuroStrata Memory (Paragraph)":** Simply right-click anywhere inside a narrative document (e.g., `docs/architecture/domains/ml_training.md`) and select this option.
 * **Auto-Boundary Detection:** The plugin is intelligent enough to automatically detect the exact paragraph boundaries (from blank line to blank line) surrounding your cursor.
-* **Structured Pointers (Pointer-Wiki):** It extracts the exact physical file path and line numbers (e.g., `lines 42-49`) and automatically attaches them as a structured JSON `refs` array inside the Qdrant payload. When an agent retrieves this memory later, it uses these coordinates to fetch only the necessary context window (Compact Reading).
+* **Structured Pointers (Pointer-Wiki):** It extracts the exact physical file path and line numbers (e.g., `lines 42-49`) and automatically attaches them as a structured JSON `refs` array inside the LadybugDB record. When an agent retrieves this memory later, it uses these coordinates to fetch only the necessary context window (Compact Reading).
 
 ---
 
@@ -66,6 +66,6 @@ Because the web UI runs in a browser sandbox, we rely on custom OS URL protocols
 
 ## Getting Started
 
-1. Ensure the **NeuroStrata Native Go Server** is running in the background (it automatically starts when your AI client launches via MCP).
+1. Ensure the **NeuroStrata daemon** is running in the background (it automatically starts when your AI client launches via MCP).
 2. Enable the NeuroStrata Plugin in your Obsidian Community Plugins settings.
 3. Open the command palette (`Ctrl+P` or `Cmd+P`) and type `NeuroStrata: Open Inspector` to launch the sidebar!

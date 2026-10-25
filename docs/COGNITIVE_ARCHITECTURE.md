@@ -56,9 +56,9 @@ To prevent context bleeding between vastly different projects or languages, Neur
 *Inspired by object permanence and executive goal maintenance.*
 An AI's memory and task state must never decouple. Goals (tracked work) are Engrams in the same LadybugDB as every other memory — `memory_type: "task"` with a durable, append-only history — so one backup, one restore, and one GraphRAG traversal move knowledge and work state together. A Goal can only be completed through **Knowledge Consolidation**: `neurostrata_task_complete` fails until the work has produced an extracted Engram, and the **Supervisory Attentional System** (pre-push task gate) refuses to ship while Goals remain unfinished. Memory and momentum share one lifecycle.
 
-### 9. Extended Cognition Workspace (Human-AI Symbiosis via NeuroVault)
+### 9. Extended Cognition Workspace (Human-AI Symbiosis)
 *Inspired by the extended mind thesis.*
-Memory is not locked in a black-box database. Through the NeuroVault and Obsidian integration, the exact same memory nodes the AI uses to structure code are exposed as a visual, navigable markdown graph for human developers. Humans can curate, audit, and organically learn from the same cognitive graph the AI relies on, creating true symbiosis.
+Memory is not locked in a black-box database. The memory graph the AI uses can be exported (`/export-graph`) and inspected in the shipped Web UI, so human developers can audit the same cognitive graph the AI relies on. No Obsidian integration — and no component named NeuroVault — ships in this tree.
 
 ### 10. Asynchronous Delegation (Orchestrator-Worker Pattern)
 *Inspired by the brain's division of labor across specialized regions.*

@@ -4,51 +4,6 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
-## [1.13.0] - 2026-10-25
-
-### Added
-
-- **Composite improvement recommendations (28 items, P0→P1→P2).** Full P0 security hardening (R1–R8), P1 mesh/embed/namespace/filter improvements (R9–R21), P2 CLI proxy/storage/sandbox/vocabulary/structural split (R22–R28). See `docs/designs/2026-10-24-composite-improvement-recommendations.md`.
-- **Daemon `/export-graph` endpoint** (R22) — routes through daemon's single writer, avoiding lock contention.
-- **Handler extraction** (R28) — `src/handlers/memory.rs` with `handle_get_memory` and `handle_list_namespaces`.
-- **R12 incomplete marker** — `incomplete: bool` on `DomainSearchOutcome`, set when 10x FETCH_MULTIPLIER budget exhausted.
-- **R13 RemoteEmbedder fail-closed auth** — verifies non-empty api_key before any remote embed call.
-- **Mesh procedure trust** (PR #34) — manifest stamp, provenance gate, secret scan.
-- **Daemon request trust** (PR #33) — Host/Origin checks, operator tier.
-- **Task claim atomicity** (PR #32) — resolves test file conflict.
-
-### Changed
-
-- All "deferred" language removed from artifacts and task descriptions.
-- R24 storage migration evaluation: stay on lbug 0.20.4, no migration.
-- sygq (Laya training) retired — Python/Torch no longer needed.
-
-### Fixed
-
-- Float-binding test alignment (PR #35).
-- ProjectAnchors references removed from episodic_pointer_echo.rs (PR #29 divergence).
-- Test compile fixes (PR #31).
-
----
-
-## [1.11.0] - 2026-10-22
-
-### Added
-
-- **The vocabulary gained its sixth version and two new shapes.** `fact.fields.attempt` and `fact.fields.domain_registry` are declared at vocabulary version 6 (`src/schemas/memory-vocabulary.v3.json`), so the two shapes an agent needs for the recall closure are teachable and checkable rather than ad hoc metadata. `metadata.attempt` records a failed approach (what was tried, why it failed, the constraint it exposed, the scope); `metadata.domain_registry` is the per-namespace registry row.
-- **A domain that is not registered is refused, with the registered list and the remedy.** The first domain write in a namespace seeds the registry from the namespace's own rows; a later write whose slug neither the registry nor the namespace's data carries is refused with `Registered domains: [...]` and `Remedy: pass register_domain: true to add '<slug>'`. The registry is a cache, not the truth, so it can be stale and the reconcile repairs it; a non-string `domain` is rejected, not guessed at. The rejection runs on both write paths (`neurostrata_add_memory` and `neurostrata_task_complete`).
-- **A failed attempt is surfaced three ways, from one predicate.** `src/attempt.rs::is_failed_attempt` is the single predicate behind the store's shape check, the `format_memory` rendering line (`Attempt [FAILED in <scope>]: <what>`), the `[FAILED ATTEMPT] ` snippet prefix (applied before the 120-character truncation), and the duplicate partition (a candidate carrying a valid attempt never blocks a positive fact, and vice versa). The attempt shape warns but never rejects.
-- **The snapshot names the registered domains and carries a domain strap.** `neurostrata_get_snapshot` takes an optional `domain` (string or array); the top five are unchanged, and a bounded strap (at most three entries, at most two per domain) surfaces domain-tagged rows the access-count cut would have hidden, with an explicit zero when empty. The body carries `Registered domains (N): ...`.
-- **The metrics surface gained `domain_filter` and `recall` sections.** Six process-global atomics (`domain_queries_total`, `domain_narrowed_hits`, `domain_fallback_vector`, `single_domain_bypasses`, `recall_responses`, `recall_promotions`) ride on the bus metrics body alongside the bus's own eight integers, plus a bounded, per-namespace recently-recalled id set that is evicted on promotion.
-- **The mesh import unions an imported record's domain into the local registry** after the apply succeeds, so no shared record is ever refused for a domain the local registry has not seen; a registry-write failure is a warning, never a refusal.
-
-### Changed
-
-- Vocabulary version 5 → 6 (`fact.fields.attempt`, `fact.fields.domain_registry`).
-- The static `memory_type` description now teaches the `attempt` and `domain_registry` shapes.
-
----
-
 ## [Unreleased] - 2026-10-20
 
 ### Added
@@ -112,6 +67,51 @@ All notable changes to the NeuroStrata project will be documented in this file.
   - **Documents corrected:** `README.md` (the "BM25 via Tantivy" and "Embedded LadybugDB & Tantivy" claims, the Synaptic-Pruning wording, the search-scope statement, and the guard-tool and daemon-route lists); `docs/COGNITIVE_ARCHITECTURE.md` §3 (the neural-gain formula, which omitted the `0.5 * distance` cap and the provenance term), §4 (`domain` was descriptive metadata, not a retrieval filter — *now superseded in this same section*: `domain` is an optional soft filter on the search query) and §6 (the "Reciprocal Rank Fusion" section, now "Deterministic Retrieval — Boosted Distance + Bounded Graph Evidence"); and `docs/architecture/MEMORY_AGENTS_VERDICT.md` §2.2 and R1/R3, whose no-LLM-reranker argument rested on the false RRF premise and has been re-derived on the true premise.
   - **Consequence, still open.** Exact-identifier recall — a function name, an env var, a config key, an error string — depends on the embedder landing near the query, because no lexical track exists. The adjudicated recommendation is a **narrow deterministic `CONTAINS` / symbol-id match**, preferred over a Tantivy + RRF build. **It is not implemented.**
   - **Panel record:** `docs/designs/2026-10-20-argon-k3-panel-verdicts.md` (Part C, §1 DOC-1 and §5 Phase 4) and `docs/designs/2026-10-20-hyperskill-review-findings.md` (Part B, DOC-1).
+
+---
+
+## [1.13.0] - 2026-10-25
+
+### Added
+
+- **Composite improvement recommendations (28 items, P0→P1→P2).** Full P0 security hardening (R1–R8), P1 mesh/embed/namespace/filter improvements (R9–R21), P2 CLI proxy/storage/sandbox/vocabulary/structural split (R22–R28). See `docs/designs/2026-10-24-composite-improvement-recommendations.md`.
+- **Daemon `/export-graph` endpoint** (R22) — routes through daemon's single writer, avoiding lock contention.
+- **Handler extraction** (R28) — `src/handlers/memory.rs` with `handle_get_memory` and `handle_list_namespaces`.
+- **R12 incomplete marker** — `incomplete: bool` on `DomainSearchOutcome`, set when 10x FETCH_MULTIPLIER budget exhausted.
+- **R13 RemoteEmbedder fail-closed auth** — verifies non-empty api_key before any remote embed call.
+- **Mesh procedure trust** (PR #34) — manifest stamp, provenance gate, secret scan.
+- **Daemon request trust** (PR #33) — Host/Origin checks, operator tier.
+- **Task claim atomicity** (PR #32) — resolves test file conflict.
+
+### Changed
+
+- All "deferred" language removed from artifacts and task descriptions.
+- R24 storage migration evaluation: stay on lbug 0.20.4, no migration.
+- sygq (Laya training) retired — Python/Torch no longer needed.
+
+### Fixed
+
+- Float-binding test alignment (PR #35).
+- ProjectAnchors references removed from episodic_pointer_echo.rs (PR #29 divergence).
+- Test compile fixes (PR #31).
+
+---
+
+## [1.11.0] - 2026-10-22
+
+### Added
+
+- **The vocabulary gained its sixth version and two new shapes.** `fact.fields.attempt` and `fact.fields.domain_registry` are declared at vocabulary version 6 (`src/schemas/memory-vocabulary.v3.json`), so the two shapes an agent needs for the recall closure are teachable and checkable rather than ad hoc metadata. `metadata.attempt` records a failed approach (what was tried, why it failed, the constraint it exposed, the scope); `metadata.domain_registry` is the per-namespace registry row.
+- **A domain that is not registered is refused, with the registered list and the remedy.** The first domain write in a namespace seeds the registry from the namespace's own rows; a later write whose slug neither the registry nor the namespace's data carries is refused with `Registered domains: [...]` and `Remedy: pass register_domain: true to add '<slug>'`. The registry is a cache, not the truth, so it can be stale and the reconcile repairs it; a non-string `domain` is rejected, not guessed at. The rejection runs on both write paths (`neurostrata_add_memory` and `neurostrata_task_complete`).
+- **A failed attempt is surfaced three ways, from one predicate.** `src/attempt.rs::is_failed_attempt` is the single predicate behind the store's shape check, the `format_memory` rendering line (`Attempt [FAILED in <scope>]: <what>`), the `[FAILED ATTEMPT] ` snippet prefix (applied before the 120-character truncation), and the duplicate partition (a candidate carrying a valid attempt never blocks a positive fact, and vice versa). The attempt shape warns but never rejects.
+- **The snapshot names the registered domains and carries a domain strap.** `neurostrata_get_snapshot` takes an optional `domain` (string or array); the top five are unchanged, and a bounded strap (at most three entries, at most two per domain) surfaces domain-tagged rows the access-count cut would have hidden, with an explicit zero when empty. The body carries `Registered domains (N): ...`.
+- **The metrics surface gained `domain_filter` and `recall` sections.** Six process-global atomics (`domain_queries_total`, `domain_narrowed_hits`, `domain_fallback_vector`, `single_domain_bypasses`, `recall_responses`, `recall_promotions`) ride on the bus metrics body alongside the bus's own eight integers, plus a bounded, per-namespace recently-recalled id set that is evicted on promotion.
+- **The mesh import unions an imported record's domain into the local registry** after the apply succeeds, so no shared record is ever refused for a domain the local registry has not seen; a registry-write failure is a warning, never a refusal.
+
+### Changed
+
+- Vocabulary version 5 → 6 (`fact.fields.attempt`, `fact.fields.domain_registry`).
+- The static `memory_type` description now teaches the `attempt` and `domain_registry` shapes.
 
 ---
 
