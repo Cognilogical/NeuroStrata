@@ -517,8 +517,20 @@ async fn search_inner(
                 // The real discriminator is EvidenceKind, not score.
                 const EXPANSION_BASE_SCORE: f32 = 1.0; // sorts after any real boosted_distance (< 1.0 typically)
                 for id in &admitted {
-                    let entry = by_id.remove(id).unwrap();
-                    let payload = entry.payload.unwrap();
+                    let entry = match by_id.remove(id) {
+                        Some(e) => e,
+                        None => {
+                            tracing::warn!("admitted id {} not in by_id map (drift); skipping", id);
+                            continue;
+                        }
+                    };
+                    let payload = match entry.payload {
+                        Some(p) => p,
+                        None => {
+                            tracing::warn!("entry for {} has no payload (drift); skipping", id);
+                            continue;
+                        }
+                    };
                     let mut evidence = entry.evidence;
                     // Sort evidence: kind (OneHop < Governs2hop), then path edges
                     evidence.sort_by(|a, b| {

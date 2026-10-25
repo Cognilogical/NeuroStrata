@@ -94,7 +94,11 @@ impl SandboxEvaluator {
                 &format!("-v={}:/workspace:ro", cwd_str),
                 "--tmpfs=/tmp",
                 "-w=/workspace",
-                "alpine:latest",
+                // Pinned to a specific Alpine release (R26) instead of
+                // `latest` so a registry re-push cannot silently change
+                // the sandbox behavior. Full digest pin (image@sha256:...)
+                // is filed as a follow-up (needs digest resolution at install).
+                "alpine:3.21",
                 "sh",
                 "-c",
                 payload,
