@@ -75,7 +75,7 @@ Migration remains a research option. Any future work will be triggered when one 
 - lbug SIGSEGV/corruption recurs despite R5/R21 fixes, OR
 - graph traversal requirements are simplified (e.g., edges removed)
 
-If migration work is later decided, it will be tracked as a separate task with owner and concrete next actions — not as a deferred continuation.
+If migration work is later decided, it will be tracked as a separate task with owner and concrete next actions.
 
 ## Decision
 Stay on lbug 0.20.4. Reassess at next major release cycle. Migration remains a research option, not a committed path.
