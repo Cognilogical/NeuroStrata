@@ -182,7 +182,12 @@ fn collect_artifact_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Res
         } else if path.is_file() {
             let rel = path
                 .strip_prefix(root)
-                .expect("walk stays under the root")
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "model cache walk escaped its root at {}",
+                        path.display()
+                    )
+                })?
                 .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
@@ -228,12 +233,15 @@ fn enforce_artifact_pin(
         }
         None => {
             let candidate = model_dir.join("PIN-CANDIDATE");
-            fs::write(&candidate, format!("{computed}\n")).with_context(|| {
-                format!(
-                    "failed to write artifact pin candidate {}",
+            // Best-effort: an unwritable cache must not fail a load that
+            // would have succeeded unpinned — the eprintln below still
+            // records the computed pin, and the warning names the failure.
+            if let Err(e) = fs::write(&candidate, format!("{computed}\n")) {
+                eprintln!(
+                    "warning: could not write artifact pin candidate {}: {e}",
                     candidate.display()
-                )
-            })?;
+                );
+            }
             eprintln!(
                 "No artifact_pin recorded for embedder model '{model_name}': computed pin \
                  {computed} over the artifact set in {} and wrote it to {} — record it as \
