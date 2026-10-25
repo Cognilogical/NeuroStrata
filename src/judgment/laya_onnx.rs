@@ -163,3 +163,66 @@ impl LearningRuntimeManager {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_bundle_dir(label: &str, manifest: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ns-laya-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        dir
+    }
+
+    fn payload() -> MemoryPayload {
+        MemoryPayload {
+            content: "hello".to_string(),
+            user_id: "u1".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_check_reflects_provider_state() {
+        let dir = temp_bundle_dir(
+            "state",
+            r#"{"embedder_id":"test-embedder","model_version":"v-test"}"#,
+        );
+        let provider = LayaOnnxProvider::load(&dir, Arc::new(Semaphore::new(1))).unwrap();
+        // `load` creates no ONNX session in this build, so the provider must
+        // not report Ready, and its health check must agree with its state.
+        assert_eq!(provider.state(), RuntimeState::Unavailable);
+        assert!(!provider.health_check().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn judge_duplicates_reports_unavailable() {
+        let dir = temp_bundle_dir("judge", r#"{"embedder_id":"test-embedder"}"#);
+        let provider = LayaOnnxProvider::load(&dir, Arc::new(Semaphore::new(1))).unwrap();
+        let err = provider
+            .judge_duplicates(&payload(), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not available"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn learning_runtime_manager_does_not_claim_ready() {
+        let manager = LearningRuntimeManager {
+            paths: LearningPaths {
+                root: PathBuf::from("/nonexistent"),
+            },
+        };
+        // Nothing is provisioned by this manager in this build; like the
+        // canonical manager in `learning::runtime`, it must not claim Ready.
+        assert_eq!(manager.ensure_ready().await, RuntimeState::Unavailable);
+    }
+}

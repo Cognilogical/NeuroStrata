@@ -24,3 +24,19 @@ impl Default for TemperatureFitter {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temperature_fit_is_not_a_silent_noop() {
+        let fitter = TemperatureFitter::new();
+        let result = fitter.fit(&[0.2, 0.5, 0.8], &[0.1, 0.4, 0.9]);
+        assert!(
+            result.is_err(),
+            "fit must not silently return a plausible temperature before \
+             fitting is implemented, got: {result:?}"
+        );
+    }
+}

@@ -30,3 +30,16 @@ impl Default for EvaluationReport {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_evaluation_report_names_its_placeholder() {
+        let report = EvaluationReport::default();
+        // A default report evaluated nothing; its candidate field must name
+        // itself a placeholder rather than pose as a version.
+        assert_eq!(report.candidate, "bridge-placeholder");
+    }
+}
