@@ -49,7 +49,7 @@ pub enum SynapticMeshCommands {
     /// ALWAYS one line and the CLI never exits non-zero: a hook must never
     /// block the source push. Manual push/pull remains first-class — this
     /// command is only the hook's target, and manual wiring is documented
-    /// at `PRE_PUSH_HOOK` in main.rs.
+    /// at `install_pre_push_hook` in main.rs.
     #[command(hide = true)]
     SyncEnqueue,
 
