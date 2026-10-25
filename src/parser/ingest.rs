@@ -59,13 +59,17 @@ pub const NAMESPACE_SEPARATOR: &str = "::";
 
 /// A node id, qualified by the namespace that owns it.
 ///
-/// Node ids are paths, and the Memory table is PRIMARY KEY (id) -- one column,
-/// because lbug 0.15.3 has no composite key (see examples/composite_pk_repro.rs
-/// for the parser refusing one). So an id is unique across the WHOLE database,
-/// while paths are only unique within a project. Every repository has a `src`
-/// and a `README.md`, and the database is shared by all of them, which meant the
-/// second project ingested silently took the first project's nodes: upsert
-/// MERGEs on the id, finds the existing row, and updates it.
+/// Node ids are paths, and the Memory table's original key was PRIMARY KEY
+/// (id) -- one column, because lbug has no composite key (see
+/// examples/composite_pk_repro.rs for the parser refusing one). So an id was
+/// unique across the WHOLE database, while paths are only unique within a
+/// project. Every repository has a `src` and a `README.md`, and the database
+/// is shared by all of them, which meant the second project ingested silently
+/// took the first project's nodes: upsert MERGEs on the id, finds the existing
+/// row, and updates it. Fresh tables now key on a derived pk
+/// (namespace + U+0001 + id; Task 7 re-plan), but tables written by older
+/// binaries still key on (id) alone — and qualified ids remain the
+/// ingest-minted shape either way, so the separation below holds on both.
 ///
 /// Qualifying the id with its namespace is what makes "projects are separated by
 /// namespace" true in the schema rather than only in the documentation. It is

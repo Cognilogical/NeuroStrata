@@ -622,6 +622,13 @@ pub struct LadybugStore {
     /// already exists. That is a write transaction per read, colliding with
     /// real writes for nothing.
     schema_ready: std::sync::atomic::AtomicBool,
+    /// Set by init() when the Memory table carries the derived `pk`
+    /// column (Task 7 re-plan): fresh tables are created with it, and a
+    /// pre-existing table gains it via ALTER + backfill. While false,
+    /// identity operations (upsert MERGE, get, delete, edge MERGE) use
+    /// the legacy (namespace, id) property matching instead of keying on
+    /// pk — the store never refuses to open over a missing column.
+    pk_ready: std::sync::atomic::AtomicBool,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -745,6 +752,14 @@ impl LadybugStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Whether init() confirmed the derived `pk` column on the Memory
+    /// table (Task 7 re-plan). Identity operations key on pk when this
+    /// holds and fall back to (namespace, id) property matching when it
+    /// does not.
+    fn pk_ready(&self) -> bool {
+        self.pk_ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn for_testing(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         let max_db_size: u64 = std::env::var("NEUROSTRATA_TEST_MAX_DB_SIZE")
             .ok()
@@ -864,6 +879,7 @@ impl LadybugStore {
             identity_audit: std::sync::Mutex::new(RowIdentityAudit::default()),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
+            pk_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1407,6 +1423,24 @@ fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
 
+/// The derived single-column key for a Memory row (Task 7 re-plan,
+/// ratified 2026-10-25): `namespace + U+0001 + id`, carried in the `pk`
+/// column — the PRIMARY KEY of fresh tables, an ordinary backfilled
+/// column on tables that predate it.
+///
+/// The scheme exists because lbug 0.20.4's parser rejects a multi-column
+/// PRIMARY KEY in CREATE NODE TABLE outright (probed, run 40164691714),
+/// so the (namespace, id) identity the row MERGE keys on cannot be the
+/// table's key directly. The separator is U+0001, a control character:
+/// DR-1 namespaces, DR-2 bare ids, and the ratified qualified-id
+/// remainder (no quotes, backslashes, or control characters) all refuse
+/// control characters, so neither side of the derivation can contain the
+/// separator and the concatenation is injective — two distinct
+/// (namespace, id) pairs never derive the same pk.
+fn memory_pk(namespace: &str, id: &str) -> String {
+    format!("{}\u{1}{}", namespace, id)
+}
+
 /// NUL is refused at the store boundary, by name (Task 7). It is the one
 /// byte no rung of the escaping ladder may carry into the engine: handed
 /// to a bound parameter it would meet the engine's C strings, and embedded
@@ -1539,14 +1573,22 @@ impl VectorStore for LadybugStore {
         // with_conn releases it on timeout while the C++ call is still running.
         let outcome = self.write_with_deadline("initializing schema", move |conn| {
 
+            // Task 7 re-plan (ratified 2026-10-25): fresh Memory tables
+            // key on the derived pk (see memory_pk) — lbug 0.20.4 accepts
+            // only a single-column PRIMARY KEY, so (namespace, id)
+            // identity is carried in one column. A table that already
+            // exists keeps its PRIMARY KEY (id); it gains the pk column
+            // below instead of being recreated.
             let create_node_table = format!(
-                "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
+                "CREATE NODE TABLE Memory (pk STRING, id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (pk))",
                 dimensions
             );
+            let mut created_fresh = true;
             if let Err(e) = conn.query(&create_node_table) {
                 if !e.to_string().contains("already exists") {
                     return Err(e.into());
                 }
+                created_fresh = false;
             }
 
             let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory)";
@@ -1625,18 +1667,93 @@ impl VectorStore for LadybugStore {
                 );
             }
 
-            Ok(audit)
+            // Task 7 re-plan: a pre-existing Memory table has no pk
+            // column (its PRIMARY KEY is still (id)). Add the column and
+            // backfill each row's derived pk, so identity operations can
+            // key on pk against it exactly as they do against a fresh
+            // table. This never blocks the open either: if the ALTER or
+            // the backfill fails, the store continues in legacy
+            // (namespace, id) matching mode (pk_ready stays false) and
+            // says so on stderr. Runs after the namespace audit above so
+            // rows whose namespace was just backfilled get the pk of
+            // their repaired identity in the same pass.
+            let mut pk_ready = created_fresh;
+            if !created_fresh {
+                let has_pk_column =
+                    conn.query("MATCH (m:Memory) RETURN m.pk LIMIT 1").is_ok();
+                if has_pk_column {
+                    pk_ready = true;
+                } else {
+                    match conn.query("ALTER TABLE Memory ADD pk STRING DEFAULT ''") {
+                        Ok(_) => {
+                            pk_ready = true;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[neurostrata:identity-audit] could not add the derived pk column to the existing Memory table ({}) — continuing in legacy (namespace, id) matching mode",
+                                e
+                            );
+                        }
+                    }
+                }
+                if pk_ready {
+                    let mut stale: Vec<(String, String, String)> = Vec::new();
+                    if let Ok(mut rows) = conn.query(
+                        "MATCH (m:Memory) WHERE m.namespace IS NOT NULL RETURN m.id, m.namespace, m.pk",
+                    ) {
+                        while let Some(row) = rows.next() {
+                            let row_id = format!("{}", row[0]);
+                            let row_ns = format!("{}", row[1]);
+                            let row_pk = format!("{}", row[2]);
+                            let derived = memory_pk(&row_ns, &row_id);
+                            if row_pk != derived {
+                                stale.push((row_id, row_ns, derived));
+                            }
+                        }
+                    }
+                    let mut backfilled = 0usize;
+                    for (row_id, row_ns, derived) in &stale {
+                        let applied = (|| -> std::result::Result<(), lbug::Error> {
+                            let mut stmt = conn.prepare(
+                                "MATCH (m:Memory) WHERE m.id = $id AND m.namespace = $ns SET m.pk = $pk",
+                            )?;
+                            conn.execute(
+                                &mut stmt,
+                                vec![
+                                    ("id", lbug::Value::String(row_id.clone())),
+                                    ("ns", lbug::Value::String(row_ns.clone())),
+                                    ("pk", lbug::Value::String(derived.clone())),
+                                ],
+                            )?;
+                            Ok(())
+                        })();
+                        if applied.is_ok() {
+                            backfilled += 1;
+                        }
+                    }
+                    if backfilled > 0 {
+                        eprintln!(
+                            "[neurostrata:identity-audit] backfilled the derived pk on {} Memory row(s)",
+                            backfilled
+                        );
+                    }
+                }
+            }
+
+            Ok((audit, pk_ready))
         })
         .await;
 
         // Creating the tables is itself a write worth flushing.
         self.dirty.mark();
         match outcome {
-            Ok(audit) => {
+            Ok((audit, pk_ready)) => {
                 *self
                     .identity_audit
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = audit;
+                self.pk_ready
+                    .store(pk_ready, std::sync::atomic::Ordering::Release);
                 self.schema_ready
                     .store(true, std::sync::atomic::Ordering::Release);
                 Ok(())
@@ -1686,6 +1803,7 @@ impl VectorStore for LadybugStore {
         }
         // Parse shape warnings from the ORIGINAL payload before the write.
         let shape_warnings = write_shape_warnings(&payload);
+        let pk_ready = self.pk_ready();
         self.write_with_deadline("writing a memory", move |conn| {
 
             let safe_id = escape_ladybug_string(&id);
@@ -1733,19 +1851,67 @@ impl VectorStore for LadybugStore {
                 );
             }
 
-            // Row identity is (namespace, id): the MERGE pattern carries
-            // both, so the same id in another namespace is a different
-            // row, and an old row written by a pre-identity binary (which
-            // set namespace ON CREATE) is found by the same pattern.
-            let insert_query = format!(
-                "MERGE (m:Memory {{id: '{}', namespace: '{}'}})
-                 ON CREATE SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
-                 ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
-                safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
-                safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
-            );
+            // Row identity is (namespace, id). When the table carries
+            // the derived pk column, the MERGE keys on it and every value
+            // is a bound parameter (B1 — binding is probed, Step A): the
+            // pattern key and the SET values travel as $parameters, so
+            // nothing caller-supplied is interpolated into the statement.
+            // The embedding still interpolates as a literal: it is a
+            // vector of engine-formatted numbers built above, never
+            // caller text. When init could not give the table a pk
+            // column (legacy mode), the MERGE keeps the pre-re-plan
+            // (namespace, id) property pattern over escaped literals.
+            if pk_ready {
+                let merge_query = format!(
+                    "MERGE (m:Memory {{pk: $pk}})
+                     ON CREATE SET m.id = $id, m.namespace = $ns, m.content = $content, m.user_id = $user_id, m.memory_type = $memory_type, m.agent_name = $agent_name, m.location = $location, m.location_lines = $location_lines, m.metadata = $metadata, m.embedding = {}
+                     ON MATCH SET m.content = $content, m.user_id = $user_id, m.memory_type = $memory_type, m.agent_name = $agent_name, m.location = $location, m.location_lines = $location_lines, m.metadata = $metadata, m.embedding = {}",
+                    vec_str, vec_str
+                );
+                let mut stmt = conn.prepare(&merge_query)?;
+                conn.execute(
+                    &mut stmt,
+                    vec![
+                        ("pk", lbug::Value::String(memory_pk(&namespace, &id))),
+                        ("id", lbug::Value::String(id.clone())),
+                        ("ns", lbug::Value::String(namespace.clone())),
+                        ("content", lbug::Value::String(payload.content.clone())),
+                        ("user_id", lbug::Value::String(payload.user_id.clone())),
+                        (
+                            "memory_type",
+                            lbug::Value::String(payload.memory_type.clone()),
+                        ),
+                        (
+                            "agent_name",
+                            lbug::Value::String(
+                                payload
+                                    .agent_name
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                            ),
+                        ),
+                        ("location", lbug::Value::String(payload.location.clone())),
+                        (
+                            "location_lines",
+                            lbug::Value::String(payload.location_lines.clone()),
+                        ),
+                        (
+                            "metadata",
+                            lbug::Value::String(serde_json::to_string(&payload.metadata)?),
+                        ),
+                    ],
+                )?;
+            } else {
+                let insert_query = format!(
+                    "MERGE (m:Memory {{id: '{}', namespace: '{}'}})
+                     ON CREATE SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
+                     ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+                    safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
+                    safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+                );
 
-            conn.query(&insert_query)?;
+                conn.query(&insert_query)?;
+            }
 
             // Emit shape warnings after successful row write.
             for w in &shape_warnings {
@@ -1861,18 +2027,57 @@ impl VectorStore for LadybugStore {
                         continue;
                     }
                 };
-                let target_safe = escape_ladybug_string(&target);
-                let target_ns_safe = escape_ladybug_string(&target_ns);
-                let (from, from_ns, to, to_ns) = if edge.points_at_target {
-                    (safe_id.as_str(), safe_ns.as_str(), target_safe.as_str(), target_ns_safe.as_str())
+                let (from_pair, to_pair) = if edge.points_at_target {
+                    (
+                        (id.as_str(), namespace.as_str()),
+                        (target.as_str(), target_ns.as_str()),
+                    )
                 } else {
-                    (target_safe.as_str(), target_ns_safe.as_str(), safe_id.as_str(), safe_ns.as_str())
+                    (
+                        (target.as_str(), target_ns.as_str()),
+                        (id.as_str(), namespace.as_str()),
+                    )
                 };
-                let edge_query = format!(
-                    "MATCH (a:Memory {{id: '{}', namespace: '{}'}}), (b:Memory {{id: '{}', namespace: '{}'}}) MERGE (a)-[:{}]->(b)",
-                    from, from_ns, to, to_ns, edge.rel_type
-                );
-                if let Err(e) = conn.query(&edge_query) {
+                // With the pk column present, both ends bind by derived
+                // pk via $parameters (B1); the relation type still
+                // interpolates — it is a validated identifier
+                // (is_valid_relation_name above), never free text. In
+                // legacy mode the (id, namespace) property MATCH over
+                // escaped literals is kept.
+                let edge_result: Result<()> = (|| {
+                    if pk_ready {
+                        let edge_query = format!(
+                            "MATCH (a:Memory {{pk: $apk}}), (b:Memory {{pk: $bpk}}) MERGE (a)-[:{}]->(b)",
+                            edge.rel_type
+                        );
+                        let mut stmt = conn.prepare(&edge_query)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![
+                                (
+                                    "apk",
+                                    lbug::Value::String(memory_pk(from_pair.1, from_pair.0)),
+                                ),
+                                (
+                                    "bpk",
+                                    lbug::Value::String(memory_pk(to_pair.1, to_pair.0)),
+                                ),
+                            ],
+                        )?;
+                    } else {
+                        let edge_query = format!(
+                            "MATCH (a:Memory {{id: '{}', namespace: '{}'}}), (b:Memory {{id: '{}', namespace: '{}'}}) MERGE (a)-[:{}]->(b)",
+                            escape_ladybug_string(from_pair.0),
+                            escape_ladybug_string(from_pair.1),
+                            escape_ladybug_string(to_pair.0),
+                            escape_ladybug_string(to_pair.1),
+                            edge.rel_type
+                        );
+                        conn.query(&edge_query)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = edge_result {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
                         rel_type: edge.rel_type.to_string(),
                         declared_target: edge.target_id.clone(),
@@ -2223,6 +2428,7 @@ impl VectorStore for LadybugStore {
         // Task 7: NUL is refused at the store boundary on writes too.
         reject_nul("namespace", &namespace)?;
         reject_nul("id", &id)?;
+        let pk_ready = self.pk_ready();
         self.write_with_deadline("deleting a memory", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
@@ -2248,6 +2454,25 @@ impl VectorStore for LadybugStore {
             // A silent no-op on a missing id reads as success to the caller
             // (the CLI then reports a deletion that never happened), so
             // resolve the row first and fail loudly when it is absent.
+            // With the pk column present the row is addressed by its
+            // derived pk (bound, B1); legacy mode keeps the (id,
+            // namespace) property match.
+            if pk_ready {
+                let pk = memory_pk(&namespace, &id);
+                let exists = (|| -> std::result::Result<bool, lbug::Error> {
+                    let mut stmt =
+                        conn.prepare("MATCH (m:Memory {pk: $pk}) RETURN m.id LIMIT 1")?;
+                    let mut rows =
+                        conn.execute(&mut stmt, vec![("pk", lbug::Value::String(pk.clone()))])?;
+                    Ok(rows.next().is_some())
+                })()?;
+                if !exists {
+                    anyhow::bail!("No memory with id '{}' in namespace '{}'. Note: stored ids are namespace-qualified for ingested nodes.", id, namespace);
+                }
+                let mut stmt = conn.prepare("MATCH (m:Memory {pk: $pk}) DETACH DELETE m")?;
+                conn.execute(&mut stmt, vec![("pk", lbug::Value::String(pk))])?;
+                return Ok(());
+            }
             let exists = conn
                 .query(&format!(
                     "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.id LIMIT 1",
@@ -2285,9 +2510,30 @@ impl VectorStore for LadybugStore {
         }
 
         let (id, from, to) = (id.to_string(), from.to_string(), to.to_string());
+        let pk_ready = self.pk_ready();
         self.write_with_deadline("moving a memory", move |conn| {
             // One statement, so there is no moment at which the memory exists in
             // neither namespace, and the row keeps its id, vector and edges.
+            // With the pk column present the derived key moves with the
+            // row (bound, B1): a relocate that left the old namespace's
+            // pk behind would strand the row — pk lookups in the new
+            // namespace would miss it, and a fresh upsert there could
+            // fork a second row under the same id.
+            if pk_ready {
+                let mut stmt = conn.prepare(
+                    "MATCH (m:Memory) WHERE m.id = $id AND m.namespace = $from AND m.user_id <> 'auto-ingestor' SET m.namespace = $to, m.pk = $pk",
+                )?;
+                conn.execute(
+                    &mut stmt,
+                    vec![
+                        ("id", lbug::Value::String(id.clone())),
+                        ("from", lbug::Value::String(from.clone())),
+                        ("to", lbug::Value::String(to.clone())),
+                        ("pk", lbug::Value::String(memory_pk(&to, &id))),
+                    ],
+                )?;
+                return Ok(RelocateOutcome::Moved);
+            }
             let query = format!(
                 "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' AND m.user_id <> 'auto-ingestor' SET m.namespace = '{}'",
                 escape_ladybug_string(&id),
@@ -2518,13 +2764,26 @@ impl VectorStore for LadybugStore {
         // a query that can only miss.
         reject_nul("namespace", &namespace)?;
         reject_nul("id", &id)?;
+        let pk_ready = self.pk_ready();
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
 
-            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
-
-            let mut result = conn.query(&query)?;
+            // With the pk column present the row is addressed by its
+            // derived pk (bound, B1); legacy mode keeps the (namespace,
+            // id) property match.
+            let mut result = if pk_ready {
+                let mut stmt = conn.prepare(
+                    "MATCH (m:Memory {pk: $pk}) RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
+                )?;
+                conn.execute(
+                    &mut stmt,
+                    vec![("pk", lbug::Value::String(memory_pk(&namespace, &id)))],
+                )?
+            } else {
+                let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
+                conn.query(&query)?
+            };
 
             if let Some(row) = result.next() {
                 // The column is FLOAT[N], a fixed-size ARRAY, so the engine hands
@@ -4382,7 +4641,8 @@ eurostrata\src\daemon.rs",
 
         let seed = |id: &str, metadata: &str| {
             format!(
-                "CREATE (m:Memory {{id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                "CREATE (m:Memory {{pk: '{}', id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                escape_ladybug_string(&format!("seed-pk:{id}")),
                 escape_ladybug_string(id),
                 escape_ladybug_string(metadata)
             )
@@ -4535,7 +4795,7 @@ eurostrata\src\daemon.rs",
         store.init("probe").await.expect("create the schema");
 
         let row = format!(
-            "CREATE (m:Memory {{id: 'rule', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+            "CREATE (m:Memory {{pk: 'seed-pk:rule', id: 'rule', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 't', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
             escape_ladybug_string(r#"{"governs": ["src/never-ingested.rs"]}"#)
         );
         store
@@ -8321,6 +8581,92 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn legacy_table_gains_pk_backfill_and_fails_loud_across_namespaces() {
+        // A store built by the pre-re-plan binary: PRIMARY KEY (id), no pk
+        // column, one row. Reopening through init must add the column and
+        // backfill the derived pk — never brick the open.
+        let path = std::env::temp_dir().join(format!("ns-t7-legacy-{}", uuid::Uuid::new_v4()));
+        {
+            let _db = t7_raw_db(&path);
+            let conn = Connection::new(&_db).expect("raw connection");
+            conn.query(T7_OLD_DDL).expect("old DDL");
+            t7_old_shape_insert(&conn, "legacy-ns", "legacy-id", "old content");
+        }
+        let store = LadybugStore::for_testing(&path, 4).expect("open old store");
+        store.init("legacy-ns").await.expect("init over old store");
+        assert!(
+            store.pk_ready(),
+            "init must give the legacy table a working pk column"
+        );
+
+        // The row is readable, and its stored pk is the derived key.
+        let (_, got) = store
+            .get("legacy-ns", "legacy-id")
+            .await
+            .unwrap()
+            .expect("row readable");
+        assert_eq!(got.content, "old content");
+        let stored_pk = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (m:Memory) WHERE m.id = 'legacy-id' RETURN m.pk",
+                )?;
+                let pk = rows
+                    .next()
+                    .map(|row| format!("{}", row[0]))
+                    .unwrap_or_default();
+                Ok(pk)
+            })
+            .await
+            .expect("read the stored pk");
+        assert_eq!(stored_pk, memory_pk("legacy-ns", "legacy-id"));
+
+        // An upsert by (namespace, id) matches the backfilled row.
+        store
+            .upsert(
+                "legacy-ns",
+                "legacy-id",
+                vec![0.0; 4],
+                t7_payload("matched"),
+            )
+            .await
+            .expect("upsert matches the backfilled row");
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'legacy-id'").await,
+            1,
+            "the backfilled row was matched, not duplicated"
+        );
+
+        // The legacy table's PRIMARY KEY is still (id), so the same id in
+        // another namespace cannot become a second row: the write fails
+        // LOUD at the engine rather than silently aliasing onto the
+        // existing row, and the existing row is untouched.
+        let res = store
+            .upsert(
+                "other-ns",
+                "legacy-id",
+                vec![0.0; 4],
+                t7_payload("alias attempt"),
+            )
+            .await;
+        assert!(
+            res.is_err(),
+            "a cross-namespace same-id write on a legacy table must fail loud"
+        );
+        assert_eq!(
+            t7_count_where(&store, "m.id = 'legacy-id'").await,
+            1,
+            "the failed write created nothing"
+        );
+        let (_, got) = store
+            .get("legacy-ns", "legacy-id")
+            .await
+            .unwrap()
+            .expect("row still readable");
+        assert_eq!(got.content, "matched", "the existing row was not aliased");
+    }
+
+    #[tokio::test]
     async fn null_namespace_rows_backfill_or_quarantine_never_block() {
         let path = std::env::temp_dir().join(format!("ns-t7-null-{}", uuid::Uuid::new_v4()));
         // Phase 1: seed two rows whose namespace property is NULL (omitted
@@ -8334,7 +8680,8 @@ eurostrata\src\daemon.rs",
                 ("orphan-no-meta", "{}"),
             ] {
                 let create = format!(
-                    "CREATE (m:Memory {{id: '{}', content: 'c', user_id: 'u', memory_type: 'note', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                    "CREATE (m:Memory {{pk: '{}', id: '{}', content: 'c', user_id: 'u', memory_type: 'note', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                    escape_ladybug_string(&format!("seed-pk:{id}")),
                     id,
                     escape_ladybug_string(metadata),
                 );
@@ -8619,6 +8966,13 @@ eurostrata\src\daemon.rs",
     // ── print-form originals were unreadable in CI, which discards the ──────
     // ── output of passing tests.) The verdicts decide which rung of the ────
     // ── escaping ladder and which DDL the implementation takes. ────────────
+    //
+    // The second Step A probe — composite PRIMARY KEY (namespace, id) —
+    // was retired on 2026-10-25: it FAILED as designed (run 40164691714),
+    // proving lbug 0.20.4's parser rejects a multi-column PRIMARY KEY in
+    // CREATE NODE TABLE. That verdict is the reason fresh tables key on
+    // the derived single-column pk (see memory_pk); the probe's work is
+    // done and its record lives in the plan's Decisions Register.
 
     #[test]
     fn probe_lbug_param_binding_merge_and_array() {
@@ -8705,40 +9059,5 @@ eurostrata\src\daemon.rs",
             "PROBE BINDING: FLOAT[4] array parameter must round-trip element-for-element"
         );
         eprintln!("PROBE BINDING: supported — asserted via bound MERGE + FLOAT[4] round-trip");
-    }
-
-    #[test]
-    fn probe_lbug_composite_primary_key() {
-        let path = std::env::temp_dir().join(format!("ns-t7-probe-pk-{}", uuid::Uuid::new_v4()));
-        let _db = t7_raw_db(&path);
-        let conn = Connection::new(&_db).expect("raw connection");
-        // The capability under test: PRIMARY KEY (namespace, id) in the
-        // DDL, two rows sharing the id component under different
-        // namespaces, and an exact duplicate pair refused by the key.
-        conn.query(
-            "CREATE NODE TABLE CP (namespace STRING, id STRING, content STRING, PRIMARY KEY (namespace, id))",
-        )
-        .expect("PROBE COMPOSITE PK unsupported: composite-PK DDL failed");
-        conn.query("CREATE (:CP {namespace: 'a', id: 'x', content: 'one'})")
-            .expect("PROBE COMPOSITE PK unsupported: first row refused");
-        conn.query("CREATE (:CP {namespace: 'b', id: 'x', content: 'two'})")
-            .expect("PROBE COMPOSITE PK unsupported: a row sharing only the id component was refused");
-        let dup = conn.query("CREATE (:CP {namespace: 'a', id: 'x', content: 'three'})");
-        assert!(
-            dup.is_err(),
-            "PROBE COMPOSITE PK: an exact duplicate (namespace, id) pair must be refused"
-        );
-        let mut rows = conn
-            .query("MATCH (m:CP) RETURN count(m)")
-            .expect("PROBE COMPOSITE PK: count query failed");
-        let n = rows
-            .next()
-            .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(-1))
-            .unwrap_or(-1);
-        assert_eq!(
-            n, 2,
-            "PROBE COMPOSITE PK: the table must hold exactly the two distinct pairs"
-        );
-        eprintln!("PROBE COMPOSITE PK: supported — asserted via DDL + shared component + duplicate refusal");
     }
 }
