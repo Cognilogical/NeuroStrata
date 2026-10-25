@@ -1524,6 +1524,10 @@ impl VectorStore for LadybugStore {
         payload: MemoryPayload,
     ) -> Result<crate::traits::UpsertReport> {
         let namespace = namespace.to_string();
+        // R14: reject empty/whitespace namespaces before hitting the store.
+        if namespace.trim().is_empty() {
+            anyhow::bail!("namespace must be non-empty");
+        }
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let shape_warnings = write_shape_warnings(&payload);
