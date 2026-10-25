@@ -8216,13 +8216,15 @@ eurostrata\src\daemon.rs",
     /// old-binary store, not a caricature of one.
     const T7_OLD_DDL: &str = "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[4], PRIMARY KEY (id))";
 
-    fn t7_raw_open(path: &std::path::Path) -> (Database, Connection) {
+    // Returns the Database alone: a Connection borrows its Database, so a
+    // (Database, Connection) pair can never be returned from one function
+    // (E0515/E0505). Call sites bind the Database first (keep-alive; drops
+    // last) and build their own Connection from it.
+    fn t7_raw_db(path: &std::path::Path) -> Database {
         let cfg = SystemConfig::default()
             .max_db_size(512 * 1024 * 1024)
             .buffer_pool_size(64 * 1024 * 1024);
-        let db = Database::new(path, cfg).expect("raw open");
-        let conn = Connection::new(&db).expect("raw connection");
-        (db, conn)
+        Database::new(path, cfg).expect("raw open")
     }
 
     /// Seed one row the way the OLD upsert writes it: MERGE on {id} alone,
@@ -8288,7 +8290,8 @@ eurostrata\src\daemon.rs",
     async fn old_binary_rows_are_found_not_duplicated() {
         let path = std::env::temp_dir().join(format!("ns-t7-old-{}", uuid::Uuid::new_v4()));
         {
-            let (_db, conn) = t7_raw_open(&path);
+            let _db = t7_raw_db(&path);
+            let conn = Connection::new(&_db).expect("raw connection");
             conn.query(T7_OLD_DDL).expect("old DDL");
             t7_old_shape_insert(&conn, "legacy-ns", "legacy-id", "old content");
         }
@@ -8398,7 +8401,8 @@ eurostrata\src\daemon.rs",
     async fn audit_at_init_never_blocks_open() {
         let path = std::env::temp_dir().join(format!("ns-t7-init-{}", uuid::Uuid::new_v4()));
         {
-            let (_db, conn) = t7_raw_open(&path);
+            let _db = t7_raw_db(&path);
+            let conn = Connection::new(&_db).expect("raw connection");
             conn.query(T7_OLD_DDL).expect("old DDL");
             conn.query(
                 "CREATE (m:Memory {id: 'pre-orphan', content: 'c', user_id: 'u', memory_type: 'note', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})",
@@ -8617,7 +8621,8 @@ eurostrata\src\daemon.rs",
     fn probe_lbug_param_binding_merge_and_array() {
         use lbug::{LogicalType, Value};
         let path = std::env::temp_dir().join(format!("ns-t7-probe-bind-{}", uuid::Uuid::new_v4()));
-        let (_db, conn) = t7_raw_open(&path);
+        let _db = t7_raw_db(&path);
+        let conn = Connection::new(&_db).expect("raw connection");
         conn.query(
             "CREATE NODE TABLE Probe (id STRING, namespace STRING, content STRING, embedding FLOAT[4], PRIMARY KEY (id))",
         )
@@ -8673,7 +8678,8 @@ eurostrata\src\daemon.rs",
     #[test]
     fn probe_lbug_composite_primary_key() {
         let path = std::env::temp_dir().join(format!("ns-t7-probe-pk-{}", uuid::Uuid::new_v4()));
-        let (_db, conn) = t7_raw_open(&path);
+        let _db = t7_raw_db(&path);
+        let conn = Connection::new(&_db).expect("raw connection");
         let verdict = (|| -> Result<i64, lbug::Error> {
             conn.query(
                 "CREATE NODE TABLE CP (namespace STRING, id STRING, content STRING, PRIMARY KEY (namespace, id))",
