@@ -334,7 +334,8 @@ pub(crate) enum TaskCommands {
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub(crate) enum HooksCommands {
-    /// Write .git/hooks/pre-push: the only hook the task system keeps
+    /// Write the pre-push hook into the directory git runs hooks from
+    /// (core.hooksPath honored): the only hook the task system keeps
     Install {
         /// Replace a pre-push hook NeuroStrata did not write
         #[arg(long)]
@@ -580,39 +581,6 @@ fn daemon_busy(probe: DaemonProbe, lock_held: bool) -> bool {
     lock_held && probe != DaemonProbe::Responsive
 }
 
-/// The pre-push hook, section 5.2 verbatim. Installed by `hooks install`.
-///
-/// One hook is the whole enforcement surface: tasks live in LadybugDB, never
-/// in the repo, so there is nothing to commit, sync, or rebuild. Blocks only
-/// on exit 1 -- an unavailable database (exit 2) passes here; `task gate
-/// --strict` maps its own infra failure to exit 1 instead of 2 (section 5.1).
-///
-/// Mesh piggyback (spec §"Hooks"), slice 7 decision: the mesh enqueue is
-/// deliberately NOT installed into this hook. Hooks are unreliable (spec:
-/// not inherited by clones, conflict with hook managers), rewriting this
-/// const would not retrofit already-installed hooks, and the gate stays
-/// single-purpose. `neurostrata-mcp mesh sync-enqueue` (hidden CLI,
-/// pull-then-push, one line, always exit 0) is the hook TARGET for sites
-/// that opt in; manual wiring line, if wanted:
-///   printf '\nneurostrata-mcp mesh sync-enqueue >/dev/null 2>&1 || true\n' >> .git/hooks/pre-push
-/// Manual push/pull remains first-class either way.
-const PRE_PUSH_HOOK: &str = r#"#!/bin/bash
-# NeuroStrata task gate. One hook is the whole enforcement surface:
-# tasks live in LadybugDB, never in the repo, so there is nothing to
-# commit, sync, or rebuild.
-command -v neurostrata-mcp >/dev/null || exit 0
-[ -n "$NEUROSTRATA_SKIP_GATE" ] && exit 0
-
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-neurostrata-mcp task gate "$NAMESPACE" --strict
-code=$?
-if [ $code -eq 1 ]; then
-    echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
-    exit 1
-fi
-exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-"#;
-
 /// The gate's exit code: verdict known -> 0/1; verdict unavailable -> strict
 /// blocks (1), otherwise 2 (section 5.1). The hook only blocks on 1, so the
 /// non-strict infra path warns and lets the push through.
@@ -628,6 +596,15 @@ fn gate_exit_code(ok: Option<bool>, strict: bool) -> i32 {
             }
         }
     }
+}
+
+/// The gate CLI's half of the SKIP_GATE definition: the escape hatch is
+/// honored only for the exact value "1" — "0", "false", "yes", and empty
+/// all run the gate. The installed pre-push hook carries the same
+/// definition in shell; the two homes must never drift (the Task 4 tests
+/// pin both).
+fn skip_gate_value_skips(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 /// The enclosing git work tree, or None outside one.
@@ -695,6 +672,48 @@ fn cli_ingest_root(dir: &str) -> String {
 }
 
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
+
+/// What `hooks install` writes, and where: the scaffolded hook text — the
+/// same bytes the task-setup payload ships — into the directory git
+/// actually runs hooks from (`git_hooks_dir`, which honors
+/// `core.hooksPath`). One hook text, one resolution; there is no second
+/// copy in this binary. Returns the installed hook's path; `Err` carries
+/// the user-facing refusal (a pre-push hook NeuroStrata did not write,
+/// and no `--force`).
+///
+/// Mesh piggyback (spec §"Hooks"), slice 7 decision: the mesh enqueue is
+/// deliberately NOT installed into this hook. Hooks are unreliable (spec:
+/// not inherited by clones, conflict with hook managers), rewriting the
+/// hook would not retrofit already-installed hooks, and the gate stays
+/// single-purpose. `neurostrata-mcp mesh sync-enqueue` (hidden CLI,
+/// pull-then-push, one line, always exit 0) is the hook TARGET for sites
+/// that opt in; manual wiring line, if wanted:
+///   printf '\nneurostrata-mcp mesh sync-enqueue >/dev/null 2>&1 || true\n' >> .git/hooks/pre-push
+/// Manual push/pull remains first-class either way.
+fn install_pre_push_hook(
+    root: &std::path::Path,
+    force: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    let hooks_dir = crate::task::git_hooks_dir(root);
+    if !hooks_dir.is_dir() {
+        std::fs::create_dir_all(&hooks_dir)?;
+    }
+    let target = hooks_dir.join("pre-push");
+    // Overwriting our own hook needs no flag: --force is for
+    // a pre-push somebody else wrote.
+    let ours = std::fs::read_to_string(&target)
+        .map(|content| content.contains("NeuroStrata task gate"))
+        .unwrap_or(false);
+    if target.exists() && !ours && !force {
+        anyhow::bail!(
+            "{} already exists and was not written by NeuroStrata.\nRe-run with --force to replace it with the NeuroStrata task gate:\n  neurostrata-mcp hooks install --force",
+            target.display()
+        );
+    }
+    std::fs::write(&target, crate::task::SCAFFOLDED_PRE_PUSH_HOOK)?;
+    set_hook_executable(&target)?;
+    Ok(target)
+}
 
 /// Mark a freshly-written hook file as executable. Git on POSIX runs a hook
 /// only when the mode bit is set; on Windows it uses the filename
@@ -1237,24 +1256,485 @@ mod tests {
         );
     }
 
-    /// Section 5.2 verbatim: blocks on violations only, skips on the escape
-    /// hatch, and lets 0 and 2 pass.
-    #[test]
-    fn the_pre_push_hook_is_the_documented_script() {
-        assert!(PRE_PUSH_HOOK.starts_with("#!/bin/bash\n"));
-        assert!(PRE_PUSH_HOOK.contains("command -v neurostrata-mcp >/dev/null || exit 0"));
-        assert!(PRE_PUSH_HOOK.contains("[ -n \"$NEUROSTRATA_SKIP_GATE\" ] && exit 0"));
+    // ── Task 4: one hook installer, honest SKIP_GATE ─────────────────────
+    //
+    // The five tests below pin the unified gate/hook enforcement chain:
+    // `hooks install` writes the scaffolded hook text (the one the
+    // task-setup payload ships) into the directory git actually runs
+    // hooks from, SKIP_GATE skips only for exactly "1" in both of its
+    // homes, and a missing gate binary is announced, never silent.
+
+    /// Run git in `root`, isolated from the developer's own global/system
+    /// config so a personal `core.hooksPath` cannot change what is
+    /// asserted. Returns the command's output.
+    #[cfg(unix)]
+    fn t4_git(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git runs")
+    }
+
+    #[cfg(unix)]
+    fn t4_git_ok(root: &std::path::Path, args: &[&str]) {
+        let out = t4_git(root, args);
         assert!(
-            PRE_PUSH_HOOK.contains("NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")")
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
         );
-        assert!(PRE_PUSH_HOOK.contains("neurostrata-mcp task gate \"$NAMESPACE\" --strict"));
-        assert!(PRE_PUSH_HOOK.contains("code=$?"));
-        assert!(PRE_PUSH_HOOK.contains("if [ $code -eq 1 ]; then"));
-        assert!(PRE_PUSH_HOOK.contains("NEUROSTRATA_SKIP_GATE=1 git push"));
-        assert!(PRE_PUSH_HOOK
-            .contains("exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking"));
+    }
+
+    /// A fresh git repo in a temp dir, with a commit-ready identity.
+    #[cfg(unix)]
+    fn t4_repo(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("ns-t4-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        t4_git_ok(&root, &["init", "-q", "-b", "main"]);
+        t4_git_ok(&root, &["config", "user.email", "t4@example.invalid"]);
+        t4_git_ok(&root, &["config", "user.name", "Task 4 Test"]);
+        root
+    }
+
+    /// `t4_repo` plus a bare remote and one seed commit, ready to push.
+    #[cfg(unix)]
+    fn t4_repo_with_remote(tag: &str) -> std::path::PathBuf {
+        let root = t4_repo(tag);
+        let remote = root.join("remote.git");
+        t4_git_ok(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        t4_git_ok(&root, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        std::fs::write(root.join("file.txt"), "task 4\n").unwrap();
+        t4_git_ok(&root, &["add", "file.txt"]);
+        t4_git_ok(&root, &["commit", "-q", "-m", "task 4 seed"]);
+        root
+    }
+
+    /// A stub `neurostrata-mcp` whose exit code is STUB_GATE_EXIT; every
+    /// invocation appends a line to the marker file, so a test can prove
+    /// the hook actually ran the gate.
+    #[cfg(unix)]
+    fn t4_stub_bin(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("stub-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let marker = root.join("gate-ran.marker");
+        let stub = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\nexit ${{STUB_GATE_EXIT:-0}}\n",
+            marker.display()
+        );
+        let stub_path = bin.join("neurostrata-mcp");
+        std::fs::write(&stub_path, stub).unwrap();
+        let mut perms = std::fs::metadata(&stub_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub_path, perms).unwrap();
+        (bin, marker)
+    }
+
+    /// Push `main` to origin with `path` as the push process's PATH.
+    #[cfg(unix)]
+    fn t4_push(
+        root: &std::path::Path,
+        path: &str,
+        stub_gate_exit: Option<&str>,
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["push", "origin", "main"])
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("PATH", path);
+        if let Some(code) = stub_gate_exit {
+            cmd.env("STUB_GATE_EXIT", code);
+        }
+        cmd.output().expect("git push runs")
+    }
+
+    /// `t4_push` with `NEUROSTRATA_SKIP_GATE` set on the push process
+    /// (the hook inherits it), or explicitly removed when `None`.
+    #[cfg(unix)]
+    fn t4_push_with_skip(
+        root: &std::path::Path,
+        path: &str,
+        stub_gate_exit: Option<&str>,
+        skip_gate: Option<&str>,
+    ) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["push", "origin", "main"])
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("PATH", path);
+        if let Some(code) = stub_gate_exit {
+            cmd.env("STUB_GATE_EXIT", code);
+        }
+        match skip_gate {
+            Some(value) => {
+                cmd.env("NEUROSTRATA_SKIP_GATE", value);
+            }
+            None => {
+                cmd.env_remove("NEUROSTRATA_SKIP_GATE");
+            }
+        }
+        cmd.output().expect("git push runs")
+    }
+
+    /// The CLI binary `cargo test` builds beside the test profile dir:
+    /// unit tests run from `<profile>/deps/<test-binary>`, the CLI itself
+    /// is at `<profile>/neurostrata-mcp`.
+    #[cfg(unix)]
+    fn t4_cli_binary() -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        exe.parent()
+            .and_then(|deps| deps.parent())
+            .map(|profile| profile.join("neurostrata-mcp"))
+            .expect("the CLI binary path derives from the test binary path")
+    }
+
+    /// Task 4, Step 1: with `core.hooksPath` set, `hooks install` writes
+    /// the hook there — and git actually runs it from there on push; with
+    /// it unset, the hook lands in `.git/hooks`.
+    #[cfg(unix)]
+    #[test]
+    fn hooks_install_honors_hooks_path() {
+        let root = t4_repo_with_remote("hookspath");
+        t4_git_ok(&root, &["config", "core.hooksPath", ".githooks"]);
+        let target = install_pre_push_hook(&root, false).expect("install succeeds");
+        assert_eq!(target, root.join(".githooks").join("pre-push"));
+        assert!(target.is_file(), "the hook lands where git looks for it");
         assert!(
-            !PRE_PUSH_HOOK.contains("$code -eq 2"),
+            !root.join(".git").join("hooks").join("pre-push").exists(),
+            "with core.hooksPath set, .git/hooks is not git's hooks dir"
+        );
+
+        // git runs the installed hook on push: a failing stub gate
+        // blocks the push (and leaves its marker); a passing one lets
+        // the same push through.
+        let (stub_bin, marker) = t4_stub_bin(&root);
+        let path = format!("{}:/usr/bin:/bin", stub_bin.display());
+        let blocked = t4_push(&root, &path, Some("1"));
+        assert!(
+            !blocked.status.success(),
+            "a failing gate must fail the push: {}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        assert!(marker.exists(), "the hook ran the gate on push");
+        assert!(
+            String::from_utf8_lossy(&blocked.stderr).contains("Push blocked"),
+            "the hook's verdict reaches the pusher: {}",
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        let clean = t4_push(&root, &path, Some("0"));
+        assert!(
+            clean.status.success(),
+            "a passing gate lets the push through: {}",
+            String::from_utf8_lossy(&clean.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Unset: the default .git/hooks. (Skipped where the ambient
+        // config already sets a hooksPath — git_hooks_dir would be
+        // right to honor it, exactly as the installer honors it.)
+        let root = t4_repo("hooksdefault");
+        let ambient = std::process::Command::new("git")
+            .args(["config", "--get", "core.hooksPath"])
+            .current_dir(&root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ambient {
+            let target = install_pre_push_hook(&root, false).expect("install succeeds");
+            assert_eq!(target, root.join(".git").join("hooks").join("pre-push"));
+            assert!(target.is_file());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Task 4, Step 1: the installed bytes ARE the scaffolded hook — the
+    /// text the task-setup payload ships — in both install locations.
+    #[cfg(unix)]
+    #[test]
+    fn installed_hook_is_the_scaffolded_one() {
+        use std::os::unix::fs::PermissionsExt;
+        for (tag, hooks_path) in [("bytes-default", None), ("bytes-custom", Some(".githooks"))] {
+            let root = t4_repo(tag);
+            if let Some(hp) = hooks_path {
+                t4_git_ok(&root, &["config", "core.hooksPath", hp]);
+            }
+            let target = install_pre_push_hook(&root, false).expect("install succeeds");
+            let bytes = std::fs::read(&target).unwrap();
+            assert_eq!(
+                bytes,
+                crate::task::SCAFFOLDED_PRE_PUSH_HOOK.as_bytes(),
+                "hooks install must write the scaffolded hook text byte for byte ({})",
+                tag
+            );
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert!(
+                mode & 0o111 != 0,
+                "the installed hook is executable ({})",
+                tag
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Task 4, Step 1: SKIP_GATE has ONE definition in both homes — the
+    /// gate CLI's predicate and the installed hook's shell test: only the
+    /// exact value "1" skips; "0", "false", "yes", and empty all run the
+    /// gate. (That the CLI *logs* the skip — stderr plus its stdout
+    /// report line — is pinned behaviorally by
+    /// `gate_cli_skip_is_logged_to_stderr_and_report`; the hook's legs
+    /// through real pushes by `skip_gate_hook_legs_on_real_pushes`.)
+    #[test]
+    fn skip_gate_only_exactly_one() {
+        assert!(!skip_gate_value_skips(None), "unset runs the gate");
+        assert!(!skip_gate_value_skips(Some("")), "empty runs the gate");
+        assert!(!skip_gate_value_skips(Some("0")), "\"0\" runs the gate");
+        assert!(
+            !skip_gate_value_skips(Some("false")),
+            "\"false\" runs the gate"
+        );
+        assert!(!skip_gate_value_skips(Some("yes")), "\"yes\" runs the gate");
+        assert!(!skip_gate_value_skips(Some("01")), "\"01\" is not \"1\"");
+        assert!(
+            !skip_gate_value_skips(Some(" 1")),
+            "whitespace is not trimmed into a skip"
+        );
+        assert!(skip_gate_value_skips(Some("1")), "exactly \"1\" skips");
+
+        let hook = crate::task::SCAFFOLDED_PRE_PUSH_HOOK;
+        assert!(
+            hook.contains("[ \"$NEUROSTRATA_SKIP_GATE\" = \"1\" ]"),
+            "the hook's skip test is the exact-match form"
+        );
+        assert!(
+            !hook.contains("[ -n \"$NEUROSTRATA_SKIP_GATE\" ]"),
+            "the hook must not skip on any non-empty value"
+        );
+    }
+
+    /// Task 4 fix round (I-1): the CLI half of the skip contract, pinned
+    /// behaviorally against the real binary. With
+    /// `NEUROSTRATA_SKIP_GATE=1` the gate arm logs the skip to stderr AND
+    /// prints it in its stdout report, exiting before any store work;
+    /// with "yes" it does neither — the gate actually runs (against the
+    /// fresh default store under the isolated HOME it reports clean, or
+    /// refuses *as a gate*, never as a skip).
+    #[cfg(unix)]
+    #[test]
+    fn gate_cli_skip_is_logged_to_stderr_and_report() {
+        let bin = t4_cli_binary();
+        assert!(
+            bin.is_file(),
+            "cargo test builds the CLI binary at {}",
+            bin.display()
+        );
+        let home = std::env::temp_dir().join(format!("ns-t4-clihome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        let run_gate = |skip: &str| {
+            std::process::Command::new(&bin)
+                .args(["task", "gate", "t4cli"])
+                .current_dir(&home)
+                .env("HOME", &home)
+                .env("NEUROSTRATA_SKIP_GATE", skip)
+                .output()
+                .expect("the CLI runs")
+        };
+
+        let skipped = run_gate("1");
+        assert!(
+            skipped.status.success(),
+            "a skipped gate exits cleanly: {}",
+            String::from_utf8_lossy(&skipped.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&skipped.stderr).contains(
+                "[neurostrata:gate] NEUROSTRATA_SKIP_GATE=1 is set; skipping the gate for 't4cli'."
+            ),
+            "the skip is logged to stderr: {}",
+            String::from_utf8_lossy(&skipped.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&skipped.stdout).contains(
+                "Task gate: skipped in 't4cli' (NEUROSTRATA_SKIP_GATE=1)."
+            ),
+            "the skip appears in the stdout gate report: {}",
+            String::from_utf8_lossy(&skipped.stdout)
+        );
+
+        let ran = run_gate("yes");
+        assert!(
+            !String::from_utf8_lossy(&ran.stderr).contains("skipping the gate"),
+            "SKIP_GATE=yes must not take the skip branch: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&ran.stdout).contains("Task gate: skipped"),
+            "SKIP_GATE=yes must not report a skip: {}",
+            String::from_utf8_lossy(&ran.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&ran.stdout).contains("Task gate: clean in 't4cli'.")
+                || String::from_utf8_lossy(&ran.stderr)
+                    .contains("[neurostrata:gate] the task gate could not run for 't4cli'"),
+            "the gate actually ran (reported, or refused as a gate): stdout={} stderr={}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Task 4 fix round (I-1): the hook half of the skip contract,
+    /// driven through real pushes. Only exactly "1" skips — announced on
+    /// stderr, gate not run; "yes" is not a skip: the gate runs and its
+    /// verdict governs the push.
+    #[cfg(unix)]
+    #[test]
+    fn skip_gate_hook_legs_on_real_pushes() {
+        let root = t4_repo_with_remote("skiplegs");
+        install_pre_push_hook(&root, false).expect("install succeeds");
+        let (stub_bin, marker) = t4_stub_bin(&root);
+        let path = format!("{}:/usr/bin:/bin", stub_bin.display());
+
+        // "yes" is not a skip: the gate runs, and its failing verdict
+        // blocks the push.
+        let ran = t4_push_with_skip(&root, &path, Some("1"), Some("yes"));
+        assert!(
+            !ran.status.success(),
+            "SKIP_GATE=yes must not skip: the failing gate blocks the push: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert!(marker.exists(), "the gate ran under SKIP_GATE=yes");
+        std::fs::remove_file(&marker).unwrap();
+
+        // Exactly "1" skips: the push proceeds despite the failing gate,
+        // the gate never runs, and the skip is announced on stderr.
+        let skipped = t4_push_with_skip(&root, &path, Some("1"), Some("1"));
+        assert!(
+            skipped.status.success(),
+            "SKIP_GATE=1 skips the gate, so the push proceeds: {}",
+            String::from_utf8_lossy(&skipped.stderr)
+        );
+        assert!(!marker.exists(), "the gate did not run under SKIP_GATE=1");
+        assert!(
+            String::from_utf8_lossy(&skipped.stderr)
+                .contains("NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1)"),
+            "the hook announces its skip, never silent: {}",
+            String::from_utf8_lossy(&skipped.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Task 4, Step 1: the installed hook, when `neurostrata-mcp` is not
+    /// on PATH, announces that the gate did NOT run and lets the push
+    /// proceed — never the old silent `exit 0`.
+    #[cfg(unix)]
+    #[test]
+    fn missing_binary_warns_loudly() {
+        let root = t4_repo_with_remote("nobinary");
+        install_pre_push_hook(&root, false).expect("install succeeds");
+        // A PATH with git but no neurostrata-mcp anywhere on it.
+        let out = t4_push(&root, "/usr/bin:/bin", None);
+        assert!(
+            out.status.success(),
+            "a missing gate binary must not block the push: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("warning: neurostrata-mcp not found — gate NOT run for this push"),
+            "the skip-by-absence is announced, never silent: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Task 4 fix round (F5): a gate that exits 2 — could-not-check,
+    /// never a verdict (under --strict the gate CLI itself exits only 0
+    /// or 1, so a 2 means the binary that answered was stale, foreign,
+    /// or died before reporting) — is announced on stderr, and the push
+    /// still proceeds. Before the fix round this was the one silent
+    /// pass left in the hook's own paths.
+    #[cfg(unix)]
+    #[test]
+    fn gate_exit_two_is_announced_and_passes() {
+        let root = t4_repo_with_remote("exittwo");
+        install_pre_push_hook(&root, false).expect("install succeeds");
+        let (stub_bin, marker) = t4_stub_bin(&root);
+        let path = format!("{}:/usr/bin:/bin", stub_bin.display());
+        let out = t4_push(&root, &path, Some("2"));
+        assert!(
+            out.status.success(),
+            "an exit 2 never blocks the push: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(marker.exists(), "the gate was invoked");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("warning: neurostrata-mcp task gate exited 2"),
+            "the could-not-run is announced, never silent: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Task 4, Step 1: the parallel PRE_PUSH_HOOK const is removed by
+    /// this task; the scaffolded hook (the surviving text) must carry
+    /// every behavior the const had, so the removal loses nothing. The
+    /// list below is the const's complete behavior inventory at the Task
+    /// 4 branch point. Two const behaviors are deliberately NOT in it —
+    /// they are the defects this task removes, replaced and pinned by
+    /// their own tests: silent exit when the binary is missing (now the
+    /// loud warning, `missing_binary_warns_loudly`) and skip on any
+    /// non-empty SKIP_GATE (now exactly "1", `skip_gate_only_exactly_one`).
+    /// Everything else must be present in the scaffold verbatim.
+    #[test]
+    fn const_and_scaffold_diff_is_empty_or_ported() {
+        let hook = crate::task::SCAFFOLDED_PRE_PUSH_HOOK;
+        assert!(
+            hook.starts_with("#!/bin/bash\n"),
+            "the scaffold starts with the bash shebang, as the removed const did"
+        );
+        for behavior in [
+            "command -v neurostrata-mcp",
+            "NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
+            "neurostrata-mcp task gate \"$NAMESPACE\" --strict",
+            "code=$?",
+            "if [ $code -eq 1 ]; then",
+            "echo \"Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push\" >&2",
+            "exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking",
+        ] {
+            assert!(
+                hook.contains(behavior),
+                "behavior the removed const had is missing from the scaffold: {}",
+                behavior
+            );
+        }
+        // Fix round (F5): an exit 2 is announced, never silent — and
+        // still never blocks. (Under --strict the gate CLI itself exits
+        // only 0 or 1, so a 2 is never a verdict: a stale, foreign, or
+        // dying binary.) The announcement branch must say so and must
+        // not exit 1.
+        let two_branch = hook
+            .split("if [ $code -eq 2 ]; then")
+            .nth(1)
+            .expect("the exit-2 announcement branch exists")
+            .split("fi")
+            .next()
+            .unwrap();
+        assert!(
+            two_branch.contains("gate could NOT run for this push"),
+            "an exit 2 is announced as a could-not-run, never silent"
+        );
+        assert!(
+            !two_branch.contains("exit 1"),
             "2 never blocks in the hook itself"
         );
     }
@@ -2248,12 +2728,15 @@ async fn run() -> anyhow::Result<()> {
                     }
 
                     // Both policies print the escape hatch (section 5.1).
-                    if std::env::var("NEUROSTRATA_SKIP_GATE")
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false)
-                    {
+                    if skip_gate_value_skips(
+                        std::env::var("NEUROSTRATA_SKIP_GATE").ok().as_deref(),
+                    ) {
                         eprintln!(
-                            "[neurostrata:gate] NEUROSTRATA_SKIP_GATE is set; skipping the gate for '{}'.",
+                            "[neurostrata:gate] NEUROSTRATA_SKIP_GATE=1 is set; skipping the gate for '{}'.",
+                            namespace
+                        );
+                        println!(
+                            "Task gate: skipped in '{}' (NEUROSTRATA_SKIP_GATE=1).",
                             namespace
                         );
                         return Ok(());
@@ -2530,34 +3013,19 @@ async fn run() -> anyhow::Result<()> {
                         );
                         std::process::exit(1);
                     }
-                    let hooks_dir = root.join(".git/hooks");
-                    if !hooks_dir.is_dir() {
-                        std::fs::create_dir_all(&hooks_dir)?;
+                    match install_pre_push_hook(&root, force) {
+                        Ok(target) => {
+                            println!(
+                                "Installed the NeuroStrata task gate at {}.",
+                                target.display()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
                     }
-                    let target = hooks_dir.join("pre-push");
-                    // Overwriting our own hook needs no flag: --force is for
-                    // a pre-push somebody else wrote.
-                    let ours = std::fs::read_to_string(&target)
-                        .map(|content| content.contains("NeuroStrata task gate"))
-                        .unwrap_or(false);
-                    if target.exists() && !ours && !force {
-                        eprintln!(
-                            "{} already exists and was not written by NeuroStrata.",
-                            target.display()
-                        );
-                        eprintln!(
-                            "Re-run with --force to replace it with the NeuroStrata task gate:"
-                        );
-                        eprintln!("  neurostrata-mcp hooks install --force");
-                        std::process::exit(1);
-                    }
-                    std::fs::write(&target, PRE_PUSH_HOOK)?;
-                    set_hook_executable(&target)?;
-                    println!(
-                        "Installed the NeuroStrata task gate at {}.",
-                        target.display()
-                    );
-                    return Ok(());
                 }
             },
             other => {
