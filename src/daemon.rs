@@ -391,13 +391,34 @@ impl ProjectAnchors {
     }
 
     /// Record that `namespace` is served from `root` (a request carried
-    /// both). Best-effort: an unresolvable root teaches nothing.
+    /// both). First writer wins for the daemon's lifetime (Task 2 fix
+    /// round / I-1): a namespace already anchored to a DIFFERENT root
+    /// keeps its anchor, and the conflicting teach is refused with a
+    /// warning naming the namespace and both roots — otherwise any
+    /// caller could re-anchor another project's namespace to its own
+    /// root and divert that project's pointer echoes into its own
+    /// buffer. Best-effort: an unresolvable root teaches nothing.
     pub(crate) fn note_namespace_root(&self, namespace: &str, root: &Path) {
-        if let Ok(anchor) = self.anchor_for(Some(root)) {
-            self.by_namespace
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(namespace.to_string(), anchor.root.clone());
+        let Ok(anchor) = self.anchor_for(Some(root)) else {
+            return;
+        };
+        let mut by_namespace = self
+            .by_namespace
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match by_namespace.get(namespace) {
+            Some(existing) if *existing != anchor.root => {
+                tracing::warn!(
+                    "anchor conflict: namespace {namespace} is anchored to {}; \
+                     refusing to re-anchor it to {} — the first root taught \
+                     this daemon lifetime wins",
+                    existing.display(),
+                    anchor.root.display()
+                );
+            }
+            _ => {
+                by_namespace.insert(namespace.to_string(), anchor.root.clone());
+            }
         }
     }
 
@@ -451,10 +472,19 @@ pub(crate) fn check_caller_path(
 }
 
 /// Resolve `raw` to the canonical path it names, per [`check_caller_path`].
+///
+/// A relative `raw` is resolved against the daemon's working directory —
+/// the baseline handler semantics, from before this policy existed, when
+/// handlers consumed caller paths joined onto the process CWD verbatim.
+/// The choice is recorded here deliberately (Task 2 fix round / M-2):
+/// containment is judged on the resolved ABSOLUTE path, so the CWD base
+/// can make a relative path refuse, but can never widen what it reaches.
 fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
     let absolute = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
+        // Relative: the daemon's CWD is the base (see the doc comment —
+        // baseline semantics; containment judges the absolute result).
         std::env::current_dir()
             .map(|cwd| cwd.join(raw))
             .unwrap_or_else(|_| raw.to_path_buf())
@@ -1400,32 +1430,31 @@ async fn handle_set_metadata(
 }
 
 // Handle a single MCP JSON-RPC line
-/// Teach the anchor cache from one MCP request (Task 2 / J19): a tool call
-/// that carries a `project_root` resolves that root's anchor; one that
-/// carries a `namespace` as well records the pairing the pointer echo
-/// consults, keyed by the RESOLVED namespace — the spelling pulses carry —
-/// not the caller's. Best-effort by design — teaching never fails a
-/// request; an unresolvable root simply teaches nothing.
-async fn note_request_anchors(state: &AppState, request: &serde_json::Value) {
+/// What one MCP request would teach the anchor cache (Task 2 / J19): a
+/// tool call that carries a `project_root`, plus the namespace pairing
+/// when it carries a `namespace` too — keyed by the RESOLVED namespace,
+/// the spelling pulses carry, not the caller's. This only RESOLVES the
+/// teaching (a read; it records nothing): `handle_mcp` applies it after
+/// the call dispatches successfully, so a failed or refused call anchors
+/// nothing. Best-effort by design — an unresolvable root simply teaches
+/// nothing, and teaching never fails a request.
+async fn resolve_request_anchor(
+    state: &AppState,
+    request: &serde_json::Value,
+) -> Option<(Option<String>, PathBuf)> {
     if request.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
-        return;
+        return None;
     }
-    let Some(arguments) = request.get("params").and_then(|p| p.get("arguments")) else {
-        return;
-    };
-    let Some(root) = arguments.get("project_root").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let root = Path::new(root);
+    let arguments = request.get("params").and_then(|p| p.get("arguments"))?;
+    let root = arguments.get("project_root").and_then(|v| v.as_str())?;
+    let root = PathBuf::from(root);
     match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(namespace) => {
             let resolved =
                 crate::server::resolve_namespace(&state.vector_store, namespace).await;
-            state.anchors.note_namespace_root(&resolved, root);
+            Some((Some(resolved), root))
         }
-        None => {
-            let _ = state.anchors.anchor_for(Some(root));
-        }
+        None => Some((None, root)),
     }
 }
 
@@ -1433,7 +1462,18 @@ async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    note_request_anchors(&state, &request).await;
+    // Resolve the request's anchor teaching BEFORE dispatch (a read, so
+    // applying it afterwards costs no await), but apply it only once the
+    // call has dispatched successfully (Task 2 fix round / I-1): before
+    // this fix the pairing was recorded before dispatch, unconditionally,
+    // so even a request the daemon refused taught its caller's root for
+    // the namespace it named. Success here is the JSON-RPC layer's — the
+    // response carries no `error`. This codebase's tool handlers report
+    // their own refusals as text inside a success envelope (there is no
+    // structured tool-error channel to key on), so a handler's textual
+    // refusal still teaches; first-writer-wins in `note_namespace_root`
+    // bounds what any one teach can do.
+    let pending_anchor = resolve_request_anchor(&state, &request).await;
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
         let response = crate::server::process_mcp_request(
             rpc_req,
@@ -1444,6 +1484,17 @@ async fn handle_mcp(
             state.bus.clone(),
         )
         .await;
+        if response.get("error").is_none() {
+            match pending_anchor {
+                Some((Some(namespace), root)) => {
+                    state.anchors.note_namespace_root(&namespace, &root);
+                }
+                Some((None, root)) => {
+                    let _ = state.anchors.anchor_for(Some(&root));
+                }
+                None => {}
+            }
+        }
         Json(response)
     } else {
         Json(
