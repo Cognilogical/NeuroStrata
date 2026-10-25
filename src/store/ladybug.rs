@@ -1489,6 +1489,11 @@ fn is_valid_relation_name(name: &str) -> bool {
 /// the query text, so this is what bounds how large that text can get.
 const RELINK_BATCH: usize = 500;
 
+/// The relationship tables init() creates between Memory rows. Relocate's
+/// delete-and-recreate path replays a moved row's edges across exactly
+/// these tables.
+const MEMORY_REL_TABLES: [&str; 4] = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM"];
+
 /// Replays one relationship type in a couple of statements instead of one per
 /// edge.
 ///
@@ -1712,6 +1717,7 @@ impl VectorStore for LadybugStore {
                         }
                     }
                     let mut backfilled = 0usize;
+                    let mut unfixable = 0usize;
                     for (row_id, row_ns, derived) in &stale {
                         let applied = (|| -> std::result::Result<(), lbug::Error> {
                             let mut stmt = conn.prepare(
@@ -1729,12 +1735,26 @@ impl VectorStore for LadybugStore {
                         })();
                         if applied.is_ok() {
                             backfilled += 1;
+                        } else {
+                            unfixable += 1;
                         }
                     }
                     if backfilled > 0 {
                         eprintln!(
                             "[neurostrata:identity-audit] backfilled the derived pk on {} Memory row(s)",
                             backfilled
+                        );
+                    }
+                    if unfixable > 0 {
+                        // A primary-key column cannot be updated in
+                        // place (the binder refuses SET on it), so a
+                        // stale pk on a fresh table is beyond init's
+                        // repair: the row keeps its stored key, stays
+                        // readable by property scans, and is reported
+                        // here rather than silently skipped.
+                        eprintln!(
+                            "[neurostrata:identity-audit] {} Memory row(s) carry a pk that does not match their (namespace, id) and could not be rewritten in place — an operator repair (delete + reinsert) is required",
+                            unfixable
                         );
                     }
                 }
@@ -1862,9 +1882,17 @@ impl VectorStore for LadybugStore {
             // column (legacy mode), the MERGE keeps the pre-re-plan
             // (namespace, id) property pattern over escaped literals.
             if pk_ready {
+                // The pattern carries id beside pk: on a legacy table
+                // (pk added by ALTER) the PRIMARY KEY is still id, and
+                // the binder refuses a MERGE whose create path does not
+                // supply the key property in the pattern ("Create node m
+                // expects primary key id as input" — run 40167089842).
+                // A key property also cannot be assigned via SET, so id
+                // comes from the pattern and ON CREATE SET starts at
+                // namespace.
                 let merge_query = format!(
-                    "MERGE (m:Memory {{pk: $pk}})
-                     ON CREATE SET m.id = $id, m.namespace = $ns, m.content = $content, m.user_id = $user_id, m.memory_type = $memory_type, m.agent_name = $agent_name, m.location = $location, m.location_lines = $location_lines, m.metadata = $metadata, m.embedding = {}
+                    "MERGE (m:Memory {{pk: $pk, id: $id}})
+                     ON CREATE SET m.namespace = $ns, m.content = $content, m.user_id = $user_id, m.memory_type = $memory_type, m.agent_name = $agent_name, m.location = $location, m.location_lines = $location_lines, m.metadata = $metadata, m.embedding = {}
                      ON MATCH SET m.content = $content, m.user_id = $user_id, m.memory_type = $memory_type, m.agent_name = $agent_name, m.location = $location, m.location_lines = $location_lines, m.metadata = $metadata, m.embedding = {}",
                     vec_str, vec_str
                 );
@@ -2496,8 +2524,8 @@ impl VectorStore for LadybugStore {
         if from == to {
             return Ok(RelocateOutcome::SameNamespace);
         }
-        let payload = match self.get(from, id).await? {
-            Some((_, payload)) => payload,
+        let (vector, payload) = match self.get(from, id).await? {
+            Some(pair) => pair,
             None => return Ok(RelocateOutcome::NotFound),
         };
         // An ingested node's id names the namespace that owns it, and the next
@@ -2511,27 +2539,156 @@ impl VectorStore for LadybugStore {
 
         let (id, from, to) = (id.to_string(), from.to_string(), to.to_string());
         let pk_ready = self.pk_ready();
+        let payload = payload.clone();
         self.write_with_deadline("moving a memory", move |conn| {
             // One statement, so there is no moment at which the memory exists in
             // neither namespace, and the row keeps its id, vector and edges.
-            // With the pk column present the derived key moves with the
-            // row (bound, B1): a relocate that left the old namespace's
-            // pk behind would strand the row — pk lookups in the new
-            // namespace would miss it, and a fresh upsert there could
-            // fork a second row under the same id.
+            // With the pk column present the derived key must move with
+            // the row (bound, B1): a relocate that left the old
+            // namespace's pk behind would strand the row — pk lookups in
+            // the new namespace would miss it, and a fresh upsert there
+            // could fork a second row under the same id.
             if pk_ready {
-                let mut stmt = conn.prepare(
-                    "MATCH (m:Memory) WHERE m.id = $id AND m.namespace = $from AND m.user_id <> 'auto-ingestor' SET m.namespace = $to, m.pk = $pk",
+                let old_pk = memory_pk(&from, &id);
+                let new_pk = memory_pk(&to, &id);
+                // First attempt: move the row in place. Legal where pk
+                // is a plain column (a legacy table that gained it via
+                // ALTER); the binder refuses it where pk IS the primary
+                // key — "Cannot set property pk ... Try delete and then
+                // insert" (run 40167089842) — and that refusal selects
+                // the delete-and-recreate path below.
+                let in_place = (|| -> std::result::Result<(), lbug::Error> {
+                    let mut stmt = conn.prepare(
+                        "MATCH (m:Memory) WHERE m.id = $id AND m.namespace = $from AND m.user_id <> 'auto-ingestor' SET m.namespace = $to, m.pk = $pk",
+                    )?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("id", lbug::Value::String(id.clone())),
+                            ("from", lbug::Value::String(from.clone())),
+                            ("to", lbug::Value::String(to.clone())),
+                            ("pk", lbug::Value::String(new_pk.clone())),
+                        ],
+                    )?;
+                    Ok(())
+                })();
+                match in_place {
+                    Ok(()) => return Ok(RelocateOutcome::Moved),
+                    Err(e) if e.to_string().contains("primary key") => {}
+                    Err(e) => return Err(e.into()),
+                }
+                // Delete and recreate under the new namespace's key,
+                // replaying the row's edges so the move keeps them, as
+                // the single-statement form did. The whole sequence runs
+                // under the writer's turn, so no other writer observes
+                // the row mid-move.
+                let mut edges: Vec<(&'static str, bool, String)> = Vec::new();
+                for rel in MEMORY_REL_TABLES {
+                    for outgoing in [true, false] {
+                        let capture = if outgoing {
+                            format!(
+                                "MATCH (m:Memory {{pk: $pk}})-[:{}]->(o:Memory) RETURN o.pk",
+                                rel
+                            )
+                        } else {
+                            format!(
+                                "MATCH (o:Memory)-[:{}]->(m:Memory {{pk: $pk}}) RETURN o.pk",
+                                rel
+                            )
+                        };
+                        let mut stmt = conn.prepare(&capture)?;
+                        let rows = conn.execute(
+                            &mut stmt,
+                            vec![("pk", lbug::Value::String(old_pk.clone()))],
+                        )?;
+                        for row in rows {
+                            edges.push((rel, outgoing, format!("{}", row[0])));
+                        }
+                    }
+                }
+                let mut stmt = conn.prepare("MATCH (m:Memory {pk: $pk}) DETACH DELETE m")?;
+                conn.execute(
+                    &mut stmt,
+                    vec![("pk", lbug::Value::String(old_pk.clone()))],
                 )?;
+                let vec_str = format!(
+                    "[{}]",
+                    vector
+                        .iter()
+                        .map(|f| {
+                            let s = format!("{}", f);
+                            if s.contains('.') || s.contains('e') || s.contains('E') {
+                                s
+                            } else {
+                                format!("{}.0", s)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                let create = format!(
+                    "CREATE (m:Memory {{pk: $pk, id: $id, namespace: $ns, content: $content, user_id: $user_id, memory_type: $memory_type, agent_name: $agent_name, location: $location, location_lines: $location_lines, metadata: $metadata, embedding: {}}})",
+                    vec_str
+                );
+                let mut stmt = conn.prepare(&create)?;
                 conn.execute(
                     &mut stmt,
                     vec![
+                        ("pk", lbug::Value::String(new_pk.clone())),
                         ("id", lbug::Value::String(id.clone())),
-                        ("from", lbug::Value::String(from.clone())),
-                        ("to", lbug::Value::String(to.clone())),
-                        ("pk", lbug::Value::String(memory_pk(&to, &id))),
+                        ("ns", lbug::Value::String(to.clone())),
+                        ("content", lbug::Value::String(payload.content.clone())),
+                        ("user_id", lbug::Value::String(payload.user_id.clone())),
+                        (
+                            "memory_type",
+                            lbug::Value::String(payload.memory_type.clone()),
+                        ),
+                        (
+                            "agent_name",
+                            lbug::Value::String(
+                                payload
+                                    .agent_name
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                            ),
+                        ),
+                        ("location", lbug::Value::String(payload.location.clone())),
+                        (
+                            "location_lines",
+                            lbug::Value::String(payload.location_lines.clone()),
+                        ),
+                        (
+                            "metadata",
+                            lbug::Value::String(serde_json::to_string(&payload.metadata)?),
+                        ),
                     ],
                 )?;
+                for (rel, outgoing, other_pk) in &edges {
+                    // A self-edge's other end is the moved row itself:
+                    // it follows the row to its new key.
+                    let other = if other_pk == &old_pk {
+                        new_pk.clone()
+                    } else {
+                        other_pk.clone()
+                    };
+                    let (a_pk, b_pk) = if *outgoing {
+                        (new_pk.clone(), other)
+                    } else {
+                        (other, new_pk.clone())
+                    };
+                    let replay = format!(
+                        "MATCH (a:Memory {{pk: $apk}}), (b:Memory {{pk: $bpk}}) CREATE (a)-[:{}]->(b)",
+                        rel
+                    );
+                    let mut stmt = conn.prepare(&replay)?;
+                    conn.execute(
+                        &mut stmt,
+                        vec![
+                            ("apk", lbug::Value::String(a_pk)),
+                            ("bpk", lbug::Value::String(b_pk)),
+                        ],
+                    )?;
+                }
                 return Ok(RelocateOutcome::Moved);
             }
             let query = format!(
@@ -8679,15 +8836,28 @@ eurostrata\src\daemon.rs",
                 ("orphan-with-meta", r#"{"namespace":"recovered-ns"}"#),
                 ("orphan-no-meta", "{}"),
             ] {
+                // The pk is bound, not interpolated: the with-meta row's
+                // key is the derived key of the namespace its metadata
+                // claims (as an upsert would have written it before the
+                // namespace property was lost), and a derived key carries
+                // the U+0001 separator, which travels as a parameter.
+                let pk = if id == "orphan-with-meta" {
+                    memory_pk("recovered-ns", id)
+                } else {
+                    format!("seed-pk:{id}")
+                };
                 let create = format!(
-                    "CREATE (m:Memory {{pk: '{}', id: '{}', content: 'c', user_id: 'u', memory_type: 'note', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
-                    escape_ladybug_string(&format!("seed-pk:{id}")),
+                    "CREATE (m:Memory {{pk: $pk, id: '{}', content: 'c', user_id: 'u', memory_type: 'note', agent_name: 'a', location: '', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
                     id,
                     escape_ladybug_string(metadata),
                 );
                 seed_store
                     .with_conn(move |conn| {
-                        conn.query(&create)?;
+                        let mut stmt = conn.prepare(&create)?;
+                        conn.execute(
+                            &mut stmt,
+                            vec![("pk", lbug::Value::String(pk))],
+                        )?;
                         Ok(())
                     })
                     .await
