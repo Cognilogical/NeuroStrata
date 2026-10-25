@@ -580,12 +580,29 @@ Ok(DomainSearchOutcome { results, mode, incomplete })
         .await
 }
 
+/// One pass of the row-identity audit init() runs (Task 7): the store's
+/// Memory rows classified by their (namespace, id) identity. A row whose
+/// namespace property is NULL predates the identity rule (or arrived
+/// damaged); the audit backfills it in place when its metadata carries a
+/// valid `namespace`, and quarantines it otherwise. A quarantined row
+/// keeps its data, blocks nothing, and refuses writes aimed at its id
+/// until an operator repairs it. The audit never fails init.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RowIdentityAudit {
+    pub total_rows: i64,
+    pub null_namespace_rows: i64,
+    pub backfilled: i64,
+    pub quarantined: i64,
+}
+
 pub struct LadybugStore {
     #[allow(dead_code)]
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
     dirty: Dirty,
+    /// The most recent row-identity audit, taken by init() (Task 7).
+    identity_audit: std::sync::Mutex<RowIdentityAudit>,
     /// LadybugDB allows exactly one write transaction and REFUSES a second
     /// rather than queueing it, so two writers that overlap produce "Cannot
     /// start a new write transaction in the system" for whichever arrives
@@ -719,6 +736,15 @@ impl LadybugStore {
     /// 15-ish test sites use temp directories; this keeps every concurrent
     /// open well under container memory ceilings and ends the open-time
     /// `Mmap for size 8796093022208 failed` flake (task neurostrata-c8te).
+    /// The most recent row-identity audit, taken by init() (Task 7). All
+    /// zeroes until the first init() completes on this store instance.
+    pub fn row_identity_audit(&self) -> RowIdentityAudit {
+        *self
+            .identity_audit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn for_testing(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
         let max_db_size: u64 = std::env::var("NEUROSTRATA_TEST_MAX_DB_SIZE")
             .ok()
@@ -835,6 +861,7 @@ impl LadybugStore {
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
+            identity_audit: std::sync::Mutex::new(RowIdentityAudit::default()),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1380,6 +1407,33 @@ fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
 
+/// NUL is refused at the store boundary, by name (Task 7). It is the one
+/// byte no rung of the escaping ladder may carry into the engine: handed
+/// to a bound parameter it would meet the engine's C strings, and embedded
+/// in an escaped literal it would land raw. Every other control character
+/// is the ladder's business; NUL is the boundary's.
+fn reject_nul(field: &str, value: &str) -> Result<()> {
+    if value.contains('\u{0}') {
+        anyhow::bail!("ERROR [NUL]: NUL byte in {field} is refused at the store boundary");
+    }
+    Ok(())
+}
+
+/// Whether any string in a metadata value — keys included — carries a NUL.
+/// Checked on the value itself, not its serialization: in the serialized
+/// text a NUL appears as a six-character escape sequence, where a scan
+/// for the raw byte would miss it.
+fn value_contains_nul(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.contains('\u{0}'),
+        Value::Array(items) => items.iter().any(value_contains_nul),
+        Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| k.contains('\u{0}') || value_contains_nul(v)),
+        _ => false,
+    }
+}
+
 /// Validates a Cypher relation (edge) type name before it is interpolated
 /// into a query string. Relation types are compile-time constants today, but
 /// this guard prevents a future code path that accepts user-supplied relation
@@ -1516,18 +1570,79 @@ impl VectorStore for LadybugStore {
             let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version LONG, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
             conn.query(create_candidates_table).ok();
 
-            Ok(())
+            // Task 7 row-identity audit: classify the store's rows by
+            // (namespace, id) identity. A row whose namespace property is
+            // NULL predates the identity rule (or arrived damaged); one
+            // carrying a valid namespace in its metadata is backfilled in
+            // place, the rest are quarantined — counted, left
+            // byte-identical, and refused as write targets by upsert and
+            // delete until an operator repairs them. The audit runs
+            // inside init's write on purpose: it must never become a
+            // reason the store refuses to open, so every failure mode
+            // here degrades to a count, never an error.
+            let mut audit = RowIdentityAudit::default();
+            if let Ok(mut rows) = conn.query("MATCH (m:Memory) RETURN count(m)") {
+                if let Some(row) = rows.next() {
+                    audit.total_rows = format!("{}", row[0]).parse().unwrap_or(0);
+                }
+            }
+            let mut orphans: Vec<(String, String)> = Vec::new();
+            if let Ok(mut rows) = conn.query(
+                "MATCH (m:Memory) WHERE m.namespace IS NULL RETURN m.id, m.metadata",
+            ) {
+                while let Some(row) = rows.next() {
+                    orphans.push((format!("{}", row[0]), format!("{}", row[1])));
+                }
+            }
+            audit.null_namespace_rows = orphans.len() as i64;
+            for (orphan_id, metadata) in &orphans {
+                let claimed = serde_json::from_str::<Value>(metadata).ok().and_then(|v| {
+                    v.get("namespace")
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                });
+                let repaired = match claimed {
+                    Some(ns) if crate::domain::validate_namespace(&ns).is_ok() => {
+                        let repair = format!(
+                            "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace IS NULL SET m.namespace = '{}'",
+                            escape_ladybug_string(orphan_id),
+                            escape_ladybug_string(&ns),
+                        );
+                        conn.query(&repair).is_ok()
+                    }
+                    _ => false,
+                };
+                if repaired {
+                    audit.backfilled += 1;
+                } else {
+                    audit.quarantined += 1;
+                }
+            }
+            if audit.null_namespace_rows > 0 {
+                eprintln!(
+                    "[neurostrata:identity-audit] {} of {} Memory rows had a NULL namespace: {} backfilled from metadata, {} quarantined (writes to a quarantined id refuse until an operator repairs the row)",
+                    audit.null_namespace_rows, audit.total_rows, audit.backfilled, audit.quarantined
+                );
+            }
+
+            Ok(audit)
         })
         .await;
 
-        if outcome.is_ok() {
-            self.schema_ready
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-
         // Creating the tables is itself a write worth flushing.
         self.dirty.mark();
-        outcome
+        match outcome {
+            Ok(audit) => {
+                *self
+                    .identity_audit
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = audit;
+                self.schema_ready
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1542,11 +1657,33 @@ impl VectorStore for LadybugStore {
         payload: MemoryPayload,
     ) -> Result<crate::traits::UpsertReport> {
         let namespace = namespace.to_string();
+        let id = id.to_string();
+        // Task 7: the store boundary validates row identity before any
+        // query is built. NUL is refused first and by name — it is the one
+        // byte no rung of the escaping ladder may carry into the engine —
+        // then DR-1/DR-2 decide the namespace and the id (validate_id
+        // carries the ratified composite rule for qualified ids).
+        reject_nul("namespace", &namespace)?;
+        reject_nul("id", &id)?;
+        crate::domain::validate_namespace(&namespace).map_err(anyhow::Error::msg)?;
+        crate::domain::validate_id(&id).map_err(anyhow::Error::msg)?;
+        reject_nul("content", &payload.content)?;
+        reject_nul("user_id", &payload.user_id)?;
+        reject_nul("memory_type", &payload.memory_type)?;
+        if let Some(agent_name) = &payload.agent_name {
+            reject_nul("agent_name", agent_name)?;
+        }
+        reject_nul("location", &payload.location)?;
+        reject_nul("location_lines", &payload.location_lines)?;
+        if value_contains_nul(&payload.metadata) {
+            anyhow::bail!("ERROR [NUL]: NUL byte in metadata is refused at the store boundary");
+        }
         // R14: reject empty/whitespace namespaces before hitting the store.
+        // DR-1 above already refuses both; this stays as the store-layer
+        // backstop R14 landed, beneath the validator.
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
-        let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let shape_warnings = write_shape_warnings(&payload);
         self.write_with_deadline("writing a memory", move |conn| {
@@ -1578,9 +1715,31 @@ impl VectorStore for LadybugStore {
                 }).collect::<Vec<_>>().join(",")
             );
 
+            // A quarantined row (NULL namespace, per init's audit) must not
+            // be forked into a second identity by this write: refuse loudly
+            // and leave the row byte-identical for an operator to repair.
+            let mut held = conn.query(&format!(
+                "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace IS NULL RETURN count(m)",
+                safe_id
+            ))?;
+            let held_count = held
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0))
+                .unwrap_or(0);
+            if held_count > 0 {
+                anyhow::bail!(
+                    "write refused: id '{}' is held by a quarantined row (NULL namespace) — the quarantine is repaired by an operator, not by forking the id into a second row",
+                    id
+                );
+            }
+
+            // Row identity is (namespace, id): the MERGE pattern carries
+            // both, so the same id in another namespace is a different
+            // row, and an old row written by a pre-identity binary (which
+            // set namespace ON CREATE) is found by the same pattern.
             let insert_query = format!(
-                "MERGE (m:Memory {{id: '{}'}})
-                 ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
+                "MERGE (m:Memory {{id: '{}', namespace: '{}'}})
+                 ON CREATE SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
                  ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
                 safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
                 safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
@@ -1664,15 +1823,54 @@ impl VectorStore for LadybugStore {
                     });
                     continue;
                 }
+                // Task 7: the edge binds rows by (namespace, id), never by
+                // id alone — an id-only MATCH lands the edge on every
+                // same-id twin in other namespaces. The target row's
+                // namespace is resolved with the source namespace
+                // preferred; a true tie (the id lives in several
+                // namespaces, the source's not among them) defers instead
+                // of spraying.
+                let target_ns = match bind_row_namespace(conn, &target, &namespace) {
+                    RowBind::Bound(ns) => ns,
+                    RowBind::Gone => {
+                        deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                            rel_type: edge.rel_type.to_string(),
+                            declared_target: edge.target_id.clone(),
+                            declaration_index: edge.declaration_index,
+                            resolution: crate::traits::TargetResolution::Missing,
+                        });
+                        emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                            field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                            why: "target row no longer exists".to_string(),
+                            skipped: "this edge materialization".to_string(),
+                        });
+                        continue;
+                    }
+                    RowBind::Ambiguous(candidates) => {
+                        deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                            rel_type: edge.rel_type.to_string(),
+                            declared_target: edge.target_id.clone(),
+                            declaration_index: edge.declaration_index,
+                            resolution: crate::traits::TargetResolution::Ambiguous(candidates),
+                        });
+                        emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                            field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                            why: "target id is ambiguous across namespaces".to_string(),
+                            skipped: "this edge materialization".to_string(),
+                        });
+                        continue;
+                    }
+                };
                 let target_safe = escape_ladybug_string(&target);
-                let (from, to) = if edge.points_at_target {
-                    (safe_id.as_str(), target_safe.as_str())
+                let target_ns_safe = escape_ladybug_string(&target_ns);
+                let (from, from_ns, to, to_ns) = if edge.points_at_target {
+                    (safe_id.as_str(), safe_ns.as_str(), target_safe.as_str(), target_ns_safe.as_str())
                 } else {
-                    (target_safe.as_str(), safe_id.as_str())
+                    (target_safe.as_str(), target_ns_safe.as_str(), safe_id.as_str(), safe_ns.as_str())
                 };
                 let edge_query = format!(
-                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
-                    from, to, edge.rel_type
+                    "MATCH (a:Memory {{id: '{}', namespace: '{}'}}), (b:Memory {{id: '{}', namespace: '{}'}}) MERGE (a)-[:{}]->(b)",
+                    from, from_ns, to, to_ns, edge.rel_type
                 );
                 if let Err(e) = conn.query(&edge_query) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
@@ -2022,9 +2220,30 @@ impl VectorStore for LadybugStore {
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();
+        // Task 7: NUL is refused at the store boundary on writes too.
+        reject_nul("namespace", &namespace)?;
+        reject_nul("id", &id)?;
         self.write_with_deadline("deleting a memory", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
+
+            // A quarantined row (NULL namespace, per init's audit) refuses
+            // writes aimed at its id, delete included: removing it is an
+            // operator's repair decision, not a caller's side effect.
+            let mut held = conn.query(&format!(
+                "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace IS NULL RETURN count(m)",
+                safe_id
+            ))?;
+            let held_count = held
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0))
+                .unwrap_or(0);
+            if held_count > 0 {
+                anyhow::bail!(
+                    "delete refused: id '{}' is held by a quarantined row (NULL namespace) — the quarantine is repaired by an operator, not deleted around",
+                    id
+                );
+            }
 
             // A silent no-op on a missing id reads as success to the caller
             // (the CLI then reports a deletion that never happened), so
@@ -2294,6 +2513,11 @@ impl VectorStore for LadybugStore {
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
         let namespace = namespace.to_string();
         let id = id.to_string();
+        // Task 7: NUL is refused at the store boundary on reads too — a
+        // lookup carrying one is refused by name rather than escaped into
+        // a query that can only miss.
+        reject_nul("namespace", &namespace)?;
+        reject_nul("id", &id)?;
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
@@ -3250,6 +3474,47 @@ fn pick_declared_target(
 /// The exact id stays unscoped, as edges always have been; everything inferred
 /// from it is confined to the memory's own namespace, so a bare `src/lib.rs`
 /// cannot land on another project's file.
+/// How an edge target binds to exactly one row (Task 7).
+enum RowBind {
+    /// The namespace of the row the edge lands on.
+    Bound(String),
+    /// No row carries the id (or the lookup itself failed — edge
+    /// materialization is best-effort and reports through the deferred
+    /// list either way).
+    Gone,
+    /// The id lives in several namespaces, none of them the preferred
+    /// one: a true tie, deferred rather than sprayed.
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve the namespace of the row an edge should land on: the row whose
+/// id is `id`, preferring `preferred` (the source memory's namespace)
+/// when the id lives there, else the single namespace holding it.
+fn bind_row_namespace(conn: &Connection, id: &str, preferred: &str) -> RowBind {
+    let query = format!(
+        "MATCH (b:Memory) WHERE b.id = '{}' AND b.namespace IS NOT NULL RETURN DISTINCT b.namespace",
+        escape_ladybug_string(id)
+    );
+    let mut namespaces = Vec::new();
+    match conn.query(&query) {
+        Ok(mut rows) => {
+            while let Some(row) = rows.next() {
+                namespaces.push(format!("{}", row[0]));
+            }
+        }
+        Err(_) => return RowBind::Gone,
+    }
+    if namespaces.iter().any(|ns| ns == preferred) {
+        RowBind::Bound(preferred.to_string())
+    } else if namespaces.len() == 1 {
+        RowBind::Bound(namespaces.into_iter().next().unwrap())
+    } else if namespaces.is_empty() {
+        RowBind::Gone
+    } else {
+        RowBind::Ambiguous(namespaces)
+    }
+}
+
 fn resolve_target_on_write(
     conn: &Connection,
     namespace: &str,
