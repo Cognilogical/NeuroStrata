@@ -5,7 +5,7 @@
 //! at 500KB, and pruning rolled files past the retention window.
 
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::domain::normalize_domain_slug;
@@ -56,8 +56,64 @@ pub(crate) fn scan_for_append(content: &str, tags: &[String]) -> Option<String> 
         .map(|r| r.to_string())
 }
 
+/// The J22 refusal, in one place so the pre-creation judgment and the
+/// post-creation verification in [`append_entry`] speak identically.
+fn sessions_outside_root(
+    sessions_path: &Path,
+    resolved: &Path,
+    canonical_root: &Path,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "refused: the sessions directory {} resolves to {}, outside \
+             the project root {} — nothing was written",
+            sessions_path.display(),
+            resolved.display(),
+            canonical_root.display()
+        ),
+    )
+}
+
+/// Where `path` would resolve, judged without creating anything: the
+/// nearest existing ancestor canonicalized, the remainder rejoined as
+/// plain components — the `check_caller_path` pattern (daemon.rs). A
+/// remainder component with no plain file name (`..`, `.`) cannot be
+/// judged this way and yields `None`.
+fn judged_resolution(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path.to_path_buf();
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
+            let mut resolved = canonical;
+            for name in remainder.iter().rev() {
+                resolved.push(name);
+            }
+            return Some(resolved);
+        }
+        match (cursor.file_name().map(|n| n.to_os_string()), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                remainder.push(name);
+                cursor = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Append one entry (and its optional topic-switch marker) to the buffer.
 /// `max_bytes` is injectable so tests do not have to write 500KB.
+///
+/// Path discipline (Task 2 / J22): the sessions directory is canonicalized
+/// and must lie inside the canonical project root before anything opens —
+/// a `.NeuroStrata` or `sessions` symlink planted in the tree cannot
+/// redirect the write out of the project. Containment is judged BEFORE
+/// anything is created (fix round / M-1), so the refusal never follows a
+/// planted link into creating directories outside the project on its way
+/// to claiming nothing was written. The session file itself is
+/// opened with `O_NOFOLLOW` on Unix, and a final component that is a
+/// symlink is a loud error with nothing written: the pre-open check names
+/// the refusal, and the flag closes the check-to-open race.
 pub(crate) fn append_entry(
     project_root: &Path,
     content: &str,
@@ -65,9 +121,46 @@ pub(crate) fn append_entry(
     max_bytes: u64,
     retention_days: u64,
 ) -> std::io::Result<Outcome> {
-    let sessions = project_root.join(".NeuroStrata").join("sessions");
-    std::fs::create_dir_all(&sessions)?;
+    let sessions_path = project_root.join(".NeuroStrata").join("sessions");
+    // Judge containment before creating anything (M-1): canonicalize the
+    // nearest existing ancestor of the sessions path and judge the
+    // remainder. When the root itself does not exist yet, nothing beneath
+    // it exists either — no link can have been planted — and the
+    // post-creation check below remains the authority.
+    if let Ok(canonical_root) = std::fs::canonicalize(project_root) {
+        if let Some(judged) = judged_resolution(&sessions_path) {
+            if !judged.starts_with(&canonical_root) {
+                return Err(sessions_outside_root(
+                    &sessions_path,
+                    &judged,
+                    &canonical_root,
+                ));
+            }
+        }
+    }
+    std::fs::create_dir_all(&sessions_path)?;
+    let canonical_root = std::fs::canonicalize(project_root)?;
+    let sessions = std::fs::canonicalize(&sessions_path)?;
+    if !sessions.starts_with(&canonical_root) {
+        return Err(sessions_outside_root(
+            &sessions_path,
+            &sessions,
+            &canonical_root,
+        ));
+    }
     let current = sessions.join("current.md");
+    if let Ok(link) = std::fs::symlink_metadata(&current) {
+        if link.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refused: the session file {} is a symlink — the episodic \
+                     buffer never writes through a link; nothing was written",
+                    current.display()
+                ),
+            ));
+        }
+    }
 
     let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let mut entry = String::new();
@@ -90,10 +183,7 @@ pub(crate) fn append_entry(
     }
 
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&current)?;
+    let mut file = open_session_file(&current)?;
     file.write_all(entry.as_bytes())?;
     let size_bytes = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
 
@@ -102,6 +192,44 @@ pub(crate) fn append_entry(
         size_bytes,
         rolled,
     })
+}
+
+/// Open the session file for appending. On Unix the open carries
+/// `O_NOFOLLOW`, so a symlink swapped in after `append_entry`'s pre-open
+/// check still cannot be written through — the kernel refuses it (ELOOP)
+/// and the refusal is translated into the same words as the check's.
+#[cfg(unix)]
+fn open_session_file(current: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW);
+    options.open(current).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refused: the session file {} is a symlink — the episodic \
+                     buffer never writes through a link; nothing was written",
+                    current.display()
+                ),
+            )
+        } else {
+            e
+        }
+    })
+}
+
+/// Open the session file for appending (non-Unix: `append_entry`'s
+/// pre-open symlink check is the guard; there is no `O_NOFOLLOW` to add).
+#[cfg(not(unix))]
+fn open_session_file(current: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(current)
 }
 
 /// Delete rolled `session-*.md` files older than the retention window.
@@ -438,6 +566,86 @@ mod tests {
         let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
         assert!(scan_for_append(key, &[]).is_some());
         assert!(scan_for_append("plain entry", &[]).is_none());
+    }
+
+    /// J22 (Task 2): a session file replaced by a symlink out of the project
+    /// must refuse loudly and write nothing through the link — the buffer is
+    /// an audit trail, and a silent write through a planted link would put
+    /// session content wherever the link points.
+    #[cfg(unix)]
+    #[test]
+    fn append_log_through_symlink_writes_nothing() {
+        let root = scratch("symlink");
+        let sessions = root.join(".NeuroStrata").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let outside = scratch("symlink-target");
+        let target = outside.join("loot.md");
+        std::fs::write(&target, "original\n").unwrap();
+        std::os::unix::fs::symlink(&target, sessions.join("current.md")).unwrap();
+
+        let err = match append_entry(&root, "must not land", &[], 500 * 1024, 30) {
+            Ok(_) => panic!("a symlinked session file is refused, not written through"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("symlink"),
+            "the refusal names the symlink: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original\n",
+            "the link target is untouched"
+        );
+    }
+
+    /// J22 (Task 2 fix round / M-1): a `.NeuroStrata` symlink planted in
+    /// the project, pointing outside it, must be refused BEFORE anything
+    /// is created — the pre-fix order ran `create_dir_all` first, so the
+    /// refusal was preceded by directory creation through the link, and
+    /// its "nothing was written" was shy of literally true.
+    #[cfg(unix)]
+    #[test]
+    fn append_log_through_sessions_symlink_creates_nothing() {
+        let root = scratch("dirlink");
+        let outside = scratch("dirlink-target");
+        std::os::unix::fs::symlink(&outside, root.join(".NeuroStrata")).unwrap();
+
+        let err = match append_entry(&root, "must not land", &[], 500 * 1024, 30) {
+            Ok(_) => panic!("a sessions path through a planted link is refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("outside"),
+            "the refusal names the escape: {err}"
+        );
+        assert!(
+            !outside.join("sessions").exists(),
+            "no directory was created through the link"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "the link target gained nothing at all"
+        );
+    }
+
+    /// J22 pin: the normal path still appends, entry after entry, into the
+    /// project's own sessions directory.
+    #[test]
+    fn append_log_normal_path_appends() {
+        let root = scratch("normal");
+        append_entry(&root, "first entry", &[], 500 * 1024, 30).unwrap();
+        let outcome = append_entry(&root, "second entry", &[], 500 * 1024, 30).unwrap();
+        let text = std::fs::read_to_string(&outcome.file).unwrap();
+        assert!(text.contains("first entry"), "the first entry persists: {text}");
+        assert!(
+            text.contains("second entry"),
+            "the second entry appends: {text}"
+        );
+        assert!(
+            outcome.file.starts_with(&root.display().to_string()),
+            "the buffer file lives under the project root: {}",
+            outcome.file
+        );
     }
 
     #[tokio::test]
