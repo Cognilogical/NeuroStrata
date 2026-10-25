@@ -2683,12 +2683,13 @@ impl crate::traits::AsAny for RecordingStore {
             // Name where the echo actually went before failing: the bus
             // metrics say whether a pulse was dispatched at all, and the
             // startup buffer says whether it landed in the wrong project.
-            let metrics = client
-                .post(format!("{base}/bus/metrics"))
-                .send()
-                .await
-                .and_then(|r| r.text().await)
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let metrics = match client.post(format!("{base}/bus/metrics")).send().await {
+                Ok(r) => r
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<unreadable>".to_string()),
+                Err(_) => "<unreadable>".to_string(),
+            };
             let text_a = std::fs::read_to_string(&buffer_a).unwrap_or_default();
             panic!(
                 "the pointer lands in the second project's own buffer: {echoed:?}; \
