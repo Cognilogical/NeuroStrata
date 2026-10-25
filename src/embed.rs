@@ -153,6 +153,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// sorted by relative path — a pin over the ONNX file alone would let a
 /// swapped tokenizer walk past it. The PIN-CANDIDATE adoption record is
 /// the one exclusion: it is this gate's own output, not a model artifact.
+/// Files are hashed incrementally — a model's graph is hundreds of MB
+/// and this gate runs on every load, so no artifact is buffered whole.
 fn compute_artifact_pin(model_dir: &Path) -> Result<String> {
     let mut rel_paths: Vec<String> = Vec::new();
     collect_artifact_files(model_dir, model_dir, &mut rel_paths)?;
@@ -165,11 +167,28 @@ fn compute_artifact_pin(model_dir: &Path) -> Result<String> {
     rel_paths.sort();
     let mut listing = String::new();
     for rel in &rel_paths {
-        let bytes = fs::read(model_dir.join(rel))
+        let digest = sha256_hex_of_file(&model_dir.join(rel))
             .with_context(|| format!("failed to read embedder artifact {rel}"))?;
-        listing.push_str(&format!("{}  {}\n", sha256_hex(&bytes), rel));
+        listing.push_str(&format!("{}  {}\n", digest, rel));
     }
     Ok(sha256_hex(listing.as_bytes()))
+}
+
+/// SHA-256 hex of one file's bytes, streamed in fixed-size chunks so a
+/// several-hundred-MB model graph never lands in memory whole.
+fn sha256_hex_of_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn collect_artifact_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
@@ -360,6 +379,18 @@ impl FastEmbedder {
                             cache_dir.display()
                         );
                     }
+                    // Unpinned with an unresolvable snapshot layout: there
+                    // is no artifact set to record a candidate over, so the
+                    // adoption record is skipped — say so on stderr rather
+                    // than letting the load proceed unpinned in silence.
+                    eprintln!(
+                        "Skipped recording an artifact pin candidate for embedder model \
+                         '{}': the model's snapshot directory could not be resolved under \
+                         {} after load, so there is no artifact set to pin — the load \
+                         proceeds unpinned",
+                        target_model.model_name,
+                        cache_dir.display()
+                    );
                 }
             }
         }
@@ -667,16 +698,15 @@ mod tests {
 
     /// The DR-7 pin construction, reimplemented on the test side so the
     /// production computation is checked against an independent reading of
-    /// the spec: per-file SHA-256; lines `"<file-sha256>  <filename>\n"`
-    /// sorted by filename; the pin is the SHA-256 hex of the concatenation.
-    /// (The synthetic dirs are flat, so filenames are the relative paths.)
+    /// the spec: per-file SHA-256 over every file in the tree, walked
+    /// recursively; lines `"<file-sha256>  <relative-path>\n"` with
+    /// `/`-joined relative paths, sorted by relative path; the pin is the
+    /// SHA-256 hex of the concatenation. The PIN-CANDIDATE adoption record
+    /// is excluded, as in production.
     fn spec_artifact_pin(dir: &Path) -> String {
         use sha2::{Digest, Sha256};
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "PIN-CANDIDATE")
-            .collect();
+        let mut names: Vec<String> = Vec::new();
+        collect_spec_files(dir, dir, &mut names);
         names.sort();
         let mut listing = String::new();
         for name in &names {
@@ -688,6 +718,26 @@ mod tests {
             ));
         }
         format!("{:x}", Sha256::digest(listing.as_bytes()))
+    }
+
+    fn collect_spec_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_spec_files(root, &path, out);
+            } else if path.is_file() {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if rel != "PIN-CANDIDATE" {
+                    out.push(rel);
+                }
+            }
+        }
     }
 
     #[test]
@@ -751,6 +801,26 @@ mod tests {
         std::fs::write(dir.join("vocab.txt"), b"extra file").unwrap();
         enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
             .expect_err("an additional file in the set must refuse");
+    }
+
+    #[test]
+    fn nested_artifact_file_is_covered_by_the_pin() {
+        // The operator's real snapshot layout nests the graph under an
+        // `onnx/` subdirectory. The pin must cover subdirectory files
+        // under their `/`-joined relative paths: a flat-only production
+        // walk would compute a different pin than the recursive spec
+        // reimplementation (failing the load below), and mutating the
+        // nested file must refuse.
+        let dir = synthetic_model_dir("nested-layout");
+        let onnx_dir = dir.join("onnx");
+        std::fs::create_dir_all(&onnx_dir).unwrap();
+        std::fs::write(onnx_dir.join("model.onnx"), b"nested-graph-bytes-v1").unwrap();
+        let pin = spec_artifact_pin(&dir);
+        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
+            .expect("a pin computed over the nested layout loads");
+        std::fs::write(onnx_dir.join("model.onnx"), b"nested-graph-bytes-v2").unwrap();
+        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
+            .expect_err("a swapped nested graph file must refuse");
     }
 
     #[test]
