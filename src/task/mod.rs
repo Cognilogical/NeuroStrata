@@ -1053,6 +1053,30 @@ pub async fn handle_task_complete(
     // M3: optional inline follow_up_tasks. Validate everything before any
     // mutation so a bad entry cannot leave the parent half-completed.
     let mut follow_up_specs: Vec<(String, Option<String>, String, i64, Vec<String>)> = Vec::new();
+    
+    // Task intent enforcement: reject if intent markers present without follow_up_tasks or task ID citation
+    let mut full_text = String::new();
+    if !reason.is_empty() {
+        full_text.push_str(&reason);
+    }
+    if let Some(mem_content) = memory.as_ref()
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+    {
+        full_text.push_str(mem_content);
+    }
+    let has_follow_up = args.get("follow_up_tasks").is_some();
+    if !full_text.is_empty() {
+        use crate::task::intent::detect_task_intents;
+        let signals = detect_task_intents(&full_text);
+        if !signals.is_empty() && !has_follow_up && link_memory_id.is_none() {
+            return Err(format!(
+                "BLOCKED (Lock 2): task {} cannot complete without an explicit follow_up_tasks or task ID citation. Task intent markers detected. Either populate `follow_up_tasks` with new tasks or cite an existing task ID via `link_memory_id`. Detected markers: {:?}.",
+                id, signals
+            ));
+        }
+    }
+
     if let Some(fu) = args.get("follow_up_tasks") {
         if !fu.is_null() {
             let arr = match fu.as_array() {
@@ -1812,6 +1836,9 @@ fi
 # Add the path of each local guard; it runs before every push on every host.
 # A guard that belongs here does NOT need a CI workflow to be real.
 PROJECT_GATES=(
+    # Task-coverage gate: blocks pushes when changed docs contain work-item
+    # language without a NeuroStrata task ID citation.
+    ./scripts/task-coverage-gate.sh
     # ./scripts/rules-gate.sh
 )
 
@@ -3217,8 +3244,8 @@ mod tests {
             json!(["task-gate"])
         );
         assert_eq!(wiring_block["coverage"]["uncovered"], json!([]));
-        // the honest read: no project guard is wired in that hook
-        assert_eq!(verified["hook_project_guards"], json!([]));
+        // the task-coverage gate is wired by design; it is a real guard, not faked
+        assert_eq!(verified["hook_project_guards"], json!(["./scripts/task-coverage-gate.sh"]));
         // and no per-guard claim of client-side coverage survives
         assert!(
             wiring_block["automatic"]
@@ -3248,7 +3275,7 @@ mod tests {
         assert_eq!(verified["hook_installed"], json!(true));
         assert_eq!(
             verified["hook_project_guards"],
-            json!(["./scripts/rules-gate.sh", "./scripts/typecheck.sh"])
+            json!(["./scripts/task-coverage-gate.sh", "./scripts/rules-gate.sh", "./scripts/typecheck.sh"])
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3544,6 +3571,21 @@ mod tests {
             root.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
+
+        // Create a stub project gate that always passes (test is about hook infrastructure)
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(
+            root.join("scripts").join("task-coverage-gate.sh"),
+            "#!/bin/bash\n# stub gate for test\ntask-coverage-gate: no untracked work items found\nexit 0\n",
+        ).unwrap();
+        let mut perms = std::fs::metadata(
+            root.join("scripts").join("task-coverage-gate.sh")
+        ).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(
+            root.join("scripts").join("task-coverage-gate.sh"),
+            perms,
+        ).unwrap();
 
         let run_gate = |code: i32| {
             std::process::Command::new("bash")
