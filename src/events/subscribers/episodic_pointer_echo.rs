@@ -62,9 +62,6 @@ const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// keeps a single-project daemon's behavior byte-identical.
 pub struct EpisodicPointerEcho {
     project_root: PathBuf,
-    /// The daemon's per-request anchor cache, when wired. `None` is the
-    /// construction-fixed behavior the unit tests pin.
-    anchors: Option<std::sync::Arc<crate::daemon::ProjectAnchors>>,
     /// The operator's episodic-buffer settings, read fresh on every `Created`.
     ///
     /// A function pointer rather than a call to `buffer::load_config` inline so
@@ -82,22 +79,6 @@ impl EpisodicPointerEcho {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
-            anchors: None,
-            load_config: buffer::load_config,
-        }
-    }
-
-    /// The daemon's construction (Task 2 / J19): `project_root` is the
-    /// startup root — the fallback for namespaces the cache has not been
-    /// taught — and `anchors` is the daemon state's per-request cache this
-    /// subscriber consults for every pulse.
-    pub fn with_anchors(
-        project_root: impl Into<PathBuf>,
-        anchors: std::sync::Arc<crate::daemon::ProjectAnchors>,
-    ) -> Self {
-        Self {
-            project_root: project_root.into(),
-            anchors: Some(anchors),
             load_config: buffer::load_config,
         }
     }
@@ -112,18 +93,13 @@ impl EpisodicPointerEcho {
     ) -> Self {
         Self {
             project_root: project_root.into(),
-            anchors: None,
             load_config,
         }
     }
 
-    /// The project this pulse belongs to: the anchor cache's answer for its
-    /// namespace when wired, the construction root otherwise.
-    fn root_for(&self, namespace: &str) -> PathBuf {
-        match &self.anchors {
-            Some(anchors) => anchors.root_for_namespace(namespace),
-            None => self.project_root.clone(),
-        }
+    /// The project this pulse belongs to: the construction root.
+    fn root_for(&self, _namespace: &str) -> PathBuf {
+        self.project_root.clone()
     }
 }
 

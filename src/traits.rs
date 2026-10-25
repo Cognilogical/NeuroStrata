@@ -124,6 +124,9 @@ pub enum DomainMatchMode {
 pub struct DomainSearchOutcome {
     pub results: Vec<SearchResult>,
     pub mode: DomainMatchMode,
+    /// Set true when the FETCH_MULTIPLIER budget was exhausted and more
+    /// candidates remain — callers must paginate to avoid losing matches.
+    pub incomplete: bool,
 }
 
 /// What an attempt to move a memory between namespaces found.
@@ -336,6 +339,7 @@ pub trait VectorStore: Send + Sync + AsAny {
         Ok(DomainSearchOutcome {
             results,
             mode: DomainMatchMode::Vector,
+            incomplete: false,
         })
     }
 

@@ -7,6 +7,7 @@
 
 pub mod archive_memory;
 pub mod bus_metrics;
+pub mod memory;
 
 // Test-only re-export: `src/main.rs`'s `bus-metrics` CLI test calls the handler
 // through the short path. Production callers use the fully-qualified

@@ -239,6 +239,7 @@ impl VectorStore for MockStore {
         Ok(DomainSearchOutcome {
             results: chosen_primaries,
             mode,
+            incomplete: false,
         })
     }
 

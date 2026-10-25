@@ -808,6 +808,7 @@ pub(crate) async fn start_daemon_on(
         .route("/validate", post(handle_validate))
         .route("/mcp", post(handle_mcp))
         .route("/backup", post(handle_backup))
+        .route("/export-graph", post(handle_export_graph))
         .route("/tasks/import", post(handle_tasks_import))
         .route("/cli/read", post(handle_cli_read))
         .route("/tasks/gate", post(handle_tasks_gate))
@@ -1064,6 +1065,46 @@ async fn handle_backup(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(format!("Backed up to {}", req.dir))
+}
+
+/// R22: export-graph CLI proxy — routes through the daemon when it is
+/// healthy, avoiding the lock contention that comes from opening the
+/// store directly. The daemon is the store's single writer; the CLI
+/// opens a second engine only when no daemon is reachable (offline).
+#[derive(serde::Deserialize)]
+struct ExportGraphReq {
+    target: String,
+    exclude_superseded: Option<bool>,
+    include_archived: Option<bool>,
+    anchor_root: Option<String>,
+    source_id: Option<String>,
+}
+
+async fn handle_export_graph(
+    State(state): State<AppState>,
+    Json(req): Json<ExportGraphReq>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    let config = crate::config::Config::from_default_path()
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let anchor_root = req.anchor_root.as_deref().map(Path::new);
+    let anchor_override =
+        crate::source_context::scoped_anchor_override(anchor_root, req.source_id.as_deref());
+
+    let data = state
+        .vector_store
+        .export_graph(
+            req.exclude_superseded.unwrap_or(false),
+            req.include_archived.unwrap_or(false),
+            &config.project_contexts,
+            anchor_override.as_ref(),
+        )
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    std::fs::write(&req.target, serde_json::to_string_pretty(&data).map_err(|e| {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(format!("Graph exported to {}", req.target))
 }
 
 #[derive(serde::Deserialize)]
