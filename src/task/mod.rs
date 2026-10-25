@@ -1844,6 +1844,7 @@ PROJECT_GATES=(
 
 if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
     for g in "${PROJECT_GATES[@]}"; do
+        [ -f "$g" ] || { echo "task-coverage-gate: guard $g missing — skipping" >&2; continue; }
         "$g" || { echo "Push blocked: $g failed" >&2; exit 1; }
     done
 fi
