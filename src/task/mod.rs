@@ -1295,6 +1295,13 @@ pub async fn handle_task_complete(
             // is no top-level `domain` argument on this path, so
             // `register_domain` applies to that field and is a no-op when the
             // memory carries no domain. The decision precedes the write.
+            // Mirror handle_add_memory: normalize the domain to its slug before
+            // the registry check so canonical keys agree across the two paths.
+            if let Some(slug) = crate::domain::domain_key(&meta) {
+                if let Some(meta_obj) = meta.as_object_mut() {
+                    meta_obj.insert("domain".to_string(), Value::String(slug));
+                }
+            }
             if let Some(raw) = meta.get("domain").cloned() {
                 let register_domain = args
                     .get("register_domain")
@@ -1329,6 +1336,25 @@ pub async fn handle_task_complete(
                 dedup.as_ref(),
             )
             .await?;
+            // If the extraction was blocked by dedup rather than written, do
+            // not fall through to the generic Lock 2 refusal: name the
+            // candidate so the agent can retry with link_memory_id instead of
+            // looping on the same content.
+            if matches!(
+                report.decision,
+                crate::judgment::policy::DedupDecision::BlockedExact
+                    | crate::judgment::policy::DedupDecision::BlockedModel
+            ) {
+                let candidate = report
+                    .linked_existing_id
+                    .clone()
+                    .or_else(|| report.dedup_hint.as_ref().map(|h| h.candidate_id.clone()))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                return Err(format!(
+                    "ERROR: extraction was blocked by dedup ({:?}). The lesson matches an existing memory '{}'. Retry neurostrata_task_complete with link_memory_id: \"{}\" instead of memory.content, or pass a materially different content.",
+                    report.decision, candidate, candidate
+                ));
+            }
             // Only now, with the extraction durable: a cache failure is
             // reported and never undoes the acceptance.
             if let Some(domains) = pending_registry.take() {
