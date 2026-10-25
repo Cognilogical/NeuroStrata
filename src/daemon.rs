@@ -2589,4 +2589,386 @@ impl crate::traits::AsAny for RecordingStore {
             Some(std::time::Duration::from_secs(60))
         );
     }
+
+    /// Task 2 re-file (J6): a daemon serving one scratch project root, so
+    /// the caller-path tests can name paths inside and outside it. Adapted
+    /// from the original Task 2 branch's helper: the env var is removed
+    /// once startup has resolved the root — the daemon serves the root it
+    /// captured, not the variable. The client carries both token files,
+    /// like the operator's own client (the /backup and /shutdown routes
+    /// are destructive-class under DR-5).
+    async fn spawn_daemon_serving(
+        root: &Path,
+    ) -> (
+        String,
+        reqwest::Client,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        std::env::set_var(PROJECT_ROOT_ENV, root);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let daemon = tokio::spawn(start_daemon_on(
+            addr.clone(),
+            Arc::new(StubEmbedder { dimensions: 8 }),
+            Arc::new(RecordingStore::default()),
+            None,
+        ));
+        let base = format!("http://{addr}");
+        let bare = reqwest::Client::new();
+        let mut serving = false;
+        for _ in 0..500 {
+            if bare
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                serving = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(serving, "daemon never started serving on {addr}");
+        std::env::remove_var(PROJECT_ROOT_ENV);
+        let home = dirs::home_dir().unwrap_or_default();
+        let token_dir = home.join(".config").join("neurostrata");
+        let token = std::fs::read_to_string(token_dir.join("daemon.token"))
+            .expect("the daemon created its token file before serving");
+        let operator = std::fs::read_to_string(token_dir.join("operator.token"))
+            .expect("the daemon created its operator token file before serving");
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim())).unwrap(),
+        );
+        headers.insert(
+            "x-neurostrata-operator",
+            reqwest::header::HeaderValue::from_str(operator.trim()).unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        (base, client, daemon)
+    }
+
+    async fn stop_daemon(
+        client: &reqwest::Client,
+        base: &str,
+        daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        client
+            .post(format!("{base}/shutdown"))
+            .send()
+            .await
+            .unwrap();
+        daemon.await.unwrap().unwrap();
+    }
+
+    /// A scratch directory holding one parseable source file, so an ingest
+    /// of it has real work to do.
+    fn scratch_tree(tag: &str) -> PathBuf {
+        let dir = scratch_root(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
+        dir
+    }
+
+    /// Task 2 re-file (J6): a caller-named backup destination outside the
+    /// served project root is refused before any use, and the refusal names
+    /// the path and the `allowed_external_dirs` escape hatch. (PR #29's
+    /// merge dropped the daemon half of the original Task 2; at HEAD this
+    /// handler consumes `req.dir` verbatim.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_to_path_outside_root_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-backup-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2r-backup-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": outside.display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a backup destination outside the project root is a refusal, not a write"
+        );
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains(&outside.display().to_string()),
+            "the refusal names the offending path: {body}"
+        );
+        assert!(
+            body.contains("allowed_external_dirs"),
+            "the refusal names the config key that changes the policy: {body}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file pin: a backup destination inside the served root
+    /// succeeds exactly as it did before the policy existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_inside_root_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-backup-inside-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let dest = root.join("snapshots");
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": dest.display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains("Backed up to"),
+            "the handler's own answer: {body}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file (J6): a backup destination spelled with `..` that
+    /// resolves outside the root is refused — containment is judged on the
+    /// canonicalized path, never the spelling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_destination_spelled_with_dotdot_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-dotdot-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2r-dotdot-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        // Both scratch dirs sit directly under the temp dir, so
+        // `<root>/../<outside-name>` canonicalizes onto the outside dir.
+        let spelling = root
+            .join("..")
+            .join(outside.file_name().unwrap())
+            .display()
+            .to_string();
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": spelling }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a `..` spelling that lands outside the root is a refusal"
+        );
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains("allowed_external_dirs"),
+            "the refusal names the config key that changes the policy: {body}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file (J6, Review Focus #4): a symlink planted inside the
+    /// root that points outside it does not smuggle the backup out — the
+    /// canonicalized target governs.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn symlinked_backup_destination_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-backup-link-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2r-backup-link-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let res = client
+            .post(format!("{base}/backup"))
+            .json(&serde_json::json!({ "dir": root.join("escape").display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "the canonical target governs, not the spelling inside the root"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file (J6): an ingest directory outside the served root is
+    /// refused before the walk starts — the walk reads whatever tree the
+    /// caller named, so the policy decides whether this daemon may read
+    /// it at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_outside_root_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-ingest-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_tree("t2r-ingest-outside");
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        let res = client
+            .post(format!("{base}/ingest"))
+            .json(&serde_json::json!({
+                "dir": outside.display().to_string(),
+                "namespace": "t2r-ingest-out"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "an ingest tree outside the project root is a refusal, not a walk"
+        );
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains(&outside.display().to_string()),
+            "the refusal names the offending path: {body}"
+        );
+        assert!(
+            body.contains("allowed_external_dirs"),
+            "the refusal names the config key that changes the policy: {body}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file pin: an ingest tree inside the served root is walked
+    /// exactly as before the policy existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingest_inside_root_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-ingest-inside-root");
+        let tree = root.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        let res = client
+            .post(format!("{base}/ingest"))
+            .json(&serde_json::json!({
+                "dir": tree.display().to_string(),
+                "namespace": "t2r-ingest-in"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::OK,
+            "an in-root ingest proceeds: {}",
+            res.text().await.unwrap()
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file (J6, the /export-graph leg): R22 added this route
+    /// after the original Task 2 was filed — it writes the graph to a
+    /// caller-supplied target with no path check at all. An outside target
+    /// is refused before any write, and no file appears.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn export_graph_outside_target_is_refused_and_writes_nothing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-export-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2r-export-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("graph.json");
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        let res = client
+            .post(format!("{base}/export-graph"))
+            .json(&serde_json::json!({ "target": target.display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "an export target outside the project root is a refusal, not a write"
+        );
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains("allowed_external_dirs"),
+            "the refusal names the config key that changes the policy: {body}"
+        );
+        assert!(
+            !target.exists(),
+            "a refused export writes nothing: {} must not exist",
+            target.display()
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file pin: an export target inside the served root is
+    /// written exactly as before the policy existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn export_graph_inside_root_succeeds() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-export-inside-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("graph.json");
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        let res = client
+            .post(format!("{base}/export-graph"))
+            .json(&serde_json::json!({ "target": target.display().to_string() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::OK,
+            "an in-root export proceeds: {}",
+            res.text().await.unwrap()
+        );
+        assert!(
+            target.exists(),
+            "the export lands at the in-root target: {}",
+            target.display()
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file (J6): a beads file outside the served root is
+    /// refused before the import reads a byte of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tasks_import_outside_root_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = scratch_root("t2r-import-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2r-import-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let beads = outside.join("issues.jsonl");
+        std::fs::write(&beads, "this is not a beads file\n").unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+
+        let res = client
+            .post(format!("{base}/tasks/import"))
+            .json(&serde_json::json!({
+                "namespace": "t2r-import",
+                "from_beads": beads.display().to_string()
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a beads file outside the project root is a refusal, not a read"
+        );
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains("allowed_external_dirs"),
+            "the refusal names the config key that changes the policy: {body}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
 }
