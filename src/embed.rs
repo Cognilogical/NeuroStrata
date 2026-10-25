@@ -337,8 +337,8 @@ impl FastEmbedder {
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
         let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_enum)
-                .with_cache_dir(cache_dir)
+            TextInitOptions::new(model_enum.clone())
+                .with_cache_dir(cache_dir.clone())
                 .with_max_length(MAX_EMBED_TOKENS)
                 .with_show_download_progress(true),
         )?;
