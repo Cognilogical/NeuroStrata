@@ -542,6 +542,36 @@ mod tests {
         );
     }
 
+    /// J22 (Task 2 fix round / M-1): a `.NeuroStrata` symlink planted in
+    /// the project, pointing outside it, must be refused BEFORE anything
+    /// is created — the pre-fix order ran `create_dir_all` first, so the
+    /// refusal was preceded by directory creation through the link, and
+    /// its "nothing was written" was shy of literally true.
+    #[cfg(unix)]
+    #[test]
+    fn append_log_through_sessions_symlink_creates_nothing() {
+        let root = scratch("dirlink");
+        let outside = scratch("dirlink-target");
+        std::os::unix::fs::symlink(&outside, root.join(".NeuroStrata")).unwrap();
+
+        let err = match append_entry(&root, "must not land", &[], 500 * 1024, 30) {
+            Ok(_) => panic!("a sessions path through a planted link is refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("outside"),
+            "the refusal names the escape: {err}"
+        );
+        assert!(
+            !outside.join("sessions").exists(),
+            "no directory was created through the link"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "the link target gained nothing at all"
+        );
+    }
+
     /// J22 pin: the normal path still appends, entry after entry, into the
     /// project's own sessions directory.
     #[test]

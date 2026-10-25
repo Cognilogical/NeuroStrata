@@ -2756,6 +2756,255 @@ impl crate::traits::AsAny for RecordingStore {
         );
     }
 
+    /// One `neurostrata_add_memory` call through the real /mcp surface,
+    /// for the anchor-teaching tests below. Returns the raw response body.
+    async fn mcp_add_memory(
+        client: &reqwest::Client,
+        base: &str,
+        content: &str,
+        namespace: &str,
+        project_root: Option<&Path>,
+        create_new_namespace: bool,
+    ) -> String {
+        let mut arguments = serde_json::json!({
+            "content": content,
+            "namespace": namespace,
+            "memory_type": "fact",
+            "create_new_namespace": create_new_namespace
+        });
+        if let Some(root) = project_root {
+            arguments["project_root"] = serde_json::json!(root.display().to_string());
+        }
+        let res = client
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "neurostrata_add_memory",
+                    "arguments": arguments
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        res.text().await.unwrap()
+    }
+
+    /// The memory id an add_memory reply names ("Memory ID: <id>").
+    fn memory_id_of(response_body: &str) -> String {
+        let start = response_body
+            .find("Memory ID: ")
+            .expect("the add_memory reply names the id")
+            + "Memory ID: ".len();
+        response_body[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect()
+    }
+
+    /// Poll a project's session buffer until it carries `needle` — the
+    /// pointer echo lands asynchronously, through the bus dispatcher.
+    async fn buffer_text_until(root: &Path, needle: &str) -> String {
+        let buffer = root
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&buffer) {
+                if text.contains(needle) {
+                    return text;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no {needle:?} in {} within 5s",
+                buffer.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Task 2 fix round (I-1), unit leg: namespace teaching is
+    /// first-writer-wins for the daemon's lifetime. A second caller naming
+    /// the same namespace with a DIFFERENT root cannot re-anchor it; the
+    /// conflicting teach is refused (and logged), and re-teaching the SAME
+    /// root stays a no-op.
+    #[test]
+    fn namespace_anchor_first_writer_wins() {
+        let startup = scratch_root("t2-fww-startup");
+        std::fs::create_dir_all(&startup).unwrap();
+        let root_b = scratch_root("t2-fww-b");
+        std::fs::create_dir_all(&root_b).unwrap();
+        let root_c = scratch_root("t2-fww-c");
+        std::fs::create_dir_all(&root_c).unwrap();
+        let anchors = ProjectAnchors::new(startup);
+        let canonical_b = std::fs::canonicalize(&root_b).unwrap();
+
+        anchors.note_namespace_root("shared-ns", &root_b);
+        assert_eq!(anchors.root_for_namespace("shared-ns"), canonical_b);
+
+        anchors.note_namespace_root("shared-ns", &root_c);
+        assert_eq!(
+            anchors.root_for_namespace("shared-ns"),
+            canonical_b,
+            "a conflicting teach cannot re-anchor the namespace"
+        );
+
+        anchors.note_namespace_root("shared-ns", &root_b);
+        assert_eq!(
+            anchors.root_for_namespace("shared-ns"),
+            canonical_b,
+            "re-teaching the same root is a no-op"
+        );
+    }
+
+    /// Task 2 fix round (I-1), /mcp leg: once a namespace is anchored by a
+    /// successful call, a second caller naming the same namespace with its
+    /// OWN root cannot divert the namespace's echoes. The second write
+    /// still succeeds — but its pointer echo lands in the FIRST project's
+    /// buffer, never the would-be diverter's (and never the startup
+    /// project's either: the pairing, not the fallback, governs).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conflicting_anchor_teach_cannot_divert_a_namespaces_echoes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root_a = scratch_root("t2-divert-a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let root_b = scratch_root("t2-divert-b");
+        std::fs::create_dir_all(root_b.join(".NeuroStrata")).unwrap();
+        let root_c = scratch_root("t2-divert-c");
+        std::fs::create_dir_all(root_c.join(".NeuroStrata")).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root_a).await;
+
+        let body_b = mcp_add_memory(
+            &client,
+            &base,
+            "first project's write",
+            "divert-ns",
+            Some(&root_b),
+            true,
+        )
+        .await;
+        assert!(
+            body_b.contains("Successfully added memory"),
+            "the teaching write succeeds: {body_b}"
+        );
+        let body_c = mcp_add_memory(
+            &client,
+            &base,
+            "second caller's write",
+            "divert-ns",
+            Some(&root_c),
+            false,
+        )
+        .await;
+        assert!(
+            body_c.contains("Successfully added memory"),
+            "the conflicting write itself succeeds: {body_c}"
+        );
+        let id_c = memory_id_of(&body_c);
+
+        let text_b = buffer_text_until(&root_b, &id_c).await;
+        assert!(
+            text_b.contains("pointer echo"),
+            "the echo is a pointer echo: {text_b}"
+        );
+        let buffer_c = root_c
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        let text_c = std::fs::read_to_string(&buffer_c).unwrap_or_default();
+        assert!(
+            !text_c.contains(&id_c),
+            "the second caller's write never echoes into its own buffer: {text_c}"
+        );
+        let buffer_a = root_a
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        let text_a = std::fs::read_to_string(&buffer_a).unwrap_or_default();
+        assert!(
+            !text_a.contains(&id_c),
+            "nor into the startup project's buffer: {text_a}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 fix round (I-1), /mcp leg: a request the daemon refuses at
+    /// the JSON-RPC layer teaches NOTHING. The request below is not a
+    /// valid JsonRpcRequest — its `jsonrpc` field is a number, so parsing
+    /// fails and the daemon answers Invalid Request — yet it carries a
+    /// namespace and a foreign project_root that the pre-fix code taught
+    /// from BEFORE dispatch. A later rootless write to that namespace
+    /// (rootless teaches nothing itself) must echo into the STARTUP
+    /// project's buffer — the untaught fallback — never the foreign
+    /// root's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_mcp_request_teaches_no_anchor() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root_a = scratch_root("t2-poison-a");
+        std::fs::create_dir_all(&root_a).unwrap();
+        let root_foreign = scratch_root("t2-poison-foreign");
+        std::fs::create_dir_all(root_foreign.join(".NeuroStrata")).unwrap();
+        let (base, client, daemon) = spawn_daemon_serving(&root_a).await;
+
+        let res = client
+            .post(format!("{base}/mcp"))
+            .json(&serde_json::json!({
+                "jsonrpc": 2.0,
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "neurostrata_add_memory",
+                    "arguments": {
+                        "content": "poisoned teach attempt",
+                        "namespace": "victim-ns",
+                        "project_root": root_foreign.display().to_string(),
+                        "memory_type": "fact",
+                        "create_new_namespace": true
+                    }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains("Invalid Request"),
+            "the malformed request is refused at the RPC layer: {body}"
+        );
+
+        let body2 = mcp_add_memory(
+            &client,
+            &base,
+            "the victim namespace's real write",
+            "victim-ns",
+            None,
+            true,
+        )
+        .await;
+        assert!(
+            body2.contains("Successfully added memory"),
+            "the rootless write succeeds: {body2}"
+        );
+        let id = memory_id_of(&body2);
+        let _ = buffer_text_until(&root_a, &id).await;
+        let buffer_foreign = root_foreign
+            .join(".NeuroStrata")
+            .join("sessions")
+            .join("current.md");
+        let text_foreign = std::fs::read_to_string(&buffer_foreign).unwrap_or_default();
+        assert!(
+            !text_foreign.contains(&id),
+            "the failed request taught no anchor — the echo stayed home: {text_foreign}"
+        );
+        stop_daemon(&client, &base, daemon).await;
+    }
+
     /// Task 2 (J19): two projects each get their OWN mesh anchor from the
     /// daemon-state cache — keyed by canonical root, so a second resolution
     /// of the same project returns the same anchor — and the echo follows
