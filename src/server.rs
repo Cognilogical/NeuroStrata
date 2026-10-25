@@ -1288,9 +1288,28 @@ pub(crate) async fn embed_dedup_and_upsert(
                         .payload
                         .metadata
                         .get("extracted_from")
-                        .map(|v| !v.is_null())
+                        .and_then(|v| v.as_array())
+                        .map(|a| !a.is_empty())
                         .unwrap_or(false);
-                    if has_extracted {
+                    // An incoming memory that itself declares an extraction
+                    // (e.g. task_complete's inline lesson, or an add_memory
+                    // carrying extracted_from) is a link, not a duplicate: the
+                    // lesson still needs to land on the existing row. Blocking
+                    // it here would strand the task in Lock 2 (the task_complete
+                    // dedup trap). Only a bare content duplicate with no
+                    // extraction on either side is a true BlockedExact.
+                    let incoming_ids: Vec<String> = payload
+                        .metadata
+                        .get("extracted_from")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let incoming_has_extracted = !incoming_ids.is_empty();
+                    if has_extracted || incoming_has_extracted {
                         linked_existing_id = Some(ec.id.clone());
                         decision = DedupDecision::LinkedExisting;
                         // Update existing candidate's metadata idempotently:
@@ -1298,13 +1317,6 @@ pub(crate) async fn embed_dedup_and_upsert(
                         if let Ok(Some((existing_vec, mut existing_payload))) =
                             store.get(namespace, &ec.id).await
                         {
-                            // merge extracted_from from incoming
-                            let incoming_ids: Vec<String> = payload
-                                .metadata
-                                .get("extracted_from")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                                .unwrap_or_default();
                             let meta = existing_payload.metadata.as_object_mut();
                             if let Some(m) = meta {
                                 let arr = m
@@ -1325,6 +1337,12 @@ pub(crate) async fn embed_dedup_and_upsert(
                         }
                     } else {
                         decision = DedupDecision::BlockedExact;
+                        // Surface the candidate so callers (e.g. task_complete)
+                        // can fall back to link_memory_id instead of failing
+                        // opaquely on Lock 2.
+                        if linked_existing_id.is_none() {
+                            linked_existing_id = Some(ec.id.clone());
+                        }
                     }
                     // No new row for exact reuse / bare exact duplicate.
                     return Ok(MemoryWriteReport {
