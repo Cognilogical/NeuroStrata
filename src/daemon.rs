@@ -2646,7 +2646,8 @@ impl crate::traits::AsAny for RecordingStore {
                         "content": "anchor probe for the second project",
                         "namespace": "anchor-b",
                         "project_root": root_b.display().to_string(),
-                        "memory_type": "fact"
+                        "memory_type": "fact",
+                        "create_new_namespace": true
                     }
                 }
             }))
