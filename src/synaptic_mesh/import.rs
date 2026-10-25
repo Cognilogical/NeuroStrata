@@ -348,6 +348,14 @@ pub async fn apply_changed(
     // table is consulted.
     let concurrent = full_tree;
 
+    // Program Task 3: the trust stamp for imported procedures comes
+    // from THIS mesh's manifest policy — read here, once per pass, and
+    // threaded down to the apply. The sender's record is never the
+    // stamp source. The HEAD signature state rides along for
+    // provenance recording (DR-9: metadata only, never a gate).
+    let import_trust = mesh.manifest().policy.imported_procedures_trust;
+    let head_signature = head_commit_signature_state(root);
+
     for rel in paths {
         let candidate = match classify_path(&rel, served) {
             Ok(Some(c)) => c,
@@ -385,6 +393,8 @@ pub async fn apply_changed(
             store.clone(),
             emb.clone(),
             concurrent,
+            import_trust,
+            head_signature,
         )
         .await
         {
@@ -667,6 +677,29 @@ pub fn validate_record(
                 .to_string(),
         );
     }
+    // Secret scan (J15, import leg): the same scanner every local write
+    // path answers to, run over the record's content and metadata before
+    // anything is applied. The refusal names the scan category and
+    // which half of the record matched, never the secret itself — and
+    // never the scanner's raw location either: locations are built
+    // from the record's own metadata key names, which are
+    // sender-controlled and could carry secret-shaped text of their
+    // own into the operator-visible report (fix round, M-1).
+    let content_scan_text = serde_json::to_string(&record.content)
+        .map_err(|e| format!("unparseable MeshRecord content ({e})"))?;
+    if let Some(rejection) =
+        crate::secrets::scan_entry_point(&content_scan_text, &record.metadata, "mesh_import")
+    {
+        let surface = if rejection.location.starts_with("mesh_import.metadata") {
+            "record metadata"
+        } else {
+            "record content"
+        };
+        return Err(format!(
+            "secret scan rejected the record: {} detected in {surface}",
+            rejection.category
+        ));
+    }
     Ok(record)
 }
 
@@ -921,24 +954,53 @@ fn local_mesh_state(metadata: &Value) -> Option<(LifecycleState, Option<Uuid>)> 
 /// The `metadata.mesh` provenance object for a freshly applied row. Carries
 /// the effective lifecycle state (not necessarily the candidate's, in the
 /// archive+edit combination) so the next apply can gate against it.
+///
+/// Trust provenance (Program Task 3): `origin` names the funnel
+/// ("mesh-import"), NOT the sender. The sender's `created_by` is kept
+/// as `claimed_created_by` with `created_by_verified: false` — a mesh
+/// record's author field is an unverified assertion by the sender, and
+/// the provenance says so instead of laundering it into a fact.
+/// `head_commit_signature` records the signature state of the mesh
+/// HEAD commit the record arrived in (DR-9: recorded as metadata only,
+/// never gated on — mesh commits are unsigned by construction).
 fn mesh_provenance(
     mesh_id: &str,
     update_id: &Uuid,
-    created_by: &str,
+    claimed_created_by: &str,
     origin_mesh_epoch: u32,
     state: LifecycleState,
     superseded_by: Option<Uuid>,
+    head_commit_signature: &str,
 ) -> Value {
     json!({
         "mesh_id": mesh_id,
         "update_id": update_id.to_string(),
-        "origin": created_by,
+        "origin": "mesh-import",
+        "claimed_created_by": claimed_created_by,
+        "created_by_verified": false,
+        "head_commit_signature": head_commit_signature,
         "origin_mesh_epoch": origin_mesh_epoch,
         "recorded_at": chrono::Utc::now().to_rfc3339(),
         "lifecycle_state": state.to_string(),
         "superseded_by": superseded_by.map(|u| u.to_string()),
         "conflict": false,
     })
+}
+
+/// The signature state of the mesh checkout's HEAD commit, for
+/// provenance recording only (DR-9). `git log --format=%G?` answers
+/// "G" for a good signature and "N" for none; anything else — bad or
+/// unknown validity, a git failure, no HEAD — reads as "unverifiable"
+/// rather than a guess.
+fn head_commit_signature_state(root: &Path) -> &'static str {
+    match run_ok(root, &["log", "-1", "--format=%G?", "HEAD"]) {
+        Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
+            "G" => "signed",
+            "N" => "unsigned",
+            _ => "unverifiable",
+        },
+        Err(_) => "unverifiable",
+    }
 }
 
 /// Merge the 1.8.0 read-side conventions (`archived: true`,
@@ -1041,6 +1103,9 @@ enum ApplyShape {
 /// Validate-and-apply one candidate against the store. `root` is the mesh
 /// checkout (its sibling `.conflicts` dir receives preserved variants);
 /// `concurrent` is true only on the full-tree reconciliation path.
+/// `import_trust` is the manifest's imported-procedures policy (the
+/// stamp source for applied procedures); `head_signature` is the HEAD
+/// commit's signature state, recorded in provenance only.
 async fn apply_one(
     root: &Path,
     mesh_id: &str,
@@ -1049,6 +1114,8 @@ async fn apply_one(
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
     concurrent: bool,
+    import_trust: Trust,
+    head_signature: &str,
 ) -> Disposition {
     let id = record.id.to_string();
     let namespace = record.namespace.clone();
@@ -1131,6 +1198,8 @@ async fn apply_one(
                             &record,
                             store,
                             emb,
+                            import_trust,
+                            head_signature,
                         )
                         .await;
                     }
@@ -1152,6 +1221,8 @@ async fn apply_one(
                             store,
                             emb,
                             ApplyShape::ArchivedCombination { edited },
+                            Some(import_trust),
+                            head_signature,
                         )
                         .await
                         {
@@ -1176,6 +1247,8 @@ async fn apply_one(
         store,
         emb,
         ApplyShape::AsCandidate,
+        Some(import_trust),
+        head_signature,
     )
     .await
 }
@@ -1184,6 +1257,12 @@ async fn apply_one(
 /// effective content, stamp the mesh provenance and lifecycle markers, and
 /// upsert. On success, any prior conflict registration for this id is
 /// cleared (the row is no longer suppressed).
+///
+/// `trust_stamp` is the manifest policy to stamp onto a procedure row
+/// (`Some` for records arriving through the mesh funnel). `None` leaves
+/// the record's own trust key as the record builder set it — the
+/// preserved-edit path, whose builder is itself funnel code that has
+/// already decided the stamp. Non-procedure records are never stamped.
 async fn apply_effective(
     root: &Path,
     mesh_id: &str,
@@ -1193,6 +1272,8 @@ async fn apply_effective(
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
     shape: ApplyShape,
+    trust_stamp: Option<Trust>,
+    head_signature: &str,
 ) -> Disposition {
     let (text, state, superseded_by, archived_at, tombstoned_at) = match shape {
         ApplyShape::AsCandidate => (
@@ -1222,6 +1303,17 @@ async fn apply_effective(
             return Disposition::Ignored(format!("record {id} metadata is not a JSON object"));
         }
     };
+    // Program Task 3 (b): the procedure trust stamp comes from the
+    // manifest policy threaded in by the caller — whatever the sender's
+    // record claims in its metadata is overwritten here. This is the
+    // preserved-edit embryo (which force-stamps "untrusted" in
+    // `preserved_edit_record`) generalized to the main apply path: the
+    // funnel decides, the sender doesn't.
+    if record.memory_type == "procedure" {
+        if let Some(policy) = trust_stamp {
+            metadata.insert("trust".to_string(), json!(policy.to_string()));
+        }
+    }
     metadata.insert(
         "mesh".to_string(),
         mesh_provenance(
@@ -1231,6 +1323,7 @@ async fn apply_effective(
             record.origin_mesh_epoch,
             state,
             superseded_by,
+            head_signature,
         ),
     );
     apply_lifecycle_markers(
@@ -1305,6 +1398,8 @@ async fn preserve_superseded_edit(
     cand: &MeshRecord,
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
+    import_trust: Trust,
+    head_signature: &str,
 ) -> Disposition {
     // Which side holds the edit, and must the incoming supersession apply?
     // `source_metadata` is the metadata the new record inherits from the
@@ -1347,6 +1442,8 @@ async fn preserve_superseded_edit(
             store.clone(),
             emb.clone(),
             ApplyShape::AsCandidate,
+            Some(import_trust),
+            head_signature,
         )
         .await
         {
@@ -1366,6 +1463,10 @@ async fn preserve_superseded_edit(
         cand.origin_mesh_epoch,
     );
     let new_id = new_record.id.to_string();
+    // No trust_stamp: `preserved_edit_record` is funnel code and has
+    // already set the preserved record's stamp ("untrusted") itself —
+    // the embryo this task generalizes. Stamping the manifest policy
+    // here would overwrite the funnel's own decision.
     apply_effective(
         root,
         mesh_id,
@@ -1375,17 +1476,26 @@ async fn preserve_superseded_edit(
         store,
         emb,
         ApplyShape::AsCandidate,
+        None,
+        head_signature,
     )
     .await
 }
 
-/// The origin node of an already-applied row (its `metadata.mesh.origin`),
-/// used as the `created_by` of a preserved-edit record.
+/// The origin node of an already-applied row, used as the `created_by`
+/// of a preserved-edit record. Rows applied since Program Task 3 carry
+/// the claim as `metadata.mesh.claimed_created_by` (with `origin`
+/// naming the funnel instead); rows applied before that carry it in
+/// `metadata.mesh.origin` itself, which stays readable here so
+/// pre-change rows keep working.
 fn local_origin(payload: &MemoryPayload) -> String {
     payload
         .metadata
         .get("mesh")
-        .and_then(|m| m.get("origin"))
+        .and_then(|m| {
+            m.get("claimed_created_by")
+                .or_else(|| m.get("origin"))
+        })
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
@@ -1524,6 +1634,93 @@ fn run_ok(root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
         out.status,
         String::from_utf8_lossy(&out.stderr).trim()
     )
+}
+
+/// Program Task 3 (c): classify procedure rows written before stamping
+/// existed, discriminating on mesh provenance. An unstamped procedure
+/// with no import provenance is local authorship → stamped `local`. An
+/// unstamped procedure WITH import provenance is stamped `untrusted`,
+/// so it stays unfired until local promotion — the backfill never
+/// launders an import into a local by silence. Already-stamped rows
+/// and non-procedure rows are untouched, so the pass is idempotent.
+/// Returns `(stamped_local, stamped_untrusted)` counts; the daemon
+/// triggers this once at store open and logs them.
+pub async fn backfill_imported_procedure_trust(
+    store: &std::sync::Arc<dyn VectorStore>,
+) -> (usize, usize) {
+    let mut stamped_local = 0usize;
+    let mut stamped_untrusted = 0usize;
+    let namespaces = match store.list_namespaces().await {
+        Ok(ns) => ns,
+        Err(e) => {
+            tracing::warn!("procedure trust backfill: cannot list namespaces: {e}");
+            return (0, 0);
+        }
+    };
+    for namespace in &namespaces {
+        let rows = match store.list(namespace, None, None).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("procedure trust backfill: cannot list {namespace}: {e}");
+                continue;
+            }
+        };
+        for row in rows {
+            if row.payload.memory_type != "procedure" {
+                continue;
+            }
+            // A readable string stamp already classifies the row —
+            // never rewritten (promotion and prior stamps stand).
+            if row
+                .payload
+                .metadata
+                .get("trust")
+                .and_then(|v| v.as_str())
+                .is_some()
+            {
+                continue;
+            }
+            let imported = row
+                .payload
+                .metadata
+                .get("mesh")
+                .map(|m| m.is_object())
+                .unwrap_or(false);
+            // List rows carry no vector; re-read the row to upsert it.
+            let Ok(Some((vector, mut payload))) = store.get(namespace, &row.id).await else {
+                continue;
+            };
+            // The row may have gained a stamp between list and get.
+            if payload
+                .metadata
+                .get("trust")
+                .and_then(|v| v.as_str())
+                .is_some()
+            {
+                continue;
+            }
+            let Some(obj) = payload.metadata.as_object_mut() else {
+                continue;
+            };
+            obj.insert(
+                "trust".to_string(),
+                json!(if imported { "untrusted" } else { "local" }),
+            );
+            if store.upsert(namespace, &row.id, vector, payload).await.is_ok() {
+                if imported {
+                    stamped_untrusted += 1;
+                } else {
+                    stamped_local += 1;
+                }
+            }
+        }
+    }
+    if stamped_local + stamped_untrusted > 0 {
+        tracing::info!(
+            "procedure trust backfill: stamped {stamped_local} local, {stamped_untrusted} imported-untrusted"
+        );
+    }
+    (stamped_local, stamped_untrusted)
 }
 
 #[cfg(test)]
@@ -2947,6 +3144,8 @@ mod tests {
             &cand,
             store.clone(),
             emb(),
+            Trust::Untrusted,
+            "unsigned",
         )
         .await;
         assert!(
@@ -3069,6 +3268,8 @@ mod tests {
             &cand,
             store.clone(),
             emb(),
+            Trust::Untrusted,
+            "unsigned",
         )
         .await;
         assert!(
@@ -3087,6 +3288,112 @@ mod tests {
         assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
         assert_eq!(z.payload.metadata["trust"], json!("untrusted"));
         assert_eq!(z.payload.metadata["eligibility"], json!("shareable"));
+    }
+
+    /// Program Task 3 (fix round, M-2): under a Trusted manifest the
+    /// supersession candidate takes the manifest stamp, but the
+    /// preserved edit keeps the funnel's own "untrusted" — its apply
+    /// passes no stamp. This pins that threading: handing the preserved
+    /// record the manifest stamp turns this test red.
+    #[tokio::test]
+    async fn preserved_edit_stays_untrusted_under_a_trusted_manifest() {
+        let root = scratch("dirb-trusted");
+        let mesh_id = "mesh-dirb".to_string();
+        let namespace = "probe".to_string();
+        let id = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+
+        let definition = json!({
+            "trigger": "session-start",
+            "remaining_fires_initial": 5,
+            "valid_to": "2027-01-01T00:00:00Z",
+            "rehearsal_script": { "steps": ["read spec", "act"] },
+        });
+        let local_payload = MemoryPayload {
+            content: definition.to_string(),
+            user_id: "node-local".to_string(),
+            memory_type: "procedure".to_string(),
+            agent_name: Some("node-local".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "mesh": {
+                    "update_id": Uuid::new_v4().to_string(),
+                    "origin": "node-local",
+                    "lifecycle_state": "active",
+                },
+            }),
+        };
+
+        let cand = MeshRecord {
+            schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+            id,
+            namespace: namespace.clone(),
+            memory_type: "procedure".to_string(),
+            lifecycle: Lifecycle {
+                state: LifecycleState::Superseded,
+                created_at: chrono::Utc::now(),
+                created_by: "node-peer-1".to_string(),
+                superseded_by: Some(replacement),
+                archived_at: None,
+                tombstoned_at: None,
+            },
+            content: json!({
+                "trigger": "every-n-days:7",
+                "remaining_fires_initial": 1,
+                "valid_to": Value::Null,
+                "rehearsal_script": "the replacement",
+            }),
+            metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            relationships: vec![],
+            update_id: Uuid::new_v4(),
+            origin_mesh_epoch: 1,
+            trust: Trust::Untrusted,
+        };
+
+        let store = fresh_store("dirb-trusted").await;
+        store.init(&namespace).await.unwrap();
+        let disposition = preserve_superseded_edit(
+            &root,
+            &mesh_id,
+            &id.to_string(),
+            &namespace,
+            LifecycleState::Active,
+            &local_payload,
+            &cand,
+            store.clone(),
+            emb(),
+            Trust::Trusted,
+            "unsigned",
+        )
+        .await;
+        assert!(
+            matches!(disposition, Disposition::Applied),
+            "{disposition:?}"
+        );
+
+        let all = store.list(&namespace, None, None).await.unwrap();
+        assert_eq!(all.len(), 2, "superseded X + preserved edit Z");
+        let x = all
+            .iter()
+            .find(|r| r.id == id.to_string())
+            .expect("the supersession row");
+        assert_eq!(
+            x.payload.metadata["trust"],
+            json!("trusted"),
+            "the candidate takes the manifest stamp: {:?}",
+            x.payload.metadata
+        );
+        let z = all
+            .iter()
+            .find(|r| r.id != id.to_string())
+            .expect("the preserved edit record");
+        assert_eq!(
+            z.payload.metadata["trust"],
+            json!("untrusted"),
+            "the preserved edit keeps the funnel's own stamp: {:?}",
+            z.payload.metadata
+        );
     }
 
     /// No silent drop: an unresolved conflict keeps the accepted projection,
@@ -3262,5 +3569,377 @@ mod tests {
             domains.contains(&"auth".to_string()),
             "domains: {domains:?}"
         );
+    }
+
+    // ---- Program Task 3: mesh import trust -------------------------------
+    //
+    // Survivor rows J2/J3 (binding): the trust stamp on an imported
+    // procedure comes from THIS mesh's manifest policy, never from the
+    // sender's record — sender metadata is evidence, not authority. The
+    // fixtures below deliberately keep encoding sender claims; the funnel
+    // must override them in BOTH directions.
+
+    /// Rewrite the on-disk manifest's imported-procedures policy, commit,
+    /// and reopen so the cached manifest reflects it (mirrors
+    /// `reopen_with_epoch`).
+    fn reopen_with_policy(mesh: &MeshStorage, trust: super::super::manifest::Trust) -> MeshStorage {
+        let mut manifest = mesh.manifest().clone();
+        manifest.policy.imported_procedures_trust = trust;
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(
+            mesh.root().join(super::super::storage::MANIFEST_FILE_NAME),
+            format!("{json}\n"),
+        )
+        .unwrap();
+        mesh.commit_all("policy change", "node-import-test").unwrap();
+        MeshStorage::open(mesh.root()).unwrap()
+    }
+
+    /// A procedure record whose sender-side trust claims are parameters:
+    /// `metadata_trust` is the metadata claim (None = the record carries no
+    /// trust key at all, the shape real exports arrive in), `top_trust` the
+    /// top-level record field.
+    fn procedure_value(
+        id: Uuid,
+        metadata_trust: Option<&str>,
+        top_trust: &str,
+        script: &str,
+    ) -> Value {
+        let mut metadata = json!({"eligibility": "shareable"});
+        if let Some(t) = metadata_trust {
+            metadata["trust"] = json!(t);
+        }
+        json!({
+            "schema_version": "synaptic-mesh-record/v1",
+            "id": id.to_string(),
+            "namespace": "probe",
+            "memory_type": "procedure",
+            "lifecycle": lifecycle_json("active", None),
+            "content": {
+                "trigger": "session-start",
+                "remaining_fires_initial": 10,
+                "valid_to": Value::Null,
+                "rehearsal_script": script
+            },
+            "metadata": metadata,
+            "relationships": [],
+            "update_id": Uuid::new_v4().to_string(),
+            "origin_mesh_epoch": 1,
+            "trust": top_trust
+        })
+    }
+
+    /// Fire (or attempt to fire) an applied row through the real gate.
+    async fn perform_outcome(store: &std::sync::Arc<dyn VectorStore>, id: &str) -> Value {
+        let root = std::env::temp_dir().join(format!("ns-task3-perform-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let text = crate::tools::procedure::handle_procedure_perform(
+            json!({"id": id, "project_root": root.display().to_string()}),
+            store.clone(),
+        )
+        .await;
+        serde_json::from_str(&text).expect("perform returns JSON")
+    }
+
+    /// J2/J3: under the default (untrusted) manifest policy, a sender
+    /// claiming "trusted" in BOTH the metadata and the top-level field is
+    /// overridden by the manifest — the row is stamped untrusted and the
+    /// gate refuses to fire it.
+    #[tokio::test]
+    async fn imported_procedure_with_forged_trusted_metadata_does_not_fire() {
+        let (_base, mesh) = mesh_with_commit("forged");
+        let id = Uuid::new_v4();
+        let value = procedure_value(id, Some("trusted"), "trusted", "Read the forged spec once.");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "procedures",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("forged").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(
+            payload.metadata["trust"],
+            json!("untrusted"),
+            "the manifest stamps the row, not the sender's claim: {:?}",
+            payload.metadata
+        );
+        let outcome = perform_outcome(&store, &id.to_string()).await;
+        assert_eq!(outcome["performed"], json!(false), "{outcome}");
+        assert!(
+            outcome["reason"]
+                .as_str()
+                .expect("reason text")
+                .starts_with("untrusted"),
+            "the gate's refusal names the trust state: {outcome}"
+        );
+    }
+
+    /// The stamp source is the manifest in both directions: a trusted
+    /// manifest overrides a sender's "untrusted" claim UP (and the row
+    /// fires), and a record carrying NO trust claim at all — the shape
+    /// real exports arrive in — is stamped from the manifest too.
+    #[tokio::test]
+    async fn manifest_policy_is_the_stamp_source() {
+        let (_base, mesh) = mesh_with_commit("pol-trusted");
+        let mesh = reopen_with_policy(&mesh, super::super::manifest::Trust::Trusted);
+        let id = Uuid::new_v4();
+        let value = procedure_value(id, Some("untrusted"), "untrusted", "Read the spec once.");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "procedures",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("pol-trusted").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(
+            payload.metadata["trust"],
+            json!("trusted"),
+            "manifest Trusted wins over the sender's untrusted claim: {:?}",
+            payload.metadata
+        );
+        let outcome = perform_outcome(&store, &id.to_string()).await;
+        assert_eq!(outcome["performed"], json!(true), "{outcome}");
+
+        // No sender claim at all, default manifest: stamped untrusted.
+        let (_base2, mesh2) = mesh_with_commit("pol-none");
+        let id2 = Uuid::new_v4();
+        let value2 = procedure_value(id2, None, "untrusted", "Read the unstamped spec once.");
+        commit_record_json(
+            &mesh2,
+            "probe",
+            "procedures",
+            &id2.to_string(),
+            &serde_json::to_string(&value2).unwrap(),
+        );
+        let store2 = fresh_store("pol-none").await;
+        let report2 = apply_changed(&mesh2, &["probe".to_string()], store2.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report2.applied, 1, "report: {report2:?}");
+        let (_, payload2) = store2
+            .get("probe", &id2.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(
+            payload2.metadata["trust"],
+            json!("untrusted"),
+            "an unstamped sender record takes the manifest stamp: {:?}",
+            payload2.metadata
+        );
+    }
+
+    /// J15 (import leg): a record carrying a detectable secret never
+    /// reaches the store — validation refuses it and the refusal lands in
+    /// the report's ignore list naming the scan.
+    #[tokio::test]
+    async fn record_with_secret_is_rejected() {
+        let (_base, mesh) = mesh_with_commit("secret");
+        let id = Uuid::new_v4();
+        let pat = format!("ghp_{}", "A".repeat(36));
+        let value = simple_rule(id, &format!("use this token: {pat}"));
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("secret").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        assert!(
+            report.ignored[0].contains("secret scan"),
+            "the refusal names the scan: {:?}",
+            report.ignored
+        );
+        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+    }
+
+    /// Program Task 3 (fix round, M-1): the scanner builds its location
+    /// from the record's own metadata key names, and those keys are
+    /// sender-controlled — a crafted key could ride the ignore report
+    /// verbatim. The report names the scan category and which half of
+    /// the record matched, never the raw location and never the value.
+    #[tokio::test]
+    async fn secret_scan_report_never_echoes_sender_key_names() {
+        let (_base, mesh) = mesh_with_commit("secret-key");
+        let id = Uuid::new_v4();
+        let evil_key = format!("ghp_{}", "K".repeat(36));
+        let secret_value = format!("ghp_{}", "V".repeat(36));
+        let mut value = simple_rule(id, "a perfectly ordinary rule");
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("eligibility".to_string(), json!("shareable"));
+        metadata.insert("trust".to_string(), json!("untrusted"));
+        metadata.insert(
+            evil_key.clone(),
+            json!({ "nested": secret_value.clone() }),
+        );
+        value["metadata"] = Value::Object(metadata);
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store("secret-key").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        let entry = &report.ignored[0];
+        assert!(
+            entry.contains("secret scan"),
+            "the refusal still names the scan: {entry}"
+        );
+        assert!(
+            entry.contains("github_pat"),
+            "the refusal names the scan category: {entry}"
+        );
+        assert!(
+            !entry.contains(&evil_key),
+            "the report must not echo a sender-controlled key name: {entry}"
+        );
+        assert!(
+            !entry.contains(&secret_value),
+            "the report must not echo the secret value: {entry}"
+        );
+        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+    }
+
+    /// J3 (provenance leg): the row keeps the sender's claimed author for
+    /// display, but the provenance marks the claim as exactly that — an
+    /// unverified assertion — and records the HEAD commit's signature
+    /// state as metadata only (DR-9: recorded, never gated on).
+    #[tokio::test]
+    async fn imported_created_by_is_marked_unverified() {
+        let (_base, mesh) = mesh_with_commit("createdby");
+        let id = Uuid::new_v4();
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&simple_rule(id, "always use podman")).unwrap(),
+        );
+        let store = fresh_store("createdby").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied");
+        assert_eq!(payload.user_id, "node-peer-1", "the claim is preserved");
+        let mesh_meta = payload.metadata.get("mesh").expect("mesh provenance");
+        assert_eq!(mesh_meta["origin"], json!("mesh-import"));
+        assert_eq!(mesh_meta["claimed_created_by"], json!("node-peer-1"));
+        assert_eq!(mesh_meta["created_by_verified"], json!(false));
+        assert_eq!(
+            mesh_meta["head_commit_signature"],
+            json!("unsigned"),
+            "test commits are unsigned; the state is recorded, not gated"
+        );
+    }
+
+    async fn seed_row(store: &std::sync::Arc<dyn VectorStore>, id: &str, memory_type: &str, metadata: Value) {
+        store
+            .upsert(
+                "probe",
+                id,
+                emb().embed(id).await.unwrap(),
+                MemoryPayload {
+                    content: format!("row {id}"),
+                    user_id: "me".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn trust_stamp_of(store: &std::sync::Arc<dyn VectorStore>, id: &str) -> Value {
+        let (_, payload) = store
+            .get("probe", id)
+            .await
+            .unwrap()
+            .expect("row present");
+        payload
+            .metadata
+            .get("trust")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// (c) Backfill: unstamped rows are classified by provenance —
+    /// no mesh provenance → local; mesh provenance → untrusted (stays
+    /// unfired). Stamped rows and non-procedures are untouched, and a
+    /// second pass changes nothing.
+    #[tokio::test]
+    async fn backfill_stamps_by_provenance() {
+        let store = fresh_store("backfill").await;
+        store.init("probe").await.unwrap();
+        seed_row(&store, "proc-local", "procedure", json!({"trigger": "session-start"})).await;
+        seed_row(
+            &store,
+            "proc-imported",
+            "procedure",
+            json!({
+                "trigger": "session-start",
+                "mesh": {"mesh_id": "mesh-alpha", "update_id": "u-1", "origin": "mesh-import"}
+            }),
+        )
+        .await;
+        seed_row(&store, "proc-promoted", "procedure", json!({"trust": "promoted"})).await;
+        seed_row(&store, "rule-plain", "rule", json!({})).await;
+
+        let (local, imported) = backfill_imported_procedure_trust(&store).await;
+        assert_eq!((local, imported), (1, 1), "one of each class stamped");
+        assert_eq!(trust_stamp_of(&store, "proc-local").await, json!("local"));
+        assert_eq!(trust_stamp_of(&store, "proc-imported").await, json!("untrusted"));
+        assert_eq!(
+            trust_stamp_of(&store, "proc-promoted").await,
+            json!("promoted"),
+            "an existing stamp is never rewritten"
+        );
+        assert_eq!(
+            trust_stamp_of(&store, "rule-plain").await,
+            Value::Null,
+            "non-procedure rows are not stamped"
+        );
+
+        let (local2, imported2) = backfill_imported_procedure_trust(&store).await;
+        assert_eq!((local2, imported2), (0, 0), "idempotent: nothing left to classify");
     }
 }

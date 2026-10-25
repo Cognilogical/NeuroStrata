@@ -1280,6 +1280,11 @@ pub async fn handle_task_complete(
             }
             // The same lineage stamps add_memory gives every new row.
             crate::server::stamp_new_memory(&mut meta);
+            // A procedure minted by an extraction is locally authored,
+            // exactly as if add_memory had written it (Program Task 3).
+            if memory_type == "procedure" {
+                crate::tools::procedure::stamp_local_trust(&mut meta);
+            }
             // An extraction is an insertion: it meets the same scanner.
             if let Some(rejection) =
                 crate::secrets::scan_entry_point(&content, &meta, "task_complete")
