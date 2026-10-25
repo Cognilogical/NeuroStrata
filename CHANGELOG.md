@@ -4,6 +4,33 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.13.0] - 2026-10-25
+
+### Added
+
+- **Composite improvement recommendations (28 items, P0→P1→P2).** Full P0 security hardening (R1–R8), P1 mesh/embed/namespace/filter improvements (R9–R21), P2 CLI proxy/storage/sandbox/vocabulary/structural split (R22–R28). See `docs/designs/2026-10-24-composite-improvement-recommendations.md`.
+- **Daemon `/export-graph` endpoint** (R22) — routes through daemon's single writer, avoiding lock contention.
+- **Handler extraction** (R28) — `src/handlers/memory.rs` with `handle_get_memory` and `handle_list_namespaces`.
+- **R12 incomplete marker** — `incomplete: bool` on `DomainSearchOutcome`, set when 10x FETCH_MULTIPLIER budget exhausted.
+- **R13 RemoteEmbedder fail-closed auth** — verifies non-empty api_key before any remote embed call.
+- **Mesh procedure trust** (PR #34) — manifest stamp, provenance gate, secret scan.
+- **Daemon request trust** (PR #33) — Host/Origin checks, operator tier.
+- **Task claim atomicity** (PR #32) — resolves test file conflict.
+
+### Changed
+
+- All "deferred" language removed from artifacts and task descriptions.
+- R24 storage migration evaluation: stay on lbug 0.20.4, no migration.
+- sygq (Laya training) retired — Python/Torch no longer needed.
+
+### Fixed
+
+- Float-binding test alignment (PR #35).
+- ProjectAnchors references removed from episodic_pointer_echo.rs (PR #29 divergence).
+- Test compile fixes (PR #31).
+
+---
+
 ## [1.11.0] - 2026-10-22
 
 ### Added
