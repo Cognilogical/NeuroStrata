@@ -102,6 +102,7 @@ async fn search_inner(
             );
 
             let result = conn.query(&search_query)?;
+            let result_count = result.get_num_tuples() as usize;
             let mut all_primaries = Vec::new();
             let mut filtered_primaries = Vec::new();
 
@@ -567,9 +568,14 @@ async fn search_inner(
                 }
             });
 
-            // Return limit primaries + their expansions (no truncation to limit*2)
-            // The admission caps already bound expansions to limit per family.
-            Ok(DomainSearchOutcome { results, mode })
+            // Incomplete marker: set when the full 10x budget was consumed by the
+// Cypher LIMIT, meaning more matching rows beyond the page may exist and
+// must be fetched via pagination to avoid losing live matches hidden behind
+// rows filtered out after LIMIT. Heuristic: if result_count == fetch_limit
+// the engine's LIMIT was hit, indicating the multiplier exhausted and pages
+// beyond remain.
+let incomplete = result_count >= fetch_limit;
+Ok(DomainSearchOutcome { results, mode, incomplete })
         })
         .await
 }

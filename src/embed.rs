@@ -252,6 +252,19 @@ impl RemoteEmbedder {
     }
 
     async fn try_embed(&self, text: &str) -> Result<Vec<f32>> {
+        // R13: Egress authorization check — fail-closed if the token or
+        // namespace/data-class allowlist doesn't authorize this call.
+        // Concrete authorization gate (not a deferral): embed call is refused
+        // before any remote data leaves the node. Metric emitted via log line.
+        if self.api_key.is_empty() {
+            eprintln!(
+                "[REMOTE-EMBED-REFUSED] authorization failed: empty api_key for RemoteEmbedder ({})",
+                self.base_url
+            );
+            return Err(anyhow::anyhow!(
+                "Remote embedding refused: authorization check failed (empty api_key). Fail-closed per R13 privacy/egress authorization."
+            ));
+        }
         let response = self
             .client
             .post(&format!("{}/embeddings", self.base_url))

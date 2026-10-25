@@ -2759,7 +2759,7 @@ fn render_anchor(anchor: &Value) -> String {
 
 /// One rendering of a memory, shared by search and get, so a record reads the
 /// same however the agent reached it.
-fn format_memory(id: &str, payload: &MemoryPayload) -> String {
+pub(crate) fn format_memory(id: &str, payload: &MemoryPayload) -> String {
     let mut out = format!("--- Memory ID: {} ---\nType: {}", id, payload.memory_type);
     if crate::attempt::is_failed_attempt(&payload.metadata) {
         let attempt = payload.metadata.get("attempt").unwrap();
