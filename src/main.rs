@@ -1656,6 +1656,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Task 4 fix round (F5): a gate that exits 2 — could-not-check,
+    /// never a verdict (under --strict the gate CLI itself exits only 0
+    /// or 1, so a 2 means the binary that answered was stale, foreign,
+    /// or died before reporting) — is announced on stderr, and the push
+    /// still proceeds. Before the fix round this was the one silent
+    /// pass left in the hook's own paths.
+    #[cfg(unix)]
+    #[test]
+    fn gate_exit_two_is_announced_and_passes() {
+        let root = t4_repo_with_remote("exittwo");
+        install_pre_push_hook(&root, false).expect("install succeeds");
+        let (stub_bin, marker) = t4_stub_bin(&root);
+        let path = format!("{}:/usr/bin:/bin", stub_bin.display());
+        let out = t4_push(&root, &path, Some("2"));
+        assert!(
+            out.status.success(),
+            "an exit 2 never blocks the push: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(marker.exists(), "the gate was invoked");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("warning: neurostrata-mcp task gate exited 2"),
+            "the could-not-run is announced, never silent: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Task 4, Step 1: the parallel PRE_PUSH_HOOK const is removed by
     /// this task; the scaffolded hook (the surviving text) must carry
     /// every behavior the const had, so the removal loses nothing. The
@@ -1688,8 +1717,24 @@ mod tests {
                 behavior
             );
         }
+        // Fix round (F5): an exit 2 is announced, never silent — and
+        // still never blocks. (Under --strict the gate CLI itself exits
+        // only 0 or 1, so a 2 is never a verdict: a stale, foreign, or
+        // dying binary.) The announcement branch must say so and must
+        // not exit 1.
+        let two_branch = hook
+            .split("if [ $code -eq 2 ]; then")
+            .nth(1)
+            .expect("the exit-2 announcement branch exists")
+            .split("fi")
+            .next()
+            .unwrap();
         assert!(
-            !hook.contains("$code -eq 2"),
+            two_branch.contains("gate could NOT run for this push"),
+            "an exit 2 is announced as a could-not-run, never silent"
+        );
+        assert!(
+            !two_branch.contains("exit 1"),
             "2 never blocks in the hook itself"
         );
     }
