@@ -298,6 +298,16 @@ struct AppState {
     /// Fires once, when something asks the daemon to stop. Taken by whoever
     /// gets there first so a second /shutdown call is harmless.
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// The project root resolved at startup (Task 2 re-file / J6): every
+    /// caller-supplied path a handler acts on must resolve inside it, or
+    /// inside `allowed_external_dirs`. Captured once, here, so a later
+    /// environment change cannot move the boundary a request is judged
+    /// against.
+    startup_root: PathBuf,
+    /// The `allowed_external_dirs` allowlist from the operator's config,
+    /// loaded once at startup. Fail-soft toward EMPTY (never toward
+    /// permissive): an unreadable config permits nothing outside the root.
+    allowed_external_dirs: Vec<PathBuf>,
     /// Memory deduplication checker (None if disabled or misconfigured)
     deduplication_checker: Option<Arc<DeduplicationChecker>>,
     /// Guard validator for behavioral constraint checking
@@ -441,6 +451,125 @@ pub(crate) fn resolve_project_root() -> PathBuf {
                 PathBuf::new()
             }
         },
+    }
+}
+
+/// The caller-path policy (Task 2 re-file / J6): may the daemon act on
+/// this caller-supplied path? Canonicalize-then-check, following the
+/// guard sandbox's pattern: an existing path is judged by its canonical
+/// form (so a symlink planted inside the root that points outside it is
+/// governed by its TARGET, not its spelling); a path that does not exist
+/// yet — a backup destination — is judged by its nearest existing
+/// ancestor plus a remainder of plain relative components (no `..`, so
+/// the remainder cannot climb out of the canonical ancestor). The
+/// resolved path must lie inside `root` or inside an
+/// `allowed_external_dirs` entry; anything else is a refusal naming the
+/// path, the root, and the config key.
+///
+/// This is the daemon half of the original Task 2, re-implemented
+/// against the current tree: PR #29's merge resolution dropped the
+/// daemon.rs half ("resolved in favor of current R19+ base"), leaving
+/// the handlers consuming caller paths verbatim and the landed
+/// `allowed_external_dirs` config key inert.
+pub(crate) fn check_caller_path(
+    raw: &Path,
+    root: &Path,
+    allowlist: &[PathBuf],
+) -> Result<PathBuf, String> {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let resolved = resolve_caller_path(raw)?;
+    if resolved.starts_with(&canonical_root) {
+        return Ok(resolved);
+    }
+    for entry in allowlist {
+        let canonical_entry =
+            std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+        if resolved.starts_with(&canonical_entry) {
+            return Ok(resolved);
+        }
+    }
+    Err(format!(
+        "refused: {} resolves to {}, which is outside the project root {}; \
+         to permit it, add the directory to allowed_external_dirs in \
+         ~/.config/neurostrata/config.json",
+        raw.display(),
+        resolved.display(),
+        canonical_root.display()
+    ))
+}
+
+/// Resolve `raw` to the canonical path it names, per [`check_caller_path`].
+///
+/// A relative `raw` is resolved against the daemon's working directory —
+/// the baseline handler semantics, from before this policy existed, when
+/// handlers consumed caller paths joined onto the process CWD verbatim.
+/// The choice is recorded here deliberately: containment is judged on
+/// the resolved ABSOLUTE path, so the CWD base can make a relative path
+/// refuse, but can never widen what it reaches.
+fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        // Relative: the daemon's CWD is the base (see the doc comment —
+        // baseline semantics; containment judges the absolute result).
+        std::env::current_dir()
+            .map(|cwd| cwd.join(raw))
+            .unwrap_or_else(|_| raw.to_path_buf())
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return Ok(canonical);
+    }
+    // Walk up to the nearest existing ancestor; the components below it
+    // must each be one plain name. `file_name` is `None` for `..`, `.`,
+    // and the filesystem root, so a remainder spelled with `..` ends here
+    // as a refusal rather than being joined onto the canonical ancestor.
+    let mut cursor = absolute.clone();
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
+            let mut resolved = canonical;
+            for name in remainder.iter().rev() {
+                resolved.push(name);
+            }
+            return Ok(resolved);
+        }
+        match (cursor.file_name().map(|n| n.to_os_string()), cursor.parent()) {
+            (Some(name), Some(parent)) => {
+                remainder.push(name);
+                cursor = parent.to_path_buf();
+            }
+            _ => {
+                return Err(format!(
+                    "refused: {} cannot be resolved — it has no existing ancestor \
+                     on this machine, or its non-existent remainder is not plain \
+                     relative components",
+                    raw.display()
+                ))
+            }
+        }
+    }
+}
+
+/// The `allowed_external_dirs` allowlist from the operator's config file.
+/// Fail-soft toward EMPTY (never toward permissive): an unreadable config
+/// permits nothing outside the project root, and says so in the log.
+fn load_allowed_external_dirs() -> Vec<PathBuf> {
+    let Ok(path) = crate::config::Config::default_path() else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        return Vec::new();
+    }
+    match crate::config::Config::load_from(&path) {
+        Ok(config) => config.allowed_external_dirs,
+        Err(e) => {
+            tracing::warn!(
+                "could not read {} for allowed_external_dirs; treating the \
+                 allowlist as empty: {e}",
+                path.display()
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -785,6 +914,8 @@ pub(crate) async fn start_daemon_on(
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
         deduplication_checker,
         guard_validator,
+        startup_root: resolve_project_root(),
+        allowed_external_dirs: load_allowed_external_dirs(),
         build: BuildInfo {
             version: env!("CARGO_PKG_VERSION"),
             exe_hash: fingerprint.0,
@@ -1016,10 +1147,29 @@ async fn handle_get_graph(
     })))
 }
 
+/// The caller-path policy as a handler refusal (Task 2 re-file / J6):
+/// the path is validated through [`check_caller_path`] BEFORE any use,
+/// against the daemon's startup root and the configured allowlist.
+fn caller_path_refusal(
+    state: &AppState,
+    raw: &str,
+) -> Result<PathBuf, (axum::http::StatusCode, String)> {
+    check_caller_path(
+        Path::new(raw),
+        &state.startup_root,
+        &state.allowed_external_dirs,
+    )
+    .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e))
+}
+
 async fn handle_ingest(
     State(state): State<AppState>,
     Json(req): Json<IngestReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // The walk reads whatever directory the caller named; the path policy
+    // decides whether this daemon may read it at all (Task 2 re-file / J6).
+    let dir = caller_path_refusal(&state, &req.dir)?;
+    let dir = dir.to_string_lossy().into_owned();
     // The shipped schema, the same one the CLI and the MCP tool use. This route
     // carried its own inline copy declaring rust and nothing else, so the GUI --
     // which is this route's main caller -- built a graph with no Python, Go,
@@ -1040,7 +1190,7 @@ async fn handle_ingest(
         .ingests
         .run(
             &namespace,
-            &req.dir,
+            &dir,
             schema,
             state.embedder.clone(),
             state.vector_store.clone(),
@@ -1059,9 +1209,12 @@ async fn handle_backup(
     State(state): State<AppState>,
     Json(req): Json<BackupReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
+    // The snapshot lands wherever the caller named; the path policy
+    // decides whether this daemon may write there (Task 2 re-file / J6).
+    let dir = caller_path_refusal(&state, &req.dir)?;
     state
         .vector_store
-        .export_database(&req.dir)
+        .export_database(&dir.to_string_lossy())
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(format!("Backed up to {}", req.dir))
@@ -1084,6 +1237,10 @@ async fn handle_export_graph(
     State(state): State<AppState>,
     Json(req): Json<ExportGraphReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
+    // The graph is written wherever the caller named; the path policy
+    // decides whether this daemon may write there, BEFORE any use
+    // (Task 2 re-file / J6 — this route postdates the original filing).
+    let target = caller_path_refusal(&state, &req.target)?;
     let config = crate::config::Config::from_default_path()
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let anchor_root = req.anchor_root.as_deref().map(Path::new);
@@ -1101,7 +1258,7 @@ async fn handle_export_graph(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    std::fs::write(&req.target, serde_json::to_string_pretty(&data).map_err(|e| {
+    std::fs::write(&target, serde_json::to_string_pretty(&data).map_err(|e| {
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?).map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(format!("Graph exported to {}", req.target))
@@ -1121,11 +1278,14 @@ async fn handle_tasks_import(
     State(state): State<AppState>,
     Json(req): Json<ImportReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
+    // The import reads whatever file the caller named; the path policy
+    // decides whether this daemon may read it at all (Task 2 re-file / J6).
+    let from_beads = caller_path_refusal(&state, &req.from_beads)?;
     let summary = crate::task::import_beads(
         state.vector_store.clone(),
         state.embedder.clone(),
         &req.namespace,
-        &req.from_beads,
+        &from_beads.to_string_lossy(),
     )
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -2970,5 +3130,178 @@ impl crate::traits::AsAny for RecordingStore {
             "the refusal names the config key that changes the policy: {body}"
         );
         stop_daemon(&client, &base, daemon).await;
+    }
+
+    /// Task 2 re-file (J6), unit leg: a not-yet-existing destination
+    /// spelled with `..` is refused — the remainder below the nearest
+    /// existing ancestor must be plain relative components, so a spelling
+    /// cannot climb out of the canonical ancestor it was judged against.
+    #[test]
+    fn nonexistent_destination_with_dotdot_is_refused() {
+        let root = scratch_root("t2r-unit-dotdot-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let sneaky = root.join("new").join("..").join("..").join("escape");
+        let err = check_caller_path(&sneaky, &root, &[]).expect_err("a `..` remainder refuses");
+        assert!(
+            err.contains("cannot be resolved"),
+            "the refusal says which check failed: {err}"
+        );
+    }
+
+    /// Task 2 re-file (J6), unit leg: a not-yet-existing destination with
+    /// a plain remainder resolves to the canonical ancestor plus the
+    /// remainder — the normal first-backup shape.
+    #[test]
+    fn nonexistent_destination_plain_remainder_succeeds() {
+        let root = scratch_root("t2r-unit-plain-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let dest = root.join("backups").join("2026-10-25");
+        let resolved = check_caller_path(&dest, &root, &[]).expect("a plain remainder resolves");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&root)
+                .unwrap()
+                .join("backups")
+                .join("2026-10-25"),
+            "the resolved path is the canonical root plus the plain remainder"
+        );
+    }
+
+    /// Task 2 re-file (J6), unit leg: a destination outside the root
+    /// succeeds when its directory is on the `allowed_external_dirs`
+    /// allowlist — the one escape hatch, and the shape the operator's
+    /// backup flow uses.
+    #[test]
+    fn backup_to_allowlisted_dir_succeeds() {
+        let root = scratch_root("t2r-unit-allow-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let external = scratch_root("t2r-unit-allow-external");
+        std::fs::create_dir_all(&external).unwrap();
+        let dest = external.join("snapshot");
+        let resolved = check_caller_path(&dest, &root, &[external.clone()])
+            .expect("an allowlisted directory permits the destination");
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&external).unwrap().join("snapshot")
+        );
+    }
+
+    /// Task 2 re-file (J6), unit leg: the refusal for an existing outside
+    /// directory names the offending path, the project root, and the
+    /// config key — prescriptive, not a bare denial.
+    #[test]
+    fn outside_path_refusal_names_path_root_and_key() {
+        let root = scratch_root("t2r-unit-refusal-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = scratch_root("t2r-unit-refusal-outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let err = check_caller_path(&outside, &root, &[]).expect_err("an outside path refuses");
+        assert!(
+            err.contains(&outside.display().to_string()),
+            "the refusal names the path: {err}"
+        );
+        assert!(
+            err.contains(&std::fs::canonicalize(&root).unwrap().display().to_string()),
+            "the refusal names the root: {err}"
+        );
+        assert!(
+            err.contains("allowed_external_dirs"),
+            "the refusal names the config key: {err}"
+        );
+    }
+
+    /// An AppState serving `root` with `allowlist`, built directly so the
+    /// handler tests below can name an allowlist — a spawned daemon reads
+    /// the list from the operator's real config file, which a test must
+    /// never rewrite.
+    async fn caller_path_state(root: &Path, allowlist: Vec<PathBuf>) -> AppState {
+        let store = Arc::new(RecordingStore::default());
+        let embedder = Arc::new(StubEmbedder { dimensions: 8 });
+        AppState {
+            embedder: embedder.clone(),
+            vector_store: store.clone(),
+            bus: build_thalamic_bus(store.clone(), 8, root.to_path_buf()),
+            ingests: Arc::new(crate::ingest_jobs::IngestJobs::new()),
+            shutdown: Arc::new(Mutex::new(None)),
+            deduplication_checker: None,
+            guard_validator: Arc::new(
+                crate::guard::GuardValidator::new(store.clone(), embedder.clone(), "guard").await,
+            ),
+            startup_root: root.to_path_buf(),
+            allowed_external_dirs: allowlist,
+            build: BuildInfo {
+                version: env!("CARGO_PKG_VERSION"),
+                exe_hash: 0,
+                exe_len: 0,
+                pid: std::process::id(),
+                started_at: 0,
+            },
+            daemon_token: "test-daemon-token".to_string(),
+            operator_token: "test-operator-token".to_string(),
+        }
+    }
+
+    /// Task 2 re-file (J6): an export target under an
+    /// `allowed_external_dirs` entry is written — the escape hatch works
+    /// at the handler, not only in the policy function.
+    #[tokio::test]
+    async fn export_graph_to_allowlisted_dir_succeeds() {
+        let root = scratch_root("t2r-allow-export-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let external = scratch_root("t2r-allow-export-external");
+        std::fs::create_dir_all(&external).unwrap();
+        let target = external.join("graph.json");
+        let state = caller_path_state(&root, vec![external.clone()]).await;
+        let out = handle_export_graph(
+            State(state),
+            Json(ExportGraphReq {
+                target: target.display().to_string(),
+                exclude_superseded: None,
+                include_archived: None,
+                anchor_root: None,
+                source_id: None,
+            }),
+        )
+        .await
+        .expect("an allowlisted export target is written");
+        assert!(
+            out.contains("Graph exported to"),
+            "the handler's own answer: {out}"
+        );
+        assert!(
+            target.exists(),
+            "the export lands in the allowlisted dir: {}",
+            target.display()
+        );
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&written).is_ok(),
+            "the export is the graph JSON: {written}"
+        );
+    }
+
+    /// Task 2 re-file (J6): an ingest tree under an
+    /// `allowed_external_dirs` entry is walked — the shape the operator's
+    /// beads/ingest flows outside a project root rely on.
+    #[tokio::test]
+    async fn ingest_under_allowlisted_dir_succeeds() {
+        let root = scratch_root("t2r-allow-ingest-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let external_tree = scratch_tree("t2r-allow-ingest-external");
+        let state = caller_path_state(&root, vec![external_tree.clone()]).await;
+        let out = handle_ingest(
+            State(state),
+            Json(IngestReq {
+                dir: external_tree.display().to_string(),
+                namespace: "t2r-ingest-allow".to_string(),
+            }),
+        )
+        .await
+        .expect("an allowlisted ingest tree is walked");
+        assert!(
+            out.0.get("state").is_some(),
+            "the handler answers with the ingest progress: {}",
+            out.0
+        );
     }
 }
