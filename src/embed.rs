@@ -428,11 +428,15 @@ fn validate_remote_base_url(base_url: &str) -> Result<()> {
              base_url must use https (http is accepted only for loopback hosts)"
         )
     })?;
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false);
+    // Judge loopback from the parsed host, not host_str(): host_str()
+    // keeps the brackets of an IPv6 literal ("[::1]"), which IpAddr
+    // parsing rejects — url::Host yields the address itself.
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
     match url.scheme() {
         "https" => Ok(()),
         "http" if loopback => Ok(()),

@@ -38,6 +38,10 @@ cxx = "=1.0.138"
 lbug = "0.20.4"
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json"] }
+# The embedder's remote-URL validation matches on url::Host; the crate was
+# already in the tree as a transitive dependency (via reqwest), so this
+# adds no download.
+url = "2"
 # The crash breadcrumb needs the signal and file syscalls directly; it was
 # already in the tree as a transitive dependency, so this adds no download.
 libc = "0.2"
