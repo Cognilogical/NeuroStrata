@@ -2,7 +2,6 @@
 /// The exact-identifier lane: direct ID lookup via `get()` bypasses vector budget.
 /// This test verifies the contract without consuming search budget.
 
-use neurostrata_mcp::traits::VectorStore;
 
 #[test]
 fn exact_identifier_lane_bypasses_vector_budget() {
