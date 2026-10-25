@@ -416,4 +416,255 @@ mod tests {
         let embedder = build_embedder();
         assert!(embedder.is_ok());
     }
+
+    // ---- Task 9 (J29/J23): embedder identity & egress ----
+
+    /// A synthetic model artifact directory: the five files a real
+    /// fastembed snapshot carries, with stand-in bytes. The pin machinery
+    /// operates on file bytes, so no model download is needed.
+    fn synthetic_model_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neurostrata-t9-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in [
+            ("model.onnx", &b"onnx-graph-bytes-v1"[..]),
+            ("tokenizer.json", &b"{\"tokenizer\":true}"[..]),
+            ("config.json", &b"{\"architectures\":[\"BertModel\"]}"[..]),
+            (
+                "tokenizer_config.json",
+                &b"{\"tokenizer_class\":\"BertTokenizer\"}"[..],
+            ),
+            (
+                "special_tokens_map.json",
+                &b"{\"unk_token\":\"[UNK]\"}"[..],
+            ),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        dir
+    }
+
+    /// The DR-7 pin construction, reimplemented on the test side so the
+    /// production computation is checked against an independent reading of
+    /// the spec: per-file SHA-256; lines `"<file-sha256>  <filename>\n"`
+    /// sorted by filename; the pin is the SHA-256 hex of the concatenation.
+    /// (The synthetic dirs are flat, so filenames are the relative paths.)
+    fn spec_artifact_pin(dir: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "PIN-CANDIDATE")
+            .collect();
+        names.sort();
+        let mut listing = String::new();
+        for name in &names {
+            let bytes = std::fs::read(dir.join(name)).unwrap();
+            listing.push_str(&format!(
+                "{}  {}\n",
+                format!("{:x}", Sha256::digest(&bytes)),
+                name
+            ));
+        }
+        format!("{:x}", Sha256::digest(listing.as_bytes()))
+    }
+
+    #[test]
+    fn unknown_model_name_refuses_and_names_the_list() {
+        let err = resolve_embedding_model("DefinitelyNotAModel")
+            .expect_err("an unknown model name must refuse, not fall back")
+            .to_string();
+        assert!(err.contains("DefinitelyNotAModel"), "names the request: {err}");
+        assert!(
+            err.contains("NomicEmbedTextV15"),
+            "names the acceptable list: {err}"
+        );
+        assert!(
+            err.contains("BGEBaseENV15"),
+            "names the acceptable list: {err}"
+        );
+    }
+
+    #[test]
+    fn known_model_names_still_resolve() {
+        // Zero-change pin: every model the operator's embedders.json names
+        // today keeps resolving by name.
+        for name in ["NomicEmbedTextV15", "BGEBaseENV15", "BGESmallENV15Q"] {
+            assert!(resolve_embedding_model(name).is_ok(), "{name} resolves");
+        }
+    }
+
+    #[test]
+    fn pinned_model_with_wrong_hash_refuses() {
+        let dir = synthetic_model_dir("wrong-hash");
+        let wrong = "0".repeat(64);
+        let err = enforce_artifact_pin(&dir, Some(wrong.as_str()), "SyntheticModel")
+            .expect_err("a pin that does not match the artifact set must refuse")
+            .to_string();
+        assert!(err.contains("SyntheticModel"), "names the model: {err}");
+    }
+
+    #[test]
+    fn pinned_model_with_correct_hash_loads() {
+        let dir = synthetic_model_dir("correct-hash");
+        let pin = spec_artifact_pin(&dir);
+        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
+            .expect("a matching pin loads");
+    }
+
+    #[test]
+    fn swapped_tokenizer_file_refuses() {
+        // The anti-theater test: the pin covers the whole file set, so
+        // changing one non-graph file must refuse.
+        let dir = synthetic_model_dir("swapped-tokenizer");
+        let pin = spec_artifact_pin(&dir);
+        std::fs::write(dir.join("tokenizer.json"), b"{\"tokenizer\":false}").unwrap();
+        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
+            .expect_err("a swapped tokenizer.json must refuse");
+    }
+
+    #[test]
+    fn added_artifact_file_refuses() {
+        let dir = synthetic_model_dir("added-file");
+        let pin = spec_artifact_pin(&dir);
+        std::fs::write(dir.join("vocab.txt"), b"extra file").unwrap();
+        enforce_artifact_pin(&dir, Some(pin.as_str()), "SyntheticModel")
+            .expect_err("an additional file in the set must refuse");
+    }
+
+    #[test]
+    fn identical_recache_passes() {
+        let first = synthetic_model_dir("recache-a");
+        let pin = spec_artifact_pin(&first);
+        let second = synthetic_model_dir("recache-b");
+        enforce_artifact_pin(&second, Some(pin.as_str()), "SyntheticModel")
+            .expect("a byte-identical re-download verifies against the pin");
+    }
+
+    #[test]
+    fn unpinned_model_loads_and_records_hash() {
+        let dir = synthetic_model_dir("unpinned");
+        enforce_artifact_pin(&dir, None, "SyntheticModel")
+            .expect("an unpinned model loads");
+        let candidate = dir.join("PIN-CANDIDATE");
+        assert!(candidate.exists(), "the adoption record is written");
+        let recorded = std::fs::read_to_string(&candidate).unwrap();
+        assert_eq!(recorded.trim(), spec_artifact_pin(&dir));
+        // The recorded candidate, once adopted into embedders.json, verifies.
+        enforce_artifact_pin(&dir, Some(recorded.trim()), "SyntheticModel")
+            .expect("the recorded candidate verifies once adopted");
+    }
+
+    #[test]
+    fn embedders_json_pin_field_is_optional() {
+        // Zero-change pin: existing embedders.json files (no artifact_pin)
+        // parse unchanged, and a present pin round-trips.
+        let without: Vec<AcceptableEmbedder> = serde_json::from_str(
+            r#"[{"model_name":"NomicEmbedTextV15","dimensions":768}]"#,
+        )
+        .unwrap();
+        assert!(without[0].artifact_pin.is_none());
+        let with: Vec<AcceptableEmbedder> = serde_json::from_str(
+            r#"[{"model_name":"NomicEmbedTextV15","dimensions":768,"artifact_pin":"abc123"}]"#,
+        )
+        .unwrap();
+        assert_eq!(with[0].artifact_pin.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn remote_http_to_public_host_is_refused() {
+        let err = RemoteEmbedder::new(
+            "http://embeddings.example.com:8080".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            768,
+        )
+        .err()
+        .expect("plain http to a public host must refuse")
+        .to_string();
+        assert!(
+            err.contains("embeddings.example.com"),
+            "names the host: {err}"
+        );
+        assert!(err.contains("https"), "names the rule: {err}");
+        assert!(!err.contains("test-key"), "never names the key: {err}");
+    }
+
+    #[test]
+    fn remote_https_loads() {
+        let embedder = RemoteEmbedder::new(
+            "https://embeddings.example.com".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            768,
+        );
+        assert!(embedder.is_ok());
+    }
+
+    #[test]
+    fn remote_http_to_loopback_loads() {
+        for url in ["http://127.0.0.1:8080", "http://[::1]:8080"] {
+            let embedder = RemoteEmbedder::new(
+                url.to_string(),
+                "test-key".to_string(),
+                "test-model".to_string(),
+                768,
+            );
+            assert!(embedder.is_ok(), "{url} is loopback http and loads");
+        }
+    }
+
+    #[test]
+    fn remote_url_without_host_is_refused() {
+        for url in ["http://", "not-a-url"] {
+            let embedder = RemoteEmbedder::new(
+                url.to_string(),
+                "test-key".to_string(),
+                "test-model".to_string(),
+                768,
+            );
+            assert!(embedder.is_err(), "{url} has no usable host and refuses");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_error_contains_status_not_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let body = "MARKER-SECRET-BODY";
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{addr}"),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            8,
+        )
+        .unwrap();
+        let err = embedder
+            .embed("hello")
+            .await
+            .expect_err("a 500 response is an error")
+            .to_string();
+        assert!(err.contains("500"), "names the status: {err}");
+        assert!(
+            !err.contains("MARKER-SECRET-BODY"),
+            "never carries the response body: {err}"
+        );
+    }
 }
