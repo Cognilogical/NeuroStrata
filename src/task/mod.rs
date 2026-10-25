@@ -4770,8 +4770,9 @@ mod tests {
             &self,
             namespace: &str,
             user_id: Option<&str>,
+            memory_type: Option<&str>,
         ) -> anyhow::Result<Vec<SearchResult>> {
-            self.inner.list(namespace, user_id).await
+            self.inner.list(namespace, user_id, memory_type).await
         }
         async fn get(
             &self,
