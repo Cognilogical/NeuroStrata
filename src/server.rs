@@ -6286,7 +6286,7 @@ mod tests {
             "{reply}"
         );
 
-        let rows = store.list("probe", None).await.expect("list");
+        let rows = store.list("probe", None, None).await.expect("list");
         let proc_row = rows
             .iter()
             .find(|r| r.payload.memory_type == "procedure")
@@ -6333,7 +6333,7 @@ mod tests {
             reply.starts_with("Successfully added memory"),
             "{reply}"
         );
-        let rows = store.list("probe", None).await.expect("list");
+        let rows = store.list("probe", None, None).await.expect("list");
         let rule_row = rows
             .iter()
             .find(|r| r.payload.content == "a plain local rule about stamping")

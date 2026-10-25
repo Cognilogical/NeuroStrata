@@ -1658,7 +1658,7 @@ pub async fn backfill_imported_procedure_trust(
         }
     };
     for namespace in &namespaces {
-        let rows = match store.list(namespace, None).await {
+        let rows = match store.list(namespace, None, None).await {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!("procedure trust backfill: cannot list {namespace}: {e}");
@@ -3372,7 +3372,7 @@ mod tests {
             "{disposition:?}"
         );
 
-        let all = store.list(&namespace, None).await.unwrap();
+        let all = store.list(&namespace, None, None).await.unwrap();
         assert_eq!(all.len(), 2, "superseded X + preserved edit Z");
         let x = all
             .iter()
