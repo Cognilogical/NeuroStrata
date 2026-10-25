@@ -1,10 +1,12 @@
 //! Post-hoc Gold temperature fitting from gold calibration pairs.
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 /// Post-hoc temperature fitting on gold calibration data.
-/// Computes the temperature scaling that maximizes log-probability agreement
-/// between candidate and gold soft targets, and writes calibration metadata
-/// into the exported bundle.
+///
+/// Fitting is NOT implemented in this build: `fit` returns an error rather
+/// than a fabricated temperature. When implemented, it will compute the
+/// temperature scaling that maximizes log-probability agreement between
+/// candidate and gold soft targets.
 pub struct TemperatureFitter;
 
 impl TemperatureFitter {
@@ -14,8 +16,13 @@ impl TemperatureFitter {
 
     /// Fit temperature from gold calibration log-probs.
     pub fn fit(&self, gold_log_probs: &[f64], cand_log_probs: &[f64]) -> Result<f64> {
-        // Phase-0: no-op; actual optimization deferred to Task 3.
-        Ok(1.0)
+        // Not implemented in this build. Refuse honestly: returning 1.0
+        // would hand the caller a plausible-looking temperature that no
+        // fitting produced.
+        let _ = (gold_log_probs, cand_log_probs);
+        Err(anyhow!(
+            "temperature fitting is not implemented in this build"
+        ))
     }
 }
 

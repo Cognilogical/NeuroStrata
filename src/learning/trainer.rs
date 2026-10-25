@@ -103,10 +103,10 @@ mod tests {
     #[test]
     fn evaluation_report_default_fields() {
         let report = EvaluationReport {
-            candidate: "v0.0.0-bridge".to_string(),
+            candidate: "bridge-placeholder".to_string(),
             suites: vec![],
         };
-        assert_eq!(report.candidate, "v0.0.0-bridge");
+        assert_eq!(report.candidate, "bridge-placeholder");
         assert!(report.gold_metrics().is_none());
     }
 }

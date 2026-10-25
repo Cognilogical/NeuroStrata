@@ -1,7 +1,7 @@
 //! Validated ONNX model bundle: manifest, tokenizer, checkpoint, calibration tier.
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 /// A bundle of ONNX artifacts produced by the bridge probe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,13 +17,29 @@ pub struct ModelBundle {
 }
 
 impl ModelBundle {
-    /// Load a bundle from `bundle_dir` and validate its manifest, paths,
-    /// and identity against the configured embedder.
+    /// Load a bundle from `bundle_dir`, reading its `manifest.json`.
+    ///
+    /// The bundle's version is the one its manifest declares
+    /// (`bundle_version`, falling back to `model_version`) — never a string
+    /// minted by this loader. A bundle whose manifest is missing,
+    /// unparsable, or declares no version is refused.
     pub fn load(bundle_dir: &Path, embedder_id: &str) -> Result<Self> {
         let root = bundle_dir.to_path_buf();
-        // Phase-0: minimal validation; full manifest parsing deferred to bridge spike.
+        let manifest_path = root.join("manifest.json");
+        let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            anyhow!("Cannot read bundle manifest {}: {e}", manifest_path.display())
+        })?;
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+            .map_err(|e| anyhow!("Bad bundle manifest JSON: {e}"))?;
+        let version = manifest["bundle_version"]
+            .as_str()
+            .or_else(|| manifest["model_version"].as_str())
+            .ok_or_else(|| {
+                anyhow!("Bundle manifest declares no bundle_version or model_version")
+            })?
+            .to_string();
         Ok(Self {
-            version: "v0.0.0-bridge".to_string(),
+            version,
             root,
             calibration_tier: crate::judgment::CalibrationTier::ProxyInternal,
             embedder_id: embedder_id.to_string(),

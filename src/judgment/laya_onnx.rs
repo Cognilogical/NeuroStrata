@@ -1,8 +1,11 @@
 /// Local Laya ONNX inference provider implementing `JudgmentProvider` for
 /// deduplication candidate judgment. Uses canonical Rust `noul` questions and a
-/// provisioned local ONNX bundle path (`allow_download = false`). CPU inference
-/// runs inside `spawn_blocking` under a semaphore; the permit is held until the
-/// blocking job ends even if the async caller times out.
+/// provisioned local ONNX bundle path (`allow_download = false`).
+///
+/// Inference is NOT implemented in this build: `load` validates the bundle
+/// and the provider reports `RuntimeState::Unavailable`, `judge_duplicates`
+/// returns an error, and `health_check` returns `Ok(false)`. No ONNX session
+/// is ever created here.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,8 +18,8 @@ use crate::judgment::{CalibrationTier, DuplicateJudgment, JudgmentProvider};
 use crate::traits::{MemoryPayload, SearchResult};
 
 /// A `JudgmentProvider` for Laya ONNX models loaded and validated by the
-/// runtime system. Inference is performed locally via ONNX Runtime with
-/// `spawn_blocking` to avoid blocking the async runtime.
+/// runtime system. In this build the provider is a validated stub: no ONNX
+/// session is created, so it reports `Unavailable` (see module docs).
 pub struct LayaOnnxProvider {
     /// Path to the validated ONNX bundle directory (manifest + checkpoint).
     bundle_root: PathBuf,
@@ -51,7 +54,10 @@ impl LayaOnnxProvider {
         Ok(Self {
             bundle_root: canonical,
             inference_semaphore: semaphore,
-            state: crate::judgment::RuntimeState::Ready,
+            // No ONNX session is created by `load` in this build, so the
+            // provider is not Ready: report Unavailable, consistent with
+            // `judge_duplicates` erroring and `health_check` returning false.
+            state: crate::judgment::RuntimeState::Unavailable,
         })
     }
 
@@ -146,7 +152,10 @@ impl LearningRuntimeManager {
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
-        RuntimeState::Ready
+        // The local Laya training runtime is not provisioned in this build.
+        // Report Unavailable honestly rather than claiming Ready (mirrors
+        // the canonical manager in `learning::runtime`).
+        RuntimeState::Unavailable
     }
 
     /// Return the local training runtime configuration.
