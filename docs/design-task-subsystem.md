@@ -342,11 +342,17 @@ print the escape hatch (`NEUROSTRATA_SKIP_GATE=1`), mirroring the existing
 
 ```bash
 #!/bin/bash
-# NeuroStrata task gate. One hook is the whole enforcement surface:
-# tasks live in LadybugDB, never in the repo, so there is nothing to
-# commit, sync, or rebuild.
-command -v neurostrata-mcp >/dev/null || exit 0
-[ -n "$NEUROSTRATA_SKIP_GATE" ] && exit 0
+# NeuroStrata task gate — scaffolded by neurostrata-bootstrap / task_setup.
+# One hook is the whole enforcement surface: tasks live in LadybugDB,
+# never in the repo, so there is nothing to commit, sync, or rebuild.
+# (Gate section of SCAFFOLDED_PRE_PUSH_HOOK in src/task/mod.rs, the one
+# text both install paths write; the shipped hook then runs any project
+# guards listed in PROJECT_GATES.)
+command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
+if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
+    echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
+    exit 0
+fi
 
 NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 neurostrata-mcp task gate "$NAMESPACE" --strict
