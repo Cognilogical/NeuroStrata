@@ -40,7 +40,10 @@ fn match_kind_priority_orders_best_first() {
     assert!(GraphMatchKind::ExactFile.priority() < GraphMatchKind::SymbolTwoHop.priority());
     assert!(GraphMatchKind::SymbolTwoHop.priority() < GraphMatchKind::AncestorDirectory.priority());
     assert!(
-        GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::MetadataFallback.priority()
+        GraphMatchKind::AncestorDirectory.priority() < GraphMatchKind::Related.priority()
+    );
+    assert!(
+        GraphMatchKind::Related.priority() < GraphMatchKind::MetadataFallback.priority()
     );
 }
 

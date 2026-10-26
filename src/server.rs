@@ -1164,6 +1164,15 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         .unwrap_or(crate::graph_read::memories_for_file::DEFAULT_LIMIT as u64)
         as usize;
 
+    // `project_root` names the worktree being read, which pins the source (and
+    // therefore the active generation) the query resolves against -- the same
+    // key ingestion derives from the directory it walks. Absent a root, the
+    // store falls back to the most recently published generation.
+    let source: Option<String> = arguments
+        .get("project_root")
+        .and_then(|p| p.as_str())
+        .map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
+
     // The graph-read capability is optional per backend: only LadybugStore
     // implements it (spec §4.6). Anything else answers `unsupported` -- never
     // an empty list, which a caller would misread as "no rules govern this".
@@ -1181,19 +1190,17 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     match store
         .memories_for_file(
             &namespace,
-            None,
+            source.as_deref(),
             path,
             symbol,
             include_ancestors,
             &memory_types,
+            &exclude_ids,
             limit,
         )
         .await
     {
-        Ok(mut hits) => {
-            if !exclude_ids.is_empty() {
-                hits.retain(|h| !exclude_ids.iter().any(|e| e == &h.id));
-            }
+        Ok(hits) => {
             serde_json::json!({
                 "memories": hits,
                 "unsupported": false,
@@ -4549,6 +4556,22 @@ mod tests {
             .await
             .expect("seed the rule");
         (store, id)
+    }
+
+    /// A backend without graph-read must answer `unsupported: true`, never an
+    /// empty list -- which a caller would misread as "no rules govern this".
+    #[tokio::test]
+    async fn unsupported_backend_returns_unsupported_true() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let arguments = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+        });
+        let text = handle_memories_for_file(arguments, store).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["unsupported"], serde_json::json!(true));
+        assert_eq!(parsed["memories"], serde_json::json!([]));
+        assert_eq!(parsed["path"], serde_json::json!("src/lib.rs"));
     }
 
     #[tokio::test]
