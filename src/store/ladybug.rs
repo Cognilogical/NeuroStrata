@@ -1237,6 +1237,9 @@ impl<'a> KnownIds<'a> {
 
     /// Finds the node a declaration means, when it does not name one exactly.
     pub fn resolve(&self, declared: &str) -> Option<String> {
+        // Trailing slashes name a directory the same way the path without
+        // one does; the ingested node id carries no trailing slash.
+        let declared = declared.trim_end_matches('/');
         // Deliberately before normalisation: an id stored with backslashes is
         // still matched by naming it exactly, as it always was.
         if self.ids.contains(declared) {
