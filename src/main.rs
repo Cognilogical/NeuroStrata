@@ -4,6 +4,11 @@
 mod attempt;
 mod buffer;
 mod config;
+// The context DTOs are shipped ahead of the service that builds plans
+// (plan Task 2 of the agent-adoption plan). Nothing constructs them yet,
+// so the dead-code lint has no honest answer to give.
+#[allow(dead_code)]
+mod context;
 mod crash;
 mod daemon;
 mod domain;
