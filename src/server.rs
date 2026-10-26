@@ -217,6 +217,28 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_related",
+                        "description": "Bounded 1-2 hop traversal of the knowledge graph from a seed node (a memory id, task id, or file path). Returns the nodes reached, the directed edges crossed (each marked with its semantic role: governance, structure, supporting, extraction), evidence paths, and a pagination cursor. RELATES_TO edges are supporting evidence only, never governance. Results are paginated (default 10, max 25 nodes) with a cursor that rechecks retirement/privacy on every page.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "id": { "type": "string", "description": "The seed node: a memory id, a task id, or a qualified file path." },
+                                "relations": { "type": "array", "items": { "type": "string" }, "description": "Relations to follow: GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM. Default all four." },
+                                "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Traversal direction. Default both." },
+                                "max_hops": { "type": "integer", "description": "Traversal depth. Default 1, max 2." },
+                                "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Optional memory-type filter for returned nodes." },
+                                "limit": { "type": "integer", "description": "Nodes per page. Default 10, max 25." },
+                                "cursor": { "type": "object", "description": "Opaque pagination cursor from a previous next_cursor.", "properties": {
+                                    "fingerprint": { "type": "string" },
+                                    "generation": { "type": "integer" },
+                                    "offset": { "type": "integer" }
+                                } }
+                            },
+                            "required": ["namespace", "id"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_supersede_memory",
                         "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced. This is the only tool on this surface that changes an existing memory.",
                         "inputSchema": {
@@ -650,6 +672,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_memories_for_file" => {
                             result_text = handle_memories_for_file(arguments, store.clone()).await;
+                        }
+                        "neurostrata_related" => {
+                            result_text = handle_related(arguments, store.clone()).await;
                         }
                         "neurostrata_supersede_memory" => {
                             result_text = handle_supersede_memory(
@@ -1212,6 +1237,103 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             "memories": [],
             "unsupported": false,
             "path": path,
+            "error": e.to_string(),
+        })
+        .to_string(),
+    }
+}
+
+/// The `neurostrata_related` handler. Returns the bounded traversal result plus
+/// `unsupported` (false for LadybugStore) and `seed` echoing the queried node,
+/// so a backend without graph-read is never mistaken for "nothing is related".
+async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => {
+            return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to read from.".to_string();
+        }
+    };
+    let seed = match arguments.get("id").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return "Missing 'id' parameter.".to_string(),
+    };
+    let namespace = resolve_namespace(&store, namespace).await;
+
+    let relations: Vec<String> = match arguments.get("relations") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let direction = crate::graph_read::related::parse_direction(
+        arguments.get("direction").and_then(|v| v.as_str()),
+    );
+    let max_hops = arguments
+        .get("max_hops")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(crate::graph_read::related::DEFAULT_MAX_HOPS as u64)
+        as usize;
+    let memory_types: Vec<String> = match arguments.get("memory_types") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(crate::graph_read::related::DEFAULT_LIMIT as u64)
+        as usize;
+    let cursor: Option<crate::graph_read::related::Cursor> = arguments
+        .get("cursor")
+        .and_then(|c| serde_json::from_value(c.clone()).ok());
+
+    let Some(store) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    else {
+        return serde_json::json!({
+            "nodes": [],
+            "edges": [],
+            "evidence": [],
+            "total": 0,
+            "truncated": false,
+            "unsupported": true,
+            "seed": seed,
+        })
+        .to_string();
+    };
+
+    match store
+        .related(
+            &namespace,
+            seed,
+            &relations,
+            direction,
+            max_hops,
+            &memory_types,
+            limit,
+            cursor.as_ref(),
+        )
+        .await
+    {
+        Ok(result) => {
+            let mut body = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("unsupported".to_string(), serde_json::json!(false));
+                obj.insert("seed".to_string(), serde_json::json!(seed));
+            }
+            body.to_string()
+        }
+        Err(e) => serde_json::json!({
+            "nodes": [],
+            "edges": [],
+            "evidence": [],
+            "total": 0,
+            "truncated": false,
+            "unsupported": false,
+            "seed": seed,
             "error": e.to_string(),
         })
         .to_string(),
@@ -6267,6 +6389,7 @@ mod tests {
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
                 "neurostrata_memories_for_file",
+                "neurostrata_related",
                 "neurostrata_supersede_memory",
                 "neurostrata_procedure_perform",
                 "neurostrata_task_create",

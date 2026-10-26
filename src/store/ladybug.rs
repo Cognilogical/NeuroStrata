@@ -3446,6 +3446,285 @@ impl GraphRead for LadybugStore {
         hits.truncate(limit);
         Ok(hits)
     }
+
+    async fn related(
+        &self,
+        namespace: &str,
+        seed: &str,
+        relations: &[String],
+        direction: crate::graph_read::related::Direction,
+        max_hops: usize,
+        memory_types: &[String],
+        limit: usize,
+        cursor: Option<&crate::graph_read::related::Cursor>,
+    ) -> Result<crate::graph_read::related::RelatedResult> {
+        let namespace = namespace.to_string();
+        let seed = seed.to_string();
+        let relations = relations.to_vec();
+        let memory_types = memory_types.to_vec();
+        let max_hops = crate::graph_read::related::clamp_max_hops(max_hops);
+        let limit = crate::graph_read::related::clamp_limit(limit);
+
+        let ns = namespace.clone();
+        let seed_c = seed.clone();
+        let rels = relations.clone();
+
+        let (nodes, edges, generation) = self
+            .with_conn(move |conn| {
+                fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops)
+            })
+            .await?;
+
+        Ok(crate::graph_read::related::graph_read_related(
+            &seed,
+            &nodes,
+            &edges,
+            &relations,
+            direction,
+            max_hops,
+            &memory_types,
+            limit,
+            generation,
+            cursor,
+        ))
+    }
+}
+
+/// How many edge rows one traversal level may fetch (bounding the Cypher read;
+/// the in-memory traversal applies the tighter `MAX_NODES`/`MAX_EDGES` budget).
+const RELATED_FETCH_LIMIT: usize = 500;
+
+/// Fetch the bounded subgraph within `max_hops` of `seed`: the seed node plus
+/// its neighbours out to the hop limit, each row-class-filtered (retired /
+/// archived / mesh-conflicting / registry / superseded generation). Returns the
+/// in-memory `NodeSpec`/`EdgeSpec` lists the pure traversal consumes, plus the
+/// active generation the cursor fingerprint must match.
+fn fetch_related_subgraph(
+    conn: &Connection,
+    namespace: &str,
+    seed: &str,
+    relations: &[String],
+    max_hops: usize,
+) -> Result<(
+    Vec<crate::graph_read::related::NodeSpec>,
+    Vec<crate::graph_read::related::EdgeSpec>,
+    u64,
+)> {
+    use crate::graph_read::related::{EdgeSpec, NodeSpec};
+
+    let safe_ns = escape_ladybug_string(namespace);
+    let now = chrono::Utc::now().timestamp();
+    let active_gens = active_generations_of(conn, namespace);
+    let generation = active_gens.iter().copied().max().unwrap_or(0);
+
+    let allowed: std::collections::HashSet<&str> = if relations.is_empty() {
+        crate::graph_read::related::DEFAULT_RELATIONS
+            .iter()
+            .copied()
+            .collect()
+    } else {
+        relations
+            .iter()
+            .map(String::as_str)
+            .filter(|r| crate::graph_read::related::is_allowed_relation(r))
+            .collect()
+    };
+
+    let to_node_spec = |id: String,
+                        memory_type: String,
+                        content: String,
+                        metadata: &Value|
+     -> NodeSpec {
+        let visible = is_active_id(&id, &active_gens)
+            && !is_archived(metadata)
+            && !is_retired_at(metadata, now)
+            && !is_mesh_conflicting(metadata)
+            && !crate::registry::is_registry_row(metadata);
+        NodeSpec {
+            id,
+            memory_type,
+            content,
+            domain: metadata
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            freshness: metadata
+                .get("verification")
+                .and_then(|v| v.get("status"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+            lifecycle: metadata
+                .get("superseded_by")
+                .and_then(|v| v.as_str())
+                .map(|_| "superseded".to_string()),
+            visible,
+        }
+    };
+
+    let mut nodes: std::collections::HashMap<String, NodeSpec> =
+        std::collections::HashMap::new();
+    let mut edges: Vec<EdgeSpec> = Vec::new();
+
+    // Resolve the seed: an exact id first (memory/task/qualified id), then a
+    // normalized path against `location` (file/symbol nodes).
+    let mut seed_id: Option<String> = None;
+    let exact_q = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.id, m.memory_type, m.content, m.metadata",
+        safe_ns,
+        escape_ladybug_string(seed)
+    );
+    let mut rows = conn.query(&exact_q)?;
+    if let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        let memory_type = format!("{}", row[1]);
+        let content = format!("{}", row[2]);
+        let metadata: Value = serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+        seed_id = Some(id.clone());
+        nodes.insert(
+            id.clone(),
+            to_node_spec(id, memory_type, content, &metadata),
+        );
+    }
+
+    if seed_id.is_none() {
+        let normalized = crate::parser::ingest::normalize_node_path(seed);
+        let loc_q = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id, m.memory_type, m.content, m.metadata ORDER BY m.memory_type ASC",
+            safe_ns,
+            escape_ladybug_string(&normalized)
+        );
+        let mut rows = conn.query(&loc_q)?;
+        // Prefer the file node over a symbol over any other row.
+        let mut candidate: Option<(String, String, String, Value)> = None;
+        while let Some(row) = rows.next() {
+            let id = format!("{}", row[0]);
+            let memory_type = format!("{}", row[1]);
+            let content = format!("{}", row[2]);
+            let metadata: Value =
+                serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+            let prefer = match (candidate.as_ref().map(|c| c.1.as_str()), memory_type.as_str()) {
+                (_, "file") => true,
+                (Some("file"), _) => false,
+                (Some("symbol"), "directory") => false,
+                _ => candidate.is_none(),
+            };
+            if prefer || candidate.is_none() {
+                candidate = Some((id, memory_type, content, metadata));
+            }
+        }
+        if let Some((id, memory_type, content, metadata)) = candidate {
+            seed_id = Some(id.clone());
+            nodes.insert(id.clone(), to_node_spec(id, memory_type, content, &metadata));
+        }
+    }
+
+    let Some(seed_id) = seed_id else {
+        return Ok((Vec::new(), Vec::new(), generation));
+    };
+
+    // BFS out to `max_hops`, fetching both orientations (the pure traversal
+    // reapplies the direction allowlist). Only same-namespace neighbours are
+    // ever read, so the traversal can never leak across namespaces.
+    let mut frontier: Vec<String> = vec![seed_id.clone()];
+    let mut seen: std::collections::HashSet<String> = [seed_id].into_iter().collect();
+
+    for _hop in 0..max_hops {
+        if frontier.is_empty() {
+            break;
+        }
+        let id_list = frontier
+            .iter()
+            .map(|id| format!("'{}'", escape_ladybug_string(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut next_frontier = Vec::new();
+
+        let out_q = format!(
+            "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' RETURN a.id, label(e), b.id, b.memory_type, b.content, b.metadata LIMIT {}",
+            id_list, safe_ns, RELATED_FETCH_LIMIT
+        );
+        {
+            let mut rows = conn.query(&out_q)?;
+            while let Some(row) = rows.next() {
+                let frontier_id = format!("{}", row[0]);
+                let relation = format!("{}", row[1]);
+                let neighbor_id = format!("{}", row[2]);
+                let neighbor_type = format!("{}", row[3]);
+                let neighbor_content = format!("{}", row[4]);
+                let neighbor_meta: Value =
+                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
+                if !allowed.contains(relation.as_str()) {
+                    continue;
+                }
+                edges.push(EdgeSpec {
+                    source: frontier_id.clone(),
+                    relation: relation.clone(),
+                    target: neighbor_id.clone(),
+                });
+                if !nodes.contains_key(&neighbor_id) {
+                    nodes.insert(
+                        neighbor_id.clone(),
+                        to_node_spec(
+                            neighbor_id.clone(),
+                            neighbor_type,
+                            neighbor_content,
+                            &neighbor_meta,
+                        ),
+                    );
+                }
+                if !seen.contains(&neighbor_id) {
+                    seen.insert(neighbor_id.clone());
+                    next_frontier.push(neighbor_id);
+                }
+            }
+        }
+
+        let in_q = format!(
+            "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' RETURN a.id, label(e), b.id, b.memory_type, b.content, b.metadata LIMIT {}",
+            id_list, safe_ns, RELATED_FETCH_LIMIT
+        );
+        {
+            let mut rows = conn.query(&in_q)?;
+            while let Some(row) = rows.next() {
+                let frontier_id = format!("{}", row[0]);
+                let relation = format!("{}", row[1]);
+                let neighbor_id = format!("{}", row[2]);
+                let neighbor_type = format!("{}", row[3]);
+                let neighbor_content = format!("{}", row[4]);
+                let neighbor_meta: Value =
+                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
+                if !allowed.contains(relation.as_str()) {
+                    continue;
+                }
+                edges.push(EdgeSpec {
+                    source: neighbor_id.clone(),
+                    relation: relation.clone(),
+                    target: frontier_id.clone(),
+                });
+                if !nodes.contains_key(&neighbor_id) {
+                    nodes.insert(
+                        neighbor_id.clone(),
+                        to_node_spec(
+                            neighbor_id.clone(),
+                            neighbor_type,
+                            neighbor_content,
+                            &neighbor_meta,
+                        ),
+                    );
+                }
+                if !seen.contains(&neighbor_id) {
+                    seen.insert(neighbor_id.clone());
+                    next_frontier.push(neighbor_id);
+                }
+            }
+        }
+
+        frontier = next_frontier;
+    }
+
+    let nodes: Vec<NodeSpec> = nodes.into_values().collect();
+    Ok((nodes, edges, generation))
 }
 
 /// IntakeStore implementation for LadybugStore (PQTH durable intake ledger).
@@ -5012,6 +5291,73 @@ eurostrata\src\daemon.rs",
             .expect("the related memory surfaces: {:?}");
         assert_eq!(hit.match_kind, GraphMatchKind::Related);
         assert!(hit.explanation.contains("relates to"));
+    }
+
+    /// The `related` traversal reaches a depth-2 neighbour through a real
+    /// `RELATES_TO` chain, marks every crossed edge `Supporting` (never
+    /// `Governance`), and starts from the seed's exact id.
+    #[tokio::test]
+    async fn related_traverses_a_depth_two_relates_to_chain() {
+        let store = retired_test_store().await;
+        let zero = vec![0.0f32; 4];
+
+        // Targets first: the write-shape validator refuses edges whose target
+        // row does not exist yet.
+        store
+            .upsert("probe", "deep", zero.clone(), retired_test_payload("fact", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "mid",
+                zero.clone(),
+                retired_test_payload("fact", "agent", json!({ "related_to": ["deep"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "seed",
+                zero,
+                retired_test_payload("rule", "agent", json!({ "related_to": ["mid"] })),
+            )
+            .await
+            .unwrap();
+
+        let result = store
+            .related(
+                "probe",
+                "seed",
+                &[],
+                crate::graph_read::related::Direction::Both,
+                2,
+                &[],
+                25,
+                None,
+            )
+            .await
+            .expect("related traversal succeeds");
+
+        let ids: Vec<&str> = result.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["seed", "mid", "deep"]);
+        assert_eq!(result.total, 3);
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|e| e.role == crate::graph_read::related::EdgeRole::Supporting),
+            "RELATES_TO edges are supporting, never governance: {:?}",
+            result.edges
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|e| e.source == "mid" && e.target == "deep"),
+            "the depth-2 hop is present as an edge"
+        );
     }
 
     /// A stub materialised for an unindexed file is retired once the real node

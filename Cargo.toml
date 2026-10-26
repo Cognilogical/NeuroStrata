@@ -28,6 +28,12 @@ path = "tests/ingest/staged_publication_test.rs"
 name = "memories_for_file_test"
 path = "tests/graph_read/memories_for_file_test.rs"
 
+# Task 4: bounded `related` traversal contract. Compiles the crate-free
+# graph_read::related module from its real path (see the file's module comment).
+[[test]]
+name = "related_test"
+path = "tests/graph_read/related_test.rs"
+
 [dependencies]
 tokio = { version = "1.53", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

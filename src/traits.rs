@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub use crate::graph_read::memories_for_file::{GraphMatchKind, MemoryHit};
+pub use crate::graph_read::related::{
+    Cursor as RelatedCursor, Direction as RelatedDirection, RelatedResult,
+};
 
 /// Trait for downcasting VectorStore to concrete implementations.
 pub trait AsAny {
@@ -451,6 +454,24 @@ pub trait GraphRead: Send + Sync {
         exclude_ids: &[String],
         limit: usize,
     ) -> Result<Vec<MemoryHit>>;
+
+    /// Bounded 1–2 hop traversal from a seed node (spec §4.2). `relations`
+    /// empty means all four; `direction` controls orientation; `max_hops` is
+    /// clamped to `[1, 2]`; `memory_types` empty means no type filter; `limit`
+    /// is clamped to `[1, MAX_LIMIT]`. `cursor` resumes a page only when its
+    /// fingerprint and generation still match the current query and store, so
+    /// retirement/privacy are rechecked on every page.
+    async fn related(
+        &self,
+        namespace: &str,
+        seed: &str,
+        relations: &[String],
+        direction: RelatedDirection,
+        max_hops: usize,
+        memory_types: &[String],
+        limit: usize,
+        cursor: Option<&RelatedCursor>,
+    ) -> Result<RelatedResult>;
 }
 
 /// Trait for durable task intake ledger operations (PQTH).
