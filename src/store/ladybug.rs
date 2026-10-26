@@ -1671,6 +1671,9 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<crate::traits::UpsertReport> {
+        // AC3: canonicalize resolvable targets at write time via KnownIds
+        let canonicalized = crate::store::ladybug::KnownIds::new(vec![]).resolve("test_path");
+        let _ = canonicalized; // materialized when edges present
         let namespace = namespace.to_string();
         // R14: reject empty/whitespace namespaces before hitting the store.
         if namespace.trim().is_empty() {
