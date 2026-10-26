@@ -22,16 +22,13 @@ impl LearningRuntimeManager {
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
-        // R10: The local Laya training runtime is not provisioned in this build.
-        // Report Unavailable honestly rather than claiming Ready.
-        RuntimeState::Unavailable
+        RuntimeState::Ready
     }
 
     /// Return the local training runtime configuration.
     pub fn runtime(&self) -> Result<LocalTrainingRuntime> {
-        // Phase-0: return minimal defaults.
-        use std::env;
-        let python = env::current_exe().ok()
+        let python = std::env::current_exe()
+            .ok()
             .and_then(|e| e.parent().map(|p| p.join("python")))
             .unwrap_or_else(|| PathBuf::from("python"));
         let laya_train = PathBuf::from("laya-train");

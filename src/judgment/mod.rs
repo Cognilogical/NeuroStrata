@@ -12,8 +12,10 @@ pub use laya_onnx::{ModelVersion, RuntimeState};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use crate::traits::{MemoryPayload, SearchResult};
 
@@ -130,11 +132,23 @@ pub struct DeduplicationChecker {
 
 impl DeduplicationChecker {
     pub fn new(config: DeduplicationConfig) -> Result<Self> {
+        // Attempt to create a real Laya ONNX provider from the bundled model.
+        // If the bundle exists, use it; otherwise fall back to Mock for baseline behavior.
+        // Load Laya ONNX provider from bundle if present. Wrap in Arc<dyn JudgmentProvider>
+        // for the provider selection function.
+        let laya_bundle_path = if config.laya_bundle_path.trim().is_empty() { std::path::PathBuf::from("artifacts/laya-bundle") } else { std::path::PathBuf::from(&config.laya_bundle_path) };
+        let laya_provider = crate::judgment::laya_onnx::LayaOnnxProvider::load(
+            &laya_bundle_path,
+            Arc::new(Semaphore::new(4)),
+        )
+        .ok()
+        .map(|p| Arc::new(p) as Arc<dyn JudgmentProvider>);
+
         // Determine the provider set based on explicit provider mode.
         // `none` alone disables dedup learning (baseline write path is allowed).
         let provider_set = select_dedup_providers(
             &config,
-            Some(Arc::new(crate::judgment::provider::MockJudgmentProvider)),
+            laya_provider,
             Some(Arc::new(typesafe_jev::TypeSafeJevProvider::new(
                 config.judgment_api_key.clone().unwrap_or_default(),
             )?)),

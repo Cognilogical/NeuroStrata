@@ -90,16 +90,26 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 - **Comments:** Add comments sparingly, focusing on *why* rather than *what*. Never talk to the user through code comments.
 - **Paths:** Always use absolute paths when using file system tools.
 
-## 9. No Deferrals (owner ruling, 2026-10-21)
-- **NEVER defer.** No spec, brief, plan, or task may contain a "deferred" bucket, an
-  "out of scope / revisit later" clause, or an open question parked for "observation data".
-- **Every open item is exactly one of:** (a) decided inside the artifact being written, or
-  (b) filed as a tracked task with an owner and a concrete next action, and named in that
-  artifact.
-- **"We will know later" is not an answer.** When a mechanism would only pay off with more
-  usage, instrument it and name the metric in the spec — do not postpone the mechanism.
-- **Close the whole set.** A spec that defers items hands the next spec a closed list to
-  resolve; a deferral never rolls forward unmentioned.
+## 0. The Prime Directive: Never Defer Anything (Ruling 2026-10-25)
+- **This is the highest-priority rule.** No task, feature, or implementation may be
+  left in a "deferred", "todo", "stub", "phase-2", or "later" state. If it cannot be
+  completed in the current session, it must be filed as a concrete tracked task with
+  an owner, description, and next action — and the current work must not proceed until
+  the deferred item is resolved or explicitly, formally retired.
+- **If you are about to leave something unfinished, STOP.** The work is not done until
+  `neurostrata_task_complete` succeeds and the task gate passes (Lock 2). There are no
+  "we'll come back to this" exits.
+- **Every open item is exactly one of:** (a) completed and committed to `git`, or
+  (b) a tracked task with assignee + deadline, named on a task row, with blockers
+  documented. Nothing else survives past this session.
+- **"We will know later" is not an answer.** If a mechanism would only pay off with
+  more usage, instrument it and name the metric — do not postpone the mechanism.
+  Any incomplete implementation must be extracted as a memory before this session
+  ends, or filed as a tracked task.
+- **Prior compliance failures.** The Laya `judge_duplicates` stub (error "not available"),
+  the training loop (`train_candidate` error), and the `ensure_ready` → `Unavailable`
+  state are all violations of this directive. They must be resolved or formally retired
+  with extracted memory before this session claims completion.
 
 <!-- lean-ctx-compression -->
 OUTPUT STYLE: expert-terse

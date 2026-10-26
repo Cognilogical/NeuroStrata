@@ -3746,6 +3746,7 @@ mod tests {
                 cb_failure_threshold: 3,
                 cb_backoff_initial_seconds: 1,
                 cb_backoff_max_seconds: 60,
+                laya_bundle_path: "artifacts/laya-bundle".to_string(),
             };
             let _ = &mut cfg;
             let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
@@ -3802,6 +3803,7 @@ mod tests {
                 max_candidates: 5,
                 cb_failure_threshold: 3,
                 cb_backoff_initial_seconds: 1,
+                laya_bundle_path: "artifacts/laya-bundle".to_string(),
                 cb_backoff_max_seconds: 60,
             };
             let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
@@ -3870,6 +3872,7 @@ mod tests {
                 confidence_threshold: 0.5,
                 max_candidates: 5,
                 cb_failure_threshold: 3,
+                laya_bundle_path: "artifacts/laya-bundle".to_string(),
                 cb_backoff_initial_seconds: 1,
                 cb_backoff_max_seconds: 60,
             };

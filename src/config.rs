@@ -31,6 +31,8 @@ pub struct DeduplicationConfig {
     pub confidence_threshold: f32,
     #[serde(default = "default_max_candidates")]
     pub max_candidates: usize,
+    #[serde(default = "default_laya_bundle_path")]
+    pub laya_bundle_path: String,
     #[serde(default = "default_cb_failure_threshold")]
     pub cb_failure_threshold: u32,
     #[serde(default = "default_cb_backoff_initial")]
@@ -42,6 +44,7 @@ pub struct DeduplicationConfig {
 fn default_timeout() -> u64 { 5 }
 fn default_similarity_threshold() -> f32 { 0.85 }
 fn default_confidence_threshold() -> f32 { 0.8 }
+fn default_laya_bundle_path() -> String { "artifacts/laya-bundle".to_string() }
 fn default_max_candidates() -> usize { 5 }
 fn default_cb_failure_threshold() -> u32 { 3 }
 fn default_cb_backoff_initial() -> u64 { 30 }
@@ -61,6 +64,7 @@ impl Default for DeduplicationConfig {
             similarity_threshold: default_similarity_threshold(),
             confidence_threshold: default_confidence_threshold(),
             max_candidates: default_max_candidates(),
+            laya_bundle_path: default_laya_bundle_path(),
             cb_failure_threshold: default_cb_failure_threshold(),
             cb_backoff_initial_seconds: default_cb_backoff_initial(),
             cb_backoff_max_seconds: default_cb_backoff_max(),

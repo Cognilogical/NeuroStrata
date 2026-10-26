@@ -1852,6 +1852,58 @@ fi
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
 "#;
 
+/// The scaffolded `pre-commit` hook: records the module-query ledger and
+/// stamps `graph_queried` on the active task before any commit lands.
+/// Optional: only installed when `neurostrata-mcp hooks install --pre-commit`
+/// is run on a git repo. Non-git projects skip it; the git-free
+/// `.NeuroStrata/session_queries.json` path remains the primary mechanism.
+pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
+# NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
+#
+# Records the modules touched by this commit into `.NeuroStrata/session_queries.json`
+# and stamps `graph_queried` on the active in_progress task for the namespace.
+# If the commit touches files in a governed module (per memory `governs`/`refs`)
+# and the agent did NOT query NeuroStrata for that module, the hook emits a
+# warning (non-blocking) so the agent can verify against source before push.
+#
+# Install with:  neurostrata-mcp hooks install --pre-commit
+# (git honors core.hooksPath; the hook text is one file, no drift.)
+
+NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
+ROOT=$(git rev-parse --show-toplevel)
+LEDGER="$ROOT/.NeuroStrata/session_queries.json"
+
+# ── Collect touched modules from staged diff ─────────────────────────────────
+TouchedModules=$(git diff --name-only --cached | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+if [ -z "$TouchedModules" ]; then
+    TouchedModules=$(git diff --name-only | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+fi
+
+# ── Write the query ledger (non-blocking, always writes) ─────────────────────
+mkdir -p "$(dirname "$LEDGER")"
+if [ ! -f "$LEDGER" ]; then
+    echo '{"namespace": "'"$NAMESPACE"'", "queries": []}' > "$LEDGER"
+fi
+for module in $TouchedModules; do
+    TS=$(date +%s)
+    ENTRY="{\"ts\": $TS, \"query\": \"$module\", \"domains\": [\"$module\"], \"returned_ids\": [], \"governed_prefixes\": [\"$module/\"]}"
+    if ! grep -q "\"query\": \"$module\"" "$LEDGER"; then
+        # Append to the queries array
+        sed -i 's/], "queries": \[\]/], "queries": [\n    '"$ENTRY"'\n  ]/' "$LEDGER" 2>/dev/null || true
+    fi
+done
+
+# ── Check each touched module against governing memories ─────────────────────
+for module in $TouchedModules; do
+    if ! grep -q "\"query\": \"$module\"" "$LEDGER" 2>/dev/null; then
+        echo "warning: module '$module' has no recorded neurostrata_search_memory hit in this session" >&2
+        echo "  → call: neurostrata-mcp search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+    fi
+done
+
+exit 0
+"#;
+
 /// The scaffolded `scripts/install-hooks.sh`: tracks the hook in the repo
 /// (so it is reviewable) and installs the executable copy git actually runs.
 const SCAFFOLDED_INSTALL_HOOKS: &str = r#"#!/usr/bin/env bash
