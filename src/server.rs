@@ -157,7 +157,9 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'." },
-                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain slug(s) to surface in the domain strap, regardless of access_count." }
+                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain slug(s) to surface in the domain strap, regardless of access_count." },
+                                "project_root": { "type": "string", "description": "Optional absolute path to the project root. Used for git-hook hygiene and cached in the registry row." },
+                                "include_archived": { "type": "boolean", "description": "Include archived/tombstoned rows in the snapshot (audit escape hatch)." }
                             },
                             "required": ["namespace"]
                         }
@@ -1765,6 +1767,34 @@ async fn handle_get_snapshot(
         .ok_or_else(|| "Missing 'namespace' parameter.".to_string())?;
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
+
+    // project_root: prefer explicit arg, fall back to cached registry value.
+    let project_root_arg = arguments
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let cached_root = if project_root_arg.is_none() {
+        let rid = crate::registry::registry_row_id(namespace);
+        store
+            .get(namespace, &rid)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(_, p)| {
+                p.metadata
+                    .get("project_root")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    } else {
+        None
+    };
+    let project_root = project_root_arg.clone().or(cached_root);
+
+    // Cache an explicitly-provided project_root into the registry row (best-effort).
+    if let Some(pr) = &project_root_arg {
+        crate::registry::cache_project_root(&store, None, namespace, pr).await;
+    }
 
     let mut all_memories = store
         .list(namespace, None, None)
