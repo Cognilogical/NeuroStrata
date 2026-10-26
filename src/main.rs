@@ -25,6 +25,7 @@ mod parser;
 mod recall_metrics;
 mod receipts;
 mod registry;
+mod search;
 mod secrets;
 mod server;
 mod setup;
