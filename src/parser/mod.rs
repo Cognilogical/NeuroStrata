@@ -1,3 +1,4 @@
+pub mod generation;
 pub mod ingest;
 pub mod schema;
 

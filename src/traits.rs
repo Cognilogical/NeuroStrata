@@ -286,6 +286,44 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// until something replays them (bead neurostrata-sij).
     async fn relink_edges(&self, namespace: &str) -> Result<usize>;
 
+    /// Begin a staged ingestion: allocate a fresh generation for this namespace
+    /// and return it. Nodes written against it are invisible to edge resolution
+    /// until `publish_generation` flips the active pointer onto it.
+    ///
+    /// Default `0` = a store without staged ingestion publishes as it writes.
+    async fn begin_generation(&self, _namespace: &str) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Atomically make `generation` the active generation for `namespace`. The
+    /// previous active generation's nodes remain as history, unreachable through
+    /// edge resolution.
+    async fn publish_generation(&self, _namespace: &str, _generation: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Discard a staged generation's nodes, leaving the previous active
+    /// generation untouched. Used when a build fails midway so a half-built
+    /// tree never becomes visible.
+    async fn abort_generation(&self, _namespace: &str, _generation: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// The generation currently active for `namespace` (`0` = none published).
+    async fn active_generation(&self, _namespace: &str) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// The ids of every node in `generation`. A storage-level primitive for
+    /// generation-scoped filtering and tests; the default returns nothing.
+    async fn generation_nodes(
+        &self,
+        _namespace: &str,
+        _generation: u64,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// List all memories, optionally filtered by user_id and/or memory_type.
     /// Pushing filters into the query (rather than filtering in Rust) avoids
     /// deserialising every row in large namespaces (R15).
