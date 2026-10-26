@@ -247,6 +247,19 @@ enum Commands {
         metadata: String,
     },
 
+    /// Normalize declared edge targets to qualified ids where they resolve
+    ///
+    /// For every non-ingested memory in the namespace, rewrites each target in
+    /// `related_to`, `contained_by`, `governs` and `extracted_from` to the
+    /// qualified id it resolves to (when resolution is unambiguous). Uses the
+    /// existing vector, so no re-embedding. Ingested nodes and code-node ids
+    /// are never touched. Run with the daemon stopped.
+    #[command(name = "normalize-metadata")]
+    NormalizeMetadata {
+        /// The exact project name
+        namespace: String,
+    },
+
     /// Task subsystem: the gate behind the pre-push hook (section 5)
     Task {
         #[command(subcommand)]
@@ -3433,6 +3446,67 @@ async fn run() -> anyhow::Result<()> {
                             .await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
+                    }
+                    Commands::NormalizeMetadata { namespace } => {
+                        use crate::store::ladybug::KnownIds;
+                        let all = vector_store.list(&namespace, None, None).await?;
+                        let ingested_ids: Vec<String> = all
+                            .iter()
+                            .filter(|m| m.payload.user_id == "auto-ingestor")
+                            .map(|m| m.id.clone())
+                            .collect();
+                        let known = KnownIds::new(ingested_ids.iter().map(|s| s.as_str()));
+                        let mut scanned = 0usize;
+                        let mut updated = 0usize;
+                        let mut skipped = 0usize;
+                        for mem in &all {
+                            if mem.payload.user_id == "auto-ingestor"
+                                || mem.id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                            {
+                                skipped += 1;
+                                continue;
+                            }
+                            scanned += 1;
+                            let (vector, mut payload) = match vector_store.get(&namespace, &mem.id).await? {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let mut metadata = payload.metadata.clone();
+                            if !metadata.is_object() {
+                                continue;
+                            }
+                            let mut changed = false;
+                            for key in ["related_to", "contained_by", "governs", "extracted_from"] {
+                                if let Some(arr) = metadata.get(key).and_then(|v| v.as_array()).cloned() {
+                                    let mut new_arr = Vec::with_capacity(arr.len());
+                                    for item in arr {
+                                        if let Some(s) = item.as_str() {
+                                            if let Some(resolved) = known.resolve(s) {
+                                                if resolved != s {
+                                                    new_arr.push(serde_json::Value::String(resolved));
+                                                    changed = true;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        new_arr.push(item);
+                                    }
+                                    if changed {
+                                        metadata[key] = serde_json::Value::Array(new_arr);
+                                    }
+                                }
+                            }
+                            if !changed {
+                                continue;
+                            }
+                            payload.metadata = metadata;
+                            vector_store.upsert(&namespace, &mem.id, vector, payload).await?;
+                            updated += 1;
+                        }
+                        println!(
+                            "Scanned {} memories, updated {} ({} skipped as ingested/code nodes).",
+                            scanned, updated, skipped
+                        );
                     }
                     Commands::Delete { namespace, id } => {
                         vector_store.delete(&namespace, &id).await?;
