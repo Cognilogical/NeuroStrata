@@ -253,10 +253,19 @@ fn run_producer(
 
         let node_path = node_id_for(&dir_path, path);
 
-        let parent_id = if let Some(p) = path.parent() {
-            let p_str = node_id_for(&dir_path, p);
-            if p_str != "." && p_str != "" && p_str != node_path {
-                Some(p_str)
+        let parent_id = if path == dir_path {
+            None
+        } else if let Some(p) = path.parent() {
+            // Only adopt a parent that actually lives inside the ingest root;
+            // otherwise a root-level ingest leaks an absolute-path parent id
+            // (e.g. "NeuroStrata::/home/kenton/Documents") that matches no node.
+            if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
+                let p_str = node_id_for(&dir_path, p);
+                if p_str != "." && p_str != "" && p_str != node_path {
+                    Some(p_str)
+                } else {
+                    None
+                }
             } else {
                 None
             }
