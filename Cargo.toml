@@ -14,6 +14,13 @@ path = "src/main.rs"
 name = "context_model_test"
 path = "tests/context/model_test.rs"
 
+# Task 5: source/generation-scoped staged ingestion contract. Compiles the
+# id/hash helpers from their real path (see the file's module comment) because
+# the crate ships a binary target only.
+[[test]]
+name = "staged_publication_test"
+path = "tests/ingest/staged_publication_test.rs"
+
 [dependencies]
 tokio = { version = "1.53", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

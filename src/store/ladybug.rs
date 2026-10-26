@@ -1185,6 +1185,24 @@ fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
     Ok(rows.next().is_some())
 }
 
+/// The generation currently active for a namespace, read on the given
+/// connection (`0` = none published). A query that cannot run reports `0`
+/// rather than failing: resolution degrades to "no generation" instead of
+/// erroring out of a write it is only trying to guide.
+fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    match conn.query(&query) {
+        Ok(mut rows) => match rows.next() {
+            Some(row) => format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64,
+            None => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
 /// The ids a namespace actually holds, indexed so a declaration can be resolved
 /// without scanning them.
 ///
@@ -1209,26 +1227,58 @@ pub struct KnownIds<'a> {
 }
 
 impl<'a> KnownIds<'a> {
+    /// Index every id. A bare path is reachable exactly as-is; a qualified or
+    /// generation-scoped id is reachable by its logical path. No generation
+    /// filter: used by tests and by callers that have already narrowed the set.
     pub fn new(ids: impl IntoIterator<Item = &'a str>) -> Self {
-        let ids: std::collections::HashSet<&'a str> =
-            ids.into_iter().filter(|id| !id.is_empty()).collect();
+        Self::build(ids, None)
+    }
 
+    /// Index only the active generation's nodes. A generation-scoped id whose
+    /// generation is not `active_gen` is left out, and so is any id that is not
+    /// generation-scoped at all (a rule/task UUID, or a pre-generation
+    /// qualified id) -- only the published generation is reachable.
+    pub fn active(ids: impl IntoIterator<Item = &'a str>, active_gen: u64) -> Self {
+        Self::build(ids, Some(active_gen))
+    }
+
+    fn build(ids: impl IntoIterator<Item = &'a str>, active_gen: Option<u64>) -> Self {
+        let mut id_set: std::collections::HashSet<&'a str> =
+            std::collections::HashSet::new();
         let mut by_path: std::collections::HashMap<&'a str, Option<&'a str>> =
             std::collections::HashMap::new();
-        for id in &ids {
-            if let Some(cut) = id.find(crate::parser::ingest::NAMESPACE_SEPARATOR) {
-                let path = &id[cut + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
-                if path.is_empty() {
-                    continue;
+
+        for id in ids.into_iter().filter(|id| !id.is_empty()) {
+            if let Some(active) = active_gen {
+                match crate::parser::ingest::split_scoped_id(id) {
+                    Some((_, gen, _)) => {
+                        if gen != active {
+                            continue; // a stale generation is not reachable
+                        }
+                    }
+                    // Not generation-scoped: not part of any active generation.
+                    None => continue,
                 }
-                by_path
-                    .entry(path)
-                    .and_modify(|slot| *slot = None)
-                    .or_insert(Some(id));
+            }
+
+            id_set.insert(id);
+            // Only namespace- (or generation-) scoped ids are indexed by their
+            // logical path; a bare id stays reachable exactly as-is.
+            if id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                let path = crate::parser::ingest::logical_path_of(id);
+                if !path.is_empty() {
+                    by_path
+                        .entry(path)
+                        .and_modify(|slot| *slot = None)
+                        .or_insert(Some(id));
+                }
             }
         }
 
-        Self { ids, by_path }
+        Self {
+            ids: id_set,
+            by_path,
+        }
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -1518,6 +1568,13 @@ impl VectorStore for LadybugStore {
             // PQTH: Intake candidates table (operational, not memory rows)
             let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version LONG, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
             conn.query(create_candidates_table).ok();
+
+            // Source-scoped staged ingestion: the generation pointer per
+            // namespace. id = namespace (primary key), `counter` allocates the
+            // next generation, `active_generation` names the published one
+            // (0 = none). The pointer flip is the atomic publish step.
+            let create_generation_table = "CREATE NODE TABLE IngestGeneration (id STRING, namespace STRING, active_generation INT64, counter INT64, PRIMARY KEY (id))";
+            conn.query(create_generation_table).ok();
 
             Ok(())
         })
@@ -2154,12 +2211,15 @@ impl VectorStore for LadybugStore {
         // only the edges themselves are lost with the nodes. Replaying them is
         // therefore a read of what is already stored, not a guess.
         let memories = self.list(namespace, None, None).await?;
+        let active_gen = self.active_generation(namespace).await?;
 
         // Ids stored before node ids became repository-relative are absolute, so
         // a rule written to match them declares C:/proj/src/foo.rs and matches
         // nothing now. Resolve those by path suffix against the ids that do
-        // exist, and leave an ambiguous suffix alone rather than guess.
-        let known = KnownIds::new(memories.iter().map(|m| m.id.as_str()));
+        // exist, and leave an ambiguous suffix alone rather than guess. Only the
+        // active generation's nodes are reachable: a rule always re-attaches to
+        // the published tree, never to a superseded one.
+        let known = KnownIds::active(memories.iter().map(|m| m.id.as_str()), active_gen);
 
         // Grouped by relationship because the type is part of the statement and
         // cannot be a value in it: three groups, so three statements, whatever
@@ -2235,6 +2295,94 @@ impl VectorStore for LadybugStore {
             let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.user_id = 'auto-ingestor' DETACH DELETE m", safe_ns);
             conn.query(&query)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn begin_generation(&self, namespace: &str) -> Result<u64> {
+        let namespace = namespace.to_string();
+        self.write_with_deadline("beginning a staging generation", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+
+            // Read the current counter (default 0), then write counter + 1 in
+            // the same write turn. The single-writer lock serialises this
+            // against every other store write, so the read and the bump are one
+            // atomic step and no two begins hand out the same generation.
+            let read = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.counter",
+                safe_ns
+            );
+            let mut current: i64 = 0;
+            if let Ok(mut rows) = conn.query(&read) {
+                if let Some(row) = rows.next() {
+                    current = format!("{}", row[0]).parse::<i64>().unwrap_or(0);
+                }
+            }
+            let next = (current.max(0) as u64).saturating_add(1);
+
+            let write = format!(
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.counter = {}, g.active_generation = 0 ON MATCH SET g.counter = {}",
+                safe_ns, safe_ns, next, next
+            );
+            conn.query(&write)?;
+            Ok(next)
+        })
+        .await
+    }
+
+    async fn publish_generation(&self, namespace: &str, generation: u64) -> Result<()> {
+        let namespace = namespace.to_string();
+        self.write_with_deadline("publishing a staging generation", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            // The flip is one statement: the active pointer moves to `generation`
+            // and the previous generation's rows stay as history.
+            let write = format!(
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.counter = {}, g.active_generation = {} ON MATCH SET g.active_generation = {}",
+                safe_ns, safe_ns, generation, generation, generation
+            );
+            conn.query(&write)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn abort_generation(&self, namespace: &str, generation: u64) -> Result<()> {
+        let namespace = namespace.to_string();
+        self.write_with_deadline("aborting a staging generation", move |conn| {
+            // A staged node's id is `ns::<generation>::<path>`, so every row of
+            // this generation shares the prefix. Nothing else matches it, and
+            // the previous generation is untouched.
+            let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' DETACH DELETE m",
+                escape_ladybug_string(&prefix)
+            );
+            conn.query(&query)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn active_generation(&self, namespace: &str) -> Result<u64> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| Ok(active_generation_of(conn, &namespace)))
+            .await
+    }
+
+    async fn generation_nodes(&self, namespace: &str, generation: u64) -> Result<Vec<String>> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' RETURN m.id",
+                escape_ladybug_string(&prefix)
+            );
+            let mut rows = conn.query(&query)?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next() {
+                ids.push(format!("{}", row[0]));
+            }
+            Ok(ids)
         })
         .await
     }
@@ -3205,31 +3353,42 @@ fn is_retired_at(metadata: &Value, now: i64) -> bool {
 }
 
 /// The ids a declared edge target could stand for when it is not already a
-/// qualified id: the declaration qualified by the memory's own namespace, and
-/// every separator-anchored suffix of it, bare and qualified. A suffix is how a
+/// qualified id: the declaration generation-scoped into the active generation,
+/// and every separator-anchored suffix of it, bare and scoped. A suffix is how a
 /// legacy absolute path finds the file it meant.
-fn declared_target_candidates(namespace: &str, declared: &str) -> Vec<String> {
+fn declared_target_candidates(namespace: &str, active_gen: u64, declared: &str) -> Vec<String> {
     let declared = declared.replace('\\', "/");
-    let mut candidates = vec![crate::parser::ingest::qualified_id(namespace, &declared)];
+    let mut candidates =
+        vec![crate::parser::ingest::generation_scoped_id(namespace, active_gen, &declared)];
     for (cut, _) in declared.match_indices('/') {
         let suffix = &declared[cut + 1..];
         if !suffix.is_empty() {
             candidates.push(suffix.to_string());
-            candidates.push(crate::parser::ingest::qualified_id(namespace, suffix));
+            candidates.push(crate::parser::ingest::generation_scoped_id(
+                namespace,
+                active_gen,
+                suffix,
+            ));
         }
     }
     candidates
 }
 
-/// Chooses among the ids that exist: the memory's own namespace first, then the
-/// id exactly as declared, then a suffix -- but only one. An ambiguous suffix
-/// produces no edge, because a wrong edge is worse than a missing one.
+/// Chooses among the ids that exist: the memory's own namespace first (in the
+/// active generation), then the id exactly as declared, then a suffix -- but
+/// only one. An ambiguous suffix produces no edge, because a wrong edge is
+/// worse than a missing one.
 fn pick_declared_target(
     namespace: &str,
+    active_gen: u64,
     declared: &str,
     found: &[String],
 ) -> crate::traits::TargetResolution {
-    let qualified = crate::parser::ingest::qualified_id(namespace, &declared.replace('\\', "/"));
+    let qualified = crate::parser::ingest::generation_scoped_id(
+        namespace,
+        active_gen,
+        &declared.replace('\\', "/"),
+    );
     if found.iter().any(|id| *id == qualified) {
         return crate::traits::TargetResolution::Resolved(qualified);
     }
@@ -3251,14 +3410,16 @@ fn pick_declared_target(
 /// Resolves a declared edge target while a memory is being written, in one read.
 ///
 /// The exact id stays unscoped, as edges always have been; everything inferred
-/// from it is confined to the memory's own namespace, so a bare `src/lib.rs`
-/// cannot land on another project's file.
+/// from it is confined to the memory's own namespace in the *active* generation,
+/// so a bare `src/lib.rs` lands on this project's published tree and never on
+/// another project's file or a superseded generation.
 fn resolve_target_on_write(
     conn: &Connection,
     namespace: &str,
     declared: &str,
 ) -> crate::traits::TargetResolution {
-    let candidates = declared_target_candidates(namespace, declared)
+    let active_gen = active_generation_of(conn, namespace);
+    let candidates = declared_target_candidates(namespace, active_gen, declared)
         .iter()
         .map(|c| format!("'{}'", escape_ladybug_string(c)))
         .collect::<Vec<_>>()
@@ -3277,7 +3438,7 @@ fn resolve_target_on_write(
     while let Some(row) = rows.next() {
         found.push(format!("{}", row[0]));
     }
-    pick_declared_target(namespace, declared, &found)
+    pick_declared_target(namespace, active_gen, declared, &found)
 }
 
 /// Fails a future that outstays its deadline, with a message that says what was
@@ -3901,32 +4062,37 @@ eurostrata\src\daemon.rs",
 
     #[test]
     fn a_declaration_prefers_its_own_namespace_then_its_exact_id_then_one_suffix() {
-        let both = vec!["probe::src/a.rs".to_string(), "src/a.rs".to_string()];
+        // Generation 5 is active; the qualified form is now generation-scoped.
+        let scoped = crate::parser::ingest::generation_scoped_id("probe", 5, "src/a.rs");
+        let both = vec![scoped.clone(), "src/a.rs".to_string()];
         assert!(matches!(
-            pick_declared_target("probe", "src/a.rs", &both),
-            crate::traits::TargetResolution::Resolved(ref id) if id == "probe::src/a.rs"
+            pick_declared_target("probe", 5, "src/a.rs", &both),
+            crate::traits::TargetResolution::Resolved(ref id) if *id == scoped
         ));
         assert!(matches!(
-            pick_declared_target("probe", "src/a.rs", &["src/a.rs".to_string()]),
+            pick_declared_target("probe", 5, "src/a.rs", &["src/a.rs".to_string()]),
             crate::traits::TargetResolution::Resolved(ref id) if id == "src/a.rs"
         ));
         assert!(matches!(
-            pick_declared_target("probe", "C:/old/src/a.rs", &["probe::src/a.rs".to_string()]),
-            crate::traits::TargetResolution::Resolved(ref id) if id == "probe::src/a.rs"
+            pick_declared_target("probe", 5, "C:/old/src/a.rs", &[scoped.clone()]),
+            crate::traits::TargetResolution::Resolved(ref id) if *id == scoped
         ));
         assert!(
             matches!(
                 pick_declared_target(
                     "probe",
+                    5,
                     "C:/old/src/a.rs",
-                    &["probe::src/a.rs".to_string(), "probe::a.rs".to_string()]
+                    &[
+                        scoped.clone(),
+                        crate::parser::ingest::generation_scoped_id("probe", 5, "a.rs"),
+                    ]
                 ),
                 crate::traits::TargetResolution::Ambiguous(_)
             ),
             "an ambiguous suffix is left alone"
         );
-        assert!(declared_target_candidates("probe", "C:/old/src/a.rs")
-            .contains(&"probe::src/a.rs".to_string()));
+        assert!(declared_target_candidates("probe", 5, "C:/old/src/a.rs").contains(&scoped));
     }
 
     #[tokio::test]
@@ -3966,15 +4132,20 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn a_rule_added_after_ingest_governs_the_file_it_names() {
         let store = retired_test_store().await;
+        // Ingestion stages the file as a generation-scoped node and publishes
+        // generation 1; the rule written afterwards names the bare path and must
+        // attach to the published tree, not to a superseded one.
+        let file_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
         store
             .upsert(
                 "probe",
-                "probe::src/a.rs",
+                &file_id,
                 vec![0.0; 4],
                 retired_test_payload("file", "auto-ingestor", json!({})),
             )
             .await
             .unwrap();
+        store.publish_generation("probe", 1).await.unwrap();
         store
             .upsert(
                 "probe",
@@ -4125,10 +4296,14 @@ eurostrata\src\daemon.rs",
                 escape_ladybug_string(metadata)
             )
         };
+        // Ingested nodes are generation-scoped now, and generation 1 is the
+        // published tree the relink must attach to. The file row therefore
+        // carries the scoped id, and the active pointer is flipped below.
+        let file_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
         let rows = [
             seed("rule", r#"{"governs": ["src/a.rs"]}"#),
             seed("legacy", r#"{"governs": ["C:/old/checkout/src/a.rs"]}"#),
-            seed("src/a.rs", "{}"),
+            seed(&file_id, "{}"),
         ];
         for row in rows {
             store
@@ -4139,6 +4314,10 @@ eurostrata\src\daemon.rs",
                 .await
                 .expect("seed a memory");
         }
+        store
+            .publish_generation("probe", 1)
+            .await
+            .expect("publish generation 1");
         store
     }
 
