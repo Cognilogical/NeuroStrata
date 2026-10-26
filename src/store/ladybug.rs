@@ -9,7 +9,8 @@ use lbug::{Connection, Database, SystemConfig};
 
 use crate::domain::domain_key;
 use crate::traits::{
-    DomainMatchMode, DomainSearchOutcome, MemoryPayload, RelocateOutcome, SearchResult, VectorStore,
+    DomainMatchMode, DomainSearchOutcome, GraphMatchKind, GraphRead, MemoryHit, MemoryPayload,
+    RelocateOutcome, SearchResult, VectorStore,
 };
 
 /// Read a boolean column out of a query row.
@@ -1678,6 +1679,10 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let shape_warnings = write_shape_warnings(&payload);
+        // The stub materializer needs the embedding width for its zero vector;
+        // captured here so the closure stays `FnOnce + Send + 'static`.
+        let dimensions = self.dimensions;
+        let zero_vec = zero_vector_str(dimensions);
         self.write_with_deadline("writing a memory", move |conn| {
 
             let safe_id = escape_ladybug_string(&id);
@@ -1764,6 +1769,41 @@ impl VectorStore for LadybugStore {
                 } else {
                     match resolve_target_on_write(conn, &namespace, &edge.target_id) {
                         crate::traits::TargetResolution::Resolved(found) => found,
+                        // Spec §3.2: a GOVERNS target that names a file not yet
+                        // ingested auto-materialises a stub `file` node so the
+                        // edge forms immediately instead of waiting for an
+                        // ingest that may never come. Only the unqualified,
+                        // unambiguous `Missing` case stubs -- an ambiguous or
+                        // failed resolution, or a qualified cross-namespace id,
+                        // still defers.
+                        crate::traits::TargetResolution::Missing
+                            if edge.rel_type == "GOVERNS" =>
+                        {
+                            match materialize_stub_file_node(
+                                conn,
+                                &namespace,
+                                &edge.target_id,
+                                &zero_vec,
+                            ) {
+                                Ok(stub_id) => stub_id,
+                                Err(e) => {
+                                    deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                        rel_type: edge.rel_type.to_string(),
+                                        declared_target: edge.target_id.clone(),
+                                        declaration_index: edge.declaration_index,
+                                        resolution: crate::traits::TargetResolution::Failed(
+                                            e.to_string(),
+                                        ),
+                                    });
+                                    emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                        field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                        why: "stub materialization failed".to_string(),
+                                        skipped: "this edge materialization".to_string(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                         resolution @ crate::traits::TargetResolution::Missing
                         | resolution @ crate::traits::TargetResolution::Ambiguous(_)
                         | resolution @ crate::traits::TargetResolution::Failed(_) => {
@@ -2899,6 +2939,293 @@ impl VectorStore for LadybugStore {
 impl crate::traits::AsAny for LadybugStore {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+/// A zero vector of `dimensions` floats, decimal-formatted for the engine's
+/// `ARRAY_DISTANCE` binder (R16) -- the shape structural nodes store.
+fn zero_vector_str(dimensions: usize) -> String {
+    format!("[{}]", vec!["0.0"; dimensions].join(","))
+}
+
+/// Materialises a stub `file` node for a `GOVERNS` target that does not exist
+/// yet (spec §3.2). The stub carries the legacy two-segment qualified id
+/// (`namespace::path`), so `logical_path_of` still recovers the bare path a
+/// rule names, and a later ingest replaces it. `ON CREATE` only: an existing
+/// node is never overwritten.
+fn materialize_stub_file_node(
+    conn: &Connection,
+    namespace: &str,
+    declared: &str,
+    zero_vec: &str,
+) -> Result<String> {
+    let node_path = crate::parser::ingest::normalize_node_path(declared);
+    if node_path.is_empty() {
+        anyhow::bail!("cannot materialise a stub file node for an empty path");
+    }
+    let stub_id = crate::parser::ingest::qualified_id(namespace, &node_path);
+    let safe_id = escape_ladybug_string(&stub_id);
+    let safe_ns = escape_ladybug_string(namespace);
+    let safe_location = escape_ladybug_string(&node_path);
+    let metadata = serde_json::json!({ "stub": true, "absolute_path": node_path });
+    let safe_metadata = escape_ladybug_string(&serde_json::to_string(&metadata)?);
+    let query = format!(
+        "MERGE (m:Memory {{id: '{}'}}) ON CREATE SET m.namespace = '{}', m.content = '', m.user_id = 'auto-ingestor', m.memory_type = 'file', m.agent_name = 'neurostrata-stub', m.location = '{}', m.location_lines = '', m.metadata = '{}', m.embedding = {}",
+        safe_id, safe_ns, safe_location, safe_metadata, zero_vec
+    );
+    conn.query(&query)?;
+    Ok(stub_id)
+}
+
+/// Whether `ancestor` is a directory prefix of `path`: strict, at a `/`
+/// boundary, so `src` matches `src/lib.rs` but `sr` and `src/lib` do not match
+/// `src/lib.rs`.
+fn is_ancestor_of(ancestor: &str, path: &str) -> bool {
+    !ancestor.is_empty()
+        && ancestor != path
+        && path.starts_with(ancestor)
+        && path[ancestor.len()..].starts_with('/')
+}
+
+/// Whether a symbol node's logical path (`path#kind:name@hash`) is the named
+/// symbol in `path`.
+fn is_symbol_of(logical_path: &str, path: &str, symbol: &str) -> bool {
+    let Some(rest) = logical_path.strip_prefix(path) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('#') else {
+        return false;
+    };
+    let Some((_kind, name_at_hash)) = rest.split_once(':') else {
+        return false;
+    };
+    let name = name_at_hash.split('@').next().unwrap_or(name_at_hash);
+    name == symbol
+}
+
+/// Runs one GOVERNS edge query and turns its rows into hits. `kind_of` maps a
+/// returned target id to the match kind it represents.
+fn gov_hits_from_rows(
+    conn: &Connection,
+    query: &str,
+    memory_types: &[String],
+    kind_of: impl Fn(&str) -> GraphMatchKind,
+) -> Result<Vec<MemoryHit>> {
+    let now = chrono::Utc::now().timestamp();
+    let mut rows = conn.query(query)?;
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next() {
+        let target_id = format!("{}", row[0]);
+        let id = format!("{}", row[1]);
+        let content = format!("{}", row[2]);
+        let memory_type = format!("{}", row[3]);
+        let metadata: Value =
+            serde_json::from_str(&format!("{}", row[4])).unwrap_or(Value::Null);
+
+        if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &memory_type) {
+            continue;
+        }
+        if is_archived(&metadata) || is_retired_at(&metadata, now) || is_mesh_conflicting(&metadata)
+        {
+            continue;
+        }
+        let access_count = metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        hits.push(MemoryHit {
+            id,
+            memory_type,
+            content,
+            match_kind: kind_of(&target_id),
+            access_count,
+            explanation: format!("governs {}", target_id),
+            metadata,
+        });
+    }
+    Ok(hits)
+}
+
+/// The two graph-edge paths: direct `GOVERNS` onto the candidate targets, and
+/// 2-hop symbol governance (`memory -GOVERNS-> symbol <-CONTAINS- file`).
+fn graph_hits_from_edges(
+    conn: &Connection,
+    namespace: &str,
+    candidates: &[(String, GraphMatchKind)],
+    file_ids: &[String],
+    memory_types: &[String],
+) -> Result<Vec<MemoryHit>> {
+    let safe_ns = escape_ladybug_string(namespace);
+    let mut hits = Vec::new();
+
+    if !candidates.is_empty() {
+        let id_list = candidates
+            .iter()
+            .map(|(id, _)| format!("'{}'", escape_ladybug_string(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let kind_by_id: std::collections::HashMap<&str, GraphMatchKind> = candidates
+            .iter()
+            .map(|(id, kind)| (id.as_str(), *kind))
+            .collect();
+        let query = format!(
+            "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            id_list, safe_ns
+        );
+        hits.extend(gov_hits_from_rows(conn, &query, memory_types, |target| {
+            kind_by_id
+                .get(target)
+                .copied()
+                .unwrap_or(GraphMatchKind::MetadataFallback)
+        })?);
+    }
+
+    if !file_ids.is_empty() {
+        let file_list = file_ids
+            .iter()
+            .map(|id| format!("'{}'", escape_ladybug_string(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "MATCH (m:Memory)-[:GOVERNS]->(sym:Memory)<-[:CONTAINS]-(f:Memory) WHERE f.id IN [{}] AND m.namespace = '{}' RETURN sym.id, m.id, m.content, m.memory_type, m.metadata",
+            file_list, safe_ns
+        );
+        hits.extend(gov_hits_from_rows(conn, &query, memory_types, |_| {
+            GraphMatchKind::SymbolTwoHop
+        })?);
+    }
+
+    Ok(hits)
+}
+
+/// The metadata fallback: a memory whose `metadata.governs` declares the path
+/// (or an ancestor) but whose edge never materialised -- e.g. the declaration
+/// predates the stub behaviour, or the target is outside the ingested tree.
+fn add_metadata_fallback(
+    hits: &mut Vec<MemoryHit>,
+    live: &[SearchResult],
+    path: &str,
+    include_ancestors: bool,
+    memory_types: &[String],
+) {
+    let now = chrono::Utc::now().timestamp();
+    for node in live {
+        let m = &node.payload;
+        if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &m.memory_type) {
+            continue;
+        }
+        if is_archived(&m.metadata)
+            || is_retired_at(&m.metadata, now)
+            || is_mesh_conflicting(&m.metadata)
+        {
+            continue;
+        }
+        let governs = match m.metadata.get("governs") {
+            Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+            _ => continue,
+        };
+        for declared in governs {
+            let normalized = crate::parser::ingest::normalize_node_path(declared);
+            let matched =
+                normalized == path || (include_ancestors && is_ancestor_of(&normalized, path));
+            if matched {
+                let access_count = m
+                    .metadata
+                    .get("access_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                hits.push(MemoryHit {
+                    id: node.id.clone(),
+                    memory_type: m.memory_type.clone(),
+                    content: m.content.clone(),
+                    match_kind: GraphMatchKind::MetadataFallback,
+                    access_count,
+                    explanation: format!("declares governs {}", normalized),
+                    metadata: m.metadata.clone(),
+                });
+                break;
+            }
+        }
+    }
+}
+
+/// Keep the best hit per memory id: a lower match-kind priority wins, so a
+/// direct `GOVERNS` edge is never shadowed by a weaker metadata-fallback hit.
+fn dedup_hits(hits: &mut Vec<MemoryHit>) {
+    use std::collections::hash_map::Entry;
+    let mut best: std::collections::HashMap<String, MemoryHit> = std::collections::HashMap::new();
+    for hit in hits.drain(..) {
+        match best.entry(hit.id.clone()) {
+            Entry::Vacant(e) => {
+                e.insert(hit);
+            }
+            Entry::Occupied(mut e) => {
+                if hit.match_kind.priority() < e.get().match_kind.priority() {
+                    e.insert(hit);
+                }
+            }
+        }
+    }
+    hits.extend(best.into_values());
+}
+
+#[async_trait::async_trait]
+impl GraphRead for LadybugStore {
+    async fn memories_for_file(
+        &self,
+        namespace: &str,
+        _source: Option<&str>,
+        path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        let namespace = namespace.to_string();
+        let path = crate::parser::ingest::normalize_node_path(path);
+        let symbol = symbol.map(|s| s.to_string());
+        let memory_types = memory_types.to_vec();
+        let limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
+
+        // Read the live nodes once; `list` already drops superseded
+        // generations, so candidate building and the metadata fallback share
+        // one round-trip and never see a retired tree.
+        let live = self.list(&namespace, None, None).await?;
+
+        let mut file_ids: Vec<String> = Vec::new();
+        let mut candidates: Vec<(String, GraphMatchKind)> = Vec::new();
+        for node in &live {
+            let lp = crate::parser::ingest::logical_path_of(&node.id);
+            if lp == path {
+                file_ids.push(node.id.clone());
+                candidates.push((node.id.clone(), GraphMatchKind::ExactFile));
+            } else if let Some(sym) = &symbol {
+                if is_symbol_of(lp, &path, sym) {
+                    candidates.push((node.id.clone(), GraphMatchKind::ExactSymbol));
+                }
+            }
+            if include_ancestors
+                && node.payload.memory_type == "directory"
+                && is_ancestor_of(lp, &path)
+            {
+                candidates.push((node.id.clone(), GraphMatchKind::AncestorDirectory));
+            }
+        }
+
+        let ns_edges = namespace.clone();
+        let types_edges = memory_types.clone();
+        let mut hits = self
+            .with_conn(move |conn| {
+                graph_hits_from_edges(conn, &ns_edges, &candidates, &file_ids, &types_edges)
+            })
+            .await?;
+
+        add_metadata_fallback(&mut hits, &live, &path, include_ancestors, &memory_types);
+
+        dedup_hits(&mut hits);
+        crate::graph_read::memories_for_file::rank_hits(&mut hits);
+        hits.truncate(limit);
+        Ok(hits)
     }
 }
 
@@ -4272,7 +4599,10 @@ eurostrata\src\daemon.rs",
                 retired_test_payload(
                     "rule",
                     "agent",
-                    json!({ "governs": ["src/not-ingested.rs"] }),
+                    // A qualified cross-namespace target never gets a stub
+                    // (spec §3.2: stubs are only for the unqualified missing
+                    // case), so it still defers with `Missing`.
+                    json!({ "governs": ["other-ns::src/not-ingested.rs"] }),
                 ),
             )
             .await
@@ -4283,13 +4613,81 @@ eurostrata\src\daemon.rs",
         assert_eq!(report.deferred_edges[0].rel_type, "GOVERNS");
         assert_eq!(
             report.deferred_edges[0].declared_target,
-            "src/not-ingested.rs"
+            "other-ns::src/not-ingested.rs"
         );
         assert_eq!(report.deferred_edges[0].declaration_index, 0);
         assert!(matches!(
             report.deferred_edges[0].resolution,
             crate::traits::TargetResolution::Missing
         ));
+    }
+
+    /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`
+    /// auto-materialises a stub `file` node, so the edge forms immediately.
+    #[tokio::test]
+    async fn a_missing_unqualified_governs_target_materialises_a_stub_file_node() {
+        let store = retired_test_store().await;
+        let report = store
+            .upsert(
+                "probe",
+                "rule-governing-unindexed-file",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({ "governs": ["src/not-ingested.rs"] }),
+                ),
+            )
+            .await
+            .expect("memory write remains fail-soft");
+
+        assert_eq!(report.id, "rule-governing-unindexed-file");
+        assert!(
+            report.deferred_edges.is_empty(),
+            "a stubbed GOVERNS target materialises, not defers: {:?}",
+            report.deferred_edges
+        );
+
+        // The stub exists under the legacy qualified id with a zero vector and
+        // the structural `file` shape, marked `stub: true`.
+        let stub_id = crate::parser::ingest::qualified_id("probe", "src/not-ingested.rs");
+        let (vector, payload) = store
+            .get("probe", &stub_id)
+            .await
+            .expect("read the stub back")
+            .expect("the stub file node exists");
+        assert_eq!(payload.memory_type, "file");
+        assert_eq!(payload.user_id, "auto-ingestor");
+        assert_eq!(payload.agent_name.as_deref(), Some("neurostrata-stub"));
+        assert_eq!(
+            payload.metadata.get("stub").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            payload.metadata.get("absolute_path").and_then(|v| v.as_str()),
+            Some("src/not-ingested.rs")
+        );
+        assert_eq!(vector, vec![0.0; 4]);
+
+        // The rule now finds the file through the graph-read capability.
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/not-ingested.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert!(
+            hits.iter()
+                .any(|h| h.id == "rule-governing-unindexed-file"),
+            "the governing rule surfaces for the stubbed file: {:?}",
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
     }
 
     /// Ingestion qualifies node ids, and a rule names the file the way a human

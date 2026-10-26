@@ -14,6 +14,7 @@ mod daemon;
 mod domain;
 mod embed;
 mod events;
+mod graph_read;
 mod guard;
 mod handlers;
 mod ingest_jobs;

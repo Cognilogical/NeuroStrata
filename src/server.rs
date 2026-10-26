@@ -1,4 +1,4 @@
-use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
+use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use std::sync::Arc;
@@ -196,6 +196,24 @@ pub async fn process_mcp_request(
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." }
                             },
                             "required": ["query", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_memories_for_file",
+                        "description": "Deterministic, zero-embedding lookup of the active rule/fact/procedure memories governing a file, a symbol, or its ancestor directories. Use it before reading or editing a file to surface the architectural constraints that apply to it. A backend without graph-read answers 'unsupported', never an empty list.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "path": { "type": "string", "description": "The file path (e.g. src/lib.rs), normalized the same way ingestion normalizes it." },
+                                "project_root": { "type": "string", "description": "Optional absolute path to the project root." },
+                                "symbol": { "type": "string", "description": "Optional code symbol (e.g. startSync()) to look up governance for." },
+                                "include_ancestors": { "type": "boolean", "description": "Include memories governing ancestor directories. Default true." },
+                                "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Memory types to return. Default [\"rule\",\"fact\",\"procedure\"]." },
+                                "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
+                                "limit": { "type": "integer", "description": "Max results. Default 5, max 20." }
+                            },
+                            "required": ["namespace", "path"]
                         }
                     },
                     {
@@ -629,6 +647,9 @@ pub async fn process_mcp_request(
                         "neurostrata_search_memory" => {
                             result_text =
                                 handle_search_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_memories_for_file" => {
+                            result_text = handle_memories_for_file(arguments, store.clone()).await;
                         }
                         "neurostrata_supersede_memory" => {
                             result_text = handle_supersede_memory(
@@ -1096,6 +1117,97 @@ async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
         format!("Existing namespaces: {:?}", namespaces)
     } else {
         "Failed to list namespaces.".to_string()
+    }
+}
+
+/// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
+/// `memories` (possibly empty) and `unsupported` -- an explicit flag, because a
+/// backend without graph-read must never be mistaken for "no rules apply".
+async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => {
+            return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to read from.".to_string();
+        }
+    };
+    let path = match arguments.get("path").and_then(|p| p.as_str()) {
+        Some(p) => p,
+        None => return "Missing 'path' parameter.".to_string(),
+    };
+    let namespace = resolve_namespace(&store, namespace).await;
+
+    let symbol = arguments.get("symbol").and_then(|s| s.as_str());
+    let include_ancestors = arguments
+        .get("include_ancestors")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let memory_types: Vec<String> = match arguments.get("memory_types") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    let exclude_ids: Vec<String> = match arguments.get("exclude_ids") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(crate::graph_read::memories_for_file::DEFAULT_LIMIT as u64)
+        as usize;
+
+    // The graph-read capability is optional per backend: only LadybugStore
+    // implements it (spec §4.6). Anything else answers `unsupported` -- never
+    // an empty list, which a caller would misread as "no rules govern this".
+    let Some(store) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    else {
+        return serde_json::json!({
+            "memories": [],
+            "unsupported": true,
+            "path": path,
+        })
+        .to_string();
+    };
+
+    match store
+        .memories_for_file(
+            &namespace,
+            None,
+            path,
+            symbol,
+            include_ancestors,
+            &memory_types,
+            limit,
+        )
+        .await
+    {
+        Ok(mut hits) => {
+            if !exclude_ids.is_empty() {
+                hits.retain(|h| !exclude_ids.iter().any(|e| e == &h.id));
+            }
+            serde_json::json!({
+                "memories": hits,
+                "unsupported": false,
+                "path": path,
+            })
+            .to_string()
+        }
+        Err(e) => serde_json::json!({
+            "memories": [],
+            "unsupported": false,
+            "path": path,
+            "error": e.to_string(),
+        })
+        .to_string(),
     }
 }
 
@@ -4694,7 +4806,9 @@ mod tests {
             serde_json::json!({
                 "content": "rule with a not-yet-ingested target",
                 "namespace": "probe",
-                "metadata": { "governs": ["src/not-ingested.rs"] }
+                // A qualified cross-namespace target never gets a stub
+                // (spec §3.2), so it still defers with `missing`.
+                "metadata": { "governs": ["other-ns::src/not-ingested.rs"] }
             }),
             Arc::new(StubEmbedder),
             store,
@@ -6101,7 +6215,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_one_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -6129,6 +6243,7 @@ mod tests {
                 "neurostrata_ingest_directory",
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
+                "neurostrata_memories_for_file",
                 "neurostrata_supersede_memory",
                 "neurostrata_procedure_perform",
                 "neurostrata_task_create",

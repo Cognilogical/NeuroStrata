@@ -21,6 +21,13 @@ path = "tests/context/model_test.rs"
 name = "staged_publication_test"
 path = "tests/ingest/staged_publication_test.rs"
 
+# Task 3: graph-read ranking contract. Compiles the crate-free
+# graph_read::memories_for_file module from its real path (see the file's
+# module comment) because the crate ships a binary target only.
+[[test]]
+name = "memories_for_file_test"
+path = "tests/graph_read/memories_for_file_test.rs"
+
 [dependencies]
 tokio = { version = "1.53", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
