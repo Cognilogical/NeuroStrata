@@ -3067,28 +3067,27 @@ pub async fn import_beads(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
+
     // hook hash marker tests (Task 1)
     #[test]
     fn hook_sha256_is_64_hex() {
-        let h = super::hook_sha256();
+        let h = hook_sha256();
         assert_eq!(h.len(), 64);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn scaffold_is_current_hook() {
-        assert!(super::is_current_hook(super::SCAFFOLDED_PRE_PUSH_HOOK));
+        assert!(is_current_hook(SCAFFOLDED_PRE_PUSH_HOOK));
     }
 
     #[test]
     fn foreign_hook_not_ours() {
-        assert!(!super::is_ours_hook("#!/bin/bash\necho hi\n"));
-        assert!(!super::is_current_hook("#!/bin/bash\necho hi\n"));
+        assert!(!is_ours_hook("#!/bin/bash\necho hi\n"));
+        assert!(!is_current_hook("#!/bin/bash\necho hi\n"));
     }
-
-
-    use super::*;
-    use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 
     // ── the bus, as the completion path sees it ────────────────────────────────
 
