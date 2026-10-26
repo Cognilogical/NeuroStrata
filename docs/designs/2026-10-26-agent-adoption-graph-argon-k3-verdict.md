@@ -279,3 +279,55 @@ Thresholds:
 ## 13. Acceptance criteria
 
 A fresh agent receives relevant context without being told a NeuroStrata tool name. Touching a file surfaces its governing rule and directed evidence within budget. Graph results exclude retired rows by default and report truncation honestly. Automatic injection causes no access-count self-reinforcement and no autonomous durable writes. Unknown freshness is explicit; code changes do not mark decisions stale. Provider failure produces no behavioral mutation. Evaluation proves sequences from MCP traces rather than files that daemon startup could create.
+
+---
+
+## 14. Astra independent review — reconciliation (`docs/designs/2026-10-26-agent-adoption-graph-astra-independent.md`)
+
+Astra (`openai-arch`) reviewed the goal and codebase independently (without reading Argon/K3 outputs) and converged on the same core direction while adding refinements. Reconciliation below; disagreements resolved in favor of the stronger constraint.
+
+### 14.1 Agreements (no change)
+
+- Deterministic, host-triggered delivery; no background LLM agents.
+- Exact file recall before broad graph exploration.
+- Typed decision metadata on `fact`, not a truthy flag.
+- Freshness as independent dimensions, not a scalar.
+- Bounded `related` (depth ≤2, explicit budgets, no arbitrary Cypher).
+- NeuroPlasticity infra failures are invalid runs, not score 0.
+
+### 14.2 Refinements adopted from Astra
+
+1. **Shared context service, thin host adapters.** Add a bounded context-planning boundary beside `src/server.rs` handlers (inputs: authenticated project/source binding, session/event ID, file paths, optional task/domain hints, output budget; outputs: schema version, event ID, index generation, applied scope, memories, evidence paths, freshness, truncation/degradation status). Adapters supply observations; server supplies ranking policy. Distinguish empty / unsupported / unavailable / partial explicitly.
+2. **Plugin repair is P0 before triggers.** `plugins/opencode/index.ts:66-106,192-201,229-237,255-274` also has `ctx` scope defects beyond the endpoint/missing-tool issues. Add capability negotiation, response validation, bounded timeouts, explicit namespace binding, observable degraded state. A tool name in prose is not proof of task creation (`index.ts:259`).
+3. **Host hooks are sensors, not sole boundary.** Daemon-side invalidation and replay-aware session state required for shell edits, external editors, restart, compaction. Coverage gaps must be advertised honestly.
+4. **Narrow graph interface, not vector-trait bloat.** Expose `memories_for_file`/`related` through a dedicated graph-read capability beside `VectorStore` (`src/traits.rs:219`); unsupported backends return `unsupported`, not empty. File nodes have zero vectors (`src/parser/ingest.rs:419-445`); file path must not require embeddings.
+5. **Identity/publication precede freshness.** Separate repo / checkout / worktree / revision / dirty state / relative path. Cross-scope links require explicit authorization. Publish ingestion generations atomically or retain last-good with visible incomplete state (`src/parser/ingest.rs:440-445` logs upsert failure and continues).
+6. **Freshness splits into four independent dimensions** (Astra's stronger formulation): (a) source currency (unchanged/changed/missing/unknown), (b) semantic validation (unreviewed/verified/contradicted + evidence), (c) index coverage (complete/partial/unavailable + generation), (d) decision lifecycle (proposed/accepted/superseded/withdrawn). Changed hash requests review; it does not refute a decision.
+7. **Embedding-space identity + replay-safe state.** Persist model/provider revision, dimensions, normalization, preprocessing, distance metric; refuse incompatible comparisons; retain exact file/graph retrieval during migration/outage. `src/buffer.rs:335-394` returns append success with empty recall on embedding failure — split into append/recall states with retryable event IDs (retrying recall must not re-append). Procedures: due / offered / acknowledged / performed; display must not consume rehearsal budget; idempotent receipts.
+8. **Decision envelope is typed, not a boolean.** Add version, choice, rationale, alternatives, scope, status, authority/provenance, date, supersession. Legacy rows remain readable/unclassified; no automatic fact relabeling. Conflicting decisions/facts must surface conflict, not win by recency.
+9. **Retrieved prose is untrusted evidence.** Imported provenance cannot grant permissions or promote text into system instructions. Apply caller egress policy before rendering/embedding (privacy is a hard failure, not a weighted metric).
+10. **Budgets (proposed, not measured):** depth 2; 20 returned nodes; 40 evidence edges; 1,500-token automatic context ceiling; 200ms warm-path target; 1s recall wall-time cap. Expose truncation/degradation; never imply complete constraint coverage when budget exhausted.
+11. **NeuroPlasticity refinements:** separate contract-reliability / unprompted-adoption / decision-outcome suites; adoption tasks must not name NeuroStrata or desired tool calls; grade typed traces (persisted task transitions, applied scope, pre-action delivery order, independent artifact/outcome); `src/recall_metrics.rs:64-149` counters are restart-reset and can misattribute — add bounded durable receipts keyed by session/task/event with recovery status; compare no-memory / repaired-adapter / exact-file / graph-enabled arms; primary metric = correct task outcomes under identical conditions; privacy violations and missed mandatory guards are hard failures.
+
+### 14.3 Disagreements resolved
+
+- **Host hooks as sensors vs. sole boundary:** Astra. Daemon-side invalidation + replay-aware session state added; coverage gaps advertised.
+- **Hash freshness as truth:** Astra. Hash = source currency only; semantic validation and decision lifecycle are separate.
+- **Access count as usefulness:** Astra. Reserve context for new/applicable constraints; do not reinforce historical popularity.
+- **`metadata.decision: true` sufficiency:** Astra. Typed envelope adopted.
+- **Background semantic agents:** both reject as default; Astra adds "keep optional semantic analysis explicit, bounded, privacy-gated" — adopted as non-goal clarification.
+
+### 14.4 Missing risks added (from Astra §4)
+
+Egress of snippets/telemetry; untrusted retrieved prose; worktree/symlink/rename/delete/generated-file/path errors; graph hubs/duplicate evidence/query fanout/unbounded namespace state; reconstruction erasing applicability; mesh/export/import preserving new semantics without sharing local runtime receipts or incompatible embedding assumptions.
+
+### 14.5 Priority changes
+
+Astra reorders to: (1) repair host/server contract + instrument degraded events; (2) scoped file identity + exact lookup + generation coverage + privacy filtering + replay-safe delivery; (3) typed decision/freshness rendering + bounded traversal; (4) tune graph-aware ranking only against independent outcome evidence. Adopted; supersedes Phase ordering in §11 where they conflict (Phase 1 now includes adapter repair + context service + identity/publication; graph ranking tuning moves last).
+
+### 14.6 Net effect on phased plan
+
+- Phase 1 expands: shared context service, adapter repair, scoped file identity/publication, exact lookup, privacy filtering, replay-safe delivery, typed decision/freshness rendering.
+- Phase 2: bounded `related` + graph-read capability (not vector-trait enlargement).
+- Phase 3: host hooks as sensors with daemon-side invalidation + advertised coverage.
+- Phase 4: NeuroPlasticity trace-graded loop with durable receipts and arm comparison.
