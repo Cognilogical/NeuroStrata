@@ -123,3 +123,8 @@ path = "tests/privacy/egress_test.rs"
 [[test]]
 name = "upgraded_search_test"
 path = "tests/search/upgraded_search_test.rs"
+
+
+[[test]]
+name = "validator_test"
+path = "tests/guard/validator_test.rs"
