@@ -448,6 +448,23 @@ pub async fn handle_append_log(
         (direct_matches, recalled_from_str)
     };
 
+    // Cache project_root into the registry row (best-effort) so hook hygiene
+    // and doctor scheduling can resolve it later without an explicit arg.
+    let cache_ns = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            project_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(String::from)
+                .unwrap_or_else(|| "default".to_string())
+        });
+    let cache_ns = crate::server::resolve_namespace(&store, &cache_ns).await;
+    crate::registry::cache_project_root(&store, Some(&emb), &cache_ns, &project_root.to_string_lossy()).await;
+
     // Build the success response
     let signals: Vec<Value> = crate::task::intent::detect_task_intents(&content)
         .into_iter()

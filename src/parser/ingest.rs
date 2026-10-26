@@ -572,7 +572,7 @@ pub async fn ingest_directory(
     let observer_clone = observer.clone();
     let consumer_result = run_consumer(
         rx,
-        embedder,
+        embedder.clone(),
         vector_store.clone(),
         namespace,
         observer_clone,
@@ -614,6 +614,15 @@ pub async fn ingest_directory(
     if let Some(observer) = &observer {
         observer.relinked(linked);
     }
+
+    // Cache project_root into the registry row (best-effort) for hook hygiene.
+    crate::registry::cache_project_root(
+        &vector_store,
+        Some(&embedder),
+        namespace,
+        &dir_path.to_string_lossy(),
+    )
+    .await;
 
     Ok(())
 }
