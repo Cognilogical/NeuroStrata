@@ -2322,6 +2322,19 @@ impl VectorStore for LadybugStore {
         let memories = self.list(namespace, None, None).await?;
         let active_gen = self.active_generation(namespace, source_key).await?;
 
+        // The published generation's logical paths. A stub materialised before
+        // the file was ingested is a placeholder; once the real node arrives it
+        // must be retired so the placeholder never shadows the real tree.
+        let active_paths: std::collections::HashSet<String> = memories
+            .iter()
+            .filter_map(|m| match crate::parser::ingest::split_scoped_id(&m.id) {
+                Some((_, gen, _)) if gen == active_gen => {
+                    Some(crate::parser::ingest::logical_path_of(&m.id).to_string())
+                }
+                _ => None,
+            })
+            .collect();
+
         // Ids stored before node ids became repository-relative are absolute, so
         // a rule written to match them declares C:/proj/src/foo.rs and matches
         // nothing now. Resolve those by path suffix against the ids that do
@@ -2383,7 +2396,7 @@ impl VectorStore for LadybugStore {
             }
         }
 
-        if wanted.is_empty() {
+        if wanted.is_empty() && active_paths.is_empty() {
             return Ok(0);
         }
 
@@ -2394,7 +2407,11 @@ impl VectorStore for LadybugStore {
             );
         }
 
+        let namespace_owned = namespace.to_string();
         self.write_with_deadline("relinking the graph", move |conn| {
+            // Retire stubs before replaying edges: the replayed declaration
+            // then points at the real node, not the placeholder it replaced.
+            let _ = retire_replaced_stubs(conn, &namespace_owned, &active_paths)?;
             let mut created = 0usize;
             for (rel_type, pairs) in &wanted {
                 created += create_missing_edges(conn, rel_type, pairs)?;
@@ -2959,22 +2976,61 @@ fn materialize_stub_file_node(
     declared: &str,
     zero_vec: &str,
 ) -> Result<String> {
+    // A declaration that names a directory carries a trailing slash (the same
+    // convention `KnownIds::resolve` already honours); an unindexed ancestor
+    // directory must materialise as `directory` so the graph-read's
+    // `AncestorDirectory` match finds it.
+    let is_directory = declared.ends_with('/');
     let node_path = crate::parser::ingest::normalize_node_path(declared);
     if node_path.is_empty() {
-        anyhow::bail!("cannot materialise a stub file node for an empty path");
+        anyhow::bail!("cannot materialise a stub node for an empty path");
     }
     let stub_id = crate::parser::ingest::qualified_id(namespace, &node_path);
     let safe_id = escape_ladybug_string(&stub_id);
     let safe_ns = escape_ladybug_string(namespace);
     let safe_location = escape_ladybug_string(&node_path);
+    let memory_type = if is_directory { "directory" } else { "file" };
     let metadata = serde_json::json!({ "stub": true, "absolute_path": node_path });
     let safe_metadata = escape_ladybug_string(&serde_json::to_string(&metadata)?);
     let query = format!(
-        "MERGE (m:Memory {{id: '{}'}}) ON CREATE SET m.namespace = '{}', m.content = '', m.user_id = 'auto-ingestor', m.memory_type = 'file', m.agent_name = 'neurostrata-stub', m.location = '{}', m.location_lines = '', m.metadata = '{}', m.embedding = {}",
-        safe_id, safe_ns, safe_location, safe_metadata, zero_vec
+        "MERGE (m:Memory {{id: '{}'}}) ON CREATE SET m.namespace = '{}', m.content = '', m.user_id = 'auto-ingestor', m.memory_type = '{}', m.agent_name = 'neurostrata-stub', m.location = '{}', m.location_lines = '', m.metadata = '{}', m.embedding = {}",
+        safe_id, safe_ns, memory_type, safe_location, safe_metadata, zero_vec
     );
     conn.query(&query)?;
     Ok(stub_id)
+}
+
+/// Deletes stub nodes (`agent_name = 'neurostrata-stub'`) whose logical path is
+/// now held by the published generation, so a placeholder never shadows the
+/// real ingested node that replaced it.
+fn retire_replaced_stubs(
+    conn: &Connection,
+    namespace: &str,
+    active_paths: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    let query = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.agent_name = 'neurostrata-stub' RETURN m.id",
+        escape_ladybug_string(namespace)
+    );
+    let mut rows = conn.query(&query)?;
+    let mut stubs = Vec::new();
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        let path = crate::parser::ingest::logical_path_of(&id);
+        if active_paths.contains(path) {
+            stubs.push(id);
+        }
+    }
+    let mut removed = 0usize;
+    for id in stubs {
+        let del = format!(
+            "MATCH (m:Memory {{id: '{}'}}) DETACH DELETE m",
+            escape_ladybug_string(&id)
+        );
+        conn.query(&del)?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Whether `ancestor` is a directory prefix of `path`: strict, at a `/`
@@ -3003,13 +3059,15 @@ fn is_symbol_of(logical_path: &str, path: &str, symbol: &str) -> bool {
     name == symbol
 }
 
-/// Runs one GOVERNS edge query and turns its rows into hits. `kind_of` maps a
-/// returned target id to the match kind it represents.
-fn gov_hits_from_rows(
+/// Runs one edge query and turns its rows into hits. `kind_of` maps a returned
+/// target id to the match kind it represents; `edge_name` names the relation in
+/// the explanation (`governs` vs `relates to`).
+fn edge_hits_from_rows(
     conn: &Connection,
     query: &str,
     memory_types: &[String],
     kind_of: impl Fn(&str) -> GraphMatchKind,
+    edge_name: &str,
 ) -> Result<Vec<MemoryHit>> {
     let now = chrono::Utc::now().timestamp();
     let mut rows = conn.query(query)?;
@@ -3039,15 +3097,17 @@ fn gov_hits_from_rows(
             content,
             match_kind: kind_of(&target_id),
             access_count,
-            explanation: format!("governs {}", target_id),
+            explanation: format!("{} {}", edge_name, target_id),
             metadata,
         });
     }
     Ok(hits)
 }
 
-/// The two graph-edge paths: direct `GOVERNS` onto the candidate targets, and
-/// 2-hop symbol governance (`memory -GOVERNS-> symbol <-CONTAINS- file`).
+/// The graph-edge paths that reach a governing or related memory: direct
+/// `GOVERNS` onto the candidate targets, 2-hop symbol governance
+/// (`memory -GOVERNS-> symbol <-CONTAINS- file`), and `RELATES_TO` onto the
+/// candidate targets in both directions (the relation is undirected).
 fn graph_hits_from_edges(
     conn: &Connection,
     namespace: &str,
@@ -3068,16 +3128,48 @@ fn graph_hits_from_edges(
             .iter()
             .map(|(id, kind)| (id.as_str(), *kind))
             .collect();
-        let query = format!(
+
+        let governs_query = format!(
             "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
             id_list, safe_ns
         );
-        hits.extend(gov_hits_from_rows(conn, &query, memory_types, |target| {
-            kind_by_id
-                .get(target)
-                .copied()
-                .unwrap_or(GraphMatchKind::MetadataFallback)
-        })?);
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &governs_query,
+            memory_types,
+            |target| {
+                kind_by_id
+                    .get(target)
+                    .copied()
+                    .unwrap_or(GraphMatchKind::MetadataFallback)
+            },
+            "governs",
+        )?);
+
+        // RELATES_TO is undirected, so both orientations are queried explicitly
+        // (the stored edge is still a directed row).
+        let relates_out_query = format!(
+            "MATCH (m:Memory)-[:RELATES_TO]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            id_list, safe_ns
+        );
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &relates_out_query,
+            memory_types,
+            |_| GraphMatchKind::Related,
+            "relates to",
+        )?);
+        let relates_in_query = format!(
+            "MATCH (m:Memory)<-[:RELATES_TO]-(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            id_list, safe_ns
+        );
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &relates_in_query,
+            memory_types,
+            |_| GraphMatchKind::Related,
+            "relates to",
+        )?);
     }
 
     if !file_ids.is_empty() {
@@ -3090,37 +3182,141 @@ fn graph_hits_from_edges(
             "MATCH (m:Memory)-[:GOVERNS]->(sym:Memory)<-[:CONTAINS]-(f:Memory) WHERE f.id IN [{}] AND m.namespace = '{}' RETURN sym.id, m.id, m.content, m.memory_type, m.metadata",
             file_list, safe_ns
         );
-        hits.extend(gov_hits_from_rows(conn, &query, memory_types, |_| {
-            GraphMatchKind::SymbolTwoHop
-        })?);
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &query,
+            memory_types,
+            |_| GraphMatchKind::SymbolTwoHop,
+            "governs",
+        )?);
     }
 
     Ok(hits)
 }
 
+/// Whether an id is reachable under the active generation set: a
+/// generation-scoped id is reachable only when its generation is active, while
+/// a non-scoped id (a rule/fact/procedure id, or a pre-generation stub) is
+/// always reachable.
+fn is_active_id(id: &str, active_gens: &std::collections::HashSet<u64>) -> bool {
+    match crate::parser::ingest::split_scoped_id(id) {
+        Some((_, gen, _)) => active_gens.contains(&gen),
+        None => true,
+    }
+}
+
+/// Discovers the target nodes a query can match: the exact file node, the
+/// exact symbol nodes (when a symbol is named), and the ancestor directory
+/// nodes (when `include_ancestors`). The lookups are location-scoped Cypher
+/// queries rather than a whole-namespace scan, and each row is then narrowed
+/// to the active generation set so a superseded tree never contributes.
+fn discover_candidates(
+    conn: &Connection,
+    safe_ns: &str,
+    path: &str,
+    symbol: Option<&str>,
+    include_ancestors: bool,
+    active_gens: &std::collections::HashSet<u64>,
+) -> Result<(Vec<String>, Vec<(String, GraphMatchKind)>)> {
+    let mut file_ids: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, GraphMatchKind)> = Vec::new();
+
+    // The file node and its symbol nodes share `location = path`: the file's
+    // logical path is the path itself, a symbol's is `path#kind:name@hash`.
+    let safe_path = escape_ladybug_string(path);
+    let query = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id",
+        safe_ns, safe_path
+    );
+    let mut rows = conn.query(&query)?;
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        if !is_active_id(&id, active_gens) {
+            continue;
+        }
+        let logical = crate::parser::ingest::logical_path_of(&id);
+        if logical == path {
+            file_ids.push(id.clone());
+            candidates.push((id.clone(), GraphMatchKind::ExactFile));
+        } else if let Some(sym) = symbol {
+            if is_symbol_of(logical, path, sym) {
+                candidates.push((id.clone(), GraphMatchKind::ExactSymbol));
+            }
+        }
+    }
+
+    if include_ancestors {
+        let dir_query = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type = 'directory' RETURN m.id, m.location",
+            safe_ns
+        );
+        let mut rows = conn.query(&dir_query)?;
+        while let Some(row) = rows.next() {
+            let id = format!("{}", row[0]);
+            if !is_active_id(&id, active_gens) {
+                continue;
+            }
+            let location = format!("{}", row[1]);
+            if is_ancestor_of(&location, path) {
+                candidates.push((id.clone(), GraphMatchKind::AncestorDirectory));
+            }
+        }
+    }
+
+    Ok((file_ids, candidates))
+}
+
 /// The metadata fallback: a memory whose `metadata.governs` declares the path
 /// (or an ancestor) but whose edge never materialised -- e.g. the declaration
 /// predates the stub behaviour, or the target is outside the ingested tree.
-fn add_metadata_fallback(
+///
+/// The query is scoped to the memory types asked for (rules/facts/procedures
+/// by default), so the ingested AST bulk -- file/symbol/directory rows, which
+/// never carry a `governs` declaration -- is never scanned.
+fn add_metadata_fallback_conn(
+    conn: &Connection,
+    safe_ns: &str,
     hits: &mut Vec<MemoryHit>,
-    live: &[SearchResult],
     path: &str,
     include_ancestors: bool,
     memory_types: &[String],
-) {
+) -> Result<()> {
+    // An empty `memory_types` means "no type filter" (the trait contract), so
+    // the type condition is omitted entirely; a non-empty list is pushed into
+    // the WHERE clause so only those rows are read.
+    let type_condition = if memory_types.is_empty() {
+        None
+    } else {
+        let list = memory_types
+            .iter()
+            .map(|t| format!("'{}'", escape_ladybug_string(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("m.memory_type IN [{}]", list))
+    };
+    let where_clause = match &type_condition {
+        Some(tc) => format!("m.namespace = '{}' AND {}", safe_ns, tc),
+        None => format!("m.namespace = '{}'", safe_ns),
+    };
+    let query = format!(
+        "MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.memory_type, m.metadata",
+        where_clause
+    );
     let now = chrono::Utc::now().timestamp();
-    for node in live {
-        let m = &node.payload;
-        if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &m.memory_type) {
-            continue;
-        }
-        if is_archived(&m.metadata)
-            || is_retired_at(&m.metadata, now)
-            || is_mesh_conflicting(&m.metadata)
+    let mut rows = conn.query(&query)?;
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        let content = format!("{}", row[1]);
+        let memory_type = format!("{}", row[2]);
+        let metadata: Value =
+            serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+        if is_archived(&metadata)
+            || is_retired_at(&metadata, now)
+            || is_mesh_conflicting(&metadata)
         {
             continue;
         }
-        let governs = match m.metadata.get("governs") {
+        let governs = match metadata.get("governs") {
             Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
             _ => continue,
         };
@@ -3129,24 +3325,24 @@ fn add_metadata_fallback(
             let matched =
                 normalized == path || (include_ancestors && is_ancestor_of(&normalized, path));
             if matched {
-                let access_count = m
-                    .metadata
+                let access_count = metadata
                     .get("access_count")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
                 hits.push(MemoryHit {
-                    id: node.id.clone(),
-                    memory_type: m.memory_type.clone(),
-                    content: m.content.clone(),
+                    id,
+                    memory_type,
+                    content,
                     match_kind: GraphMatchKind::MetadataFallback,
                     access_count,
                     explanation: format!("declares governs {}", normalized),
-                    metadata: m.metadata.clone(),
+                    metadata,
                 });
                 break;
             }
         }
     }
+    Ok(())
 }
 
 /// Keep the best hit per memory id: a lower match-kind priority wins, so a
@@ -3174,53 +3370,76 @@ impl GraphRead for LadybugStore {
     async fn memories_for_file(
         &self,
         namespace: &str,
-        _source: Option<&str>,
+        source: Option<&str>,
         path: &str,
         symbol: Option<&str>,
         include_ancestors: bool,
         memory_types: &[String],
+        exclude_ids: &[String],
         limit: usize,
     ) -> Result<Vec<MemoryHit>> {
         let namespace = namespace.to_string();
         let path = crate::parser::ingest::normalize_node_path(path);
         let symbol = symbol.map(|s| s.to_string());
         let memory_types = memory_types.to_vec();
+        let exclude_ids = exclude_ids.to_vec();
         let limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
+        let source = source.map(|s| s.to_string());
 
-        // Read the live nodes once; `list` already drops superseded
-        // generations, so candidate building and the metadata fallback share
-        // one round-trip and never see a retired tree.
-        let live = self.list(&namespace, None, None).await?;
+        let ns = namespace.clone();
+        let path_c = path.clone();
+        let sym_c = symbol.clone();
+        let types = memory_types.clone();
 
-        let mut file_ids: Vec<String> = Vec::new();
-        let mut candidates: Vec<(String, GraphMatchKind)> = Vec::new();
-        for node in &live {
-            let lp = crate::parser::ingest::logical_path_of(&node.id);
-            if lp == path {
-                file_ids.push(node.id.clone());
-                candidates.push((node.id.clone(), GraphMatchKind::ExactFile));
-            } else if let Some(sym) = &symbol {
-                if is_symbol_of(lp, &path, sym) {
-                    candidates.push((node.id.clone(), GraphMatchKind::ExactSymbol));
-                }
-            }
-            if include_ancestors
-                && node.payload.memory_type == "directory"
-                && is_ancestor_of(lp, &path)
-            {
-                candidates.push((node.id.clone(), GraphMatchKind::AncestorDirectory));
-            }
-        }
-
-        let ns_edges = namespace.clone();
-        let types_edges = memory_types.clone();
         let mut hits = self
             .with_conn(move |conn| {
-                graph_hits_from_edges(conn, &ns_edges, &candidates, &file_ids, &types_edges)
+                let safe_ns = escape_ladybug_string(&ns);
+
+                // A source key pins the query to that source's active
+                // generation; `None` keeps every published generation (the
+                // same set `list` reads).
+                let active_gens: std::collections::HashSet<u64> = match &source {
+                    Some(s) => {
+                        let g = active_generation_of_source(conn, &ns, s);
+                        if g > 0 {
+                            [g].into_iter().collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        }
+                    }
+                    None => active_generations_of(conn, &ns),
+                };
+
+                let (file_ids, candidates) = discover_candidates(
+                    conn,
+                    &safe_ns,
+                    &path_c,
+                    sym_c.as_deref(),
+                    include_ancestors,
+                    &active_gens,
+                )?;
+
+                let mut hits =
+                    graph_hits_from_edges(conn, &ns, &candidates, &file_ids, &types)?;
+
+                add_metadata_fallback_conn(
+                    conn,
+                    &safe_ns,
+                    &mut hits,
+                    &path_c,
+                    include_ancestors,
+                    &types,
+                )?;
+
+                Ok(hits)
             })
             .await?;
 
-        add_metadata_fallback(&mut hits, &live, &path, include_ancestors, &memory_types);
+        // Exclusion happens before the limit is applied, so an excluded hit
+        // never crowds out a live one.
+        if !exclude_ids.is_empty() {
+            hits.retain(|h| !exclude_ids.iter().any(|e| e == &h.id));
+        }
 
         dedup_hits(&mut hits);
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
@@ -4678,6 +4897,7 @@ eurostrata\src\daemon.rs",
                 None,
                 true,
                 &["rule".to_string()],
+                &[],
                 5,
             )
             .await
@@ -4687,6 +4907,159 @@ eurostrata\src\daemon.rs",
                 .any(|h| h.id == "rule-governing-unindexed-file"),
             "the governing rule surfaces for the stubbed file: {:?}",
             hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A rule that governs a *directory* (`src/`) surfaces for an unindexed
+    /// file inside it (`src/foo.rs`) through the `AncestorDirectory` match. The
+    /// stub materialised for the directory carries `memory_type = "directory"`,
+    /// not `"file"`, so the ancestor match recognises it.
+    #[tokio::test]
+    async fn unindexed_file_returns_parent_directory_rules() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "dir-governing-rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/"] })),
+            )
+            .await
+            .expect("memory write remains fail-soft");
+
+        // The directory stub is a directory, not a file.
+        let stub_id = crate::parser::ingest::qualified_id("probe", "src");
+        let (_, payload) = store
+            .get("probe", &stub_id)
+            .await
+            .expect("read the stub back")
+            .expect("the directory stub exists");
+        assert_eq!(payload.memory_type, "directory");
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/foo.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert!(
+            hits.iter().any(|h| h.id == "dir-governing-rule"),
+            "the directory-governing rule surfaces for an unindexed file inside it: {:?}",
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        let hit = hits
+            .iter()
+            .find(|h| h.id == "dir-governing-rule")
+            .expect("the rule is among the hits");
+        assert_eq!(hit.match_kind, GraphMatchKind::AncestorDirectory);
+    }
+
+    /// A memory linked by a `RELATES_TO` edge (not a `GOVERNS` edge) surfaces
+    /// for the file it relates to, with the `Related` match kind. The relation
+    /// is undirected, but the stored row is directed, so both orientations must
+    /// be queried (finding 1).
+    #[tokio::test]
+    async fn a_related_memory_surfaces_for_the_file_it_relates_to() {
+        let store = retired_test_store().await;
+
+        // Target first: the write-shape validator refuses edges whose target
+        // row does not exist yet.
+        let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        file_payload.location = "src/a.rs".to_string();
+        store
+            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], file_payload)
+            .await
+            .unwrap();
+        // The out-orientation: the memory declares the file, so the stored edge
+        // is `memory -RELATES_TO-> file`.
+        store
+            .upsert(
+                "probe",
+                "related-memory",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "related_to": ["probe::src/a.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        let hit = hits
+            .iter()
+            .find(|h| h.id == "related-memory")
+            .expect("the related memory surfaces: {:?}");
+        assert_eq!(hit.match_kind, GraphMatchKind::Related);
+        assert!(hit.explanation.contains("relates to"));
+    }
+
+    /// A stub materialised for an unindexed file is retired once the real node
+    /// is ingested and published, so the placeholder never shadows the real
+    /// tree (finding 3).
+    #[tokio::test]
+    async fn ingesting_the_real_node_retires_its_stub() {
+        let store = retired_test_store().await;
+
+        // The rule names a file that is not yet ingested: a stub materialises.
+        store
+            .upsert(
+                "probe",
+                "rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/not-ingested.rs"] })),
+            )
+            .await
+            .unwrap();
+        let stub_id = crate::parser::ingest::qualified_id("probe", "src/not-ingested.rs");
+        assert!(
+            store.get("probe", &stub_id).await.unwrap().is_some(),
+            "the stub exists before ingestion"
+        );
+
+        // The real node arrives, staged and published as generation 1.
+        let real_id =
+            crate::parser::ingest::generation_scoped_id("probe", 1, "src/not-ingested.rs");
+        store
+            .upsert(
+                "probe",
+                &real_id,
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store.publish_generation("probe", PROBE_SOURCE, 1).await.unwrap();
+
+        store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
+
+        assert!(
+            store.get("probe", &stub_id).await.unwrap().is_none(),
+            "the stub is retired once the real node is ingested"
+        );
+        assert!(
+            store.get("probe", &real_id).await.unwrap().is_some(),
+            "the real node remains"
         );
     }
 

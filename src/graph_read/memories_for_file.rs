@@ -28,9 +28,9 @@ pub const MAX_LIMIT: usize = 20;
 /// The variant order IS the primary ranking order (best first): an exact
 /// symbol outranks the file it lives in, which outranks a symbol reached
 /// through the file, which outranks an ancestor directory, which outranks a
-/// metadata declaration that never materialised an edge. `priority()` spells
-/// that order out so the sort key does not depend on `Ord`'s declaration
-/// order alone.
+/// `RELATES_TO` edge, which outranks a metadata declaration that never
+/// materialised an edge. `priority()` spells that order out so the sort key
+/// does not depend on `Ord`'s declaration order alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphMatchKind {
@@ -42,6 +42,8 @@ pub enum GraphMatchKind {
     SymbolTwoHop,
     /// The memory governs an ancestor directory of the queried file.
     AncestorDirectory,
+    /// The memory is linked to the queried target by a `RELATES_TO` edge.
+    Related,
     /// The memory declares the path in `metadata.governs` but no edge formed.
     MetadataFallback,
 }
@@ -54,7 +56,8 @@ impl GraphMatchKind {
             GraphMatchKind::ExactFile => 1,
             GraphMatchKind::SymbolTwoHop => 2,
             GraphMatchKind::AncestorDirectory => 3,
-            GraphMatchKind::MetadataFallback => 4,
+            GraphMatchKind::Related => 4,
+            GraphMatchKind::MetadataFallback => 5,
         }
     }
 }

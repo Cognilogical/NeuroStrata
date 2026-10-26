@@ -437,7 +437,9 @@ pub trait GraphRead: Send + Sync {
     /// `source` (a source key) selects the active generation to resolve node
     /// ids against; `None` uses the most recently published generation.
     /// `memory_types` is empty meaning "no type filter"; `limit` is capped at
-    /// `MAX_LIMIT` by the implementation.
+    /// `MAX_LIMIT` by the implementation. `exclude_ids` names memory ids to
+    /// drop, and is applied *before* `limit` so an excluded hit never crowds
+    /// out a live one.
     async fn memories_for_file(
         &self,
         namespace: &str,
@@ -446,6 +448,7 @@ pub trait GraphRead: Send + Sync {
         symbol: Option<&str>,
         include_ancestors: bool,
         memory_types: &[String],
+        exclude_ids: &[String],
         limit: usize,
     ) -> Result<Vec<MemoryHit>>;
 }
