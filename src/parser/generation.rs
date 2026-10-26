@@ -44,6 +44,14 @@ pub fn generation_scoped_id(namespace: &str, generation: u64, logical_path: &str
     )
 }
 
+/// The row key for one source's staged-ingestion pointer: the namespace and the
+/// source that owns the generation. The active pointer lives under this key so
+/// two worktrees of one repository (two sources, one namespace) never overwrite
+/// each other's published generation.
+pub fn generation_key(namespace: &str, source_key: &str) -> String {
+    format!("{}{}{}", namespace, NAMESPACE_SEPARATOR, source_key)
+}
+
 /// Splits a generation-scoped id back into its three segments.
 ///
 /// Returns `None` for anything that is not generation-scoped: a bare path
@@ -146,6 +154,19 @@ mod tests {
             generation_scoped_id("ns", 1, "src/lib.rs"),
             generation_scoped_id("ns", 2, "src/lib.rs"),
             "two generations of one namespace must not confluate on one id"
+        );
+    }
+
+    #[test]
+    fn two_sources_get_distinct_pointer_keys() {
+        assert_ne!(
+            generation_key("ns", "/a/worktree"),
+            generation_key("ns", "/b/worktree"),
+            "the active pointer is keyed by source, so worktree B cannot overwrite A"
+        );
+        assert_eq!(
+            generation_key("ns", "/a/worktree"),
+            "ns::/a/worktree"
         );
     }
 
