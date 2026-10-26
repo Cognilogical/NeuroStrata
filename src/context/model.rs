@@ -330,3 +330,28 @@ impl AsRef<ContextRequest> for ContextRequest {
 impl AsRef<ContextPlan> for ContextPlan {
     fn as_ref(&self) -> &Self { self }
 }
+
+
+impl EgressPolicy {
+    pub fn allow() -> Self {
+        Self { allowed: true, reason: None }
+    }
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self { allowed: false, reason: Some(reason.into()) }
+    }
+    pub fn enforce(&self) -> Result<(), String> {
+        if self.allowed {
+            Ok(())
+        } else {
+            Err(self.reason.clone().unwrap_or_else(|| "egress denied".into()))
+        }
+    }
+}
+
+/// Result of a qualified lookup, distinguishing denial from not-found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupStatus {
+    Found,
+    NotFound,
+    Denied,
+}
