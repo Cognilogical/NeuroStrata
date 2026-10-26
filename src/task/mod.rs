@@ -3085,6 +3085,8 @@ mod tests {
         assert!(!super::is_ours_hook("#!/bin/bash\necho hi\n"));
         assert!(!super::is_current_hook("#!/bin/bash\necho hi\n"));
     }
+
+
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 

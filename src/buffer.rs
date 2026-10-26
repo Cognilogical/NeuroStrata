@@ -463,7 +463,9 @@ pub async fn handle_append_log(
                 .unwrap_or_else(|| "default".to_string())
         });
     let cache_ns = crate::server::resolve_namespace(&store, &cache_ns).await;
-    crate::registry::cache_project_root(&store, Some(&emb), &cache_ns, &project_root.to_string_lossy()).await;
+    // Update-only here (no embedder): avoid an extra embedding on the hot
+    // append path; row creation happens via ingest/setup instead.
+    crate::registry::cache_project_root(&store, None, &cache_ns, &project_root.to_string_lossy()).await;
 
     // Build the success response
     let signals: Vec<Value> = crate::task::intent::detect_task_intents(&content)
