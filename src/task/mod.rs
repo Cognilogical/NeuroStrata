@@ -5003,8 +5003,8 @@ mod tests {
         async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
             self.inner.clear_ingested(namespace).await
         }
-        async fn relink_edges(&self, namespace: &str) -> anyhow::Result<usize> {
-            self.inner.relink_edges(namespace).await
+        async fn relink_edges(&self, namespace: &str, source_key: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace, source_key).await
         }
         async fn list(
             &self,
@@ -5116,8 +5116,8 @@ mod tests {
         async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
             self.inner.clear_ingested(namespace).await
         }
-        async fn relink_edges(&self, namespace: &str) -> anyhow::Result<usize> {
-            self.inner.relink_edges(namespace).await
+        async fn relink_edges(&self, namespace: &str, source_key: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace, source_key).await
         }
         async fn list(
             &self,

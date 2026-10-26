@@ -8,11 +8,12 @@
 //! from it.
 //!
 //! The store-level behaviour (two worktrees into one namespace → distinct
-//! generations; a failed staging leaves the previous generation active) is
-//! exercised by `src/parser/ingest.rs` and `src/store/ladybug.rs` unit tests,
-//! which drive the real LadybugStore. This target pins the id scheme and the
-//! hash/identity rules those tests depend on, and asserts the staged
-//! publication surface exists at the names the plan specifies.
+//! generations; a mid-stage failure aborts and keeps the previous generation
+//! active; superseded generations are filtered from reads) is exercised by
+//! `src/parser/ingest.rs` and `src/store/ladybug.rs` unit tests, which drive
+//! the real LadybugStore. This target pins the id/generation contract those
+//! tests depend on, by exercising the shipped helper functions directly rather
+//! than grepping source text for names that might drift from the behaviour.
 
 #![allow(dead_code)]
 
@@ -20,7 +21,7 @@
 mod generation;
 
 use generation::{
-    generation_scoped_id, logical_path_of, sha256_hex, split_scoped_id, symbol_id,
+    generation_key, generation_scoped_id, logical_path_of, sha256_hex, split_scoped_id, symbol_id,
     NAMESPACE_SEPARATOR,
 };
 
@@ -94,48 +95,42 @@ fn symbol_identity_is_the_body_hash_not_the_start_line() {
     assert_ne!(moved, symbol_id("a.rs", "functions", "main", &edited));
 }
 
-/// The staged publication surface must exist at the names the plan specifies,
-/// in the files the plan says carry them.
+/// A generation pointer is keyed by source (`generation_key`), not by namespace
+/// alone. This is the contract that keeps two worktrees of one repository from
+/// overwriting each other's active generation: the two source keys produce
+/// distinct pointer ids, so publishing one source never flips the other's
+/// active pointer.
 #[test]
-fn staged_publication_surface_exists() {
-    use std::path::Path;
-
-    for path in [
-        "src/parser/generation.rs",
-        "src/parser/ingest.rs",
-        "src/store/ladybug.rs",
-        "src/traits.rs",
-    ] {
-        assert!(Path::new(path).exists(), "source file must exist: {path}");
-    }
-
-    let traits = std::fs::read_to_string("src/traits.rs").expect("traits.rs readable");
-    for name in [
-        "begin_generation",
-        "publish_generation",
-        "abort_generation",
-        "active_generation",
-        "generation_nodes",
-    ] {
-        assert!(traits.contains(name), "traits.rs must declare `{name}`");
-    }
-
-    let ingest = std::fs::read_to_string("src/parser/ingest.rs").expect("ingest.rs readable");
-    for key in [
-        "source_identity",
-        "index_generation",
-        "file_sha256",
-        "span_sha256",
-    ] {
-        assert!(
-            ingest.contains(key),
-            "ingest.rs must write `{key}` metadata"
-        );
-    }
-
-    let store = std::fs::read_to_string("src/store/ladybug.rs").expect("ladybug.rs readable");
-    assert!(
-        store.contains("IngestGeneration"),
-        "ladybug.rs must persist the generation pointer table"
+fn source_scoped_generation_keys_keep_worktrees_apart() {
+    let a = generation_key("shared-ns", "/worktrees/a");
+    let b = generation_key("shared-ns", "/worktrees/b");
+    assert_ne!(
+        a, b,
+        "two sources must own distinct active-generation pointers"
     );
+    assert_eq!(a, "shared-ns::/worktrees/a");
+    assert_eq!(b, "shared-ns::/worktrees/b");
+}
+
+/// A superseded generation's rows are told apart from the live one by the
+/// middle segment. The store's read filters drop any generation-scoped id whose
+/// `(namespace, generation)` is not in the active set, and that filter is
+/// exactly `split_scoped_id` — so this pins the behaviour the filter relies on.
+#[test]
+fn superseded_generation_rows_are_distinguishable() {
+    let stale = generation_scoped_id("ns", 1, "src/lib.rs");
+    let live = generation_scoped_id("ns", 2, "src/lib.rs");
+    assert_ne!(stale, live, "a superseded row must not share the live id");
+    assert_eq!(
+        split_scoped_id(&stale),
+        Some(("ns".to_string(), 1, "src/lib.rs".to_string()))
+    );
+    assert_eq!(
+        split_scoped_id(&live),
+        Some(("ns".to_string(), 2, "src/lib.rs".to_string()))
+    );
+    // Both resolve to the same logical path, so a rule naming the path still
+    // re-attaches — but only the active generation's row is reachable.
+    assert_eq!(logical_path_of(&stale), "src/lib.rs");
+    assert_eq!(logical_path_of(&live), "src/lib.rs");
 }

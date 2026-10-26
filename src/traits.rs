@@ -284,33 +284,48 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// and re-creates every code node, taking those edges with it -- and the
     /// rules pointing at that code are not rewritten, so the links stay lost
     /// until something replays them (bead neurostrata-sij).
-    async fn relink_edges(&self, namespace: &str) -> Result<usize>;
+    async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize>;
 
     /// Begin a staged ingestion: allocate a fresh generation for this namespace
-    /// and return it. Nodes written against it are invisible to edge resolution
-    /// until `publish_generation` flips the active pointer onto it.
+    /// and source and return it. Nodes written against it are invisible to edge
+    /// resolution until `publish_generation` flips the active pointer onto it.
+    ///
+    /// The generation is keyed by `(namespace, source_key)`, so two concurrent
+    /// worktrees of one repository (two sources) never overwrite each other's
+    /// active pointer.
     ///
     /// Default `0` = a store without staged ingestion publishes as it writes.
-    async fn begin_generation(&self, _namespace: &str) -> Result<u64> {
+    async fn begin_generation(&self, _namespace: &str, _source_key: &str) -> Result<u64> {
         Ok(0)
     }
 
-    /// Atomically make `generation` the active generation for `namespace`. The
-    /// previous active generation's nodes remain as history, unreachable through
-    /// edge resolution.
-    async fn publish_generation(&self, _namespace: &str, _generation: u64) -> Result<()> {
+    /// Atomically make `generation` the active generation for `namespace` and
+    /// `source_key`. The previous active generation's nodes remain as history,
+    /// unreachable through edge resolution.
+    async fn publish_generation(
+        &self,
+        _namespace: &str,
+        _source_key: &str,
+        _generation: u64,
+    ) -> Result<()> {
         Ok(())
     }
 
     /// Discard a staged generation's nodes, leaving the previous active
     /// generation untouched. Used when a build fails midway so a half-built
     /// tree never becomes visible.
-    async fn abort_generation(&self, _namespace: &str, _generation: u64) -> Result<()> {
+    async fn abort_generation(
+        &self,
+        _namespace: &str,
+        _source_key: &str,
+        _generation: u64,
+    ) -> Result<()> {
         Ok(())
     }
 
-    /// The generation currently active for `namespace` (`0` = none published).
-    async fn active_generation(&self, _namespace: &str) -> Result<u64> {
+    /// The generation currently active for `namespace` and `source_key`
+    /// (`0` = none published).
+    async fn active_generation(&self, _namespace: &str, _source_key: &str) -> Result<u64> {
         Ok(0)
     }
 

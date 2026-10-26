@@ -1185,14 +1185,12 @@ fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
     Ok(rows.next().is_some())
 }
 
-/// The generation currently active for a namespace, read on the given
-/// connection (`0` = none published). A query that cannot run reports `0`
-/// rather than failing: resolution degrades to "no generation" instead of
-/// erroring out of a write it is only trying to guide.
-fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
+/// The generation currently active for one source (`0` = none published).
+fn active_generation_of_source(conn: &Connection, namespace: &str, source_key: &str) -> u64 {
+    let key = crate::parser::ingest::generation_key(namespace, source_key);
     let query = format!(
         "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.active_generation",
-        escape_ladybug_string(namespace)
+        escape_ladybug_string(&key)
     );
     match conn.query(&query) {
         Ok(mut rows) => match rows.next() {
@@ -1201,6 +1199,72 @@ fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
         },
         Err(_) => 0,
     }
+}
+
+/// The most recently published generation for a namespace across all sources.
+/// Used to resolve a declared edge target on write, where the source is not
+/// carried: the latest tree is the best available answer. A query that cannot
+/// run reports `0` rather than failing, so resolution degrades to "no
+/// generation" instead of erroring out of a write it is only trying to guide.
+fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    match conn.query(&query) {
+        Ok(rows) => {
+            let mut latest: u64 = 0;
+            for row in rows {
+                if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+                    if g > 0 {
+                        latest = latest.max(g as u64);
+                    }
+                }
+            }
+            latest
+        }
+        Err(_) => 0,
+    }
+}
+
+/// The set of active generations for a namespace, one per source that has
+/// published. Read surfaces (`list`, `export_graph`) drop rows from a
+/// superseded generation against this set.
+fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections::HashSet<u64> {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut gens = std::collections::HashSet::new();
+    if let Ok(rows) = conn.query(&query) {
+        for row in rows {
+            if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+                if g > 0 {
+                    gens.insert(g as u64);
+                }
+            }
+        }
+    }
+    gens
+}
+
+/// The active `(namespace, generation)` pairs across every namespace, for the
+/// whole-graph read surface (`export_graph`). A generation-scoped node whose
+/// pair is absent was superseded by a later publish and is dropped.
+fn all_active_generations(conn: &Connection) -> std::collections::HashSet<(String, u64)> {
+    let query = "MATCH (g:IngestGeneration) WHERE g.active_generation > 0 RETURN g.namespace, g.active_generation";
+    let mut pairs = std::collections::HashSet::new();
+    if let Ok(rows) = conn.query(query) {
+        for row in rows {
+            let ns = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+            if let Ok(g) = format!("{}", row[1]).parse::<i64>() {
+                if g > 0 {
+                    pairs.insert((ns, g as u64));
+                }
+            }
+        }
+    }
+    pairs
 }
 
 /// The ids a namespace actually holds, indexed so a declaration can be resolved
@@ -1569,11 +1633,16 @@ impl VectorStore for LadybugStore {
             let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version LONG, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
             conn.query(create_candidates_table).ok();
 
-            // Source-scoped staged ingestion: the generation pointer per
-            // namespace. id = namespace (primary key), `counter` allocates the
-            // next generation, `active_generation` names the published one
-            // (0 = none). The pointer flip is the atomic publish step.
-            let create_generation_table = "CREATE NODE TABLE IngestGeneration (id STRING, namespace STRING, active_generation INT64, counter INT64, PRIMARY KEY (id))";
+            // Source-scoped staged ingestion. Two row kinds live in this table:
+            //   * the counter row, `id = namespace`, whose `counter` allocates
+            //     the next generation number (shared across sources so the
+            //     generation-scoped node ids never collide);
+            //   * a pointer row per source, `id = namespace::source_key`, whose
+            //     `active_generation` names that source's published generation
+            //     (0 = none). The pointer flip is the atomic publish step, and
+            //     keying it by source is what keeps worktree B from overwriting
+            //     worktree A's active generation.
+            let create_generation_table = "CREATE NODE TABLE IngestGeneration (id STRING, namespace STRING, source_key STRING, active_generation INT64, counter INT64, PRIMARY KEY (id))";
             conn.query(create_generation_table).ok();
 
             Ok(())
@@ -2206,19 +2275,19 @@ impl VectorStore for LadybugStore {
         self.dirty.is_set()
     }
 
-    async fn relink_edges(&self, namespace: &str) -> Result<usize> {
+    async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize> {
         // Declarations live in each memory's metadata, which survives ingestion;
         // only the edges themselves are lost with the nodes. Replaying them is
         // therefore a read of what is already stored, not a guess.
         let memories = self.list(namespace, None, None).await?;
-        let active_gen = self.active_generation(namespace).await?;
+        let active_gen = self.active_generation(namespace, source_key).await?;
 
         // Ids stored before node ids became repository-relative are absolute, so
         // a rule written to match them declares C:/proj/src/foo.rs and matches
         // nothing now. Resolve those by path suffix against the ids that do
         // exist, and leave an ambiguous suffix alone rather than guess. Only the
         // active generation's nodes are reachable: a rule always re-attaches to
-        // the published tree, never to a superseded one.
+        // this source's published tree, never to a superseded one.
         let known = KnownIds::active(memories.iter().map(|m| m.id.as_str()), active_gen);
 
         // Grouped by relationship because the type is part of the statement and
@@ -2235,6 +2304,16 @@ impl VectorStore for LadybugStore {
             // may still point at it.
             if is_retired(&memory.payload.metadata) {
                 continue;
+            }
+            // An ingested node from a superseded generation must not have its
+            // structural (`contained_by`) edges replayed: only this source's
+            // active generation is live. Rules, facts and tasks (never
+            // generation-scoped) are always live.
+            if memory.payload.user_id == "auto-ingestor" {
+                match crate::parser::ingest::split_scoped_id(&memory.id) {
+                    Some((_, gen, _)) if gen == active_gen => {}
+                    _ => continue,
+                }
             }
             // Emit any shape warnings from this memory's metadata.
             let warnings = write_shape_warnings(&memory.payload);
@@ -2299,15 +2378,19 @@ impl VectorStore for LadybugStore {
         .await
     }
 
-    async fn begin_generation(&self, namespace: &str) -> Result<u64> {
+    async fn begin_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
         let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
         self.write_with_deadline("beginning a staging generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
+            let safe_sk = escape_ladybug_string(&source_key);
 
             // Read the current counter (default 0), then write counter + 1 in
             // the same write turn. The single-writer lock serialises this
             // against every other store write, so the read and the bump are one
-            // atomic step and no two begins hand out the same generation.
+            // atomic step and no two begins hand out the same generation. The
+            // counter is shared across sources (keyed by namespace alone), so a
+            // generation number never collides between two worktrees.
             let read = format!(
                 "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.counter",
                 safe_ns
@@ -2321,24 +2404,54 @@ impl VectorStore for LadybugStore {
             let next = (current.max(0) as u64).saturating_add(1);
 
             let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.counter = {}, g.active_generation = 0 ON MATCH SET g.counter = {}",
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '', g.counter = {}, g.active_generation = 0 ON MATCH SET g.counter = {}",
                 safe_ns, safe_ns, next, next
             );
             conn.query(&write)?;
+
+            // Ensure this source has a pointer row. Its active generation is
+            // left untouched here: it stays on the last published generation
+            // until `publish_generation` flips it.
+            let pointer = format!(
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '{}', g.counter = 0, g.active_generation = 0",
+                escape_ladybug_string(&crate::parser::ingest::generation_key(
+                    &namespace,
+                    &source_key
+                )),
+                safe_ns,
+                safe_sk
+            );
+            conn.query(&pointer)?;
+
             Ok(next)
         })
         .await
     }
 
-    async fn publish_generation(&self, namespace: &str, generation: u64) -> Result<()> {
+    async fn publish_generation(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<()> {
         let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
         self.write_with_deadline("publishing a staging generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
-            // The flip is one statement: the active pointer moves to `generation`
-            // and the previous generation's rows stay as history.
+            let safe_sk = escape_ladybug_string(&source_key);
+            // The flip is one statement on this source's pointer row: the active
+            // pointer moves to `generation` and the previous generation's rows
+            // stay as history. Another source's pointer is untouched.
             let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.counter = {}, g.active_generation = {} ON MATCH SET g.active_generation = {}",
-                safe_ns, safe_ns, generation, generation, generation
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '{}', g.counter = 0, g.active_generation = {} ON MATCH SET g.active_generation = {}",
+                escape_ladybug_string(&crate::parser::ingest::generation_key(
+                    &namespace,
+                    &source_key
+                )),
+                safe_ns,
+                safe_sk,
+                generation,
+                generation
             );
             conn.query(&write)?;
             Ok(())
@@ -2346,8 +2459,14 @@ impl VectorStore for LadybugStore {
         .await
     }
 
-    async fn abort_generation(&self, namespace: &str, generation: u64) -> Result<()> {
+    async fn abort_generation(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<()> {
         let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
         self.write_with_deadline("aborting a staging generation", move |conn| {
             // A staged node's id is `ns::<generation>::<path>`, so every row of
             // this generation shares the prefix. Nothing else matches it, and
@@ -2358,15 +2477,31 @@ impl VectorStore for LadybugStore {
                 escape_ladybug_string(&prefix)
             );
             conn.query(&query)?;
+
+            // Defensive: if this source's pointer somehow already names the
+            // aborted generation (abort is normally pre-publish), clear it so
+            // the superseded generation is never reachable.
+            let clear = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.active_generation = {} SET g.active_generation = 0",
+                escape_ladybug_string(&crate::parser::ingest::generation_key(
+                    &namespace,
+                    &source_key
+                )),
+                generation
+            );
+            conn.query(&clear)?;
             Ok(())
         })
         .await
     }
 
-    async fn active_generation(&self, namespace: &str) -> Result<u64> {
+    async fn active_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
         let namespace = namespace.to_string();
-        self.with_conn(move |conn| Ok(active_generation_of(conn, &namespace)))
-            .await
+        let source_key = source_key.to_string();
+        self.with_conn(move |conn| {
+            Ok(active_generation_of_source(conn, &namespace, &source_key))
+        })
+        .await
     }
 
     async fn generation_nodes(&self, namespace: &str, generation: u64) -> Result<Vec<String>> {
@@ -2394,6 +2529,14 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
+            // The active generations for this namespace, read once so every
+            // generation-scoped row can be checked against them below. A row
+            // from a superseded generation is dropped; a row that is not
+            // generation-scoped (a rule, fact, task, or legacy id) is always
+            // kept, so the full-DB diagnostic callers keep seeing everything
+            // they always did.
+            let active_gens = active_generations_of(conn, &namespace);
+
             // Build WHERE clause with optional filters (R15: push into Cypher).
             let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
             if let Some(ref uid) = user_id {
@@ -2411,6 +2554,11 @@ impl VectorStore for LadybugStore {
 
             for row in result {
                 let id: String = format!("{}", row[0]);
+                if let Some((_, gen, _)) = crate::parser::ingest::split_scoped_id(&id) {
+                    if !active_gens.contains(&gen) {
+                        continue; // superseded generation: not reachable
+                    }
+                }
                 let content: String = format!("{}", row[1]);
                 let uid: String = format!("{}", row[2]);
                 let memory_type: String = format!("{}", row[3]);
@@ -2531,9 +2679,12 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().timestamp();
 
-            // 1. Fetch all nodes
+            // 1. Fetch all nodes. Generation-scoped nodes from a superseded
+            //    generation are dropped against the live `(namespace, gen)`
+            //    set read once below, matching `list`'s superseded filter.
             let mut nodes = Vec::new();
             let mut retired_ids = std::collections::HashSet::new();
+            let active_gens = all_active_generations(conn);
             let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
             let mut result_nodes = conn.query(query_nodes)?;
 
@@ -2543,6 +2694,16 @@ impl VectorStore for LadybugStore {
                 let memory_type = if let lbug::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
                 let content = if let lbug::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
                 let location = if let lbug::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
+
+                // A generation-scoped node whose `(namespace, generation)` is not
+                // live was superseded: excluded from the export and its edges
+                // dropped below (via `retired_ids`), exactly as `list` does.
+                if let Some((_, gen, _)) = crate::parser::ingest::split_scoped_id(&id) {
+                    if !active_gens.contains(&(namespace.clone(), gen)) {
+                        retired_ids.insert(id.clone());
+                        continue;
+                    }
+                }
 
                 let mut absolute_path = "".to_string();
                 let mut domain = None;
@@ -3484,6 +3645,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The canonical source key used by the relink/publish seed helpers. A real
+    /// ingest derives it from the directory path (`source_key_for`); the unit
+    /// tests pin a stable literal so the source-scoped pointer is deterministic.
+    const PROBE_SOURCE: &str = "/worktrees/probe";
+
     /// The resolution rule as every caller now reaches it: build the index
     /// once, then ask it.
     fn resolve(declared: &str, known: &[String]) -> Option<String> {
@@ -3989,7 +4155,7 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        store.relink_edges("probe").await.expect("relink");
+        store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
 
         assert_eq!(
             governs_edges_from(&store, "live-rule").await,
@@ -4145,7 +4311,7 @@ eurostrata\src\daemon.rs",
             )
             .await
             .unwrap();
-        store.publish_generation("probe", 1).await.unwrap();
+        store.publish_generation("probe", PROBE_SOURCE, 1).await.unwrap();
         store
             .upsert(
                 "probe",
@@ -4315,7 +4481,7 @@ eurostrata\src\daemon.rs",
                 .expect("seed a memory");
         }
         store
-            .publish_generation("probe", 1)
+            .publish_generation("probe", PROBE_SOURCE, 1)
             .await
             .expect("publish generation 1");
         store
@@ -4341,7 +4507,7 @@ eurostrata\src\daemon.rs",
     async fn relinking_replays_every_declaration_once() {
         let store = store_with_two_declarations().await;
 
-        let created = store.relink_edges("probe").await.expect("relink");
+        let created = store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
         assert_eq!(created, 2, "both declarations name a node that exists");
         assert_eq!(governs_count(&store).await, 2);
     }
@@ -4354,9 +4520,9 @@ eurostrata\src\daemon.rs",
     async fn relinking_twice_creates_nothing_the_second_time() {
         let store = store_with_two_declarations().await;
 
-        assert_eq!(store.relink_edges("probe").await.expect("first"), 2);
+        assert_eq!(store.relink_edges("probe", PROBE_SOURCE).await.expect("first"), 2);
         assert_eq!(
-            store.relink_edges("probe").await.expect("second"),
+            store.relink_edges("probe", PROBE_SOURCE).await.expect("second"),
             0,
             "the edges already exist, so none are created"
         );
@@ -4463,8 +4629,89 @@ eurostrata\src\daemon.rs",
             .await
             .expect("seed a memory");
 
-        assert_eq!(store.relink_edges("probe").await.expect("relink"), 0);
+        assert_eq!(store.relink_edges("probe", PROBE_SOURCE).await.expect("relink"), 0);
         assert_eq!(governs_count(&store).await, 0);
+    }
+
+    /// A superseded generation's rows are hidden from the read surfaces once a
+    /// later publish flips the source's active pointer, while the live rows
+    /// remain reachable. Exercises the source-scoped pointer and the
+    /// `list`/`export_graph` superseded filters directly (finding 6).
+    #[tokio::test]
+    async fn superseded_generations_are_hidden_from_list_and_export() {
+        let store = retired_test_store().await;
+        let zero = vec![0.0f32; 4];
+
+        // Stage and publish generation 1 for source A.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen1_id,
+                zero.clone(),
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.active_generation("probe", "source-a").await.unwrap(),
+            1
+        );
+
+        // A second publish of the same source supersedes generation 1.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen2_id,
+                zero.clone(),
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.active_generation("probe", "source-a").await.unwrap(),
+            2
+        );
+
+        // list: only the active generation's row is reachable.
+        let listed = store.list("probe", None, None).await.unwrap();
+        let listed_ids: Vec<String> = listed.into_iter().map(|r| r.id).collect();
+        assert!(listed_ids.contains(&gen2_id), "the active generation is listed");
+        assert!(
+            !listed_ids.contains(&gen1_id),
+            "the superseded generation is not listed"
+        );
+
+        // export_graph: the same filter drops the superseded row.
+        let graph = store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        let exported_ids: Vec<String> = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            exported_ids.iter().any(|id| id == &gen2_id),
+            "the active generation is exported"
+        );
+        assert!(
+            !exported_ids.iter().any(|id| id == &gen1_id),
+            "the superseded generation is not exported"
+        );
     }
 
     /// `get` reads back the embedding it stored.
