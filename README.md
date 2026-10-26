@@ -58,15 +58,29 @@ Stop acting as the continuity layer between agent sessions.
 ## Get started
 
 ```bash
-# Build (Rust + CMake + C++20 for the vendored LadybugDB engine)
+# 1. Build (needs Rust + CMake + C++20 for the vendored LadybugDB engine)
 scripts/build.sh
 
-# Wire the guard and task gate into this repo (hooks install is git-only;
-# the done-funnel and guard still enforce without git)
+# 2. Install the daemon as a user service (run from project root)
+neurostrata-mcp setup                 # Linux: systemd; macOS/Windows: manual
+
+# 3. Initialize / wire this repo
+neurostrata_bootstrap                 # new project
+# neurostrata_task_setup              # existing project
+
+# 4. Install the pre-push gate (git only; the done-funnel still works without git)
 neurostrata-mcp hooks install
-neurostrata_bootstrap          # new project
-# neurostrata_task_setup        # existing project
 ```
+
+**What `setup` actually does:** reads your repo root, writes
+`~/.config/systemd/user/neurostrata.service`, enables the backup timer, and
+waits for daemon health. It needs `scripts/backup.sh` at your repo root — if
+that's missing it exits with the fix instruction rather than failing silently.
+
+**First-time agent / user:** You provide the `setup` command. One explicit
+instruction to the agent is enough — the agent does not auto-discover it.
+After that, `neurostrata-mcp daemon` starts automatically, and the MCP
+connection to `127.0.0.1:34343` works without further setup.
 
 The daemon listens on loopback only (`127.0.0.1:34343`) and serves `/validate`, `/tasks/gate`, `/graph`, `/mcp`, `/bus/metrics`, `/backup`, `/shutdown` — all inside the machine.
 
