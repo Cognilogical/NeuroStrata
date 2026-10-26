@@ -12,3 +12,4 @@ fn t8_complete() {}
 fn t9_complete() {}
 fn t10_complete() {}
 fn t11_complete() {}
+fn t12_complete() {}
