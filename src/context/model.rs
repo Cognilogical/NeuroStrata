@@ -322,3 +322,11 @@ impl ContextPlan {
         }
     }
 }
+
+
+impl AsRef<ContextRequest> for ContextRequest {
+    fn as_ref(&self) -> &Self { self }
+}
+impl AsRef<ContextPlan> for ContextPlan {
+    fn as_ref(&self) -> &Self { self }
+}

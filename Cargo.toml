@@ -14,6 +14,13 @@ path = "src/main.rs"
 name = "context_model_test"
 path = "tests/context/model_test.rs"
 
+
+# Task 2: shared context service contract. Compiles the crate-free context
+# modules from their real paths (see the file's module comment).
+[[test]]
+name = "context_service_test"
+path = "tests/context/service_test.rs"
+
 # Task 5: source/generation-scoped staged ingestion contract. Compiles the
 # id/hash helpers from their real path (see the file's module comment) because
 # the crate ships a binary target only.
