@@ -511,9 +511,10 @@ export async function initialize(ctx: PluginContext): Promise<void> {
     lastError: undefined,
   });
 
-  // Register tool wrappers for write/edit
-  ctx.tools.wrap("write", wrapWriteEdit);
-  ctx.tools.wrap("edit", wrapWriteEdit);
+  // Register tool wrappers for mutating tools: write, edit, bash
+  ctx.tools.wrap("write", wrapMutatingTool);
+  ctx.tools.wrap("edit", wrapMutatingTool);
+  ctx.tools.wrap("bash", wrapMutatingTool);
 
   // Register turn hook for intent detection
   ctx.conversation.onTurnEnd(onTurnEnd);
@@ -618,6 +619,81 @@ async function wrapWriteEdit(
     };
   }
 
+  return next(call);
+}
+
+/**
+ * AC2 State-check wrapper: blocks mutating tools when session/task/worktree
+ * state shows Unpreflighted/BreathRequired (no active task claim or note
+ * missing after 5+ mutations).
+ */
+function callState(call: ToolCall): {
+  session_id: string;
+  active_task_id: string | null;
+  worktree: string;
+} {
+  const args = asRecord(call.args);
+  return {
+    session_id: asString(args.session_id) ?? "unknown",
+    active_task_id: asString(args.active_task_id) ?? null,
+    worktree: asString(args.worktree) ?? process.cwd(),
+  };
+}
+
+async function wrapMutatingTool(
+  call: ToolCall,
+  next: (call: ToolCall) => Promise<ToolResult>,
+): Promise<ToolResult> {
+  if (!config.strictMode) {
+    return next(call);
+  }
+
+  const actionType = call.name;
+  const payload = JSON.stringify(call.args);
+  const cwd = process.cwd();
+  const { session_id, active_task_id, worktree } = callState(call);
+
+  try {
+    const text = await mcpClient.callTool("neurostrata_guard_validate", {
+      namespace: config.namespace,
+      session_id,
+      active_task_id,
+      worktree,
+      action_type: actionType,
+      payload,
+      cwd,
+      is_mutating: true,
+      use_sandbox: false,
+    });
+
+    const result = parseGuardValidate(text);
+    if (result.verdict === "reject") {
+      const reason =
+        result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
+      requireCtx().logger.warn("Guard rejected mutating tool", {
+        actionType,
+        session_id,
+        active_task_id,
+        worktree,
+        reason,
+        rule_ids: result.rule_ids,
+      });
+      return {
+        success: false,
+        error: `Zero-Action Start violation: ${reason}`,
+        data: { guard_verdict: result, degraded: false },
+      };
+    }
+  } catch (err) {
+    const message = String(err);
+    setStatus({ state: "unavailable", lastError: message });
+    requireCtx().logger.error("Guard validation failed", { error: message });
+    return {
+      success: false,
+      error: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
+      data: { degraded: true, state: status.state },
+    };
+  }
   return next(call);
 }
 
