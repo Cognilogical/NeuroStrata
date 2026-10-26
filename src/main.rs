@@ -13,6 +13,7 @@ mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
+mod model_downloader;
 mod learning;
 mod parser;
 mod recall_metrics;
@@ -157,6 +158,15 @@ enum Commands {
 
     /// Stop a running daemon so it checkpoints before exiting
     Shutdown,
+
+    /// Fetch a pinned Laya ONNX model bundle (checksum-verified, supply-chain protected)
+    Laya {
+        /// Model identifier to fetch (e.g., v1.11.1)
+        model: Option<String>,
+        /// Target bundle directory (default: artifacts/laya-bundle)
+        #[arg(long)]
+        out_dir: Option<String>,
+    },
 
     /// Report what an upgrade left inconsistent, changing nothing
     /// Report what an upgrade left inconsistent, changing nothing. Scoped and
@@ -341,6 +351,11 @@ pub(crate) enum HooksCommands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Write the pre-commit hook into the directory git runs hooks from
+    /// (core.hooksPath honored): stamps session_queries.json and task.graph_queried
+    /// when committing files in governed modules. Optional — only run on git repos.
+    InstallPreCommit,
 }
 
 /// What a health probe actually found.
@@ -762,6 +777,16 @@ fn set_hook_executable(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_hook_executable(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Install the pre-commit hook; non-git repos skip this (session ledger is primary mechanism).
+fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let hooks_dir = crate::task::git_hooks_dir(root);
+    if !hooks_dir.is_dir() { std::fs::create_dir_all(&hooks_dir)?; }
+    let target = hooks_dir.join("pre-commit");
+    std::fs::write(&target, crate::task::SCAFFOLDED_PRE_COMMIT_HOOK)?;
+    set_hook_executable(&target)?;
+    Ok(target)
 }
 
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
@@ -2470,6 +2495,12 @@ async fn run() -> anyhow::Result<()> {
                 record_final_checkpoint(&outcome);
                 outcome?;
             }
+            Commands::Laya { model, out_dir } => {
+                let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
+                let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
+                crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(&model_id, &target_dir).await?;
+                println!("Laya model '{}' fetched and verified to '{}'", model_id, target_dir);
+            }
             Commands::Run { program, args } => {
                 // Deliberate, named, and it never touches the database.
                 match std::process::Command::new(&program).args(&args).status() {
@@ -3127,6 +3158,31 @@ async fn run() -> anyhow::Result<()> {
                         }
                     }
                 }
+                HooksCommands::InstallPreCommit => {
+                    let root = git_toplevel()
+                        .or_else(|| std::env::current_dir().ok())
+                        .unwrap();
+                    if !root.join(".git").exists() {
+                        eprintln!(
+                            "ERROR: {:?} is not a git repository; there is nowhere to install the pre-commit hook.",
+                            root
+                        );
+                        std::process::exit(1);
+                    }
+                    match install_pre_commit_hook(&root) {
+                        Ok(target) => {
+                            println!(
+                                "Installed the NeuroStrata pre-commit graph ledger at {}.",
+                                target.display()
+                            );
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
             },
             other => {
                 let graph_target = if let Commands::ExportGraph {
@@ -3256,6 +3312,15 @@ async fn run() -> anyhow::Result<()> {
                 match other {
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
+                    }
+                    Commands::Laya { model, out_dir } => {
+                        let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
+                        let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
+                        let _ = crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(
+                            &model_id,
+                            &target_dir,
+                        )
+                        .await;
                     }
                     Commands::Namespaces => {
                         run_namespaces(&read).await?;

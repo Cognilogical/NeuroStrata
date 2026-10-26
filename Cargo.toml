@@ -37,7 +37,7 @@ regex = "1.13"
 cxx = "=1.0.138"
 lbug = "0.20.4"
 axum = "0.8"
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
 # The crash breadcrumb needs the signal and file syscalls directly; it was
 # already in the tree as a transitive dependency, so this adds no download.
 libc = "0.2"
