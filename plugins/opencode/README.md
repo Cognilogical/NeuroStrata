@@ -64,8 +64,9 @@ Or add to your OpenCode config:
 {
   "neurostrata": {
     "namespace": "NeuroStrata",
-    "guardEndpoint": "http://localhost:8080/mcp",
+    "endpoint": "http://127.0.0.1:34343/mcp",
     "strictMode": true,
+    "requestTimeoutMs": 5000,
     "intentDetection": {
       "enabled": true,
       "injectReminder": true
@@ -74,18 +75,53 @@ Or add to your OpenCode config:
 }
 ```
 
+`endpoint` (or the legacy `guardEndpoint`) is the daemon's `/mcp` route. The
+daemon listens on `:34343` — the setup default — not `:8080`.
+
+## Authentication
+
+The daemon requires a bearer token on every route except `/health`. The shim
+attaches it automatically:
+
+- `bearerToken` in the plugin config wins when it is set.
+- Otherwise the token is read from `~/.config/neurostrata/daemon.token`
+  (override the path with `tokenFile`). The daemon writes that file with
+  mode `0600` on first start.
+- A missing token is **not** an anonymous request: the shim records the
+  adapter as degraded and says so.
+
+## Degraded state
+
+`adapterStatus()` reports what the shim could actually reach:
+
+| state | meaning |
+|---|---|
+| `uninitialized` | `initialize()` has not run |
+| `ready` | the core answered `tools/list` and exposes every tool this shim needs |
+| `degraded` | the core is reachable but does not expose a tool this shim needs (`missingTools`) |
+| `unavailable` | the core could not be reached, or the guard could not answer |
+
+A degraded or unavailable core fails the guard closed in strict mode: the
+write is refused with the reason, not waved through.
+
 ## API
 
 ### `validateBeforeWriteEdit(actionType, payload, cwd)`
-Calls `neurostrata_guard_validate` with the action. Returns `{ allowed: boolean, reason?: string, verdict }`.
+Calls `neurostrata_guard_validate` with the action over `tools/call`, unwraps
+`result.content[].text` and reads the verdict from its `bucket`. Returns
+`{ allowed: boolean, reason?: string, verdict }`.
 
 ### `detectIntentsAndNudge(text, turnHasTaskCreate)`
-Runs `detect_task_intents` on the text. If signals found and `turnHasTaskCreate` is false, returns a nudge message to inject.
+Runs the lexical detector on the text. If signals are found and
+`turnHasTaskCreate` is false, returns a nudge message to inject. The core
+exposes no intent-detection tool — the earlier `neurostrata_detect_task_intents`
+call was a phantom the core answered with "Unknown tool" — so the detector
+runs in the shim and nothing is written.
 
 ## Dependencies
 
-- NeuroStrata MCP server running (provides `neurostrata_guard_validate` and `neurostrata_task_create`)
-- Rust core: `src/task/intent.rs::detect_task_intents` (compiled into MCP tools)
+- NeuroStrata daemon running on `:34343` (provides `neurostrata_guard_validate` and `neurostrata_task_create`)
+- Rust core: `src/task/intent.rs::detect_task_intents` (mirrored locally in the shim)
 - M4 Honest Guard: `src/guard/validator.rs::GuardValidator::validate`
 
 ## Honest Advertising

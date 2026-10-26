@@ -7,6 +7,13 @@ edition = "2021"
 name = "neurostrata-mcp"
 path = "src/main.rs"
 
+# The context DTO contract lives in its own integration test target: the
+# crate ships a binary only, so the test compiles the module from its real
+# source path instead of importing a library that does not exist.
+[[test]]
+name = "context_model_test"
+path = "tests/context/model_test.rs"
+
 [dependencies]
 tokio = { version = "1.53", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
