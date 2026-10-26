@@ -21,6 +21,11 @@ path = "tests/context/model_test.rs"
 name = "context_service_test"
 path = "tests/context/service_test.rs"
 
+
+[[test]]
+name = "context_freshness_test"
+path = "tests/context/freshness_test.rs"
+
 # Task 5: source/generation-scoped staged ingestion contract. Compiles the
 # id/hash helpers from their real path (see the file's module comment) because
 # the crate ships a binary target only.
