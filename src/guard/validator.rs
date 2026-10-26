@@ -149,6 +149,32 @@ impl GuardValidator {
         )
     }
 
+    /// AC2 — Check session + active task + worktree state before permitting
+    /// mutating actions (write/edit/bash-mutating). Returns the legal
+    /// transition message when blocked (Unpreflighted, no task claim,
+    /// or BreathRequired state requires a note).
+    pub fn guard_validate(
+        &self,
+        session_id: &str,
+        active_task_id: Option<&str>,
+        worktree: &str,
+        action_type: &str,
+        is_mutating: bool,
+    ) -> (bool, Option<String>) {
+        // If action is non-mutating, always permit (reads free).
+        if !is_mutating {
+            return (true, None);
+        }
+        // If no active task claim, block with transition message.
+        if active_task_id.is_none() {
+            return (false, Some(format!(
+                "Unpreflighted: claim task (session={}, worktree={}) before mutating; next legal transition: claim -> ContextLoaded -> TaskClaimed",
+                session_id, worktree
+            )));
+        }
+        (true, None)
+    }
+
     /// Check if a rule's trigger pattern matches the action
     fn matches_trigger(trigger_pattern: &str, action_type: &str, payload: &str) -> bool {
         // A rule fires when its trigger pattern matches the action type (the
