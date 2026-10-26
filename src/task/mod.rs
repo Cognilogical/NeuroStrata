@@ -1850,7 +1850,37 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
+# neurostrata-hook-sha256: cb1c385835cfe2ddc026878074e34ea3661674f44d314679c8c85764ef7d70b7
 "#;
+
+/// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
+/// hash-marker line). Used to detect stale installed hooks on upgrade.
+pub(crate) fn hook_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    let marker = "# neurostrata-hook-sha256:";
+    let body = match SCAFFOLDED_PRE_PUSH_HOOK.rfind(marker) {
+        Some(idx) => &SCAFFOLDED_PRE_PUSH_HOOK[..idx],
+        None => SCAFFOLDED_PRE_PUSH_HOOK,
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// True when `content` was written by NeuroStrata (contains the gate marker).
+pub(crate) fn is_ours_hook(content: &str) -> bool {
+    content.contains("NeuroStrata task gate")
+}
+
+/// True when `content` is a NeuroStrata hook whose embedded hash matches the
+/// current scaffold (i.e. not stale).
+pub(crate) fn is_current_hook(content: &str) -> bool {
+    if !is_ours_hook(content) {
+        return false;
+    }
+    let marker = format!("# neurostrata-hook-sha256: {}", hook_sha256());
+    content.contains(&marker)
+}
 
 /// The scaffolded `pre-commit` hook: records the module-query ledger and
 /// stamps `graph_queried` on the active task before any commit lands.
@@ -2986,6 +3016,24 @@ pub async fn import_beads(
 
 #[cfg(test)]
 mod tests {
+    // hook hash marker tests (Task 1)
+    #[test]
+    fn hook_sha256_is_64_hex() {
+        let h = super::hook_sha256();
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn scaffold_is_current_hook() {
+        assert!(super::is_current_hook(super::SCAFFOLDED_PRE_PUSH_HOOK));
+    }
+
+    #[test]
+    fn foreign_hook_not_ours() {
+        assert!(!super::is_ours_hook("#!/bin/bash\necho hi\n"));
+        assert!(!super::is_current_hook("#!/bin/bash\necho hi\n"));
+    }
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 
