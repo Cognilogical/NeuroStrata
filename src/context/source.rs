@@ -117,3 +117,16 @@ mod tests {
         assert_eq!(id.relative_path, "src/lib.rs");
     }
 }
+
+
+/// Cross-scope authorization helpers.
+pub fn same_namespace(current: &str, target: &str) -> bool {
+    current == target
+}
+
+pub fn cross_scope_authorized(current: &str, target: &str, authorized: &[String]) -> bool {
+    if same_namespace(current, target) {
+        return true;
+    }
+    authorized.iter().any(|a| a == target)
+}
