@@ -1,5 +1,5 @@
 {
-  "vocabulary_version": 7,
+  "vocabulary_version": 8,
   "relations": {
     "GOVERNS": {
       "direction": "directed",
@@ -78,6 +78,51 @@
         "domain_registry": {
           "type": "object",
           "definition": "The namespace's registry row carries metadata.domain_registry.domains: the sorted, deduplicated list of the domain slugs the namespace uses. Slug grammar is ^[a-z0-9]+(-[a-z0-9]+)*$. The row is private -- excluded from recall and from the snapshot body."
+        },
+        "decision": {
+          "type": "object",
+          "description": "Typed decision envelope.",
+          "fields": {
+            "version": {
+              "type": "integer"
+            },
+            "choice": {
+              "type": "string"
+            },
+            "rationale": {
+              "type": "string"
+            },
+            "alternatives": {
+              "type": "array"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "proposed",
+                "accepted",
+                "superseded",
+                "withdrawn"
+              ]
+            },
+            "authority": {
+              "type": "string"
+            },
+            "provenance": {
+              "type": "string"
+            },
+            "decided_at": {
+              "type": "string"
+            },
+            "superseded_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
         }
       }
     },
