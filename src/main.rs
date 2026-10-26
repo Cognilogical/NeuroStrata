@@ -763,13 +763,18 @@ fn install_pre_push_hook(
     // Overwriting our own hook needs no flag: --force is for
     // a pre-push somebody else wrote.
     let ours = std::fs::read_to_string(&target)
-        .map(|content| content.contains("NeuroStrata task gate"))
+        .map(|content| crate::task::is_ours_hook(&content))
         .unwrap_or(false);
     if target.exists() && !ours && !force {
         anyhow::bail!(
             "{} already exists and was not written by NeuroStrata.\nRe-run with --force to replace it with the NeuroStrata task gate:\n  neurostrata-mcp hooks install --force",
             target.display()
         );
+    }
+    // Back up any existing hook before overwriting (best-effort).
+    if target.exists() {
+        let backup = hooks_dir.join("pre-push.bak");
+        let _ = std::fs::copy(&target, &backup);
     }
     std::fs::write(&target, crate::task::SCAFFOLDED_PRE_PUSH_HOOK)?;
     set_hook_executable(&target)?;
