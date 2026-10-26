@@ -108,3 +108,8 @@ learning-laya = []
 name = "v8_decision_test"
 path = "tests/vocabulary/v8_decision_test.rs"
 
+
+
+[[test]]
+name = "receipt_test"
+path = "tests/receipts/receipt_test.rs"

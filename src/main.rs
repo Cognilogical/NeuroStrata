@@ -23,6 +23,7 @@ mod model_downloader;
 mod learning;
 mod parser;
 mod recall_metrics;
+mod receipts;
 mod registry;
 mod secrets;
 mod server;
