@@ -1631,7 +1631,7 @@ impl VectorStore for LadybugStore {
             conn.query(create_receipts_table).ok();
 
             // PQTH: Intake candidates table (operational, not memory rows)
-            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version LONG, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
+            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
             conn.query(create_candidates_table).ok();
 
             // Source-scoped staged ingestion. Two row kinds live in this table:
