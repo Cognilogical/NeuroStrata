@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+pub use crate::graph_read::memories_for_file::{GraphMatchKind, MemoryHit};
+
 /// Trait for downcasting VectorStore to concrete implementations.
 pub trait AsAny {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -420,6 +422,32 @@ pub trait VectorStore: Send + Sync + AsAny {
     fn is_dirty(&self) -> bool {
         true
     }
+}
+
+/// Graph-read capability, exposed beside `VectorStore` rather than folded into
+/// it (spec §4.6): file nodes carry a zero vector, so any backend that only
+/// knows vector search cannot answer these and must say so. A backend that
+/// does not implement `GraphRead` is reached through `AsAny` and answered with
+/// `unsupported`, never an empty result.
+#[async_trait]
+pub trait GraphRead: Send + Sync {
+    /// Deterministic, zero-embedding lookup of the active `rule`/`fact`/
+    /// `procedure` memories governing a file, symbol, or its ancestors.
+    ///
+    /// `source` (a source key) selects the active generation to resolve node
+    /// ids against; `None` uses the most recently published generation.
+    /// `memory_types` is empty meaning "no type filter"; `limit` is capped at
+    /// `MAX_LIMIT` by the implementation.
+    async fn memories_for_file(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>>;
 }
 
 /// Trait for durable task intake ledger operations (PQTH).
