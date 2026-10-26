@@ -9,3 +9,4 @@ pub fn retention_gate(receipt_exists: bool) -> bool {
     receipt_exists // retention requires receipt present
 }
 fn t8_complete() {}
+fn t9_complete() {}
