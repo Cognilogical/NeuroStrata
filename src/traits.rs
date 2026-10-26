@@ -147,6 +147,38 @@ pub enum RelocateOutcome {
     SameNamespace,
 }
 
+
+/// Embedding-space identity persisted on namespace metadata. Enforcement on
+/// every vector path ensures incompatible spaces are never mixed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct EmbeddingDescriptor {
+    pub provider: String,
+    pub model: String,
+    pub revision: String,
+    pub dims: usize,
+    pub normalization: String,
+    pub preprocessing: String,
+    pub distance_metric: String,
+}
+
+impl EmbeddingDescriptor {
+    pub fn unknown() -> Self {
+        Self {
+            provider: "unknown".into(),
+            model: "unknown".into(),
+            revision: "unknown".into(),
+            dims: 0,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "unknown".into(),
+        }
+    }
+
+    pub fn compatible(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 /// The core interface for generating vector embeddings from text.
 /// By making this a trait, we can swap between Local (FastEmbed/ONNX),
 /// Remote (Ollama), or Cloud (OpenAI) implementations.
@@ -163,6 +195,19 @@ pub trait Embedder: Send + Sync {
     /// for test stubs; production embedders override with a real id.
     fn embedder_id(&self) -> &str {
         "unknown"
+    }
+
+    /// Stable identity of the embedding space this embedder produces.
+    fn embedding_descriptor(&self) -> EmbeddingDescriptor {
+        EmbeddingDescriptor {
+            provider: "unknown".into(),
+            model: self.embedder_id().to_string(),
+            revision: "unknown".into(),
+            dims: self.dimensions(),
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
     }
 }
 
