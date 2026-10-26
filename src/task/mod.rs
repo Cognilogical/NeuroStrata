@@ -1997,6 +1997,57 @@ pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Best-effort hook hygiene for a project root. Returns a single status line
+/// describing what was done (or a warning), or an empty string when nothing
+/// needed doing (or the root isn't a git repo). Never errors.
+pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
+    if !root.join(".git").exists() {
+        return String::new();
+    }
+    let hooks_dir = git_hooks_dir(root);
+    if !hooks_dir.is_dir() {
+        let _ = std::fs::create_dir_all(&hooks_dir);
+    }
+    let target = hooks_dir.join("pre-push");
+    let version = env!("CARGO_PKG_VERSION");
+    if !target.exists() {
+        if std::fs::write(&target, SCAFFOLDED_PRE_PUSH_HOOK).is_ok() {
+            set_executable(&target);
+            return format!("HOOKS: auto-installed pre-push (v{})", version);
+        }
+        return String::new();
+    }
+    let content = match std::fs::read_to_string(&target) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    if is_ours_hook(&content) {
+        if is_current_hook(&content) {
+            return String::new();
+        }
+        // stale: back up + rewrite
+        let _ = std::fs::copy(&target, hooks_dir.join("pre-push.bak"));
+        if std::fs::write(&target, SCAFFOLDED_PRE_PUSH_HOOK).is_ok() {
+            set_executable(&target);
+            return format!("HOOKS: updated pre-push (stale -> v{})", version);
+        }
+        return String::new();
+    }
+    format!(
+        "HOOKS WARNING: foreign pre-push hook at {}; inspect or run 'neurostrata-mcp hooks install --force'",
+        target.display()
+    )
+}
+
+#[cfg(unix)]
+fn set_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &std::path::Path) {}
+
 /// Whether a NeuroStrata pre-push hook is observable at the path git runs.
 ///
 /// Exactly one directory is checked — the resolved hooks dir. When

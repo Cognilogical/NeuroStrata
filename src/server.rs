@@ -1796,6 +1796,12 @@ async fn handle_get_snapshot(
         crate::registry::cache_project_root(&store, None, namespace, pr).await;
     }
 
+    // Hook hygiene: auto-heal missing/stale pre-push hook (best-effort).
+    let hooks_line = project_root
+        .as_ref()
+        .map(|r| crate::task::hook_hygiene(std::path::Path::new(r)))
+        .unwrap_or_default();
+
     let mut all_memories = store
         .list(namespace, None, None)
         .await
@@ -2010,6 +2016,109 @@ async fn handle_get_snapshot(
         )
     };
 
+    // ── Doctor scheduling (in-memory, throttled) ──────────────────────────
+    let rid = crate::registry::registry_row_id(namespace);
+    let reg_found = store.get(namespace, &rid).await.ok().flatten();
+    let (reg_vec_opt, reg_payload_opt) = match reg_found {
+        Some((v, p)) => (Some(v), Some(p)),
+        None => (None, None),
+    };
+    let now_ts = chrono::Utc::now().timestamp();
+    let mut doctor_state: serde_json::Value = reg_payload_opt
+        .as_ref()
+        .and_then(|p| p.metadata.get("doctor_state"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let session_counter = doctor_state
+        .get("session_counter")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + 1;
+    let last_run_version = doctor_state
+        .get("last_run_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let last_run_ts = doctor_state
+        .get("last_run_ts")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let current_version = env!("CARGO_PKG_VERSION");
+    let trigger = last_run_version != current_version
+        || session_counter % 20 == 0
+        || (now_ts - last_run_ts) > 7 * 86400;
+
+    let mut doctor_report: Option<String> = None;
+    if trigger {
+        let known = crate::store::ladybug::KnownIds::new(all_memories.iter().map(|m| m.id.as_str()));
+        let mut unqualified_ingested = 0usize;
+        let mut resolvable = 0usize;
+        let mut missing = 0usize;
+        let mut missing_samples: Vec<String> = Vec::new();
+        for m in &all_memories {
+            if m.payload.user_id == "auto-ingestor"
+                && !crate::parser::ingest::is_qualified(namespace, &m.id)
+            {
+                unqualified_ingested += 1;
+            }
+            for edge in crate::store::ladybug::edge_specs(&m.payload.metadata) {
+                if known.contains(&edge.target_id) {
+                    continue;
+                }
+                match known.resolve(&edge.target_id) {
+                    Some(_) => resolvable += 1,
+                    None => {
+                        missing += 1;
+                        if missing_samples.len() < 3 {
+                            missing_samples.push(edge.target_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut findings: Vec<String> = Vec::new();
+        if unqualified_ingested > 0 {
+            findings.push(format!(
+                "  unqualified ingested nodes: {} (re-ingest to qualify)",
+                unqualified_ingested
+            ));
+        }
+        if resolvable > 0 {
+            findings.push(format!(
+                "  resolvable declared targets (older form): {}",
+                resolvable
+            ));
+        }
+        if missing > 0 {
+            findings.push(format!(
+                "  declared targets matching nothing: {} (e.g. {})",
+                missing,
+                missing_samples.join(", ")
+            ));
+        }
+        if !findings.is_empty() {
+            let mut report = String::from("DOCTOR REPORT:");
+            for f in &findings {
+                report.push('\n');
+                report.push_str(f);
+            }
+            doctor_report = Some(report);
+        }
+    }
+
+    // Update doctor_state.
+    doctor_state["session_counter"] = serde_json::json!(session_counter);
+    if trigger {
+        doctor_state["last_run_version"] = serde_json::json!(current_version);
+        doctor_state["last_run_ts"] = serde_json::json!(now_ts);
+    }
+    if let (Some(vec), Some(mut payload)) = (reg_vec_opt, reg_payload_opt) {
+        if let Some(obj) = payload.metadata.as_object_mut() {
+            obj.insert("doctor_state".to_string(), doctor_state);
+        }
+        let _ = store.upsert(namespace, &rid, vec, payload).await;
+    }
+
     all_memories.truncate(5);
 
     let body = if all_memories.is_empty() {
@@ -2018,10 +2127,18 @@ async fn handle_get_snapshot(
         serde_json::to_string_pretty(&all_memories)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
-    let snapshot = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        task_head, procedures, registered_domains_line, domain_strap, body
-    );
+    let mut parts: Vec<String> = vec![task_head.to_string()];
+    if !hooks_line.is_empty() {
+        parts.push(hooks_line.clone());
+    }
+    if let Some(dr) = &doctor_report {
+        parts.push(dr.clone());
+    }
+    parts.push(procedures.to_string());
+    parts.push(registered_domains_line.to_string());
+    parts.push(domain_strap.to_string());
+    parts.push(body.to_string());
+    let snapshot = parts.join("\n");
 
     Ok(match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
