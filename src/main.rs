@@ -2928,6 +2928,11 @@ async fn run() -> anyhow::Result<()> {
                                 } else if probe == DaemonProbe::Silent {
                                     Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
                                 } else {
+                                    let cwd = std::env::current_dir().unwrap_or_default();
+                                    let line = crate::task::hook_hygiene(&cwd);
+                                    if !line.is_empty() {
+                                        println!("{}", line);
+                                    }
                                     direct_report(&config, &namespace)
                                         .await
                                         .map(|report| report.gate_json())
@@ -3326,6 +3331,13 @@ async fn run() -> anyhow::Result<()> {
                     embedder.dimensions(),
                 )?);
                 let read = ReadSource::Direct(vector_store.clone());
+
+                // CLI fallback: hook hygiene against the CWD git root (daemon down).
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let line = crate::task::hook_hygiene(&cwd);
+                if !line.is_empty() {
+                    println!("{}", line);
+                }
 
                 match other {
                     Commands::Doctor { namespace } => {
