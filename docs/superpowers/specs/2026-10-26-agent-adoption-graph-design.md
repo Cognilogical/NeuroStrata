@@ -16,7 +16,7 @@ Make NeuroStrata agent adoption **automatic** (no user reminders) and make the k
 - A fresh agent receives governing context without being told a NeuroStrata tool name.
 - Touching a file surfaces its governing rule + directed evidence within budget.
 - Graph results exclude retired rows by default and report truncation honestly.
-- Automatic injection causes no `access_count` self-reinforcement and no autonomous durable writes.
+- Automatic injection causes no `access_count` self-reinforcement and no autonomous knowledge/task/procedure mutations. Bounded operational receipts are the only permitted writes; automatic `append_log` is removed in favor of a read-only domain-recall operation.
 - Unknown freshness is explicit; code changes do not mark decisions stale.
 - Provider failure produces no behavioral mutation.
 - Evaluation proves sequences from MCP traces, not files daemon startup could create.
@@ -27,22 +27,27 @@ Make NeuroStrata agent adoption **automatic** (no user reminders) and make the k
 
 Introduce `src/context/` as the single context-planning boundary. All handlers, adapters, and graph-read tools consume it; none computes freshness or ranking independently.
 
-**Module responsibilities:**
-- Source identity resolution (repo / checkout / worktree / revision / dirty / relative path).
-- Generation/publication tracking (atomic index generations, last-good fallback).
-- Privacy/egress policy evaluation.
-- Bounded recall planning (budgets, dedup, truncation/degradation status).
-- Freshness computation (4 dimensions).
+**Module responsibilities (read-planning boundary only):**
+- `context/model`: request, plan, item, lifecycle, freshness, coverage.
+- `context/source`: canonical safe paths and source/worktree resolution.
+- `context/freshness`: pure comparisons plus bounded `AnchorIo`.
+- `context/plan`: deterministic ranking, dedup, budgets.
+- `context/service`: consumes `GraphRead`/`VectorStore`; returns typed plans.
+- `context/render`: compact text from the same plan, no independent I/O.
 
-**Host coverage:** OpenCode + OpenClaw adapters repaired to real `tools/call` contract. Degraded/unsupported events advertised, not masked. Daemon-side invalidation covers non-hook edits (shell, external editors, restart, compaction).
+Ownership split (K3): storage owns generations/stubs/receipts; adapters own host-side injection policy; `context/` owns read planning and rendering. `context/` does NOT own publication, receipts, or host egress.
+
+**Host coverage:** OpenCode + OpenClaw adapters repaired to real `tools/call` contract. Degraded/unsupported events advertised, not masked. Daemon-side invalidation covers non-hook edits (shell, external editors, restart, compaction). Filesystem watchers are an optimization only; lazy hashes provide correct on-read invalidation.
 
 ---
 
 ## 3. Data model & storage changes
 
 ### 3.1 Source identity & publication
-- Every ingested `file`/`directory`/`symbol` node gains `metadata.source_identity = { repo_id, checkout_id, worktree_id, revision, dirty, relative_path }` and `metadata.index_generation`.
-- `neurostrata_ingest_directory` publishes a generation atomically, or retains last-good with visible `partial` status. `src/parser/ingest.rs:440-445` upsert failure no longer silently implies completeness.
+- Physical node IDs become source/generation-scoped (not only `namespace::path`), so concurrent worktrees/generations do not conflate (`src/parser/ingest.rs:60-79`, `src/store/ladybug.rs:1584-1590`).
+- `neurostrata_ingest_directory` uses staged publication: build into a staging generation, then atomically flip the active-generation pointer. Failed staging leaves the previous generation active (`src/parser/ingest.rs:550-558`, `src/store/ladybug.rs:2228-2236`).
+- Every ingested node gains `metadata.source_identity = { repo_id, checkout_id, worktree_id, revision, dirty, relative_path }` and `metadata.index_generation` (stored as typed fields, not opaque JSON, for indexed filtering/migration).
+- `memories_for_file` selects by source identity + active generation, not only namespace/path.
 - Cross-scope `GOVERNS` links require explicit authorization; unresolved declarations never target another namespace.
 
 ### 3.2 Stub file nodes on write
@@ -57,8 +62,8 @@ Introduce `src/context/` as the single context-planning boundary. All handlers, 
 ### 3.4 Freshness as 4 independent fields
 Rendered on every memory: `lifecycle`, `provenance`, `verification` (unknown/verified/contradicted + evidence hashes + checked_at + method), `anchor` (current/changed/missing/unknown). Computed lazily in `src/context/`.
 
-### 3.5 Embedding-space identity
-Persist on namespace metadata: `{ provider, model, revision, dims, normalization, preprocessing, distance_metric }`. Incompatible comparisons refused; exact file/graph retrieval survives migration/outage.
+### 3.5 Embedding-space identity (storage-wide enforcement)
+Persist on namespace metadata: `{ provider, model, revision, dims, normalization, preprocessing, distance_metric }`. Enforce descriptor provenance on every vector query/write/dedup path, not only context planning. Define legacy migration, mixed-generation rules. Exact file/graph retrieval remains independent of embedding availability.
 
 ### 3.6 Durable receipts
 Session/task/event-keyed receipts: attempts, empty/error, exposed IDs, acks, outcomes, latency, token cost, recovery status. Bounded retention; cap namespace count.
@@ -86,21 +91,29 @@ Bounded 1–2 hop traversal. Inputs: `namespace` (req), `id` (req; memory/task/q
 
 Returns: nodes (ID, type, snippet, domain, freshness, lifecycle), directed edges, evidence paths, counts, `truncated`, `next_cursor`. Ambiguous symbols returned as candidates. Full content stays behind `get_memory`.
 
+Semantics:
+- `RELATES_TO` is supporting evidence only, never governance. Governance = incoming `GOVERNS`; structure = `CONTAINS`; metadata fallback clearly labelled.
+- Silent query errors are forbidden (`src/store/ladybug.rs:281-283,341-344,419-420`); degraded status must be reported.
+- Cursor includes query fingerprint + generation; retirement/privacy rechecked on every page.
+
 ### 4.3 Upgraded `neurostrata_search_memory`
 Add optional `memory_types`, `fact_shape` (decision/topology/attempt/any), `path_prefix`, `exclude_stale`. Exclude `code_ast` from primary candidates by default (still used for 2-hop `GOVERNS` bridging). Grant `DECISION_SHAPE_GAIN` (+0.03, inside `0.5 * distance` cap) to `rule` and structured `fact` rows.
 
 ### 4.4 Adapter repair (P0, before triggers)
 Fix `plugins/opencode/index.ts` and `plugins/openclaw/index.ts`:
-- Real `tools/call` dispatch (not bare method names).
+- Real `tools/call` dispatch (not bare method names); unwrap `result.content[].text` (not direct typed results).
 - Endpoint `:34343` (not `:8080`).
+- Bearer token loading and attachment on every `/mcp` request (`src/daemon.rs:175-249`).
 - Remove phantom `neurostrata_detect_task_intents`.
-- Add capability negotiation, response validation, bounded timeouts, explicit namespace binding, observable degraded state.
+- Capture plugin context inside `initialize`; no out-of-scope `ctx` references.
+- Real SDK lifecycle tests; observable degraded state instead of silent local fallback.
+- Add capability negotiation, response validation, bounded timeouts, explicit namespace binding.
 
 ### 4.5 Host-triggered recall (thin adapters)
 - **Session-start:** shim invokes `get_snapshot`, injects bounded block; guard backstop appends snapshot if no snapshot/claim in 60 min.
 - **File-touch:** on `read`/`write`/`edit`, LRU `prefetchedPaths` + `injectedMemoryIds`; call `memories_for_file` (≤512 tokens, limit 5, dedup by `(session, trigger, memory_id, valid_from)`); never increment `access_count` on injection.
 - **Task-claim piggyback:** top-3 governing rules/decisions.
-- **Topic-transition:** shim detects domain slug change → `append_log({tags})` → inject non-empty `recalled`.
+- **Topic-transition:** shim detects domain slug change → invoke read-only domain-recall operation (not `append_log`) → inject non-empty `recalled`. Automatic `append_log` (which writes before embed/recall) is removed from the trigger path.
 - Daemon-side invalidation for non-hook edits; advertised coverage gaps.
 
 ### 4.6 Narrow graph interface
@@ -114,26 +127,42 @@ Expose `memories_for_file`/`related` through a dedicated graph-read capability b
 
 ## 5. Freshness, retrieval & context budget
 
-### 5.1 Freshness computation (lazy, `src/context/`)
-- Source currency: unchanged / changed / missing / unknown (via `file_sha256` + `span_sha256` + `source_context` branch awareness).
-- Semantic validation: unreviewed / verified / contradicted + evidence.
-- Index coverage: complete / partial / unavailable + generation.
-- Decision lifecycle: proposed / accepted / superseded / withdrawn.
+### 5.1 Freshness computation (lazy, `src/context/`) — canonical model
+Four independent dimensions, each with typed states:
+- **Source currency:** `unchanged` / `changed` / `missing` / `unknown` (via `file_sha256` + `span_sha256` + `source_context` branch awareness). `not_applicable` (no governed path) is distinct from `unknown`.
+- **Semantic validation:** `unreviewed` / `verified` / `contradicted`, with evidence (hash, checked_at, method).
+- **Index coverage:** `complete` / `partial` / `unavailable` + generation.
+- **Decision lifecycle:** `proposed` / `accepted` / `superseded` / `withdrawn`.
+
+Rules:
+- Hashes captured at write/verify time (`src/server.rs:1126-1153`, `src/parser/ingest.rs:426-484` currently capture none).
+- Symbol identity must be stable across line shifts (current `src/parser/ingest.rs:141-145` includes start line) — use symbol body hash, not line number.
+- `reverify` splits into anchor refresh vs. semantic verification; matching a file hash must not semantically "verify" a decision.
+- Decision lifecycle stays independent of anchor drift.
+- `exclude_stale` is defined as: exclude memories whose `source currency == changed` AND `semantic validation != verified`.
 
 ### 5.2 Retrieval changes
 - Exclude `code_ast` from primary vector candidates by default.
 - Drifted `fact` rows forfeit `source_gain` + usage boost; `rule` rows surface with `[DRIFTED — verify or supersede]` banner.
+- `access_count` is used only as a final tie-breaker for file governance; automatic full-content reads bypass the incrementing `get_memory`/search paths.
 - Snapshot top-5 = 4 by `access_count` DESC + 1 reserved recent rule/decision slot (14-day window).
 - `related`: adjacency is evidence, not authority; privacy/namespace/retirement/conflict filters apply to intermediates.
 
-### 5.3 Context budgets (proposed, not measured)
-- Automatic injection ≤1,500 tokens/trigger ceiling (per-trigger ≤512).
+### 5.3 Context budgets & injection identity (proposed, not measured)
+- Common `ContextRequest` carries `session_id`, `context_epoch`, `event_id`, trigger, source, and policy.
+- Dedup uses content revision (not `valid_from`, which in-place edits preserve: `src/server.rs:2860-2894`) plus `context_epoch`; compaction/restart requires rehydration, not suppression.
+- Budgets are per-call AND per-turn AND per-session (cumulative), not per-trigger only.
+- Automatic injection ceiling 1,500 tokens/session-turn, per-trigger ≤512.
 - `related`: depth 2, 20 nodes, 40 edges.
 - Warm-path target 200ms; recall wall-time cap 1s.
+- Existing snapshot/full-memory rendering is unbounded (`src/server.rs:2122-2129,2927-2978`); define a compact renderer and mandatory-rule overflow behavior.
 - Truncation/degradation always reported; never imply complete coverage when budget exhausted.
 
-### 5.4 Privacy/egress
-Caller egress policy evaluated before rendering or embedding. Private intermediate neighbors filtered. Privacy violations are hard failures in evaluation.
+### 5.4 Privacy/egress & cross-scope authorization
+- Qualified targets default to same-namespace lookup; cross-namespace access requires explicit target authorization (currently `src/store/ladybug.rs:1605-1608` allows exact lookup in any namespace).
+- Remote embedding egress gate must be a real policy, not only an empty-API-key check (`src/embed.rs:304-328`).
+- Core cannot prove host provider behavior post-injection; egress policy evaluated before rendering and again before host injection; denial statuses distinct from "not found".
+- Private intermediate neighbors filtered; privacy violations are hard failures in evaluation.
 
 ---
 
@@ -143,6 +172,8 @@ Caller egress policy evaluated before rendering or embedding. Private intermedia
 1. Contract reliability (adapter handshake, `tools/call`, degraded states).
 2. Unprompted adoption (tasks must not name NeuroStrata or desired tools).
 3. Decision/outcome usefulness (correct task outcomes under identical conditions).
+
+Minimal trace/receipt infrastructure ships in Phase 1 (not Phase 4) so triggers can be evaluated. Full arm comparison remains Phase 4. NP-1..NP-4 scenarios are inlined here (not referenced externally): NP-1 hidden file governance; NP-2 2-hop symbol/directory governance; NP-3 stale fact vs live code drift; NP-4 topic transition mid-session.
 
 ### 6.2 Infra gate
 Provider unavailable / missing auth / handshake failure ⇒ `INFRA_ERROR`, not behavioral score 0. Report attempted/valid/invalid separately.
@@ -166,10 +197,13 @@ Held-out repository/task families, repeated seeds, cold/resumed cohorts. Optimiz
 
 ## 7. Phased execution (supersedes verdict §11 where conflicting)
 
-1. **Phase 1:** Shared context service + adapter repair + scoped file identity/publication + exact file recall + privacy filtering + replay-safe delivery + typed decision/freshness rendering.
-2. **Phase 2:** Bounded `related` + dedicated graph-read capability (not vector-trait enlargement).
-3. **Phase 3:** Host hooks as sensors with daemon-side invalidation + advertised coverage.
-4. **Phase 4:** Vocabulary v8 + NeuroPlasticity trace-graded loop with durable receipts and arm comparison.
+0. **Phase 0:** Adapter/auth/SDK contracts, read-only semantics, canonical DTOs, error/degradation matrix, trace correlation IDs. (No behavior change shipped.)
+1. **Phase 1:** Graph-read capability + exact file recall + source-scoped staged publication + minimal durable idempotency/receipts + typed freshness rendering.
+2. **Phase 2:** Bounded `related` + cursor semantics + broader freshness + privacy/cross-scope authorization.
+3. **Phase 3:** Host triggers and compaction/restart rehydration in shadow mode (adapters as sensors; daemon-side invalidation).
+4. **Phase 4:** Vocabulary v8 decision behavior + full NeuroPlasticity trace-graded loop with arm comparison and promotion.
+
+Note: either move vocabulary v8 earlier or remove decision-dependent rendering from Phase 1; the latter gives a smaller critical path. Procedure state machine (due/offered/acknowledged/performed) with idempotent receipts is added in Phase 1 (not Phase 4), because `src/tools/procedure.rs:325-397` currently does non-atomic read/modify/write. Embedding-space identity enforcement (storage-wide, not just context planning) is added in Phase 1.
 
 ---
 
