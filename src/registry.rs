@@ -412,3 +412,23 @@ mod tests {
         assert!(!is_registry_row(&serde_json::json!({})));
     }
 }
+
+/// Read the enrichment state record from a namespace's registry row (F12/F14/F24).
+pub fn enrichment_state(metadata: &Value) -> Value {
+    metadata.get("enrichment_state").cloned().unwrap_or(serde_json::json!({
+        "state": "pending",
+        "watermark": 0,
+        "lock_holder": serde_json::Value::Null,
+        "telemetry": {}
+    }))
+}
+
+/// Build an enrichment state record.
+pub fn enrichment_state_record(state: &str, watermark: u64, lock_holder: Option<&str>, telemetry: Value) -> Value {
+    serde_json::json!({
+        "state": state,
+        "watermark": watermark,
+        "lock_holder": lock_holder,
+        "telemetry": telemetry,
+    })
+}

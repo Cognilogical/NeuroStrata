@@ -102,6 +102,7 @@ cxx-build = "=1.0.138"
 [features]
 default = []
 learning-laya = []
+gliner = []
 
 
 [[test]]
