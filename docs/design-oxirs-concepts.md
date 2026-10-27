@@ -33,7 +33,7 @@ Under the corrected framing, **OxiRS is highly relevant — arguably the closest
 
 ### 1.1 RDF as the canonical memory data model
 - **OxiRS**: `oxirs-core` (RDF 1.2, 7 syntaxes, persistent N-Quads), `oxirs-ttl`, `oxirs-star` (RDF-star quoted triples).
-- **NeuroStrata gap**: memory rows are JSON payloads in LadybugDB with a hand-maintained vocabulary (`memory-vocabulary.v9.json`). Edges are 5 typed relations. No standard serialization/interchange; SynapticMesh invented its own wire format.
+- **NeuroStrata gap**: memory rows are JSON payloads in LadybugDB with a hand-maintained vocabulary (`memory-vocabulary.v3.json`, internal `vocabulary_version` 9). Edges are 5 typed relations. No standard serialization/interchange; SynapticMesh invented its own wire format.
 - **Adaptation**: adopt RDF quads as the canonical representation: a memory = a set of triples (subject = memory id, predicates = vocabulary fields), stored in TDB2 or LadybugDB. SynapticMesh records become standard RDF Patch/N-Quads. Enables interoperability, SPARQL, and eventual JSON removal. This is the big migration; phase it (dual-write JSON+RDF first).
 - **Effort**: XL. **Priority**: P1 (strategic).
 
@@ -81,7 +81,7 @@ Under the corrected framing, **OxiRS is highly relevant — arguably the closest
 
 ### 1.9 Full-text search (Tantivy)
 - **OxiRS**: Tantivy full-text (feature-gated in oxirs-tdb/oxirs-fuseki).
-- **NeuroStrata gap**: retrieval is vector-only by design; exact-identifier recall gap documented (docs/COGNITIVE_ARCHITECTURE.md §6). The prior recommendation was narrow CONTAINS/symbol-id match.
+- **NeuroStrata gap**: an exact-name pre-pass already exists (`src/store/ladybug.rs:71-143`, F1), so the "NOT IMPLEMENTED" note in docs/COGNITIVE_ARCHITECTURE.md §6 is stale. Tantivy would be an upgrade (ranked lexical, fuzzy, multi-field) over the current exact-equality pre-pass, not a first implementation. Benchmark the existing pre-pass before funding Tantivy.
 - **Adaptation**: add an optional Tantivy index over memory content + symbol names for lexical recall, blended deterministically (not RRF) or offered as a separate `lexical` search mode. General-purpose memory benefits more than code-only. Keep auditable (single ranking rule).
 - **Effort**: M. **Priority**: P2 (closes documented correctness gap).
 
