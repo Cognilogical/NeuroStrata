@@ -38,3 +38,7 @@ target/
 .worktrees/
 
 .superpowers/sdd/
+# Generated plugin build artifacts (rebuilt by npm run build)
+plugins/opencode/dist/
+plugins/opencode/node_modules/
+plugins/opencode/@opencode/
