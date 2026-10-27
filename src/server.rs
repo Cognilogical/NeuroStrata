@@ -159,7 +159,9 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'." },
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain slug(s) to surface in the domain strap, regardless of access_count." },
                                 "project_root": { "type": "string", "description": "Optional absolute path to the project root. Used for git-hook hygiene and cached in the registry row." },
-                                "include_archived": { "type": "boolean", "description": "Include archived/tombstoned rows in the snapshot (audit escape hatch)." }
+                                "include_archived": { "type": "boolean", "description": "Include archived/tombstoned rows in the snapshot (audit escape hatch)." },
+                                "query": { "type": "string", "description": "Optional query string. When provided, procedures whose trigger matches the query are surfaced." },
+                                "task_id": { "type": "string", "description": "Optional task id. When provided, procedures whose trigger matches the task are surfaced." }
                             },
                             "required": ["namespace"]
                         }
@@ -193,7 +195,8 @@ pub async fn process_mcp_request(
                                 "query": { "type": "string", "description": "What to search for." },
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
                                 "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." },
-                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." }
+                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." },
+                                "exact": { "type": "boolean", "description": "Run a deterministic exact-name pre-pass before the vector scan. Default true." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -2084,7 +2087,13 @@ async fn handle_get_snapshot(
     // Computed off the pre-truncation list too: a procedure is worth surfacing
     // whether or not it made the top-5 by access count, and a procedure nobody
     // has ever performed has the lowest access count of all.
-    let procedures = crate::tools::procedure::procedures_due_strap(&all_memories, now);
+    let snap_query = arguments.get("query").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let snap_task_id = arguments.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let procedures = if snap_query.is_some() || snap_task_id.is_some() {
+        crate::tools::procedure::procedures_due_strap_filtered(&all_memories, now, snap_query.as_deref(), snap_task_id.as_deref())
+    } else {
+        crate::tools::procedure::procedures_due_strap(&all_memories, now)
+    };
     all_memories.retain(|r| match r.payload.metadata.get("valid_to") {
         None => true,
         Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
@@ -2878,6 +2887,10 @@ async fn handle_search_memory(
         .get("include_archived")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let exact = arguments
+        .get("exact")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     // The store now applies row-class filters and returns `limit` primaries
     // plus their bounded expansions. We ask for 5 primaries (the default page).
@@ -2914,6 +2927,8 @@ async fn handle_search_memory(
                     include_tasks,
                     include_archived,
                     &slugs,
+                    Some(query),
+                    exact,
                 )
                 .await
             {
