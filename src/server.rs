@@ -198,7 +198,10 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'. Do not use folder paths." },
                                 "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." },
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." },
-                                "exact": { "type": "boolean", "description": "Run a deterministic exact-name pre-pass before the vector scan. Default true." }
+                                "exact": { "type": "boolean", "description": "Run a deterministic exact-name pre-pass before the vector scan. Default true." },
+                                "facets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter results by epistemic facet (e.g. failed-attempt, enforced-rule, architecture-decision)." },
+                                "domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by domain slug(s) (OR)." },
+                                "node_sets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by node_set tag(s)." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -2903,6 +2906,14 @@ async fn handle_search_memory(
         .get("exact")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let facets_filter: Vec<String> = arguments
+        .get("facets")
+        .map(|v| {
+            if let Some(s) = v.as_str() { vec![s.to_string()] }
+            else if let Some(arr) = v.as_array() { arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect() }
+            else { vec![] }
+        })
+        .unwrap_or_default();
 
     // The store now applies row-class filters and returns `limit` primaries
     // plus their bounded expansions. We ask for 5 primaries (the default page).
@@ -2945,7 +2956,13 @@ async fn handle_search_memory(
                 .await
             {
                 let mode = outcome.mode;
-                let results = outcome.results;
+                let mut results = outcome.results;
+                if !facets_filter.is_empty() {
+                    results.retain(|r| {
+                        let facets = crate::domain::compute_facets(&r.payload.memory_type, &r.payload.metadata);
+                        facets_filter.iter().all(|f| facets.contains(f))
+                    });
+                }
                 if domain_requested {
                     let single_domain =
                         crate::registry::registry_domain_count(&store, namespace).await <= 1;
