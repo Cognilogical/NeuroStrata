@@ -18,7 +18,7 @@
  *   masked by a silent local fallback.
  */
 
-import type { ToolCall, ToolResult, PluginContext } from "@opencode/plugin";
+import { Plugin } from "@opencode/plugin";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -482,16 +482,16 @@ let mcpClient: NeuroStrataMCPClient;
  * `initialize`'s parameter. Capturing it here is what makes `ctx` reachable
  * from them at all.
  */
-let pluginCtx: PluginContext | null = null;
+let pluginCtx: any | null = null;
 
-function requireCtx(): PluginContext {
+function requireCtx(): any {
   if (!pluginCtx) {
     throw new Error("NeuroStrata plugin used before initialize()");
   }
   return pluginCtx;
 }
 
-export async function initialize(ctx: PluginContext): Promise<void> {
+export async function initialize(ctx: any): Promise<void> {
   pluginCtx = ctx;
   config = resolveConfig(ctx.config);
 
@@ -511,17 +511,67 @@ export async function initialize(ctx: PluginContext): Promise<void> {
     lastError: undefined,
   });
 
-  // Register tool wrappers for mutating tools: write, edit, bash
-  ctx.tools.wrap("write", wrapMutatingTool);
-  ctx.tools.wrap("edit", wrapMutatingTool);
-  ctx.tools.wrap("bash", wrapMutatingTool);
+  // Register guard validation before mutating tools (write, edit, bash).
+  // V2 API: ctx.tool.hook("execute.before", ...) fires before each tool call.
+  await ctx.tool.hook("execute.before", async (input: any) => {
+    const toolName = input?.tool;
+    if (toolName !== "write" && toolName !== "edit" && toolName !== "bash") return;
+    const call: any = {
+      name: toolName,
+      args: input?.input ?? {},
+    };
+    // Run guard validation (fail closed).
+    if (!config.strictMode) return;
+    const actionType = toolName;
+    const payload = JSON.stringify(call.args);
+    const cwd = process.cwd();
+    const { session_id, active_task_id, worktree } = callState(call);
+    try {
+      const text = await mcpClient.callTool("neurostrata_guard_validate", {
+        namespace: config.namespace,
+        session_id,
+        active_task_id,
+        worktree,
+        action_type: actionType,
+        payload,
+        cwd,
+        is_mutating: true,
+        use_sandbox: false,
+      });
+      const result = parseGuardValidate(text);
+      if (result.verdict === "reject") {
+        const reason =
+          result.reasons.join("; ") ||
+          result.constraints.join("; ") ||
+          result.bucket;
+        console.warn("[NeuroStrata] Guard rejected mutating tool", {
+          actionType,
+          session_id,
+          active_task_id,
+          worktree,
+          reason,
+          rule_ids: result.rule_ids,
+        });
+        throw new Error(`Zero-Action Start violation: ${reason}`);
+      }
+    } catch (err) {
+      const message = String(err);
+      // Re-throw guard rejections as-is.
+      if (message.startsWith("Zero-Action Start violation:")) throw err;
+      setStatus({ state: "unavailable", lastError: message });
+      console.error("[NeuroStrata] Guard validation failed", { error: message });
+      throw new Error(
+        `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
+      );
+    }
+  });
 
-  // Register turn hook for intent detection
-  ctx.conversation.onTurnEnd(onTurnEnd);
+  // Intent detection turn hook is best-effort in V2 (no direct conversation hook);
+  // onTurnEnd remains exported for callers/tests.
 
   await negotiateCapabilities();
 
-  ctx.logger.info("NeuroStrata OpenCode plugin initialized", {
+  console.info("[NeuroStrata] OpenCode plugin initialized", {
     namespace: config.namespace,
     endpoint: config.endpoint,
     authenticated: status.authenticated,
@@ -548,7 +598,7 @@ async function negotiateCapabilities(): Promise<void> {
       lastError: undefined,
     });
     if (missing.length > 0) {
-      requireCtx().logger.warn(
+      console.warn(
         "NeuroStrata core does not expose the tools this shim needs",
         { missing },
       );
@@ -558,7 +608,7 @@ async function negotiateCapabilities(): Promise<void> {
       state: "unavailable",
       lastError: String(err),
     });
-    requireCtx().logger.warn(
+    console.warn(
       "NeuroStrata core is unreachable; the shim is degraded",
       { error: String(err) },
     );
@@ -570,9 +620,9 @@ async function negotiateCapabilities(): Promise<void> {
 // ──────────────────────────────────────────────────────────────────────
 
 async function wrapWriteEdit(
-  call: ToolCall,
-  next: (call: ToolCall) => Promise<ToolResult>,
-): Promise<ToolResult> {
+  call: any,
+  next: (call: any) => Promise<any>,
+): Promise<any> {
   if (!config.strictMode) {
     return next(call);
   }
@@ -596,7 +646,7 @@ async function wrapWriteEdit(
         result.reasons.join("; ") ||
         result.constraints.join("; ") ||
         result.bucket;
-      requireCtx().logger.warn("Guard rejected write/edit", {
+      console.warn("Guard rejected write/edit", {
         actionType,
         reason,
         rule_ids: result.rule_ids,
@@ -610,7 +660,7 @@ async function wrapWriteEdit(
   } catch (err) {
     const message = String(err);
     setStatus({ state: "unavailable", lastError: message });
-    requireCtx().logger.error("Guard validation failed", { error: message });
+    console.error("Guard validation failed", { error: message });
     // Fail closed: a guard that cannot answer is not a guard that passed.
     return {
       success: false,
@@ -627,7 +677,7 @@ async function wrapWriteEdit(
  * state shows Unpreflighted/BreathRequired (no active task claim or note
  * missing after 5+ mutations).
  */
-function callState(call: ToolCall): {
+function callState(call: any): {
   session_id: string;
   active_task_id: string | null;
   worktree: string;
@@ -641,9 +691,9 @@ function callState(call: ToolCall): {
 }
 
 async function wrapMutatingTool(
-  call: ToolCall,
-  next: (call: ToolCall) => Promise<ToolResult>,
-): Promise<ToolResult> {
+  call: any,
+  next: (call: any) => Promise<any>,
+): Promise<any> {
   if (!config.strictMode) {
     return next(call);
   }
@@ -670,7 +720,7 @@ async function wrapMutatingTool(
     if (result.verdict === "reject") {
       const reason =
         result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
-      requireCtx().logger.warn("Guard rejected mutating tool", {
+      console.warn("Guard rejected mutating tool", {
         actionType,
         session_id,
         active_task_id,
@@ -687,7 +737,7 @@ async function wrapMutatingTool(
   } catch (err) {
     const message = String(err);
     setStatus({ state: "unavailable", lastError: message });
-    requireCtx().logger.error("Guard validation failed", { error: message });
+    console.error("Guard validation failed", { error: message });
     return {
       success: false,
       error: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
@@ -720,7 +770,7 @@ async function onTurnEnd(turn: {
 
   const markerList = signals.map((signal) => signal.marker).join(", ");
   const nudge = `[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`;
-  requireCtx().conversation.injectSystemMessage(nudge);
+  console.info("[NeuroStrata] " + nudge);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -728,3 +778,11 @@ async function onTurnEnd(turn: {
 // resolver, the wire helpers, the verdict parser and the adapter status are
 // the contract the adapter tests exercise.
 // ──────────────────────────────────────────────────────────────────────
+
+export default Plugin.define({
+  id: "neurostrata",
+  async setup(ctx: any) {
+    await initialize(ctx);
+    return;
+  },
+});
