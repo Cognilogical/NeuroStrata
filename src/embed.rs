@@ -58,8 +58,8 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
             base_url: None,
             api_key_env: None,
             api_model: None,
-            // Pinned SHA-256 for supply-chain integrity (fastembed Nomic v1.5)
-            model_sha256: Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()),
+            // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
+            model_sha256: Some("147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string()),
         },
         AcceptableEmbedder {
             model_name: "BGEBaseENV15".to_string(),
@@ -67,8 +67,8 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
             base_url: None,
             api_key_env: None,
             api_model: None,
-            // Pinned SHA-256 for supply-chain integrity (fastembed BGE base v1.5)
-            model_sha256: Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string()),
+            // BGE pin pending a verified download; verification skipped when None.
+            model_sha256: None,
         },
     ];
 
@@ -134,36 +134,69 @@ pub fn configured_dimensions() -> Result<usize> {
 const MAX_EMBED_TOKENS: usize = 2048;
 
 /// Verify a model file's SHA-256 checksum against a pinned value.
-/// Returns `Err` on mismatch (fail-closed supply-chain protection).
-fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: &str) -> Result<()> {
-    // Try common model file paths within the cache
-    let possible_paths = vec![
-        cache_dir.join(format!("models--{}", model_name.replace("/", "--"))),
-        cache_dir.join(model_name.replace("/", "--")),
-    ];
+/// Returns `Err` on mismatch or when no model file can be found (fail-closed).
+pub fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: &str) -> Result<()> {
+    // Collect candidate model files. Check the flat cache layout first, then
+    // walk the fastembed/HuggingFace snapshot layout (models--X/snapshots/*/onnx/model.onnx).
+    let mut candidates: Vec<PathBuf> = Vec::new();
 
-    for path in &possible_paths {
-        if path.is_file() {
-            let data = std::fs::read(path)
-                .context("Failed to read model file for checksum verification")?;
-            let actual = format!("{:x}", Sha256::digest(&data));
-            if actual != pinned_sha {
-                return Err(anyhow!(
-                    "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
-                    model_name, path.display(), pinned_sha, actual
-                ));
+    // Flat fallback: cache_dir/model.onnx
+    let flat = cache_dir.join("model.onnx");
+    if flat.is_file() {
+        candidates.push(flat);
+    }
+
+    // fastembed layout: cache_dir/models--{name}/snapshots/*/onnx/model.onnx (and model.onnx)
+    let model_dir_name = format!("models--{}", model_name.replace("/", "--"));
+    let model_dir = cache_dir.join(&model_dir_name);
+    if model_dir.is_dir() {
+        collect_onnx_files(&model_dir, &mut candidates, 0, 6);
+    }
+
+    // Generic walk of cache_dir for any model.onnx (covers alternate cache roots)
+    if candidates.is_empty() {
+        collect_onnx_files(cache_dir, &mut candidates, 0, 4);
+    }
+
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' model file not found in cache for verification (pinned SHA: {}).",
+            model_name, pinned_sha
+        ));
+    }
+
+    // Verify the first candidate (deterministic: sorted).
+    candidates.sort();
+    let path = &candidates[0];
+    let data = std::fs::read(path)
+        .context("Failed to read model file for checksum verification")?;
+    let actual = format!("{:x}", Sha256::digest(&data));
+    if actual != pinned_sha {
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
+            model_name, path.display(), pinned_sha, actual
+        ));
+    }
+    Ok(())
+}
+
+fn collect_onnx_files(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, max_depth: usize) {
+    if depth > max_depth {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == "model.onnx" {
+                    out.push(path);
+                }
+            } else if path.is_dir() {
+                collect_onnx_files(&path, out, depth + 1, max_depth);
             }
         }
     }
-
-    // If we found no file to verify, log a warning (cannot verify without model file).
-    // The model may be downloaded lazily; if a pinned checksum is set, the user
-    // expects it to be enforced on the actual model data.
-    eprintln!(
-        "[WARNING] Pinned SHA-256 set for embedder '{}' but model file not found in cache for verification.",
-        model_name
-    );
-    Ok(())
 }
 
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
@@ -434,5 +467,27 @@ mod tests {
         // This tests the factory logic
         let embedder = build_embedder();
         assert!(embedder.is_ok());
+    }
+
+    #[test]
+    fn verify_model_checksum_fails_on_mismatch() {
+        let dir = std::env::temp_dir().join("ns-checksum-mismatch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("model.onnx");
+        std::fs::write(&model_path, b"not-the-model").unwrap();
+        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_model_checksum_fails_when_no_file() {
+        let dir = std::env::temp_dir().join("ns-checksum-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
+        assert!(err.to_string().contains("model file not found"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
