@@ -224,9 +224,9 @@ async fn search_inner(
                 let domain_match = if domain_keys.is_empty() {
                     true // empty key set = no filter asked for
                 } else {
-                    domain_key(&metadata_val)
-                        .map(|k| domain_keys.contains(&k))
-                        .unwrap_or(false)
+                    crate::domain::domain_keys(&metadata_val)
+                        .iter()
+                        .any(|k| domain_keys.contains(k))
                 };
 
                 // Usage boost: ln(1+n) gives a real gain even at n=1, and the

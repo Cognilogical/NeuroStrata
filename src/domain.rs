@@ -1,5 +1,7 @@
 /// Normalize a raw domain or tag into a lowercase-kebab slug token.
 /// Returns None when nothing usable remains.
+use serde_json::Value;
+
 pub fn normalize_domain_slug(raw: &str) -> Option<String> {
     let mut slug = String::with_capacity(raw.len());
     let mut separator_pending = false;
@@ -30,6 +32,28 @@ pub fn domain_key(metadata: &serde_json::Value) -> Option<String> {
         .get("domain")
         .and_then(|value| value.as_str())
         .and_then(normalize_domain_slug)
+}
+
+/// All normalized slugs for a metadata object's `domain` field, which may be
+/// a string or an array of strings (F9).
+pub fn domain_keys(metadata: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    match metadata.get("domain") {
+        Some(Value::String(s)) => {
+            if let Some(k) = normalize_domain_slug(s) { out.push(k); }
+        }
+        Some(Value::Array(arr)) => {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    if let Some(k) = normalize_domain_slug(s) {
+                        if !out.contains(&k) { out.push(k); }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
@@ -78,4 +102,33 @@ mod tests {
             Some("database-access")
         );
     }
+}
+
+/// Compute epistemic facets from a memory's metadata (F16).
+pub fn compute_facets(memory_type: &str, metadata: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if memory_type == "rule" {
+        if metadata.get("enforcement").is_some() {
+            out.push("enforced-rule".to_string());
+        }
+    }
+    if memory_type == "fact" {
+        if let Some(attempt) = metadata.get("attempt") {
+            if attempt.get("outcome").and_then(|v| v.as_str()) == Some("failed") {
+                out.push("failed-attempt".to_string());
+            }
+        }
+        if metadata.get("decision").is_some() {
+            out.push("architecture-decision".to_string());
+        }
+    }
+    // preserve existing facets if present
+    if let Some(existing) = metadata.get("facets").and_then(|v| v.as_array()) {
+        for f in existing {
+            if let Some(s) = f.as_str() {
+                if !out.contains(&s.to_string()) { out.push(s.to_string()); }
+            }
+        }
+    }
+    out
 }

@@ -41,11 +41,51 @@ pub fn registry_domains(metadata: &Value) -> Vec<String> {
         .and_then(|domains| domains.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|value| value.as_str().map(|s| s.to_string()))
+                .filter_map(|value| {
+                    if let Some(s) = value.as_str() {
+                        Some(s.to_string())
+                    } else {
+                        value.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string())
+                    }
+                })
                 .collect()
         })
         .unwrap_or_default();
     sorted_unique(domains)
+}
+
+/// Registry domains as v2 entries (slug/parent/aliases/concept_iri), with v1
+/// backwards compat (strings map to {slug, parent: null, aliases: [], concept_iri: null}).
+pub fn registry_domain_entries(metadata: &Value) -> Vec<Value> {
+    let arr = metadata
+        .get("domain_registry")
+        .and_then(|registry| registry.get("domains"))
+        .and_then(|domains| domains.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for v in arr {
+        if let Some(s) = v.as_str() {
+            out.push(serde_json::json!({
+                "slug": s,
+                "parent": serde_json::Value::Null,
+                "aliases": [],
+                "concept_iri": serde_json::Value::Null,
+            }));
+        } else if v.is_object() {
+            let slug = v.get("slug").and_then(|s| s.as_str()).unwrap_or("");
+            let parent = v.get("parent").cloned().unwrap_or(serde_json::Value::Null);
+            let aliases = v.get("aliases").cloned().unwrap_or(serde_json::json!([]));
+            let concept_iri = v.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null);
+            out.push(serde_json::json!({
+                "slug": slug,
+                "parent": parent,
+                "aliases": aliases,
+                "concept_iri": concept_iri,
+            }));
+        }
+    }
+    out
 }
 
 /// The registry row's metadata. `eligibility: private` keeps the namespace's
