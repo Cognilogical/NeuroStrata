@@ -38,7 +38,7 @@ Effort: **S** under a week, **M** one to three weeks, **L** over three weeks.
 
 ## Skip these
 
-- Full OWL/RDF ontology, reasoners, and RDF stores.
+- (Removed: "Full OWL/RDF ontology, reasoners, and RDF stores" is no longer a skip item; OWL/RDF is now a candidate direction. See docs/design-oxirs-concepts.md.)
 - Generated global summaries / hierarchical summary index.
 - Date-based temporal reranking.
 - A separate SQLite/Redis session store.
