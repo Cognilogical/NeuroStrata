@@ -182,3 +182,12 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
     }
     out
 }
+
+/// Canonical slug for an entity alias (F17). Lowercase, strip non-alnum.
+pub fn canonical_entity_slug(raw: &str) -> String {
+    let mut out = String::new();
+    for c in raw.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() { out.push(c); }
+    }
+    out
+}
