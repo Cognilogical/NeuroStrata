@@ -146,6 +146,7 @@ impl VectorStore for MockStore {
                     kind: crate::traits::EvidenceKind::DirectMatch,
                     path: vec![],
                     explanation: "This memory matched the query vector.".to_string(),
+                    derivation: vec![],
                 }]),
             })
             .collect())
@@ -195,6 +196,7 @@ impl VectorStore for MockStore {
                     kind: crate::traits::EvidenceKind::DirectMatch,
                     path: vec![],
                     explanation: "This memory matched the query vector.".to_string(),
+                    derivation: vec![],
                 }]),
             };
 

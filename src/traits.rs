@@ -101,6 +101,8 @@ pub struct SearchEvidence {
     pub kind: EvidenceKind,
     pub path: Vec<EvidenceEdge>,
     pub explanation: String,
+    #[serde(default)]
+    pub derivation: Vec<String>,
 }
 
 /// Returns true when the evidence carries a DirectMatch — the shared
@@ -753,6 +755,7 @@ mod tests {
                 kind: EvidenceKind::DirectMatch,
                 path: vec![],
                 explanation: "test".into(),
+                derivation: vec![],
             }]),
         };
         let json = serde_json::to_value(&sr).unwrap();
@@ -787,6 +790,7 @@ mod tests {
                 },
             ],
             explanation: "explanation".into(),
+            derivation: vec![],
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["kind"], "governs_2hop");

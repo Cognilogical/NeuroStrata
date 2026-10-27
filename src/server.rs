@@ -6098,6 +6098,7 @@ mod tests {
                 kind: EvidenceKind::DirectMatch,
                 path: vec![],
                 explanation: "This memory matched the query vector.".into(),
+                derivation: vec![],
             }]),
         );
         let text = render_search_results(&[r]);
@@ -6156,6 +6157,7 @@ mod tests {
                     target: "probe::src/a.rs".into(),
                 }],
                 explanation: "This memory is one graph hop from a direct match.".into(),
+                derivation: vec![],
             }]),
         );
         let suffix = render_evidence_suffix(&r, 10);
@@ -6176,6 +6178,7 @@ mod tests {
                     target: "probe::src/a.rs".into(),
                 }],
                 explanation: "This memory is one graph hop from a direct match.".into(),
+                derivation: vec![],
             }]),
         );
         // First result fits in 2048 bytes
@@ -6197,6 +6200,7 @@ mod tests {
                             target: format!("mem-{}", i),
                         }],
                         explanation: "This memory is one graph hop from a direct match.".into(),
+                        derivation: vec![],
                     }]),
                 )
             })
@@ -6229,6 +6233,7 @@ mod tests {
                     target: "probe::src/a.rs".into(),
                 }],
                 explanation: "This memory is one graph hop from a direct match.".into(),
+                derivation: vec![],
             }]),
         );
         let text = render_search_results(&[r]);
@@ -6262,6 +6267,7 @@ mod tests {
                     target: "normal-id".into(),
                 }],
                 explanation: "This memory is one graph hop from a direct match.".into(),
+                derivation: vec![],
             }]),
         );
         // Should not panic; renderer handles it
@@ -6300,11 +6306,13 @@ mod tests {
                     kind: EvidenceKind::Governs2hop,
                     path: long_path,
                     explanation: "long".into(),
+                    derivation: vec![],
                 },
                 SearchEvidence {
                     kind: EvidenceKind::OneHop,
                     path: short_path,
                     explanation: "short".into(),
+                    derivation: vec![],
                 },
             ]),
         );
@@ -7925,6 +7933,7 @@ mod tests {
                 },
             ],
             explanation: "a path with one disconnected edge".into(),
+            derivation: vec![],
         };
         assert_eq!(
             render_path(&ev, "probe::a"),

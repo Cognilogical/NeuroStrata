@@ -184,6 +184,7 @@ async fn search_inner(
                         kind: crate::traits::EvidenceKind::DirectMatch,
                         path: vec![],
                         explanation: "This memory matched the query vector.".to_string(),
+                        derivation: vec![],
                     }]),
                 };
 
@@ -332,6 +333,7 @@ async fn search_inner(
                                 entry.evidence.push(crate::traits::SearchEvidence {
                                     kind,
                                     explanation: "This memory is one graph hop from a direct match.".to_string(),
+                                    derivation: vec![],
                                     path: edges,
                                 });
                             }
@@ -408,6 +410,7 @@ async fn search_inner(
                                 entry.evidence.push(crate::traits::SearchEvidence {
                                     kind,
                                     explanation: "This memory governs a node one hop from a direct match.".to_string(),
+                                    derivation: vec![],
                                     path: edges,
                                 });
                             }
@@ -477,6 +480,7 @@ async fn search_inner(
                             entry.evidence.push(crate::traits::SearchEvidence {
                                 kind,
                                 explanation: "This memory and a direct match were both extracted from the same task.".to_string(),
+                                derivation: vec![],
                                 path: edges,
                             });
                         }
@@ -8553,6 +8557,7 @@ eurostrata\src\daemon.rs",
                 },
             ],
             explanation: "test".into(),
+            derivation: vec![],
         };
         let json = serde_json::to_value(&ev).unwrap();
         assert_eq!(json["kind"], "episode_sibling");
