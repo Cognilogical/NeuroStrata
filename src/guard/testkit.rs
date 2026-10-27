@@ -160,6 +160,8 @@ impl VectorStore for MockStore {
         _include_tasks: bool,
         _include_archived: bool,
         domains: &[String],
+        _query_text: Option<&str>,
+        _exact: bool,
     ) -> Result<DomainSearchOutcome> {
         if *self.search_fails.lock().expect("mock store lock") {
             return Err(anyhow::anyhow!(

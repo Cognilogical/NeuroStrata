@@ -437,6 +437,8 @@ pub trait VectorStore: Send + Sync + AsAny {
         include_tasks: bool,
         include_archived: bool,
         _domains: &[String],
+        _query_text: Option<&str>,
+        _exact: bool,
     ) -> Result<DomainSearchOutcome> {
         let results = self
             .search(namespace, vector, limit, include_tasks, include_archived)

@@ -181,6 +181,45 @@ pub(crate) fn procedures_due_strap(memories: &[SearchResult], now: i64) -> Strin
     }
 }
 
+/// Filtered variant: only procedures whose trigger or content matches the
+/// query/task_id (substring, case-insensitive). Falls back to all due when
+/// no filter matches anything.
+pub(crate) fn procedures_due_strap_filtered(
+    memories: &[SearchResult],
+    now: i64,
+    query: Option<&str>,
+    task_id: Option<&str>,
+) -> String {
+    let all = procedures_due(memories, now);
+    let needle = query.or(task_id).unwrap_or("").to_lowercase();
+    if needle.is_empty() {
+        return procedures_due_strap(memories, now);
+    }
+    let mut filtered: Vec<Value> = all
+        .into_iter()
+        .filter(|row| {
+            let trigger = row.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let content_ok = memories
+                .iter()
+                .find(|m| m.id == row.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                .map(|m| m.payload.content.to_lowercase().contains(&needle))
+                .unwrap_or(false);
+            trigger.contains(&needle) || content_ok
+        })
+        .collect();
+    if filtered.is_empty() {
+        // fall back to all due
+        filtered = procedures_due(memories, now);
+    }
+    if filtered.is_empty() {
+        return "No procedures are due in this namespace.\n".to_string();
+    }
+    match serde_json::to_string_pretty(&filtered) {
+        Ok(body) => format!("Procedures due ({}):\n{}", filtered.len(), body),
+        Err(e) => format!("Procedures due: unreadable ({}).", e),
+    }
+}
+
 // ── tool: neurostrata_procedure_perform ─────────────────────────────────────
 
 /// Every outcome answers with the same seven keys, so a client can read

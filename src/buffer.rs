@@ -385,6 +385,8 @@ pub async fn handle_append_log(
                 false,          // include_tasks = false
                 false,          // include_archived = false
                 &slugs,
+                None,
+                true,
             )
             .await
         {

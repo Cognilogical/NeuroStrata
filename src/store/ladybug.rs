@@ -39,6 +39,8 @@ async fn search_inner(
     include_tasks: bool,
     include_archived: bool,
     domain_keys: HashSet<String>,
+    query_text: Option<String>,
+    exact: bool,
 ) -> Result<DomainSearchOutcome> {
     let namespace = namespace.to_string();
     store
@@ -65,6 +67,80 @@ async fn search_inner(
             // FETCH_MULTIPLIER * limit rows are scanned from the engine.
             const FETCH_MULTIPLIER: usize = 10;
             let fetch_limit = limit * FETCH_MULTIPLIER;
+
+            // Step 0: Exact-name pre-pass (F1).
+            let mut exact_matches: Vec<SearchResult> = Vec::new();
+            if exact {
+                if let Some(q) = query_text.as_ref() {
+                    let q_trim = q.trim();
+                    let mut targets: Vec<String> = vec![q_trim.to_string()];
+                    let mut rest = q_trim;
+                    while let Some(start) = rest.find('"') {
+                        let after = &rest[start+1..];
+                        if let Some(end) = after.find('"') {
+                            let phrase = after[..end].trim();
+                            if !phrase.is_empty() { targets.push(phrase.to_string()); }
+                            rest = &after[end+1..];
+                        } else { break; }
+                    }
+                    let safe_ns = escape_ladybug_string(&namespace);
+                    let exact_q = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata LIMIT {}",
+                        safe_ns, fetch_limit * 5
+                    );
+                    if let Ok(rows) = conn.query(&exact_q) {
+                        for row in rows {
+                            let id: String = format!("{}", row[0]);
+                            let content: String = format!("{}", row[1]);
+                            let user_id: String = format!("{}", row[2]);
+                            let memory_type: String = format!("{}", row[3]);
+                            let agent_name: String = format!("{}", row[4]);
+                            let location: String = format!("{}", row[5]);
+                            let location_lines: String = format!("{}", row[6]);
+                            let metadata_str: String = format!("{}", row[7]);
+                            let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                            if is_retired_at(&metadata_val, now) { continue; }
+                            if !include_archived && is_archived(&metadata_val) { continue; }
+                            if is_mesh_conflicting(&metadata_val) { continue; }
+                            if crate::registry::is_registry_row(&metadata_val) { continue; }
+                            if !include_tasks && memory_type == "task" { continue; }
+                            if STRUCTURAL_MEMORY_TYPES.contains(&memory_type.as_str()) { continue; }
+                            let symbol = metadata_val.get("symbol").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+                            let location_l = location.to_lowercase();
+                            let content_l = content.to_lowercase();
+                            let mut matched = false;
+                            for t in &targets {
+                                let tl = t.to_lowercase();
+                                if location_l == tl || content_l == tl { matched = true; break; }
+                                if let Some(sym) = &symbol { if *sym == tl { matched = true; break; } }
+                                if let Some(obj) = metadata_val.as_object() {
+                                    for (_k, v) in obj.iter() {
+                                        if let Some(s) = v.as_str() { if s.to_lowercase() == tl { matched = true; break; } }
+                                    }
+                                    if matched { break; }
+                                }
+                            }
+                            if !matched { continue; }
+                            if exact_matches.iter().any(|r| r.id == id) { continue; }
+                            exact_matches.push(SearchResult {
+                                id: id.clone(),
+                                score: 0.0,
+                                payload: MemoryPayload {
+                                    content, user_id, memory_type,
+                                    agent_name: Some(agent_name),
+                                    location, location_lines, metadata: metadata_val,
+                                },
+                                evidence: Some(vec![crate::traits::SearchEvidence {
+                                    kind: crate::traits::EvidenceKind::DirectMatch,
+                                    path: vec![],
+                                    explanation: "Exact name match.".to_string(),
+                                    derivation: vec!["exact-name".to_string()],
+                                }]),
+                            });
+                        }
+                    }
+                }
+            }
 
             // Step 1: Base vector search.
             //
@@ -220,8 +296,14 @@ async fn search_inner(
                 (filtered_primaries, DomainMatchMode::Domain)
             };
 
-            let primary_ids: Vec<String> = chosen_primaries.iter().map(|r| r.id.clone()).collect();
-            let mut results = chosen_primaries;
+            let mut all_primaries_with_exact: Vec<SearchResult> = exact_matches.clone();
+            for cp in chosen_primaries {
+                if !all_primaries_with_exact.iter().any(|r| r.id == cp.id) {
+                    all_primaries_with_exact.push(cp);
+                }
+            }
+            let primary_ids: Vec<String> = all_primaries_with_exact.iter().map(|r| r.id.clone()).collect();
+            let mut results = all_primaries_with_exact;
 
             // Step 2: Hybrid GraphRAG — directed evidence expansion.
             // Four bounded queries replace the old undirected ones, each using
@@ -256,6 +338,15 @@ async fn search_inner(
                 );
                 let govern_in_q = format!(
                     "MATCH (a:Memory)<-[e]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata, a.id, label(e) AS relation, f.id, f.metadata, false AS outgoing ORDER BY r.id ASC, f.id ASC, a.id ASC, relation ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+
+                let govern_out_cont_q = format!(
+                    "MATCH (a:Memory)-[:CONTAINS]->(f1:Memory)-[:CONTAINS]->(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata, a.id, 'CONTAINS' AS relation, f.id, f.metadata, f1.id, f1.metadata, true AS outgoing ORDER BY r.id ASC, f.id ASC, f1.id ASC, a.id ASC LIMIT {}",
+                    id_list, safe_ns, id_list, fetch_limit
+                );
+                let govern_in_cont_q = format!(
+                    "MATCH (a:Memory)<-[:CONTAINS]-(f1:Memory)<-[:CONTAINS]-(f:Memory)<-[:GOVERNS]-(r:Memory) WHERE a.id IN [{}] AND r.namespace = '{}' AND NOT r.id IN [{}] RETURN DISTINCT r.id, r.content, r.user_id, r.memory_type, r.agent_name, r.location, r.location_lines, r.metadata, a.id, 'CONTAINS' AS relation, f.id, f.metadata, f1.id, f1.metadata, false AS outgoing ORDER BY r.id ASC, f.id ASC, f1.id ASC, a.id ASC LIMIT {}",
                     id_list, safe_ns, id_list, fetch_limit
                 );
 
@@ -411,6 +502,85 @@ async fn search_inner(
                                     kind,
                                     explanation: "This memory governs a node one hop from a direct match.".to_string(),
                                     derivation: vec![],
+                                    path: edges,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Process 3-hop transitive governing queries (CONTAINS hops).
+                for q in [&govern_out_cont_q, &govern_in_cont_q] {
+                    if let Ok(rows) = conn.query(q) {
+                        for row in rows {
+                            let result_id: String = format!("{}", row[0]);
+                            let memory_type: String = format!("{}", row[3]);
+                            let metadata_str: String = format!("{}", row[7]);
+                            let metadata_val: Value =
+                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                            if is_retired_at(&metadata_val, now) { continue; }
+                            if primary_set.contains(result_id.as_str()) { continue; }
+                            if !include_tasks && memory_type == "task" { continue; }
+                            if !include_archived && is_archived(&metadata_val) { continue; }
+                            if is_mesh_conflicting(&metadata_val) { continue; }
+                            if crate::registry::is_registry_row(&metadata_val) { continue; }
+
+                            let primary_id: String = format!("{}", row[8]);
+                            let f_id: String = format!("{}", row[10]);
+                            let f_metadata_str: String = format!("{}", row[11]);
+                            let f_metadata: Value =
+                                serde_json::from_str(&f_metadata_str).unwrap_or(Value::Null);
+                            let f1_id: String = format!("{}", row[12]);
+                            let f1_metadata_str: String = format!("{}", row[13]);
+                            let f1_metadata: Value =
+                                serde_json::from_str(&f1_metadata_str).unwrap_or(Value::Null);
+                            let outgoing: bool = row_flag_true(&row[14]);
+
+                            if is_retired_at(&f_metadata, now) { continue; }
+                            if is_retired_at(&f1_metadata, now) { continue; }
+
+                            let (src1, tgt1) = if outgoing {
+                                (primary_id.clone(), f1_id.clone())
+                            } else {
+                                (f1_id.clone(), primary_id.clone())
+                            };
+                            let edges = vec![
+                                crate::traits::EvidenceEdge {
+                                    source: src1, relation: "CONTAINS".to_string(), target: tgt1,
+                                },
+                                crate::traits::EvidenceEdge {
+                                    source: if outgoing { f1_id.clone() } else { f_id.clone() },
+                                    relation: "CONTAINS".to_string(),
+                                    target: if outgoing { f_id.clone() } else { f1_id.clone() },
+                                },
+                                crate::traits::EvidenceEdge {
+                                    source: result_id.clone(),
+                                    relation: "GOVERNS".to_string(),
+                                    target: f_id.clone(),
+                                },
+                            ];
+                            let kind = crate::traits::EvidenceKind::Governs2hop;
+                            let norm = norm_path(&edges, &kind);
+
+                            let entry = by_id.entry(result_id).or_insert_with(CandidateEntry::default);
+                            if entry.payload.is_none() {
+                                let content: String = format!("{}", row[1]);
+                                let user_id: String = format!("{}", row[2]);
+                                let agent_name: String = format!("{}", row[4]);
+                                let location: String = format!("{}", row[5]);
+                                let location_lines: String = format!("{}", row[6]);
+                                entry.payload = Some(MemoryPayload {
+                                    content, user_id, memory_type: memory_type.clone(),
+                                    agent_name: Some(agent_name),
+                                    location, location_lines, metadata: metadata_val,
+                                });
+                            }
+                            entry.primary_sources.insert(primary_id);
+                            if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
+                                entry.evidence.push(crate::traits::SearchEvidence {
+                                    kind,
+                                    explanation: "This memory governs a node reachable via CONTAINS hops from a direct match.".to_string(),
+                                    derivation: vec!["transitive-governs".to_string(), "contains-2hop".to_string()],
                                     path: edges,
                                 });
                             }
@@ -1890,6 +2060,8 @@ impl VectorStore for LadybugStore {
             include_tasks,
             include_archived,
             HashSet::new(),
+            None,
+            true,
         )
         .await?;
         Ok(outcome.results)
@@ -1903,16 +2075,14 @@ impl VectorStore for LadybugStore {
         include_tasks: bool,
         include_archived: bool,
         domains: &[String],
+        query_text: Option<&str>,
+        exact: bool,
     ) -> Result<DomainSearchOutcome> {
-        // Build the normalized domain key set before entering the closure.
-        // The closure requires an owned HashSet because with_conn needs FnOnce + Send + 'static.
-        // Normalize each provided domain slug so the store's contract is:
-        // "the key set is compared by normalized slug" — the same comparison-time
-        // normalization applied to the row's stored domain.
         let domain_keys: HashSet<String> = domains
             .iter()
             .filter_map(|d| crate::domain::normalize_domain_slug(d))
             .collect();
+        let query_owned = query_text.map(|s| s.to_string());
         search_inner(
             self,
             namespace,
@@ -1921,6 +2091,8 @@ impl VectorStore for LadybugStore {
             include_tasks,
             include_archived,
             domain_keys,
+            query_owned,
+            exact,
         )
         .await
     }
@@ -8705,6 +8877,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -8749,6 +8923,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -8790,6 +8966,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database-access".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -8854,6 +9032,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["target".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -8948,6 +9128,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -8959,6 +9141,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -8985,6 +9169,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["nonexistent".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -8996,6 +9182,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["nonexistent".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -9022,6 +9210,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database-access".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -9033,6 +9223,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database-access".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
@@ -9051,11 +9243,11 @@ eurostrata\src\daemon.rs",
 
         // Case D: no filter (empty key set) → mode Vector, all rows returned
         let real_outcome = real
-            .search_with_domain(namespace, query_vec.clone(), 10, false, false, &[])
+            .search_with_domain(namespace, query_vec.clone(), 10, false, false, &[], None, true)
             .await
             .unwrap();
         let mock_outcome = mock
-            .search_with_domain(namespace, query_vec, 10, false, false, &[])
+            .search_with_domain(namespace, query_vec, 10, false, false, &[], None, true)
             .await
             .unwrap();
 
@@ -9098,7 +9290,7 @@ eurostrata\src\daemon.rs",
 
         // Empty-key branch (domains = &[]): limit = 1 should return exactly 1 row
         let outcome = mock
-            .search_with_domain(namespace, query_vec.clone(), 1, false, false, &[])
+            .search_with_domain(namespace, query_vec.clone(), 1, false, false, &[], None, true)
             .await
             .unwrap();
         assert_eq!(outcome.mode, DomainMatchMode::Vector);
@@ -9118,6 +9310,8 @@ eurostrata\src\daemon.rs",
                 false,
                 false,
                 &["database".to_string()],
+            None,
+            true,
             )
             .await
             .unwrap();
