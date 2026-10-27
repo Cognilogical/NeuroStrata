@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// The four relations the traversal may follow (vocabulary v7).
-pub const DEFAULT_RELATIONS: [&str; 4] = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM"];
+pub const DEFAULT_RELATIONS: [&str; 5] = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
 
 /// The default and maximum hop counts (spec §4.2: default 1, max 2).
 pub const DEFAULT_MAX_HOPS: usize = 1;
@@ -60,6 +60,8 @@ pub enum EdgeRole {
     Supporting,
     /// `EXTRACTED_FROM`: provenance (memory ← task), evidence not authority.
     Extraction,
+    /// `DEPENDS_ON`: dependency traversal.
+    Dependency,
 }
 
 /// The role a relation plays in the traversal.
@@ -68,6 +70,7 @@ pub fn edge_role(relation: &str) -> EdgeRole {
         "GOVERNS" => EdgeRole::Governance,
         "CONTAINS" => EdgeRole::Structure,
         "EXTRACTED_FROM" => EdgeRole::Extraction,
+        "DEPENDS_ON" => EdgeRole::Dependency,
         _ => EdgeRole::Supporting,
     }
 }

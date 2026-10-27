@@ -579,13 +579,14 @@ mod tests {
     #[test]
     fn memory_vocabulary_v7_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 8);
+        assert_eq!(v["vocabulary_version"], 9);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));
         assert!(rels.contains_key("RELATES_TO"));
         assert!(rels.contains_key("EXTRACTED_FROM"));
-        assert_eq!(rels.len(), 4);
+        assert!(rels.contains_key("DEPENDS_ON"));
+        assert_eq!(rels.len(), 5);
         assert_eq!(rels["GOVERNS"]["direction"], "directed");
         assert_eq!(rels["CONTAINS"]["direction"], "directed");
         assert_eq!(rels["RELATES_TO"]["direction"], "undirected");
