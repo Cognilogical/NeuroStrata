@@ -49,7 +49,7 @@ Edge target states:
 Transitions (host/ThalamicBus):
 - file edit → mark `GraphDirty`.
 - post-ingest (`ThalamicPulse::IngestDone`) → auto-run `KnownIds::resolve` + relink (eliminates manual `normalize-metadata` on existing nodes).
-- `task_complete` → pre-check: normalize dirty targets; classify remaining unmatched.
+- `task_complete` → pre-check: normalize dirty targets; classify unmatched targets.
 
 ## Changes to Original ACs (from Argon rereview)
 
