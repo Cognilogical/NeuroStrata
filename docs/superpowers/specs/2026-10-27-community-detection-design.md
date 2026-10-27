@@ -37,8 +37,16 @@ Out of scope:
 
 ## 5. Approach
 
+### 3.1 Library evaluation
+
+Prefer an existing crate over an in-house implementation:
+
+- `leiden-rs` provides seeded, deterministic Leiden with modularity and CPM quality functions and optional `petgraph` adapters.
+- `rust_igraph` is an alternative if broader graph algorithms are needed; it is heavier and should be evaluated against `leiden-rs` before adoption.
+- Do not implement Leiden in-house unless a dependency review rejects both candidates.
+
 ### 5.1 Feature gate
-Cargo feature `community` adds dep `leiden` or a pure-Rust implementation. If no suitable crate, implement Leiden in `src/community.rs` (~300 LOC) to avoid heavy deps. Recommend implementing in-house to control determinism and avoid LGPL crates (per RDF spec licensing allowlist). CI must run `cargo test --features community`; default-feature builds remain unaffected but do not compile this module.
+Cargo feature `community` adds `leiden-rs` (and its `petgraph` adapter if needed). CI must run `cargo test --features community`; default-feature builds remain unaffected but do not compile this module.
 
 ### 5.2 Graph build
 - Nodes: ALL active-generation memory ids (including structural connectors: directory/file/symbol/markdown) except retired, archived, conflicting, and registry rows. Node eligibility checks `is_active_id`, `is_retired_at(metadata, now)`, `is_archived`, `is_mesh_conflicting`, and `is_registry_row`.
