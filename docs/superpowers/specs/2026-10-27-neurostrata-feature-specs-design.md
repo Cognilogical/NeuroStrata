@@ -2,7 +2,7 @@
 
 Date: 2026-10-27. Design only. No implementation authorized.
 
-Status: draft for user review.
+Status: revised per Argon review (approve with changes). Awaiting user review.
 
 ## 1. Scope and constraints
 
@@ -10,50 +10,53 @@ Status: draft for user review.
 - Deterministic read path: no LLM in search, dedup, guard, or routing.
 - Single store: LadybugDB. No second database in normal installs.
 - Preserve bi-temporal memory, 3-tier namespaces, SynapticMesh privacy rules, and the pre-push task gate.
-- All new structured data is JSON conforming to `src/schemas/memory-vocabulary.v3.json` (bump to v4 for semantic changes).
+- All new structured data is JSON conforming to `src/schemas/memory-vocabulary.v3.json` (internal `vocabulary_version` bumps from 8 to 9 when `DEPENDS_ON` lands).
 - GLiNER and other models stay write-side and review-only.
 - Every feature must be falsifiable with a metric or a regression test.
 
-Non-goals: LLM completion search types, multi-tenancy, truth subspace, COGX exchange format, frontend/UI, Python sidecar in normal installs, directed calls faked as undirected relations.
+Non-goals: LLM completion search types, multi-tenancy, truth subspace, COGX exchange format, frontend/UI, Python sidecar in normal installs, directed calls faked as undirected relations, strict ingestion dropping, OWL/RDF.
 
 ## 2. Common contracts
 
 ### 2.1 Memory row
 
-- `memory_type`: existing types plus inferred facet tags stored in `metadata.facets: string[]` (not new top-level types).
-- `metadata.domain`: `string | string[]` after feature 9.
-- `metadata.node_set`: `string[]` after feature 9.
-- `metadata.concept_iri`: optional string for cross-namespace alignment (feature 20).
-- `metadata.facets`: `string[]` (feature 16).
-- `metadata.feedback_score`: number in [-1, 1] (feature 23).
-- `metadata.source_ref`: `{ file, content_hash, line_start, line_end, extractor }` on generated edges (feature 6).
+- `memory_type`: existing types plus inferred facet tags stored in `metadata.facets: string[]` (not new top-level types), with one exception: embedded markdown sections use `memory_type: "doc_section"` so they are not excluded by `STRUCTURAL_MEMORY_TYPES`.
+- `metadata.domain`: `string | string[]` after F9.
+- `metadata.node_set`: `string[]` after F9.
+- `metadata.concept_iri`: optional string for cross-namespace alignment (F20).
+- `metadata.facets`: `string[]` (F16).
+- `metadata.feedback_score`: number in [-1, 1] (F23).
+- `metadata.edge_sources`: `Array<{ rel_type, declaration_index, logical_target, file, content_hash, line_start, line_end, extractor }>` on the declaring Memory row. LadybugDB relation tables are property-less, so provenance lives on the node (F6).
+- `metadata.as_of` support: search accepts `as_of: Option<i64>` to filter by bi-temporal `valid_from`/`valid_to` (deterministic replacement for killed temporal reranking).
 
 ### 2.2 Domain registry
 
-Stored as the namespace's registry row with `eligibility: private`. Shape after feature 15:
+Stored as the namespace's registry row with `eligibility: private`. Shape after F15 (v2), with backwards-compatible v1:
 
 ```json
 {
   "domain_registry": {
     "version": 2,
     "domains": [
-      { "slug": "auth", "parent": null, "aliases": ["authentication"] },
-      { "slug": "tls", "parent": "auth", "aliases": ["ssl"] },
-      { "slug": "mtls", "parent": "tls", "aliases": ["mutual-tls"] }
+      { "slug": "auth", "parent": null, "aliases": ["authentication"], "concept_iri": null },
+      { "slug": "tls", "parent": "auth", "aliases": ["ssl"], "concept_iri": null },
+      { "slug": "mtls", "parent": "tls", "aliases": ["mutual-tls"], "concept_iri": "https://..." }
     ]
   }
 }
 ```
 
-Invariants: slugs normalized via `normalize_domain_slug`; no cycles (DAG check); aliases unique within the namespace.
+Invariants: slugs normalized via `normalize_domain_slug`; no cycles (DAG check); aliases unique within the namespace. The deserializer accepts v1 (`domains: string[]`, mapped to `{slug, parent: null, aliases: []}`) and v2 (objects).
 
 ### 2.3 Search evidence
 
-`SearchEvidence` (`src/traits.rs:66-104`) gains an optional `derivation: string[]` listing the ontology/traversal steps that produced an expanded row. Transient only; never persisted on the memory row.
+`SearchEvidence` (`src/traits.rs:66-104`) keeps `kind`, `path`, `explanation` and gains `derivation: Vec<String>` listing the traversal/ontology steps that produced an expanded row. Transient only; never persisted on the memory row.
 
-### 2.4 Ingest generations
+### 2.4 Ingest generations and enrichment state
 
-Each ingest run stamps `ingest_generation` (u64) on nodes and edges. Unchanged files reuse the prior generation's nodes and embeddings (feature 2). Superseded nodes get `valid_to` set.
+- Each ingest run stamps `index_generation` (u64) on nodes and edges (existing `IngestGeneration` pointer in `src/parser/generation.rs`).
+- Unchanged files reuse the prior generation's nodes and embeddings via cross-generation carry-forward when `file_sha256` and the pipeline fingerprint (parser version, vocabulary version, embedder descriptor) match. No `valid_to` superseding of AST symbols.
+- Enrichment state is a single record on the namespace registry row: `{ state: "pending" | "running" | "done" | "failed", watermark, lock_holder, telemetry }`. F12, F14, and F24 share this record.
 
 ## 3. Feature specifications
 
@@ -62,11 +65,11 @@ Each ingest run stamps `ingest_generation` (u64) on nodes and edges. Unchanged f
 Problem: embeddings miss exact identifiers.
 
 Requirements:
-1. Add an exact-match pass before vector scan in `search_inner`.
-2. Match when the query or any quoted phrase equals a `symbol` name, file path, env var pattern, or error string stored in node content/metadata.
-3. Reuse existing `symbol` and `file` rows; no new index or dependency.
-4. Return matches as primary results with `EvidenceKind::DirectMatch` and `derivation: ["exact-name"]`.
-5. Add `exact: bool` parameter to `neurostrata_search_memory` (default true).
+1. Thread `query_text: Option<&str>` and `exact: bool` into `VectorStore::search_with_domain` / `search_inner`.
+2. Run a deterministic pre-pass matching `m.location`, `metadata.symbol`, or an exact quoted substring. Synthetic distance `0.0` so matches sort ahead of vector hits.
+3. `derivation: ["exact-name"]`.
+4. Add `exact: bool` (default true) and `as_of: Option<i64>` to `neurostrata_search_memory`.
+5. Respect `STRUCTURAL_MEMORY_TYPES` exclusion for file/symbol containers; match against their metadata/location only.
 
 Acceptance: Recall@5 on a 30-query identifier benchmark improves by at least 20 points over baseline vector-only; zero regressions on existing direct-match queries.
 
@@ -75,9 +78,9 @@ Acceptance: Recall@5 on a 30-query identifier benchmark improves by at least 20 
 Problem: full re-ingest re-embeds and rebuilds unchanged nodes.
 
 Requirements:
-1. Store `content_hash` (SHA-256 of file bytes) per file node.
-2. On ingest, skip files whose hash matches the stored hash and whose parser/schema version matches.
-3. For changed files: supersede old symbol nodes (set `valid_to`), add new nodes in the new generation.
+1. Use existing `file_sha256` and `span_sha256` (`src/parser/ingest.rs`).
+2. Skip files whose hash and pipeline fingerprint match the previous active generation.
+3. For changed files: add new nodes in the new staging generation; carry forward unchanged file/symbol nodes and their embeddings into the new generation.
 4. Re-parse when parser version or vocabulary version changes even if the file hash matches.
 5. Report counts: files skipped, changed, added, removed, embeddings reused.
 
@@ -90,9 +93,9 @@ Problem: markdown files stored as empty `Path: ...` rows.
 Requirements:
 1. Parse markdown into sections by heading.
 2. Extract backticked symbols, file paths, and links.
-3. Create `markdown` nodes with real content and `CONTAINS` edges to extracted symbols/paths.
-4. Connect to the graph via existing `CONTAINS`/`RELATES_TO`.
-5. Embed the section text (not an empty path string).
+3. Store embedded sections as `memory_type: "doc_section"` (non-structural) with ID `path#section:slug@sha256` and `CONTAINS` edge from the file-level `markdown` container.
+4. Embed the section text.
+5. Connect to the graph via existing `CONTAINS`/`RELATES_TO`.
 
 Acceptance: a search for a backticked symbol in a doc returns the doc section; `memories_for_file` returns doc sections referencing that file.
 
@@ -102,8 +105,9 @@ Problem: model pins use SHA-256 of empty string; Laya reports fake 0.75.
 
 Requirements:
 1. Replace empty-string pins in `src/embed.rs:62,71` and `src/model_downloader.rs:32` with real SHA-256 of the downloaded artifacts.
-2. Either repair Laya's duplicate confidence (`src/judgment/laya_onnx.rs:97-120`) to return a real score or remove the Laya path and document retirement.
-3. Add a verification step in the downloader that fails on mismatch (no silent fallback).
+2. Fix `verify_model_checksum` (`src/embed.rs:138-167`) to check the actual post-download ONNX blob path; fail closed on mismatch or missing file (no silent fallback).
+3. Retire the fake `0.75` stub in `LayaOnnxProvider::judge_duplicates` (`src/judgment/laya_onnx.rs:107-118`) and `ensure_ready` (`:188`): return explicit unavailable until real `ort` session execution is wired.
+4. `ModelRegistry` (`src/model_downloader.rs:16-32`) supports multi-file bundles for F5.
 
 Acceptance: downloader rejects a tampered artifact; Laya never returns 0.75 unless computed.
 
@@ -112,11 +116,13 @@ Acceptance: downloader rejects a tampered artifact; Laya never returns 0.75 unle
 Problem: no entity/relation extraction from prose.
 
 Requirements:
-1. Add an opt-in enrichment stage using GLiNER2.5 (via the Rust ONNX path) that proposes entities and relations.
-2. Output is review-only: writes candidate edges with `eligibility: pending-review`, never auto-materializes.
-3. Auto-materialize only when a measured precision bar is met (configurable, default 0.9).
-4. Never runs in search, dedup, guard, or routing.
-5. Dry-run reports proposed edges without writing.
+1. Opt-in enrichment stage using GLiNER2.5 via the Rust ONNX path (feature-gated: `--features gliner`).
+2. Chunk prose at <= 384 words (64-word overlap) to respect the 512-token ONNX ceiling.
+3. Run inference in `spawn_blocking` gated by a bounded `Semaphore`.
+4. Output is review-only: write candidates to `IntakeCandidate` (not `Memory`), or add a hard `is_pending_review` exclusion across all read queries.
+5. Auto-materialize only when a measured precision bar is met (configurable, default 0.9).
+6. Never runs in search, dedup, guard, or routing.
+7. Dry-run reports proposed edges without writing.
 
 Acceptance: on a 50-doc corpus, proposed edges have >= 0.9 precision at the configured threshold; zero false auto-materializations.
 
@@ -125,11 +131,12 @@ Acceptance: on a 50-doc corpus, proposed edges have >= 0.9 precision at the conf
 Problem: edges carry no provenance.
 
 Requirements:
-1. Add `source_ref` to every generated edge (feature 2/5/7 outputs).
-2. Surface `source_ref` in `search_memory` output and `export-graph`.
-3. Store content hash so staleness is detectable.
+1. Add `metadata.edge_sources` to the declaring Memory row (LadybugDB edges are property-less).
+2. Key by `rel_type`, `declaration_index`, `logical_target` (via `logical_path_of`, `src/parser/generation.rs:77`) so provenance survives re-ingestion.
+3. Surface in `search_memory` output and `export-graph`.
+4. Store content hash for staleness detection.
 
-Acceptance: every generated edge in a test ingest has a non-null `source_ref` with matching hash.
+Acceptance: every generated edge in a test ingest has a non-null `edge_sources` entry with matching hash.
 
 ### F7. Dependency edges
 
@@ -137,9 +144,10 @@ Problem: no import/call traversal.
 
 Requirements:
 1. Extend tree-sitter ingest to capture imports and module dependencies.
-2. Store as `CONTAINS` (structural) and a new `DEPENDS_ON` relation (directed). Do not reuse `RELATES_TO`.
-3. Add `DEPENDS_ON` to the vocabulary and storage schema.
-4. `related` traverses `DEPENDS_ON` with bounded depth.
+2. Store as `CONTAINS` (structural) and new `DEPENDS_ON` relation (directed). Do not reuse `RELATES_TO`.
+3. Add `DEPENDS_ON` to vocabulary and storage schema; bump internal `vocabulary_version` from 8 to 9 and `rels.len()` from 4 to 5 (`src/traits.rs:578-584`).
+4. Add `CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory)` to `LadybugStore::init` (`src/store/ladybug.rs:1616`).
+5. `related` traverses `DEPENDS_ON` with bounded depth.
 
 Acceptance: a change to a module's exports surfaces dependents via `related`.
 
@@ -150,8 +158,9 @@ Problem: no pre-ingest preview.
 Requirements:
 1. Add `dry_run: bool` and `dry_run_mode: "estimate" | "presort"` to `neurostrata_ingest_directory`.
 2. Estimate mode: counts, embeddings to compute, estimated cost, secret hits. No writes, no downloads.
-3. Presort mode: junk detection, duplicate-file detection, version candidates, possible PII, proposed dataset groups. Returns a report; applies nothing.
-4. All modes produce deterministic output.
+3. Presort mode: junk detection, duplicate-file detection, version candidates, possible PII (pattern-based: emails, phones, SSN/credit-card Luhn, IPs, plus `src/secrets.rs` rules), proposed dataset groups. Returns a report; applies nothing.
+4. Label PII output `pattern_pii_warnings`.
+5. All modes produce deterministic output.
 
 Acceptance: dry-run on a 100-file tree completes without writing or downloading; report matches a subsequent real ingest's counts.
 
@@ -164,6 +173,8 @@ Requirements:
 2. Add `metadata.node_set: string[]`.
 3. `neurostrata_search_memory` accepts `domains` (OR) and `node_sets` (AND/OR) filters.
 4. Update add schema, registry, storage, and search.
+5. `domain_keys(metadata) -> Vec<String>` in `src/domain.rs`.
+6. `node_set` is ungoverned (free-form project/monorepo subset tags); `domain` remains registry-governed.
 
 Acceptance: a memory with `domain: ["auth","mtls"]` is found by either domain; node_set filter narrows results.
 
@@ -172,9 +183,10 @@ Acceptance: a memory with `domain: ["auth","mtls"]` is found by either domain; n
 Problem: contradictory active memories go unnoticed.
 
 Requirements:
-1. Add a detection pass (deterministic heuristic or offline LLM) that marks pairs of active memories sharing an entity with contradictory predicates as `disputed`.
+1. Deterministic heuristic only: two active rules/facts governing the same `location` or `topology.{component,target_system}` with opposing `enforcement` or `decision.status`, or high cosine similarity with opposite negation/modal tokens.
 2. Add `disputed: bool` and `disputed_with: string[]` to metadata.
-3. Surface in recall and snapshot. Never auto-resolve.
+3. Surface in recall and snapshot as a warning badge. Never auto-resolve.
+4. `disputed: true` must not hide the row (unlike `is_mesh_conflicting`).
 
 Acceptance: a synthetic contradictory pair is flagged; a near-duplicate pair is not.
 
@@ -183,18 +195,19 @@ Acceptance: a synthetic contradictory pair is flagged; a near-duplicate pair is 
 Problem: due procedures are not surfaced in search.
 
 Requirements:
-1. In `get_snapshot`, include procedures whose trigger matches the current query/task.
-2. Match by trigger string and description similarity.
-3. Read-only; no mutation.
+1. Add optional `query: Option<String>` and `task_id: Option<String>` to `neurostrata_get_snapshot` (`src/server.rs:158`).
+2. Include procedures whose trigger matches the query/task.
+3. Also surface matching procedures in `neurostrata_search_memory` when the query matches a procedure's trigger/content.
+4. Read-only; no mutation.
 
-Acceptance: a due procedure matching the query appears in snapshot output.
+Acceptance: a due procedure matching the query appears in snapshot/search output.
 
 ### F12. Watermarks
 
 Problem: no record of enrichment progress.
 
 Requirements:
-1. Store `last_enriched_at`, `enriched_count`, and `extractor_fingerprint` per namespace.
+1. Store `last_enriched_at`, `enriched_count`, and `extractor_fingerprint` per namespace in the enrichment state record (§2.4).
 2. Skip work already covered by the watermark.
 3. Expose in `doctor`.
 
@@ -216,7 +229,7 @@ Acceptance: a store with one dangling edge reports it by ID.
 Problem: enrichment is a black box.
 
 Requirements:
-1. Per-stage counts, failures, latency, and fingerprints.
+1. Per-stage counts, failures, latency, and fingerprints in the enrichment state record.
 2. Expose via `doctor` and logs.
 3. Deterministic output (sorted).
 
@@ -227,7 +240,7 @@ Acceptance: a failed stage reports its error and count; totals reconcile.
 Problem: flat domain list; no hierarchy or synonyms.
 
 Requirements:
-1. Upgrade `domain_registry` to the DAG shape in §2.2.
+1. Upgrade `domain_registry` to the DAG shape in §2.2 (v2), with v1 backwards compat.
 2. Expand `search_with_domain` by `subClassOf` closure.
 3. Expand query terms via `altLabel` to canonical slugs.
 4. Validate no cycles on write.
@@ -272,9 +285,10 @@ Acceptance: a malformed edge produces a warning with the row ID and reason.
 Problem: one-hop `GOVERNS` misses leaf symbols.
 
 Requirements:
-1. Extend `govern_out_q`/`govern_in_q` to traverse 2-3 hops over `CONTAINS`.
-2. Record the path in `SearchEvidence.derivation`.
-3. Cap depth at 3; no unbounded traversal.
+1. Extend `govern_out_q`/`govern_in_q` to traverse 2-3 hops over `CONTAINS`, upward from matched symbols/files to governing rules (never downward from root directories).
+2. Check `is_retired_at` on all intermediate nodes.
+3. Record the path in `SearchEvidence.derivation`.
+4. Cap depth at 3; no unbounded traversal.
 
 Acceptance: a rule governing `src/store` is returned for a symbol in `src/store/ladybug.rs`.
 
@@ -285,21 +299,22 @@ Problem: domain slugs are private; shared memories lose alignment.
 Requirements:
 1. When a shareable memory crosses SynapticMesh, stamp `metadata.concept_iri` if the local domain has one.
 2. Receiver maps `concept_iri` to its local slug.
-3. Local slugs and aliases remain private.
+3. Add `concept_iri` to the shareable metadata allowlist in `src/synaptic_mesh/record.rs` and to the v2 domain entry.
+4. Local slugs and aliases remain private.
 
 Acceptance: a shared memory queried with the receiver's local alias returns the memory.
 
-### F21. Ontology grounding (annotate/strict)
+### F21. Ontology grounding (annotate only)
 
 Problem: synonym drift across namespaces.
 
 Requirements:
 1. Optional JSON vocabulary file per namespace (`ONTOLOGY_FILE_PATH` env or config).
 2. `annotate` mode: add canonical type to metadata.
-3. `strict` mode: filter memories at ingest whose type has no vocabulary entry.
-4. Keep chunk text even when pruned.
+3. No strict ingestion filtering; out-of-vocabulary items produce a `task_validate`/`doctor` warning (matches F18 warn-first policy).
+4. Keep chunk text even when flagged.
 
-Acceptance: strict mode drops an out-of-vocabulary memory; annotate mode tags it.
+Acceptance: an out-of-vocabulary memory is tagged with a warning, not dropped.
 
 ### F22. Session distillation
 
@@ -307,7 +322,7 @@ Problem: no durable rules from session logs.
 
 Requirements:
 1. Add a `distill` command that scans `neurostrata_append_log` output and proposes candidate rules/tasks.
-2. Candidates are review-only (task rows or memories with `eligibility: pending-review`).
+2. Candidates are review-only: write to `IntakeCandidate` (or `eligibility: pending-review` with a hard read-path exclusion).
 3. No separate session store; uses existing logs.
 
 Acceptance: distill on a session log produces at least one candidate rule for a stated preference.
@@ -329,7 +344,7 @@ Acceptance: a rated memory's salience reflects the rating within the cap.
 Problem: concurrent enrichment duplicates work.
 
 Requirements:
-1. Lock per namespace during enrichment.
+1. Lock per namespace during enrichment (shared enrichment state record).
 2. A second call returns `lock_held` with rerun passes.
 3. Follow the task-claim exclusivity pattern.
 
@@ -348,18 +363,16 @@ Requirements:
 
 Acceptance: `npm run build` succeeds; shim loads in OpenCode 2.0.32; guard runs before a write.
 
-## 5. Implementation order (suggested, not mandatory)
+## 5. Implementation order (6 sequential plans)
 
-1. F4 (trust bugs) — prerequisite for all model work.
-2. F1, F19 — retrieval correctness.
-3. F2, F3, F8 — ingest hygiene.
-4. F9, F15, F17 — domain/alias.
-5. F6, F7, F13 — graph quality.
-6. F18, F16, F10, F11 — validation and surfacing.
-7. F12, F14, F24 — observability.
-8. F5, F21 — extraction and grounding.
-9. F20, F22, F23 — cross-cutting.
-10. B1 — plugin build.
+1. **Plan 1 — Trust, Hygiene & Unblocking (P0):** F4, B1. Unblocks guard hooks and supply-chain safety.
+2. **Plan 2 — Core Retrieval & Traversal (P0):** F1, F19, F11. Retrieval correctness.
+3. **Plan 3 — Incremental & Doc Ingestion (P0):** F2, F3, F8. Ingest hygiene.
+4. **Plan 4 — Graph Schema, Provenance & Diagnostics:** F7, F6, F13, F18. Graph quality.
+5. **Plan 5 — Domain DAG, Facets & Mesh Alignment:** F9, F15, F16, F17, F20, F21. Domain/alias.
+6. **Plan 6 — Enrichment Pipeline, Distillation & Signals:** F12, F14, F24 (unified state machine), F5, F10, F22, F23. Enrichment.
+
+MCP tool schema additions: `exact`, `domains`, `node_sets`, `facets`, `as_of` on `search_memory`; `dry_run`, `dry_run_mode` on `ingest_directory`; `query`, `task_id` on `get_snapshot`; new `neurostrata_feedback` and `neurostrata_distill` tools.
 
 ## 6. Open questions
 
