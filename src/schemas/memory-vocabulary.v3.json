@@ -1,5 +1,5 @@
 {
-  "vocabulary_version": 8,
+  "vocabulary_version": 9,
   "relations": {
     "GOVERNS": {
       "direction": "directed",
@@ -33,6 +33,12 @@
       "definition": "The source is a memory extracted from completing the target task.",
       "metadata_key": "extracted_from",
       "declaration_direction": "self_to_target"
+    },
+    "DEPENDS_ON": {
+      "direction": "directed",
+      "source_role": "memory",
+      "target_role": "memory",
+      "description": "Dependency edge: a module depends on another."
     }
   },
   "memory_types": {

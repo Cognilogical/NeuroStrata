@@ -1800,6 +1800,10 @@ impl VectorStore for LadybugStore {
             let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory)";
             conn.query(create_extracted_table).ok();
 
+            // F7: dependency edges (directed).
+            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory)";
+            conn.query(create_depends_table).ok();
+
             // PQTH: Intake receipts table (operational, not memory rows)
             let create_receipts_table = "CREATE NODE TABLE IntakeReceipt (id STRING, namespace STRING, source_kind STRING, source_revision STRING, source_digest STRING, detected_intents STRING, raw_text STRING, created_at STRING, PRIMARY KEY (id))";
             conn.query(create_receipts_table).ok();
