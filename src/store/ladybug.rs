@@ -1711,6 +1711,9 @@ fn create_missing_edges(
     conn: &Connection,
     rel_type: &str,
     pairs: &[(String, String)],
+    namespace: &str,
+    generation: u64,
+    now: i64,
 ) -> Result<usize> {
     if !is_valid_relation_name(rel_type) {
         anyhow::bail!("invalid relation name for Cypher interpolation: {:?}", rel_type);
@@ -1751,9 +1754,10 @@ fn create_missing_edges(
 
         // Both ends must exist; a rule naming a file the ingester never reached
         // still produces nothing, exactly as before.
+        let safe_ns = escape_ladybug_string(namespace);
         let query = format!(
-            "UNWIND [{}] AS e MATCH (a:Memory {{id: e.f}}), (b:Memory {{id: e.t}}) CREATE (a)-[:{}]->(b) RETURN count(*)",
-            list, rel_type
+            "UNWIND [{}] AS e MATCH (a:Memory {{id: e.f}}), (b:Memory {{id: e.t}}) CREATE (a)-[:{} {{source: '{}', valid_from: {}, valid_to: 0, generation: {}, extractor: 'relink'}}]->(b) RETURN count(*)",
+            list, rel_type, safe_ns, now, generation
         );
         for row in conn.query(&query)? {
             created += format!("{}", row[0]).parse::<usize>().unwrap_or(0);
@@ -1787,22 +1791,44 @@ impl VectorStore for LadybugStore {
                 }
             }
 
-            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory)";
+            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
             conn.query(create_rel_table).ok();
 
-            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory)";
+            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
             conn.query(create_contains_table).ok();
 
-            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory)";
+            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
             conn.query(create_governs_table).ok();
 
             // Vocabulary v2: extraction edges (memory -> task) behind Lock 2.
-            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory)";
+            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
             conn.query(create_extracted_table).ok();
 
             // F7: dependency edges (directed).
-            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory)";
+            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
             conn.query(create_depends_table).ok();
+
+            // RDF projection (Phase 1): idempotent migration for DBs created before
+            // edge provenance columns existed. LadybugDB supports ALTER ... ADD.
+            const EDGE_PROVENANCE_TABLES: [&str; 5] = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"];
+            const EDGE_PROVENANCE_COLUMNS: [(&str, &str); 5] = [
+                ("source", "STRING"),
+                ("valid_from", "INT64"),
+                ("valid_to", "INT64"),
+                ("generation", "INT64"),
+                ("extractor", "STRING"),
+            ];
+            for table in EDGE_PROVENANCE_TABLES {
+                for (col, ty) in EDGE_PROVENANCE_COLUMNS {
+                    let sql = format!("ALTER TABLE {} ADD {} {}", table, col, ty);
+                    if let Err(e) = conn.query(&sql) {
+                        let msg = e.to_string();
+                        if !msg.contains("already has property") && !msg.contains("already exists") {
+                            eprintln!("[neurostrata:schema] edge provenance migration failed for {}.{}: {}", table, col, msg);
+                        }
+                    }
+                }
+            }
 
             // PQTH: Intake receipts table (operational, not memory rows)
             let create_receipts_table = "CREATE NODE TABLE IntakeReceipt (id STRING, namespace STRING, source_kind STRING, source_revision STRING, source_digest STRING, detected_intents STRING, raw_text STRING, created_at STRING, PRIMARY KEY (id))";
@@ -1909,6 +1935,7 @@ impl VectorStore for LadybugStore {
             }
 
             let mut deferred_edges = Vec::new();
+            let edge_now = chrono::Utc::now().timestamp();
 
             // Materialise the edges this memory declares. A target that does not exist
             // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
@@ -2021,8 +2048,8 @@ impl VectorStore for LadybugStore {
                     (target_safe.as_str(), safe_id.as_str())
                 };
                 let edge_query = format!(
-                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[:{}]->(b)",
-                    from, to, edge.rel_type
+                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = {}, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert' ON MATCH SET r.source = '{}', r.valid_from = {}, r.extractor = 'upsert'",
+                    from, to, edge.rel_type, safe_ns, edge_now, safe_ns, edge_now
                 );
                 if let Err(e) = conn.query(&edge_query) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
@@ -2596,8 +2623,9 @@ impl VectorStore for LadybugStore {
             // then points at the real node, not the placeholder it replaced.
             let _ = retire_replaced_stubs(conn, &namespace_owned, &active_paths)?;
             let mut created = 0usize;
+            let relink_now = chrono::Utc::now().timestamp();
             for (rel_type, pairs) in &wanted {
-                created += create_missing_edges(conn, rel_type, pairs)?;
+                created += create_missing_edges(conn, rel_type, pairs, &namespace_owned, active_gen, relink_now)?;
             }
             Ok(created)
         })
@@ -5303,6 +5331,59 @@ eurostrata\src\daemon.rs",
         ));
     }
 
+    #[tokio::test]
+    async fn upsert_writes_edge_provenance() {
+        let store = retired_test_store().await;
+        // Auto-stub materialises the target file node, so the edge forms.
+        store
+            .upsert(
+                "probe",
+                "rule-with-edge",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/x.rs"] })),
+            )
+            .await
+            .expect("upsert");
+        let rows = store
+            .with_conn(|conn| {
+                let mut r = conn
+                    .query("MATCH (a:Memory)-[e:GOVERNS]->(b:Memory) RETURN e.source, e.extractor")
+                    .unwrap();
+                let mut out = Vec::new();
+                while let Some(row) = r.next() {
+                    out.push((format!("{}", row[0]), format!("{}", row[1])));
+                }
+                Ok(out)
+            })
+            .await
+            .expect("query");
+        assert!(!rows.is_empty(), "edge should exist");
+        for (source, extractor) in &rows {
+            assert_eq!(source, "probe");
+            assert_eq!(extractor, "upsert");
+        }
+    }
+
+    #[tokio::test]
+    async fn project_namespace_rdf_includes_nodes_and_edges() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "rule-with-edge",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/x.rs"] })),
+            )
+            .await
+            .expect("upsert");
+        let quads = store
+            .project_namespace_rdf("probe", crate::rdf::Tier::Domain, 1)
+            .await
+            .expect("project");
+        assert!(quads.iter().any(|q| q.predicate.ends_with("#content")));
+        assert!(quads.iter().any(|q| q.predicate.ends_with("#governs")));
+        assert!(quads.iter().all(|q| q.graph.as_deref() == Some("urn:neurostrata:graph:probe:domain:gen:1")));
+    }
     /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`
     /// auto-materialises a stub `file` node, so the edge forms immediately.
     #[tokio::test]
@@ -9659,5 +9740,66 @@ eurostrata\src\daemon.rs",
             !results.iter().any(|r| r.id == registry_id),
             "the registry row must never appear in search results"
         );
+    }
+}
+
+impl LadybugStore {
+    pub async fn project_namespace_rdf(
+        &self,
+        namespace: &str,
+        tier: crate::rdf::Tier,
+        generation: u64,
+    ) -> Result<Vec<crate::rdf::Quad>> {
+        let memories = crate::traits::VectorStore::list(self, namespace, None, None).await?;
+        let rows: Vec<(String, crate::traits::MemoryPayload)> =
+            memories.into_iter().map(|m| (m.id, m.payload)).collect();
+
+        let namespace_owned = namespace.to_string();
+        let edges: Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)> =
+            self.with_conn(move |conn: &Connection| -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+                let safe_ns = escape_ladybug_string(&namespace_owned);
+                let mut out: Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)> =
+                    Vec::new();
+                let tables = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"];
+                for table in tables {
+                    let query = format!(
+                        "MATCH (a:Memory)-[r:{}]->(b:Memory) WHERE a.namespace = '{}' AND b.namespace = '{}' RETURN a.id, b.id, r.source, r.valid_from, r.valid_to, r.generation, r.extractor",
+                        table, safe_ns, safe_ns
+                    );
+                    if let Ok(mut rows) = conn.query(&query) {
+                        while let Some(row) = rows.next() {
+                            let from = format!("{}", row[0]);
+                            let to = format!("{}", row[1]);
+                            let source = match format!("{}", row[2]).as_str() {
+                                "" | "null" => None,
+                                s => Some(s.to_string()),
+                            };
+                            let valid_from = format!("{}", row[3]).parse::<i64>().ok();
+                            let valid_to = format!("{}", row[4]).parse::<i64>().ok();
+                            let gen = format!("{}", row[5]).parse::<i64>().ok();
+                            let extractor = match format!("{}", row[6]).as_str() {
+                                "" | "null" => None,
+                                s => Some(s.to_string()),
+                            };
+                            out.push((
+                                from,
+                                table.to_string(),
+                                to,
+                                Some(crate::rdf::EdgeProvenance {
+                                    source,
+                                    valid_from,
+                                    valid_to,
+                                    generation: gen,
+                                    extractor,
+                                }),
+                            ));
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .await?;
+
+        Ok(crate::rdf::rows_to_quads(&rows, namespace, tier, generation, &edges))
     }
 }
