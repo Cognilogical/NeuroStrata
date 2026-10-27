@@ -6,7 +6,7 @@ Status: revised per Argon review (approve with changes). Awaiting user review.
 
 ## 1. Scope and constraints
 
-- JSON only. No OWL/RDF, no reasoner, no RDF store, no pilot.
+- JSON only for this feature batch. OWL/RDF, reasoners, and RDF stores are not in scope for these 24 features, but are not permanently excluded (see docs/design-oxirs-concepts.md).
 - Deterministic read path: no LLM in search, dedup, guard, or routing.
 - Single store: LadybugDB. No second database in normal installs.
 - Preserve bi-temporal memory, 3-tier namespaces, SynapticMesh privacy rules, and the pre-push task gate.
@@ -14,7 +14,7 @@ Status: revised per Argon review (approve with changes). Awaiting user review.
 - GLiNER and other models stay write-side and review-only.
 - Every feature must be falsifiable with a metric or a regression test.
 
-Non-goals: LLM completion search types, multi-tenancy, truth subspace, COGX exchange format, frontend/UI, Python sidecar in normal installs, directed calls faked as undirected relations, strict ingestion dropping, OWL/RDF.
+Non-goals: LLM completion search types, multi-tenancy, truth subspace, COGX exchange format, frontend/UI, Python sidecar in normal installs, directed calls faked as undirected relations, strict ingestion dropping. (OWL/RDF is no longer a non-goal; see docs/design-oxirs-concepts.md.)
 
 ## 2. Common contracts
 

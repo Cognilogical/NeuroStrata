@@ -7,6 +7,7 @@
 - Model card: https://huggingface.co/fastino/gliner2.5-multi-v1 (GLiNER2.5 Multi, 287M params, mDeBERTa-v3-base, Apache-2.0, ~594 MB FP16, boundary architecture, entities/classification/relations/joint IE/records/span attributes, PyTorch `gliner2[local]`, no published ONNX).
 - Prior report: `docs/design-cognee-concepts.md`.
 - NeuroStrata source at HEAD `06ff6c0` (detached at `v1.14.3-patch`).
+- **Supersession note (2026-10-27):** adjudications below that say "Kill OWL/RDF" are superseded by owner correction 2026-10-27 — OWL/RDF is no longer categorically rejected. See docs/design-oxirs-concepts.md. Registry-alias recommendations remain valid.
 
 ## 1. GLiNER2.5 verdict
 

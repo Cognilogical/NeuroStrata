@@ -3,7 +3,7 @@
 > **Review status (2026-10-27):** this report was adjudicated by Argon and K3.
 > Several claims were corrected — most importantly §1.2 (incremental ingest
 > already has generations and hashes; the gap is carry-forward), §1.3 (edge
-> properties require an lbug migration), §1.5 (OWL/RDF is killed), §1.7
+> properties require an lbug migration), §1.5 (ontology grounding; OWL/RDF no longer categorically killed — see docs/design-oxirs-concepts.md), §1.7
 > (conflict detection is candidates-only), and §1.8 (directed calls need a
 > real schema migration). Read the adjudication first:
 > `docs/designs/2026-10-27-argon-k3-gliner-cognee-verdict.md`.
