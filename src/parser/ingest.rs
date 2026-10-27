@@ -167,6 +167,125 @@ struct SymbolRow {
     /// stable identity tail (`symbol_id`), stable across line moves.
     span_sha256: String,
 }
+/// One embedded markdown section.
+#[derive(Clone)]
+struct DocSection {
+    slug: String,
+    heading: String,
+    text: String,
+    sha256: String,
+    backticked: Vec<String>,
+    links: Vec<String>,
+}
+
+/// Parse markdown into sections by heading.
+fn parse_markdown_sections(content: &str) -> Vec<DocSection> {
+    let mut sections: Vec<DocSection> = Vec::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_level: usize = 0;
+    let mut body: Vec<String> = Vec::new();
+
+    let flush = |heading: Option<String>, _level: usize, body: &Vec<String>, out: &mut Vec<DocSection>| {
+        let heading = heading.unwrap_or_else(|| "root".to_string());
+        let text = body.join("\n").trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let slug = slugify(&heading);
+        let mut backticked = Vec::new();
+        let mut links = Vec::new();
+        for line in body {
+            let mut rest = line.as_str();
+            while let Some(start) = rest.find('`') {
+                let after = &rest[start+1..];
+                if let Some(end) = after.find('`') {
+                    let code = after[..end].trim();
+                    if !code.is_empty() && !code.contains('\n') {
+                        backticked.push(code.to_string());
+                    }
+                    rest = &after[end+1..];
+                } else {
+                    break;
+                }
+            }
+            let mut r = line.as_str();
+            while let Some(start) = r.find('[') {
+                let after = &r[start..];
+                if let Some(bracket_end) = after.find(']') {
+                    let rest2 = &after[bracket_end+1..];
+                    if rest2.starts_with('(') {
+                        if let Some(paren_end) = rest2.find(')') {
+                            let url = &rest2[1..paren_end];
+                            links.push(url.to_string());
+                        }
+                    }
+                    r = &after[bracket_end+1..];
+                } else {
+                    break;
+                }
+            }
+        }
+        backticked.sort();
+        backticked.dedup();
+        links.sort();
+        links.dedup();
+        let sha = sha256_hex(text.as_bytes());
+        out.push(DocSection {
+            slug,
+            heading,
+            text,
+            sha256: sha,
+            backticked,
+            links,
+        });
+    };
+
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            if level == 0 { continue; }
+            if current_heading.is_some() {
+                flush(current_heading.take(), current_level, &body, &mut sections);
+                body.clear();
+            }
+            let heading_text = trimmed[level..].trim().to_string();
+            current_heading = Some(heading_text);
+            current_level = level;
+        } else {
+            body.push(line.to_string());
+        }
+    }
+    if current_heading.is_some() || !body.is_empty() {
+        flush(current_heading.take(), current_level, &body, &mut sections);
+    }
+    if sections.is_empty() {
+        let text = content.trim().to_string();
+        if !text.is_empty() {
+            sections.push(DocSection {
+                slug: "root".to_string(),
+                heading: "root".to_string(),
+                text: text.clone(),
+                sha256: sha256_hex(text.as_bytes()),
+                backticked: vec![],
+                links: vec![],
+            });
+        }
+    }
+    sections
+}
+
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if (c == ' ' || c == '-' || c == '_') && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
 
 // `symbol_id` and `NAMESPACE_SEPARATOR` are re-exported from
 // `crate::parser::generation` at the top of this module.
@@ -176,6 +295,7 @@ struct SymbolRow {
 /// they must be cheap and must not block.
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
+    fn file_skipped(&self, path: &str) { let _ = path; }
     fn relinked(&self, edges: usize);
 }
 
@@ -202,6 +322,12 @@ enum IngestItem {
         /// SHA-256 of the file bytes, shared by every symbol in the file.
         file_sha256: String,
     },
+    /// Embedded markdown sections.
+    DocSections {
+        node_path: String,
+        sections: Vec<DocSection>,
+        file_sha256: String,
+    },
 }
 
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
@@ -214,6 +340,8 @@ fn run_producer(
     tx: mpsc::Sender<IngestItem>,
     namespace: String,
     generation: u64,
+    prev_file_map: std::collections::HashMap<String, String>,
+    observer: Option<std::sync::Arc<dyn IngestObserver>>,
 ) -> anyhow::Result<()> {
     let skipped_dirs = [
         "node_modules",
@@ -348,6 +476,19 @@ fn run_producer(
             (None, None, None)
         };
 
+        // Incremental skip: if this file's hash matches the previous active
+        // generation, carry it forward instead of re-parsing/re-embedding.
+        if is_file {
+            if let Some(prev_hash) = prev_file_map.get(&node_path) {
+                if prev_hash == file_sha256.as_deref().unwrap_or("") {
+                    if let Some(obs) = &observer {
+                        obs.file_skipped(&path_str);
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Apply backpressure: if the channel is full, block until space is
         // available rather than silently dropping the item. If the consumer
         // has dropped (e.g. it errored), propagate the failure instead of
@@ -361,6 +502,24 @@ fn run_producer(
             file_sha256: file_sha256.clone(),
         }) {
             return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+        }
+
+        // For markdown files, parse into sections and stream them for embedding.
+        if is_file && path_str.ends_with(".md") {
+            if let Some(bytes) = std::fs::read(path).ok() {
+                let content = String::from_utf8_lossy(&bytes).to_string();
+                let sections = parse_markdown_sections(&content);
+                if !sections.is_empty() {
+                    let file_sha = sha256_hex(&bytes);
+                    if let Err(e) = tx.blocking_send(IngestItem::DocSections {
+                        node_path: node_path.clone(),
+                        sections,
+                        file_sha256: file_sha,
+                    }) {
+                        return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
+                    }
+                }
+            }
         }
 
         // Parse the content already read above and stream the symbols.
@@ -620,7 +779,52 @@ async fn run_consumer(
                     }
                 }
             }
+        IngestItem::DocSections {
+            node_path,
+            sections,
+            file_sha256,
+        } => {
+            for section in sections {
+                let id = generation_scoped_id(
+                    namespace,
+                    generation,
+                    &format!("{}#section:{}@{}", node_path, section.slug, section.sha256),
+                );
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("domain".to_string(), serde_json::json!("docs"));
+                metadata.insert("heading".to_string(), serde_json::json!(section.heading));
+                metadata.insert("slug".to_string(), serde_json::json!(section.slug));
+                metadata.insert("backticked".to_string(), serde_json::json!(section.backticked));
+                metadata.insert("links".to_string(), serde_json::json!(section.links));
+                metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                metadata.insert(
+                    "contained_by".to_string(),
+                    serde_json::json!([generation_scoped_id(namespace, generation, &node_path)]),
+                );
+                metadata.insert("source_identity".to_string(), with_relative_path(&source_identity, &node_path));
+                metadata.insert("index_generation".to_string(), serde_json::json!(generation));
+
+                let summary = format!("{}\n\n{}", section.heading, section.text);
+                let payload = MemoryPayload {
+                    content: summary.clone(),
+                    location: node_path.clone(),
+                    location_lines: String::new(),
+                    memory_type: "doc_section".to_string(),
+                    metadata: serde_json::Value::Object(metadata),
+                    user_id: "auto-ingestor".to_string(),
+                    agent_name: Some("neurostrata-mcp-ingestor".to_string()),
+                };
+
+                let embedding = embedder.embed(&summary).await.map_err(|e| {
+                    anyhow::anyhow!("failed to embed doc section {}: {}", section.heading, e)
+                })?;
+                vector_store
+                    .upsert(namespace, &id, embedding, payload)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to store doc section {}: {}", id, e))?;
+            }
         }
+    }
     }
 
     Ok(())
@@ -660,6 +864,33 @@ pub async fn ingest_directory(
     };
     let source_identity_json = serde_json::to_value(&source_identity)?;
 
+    // Previous active generation for this source (for incremental carry-forward).
+    let prev_gen = vector_store
+        .active_generation(namespace, &source_key)
+        .await
+        .unwrap_or(0);
+
+    // Build prev_file_map: node_path -> file_sha256 for files in prev gen.
+    let mut prev_file_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut prev_unchanged_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if prev_gen > 0 {
+        if let Ok(rows) = vector_store.list(namespace, None, None).await {
+            for r in rows {
+                let id = r.id.clone();
+                let (ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                if gen != prev_gen { continue; }
+                let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+                if let Some(h) = hash {
+                    prev_file_map.insert(tail.to_string(), h.clone());
+                    prev_unchanged_hashes.insert(h);
+                }
+            }
+        }
+    }
+
     // Allocate a fresh generation. Nothing is deleted: the previous active
     // generation stays visible until this one publishes, so a failed build
     // leaves the graph exactly as it was.
@@ -684,6 +915,8 @@ pub async fn ingest_directory(
 
     // The blocking producer walks the filesystem and parses files on a
     // blocking thread, streaming owned results through the channel.
+    let prev_file_map_clone = prev_file_map.clone();
+    let observer_clone = observer.clone();
     let producer = tokio::task::spawn_blocking(move || {
         run_producer(
             dir_path_owned,
@@ -692,6 +925,8 @@ pub async fn ingest_directory(
             tx,
             namespace_owned,
             generation,
+            prev_file_map_clone,
+            observer_clone,
         )
     });
 
@@ -730,6 +965,36 @@ pub async fn ingest_directory(
             );
         }
         return Err(e);
+    }
+
+    // Carry forward unchanged nodes from the previous generation so the
+    // new generation contains the full tree without re-embedding.
+    if prev_gen > 0 {
+        let mut carried = 0usize;
+        if let Ok(rows) = vector_store.list(namespace, None, None).await {
+            for r in rows {
+                let id = r.id.clone();
+                let (ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                if gen != prev_gen { continue; }
+                let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let unchanged = match &hash {
+                    Some(h) => prev_unchanged_hashes.contains(h),
+                    None => true, // directories / no-hash nodes carried forward
+                };
+                if !unchanged { continue; }
+                if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &id).await {
+                    payload.metadata.as_object_mut().map(|o| { o.insert("index_generation".to_string(), serde_json::json!(generation)); });
+                    let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
+                    if vector_store.upsert(namespace, &new_id, vec, payload).await.is_ok() {
+                        carried += 1;
+                    }
+                }
+            }
+        }
+        println!("Carried forward {} unchanged nodes", carried);
     }
 
     // Atomically flip the active pointer onto this generation. Only now are its
@@ -1341,6 +1606,10 @@ mod tests {
             1
         );
 
+        // Mutate the file so the incremental skip does not short-circuit the
+        // staging path: the second ingest must actually stage + embed.
+        std::fs::write(dir.join("hello.rs"), "fn main() { loop {} }").expect("rewrite file");
+
         // Second ingest begins generation 2, stages the file node, then the
         // symbol embed fails mid-stage.
         let outcome = ingest_directory(
@@ -1377,4 +1646,138 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&db).ok();
     }
+}
+/// Dry-run ingest: walk the tree and produce a report without writing or
+/// downloading anything.
+pub async fn dry_run_directory(
+    dir_path: &std::path::Path,
+    schema: &crate::parser::schema::ParserSchema,
+    mode: &str,
+) -> anyhow::Result<String> {
+    let ext_to_lang = build_ext_map(schema);
+    let skipped_dirs = [
+        "node_modules", "target", "vendor", ".venv", "venv", "env", ".env",
+        "dist", "build", "out", ".dolt", ".git", ".next", ".nuxt",
+        "__pycache__", ".fastembed_cache", ".idea", ".vscode", "coverage",
+    ];
+
+    let mut files = 0usize;
+    let mut parseable = 0usize;
+    let mut symbols = 0usize;
+    let mut doc_sections = 0usize;
+    let mut secret_hits = 0usize;
+    let mut file_hashes: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut junk: Vec<String> = Vec::new();
+    let mut pii_warnings: Vec<String> = Vec::new();
+    let mut groups: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    let walker = ignore::WalkBuilder::new(dir_path).build();
+    for result in walker {
+        let entry = match result { Ok(e) => e, Err(_) => continue };
+        let path = entry.path();
+        let path_str = path.to_string_lossy();
+        let mut should_skip = false;
+        for skip_dir in &skipped_dirs {
+            let skip_pattern = format!("/{}/", skip_dir);
+            let skip_start = format!("{}/", skip_dir);
+            let skip_exact = format!("./{}", skip_dir);
+            if path_str.contains(&skip_pattern) || path_str.starts_with(&skip_start) || path_str == skip_exact {
+                should_skip = true; break;
+            }
+        }
+        if should_skip { continue; }
+        let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
+        if !is_file { continue; }
+        files += 1;
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => continue };
+        let hash = sha256_hex(&bytes);
+        file_hashes.entry(hash.clone()).or_default().push(path_str.to_string());
+
+        let lang_name = path.extension()
+            .map(|e| normalize_ext(&e.to_string_lossy()))
+            .and_then(|e| ext_to_lang.get(&e).cloned())
+            .filter(|ln| get_language(ln).is_some());
+
+        let content = String::from_utf8_lossy(&bytes).to_string();
+
+        if crate::secrets::scan_entry_point(&content, &serde_json::json!({}), "dry_run").is_some() {
+            secret_hits += 1;
+        }
+
+        if mode == "presort" {
+            if content.contains('@') && content.split_whitespace().any(|w| w.contains('@') && w.contains('.')) {
+                pii_warnings.push(format!("{}: possible email", path_str));
+            }
+            let mut found_ssn = false;
+            for window in content.as_bytes().windows(11) {
+                let s = String::from_utf8_lossy(window);
+                if s.chars().nth(3) == Some('-') && s.chars().nth(6) == Some('-') {
+                    found_ssn = true;
+                }
+            }
+            if found_ssn { pii_warnings.push(format!("{}: possible SSN", path_str)); }
+            let digits: String = content.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.len() >= 16 {
+                pii_warnings.push(format!("{}: possible credit card digits", path_str));
+            }
+            if content.trim().len() < 20 {
+                junk.push(path_str.to_string());
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            let g = parent.to_string_lossy().to_string();
+            *groups.entry(g).or_insert(0) += 1;
+        }
+
+        if path_str.ends_with(".md") {
+            let secs = parse_markdown_sections(&content);
+            doc_sections += secs.len();
+            parseable += 1;
+        } else if let Some(ln) = lang_name {
+            if let Some(ts_lang) = get_language(&ln) {
+                parseable += 1;
+                let mut parser = tree_sitter::Parser::new();
+                if parser.set_language(&ts_lang).is_ok() {
+                    if let Some(tree) = parser.parse(&content, None) {
+                        let schema_lang = &schema.languages[&ln];
+                        for (_qname, qstr) in &schema_lang.queries {
+                            if let Ok(q) = tree_sitter::Query::new(&ts_lang, qstr) {
+                                let mut cursor = tree_sitter::QueryCursor::new();
+                                let mut iter = cursor.matches(&q, tree.root_node(), content.as_bytes());
+                                while let Some(_) = iter.next() { symbols += 1; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut duplicates: Vec<String> = Vec::new();
+    for (h, paths) in &file_hashes {
+        if paths.len() > 1 {
+            duplicates.push(format!("{} files share hash {}", paths.len(), &h[..12]));
+        }
+    }
+
+    let mut report = String::new();
+    report.push_str(&format!("Dry-run ({}) report:\n", mode));
+    report.push_str(&format!("Files: {}\n", files));
+    report.push_str(&format!("Parseable files: {}\n", parseable));
+    report.push_str(&format!("Symbols: {}\n", symbols));
+    report.push_str(&format!("Doc sections: {}\n", doc_sections));
+    report.push_str(&format!("Embeddings needed (est): {}\n", symbols + doc_sections));
+    report.push_str(&format!("Secret hits: {}\n", secret_hits));
+    if mode == "presort" {
+        report.push_str(&format!("Junk files: {}\n", junk.len()));
+        for j in &junk { report.push_str(&format!("  junk: {}\n", j)); }
+        report.push_str(&format!("Duplicate groups: {}\n", duplicates.len()));
+        for d in &duplicates { report.push_str(&format!("  dup: {}\n", d)); }
+        report.push_str(&format!("PII warnings: {}\n", pii_warnings.len()));
+        for w in &pii_warnings { report.push_str(&format!("  pii: {}\n", w)); }
+        report.push_str("Proposed dataset groups:\n");
+        for (g, c) in &groups { report.push_str(&format!("  {} ({} files)\n", g, c)); }
+    }
+    Ok(report)
 }

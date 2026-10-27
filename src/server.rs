@@ -173,7 +173,9 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "dir_path": { "type": "string", "description": "Absolute path to the project directory to ingest. Usually the current working directory." },
-                                "namespace": { "type": "string", "description": "The project namespace." }
+                                "namespace": { "type": "string", "description": "The project namespace." },
+                                "dry_run": { "type": "boolean", "description": "If true, produce a preview report without writing or downloading. Default false." },
+                                "dry_run_mode": { "type": "string", "enum": ["estimate", "presort"], "description": "Dry-run mode. estimate: counts/embeddings/cost/secrets. presort: adds junk/duplicate/PII/group analysis." }
                             },
                             "required": ["dir_path", "namespace"]
                         }
@@ -2413,11 +2415,21 @@ async fn handle_ingest_directory(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
+    let dry_run = arguments.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dry_run_mode = arguments.get("dry_run_mode").and_then(|v| v.as_str()).unwrap_or("estimate").to_string();
+
     let schema_str = include_str!("schema.json");
     let schema = match crate::parser::schema::ParserSchema::load(schema_str) {
         Ok(schema) => schema,
         Err(_) => return "Failed to load default parser schema.".to_string(),
     };
+
+    if dry_run {
+        match crate::parser::ingest::dry_run_directory(std::path::Path::new(dir_path), &schema, &dry_run_mode).await {
+            Ok(report) => return report,
+            Err(e) => return format!("Dry-run failed: {}", e),
+        }
+    }
 
     // Handed to the registry so the walk survives this call: an MCP client that
     // times out and disconnects no longer leaves the graph half-built (bead
