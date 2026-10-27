@@ -12,8 +12,8 @@ Effort: **S** under a week, **M** one to three weeks, **L** over three weeks.
 | 5 | **Optional GLiNER extraction** | Use GLiNER2.5 to pull entities and relations from prose, and propose graph edges for review. Review-only at first; auto-materialize only above a measured precision bar. | Biggest potential gain, but heavy (~590 MB), unproven, and must never touch search, dedup, guard, or routing. | L |
 | 6 | **Cite edge sources** | Each generated edge stores the source file, content hash, text span, and which extractor produced it. | Lets you trust and debug the graph. Without this, an edge is an unexplained assertion. | M |
 | 7 | **Dependency edges** | Extract imports and module dependencies into the graph so `related` can walk code structure. Directed calls need a separate table; do not disguise them as undirected links. | Improves code navigation and impact analysis. | M–L |
-| 8 | **Dry-run ingest** | Show what would change: files added/changed/removed, embeddings avoided, secret hits, estimated work. Write nothing, download nothing. | Safe preview before a large or expensive ingest. | M |
-| 9 | **Multi-domain memories** | Let one memory belong to several domains (`domain: string | string[]`). Update the add schema, registry, storage, and search. | Useful for monorepos and cross-cutting rules. | S–M |
+| 8 | **Dry-run ingest** | Show what would change: files added/changed/removed, embeddings avoided, secret and PII hits, junk/duplicate detection, version candidates, and estimated work. Write nothing, download nothing. | Safe preview before a large or expensive ingest. | M |
+| 9 | **Multi-domain memories / node sets** | Let one memory belong to several domains (`domain: string | string[]`) and carry a `node_set` array. Update the add schema, registry, storage, and search with AND/OR filtering. | Useful for monorepos and cross-cutting rules. | S–M |
 | 10 | **Conflict candidates** | Flag active memories that look contradictory for review. Never auto-mark truth; near-duplicates are not contradictions. | Catches stale or conflicting rules without pretending the system can settle them. | M |
 | 11 | **Surface procedures** | When a due procedure matches the current query or task, show it in the snapshot. | Makes procedural memory useful at the moment it is needed. | S |
 | 12 | **Watermarks** | Record what was last ingested or enriched, with input and extractor fingerprints. | Repeat runs skip work that is already done. | S |
@@ -33,6 +33,15 @@ reasoner, no RDF store, no pilot. Each is a candidate spec on its own.
 | 18 | **Closed-world shape checks** | Validate `GOVERNS`/`CONTAINS`/`EXTRACTED_FROM` endpoints and required fields in `task_validate` and on write (warn-first, not reject). | Catches malformed edges before they consume the expansion budget. OWL cannot do this; closed-world code can. | S–M |
 | 19 | **Bounded transitive traversal** | Extend the Cypher path in `search_inner` from one hop to two or three for `GOVERNS`/`CONTAINS`, with the path recorded in `SearchEvidence`. | Fixes the directory-rule-misses-leaf-symbol gap. A traversal change, not an OWL axiom. | S |
 | 20 | **Cross-namespace concept IRIs** | When a shareable memory crosses SynapticMesh, stamp a `concept_iri` so the receiver maps it to its local domain slug. Local slugs stay private. | Aligns vocabulary across projects without leaking domain registries. | M |
+| 21 | **Ontology grounding (annotate/strict)** | Optional JSON vocabulary loaded per namespace. `annotate` mode adds canonical type to metadata; `strict` mode filters memories at ingest. | Reduces synonym drift (`frontend` vs `ui` vs `web`) without OWL. | M–L |
+
+## Cognee Tier 2 features (medium value, needs design)
+
+| # | Idea | What it is | Why it matters | Effort |
+|---|---|---|---|---|
+| 22 | **Session distillation** | Extract candidate durable rules from session logs/append_log into task follow-ons or memories, without a separate session store. | High payoff for long sessions; uses existing task/procedure model. | L |
+| 23 | **Feedback weighting** | Add `feedback_score`/`rating` to memory metadata and a small capped term to neural gain. Optional `neurostrata_feedback` tool. | Captures explicit quality signals beyond access counts. | S–M |
+| 24 | **Enrichment locking** | Lock per namespace during enrichment; a second call reports lock held and rerun passes. | Prevents duplicate enrichment work. | S |
 
 ## Bugs to fix
 
@@ -43,7 +52,7 @@ reasoner, no RDF store, no pilot. Each is a candidate spec on its own.
 ## Skip these
 
 - Full OWL/RDF ontology, reasoners, and RDF stores.
-- Generated global summaries.
+- Generated global summaries / hierarchical summary index.
 - Date-based temporal reranking.
 - A separate SQLite/Redis session store.
 - A keyword index, BM25, or rank fusion.
@@ -51,6 +60,11 @@ reasoner, no RDF store, no pilot. Each is a candidate spec on its own.
 - GLiNER in search, dedup, guard, or routing.
 - Automatic conflict verdicts.
 - Directed calls faked as undirected relations.
+- LLM completion search types (GRAPH_COMPLETION, COT, RAG_COMPLETION, FEELING_LUCKY, AGENTIC_COMPLETION).
+- Multi-tenancy / per-user DB isolation.
+- Truth subspace.
+- COGX exchange format.
+- Frontend/UI.
 
 ## If we spec only three
 
