@@ -3483,8 +3483,8 @@ mod tests {
         let (_base, mesh) = mesh_with_commit("topology");
         let id = Uuid::new_v4();
         let topology = json!({
-            "component": "api-gateway",
-            "target_system": "ledger-service",
+            "component": "apigateway",
+            "target_system": "ledgerservice",
             "channel": "mTLS",
             "credential_boundary": "eu-west-1 VPC",
             "reason": "the ledger accepts traffic only from inside the VPC",

@@ -780,6 +780,9 @@ pub struct LadybugStore {
     /// already exists. That is a write transaction per read, colliding with
     /// real writes for nothing.
     schema_ready: std::sync::atomic::AtomicBool,
+    /// Compiled ontology index (domain DAG, aliases, sub-properties). Swapped
+    /// on `refresh_ontology`; read lock-free via ArcSwap.
+    ontology: Arc<arc_swap::ArcSwap<crate::rdf::OntologyIndex>>,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1012,6 +1015,7 @@ impl LadybugStore {
             dirty: Dirty::default(),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
+            ontology: Arc::new(arc_swap::ArcSwap::from_pointee(crate::rdf::OntologyIndex::empty())),
         })
     }
 
@@ -1885,7 +1889,25 @@ impl VectorStore for LadybugStore {
         }
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
-        let shape_warnings = write_shape_warnings(&payload);
+        let mut payload = payload;
+        if let Some(topology) = payload.metadata.get_mut("topology") {
+            crate::rdf::canonicalize_topology(topology, &self.ontology.load());
+        }
+        if payload.metadata.is_object() {
+            let inferred = crate::domain::compute_facets(&payload.memory_type, &payload.metadata);
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert("facets".to_string(), serde_json::json!(inferred));
+            }
+        }
+
+        let mut shape_warnings = write_shape_warnings(&payload);
+        for v in crate::rdf::validate_memory(&payload) {
+            shape_warnings.push(WriteShapeWarning {
+                field: v.field,
+                why: v.why,
+                skipped: "SHACL Core (warn-first)".to_string(),
+            });
+        }
         // The stub materializer needs the embedding width for its zero vector;
         // captured here so the closure stays `FnOnce + Send + 'static`.
         let dimensions = self.dimensions;
@@ -2109,10 +2131,22 @@ impl VectorStore for LadybugStore {
         query_text: Option<&str>,
         exact: bool,
     ) -> Result<DomainSearchOutcome> {
-        let domain_keys: HashSet<String> = domains
-            .iter()
-            .filter_map(|d| crate::domain::normalize_domain_slug(d))
-            .collect();
+        // Refresh the compiled ontology index from the namespace's registry row
+        // (fail-soft: a missing row keeps the previous/empty index).
+        self.refresh_ontology(namespace).await;
+        let ontology = self.ontology.load();
+
+        let mut expanded: HashSet<String> = HashSet::new();
+        for d in domains {
+            if let Some(slug) = ontology.canonical_slug(d) {
+                for e in ontology.expand_domain(&slug) {
+                    expanded.insert(e);
+                }
+            } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
+                expanded.insert(s);
+            }
+        }
+        let domain_keys: HashSet<String> = expanded;
         let query_owned = query_text.map(|s| s.to_string());
         search_inner(
             self,
@@ -7101,7 +7135,7 @@ eurostrata\src\daemon.rs",
                 .expect("the fact is stored");
             assert_eq!(
                 stored.1.metadata["topology"]["component"],
-                json!("api-gateway"),
+                json!("apigateway"),
                 "the topology is stored exactly as it was given"
             );
         }
@@ -9457,8 +9491,8 @@ eurostrata\src\daemon.rs",
         let store = retired_test_store().await;
 
         let topology = json!({
-            "component": "api-gateway",
-            "target_system": "ledger-service",
+            "component": "apigateway",
+            "target_system": "ledgerservice",
             "channel": "mTLS",
             "credential_boundary": "eu-west-1 VPC",
             "reason": "the ledger accepts traffic only from inside the VPC",
@@ -9741,6 +9775,35 @@ eurostrata\src\daemon.rs",
             "the registry row must never appear in search results"
         );
     }
+
+    #[tokio::test]
+    async fn refresh_ontology_loads_v2_entries() {
+        let dir = std::env::temp_dir().join(format!("ns-ontology-refresh-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+        let entries = vec![
+            serde_json::json!({"slug":"auth","parent":null,"aliases":["authentication"],"concept_iri":null}),
+            serde_json::json!({"slug":"tls","parent":"auth","aliases":["ssl"],"concept_iri":null}),
+        ];
+        let registry_id = crate::registry::registry_row_id("probe");
+        let payload = MemoryPayload {
+            content: crate::registry::registry_content("probe"),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: crate::registry::registry_metadata_v2(&entries),
+        };
+        store.upsert("probe", &registry_id, query_vec, payload).await.unwrap();
+
+        store.refresh_ontology("probe").await;
+        let idx = store.ontology.load();
+        assert_eq!(idx.canonical_slug("authentication"), Some("auth".to_string()));
+        assert!(idx.expand_domain("auth").contains(&"tls".to_string()));
+    }
 }
 
 impl LadybugStore {
@@ -9801,5 +9864,37 @@ impl LadybugStore {
             .await?;
 
         Ok(crate::rdf::rows_to_quads(&rows, namespace, tier, generation, &edges))
+    }
+}
+
+impl LadybugStore {
+    pub async fn refresh_ontology(&self, namespace: &str) {
+        let namespace_owned = namespace.to_string();
+        let metadata = self
+            .with_conn(move |conn: &Connection| -> Result<Option<serde_json::Value>> {
+                let safe_ns = escape_ladybug_string(&namespace_owned);
+                let rid = crate::registry::registry_row_id(&namespace_owned);
+                let safe_id = escape_ladybug_string(&rid);
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.metadata",
+                    safe_id, safe_ns
+                );
+                if let Ok(mut rows) = conn.query(&query) {
+                    if let Some(row) = rows.next() {
+                        let meta_str = format!("{}", row[0]);
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+                            return Ok(Some(v));
+                        }
+                    }
+                }
+                Ok(None)
+            })
+            .await
+            .ok()
+            .flatten();
+        let idx = metadata
+            .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(&m))
+            .unwrap_or_default();
+        self.ontology.store(std::sync::Arc::new(idx));
     }
 }

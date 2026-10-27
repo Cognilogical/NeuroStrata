@@ -97,6 +97,149 @@ pub fn registry_metadata(domains: &[String]) -> Value {
     })
 }
 
+/// Build a v2 registry metadata object from structured domain entries.
+pub fn registry_metadata_v2(entries: &[Value]) -> Value {
+    let mut normalized: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "slug": entry.get("slug").cloned().unwrap_or(serde_json::Value::Null),
+                "parent": entry.get("parent").cloned().unwrap_or(serde_json::Value::Null),
+                "aliases": entry.get("aliases").cloned().unwrap_or(serde_json::json!([])),
+                "concept_iri": entry.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect();
+    normalized.sort_by(|a, b| {
+        let sa = a.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+        let sb = b.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+        sa.cmp(sb)
+    });
+    serde_json::json!({
+        "domain_registry": {
+            "version": 2,
+            "domains": normalized,
+        },
+        "eligibility": "private",
+    })
+}
+
+/// Validate a list of v2 domain entries. Returns Ok(()) on a valid DAG.
+pub fn validate_domain_entries(entries: &[Value]) -> Result<(), String> {
+    let mut slugs: Vec<String> = Vec::new();
+    let mut parent_of: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let obj = entry
+            .as_object()
+            .ok_or_else(|| format!("entry {} must be an object", idx))?;
+        let slug = obj
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("entry {} is missing a string 'slug'", idx))?;
+        if slug.trim().is_empty() {
+            return Err(format!("entry {} has an empty slug", idx));
+        }
+        let normalized = crate::domain::normalize_domain_slug(slug)
+            .ok_or_else(|| format!("entry {} slug '{}' does not normalize", idx, slug))?;
+        if normalized != slug {
+            return Err(format!(
+                "entry {} slug '{}' is not normalized (expected '{}')",
+                idx, slug, normalized
+            ));
+        }
+        if slugs.contains(&slug.to_string()) {
+            return Err(format!("duplicate slug '{}'", slug));
+        }
+
+        let parent = match obj.get("parent") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => {
+                if s.trim().is_empty() {
+                    return Err(format!("entry {} has an empty parent", idx));
+                }
+                let pnorm = crate::domain::normalize_domain_slug(s)
+                    .ok_or_else(|| format!("entry {} parent '{}' does not normalize", idx, s))?;
+                if pnorm != *s {
+                    return Err(format!(
+                        "entry {} parent '{}' is not normalized (expected '{}')",
+                        idx, s, pnorm
+                    ));
+                }
+                Some(s.clone())
+            }
+            Some(_) => return Err(format!("entry {} parent must be a string or null", idx)),
+        };
+
+        let aliases = obj.get("aliases").cloned().unwrap_or(serde_json::json!([]));
+        let aliases = aliases
+            .as_array()
+            .ok_or_else(|| format!("entry {} aliases must be an array", idx))?;
+        for (ai, alias) in aliases.iter().enumerate() {
+            let a = alias
+                .as_str()
+                .ok_or_else(|| format!("entry {} alias {} must be a string", idx, ai))?;
+            if a.trim().is_empty() {
+                return Err(format!("entry {} has an empty alias", idx));
+            }
+        }
+
+        let concept_iri = obj.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null);
+        match concept_iri {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(_) => {}
+            _ => return Err(format!("entry {} concept_iri must be a string or null", idx)),
+        }
+
+        slugs.push(slug.to_string());
+        parent_of.insert(slug.to_string(), parent);
+    }
+
+    // Parent references must resolve to a declared slug.
+    for (slug, parent) in &parent_of {
+        if let Some(p) = parent {
+            if !slugs.contains(p) {
+                return Err(format!("parent '{}' of '{}' is not a declared slug", p, slug));
+            }
+        }
+    }
+
+    // Cycle detection.
+    for start in &slugs {
+        let mut seen = std::collections::HashSet::new();
+        let mut cur = Some(start.clone());
+        while let Some(node) = cur {
+            if !seen.insert(node.clone()) {
+                return Err(format!("cycle detected in domain DAG at '{}'", node));
+            }
+            cur = parent_of.get(&node).cloned().flatten();
+            if let Some(next) = &cur {
+                if !slugs.contains(next) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Aliases must be unique across the namespace.
+    let mut seen_aliases = std::collections::HashSet::new();
+    for entry in entries {
+        if let Some(arr) = entry.get("aliases").and_then(|v| v.as_array()) {
+            for alias in arr {
+                if let Some(s) = alias.as_str() {
+                    let key = s.to_lowercase();
+                    if !seen_aliases.insert(key.clone()) {
+                        return Err(format!("duplicate alias '{}'", s));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// The outcome of the write-path check. `warning` is for the caller and is
 /// never a rejection.
 pub struct DomainCheck {
