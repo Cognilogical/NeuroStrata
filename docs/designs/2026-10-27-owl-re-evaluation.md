@@ -226,3 +226,8 @@ Memory `aa0651d3-d1f2-4ead-b309-bbfa56133777` recorded seven grounds. Status now
 ## 14. Decision requested
 
 Adopt the scoped pilot (§10) and file it as a concrete task, or reject OWL outright and invest the same effort in the deterministic exact-identifier matcher and real markdown ingestion, which need no model and have no governance cost. The pilot is the only way to test the owner's accuracy claim without committing to a DL reasoner or a second store.
+
+
+## Owner decision (2026-10-27)
+
+No pilot. Stick to JSON. The JSON-surviving features from this evaluation are tracked as items 15-20 in `docs/designs/2026-10-27-ranked-improvement-list.md`. The OWL-specific pilot and any reasoner/RDF work is retired.
