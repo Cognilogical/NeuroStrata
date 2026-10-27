@@ -1,6 +1,6 @@
 # Ranked improvement list
 
-Ordered by impact. No phases. Each row is a candidate spec.
+Ordered by impact. No phases, no tiers. Each row is a candidate spec.
 Effort: **S** under a week, **M** one to three weeks, **L** over three weeks.
 
 | # | Idea | What it is | Why it matters | Effort |
@@ -19,14 +19,6 @@ Effort: **S** under a week, **M** one to three weeks, **L** over three weeks.
 | 12 | **Watermarks** | Record what was last ingested or enriched, with input and extractor fingerprints. | Repeat runs skip work that is already done. | S |
 | 13 | **Dangling-edge report** | Show unresolved `GOVERNS` / `RELATES_TO` targets in `doctor` and `task_validate`. | Makes broken graph links visible instead of silently skipped. | S–M |
 | 14 | **Enrichment telemetry** | Per-stage counts, failures, latency, and fingerprints for ingest and enrichment. | Makes the pipeline debuggable instead of a black box. | S–M |
-
-## Ontology features in JSON (no OWL, no pilot)
-
-These are the parts of the OWL evaluation that survive as plain JSON. No
-reasoner, no RDF store, no pilot. Each is a candidate spec on its own.
-
-| # | Idea | What it is | Why it matters | Effort |
-|---|---|---|---|---|
 | 15 | **Domain DAG + aliases** | Upgrade `domain_registry` from a flat list to a JSON DAG with `parent` and `aliases` (e.g. `mtls -> tls -> auth`; `lbug -> ladybugdb`). Expand `search_with_domain` by closure. | Biggest recall lift from the OWL work, without any ontology machinery. Beats a flat alias map only if measured. | S–M |
 | 16 | **Class facets** | Add inferred facet tags (`enforced-rule`, `failed-attempt`, `architecture-decision`) computed from metadata fields, stored as arrays on the row. | Lets search and snapshot filter by epistemic category without new top-level `memory_type` strings. | S |
 | 17 | **Canonical entity slugs** | Normalize `fact.topology.{component,target_system}` and `KnownIds` aliases to one slug per concept, stored as plain strings. | Stops `lbug` vs `LadybugDB` from splitting recall. | S–M |
@@ -34,11 +26,6 @@ reasoner, no RDF store, no pilot. Each is a candidate spec on its own.
 | 19 | **Bounded transitive traversal** | Extend the Cypher path in `search_inner` from one hop to two or three for `GOVERNS`/`CONTAINS`, with the path recorded in `SearchEvidence`. | Fixes the directory-rule-misses-leaf-symbol gap. A traversal change, not an OWL axiom. | S |
 | 20 | **Cross-namespace concept IRIs** | When a shareable memory crosses SynapticMesh, stamp a `concept_iri` so the receiver maps it to its local domain slug. Local slugs stay private. | Aligns vocabulary across projects without leaking domain registries. | M |
 | 21 | **Ontology grounding (annotate/strict)** | Optional JSON vocabulary loaded per namespace. `annotate` mode adds canonical type to metadata; `strict` mode filters memories at ingest. | Reduces synonym drift (`frontend` vs `ui` vs `web`) without OWL. | M–L |
-
-## Cognee Tier 2 features (medium value, needs design)
-
-| # | Idea | What it is | Why it matters | Effort |
-|---|---|---|---|---|
 | 22 | **Session distillation** | Extract candidate durable rules from session logs/append_log into task follow-ons or memories, without a separate session store. | High payoff for long sessions; uses existing task/procedure model. | L |
 | 23 | **Feedback weighting** | Add `feedback_score`/`rating` to memory metadata and a small capped term to neural gain. Optional `neurostrata_feedback` tool. | Captures explicit quality signals beyond access counts. | S–M |
 | 24 | **Enrichment locking** | Lock per namespace during enrichment; a second call reports lock held and rerun passes. | Prevents duplicate enrichment work. | S |
