@@ -20,6 +20,8 @@ pub struct ModelEntry {
     pub path: Option<String>,
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
 }
 
 /// The full registry schema.
@@ -29,7 +31,7 @@ pub struct ModelRegistry {
     pub models: Vec<ModelEntry>,
 }
 
-const DEFAULT_REGISTRY: &str = r#"{"version":"0.4.14-bridge","models":[{"name":"laya-v1.11.1-onne","url":"https://github.com/NandhaKishorM/laya/releases/download/v0.4.14/laya-v1.11.1-onnx.tar.gz","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","path":"model.onnx","size_bytes":2656291}]}"#;
+const DEFAULT_REGISTRY: &str = r#"{"version":"0.4.14-bridge","models":[{"name":"laya-v1.11.1-onne","url":"https://github.com/NandhaKishorM/laya/releases/download/v0.4.14/laya-v1.11.1-onnx.tar.gz","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","path":"model.onnx","size_bytes":2656291,"files":null}]}"#;
 
 impl ModelRegistry {
     /// Load the registry from `<dir>/registry.json`. Creates a default
@@ -151,4 +153,23 @@ pub fn fetch_from_registry(
 /// Hex encoding helper for SHA-256
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_entry_accepts_files_field() {
+        let json = r#"{"name":"x","url":"u","sha256":"0","files":["a.onnx","b.json"]}"#;
+        let e: ModelEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(e.files.unwrap(), vec!["a.onnx", "b.json"]);
+    }
+
+    #[test]
+    fn model_entry_defaults_files_to_none() {
+        let json = r#"{"name":"x","url":"u","sha256":"0"}"#;
+        let e: ModelEntry = serde_json::from_str(json).unwrap();
+        assert!(e.files.is_none());
+    }
 }
