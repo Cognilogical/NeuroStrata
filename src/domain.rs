@@ -132,3 +132,53 @@ pub fn compute_facets(memory_type: &str, metadata: &serde_json::Value) -> Vec<St
     }
     out
 }
+
+/// Detect conflict candidates among active memories (F10). Returns (id, disputed_with_ids).
+pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for i in 0..memories.len() {
+        let a = &memories[i];
+        if a.payload.memory_type != "rule" && a.payload.memory_type != "fact" { continue; }
+        let mut disputed_with = Vec::new();
+        for j in 0..memories.len() {
+            if i == j { continue; }
+            let b = &memories[j];
+            if b.payload.memory_type != "rule" && b.payload.memory_type != "fact" { continue; }
+            // same location or topology
+            let same_loc = !a.payload.location.is_empty() && a.payload.location == b.payload.location;
+            let topo_a = a.payload.metadata.get("topology");
+            let topo_b = b.payload.metadata.get("topology");
+            let same_topo = match (topo_a, topo_b) {
+                (Some(ta), Some(tb)) => {
+                    ta.get("component") == tb.get("component")
+                        && ta.get("target_system") == tb.get("target_system")
+                        && (ta.get("component").is_some() || ta.get("target_system").is_some())
+                }
+                _ => false,
+            };
+            if !same_loc && !same_topo { continue; }
+            // opposing enforcement
+            let enf_a = a.payload.metadata.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
+            let enf_b = b.payload.metadata.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
+            let opposing_enf = !enf_a.is_empty() && !enf_b.is_empty() && enf_a != enf_b;
+            // opposing decision status
+            let dec_a = a.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
+            let dec_b = b.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
+            let opposing_dec = !dec_a.is_empty() && !dec_b.is_empty() && dec_a != dec_b;
+            // negation token opposition
+            let neg_tokens = ["not", "never", "no", "don't", "cannot", "must not"];
+            let ca = a.payload.content.to_lowercase();
+            let cb = b.payload.content.to_lowercase();
+            let a_neg = neg_tokens.iter().any(|t| ca.contains(t));
+            let b_neg = neg_tokens.iter().any(|t| cb.contains(t));
+            let neg_opposition = a_neg != b_neg;
+            if opposing_enf || opposing_dec || (same_loc && neg_opposition) {
+                disputed_with.push(b.id.clone());
+            }
+        }
+        if !disputed_with.is_empty() {
+            out.push((a.id.clone(), disputed_with));
+        }
+    }
+    out
+}

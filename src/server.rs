@@ -498,6 +498,31 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_feedback",
+                        "description": "Record a feedback rating (-1..1) for a memory. Stored in metadata.feedback_score; influences salience within a cap. Deterministic; no LLM.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to rate." },
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "rating": { "type": "number", "description": "Rating in [-1, 1]." }
+                            },
+                            "required": ["id", "namespace", "rating"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_distill",
+                        "description": "Scan session logs and propose candidate rules/tasks (review-only). Returns proposed candidates; applies nothing.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "session_dir": { "type": "string", "description": "Optional path to session logs directory. Defaults to .NeuroStrata/sessions." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_task_intake",
                         "description": "Submit text for durable task intake. Runs M2 lexical detection to find task-shaped statements, creates an immutable receipt (source_kind, source_revision, source_digest), and spawns candidate(s) with review_state=pending. Returns receipt and candidates. Explicit zeros when no candidates.",
                         "inputSchema": {
@@ -819,6 +844,12 @@ pub async fn process_mcp_request(
                                 bus.clone(),
                             )
                             .await;
+                        }
+                        "neurostrata_feedback" => {
+                            result_text = handle_feedback_memory(arguments, store.clone()).await;
+                        }
+                        "neurostrata_distill" => {
+                            result_text = handle_distill(arguments).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -2099,6 +2130,16 @@ async fn handle_get_snapshot(
     } else {
         crate::tools::procedure::procedures_due_strap(&all_memories, now)
     };
+    let conflicts = crate::domain::detect_conflicts(&all_memories);
+    let conflict_report = if conflicts.is_empty() {
+        String::new()
+    } else {
+        let mut r = String::from("CONFLICT WARNINGS:");
+        for (id, disputed) in &conflicts {
+            r.push_str(&format!("\n  {} disputed with {}", id, disputed.join(", ")));
+        }
+        r
+    };
     all_memories.retain(|r| match r.payload.metadata.get("valid_to") {
         None => true,
         Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
@@ -2389,6 +2430,9 @@ async fn handle_get_snapshot(
     if let Some(dr) = &doctor_report {
         parts.push(dr.clone());
     }
+    if !conflict_report.is_empty() {
+        parts.push(conflict_report.clone());
+    }
     parts.push(procedures.to_string());
     parts.push(registered_domains_line.to_string());
     parts.push(domain_strap.to_string());
@@ -2453,6 +2497,37 @@ async fn handle_ingest_directory(
         Err(e) => format!("Failed to ingest directory {}: {}", dir_path, e),
     }
 }
+
+async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let id = match arguments.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i.to_string(),
+        None => return "ERROR: id missing.".to_string(),
+    };
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR: namespace missing.".to_string(),
+    };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
+    let rating = match arguments.get("rating").and_then(|v| v.as_f64()) {
+        Some(r) => r.clamp(-1.0, 1.0),
+        None => return "ERROR: rating missing.".to_string(),
+    };
+    match store.get(namespace, &id).await {
+        Ok(Some((vec, mut payload))) => {
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert("feedback_score".to_string(), serde_json::json!(rating));
+            }
+            match store.upsert(namespace, &id, vec, payload).await {
+                Ok(_) => format!("Recorded feedback {} for {}.", rating, id),
+                Err(e) => format!("Failed to record feedback: {}", e),
+            }
+        }
+        Ok(None) => format!("Memory {} not found.", id),
+        Err(e) => format!("Error reading memory: {}", e),
+    }
+}
+
 
 /// Retire a memory and store its replacement, keeping both.
 ///
@@ -6412,7 +6487,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_one_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_three_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -6457,6 +6532,8 @@ mod tests {
                 "neurostrata_guard_learn",
                 "neurostrata_guard_list_rules",
                 "neurostrata_archive_memory",
+                "neurostrata_feedback",
+                "neurostrata_distill",
                 "neurostrata_task_intake",
                 "neurostrata_task_intake_list",
                 "neurostrata_task_intake_resolve",
@@ -8404,3 +8481,31 @@ mod tests {
     }
 
 }
+
+async fn handle_distill(arguments: Value) -> String {
+    let session_dir = arguments.get("session_dir").and_then(|v| v.as_str()).map(|s| s.to_string())
+        .unwrap_or_else(|| ".NeuroStrata/sessions".to_string());
+    let path = std::path::Path::new(&session_dir);
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() { continue; }
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                for line in content.lines() {
+                    let l = line.to_lowercase();
+                    if l.contains("todo:") || l.contains("we should also") || l.contains("later we need")
+                        || l.contains("remaining work:") || l.contains("follow-up:") {
+                        candidates.push(format!("- {}", line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        "No candidate rules/tasks found in session logs.".to_string()
+    } else {
+        format!("Proposed candidates (review-only):\n{}", candidates.join("\n"))
+    }
+}
+
