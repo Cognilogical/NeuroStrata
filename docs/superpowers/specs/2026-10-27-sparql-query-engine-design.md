@@ -26,7 +26,7 @@ Add a **read-only, local-first SPARQL 1.1/1.2 query tool** over the RDF projecti
 - Read-only: no SPARQL UPDATE, no `SERVICE`, no federation in the default mode.
 - No LLM in parsing, planning, or evaluation.
 - Namespace-scoped: queries may only see rows from the requested namespace unless explicitly authorized later.
-- Visibility filters (retired, archived, mesh-conflicting, registry) apply before SPARQL evaluation.
+- Visibility filters (`retired`, `archived`, `mesh-conflicting`, `registry`) apply before SPARQL evaluation; `include_archived` and `include_retired` match existing MCP tools (`export_graph`, `task_list`). Mesh-conflicting and registry rows are never served even under `include_archived: true`.
 - Deterministic output: stable serialization and bounded results.
 - Warn-first: malformed or unsupported queries return structured errors, not panics.
 
@@ -87,7 +87,7 @@ The projection must include:
 - named graphs for namespaces and tiers.
 - `ns:validFrom`, `ns:validTo`, `ns:archived`, `ns:accessCount`, and `rdf:type` predicates for every memory node.
 
-Projection excludes retired, archived, mesh-conflicting, and registry rows unless the caller has audit authorization. Private rows are excluded from mesh and remote use; local audit mode may include them explicitly.
+Projection excludes retired, archived, mesh-conflicting, and registry rows. `include_retired` and `include_archived` flags (matching `export_graph` and `task_list`) control retired/archived inclusion. Mesh-conflicting and registry rows are never served. Private rows are excluded from mesh and remote use; local audit mode may include them explicitly.
 
 ### 5.3 Custom functions
 
@@ -106,14 +106,30 @@ Configuration:
 - `sparql_enabled: bool` (default true)
 - `sparql_timeout_ms: u64` (default 250)
 - `sparql_max_solutions: usize` (default 1000)
-- `sparql_max_memory_mb: usize` (default 64)
+- `sparql_max_dataset_quads: usize` (default 250000)
+- `sparql_max_algebra_nodes: usize` (default 1000)
 - `sparql_service_enabled: bool` (default false)
 
-If a budget is exceeded, return a structured partial result or error with the number of solutions produced so far.
+If a budget is exceeded, return a structured partial result or error with the number of solutions produced so far. Memory is enforced through structural caps (`sparql_max_dataset_quads`, `sparql_max_algebra_nodes`) and streaming `Iterator::take(sparql_max_solutions)`, not through a global allocator.
 
 ### 5.5 Result formats
 
-Support JSON, CSV, and TSV output. Results are sorted according to SPARQL result ordering; if no ORDER BY is present, apply a deterministic tie-break by subject, predicate, object, and graph.
+Support JSON, CSV, and TSV output. Results are sorted according to SPARQL result ordering; if no ORDER BY is present, apply a deterministic tie-break by lexicographic order of projected variable names for `SELECT`, and by `(subject, predicate, object)` for `CONSTRUCT`/`DESCRIBE`.
+
+The MCP return envelope is:
+
+```json
+{
+  "query_form": "select" | "ask" | "construct" | "describe",
+  "format": "json" | "csv" | "tsv",
+  "results": "<serialized>",
+  "solution_count": 0,
+  "truncated": false,
+  "timed_out": false
+}
+```
+
+`results` is the serialized output for the chosen format. `truncated` is set when the solution cap was hit; `timed_out` when the timeout was hit.
 
 ### 5.6 Security
 
@@ -125,10 +141,13 @@ Support JSON, CSV, and TSV output. Results are sorted according to SPARQL result
 ## 6. Interfaces
 
 - Tool:
-  - `neurostrata_sparql_query(query, format?, namespace?, audit?)`
+  - `neurostrata_sparql_query(query, format?, namespace?, include_retired?, include_archived?)`
 - Store/projection:
-  - `project_sparql_dataset(namespace, audit) -> oxrdf::Dataset`
+  - `project_sparql_dataset(namespace, include_retired, include_archived) -> oxrdf::Dataset`
+  - `list_namespace_edges(namespace) -> Vec<(MemoryId, Relation, MemoryId)>` for edge validation
 - Configuration as listed in §5.4.
+
+At query preparation time, pre-register the standard prefixes (`ns:`, `rdf:`, `rdfs:`, `owl:`, `skos:`, `xsd:`) so queries work without explicit PREFIX declarations. When enabled, the projection also includes an ontology graph (`urn:neurostrata:graph:<ns>:ontology`) containing the `OntologyIndex` triples (subClassOf, subPropertyOf, altLabel) for SPARQL-based domain reasoning.
 
 ## 7. Edge cases
 
