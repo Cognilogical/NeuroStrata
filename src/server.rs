@@ -2989,6 +2989,16 @@ async fn handle_search_memory(
             else { vec![] }
         })
         .unwrap_or_default();
+    let node_sets_filter: Vec<String> = arguments
+        .get("node_sets")
+        .map(|v| {
+            if let Some(s) = v.as_str() { vec![s.to_string()] }
+            else if let Some(arr) = v.as_array() { arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect() }
+            else { vec![] }
+        })
+        .unwrap_or_default();
+    // domains filter (OR) - thread into search_with_domain? Store filters by domains already via `domain` param.
+    // For now, merge domains into the existing `domains` variable handling below.
 
     // The store now applies row-class filters and returns `limit` primaries
     // plus their bounded expansions. We ask for 5 primaries (the default page).
@@ -2997,11 +3007,17 @@ async fn handle_search_memory(
     // An optional domain filter: a slug, or a list of slugs. Each value is
     // normalized here, so the store compares by slug on both sides and a
     // legacy free-text domain still matches.
-    let raw_domains: Vec<&str> = match arguments.get("domain") {
+    let mut raw_domains: Vec<&str> = match arguments.get("domain") {
         Some(Value::String(one)) => vec![one.as_str()],
         Some(Value::Array(many)) => many.iter().filter_map(|v| v.as_str()).collect(),
         _ => Vec::new(),
     };
+    // Merge `domains` (OR) filter.
+    match arguments.get("domains") {
+        Some(Value::String(one)) => raw_domains.push(one.as_str()),
+        Some(Value::Array(many)) => raw_domains.extend(many.iter().filter_map(|v| v.as_str())),
+        _ => {}
+    }
     // A domain was requested when the caller named at least one non-empty
     // value. An absent, empty or whitespace-only argument names nothing, and
     // the search then reads exactly as it did before the filter existed.
@@ -3036,6 +3052,18 @@ async fn handle_search_memory(
                     results.retain(|r| {
                         let facets = crate::domain::compute_facets(&r.payload.memory_type, &r.payload.metadata);
                         facets_filter.iter().all(|f| facets.contains(f))
+                    });
+                }
+                if !node_sets_filter.is_empty() {
+                    results.retain(|r| {
+                        let sets: Vec<String> = r.payload.metadata.get("node_set")
+                            .map(|v| {
+                                if let Some(s) = v.as_str() { vec![s.to_string()] }
+                                else if let Some(arr) = v.as_array() { arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect() }
+                                else { vec![] }
+                            })
+                            .unwrap_or_default();
+                        node_sets_filter.iter().any(|f| sets.contains(f))
                     });
                 }
                 if domain_requested {
