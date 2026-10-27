@@ -51,7 +51,8 @@ impl LayaOnnxProvider {
         Ok(Self {
             bundle_root: canonical,
             inference_semaphore: semaphore,
-            state: crate::judgment::RuntimeState::Ready,
+            // Inference is not yet wired (no real ort session); report unavailable.
+            state: crate::judgment::RuntimeState::Unavailable,
         })
     }
 
@@ -102,31 +103,92 @@ impl JudgmentProvider for LayaOnnxProvider {
         // Inference runs inside spawn_blocking under the semaphore; the permit
         // is acquired first so concurrent requests are bounded.
         let _permit = self.inference_semaphore.acquire().await.unwrap();
-        let n = candidates.len();
         let model_path = self.bundle_root.join("model.onnx");
-        if model_path.exists() && n > 0 {
-            // Laya ONNX bundle is present; run inference against candidates.
-            let judgments: Vec<DuplicateJudgment> = candidates
-                .iter()
-                .map(|c| DuplicateJudgment {
-                    existing_memory_id: c.id.clone(),
-                    confidence: 0.75,
-                    reason: Some(format!("Laya ONNX inference enabled; model loaded from {}", self.bundle_root.display())),
-                })
-                .collect();
-            return Ok(judgments);
+        if model_path.exists() && !candidates.is_empty() {
+            // Real ONNX inference is not yet wired; refuse to fabricate a score.
+            return Err(anyhow!(
+                "Laya ONNX inference not implemented (model present at {})",
+                model_path.display()
+            ));
         }
         Ok(vec![])
     }
 
     /// Health check - verify the provider is operational.
     async fn health_check(&self) -> Result<bool> {
-        Ok(true)
+        Ok(false)
     }
 
     /// Provider name for logging/metrics.
     fn name(&self) -> &str {
         "laya-onnx"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn laya_does_not_return_fake_confidence() {
+        // load may fail on missing bundle; if it succeeds, judge must not fake 0.75
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        // Create a minimal bundle dir with manifest
+        let dir = std::env::temp_dir().join("ns-laya-bundle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
+        std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        // Place a model.onnx file so the judge enters the inference branch
+        std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        if let Ok(p) = LayaOnnxProvider::load(&dir, sem) {
+            // With a present model and non-empty candidates, must error (not fake 0.75).
+            let mem = MemoryPayload {
+                content: String::new(),
+                user_id: String::new(),
+                memory_type: String::new(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::Value::Null,
+            };
+            let cand = SearchResult {
+                id: "c1".to_string(),
+                score: 1.0,
+                payload: mem.clone(),
+                evidence: None,
+            };
+            let res = p.judge_duplicates(&mem, &[cand]).await;
+            assert!(res.is_err());
+            assert!(res.unwrap_err().to_string().contains("not implemented"));
+            // candidates empty -> Ok(empty)
+            let res2 = p.judge_duplicates(&mem, &[]).await;
+            assert!(res2.unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn laya_ensure_ready_reports_unavailable() {
+        let mgr = LearningRuntimeManager {
+            paths: LearningPaths { root: std::path::PathBuf::from("/tmp") },
+        };
+        assert_eq!(mgr.ensure_ready().await, RuntimeState::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn laya_health_check_false() {
+        let dir = std::env::temp_dir().join("ns-laya-bundle2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
+        std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        if let Ok(p) = LayaOnnxProvider::load(&dir, sem) {
+            assert!(!p.health_check().await.unwrap());
+            assert_eq!(p.state(), RuntimeState::Unavailable);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -186,7 +248,7 @@ impl LearningRuntimeManager {
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
-        RuntimeState::Ready
+        RuntimeState::Unavailable
     }
 
     /// Return the local training runtime configuration.
