@@ -24,6 +24,7 @@ mod learning;
 mod parser;
 mod recall_metrics;
 mod receipts;
+mod rdf;
 mod registry;
 mod search;
 mod secrets;
