@@ -293,6 +293,10 @@ fn projected_metadata(metadata: &Value) -> Value {
     if let Some(tags) = metadata.get("tags") {
         out.insert("tags".to_string(), tags.clone());
     }
+    // concept_iri is shareable (alignment across namespaces); domain/aliases stay private.
+    if let Some(concept_iri) = metadata.get("concept_iri") {
+        out.insert("concept_iri".to_string(), concept_iri.clone());
+    }
     Value::Object(out)
 }
 

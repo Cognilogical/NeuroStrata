@@ -1335,6 +1335,81 @@ async fn apply_effective(
         tombstoned_at,
     );
 
+    // F20 concept_iri mesh mapping (C5): preserve concept_iri (already in metadata
+    // via allowlist) and map to receiver's local domain slug(s) when registry has
+    // matching concept_iri. Idempotent on replay.
+    let already_imported = store
+        .get(namespace, id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
+        .as_deref()
+        == Some(record.update_id.to_string().as_str());
+
+    if !already_imported {
+        if let Some(concept_val) = metadata.get("concept_iri").cloned() {
+            let iris: Vec<String> = match &concept_val {
+                Value::String(s) => vec![s.clone()],
+                Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                _ => vec![],
+            };
+            let rid = crate::registry::registry_row_id(namespace);
+            let entries = match store.get(namespace, &rid).await {
+                Ok(Some((_, rp))) => crate::registry::registry_domain_entries(&rp.metadata),
+                _ => vec![],
+            };
+            let mut matched_slugs: Vec<String> = Vec::new();
+            for iri in &iris {
+                let matches: Vec<String> = entries
+                    .iter()
+                    .filter_map(|e| {
+                        if e.get("concept_iri").and_then(|v| v.as_str()) == Some(iri.as_str()) {
+                            e.get("slug").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                match matches.len() {
+                    0 => {}
+                    1 => {
+                        if !matched_slugs.contains(&matches[0]) {
+                            matched_slugs.push(matches[0].clone());
+                        }
+                    }
+                    n => {
+                        // ambiguous
+                        eprintln!(
+                            "[neurostrata:mesh] ambiguous concept_iri {} matches {} local domains",
+                            iri, n
+                        );
+                    }
+                }
+            }
+            if !matched_slugs.is_empty() {
+                let mut existing: Vec<String> = match metadata.get("domain") {
+                    Some(Value::String(s)) => vec![s.clone()],
+                    Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    _ => vec![],
+                };
+                for s in &matched_slugs {
+                    if !existing.contains(s) {
+                        existing.push(s.clone());
+                    }
+                }
+                existing.sort();
+                existing.dedup();
+                let val = if existing.len() == 1 {
+                    json!(existing[0].clone())
+                } else {
+                    json!(existing)
+                };
+                metadata.insert("domain".to_string(), val);
+            }
+        }
+    }
+
     let payload = MemoryPayload {
         content: text,
         user_id: record.lifecycle.created_by.clone(),
