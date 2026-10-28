@@ -128,7 +128,7 @@ LadybugDB has five fixed relation tables: `GOVERNS`, `CONTAINS`, `RELATES_TO`, `
 
 The rejected global property chain is not implemented. Instead:
 
-- `govern_out_q` and `govern_in_q` are extended to bounded N hops (default 3, configurable 1..=5),
+- `govern_out_q` and `govern_in_q` are extended to bounded N hops (default 2, configurable 1..=5),
 - each hop records its path in `SearchEvidence`,
 - cycle detection prevents repeated nodes,
 - a hard cap limits the number of paths per result.
