@@ -2131,6 +2131,25 @@ async fn handle_get_snapshot(
         crate::tools::procedure::procedures_due_strap(&all_memories, now)
     };
     let conflicts = crate::domain::detect_conflicts(&all_memories);
+    // Apply disputed metadata badge (F10) to in-memory results.
+    for (id, disputed) in &conflicts {
+        for r in all_memories.iter_mut() {
+            if r.id == *id {
+                if let Some(obj) = r.payload.metadata.as_object_mut() {
+                    obj.insert("disputed".to_string(), serde_json::json!(true));
+                    obj.insert("disputed_with".to_string(), serde_json::json!(disputed));
+                }
+            }
+            if disputed.contains(&r.id) {
+                if let Some(obj) = r.payload.metadata.as_object_mut() {
+                    obj.insert("disputed".to_string(), serde_json::json!(true));
+                    let mut dw = obj.get("disputed_with").and_then(|v|v.as_array()).cloned().unwrap_or_default();
+                    if !dw.iter().any(|x| x.as_str()==Some(id.as_str())) { dw.push(serde_json::json!(id)); }
+                    obj.insert("disputed_with".to_string(), serde_json::Value::Array(dw));
+                }
+            }
+        }
+    }
     let conflict_report = if conflicts.is_empty() {
         String::new()
     } else {

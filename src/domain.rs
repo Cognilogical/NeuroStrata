@@ -135,14 +135,24 @@ pub fn compute_facets(memory_type: &str, metadata: &serde_json::Value) -> Vec<St
 
 /// Detect conflict candidates among active memories (F10). Returns (id, disputed_with_ids).
 pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String, Vec<String>)> {
+    let now = chrono::Utc::now().timestamp();
+    // Filter expired memories first (F10-6).
+    let active: Vec<&crate::traits::SearchResult> = memories
+        .iter()
+        .filter(|m| match m.payload.metadata.get("valid_to") {
+            None => true,
+            Some(v) => v.is_null() || v.as_i64().unwrap_or(0) > now,
+        })
+        .collect();
+
     let mut out = Vec::new();
-    for i in 0..memories.len() {
-        let a = &memories[i];
+    for i in 0..active.len() {
+        let a = active[i];
         if a.payload.memory_type != "rule" && a.payload.memory_type != "fact" { continue; }
         let mut disputed_with = Vec::new();
-        for j in 0..memories.len() {
+        for j in 0..active.len() {
             if i == j { continue; }
-            let b = &memories[j];
+            let b = active[j];
             if b.payload.memory_type != "rule" && b.payload.memory_type != "fact" { continue; }
             // same location or topology
             let same_loc = !a.payload.location.is_empty() && a.payload.location == b.payload.location;
@@ -165,12 +175,12 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
             let dec_a = a.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
             let dec_b = b.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
             let opposing_dec = !dec_a.is_empty() && !dec_b.is_empty() && dec_a != dec_b;
-            // negation token opposition
+            // negation token opposition (word-boundary to avoid "no"/"not" substring false positives)
             let neg_tokens = ["not", "never", "no", "don't", "cannot", "must not"];
             let ca = a.payload.content.to_lowercase();
             let cb = b.payload.content.to_lowercase();
-            let a_neg = neg_tokens.iter().any(|t| ca.contains(t));
-            let b_neg = neg_tokens.iter().any(|t| cb.contains(t));
+            let a_neg = contains_word_boundary(&ca, &neg_tokens);
+            let b_neg = contains_word_boundary(&cb, &neg_tokens);
             let neg_opposition = a_neg != b_neg;
             if opposing_enf || opposing_dec || (same_loc && neg_opposition) {
                 disputed_with.push(b.id.clone());
@@ -181,6 +191,26 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
         }
     }
     out
+}
+
+/// Word-boundary-aware negation token check (F10-5).
+fn contains_word_boundary(text: &str, tokens: &[&str]) -> bool {
+    for tok in tokens {
+        // find all occurrences with boundary checks
+        let mut start = 0;
+        while let Some(pos) = text[start..].find(tok) {
+            let abs = start + pos;
+            let before_ok = abs == 0 || !text.as_bytes()[abs - 1].is_ascii_alphanumeric();
+            let after = abs + tok.len();
+            let after_ok = after == text.len() || !text.as_bytes()[after].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs + 1;
+            if start >= text.len() { break; }
+        }
+    }
+    false
 }
 
 /// Canonical slug for an entity alias (F17). Lowercase, strip non-alnum.
