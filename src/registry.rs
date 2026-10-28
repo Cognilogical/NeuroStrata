@@ -11,6 +11,7 @@
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
 use serde_json::Value;
 use std::sync::Arc;
+use chrono::Utc;
 
 /// One registry row per namespace. The id is a deterministic UUID because the
 /// mesh skips any row whose id is not a parseable UUID.
@@ -674,13 +675,16 @@ mod tests {
     }
 }
 
+static ENRICHMENT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Start an enrichment run: acquire the per-namespace lock. Returns Err if already locked.
 pub async fn enrichment_start(
     store: &Arc<dyn VectorStore>,
     emb: Option<&Arc<dyn Embedder>>,
     namespace: &str,
     holder_id: &str,
-) -> Result<(), String> {
+) -> Result<Value, String> {
+    let _guard = ENRICHMENT_MUTEX.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -705,24 +709,47 @@ pub async fn enrichment_start(
         }
         Err(e) => return Err(e.to_string()),
     };
-    let mut state = enrichment_state(&payload.metadata);
-    if state.get("lock_holder").and_then(|v| v.as_str()).is_some() {
-        return Err(format!("enrichment already locked by {}", state.get("lock_holder").unwrap()));
+    let state = enrichment_state(&payload.metadata);
+    let running = state.get("state").and_then(|v| v.as_str()) == Some("running");
+    let lock_holder = state.get("lock_holder").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let acquired_at = state.get("lock_acquired_at").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let stale = if running {
+        match acquired_at.as_deref() {
+            Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+                .map(|dt| (Utc::now() - dt.with_timezone(&Utc)).num_seconds() > 30 * 60)
+                .unwrap_or(true),
+            None => true,
+        }
+    } else {
+        false
+    };
+
+    if running && !stale {
+        return Ok(serde_json::json!({
+            "acquired": false,
+            "lock_held": true,
+            "holder": lock_holder,
+            "rerun_passes": state.get("rerun_passes").cloned().unwrap_or(serde_json::json!([])),
+        }));
     }
-    state = enrichment_state_record(
-        "in_progress",
-        state.get("watermark").and_then(|v| v.as_u64()).unwrap_or(0),
+
+    let now = Utc::now().to_rfc3339();
+    let new_state = enrichment_state_record(
+        "running",
+        state.get("watermark").cloned().unwrap_or(serde_json::Value::Null),
         Some(holder_id),
+        Some(now.clone()),
+        Vec::new(),
         state.get("telemetry").cloned().unwrap_or(serde_json::json!({})),
     );
     if let Some(obj) = payload.metadata.as_object_mut() {
-        obj.insert("enrichment_state".to_string(), state);
+        obj.insert("enrichment_state".to_string(), new_state);
     }
     store
         .upsert(namespace, &registry_id, vector, payload)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(serde_json::json!({ "acquired": true }))
 }
 
 /// Commit an enrichment run: set state=done, watermark, telemetry; clear lock.
@@ -730,9 +757,10 @@ pub async fn enrichment_commit(
     store: &Arc<dyn VectorStore>,
     emb: Option<&Arc<dyn Embedder>>,
     namespace: &str,
-    watermark: u64,
+    watermark: Value,
     telemetry: Value,
 ) -> Result<(), String> {
+    let _guard = ENRICHMENT_MUTEX.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -757,7 +785,10 @@ pub async fn enrichment_commit(
         }
         Err(e) => return Err(e.to_string()),
     };
-    let state = enrichment_state_record("done", watermark, None, telemetry);
+    let telemetry = normalize_telemetry(telemetry);
+    let watermark = normalize_watermark(watermark);
+    let _guard = ENRICHMENT_MUTEX.lock().await;
+    let state = enrichment_state_record("done", watermark, None, None, Vec::new(), telemetry);
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("enrichment_state".to_string(), state);
     }
@@ -776,6 +807,7 @@ pub async fn enrichment_fail(
     stage: &str,
     error: &str,
 ) -> Result<(), String> {
+    let _guard = ENRICHMENT_MUTEX.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -810,8 +842,8 @@ pub async fn enrichment_fail(
             so.insert("last_error".to_string(), serde_json::json!(error));
         }
     }
-    let watermark = state.get("watermark").and_then(|v| v.as_u64()).unwrap_or(0);
-    state = enrichment_state_record("failed", watermark, None, telemetry);
+    let watermark = state.get("watermark").cloned().unwrap_or(serde_json::Value::Null);
+    state = enrichment_state_record("failed", normalize_watermark(watermark), None, None, Vec::new(), telemetry);
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("enrichment_state".to_string(), state);
     }
@@ -822,20 +854,81 @@ pub async fn enrichment_fail(
     Ok(())
 }
 pub fn enrichment_state(metadata: &Value) -> Value {
-    metadata.get("enrichment_state").cloned().unwrap_or(serde_json::json!({
-        "state": "pending",
-        "watermark": 0,
-        "lock_holder": serde_json::Value::Null,
-        "telemetry": {}
-    }))
+    let base = metadata.get("enrichment_state").cloned().unwrap_or(serde_json::json!({}));
+    normalize_enrichment_state(base)
+}
+
+fn normalize_enrichment_state(mut state: Value) -> Value {
+    if !state.is_object() { state = serde_json::json!({}); }
+    let obj = state.as_object_mut().unwrap();
+    if !obj.contains_key("state") { obj.insert("state".to_string(), serde_json::json!("pending")); }
+    if !obj.contains_key("watermark") { obj.insert("watermark".to_string(), serde_json::json!(null)); }
+    obj.insert("watermark".to_string(), normalize_watermark(obj.get("watermark").cloned().unwrap_or(serde_json::Value::Null)));
+    if !obj.contains_key("lock_holder") { obj.insert("lock_holder".to_string(), serde_json::Value::Null); }
+    if !obj.contains_key("lock_acquired_at") { obj.insert("lock_acquired_at".to_string(), serde_json::Value::Null); }
+    if !obj.contains_key("rerun_passes") { obj.insert("rerun_passes".to_string(), serde_json::json!([])); }
+    if !obj.contains_key("telemetry") { obj.insert("telemetry".to_string(), serde_json::json!({"stages":[],"totals":{"count":0,"failures":0,"latency_ms":0}})); }
+    obj.insert("telemetry".to_string(), normalize_telemetry(obj.get("telemetry").cloned().unwrap_or(serde_json::json!({}))));
+    state
+}
+
+pub fn normalize_watermark(w: Value) -> Value {
+    match w {
+        Value::Object(_) => w,
+        Value::Number(n) => serde_json::json!({
+            "last_enriched_at": serde_json::Value::Null,
+            "enriched_count": n,
+            "extractor_fingerprint": "",
+            "source_digest": serde_json::Value::Null,
+        }),
+        Value::Null => serde_json::json!({
+            "last_enriched_at": serde_json::Value::Null,
+            "enriched_count": 0,
+            "extractor_fingerprint": "",
+            "source_digest": serde_json::Value::Null,
+        }),
+        _ => serde_json::json!({
+            "last_enriched_at": serde_json::Value::Null,
+            "enriched_count": 0,
+            "extractor_fingerprint": "",
+            "source_digest": serde_json::Value::Null,
+        }),
+    }
+}
+
+pub fn normalize_telemetry(t: Value) -> Value {
+    let mut stages: Vec<Value> = t.get("stages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    stages.sort_by(|a,b| {
+        let an = a.get("name").and_then(|v|v.as_str()).unwrap_or("");
+        let bn = b.get("name").and_then(|v|v.as_str()).unwrap_or("");
+        an.cmp(bn)
+    });
+    let mut total_count = 0u64;
+    let mut total_failures = 0u64;
+    let mut total_latency = 0u64;
+    for st in &stages {
+        total_count += st.get("count").and_then(|v|v.as_u64()).unwrap_or(0);
+        total_failures += st.get("failures").and_then(|v|v.as_u64()).unwrap_or(0);
+        total_latency += st.get("latency_ms").and_then(|v|v.as_u64()).unwrap_or(0);
+    }
+    serde_json::json!({
+        "stages": stages,
+        "totals": {
+            "count": total_count,
+            "failures": total_failures,
+            "latency_ms": total_latency,
+        }
+    })
 }
 
 /// Build an enrichment state record.
-pub fn enrichment_state_record(state: &str, watermark: u64, lock_holder: Option<&str>, telemetry: Value) -> Value {
+pub fn enrichment_state_record(state: &str, watermark: Value, lock_holder: Option<&str>, lock_acquired_at: Option<String>, rerun_passes: Vec<String>, telemetry: Value) -> Value {
     serde_json::json!({
         "state": state,
-        "watermark": watermark,
+        "watermark": normalize_watermark(watermark),
         "lock_holder": lock_holder,
-        "telemetry": telemetry,
+        "lock_acquired_at": lock_acquired_at,
+        "rerun_passes": rerun_passes,
+        "telemetry": normalize_telemetry(telemetry),
     })
 }

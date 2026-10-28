@@ -1553,6 +1553,20 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                 if let Some(obj) = json.as_object_mut() {
                     obj.insert("ontology_warnings".to_string(), serde_json::Value::Array(ow));
                 }
+                // Enrichment state surface (F12/F14/F24), warn-first.
+                let rid = crate::registry::registry_row_id(&namespace);
+                if let Ok(Some((_, reg_payload))) = crate::traits::VectorStore::get(ls, &namespace, &rid).await {
+                    let es = crate::registry::enrichment_state(&reg_payload.metadata);
+                    if let Some(obj) = json.as_object_mut() {
+                        obj.insert("enrichment_state".to_string(), es.clone());
+                        if es.get("state").and_then(|v| v.as_str()) == Some("failed") {
+                            let warnings = obj.entry("warnings".to_string()).or_insert_with(|| serde_json::json!([]));
+                            if let Some(arr) = warnings.as_array_mut() {
+                                arr.push(serde_json::json!({"kind":"enrichment_failed","state":es}));
+                            }
+                        }
+                    }
+                }
             }
             encode(&json)
         }
