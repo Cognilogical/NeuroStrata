@@ -2,7 +2,7 @@
 
 > Status: revised per Argon review — pending user review.
 > Task: `neurostrata-2hxl` (OWL/RDFS reasoning over memory graph, OxiRS §1.2).
-> Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md` (§4, §3.4).
+> Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md` (§4, §3.4), `docs/superpowers/specs/2026-10-27-rdf-canonical-direction-design.md` (§2 Decision: JSON primary + RDF canonical transition), `docs/superpowers/specs/2026-10-27-closure-budget-zstd-anomaly-design.md` (`yjah`, QueryBudget and transitive closure primitives).
 
 ## 1. Problem
 
@@ -33,12 +33,19 @@ Add **deterministic, query-time RDFS/OWL 2 RL reasoning** over the RDF projectio
 
 Prefer existing crates over an in-house rule engine:
 
+- In-tree bounded BFS/DFS (via `QueryBudget` from `yjah` spec) for `subClassOf*`, `subPropertyOf*`, and bounded transitive `GOVERNS`. This is primary because it satisfies determinism and the crate-free `related.rs` / `context/` test-compilation contract (see `yjah` AC-3).
+- `petgraph = "0.8.3"` as backup if multi-relation DAG / SCC algorithms are needed beyond BFS.
 - `reasonable` for OWL 2 RL reasoning over RDF graphs at ontology-index compile time. It is BSD-3-Clause, actively maintained, and supports RDF 1.2 behind its `rdf-12` feature.
 - `sophia_reasoner` for RDFS/Simple/RDF entailment if a narrower RDFS-only path is preferable.
 - `oxrdf` for RDF terms, triples, and quads shared with the projection layer.
-- Evaluate `reasonable` and `sophia_reasoner` against the required rule subset before implementation. Do not hand-write a Datalog engine if either crate covers the needed rules.
+- Evaluate `reasonable` and `sophia_reasoner` against the required rule subset before implementation. If neither meets determinism or the restricted OWL 2 RL profile, fall back to the in-tree BFS/DFS closure (no Datalog engine needed for this rule subset).
 
-Do not add `horned-owl` (LGPL) or any OWL 2 DL reasoner.
+Do not add `horned-owl` (LGPL) or any OWL 2 DL reasoner. Reject `oxirs-core`/`oxirs-shacl`/`scirs2` (pulls `ctor` pre-main rustls hooks; per `yjah` and federation specs).
+
+### 3.2 Alignment with RDF canonical direction (neurostrata-9fnf)
+
+- Direction confirmed: JSON remains primary for wire/mesh; RDF canonical layer (`oxrdf`/`oxttl`) is the long-term target via dual-write then JSON retirement.
+- This spec builds against the RDF projection layer (`oxrdf::Dataset`), which `9fnf` confirms as canonical. TBox stored in `src/schemas/memory-ontology.v1.jsonld`.
 
 ## 4. Scope
 
@@ -47,7 +54,7 @@ In scope:
 - RDFS `subClassOf`, `subPropertyOf`, `domain`, and `range` entailment.
 - OWL 2 RL rules needed by NeuroStrata: `equivalentClass`, `equivalentProperty`, `inverseOf`, `symmetricProperty`, `transitiveProperty`, `sameAs` (restricted), and `hasValue`/`someValuesFrom` only where already represented by facets.
 - SKOS `altLabel`, `prefLabel`, `broader`/`narrower`, and `exactMatch` expansion.
-- Bounded transitive `GOVERNS` traversal with path evidence.
+- Bounded transitive `GOVERNS` traversal with path evidence (BFS/DFS closure from `yjah` spec, `QueryBudget` applied per `related` and `search_with_domain`).
 - `OntologyIndex` compiled closure and `ArcSwap` lifecycle.
 - Domain, alias, and relation filter expansion in `search_with_domain`, `related`, and `memories_for_file`.
 
@@ -90,7 +97,12 @@ It is held in a per-namespace map, `ArcSwap<BTreeMap<String, Arc<OntologyIndex>>
 
 ### 5.2 Rule engine
 
-Closure is compiled when `OntologyIndex` is built from the TBox and registry data, not during request handling. `reasonable` (or `sophia_reasoner` for the RDFS subset) may be used at compile time to derive the transitive and equivalence closures. Query time performs only lookups against the precompiled closures.
+Primary closure is in-tree BFS/DFS (matching `yjah` spec §1.19), applied via `QueryBudget` for bounded traversal. `petgraph` is a backup for complex DAGs if BFS/DFS cannot satisfy reachability or cycle guarantees. The compiled closure is stored in `OntologyIndex`, precomputed at index build time. At query time, `reasonable` (or `sophia_reasoner` for RDFS subset) can be used to derive transitive and equivalence closures if the rule subset is fully covered and deterministic, otherwise rely on the in-tree closure.
+
+- project the relevant TBox and ABox quads into an `oxrdf` dataset at index build time,
+- run the restricted rule set once per ontology/registry change,
+- store the resulting closures in `OntologyIndex`,
+- discard any inferred triples not used by search, `related`, or domain expansion.
 
 - project the relevant TBox and ABox quads into an `oxrdf` dataset at index build time,
 - run the restricted rule set once per ontology/registry change,
@@ -195,4 +207,4 @@ RDFS/OWL 2 RL reasoning is available as a deterministic, query-time layer over t
 - `src/rdf/reasoning.rs` (new): reasoner adapter and deterministic wrappers.
 - `src/store/ladybug.rs`: bounded `GOVERNS` traversal and filter expansion hooks.
 - `src/server.rs`: configuration and tool exposure if needed.
-- `Cargo.toml`: `reasonable` and/or `sophia_reasoner`, `oxrdf`.
+- `Cargo.toml`: `reasonable` and/or `sophia_reasoner`, `oxrdf`, `oxttl`, `petgraph` (backup); NO `oxirs-core`/`scirs2`/`horned-owl`.
