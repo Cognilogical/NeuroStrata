@@ -14,7 +14,7 @@ use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 // functions through the path they already use.
 pub use crate::parser::generation::{
     generation_key, generation_scoped_id, ingest_version, logical_path_of, sha256_hex, split_scoped_id,
-    symbol_id, version_gate_tripped, NAMESPACE_SEPARATOR, PARSER_LOGIC_VERSION,
+    symbol_id, NAMESPACE_SEPARATOR,
 };
 
 /// Schemas declare extensions bare ("rs"), but one passed via --schema-path may
@@ -346,9 +346,12 @@ fn run_producer(
     generation: u64,
     prev_file_map: std::collections::HashMap<String, String>,
     force_reparse: bool,
-    ingest_version: String,
     observer: Option<std::sync::Arc<dyn IngestObserver>>,
-) -> anyhow::Result<std::collections::HashMap<String, String>> {
+) -> anyhow::Result<(
+    std::collections::HashSet<String>,
+    std::collections::HashMap<String, String>,
+)> {
+    let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current_hashes: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let skipped_dirs = [
@@ -462,6 +465,10 @@ fn run_producer(
         };
 
         let node_id = generation_scoped_id(&namespace, generation, &node_path);
+
+        // Every visited path is recorded so carry-forward can decide whether a
+        // previous row still belongs to the current tree.
+        current_paths.insert(node_path.clone());
 
         // Every file's bytes are read once and hashed so `file_sha256` is
         // captured on file and markdown nodes too, not only on parseable code
@@ -628,9 +635,8 @@ fn run_producer(
         );
     }
 
-    Ok(current_hashes)
+    Ok((current_paths, current_hashes))
 }
-
 /// Stamps the per-node `relative_path` onto a copy of the shared source
 /// identity. The identity is otherwise identical across a tree, but the path
 /// it governs differs per node, so each row records its own.
@@ -895,6 +901,7 @@ pub async fn ingest_directory(
     // Build prev_file_map: node_path -> file_sha256 for files in prev gen.
     let mut prev_file_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut prev_version: Option<String> = None;
+    let mut prev_stamps: Vec<String> = Vec::new();
     if prev_gen > 0 {
         if let Ok(rows) = vector_store.list(namespace, None, None).await {
             for r in rows {
@@ -915,6 +922,8 @@ pub async fn ingest_directory(
                         }
                     }
                 }
+                let stamp = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                prev_stamps.push(stamp);
             }
         }
     }
@@ -940,12 +949,16 @@ pub async fn ingest_directory(
     let schema_clone = schema.clone();
 
     // Version gate: a changed (or missing) ingest_version stamps a full re-parse.
+    // A mixed previous generation (any row missing or differing) trips too.
     let current_version = ingest_version(&schema.fingerprint());
-    let force_reparse = prev_gen > 0 && version_gate_tripped(prev_version.as_deref(), &current_version);
+    let offending_stamp = prev_stamps.iter().find(|s| s.is_empty() || s.as_str() != current_version).cloned();
+    let force_reparse = prev_gen > 0 && offending_stamp.is_some();
     if force_reparse {
+        let warn_prev = offending_stamp.as_deref().filter(|s| !s.is_empty()).unwrap_or("(none)");
         if let Some(obs) = &observer {
-            obs.version_gate_tripped(prev_version.as_deref().unwrap_or("(none)"), &current_version);
+            obs.version_gate_tripped(warn_prev, &current_version);
         }
+        tracing::warn!(prev = warn_prev, current = %current_version, "ingest version changed; re-parsing all files");
     }
 
     let (tx, rx) = mpsc::channel::<IngestItem>(256);
@@ -954,7 +967,6 @@ pub async fn ingest_directory(
     // blocking thread, streaming owned results through the channel.
     let prev_file_map_clone = prev_file_map.clone();
     let observer_clone = observer.clone();
-    let current_version_clone = current_version.clone();
     let producer = tokio::task::spawn_blocking(move || {
         run_producer(
             dir_path_owned,
@@ -965,7 +977,6 @@ pub async fn ingest_directory(
             generation,
             prev_file_map_clone,
             force_reparse,
-            current_version_clone,
             observer_clone,
         )
     });
@@ -990,9 +1001,11 @@ pub async fn ingest_directory(
     // Any failure aborts the staging generation: the previous active generation
     // stays reachable, and this one's half-built tree is discarded.
     let mut current_hashes = std::collections::HashMap::new();
+    let mut current_paths = std::collections::HashSet::new();
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(()), Ok(Ok(h))) => {
-            current_hashes = h;
+        (Ok(()), Ok(Ok((paths, hashes)))) => {
+            current_paths = paths;
+            current_hashes = hashes;
             None
         }
         (Err(e), _) => Some(e),
@@ -1014,7 +1027,9 @@ pub async fn ingest_directory(
 
     // Carry forward unchanged nodes from the previous generation so the
     // new generation contains the full tree without re-embedding.
-    if prev_gen > 0 {
+    // A forced re-parse (version trip) stages every current node itself, so
+    // no previous row is carried in that mode.
+    if prev_gen > 0 && !force_reparse {
         let mut carried = 0usize;
         if let Ok(rows) = vector_store.list(namespace, None, None).await {
             for r in rows {
@@ -1024,20 +1039,25 @@ pub async fn ingest_directory(
                     None => continue,
                 };
                 if gen != prev_gen { continue; }
+                // The row's `location` is the file it came from (stamped at
+                // ingest time), which survives `#` in file names unlike
+                // splitting the symbol id.
+                let file_path = r.payload.location.clone();
                 let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
                 // Carry a previous row only when its file is still present with
-                // the same bytes: deleted files and stale symbols from changed
-                // files drop out of the new generation.
-                let unchanged = match &hash {
-                    Some(h) => {
-                        let file_path = tail.split('#').next().unwrap_or(&tail);
-                        current_hashes.get(file_path) == Some(h)
+                // the same bytes, or (for no-hash rows) when the path is still
+                // visited. Deleted files and stale symbols drop out.
+                let carry = if current_paths.contains(&file_path) {
+                    match &hash {
+                        Some(h) => current_hashes.get(&file_path) == Some(h),
+                        None => true,
                     }
-                    None => true, // directories / no-hash nodes carried forward
+                } else {
+                    false
                 };
-                if !unchanged { continue; }
+                if !carry { continue; }
                 if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &id).await {
-                    payload.metadata.as_object_mut().map(|o| { o.insert("index_generation".to_string(), serde_json::json!(generation)); });
+                    payload.metadata.as_object_mut().map(|o| { o.insert("index_generation".to_string(), serde_json::json!(generation)); o.insert("ingest_version".to_string(), serde_json::json!(current_version)); });
                     let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
                     if vector_store.upsert(namespace, &new_id, vec, payload).await.is_ok() {
                         carried += 1;
@@ -1767,6 +1787,156 @@ mod tests {
             store.get("probe", &file_id).await.expect("read").is_none(),
             "deleted file must not be resurrected by carry-forward"
         );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn hash_filename_with_hash_survives_carry_forward() {
+        let tmp = std::env::temp_dir().join(format!("ns-hashname-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("a#b.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-hashname-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+            .await
+            .expect("first ingest");
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+            .await
+            .expect("second ingest");
+
+        let gen2 = store
+            .active_generation("probe", &source_key_for(&tmp))
+            .await
+            .expect("read active generation");
+        let file_id = generation_scoped_id("probe", gen2, "a#b.rs");
+        assert!(
+            store.get("probe", &file_id).await.expect("read").is_some(),
+            "file node with '#' in name must survive carry-forward"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn pre_migration_generation_re_parses_and_stamps_every_row() {
+        let tmp = std::env::temp_dir().join(format!("ns-premig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-premig-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&tmp);
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+            .await
+            .expect("first ingest");
+
+        // Simulate a pre-migration generation by stripping ingest_version from
+        // every row of the active generation.
+        let gen1 = store.active_generation("probe", &source_key).await.expect("read");
+        let rows = store.list("probe", None, None).await.expect("list");
+        for r in rows {
+            let scoped = crate::parser::ingest::split_scoped_id(&r.id);
+            if scoped.is_none() { continue; }
+            let (_, g, _) = scoped.unwrap();
+            if g != gen1 {
+                continue;
+            }
+            if let Ok(Some((vec, mut payload))) = store.get("probe", &r.id).await {
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    obj.remove("ingest_version");
+                }
+                store.upsert("probe", &r.id, vec, payload).await.expect("upsert");
+            }
+        }
+
+        // Re-ingest must trip the gate (missing stamps) and stamp every row.
+        struct Rec(std::sync::Mutex<usize>);
+        impl IngestObserver for Rec {
+            fn file_ingested(&self, _p: &str, _s: usize) {}
+            fn file_skipped(&self, _p: &str) {}
+            fn relinked(&self, _e: usize) {}
+            fn version_gate_tripped(&self, _p: &str, _c: &str) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+        let rec = Arc::new(Rec(std::sync::Mutex::new(0)));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()))
+            .await
+            .expect("second ingest");
+        assert_eq!(*rec.0.lock().unwrap(), 1, "pre-migration generation trips the gate");
+
+        let gen2 = store.active_generation("probe", &source_key).await.expect("read");
+        let rows2 = store.list("probe", None, None).await.expect("list");
+        for r in rows2 {
+            let scoped = crate::parser::ingest::split_scoped_id(&r.id);
+            if scoped.is_none() { continue; }
+            let (_, g, _) = scoped.unwrap();
+            if g != gen2 {
+                continue;
+            }
+            let v = r.payload.metadata.get("ingest_version").and_then(|x| x.as_str());
+            assert!(v.is_some() && !v.unwrap().is_empty(), "every current row must be stamped");
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn mixed_stamps_trip_even_if_first_row_is_current() {
+        let tmp = std::env::temp_dir().join(format!("ns-mixed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-mixed-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&tmp);
+
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+            .await
+            .expect("first ingest");
+        let gen1 = store.active_generation("probe", &source_key).await.expect("read");
+        let current = ingest_version(&schema.fingerprint());
+
+        // Tamper with one row's stamp to a different value.
+        let rows = store.list("probe", None, None).await.expect("list");
+        let target = rows.iter().find(|r| {
+            crate::parser::ingest::split_scoped_id(&r.id).map(|x| x.1 == gen1).unwrap_or(false)
+        }).expect("row").id.clone();
+        if let Ok(Some((vec, mut payload))) = store.get("probe", &target).await {
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert("ingest_version".to_string(), serde_json::json!("tampered"));
+            }
+            store.upsert("probe", &target, vec, payload).await.expect("upsert");
+        }
+        let _ = current;
+
+        struct Rec(std::sync::Mutex<usize>);
+        impl IngestObserver for Rec {
+            fn file_ingested(&self, _p: &str, _s: usize) {}
+            fn file_skipped(&self, _p: &str) {}
+            fn relinked(&self, _e: usize) {}
+            fn version_gate_tripped(&self, _p: &str, _c: &str) {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+        let rec = Arc::new(Rec(std::sync::Mutex::new(0)));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()))
+            .await
+            .expect("second ingest");
+        assert_eq!(*rec.0.lock().unwrap(), 1, "mixed stamps must trip the gate");
 
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
