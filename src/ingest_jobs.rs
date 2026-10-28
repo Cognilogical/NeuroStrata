@@ -90,6 +90,10 @@ impl IngestObserver for ProgressReporter {
         self.tx
             .send_modify(|progress| progress.relinked_edges = Some(edges));
     }
+
+    fn version_gate_tripped(&self, prev: &str, current: &str) {
+        tracing::warn!(prev, current, "ingest version changed; re-parsing all files");
+    }
 }
 
 /// The walk a caller should wait on instead of starting one, if there is one.
