@@ -1228,6 +1228,7 @@ fn parse_edge_specs(
         // Vocabulary v2: a memory extracted from a completed task declares it,
         // and the edge points memory -> task (self_to_target).
         ("extracted_from", "EXTRACTED_FROM", true),
+        ("depends_on", "DEPENDS_ON", true),
     ] {
         match payload.metadata.get(key) {
             None => { /* absent: ok */ }
@@ -3151,6 +3152,22 @@ impl VectorStore for LadybugStore {
                     "source": source,
                     "target": target,
                     "type": "EXTRACTED_FROM"
+                }));
+            }
+
+            // DEPENDS_ON (vocabulary v2): module dependency edges.
+            let query_depends = "MATCH (a:Memory)-[r:DEPENDS_ON]->(b:Memory) RETURN a.id, b.id;";
+            let res_depends = conn.query(query_depends)?;
+            for row in res_depends {
+                let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
+                    continue;
+                }
+                links.push(serde_json::json!({
+                    "source": source,
+                    "target": target,
+                    "type": "DEPENDS_ON"
                 }));
             }
 

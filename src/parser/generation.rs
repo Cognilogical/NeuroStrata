@@ -97,7 +97,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// The parser logic version. Bump it whenever extraction changes in a way that
 /// must re-parse already-ingested nodes even though the schema is unchanged.
-pub const PARSER_LOGIC_VERSION: u32 = 1;
+pub const PARSER_LOGIC_VERSION: u32 = 2;
 
 /// The stamp stored beside ingested rows: which logic version and which schema
 /// fingerprint produced them. A change to either invalidates the stamp.

@@ -47,7 +47,7 @@ fn ingest_version_changes_with_logic_version_or_fingerprint() {
     assert_eq!(v, ingest_version("abc123"));
     assert_ne!(v, ingest_version("def456"));
     assert!(v.chars().all(|c| c.is_ascii_hexdigit()));
-    assert_eq!(PARSER_LOGIC_VERSION, 1);
+    assert_eq!(PARSER_LOGIC_VERSION, 2);
 }
 
 #[test]
