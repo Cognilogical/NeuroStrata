@@ -31,7 +31,16 @@ Normalize topology fields and `KnownIds` aliases to canonical entity slugs; prev
 - Write back to `metadata.canonical_slug` at `upsert` / `relink_edges`.
 - Read-time projection uses canonical slug.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `sha2` for canonical slug derivation; `oxrdf` for IRI normalization; NO `oxirs-core`/`scirs2`/`horned-owl`.
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: canonical slug derived per namespace; cross-namespace alignment via `pjoa` concept IRI only (`ooa1`).
+- References `neurostrata-9fnf` (JSON primary + RDF canonical direction), `yjah` (QueryBudget / transient inference), `2hxl` (BFS / ontology index), `pjoa` (concept IRI alignment), `4gb2` (RDF-star provenance), `52dq` (GraphRAG hybrid), `mhsp` (inter-namespace).
+- Warn-first: unknown class/property / normalization failure → warning (non-fatal).
+- Deterministic: fixed normalization rules, sorted output.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: slug normalization hooks.
 - `src/rdf/ontology.rs`: `canonical_slug()` method.

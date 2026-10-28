@@ -30,7 +30,16 @@ Add watermark storage for ingest and enrichment runs, keyed by fingerprints (con
 - Watermark keyed by namespace + file + stage.
 - Reuse with `emrz` hash-reuse logic.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `sha2` (fingerprint); NO `oxirs-core`/`scirs2`/`horned-owl`; `oxrdf` optional (`9fnf`/`2hxl`).
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: watermarks per namespace/file/stage.
+- References `neurostrata-9fnf` (canonical IRI / RDF direction), `yjah` (QueryBudget / transient inference), `2hxl` (BFS), `4gb2` (provenance), `52dq` (GraphRAG), `emrz` (hash reuse), `mhsp` (inter-namespace).
+- Warn-first: watermark corruption / mismatch → warning, not failure.
+- Deterministic: fingerprint = content hash + parser version (monotonic).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/ingest/staged_publication.rs`: watermark records.
 - `src/store/ladybug.rs`: watermark persistence.

@@ -33,7 +33,16 @@ Extract source-file import/module dependency relationships and project them into
 - Bound to namespace per `project_federated_sparql_dataset` patterns.
 - Deterministic: sort dependencies by module IRI, stable ordering.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `syn` / `tree-sitter` (multi-language parser) or `syn` (Rust-only); `oxrdf` for projection; NO `oxirs-core`/`scirs2`/`horned-owl` (rejected per `yjah` library hygiene rules).
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: dependency edge projection scoped per namespace.
+- References `neurostrata-9fnf` (canonical IRI / RDF projection), `yjah` (transient inference / QueryBudget / warn-first), `2hxl` (in-tree BFS), `4gb2` (RDF-star provenance), `52dq` (GraphRAG hybrid), `mhsp` (inter-namespace).
+- Warn-first: unsupported file types / parse errors emit warnings (non-fatal).
+- Deterministic: sorted dependency lists, stable IRI mapping.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/dependency/parser.rs` (new): multi-language import extraction using `syn` (Rust) / `tree-sitter` (Python/TS/JS) / `pylsp` Python language server protocol.
 - `src/store/ladybug.rs`: dependency edge write hooks, `upsert` with `DEPENDS_ON` schema.

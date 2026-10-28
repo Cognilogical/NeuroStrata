@@ -30,7 +30,16 @@ Report dangling edges (edges pointing to non-existent nodes) in `doctor` and `ta
 - Compare against active node IDs; report differences.
 - Report in `doctor` output and `task_validate` advisory.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `oxrdf` for RDF projection / edge lookup; NO `oxirs-core`/`scirs2`/`horned-owl`. Manual edge validation preferred.
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: dangling-edge report scoped per namespace (`relink_edges` per namespace).
+- References `neurostrata-9fnf` (canonical IRI), `yjah` (QueryBudget / bounded closure), `2hxl` (BFS / transient inference), `4gb2` (provenance), `52dq` (GraphRAG), `mhsp` (inter-namespace), `pjoa` (concept IRI).
+- Warn-first: dangling edges reported, not rejected (backward compatible).
+- Deterministic: sorted dangling-edge list; stable reporting.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: dangling edge check in `relink_edges`.
 - `src/doctor.rs`: dangling report output.

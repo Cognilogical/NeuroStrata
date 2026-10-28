@@ -32,7 +32,16 @@ Add closed-world shape checks at upsert/write time for edge required fields; war
 - Check at upsert time.
 - Warn-first: return `ValidationWarning` with missing/erroneous fields; continue write with defaults.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `oxrdf` / `oxrd` for shape validation if RDF-based; NO `oxirs-core`/`oxirs-shacl` (rejected — `oxirs-shacl` separate, not `oxirs-core`); NO `scirs2`/`horned-owl`. Manual schema per relation table preferred (`yjah` AC-3).
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: shape checks applied per namespace; schema per namespace optional override.
+- References `neurostrata-9fnf` (canonical direction / RDF layer), `yjah` (QueryBudget / warn-first / closed-world), `2hxl` (BFS / transient inference), `4gb2` (provenance), `52dq` (GraphRAG), `mhsp` (inter-namespace).
+- Warn-first: invalid/unknown fields emit warnings, not errors; backward compatible.
+- Deterministic: fixed schema rules, fixed order.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: upsert-time shape validation hooks.
 - `src/doctor.rs`: surface shape warnings.

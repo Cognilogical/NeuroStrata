@@ -33,7 +33,16 @@ Add file-level content hash reuse: unchanged files reuse existing nodes and embe
 - On ingest, compare stored hash to current hash; if match, skip re-parse.
 - Version gate: bump parser/schema version triggers full re-parse.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `sha2` (hash reuse); NO `oxirs-core`/`scirs2`/`horned-owl`; `oxrdf` optional for RDF projection (`9fnf`/`2hxl`).
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: hash-reuse scoped per namespace (namespace key in hash lookup).
+- References `neurostrata-9fnf` (canonical direction / RDF layer), `yjah` (QueryBudget / transient inference / warn-first), `2hxl` (BFS closure), `4gb2` (provenance), `52dq` (GraphRAG), `mhsp` (inter-namespace).
+- Warn-first: hash mismatch / version mismatch → warning + re-parse.
+- Deterministic: content-based hash, not timestamp-based.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/ingest/staged_publication.rs`: hash computation and reuse logic.
 - `src/store/ladybug.rs`: hash lookup and node reuse.
