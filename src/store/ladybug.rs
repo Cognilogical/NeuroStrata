@@ -1858,7 +1858,58 @@ impl LadybugStore {
         .await
     }
 
-
+    /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
+    pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
+        let rows = self.list(namespace, None, None).await.unwrap_or_default();
+        let mut out = Vec::new();
+        for r in rows {
+            // shacl validate
+            for v in crate::rdf::validate_memory(&r.payload) {
+                out.push(serde_json::json!({
+                    "id": r.id,
+                    "field": v.field,
+                    "why": v.why,
+                }));
+            }
+            // edge endpoint roles
+            let source_type = r.payload.memory_type.clone();
+            let meta = r.payload.metadata.clone();
+            for (key, rel_type) in [
+                ("related_to", "RELATES_TO"),
+                ("contained_by", "CONTAINS"),
+                ("governs", "GOVERNS"),
+                ("extracted_from", "EXTRACTED_FROM"),
+                ("depends_on", "DEPENDS_ON"),
+            ] {
+                if let Some(arr) = meta.get(key).and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(target) = item.as_str() {
+                            // resolve target namespace
+                            let (ns, tid) = if target.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                                let pos = target.find(crate::parser::ingest::NAMESPACE_SEPARATOR).unwrap();
+                                let ns = &target[..pos];
+                                let id = &target[pos + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
+                                (ns.to_string(), id.to_string())
+                            } else {
+                                (namespace.to_string(), target.to_string())
+                            };
+                            if let Ok(Some((_, tpayload))) = self.get(&ns, &tid).await {
+                                let target_type = tpayload.memory_type;
+                                if !crate::rdf::shacl::endpoint_role_allowed(rel_type, &source_type, &target_type) {
+                                    out.push(serde_json::json!({
+                                        "id": r.id,
+                                        "field": format!("metadata.{}", key),
+                                        "why": format!("endpoint role mismatch: {} (source={} target={})", rel_type, source_type, target_type),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 #[async_trait]
@@ -2159,6 +2210,15 @@ impl VectorStore for LadybugStore {
             // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
             // That is deliberate -- a rule may name a file the ingester has not reached.
             for edge in edge_specs(&payload.metadata) {
+                // F18 endpoint role: GOVERNS requires rule source.
+                if edge.rel_type == "GOVERNS" && !(payload.memory_type == "rule" || payload.memory_type == "fact" || payload.memory_type == "context") {
+                    emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                        field: "metadata.governs".to_string(),
+                        why: format!("endpoint role mismatch: GOVERNS requires source=rule (got {})", payload.memory_type),
+                        skipped: "this edge materialization".to_string(),
+                    });
+                    continue;
+                }
                 let target = if edge.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
                     // (E) Qualified: exact ID lookup in any namespace.
                     match exact_target_exists(conn, &edge.target_id) {
@@ -2203,7 +2263,7 @@ impl VectorStore for LadybugStore {
                         // failed resolution, or a qualified cross-namespace id,
                         // still defers.
                         crate::traits::TargetResolution::Missing
-                            if edge.rel_type == "GOVERNS" =>
+                            if edge.rel_type == "GOVERNS" && payload.memory_type == "rule" =>
                         {
                             match materialize_stub_file_node(
                                 conn,
@@ -2248,6 +2308,21 @@ impl VectorStore for LadybugStore {
                         }
                     }
                 };
+                // F18 endpoint role matrix: check source/target memory types.
+                let target_type = {
+                    let q = format!("MATCH (m:Memory {{id: '{}'}}) RETURN m.memory_type", escape_ladybug_string(&target));
+                    conn.query(&q).ok().and_then(|mut r| r.next()).map(|row| format!("{}", row[0])).unwrap_or_default()
+                };
+                if !crate::rdf::shacl::endpoint_role_allowed(&edge.rel_type, &payload.memory_type, &target_type) {
+                    emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                        field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                        why: format!("endpoint role mismatch: {} (source={} target={})", edge.rel_type, payload.memory_type, target_type),
+                        skipped: "this edge materialization".to_string(),
+                    });
+                    continue;
+                }
+                // F18: GOVERNS source must be rule even when target missing/stubbed.
+                // (handled above for resolved targets; missing targets skip role check)
                 // F6: stamp edge provenance for this resolved declaration.
                 {
                     let declared = edge.target_id.clone();
