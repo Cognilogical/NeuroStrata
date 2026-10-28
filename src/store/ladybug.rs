@@ -1772,6 +1772,90 @@ fn create_missing_edges(
     Ok(created)
 }
 
+impl LadybugStore {
+    pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            // Collect active memory ids + metadata.
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.metadata, m.is_retired",
+                escape_ladybug_string(&namespace)
+            );
+            let mut res = conn.query(&query)?;
+            let mut rows: Vec<(String, String)> = Vec::new();
+            while let Some(row) = res.next() {
+                let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                let meta = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
+                // skip retired
+                let retired = match &row[2] {
+                    lbug::Value::Bool(b) => *b,
+                    _ => false,
+                };
+                if retired {
+                    continue;
+                }
+                rows.push((id, meta));
+            }
+
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            for (declaring_id, meta_str) in &rows {
+                let meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
+                // Skip registry rows.
+                if meta.get("domain_registry").is_some() {
+                    continue;
+                }
+                let specs = edge_specs(&meta);
+                for spec in specs {
+                    let resolution = if spec.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                        match exact_target_exists(conn, &spec.target_id) {
+                            Ok(true) => crate::traits::TargetResolution::Resolved(spec.target_id.clone()),
+                            Ok(false) => crate::traits::TargetResolution::Missing,
+                            Err(e) => crate::traits::TargetResolution::Failed(e.to_string()),
+                        }
+                    } else {
+                        resolve_target_on_write(conn, &namespace, &spec.target_id)
+                    };
+                    let reason = match resolution {
+                        crate::traits::TargetResolution::Missing => "missing",
+                        crate::traits::TargetResolution::Ambiguous(_) => "ambiguous",
+                        crate::traits::TargetResolution::Failed(_) => "unresolvable",
+                        crate::traits::TargetResolution::Resolved(_) => continue,
+                    };
+                    out.push(serde_json::json!({
+                        "rel_type": spec.rel_type,
+                        "declaring_id": declaring_id,
+                        "declaration_index": spec.declaration_index,
+                        "declared_target": spec.target_id,
+                        "reason": reason,
+                    }));
+                }
+            }
+            // Sort by (rel_type, declaring_id, declaration_index, declared_target, reason).
+            out.sort_by(|a, b| {
+                let ka = (
+                    a.get("rel_type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    a.get("declaring_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    a.get("declaration_index").and_then(|x| x.as_u64()).unwrap_or(0),
+                    a.get("declared_target").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    a.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                );
+                let kb = (
+                    b.get("rel_type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    b.get("declaring_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    b.get("declaration_index").and_then(|x| x.as_u64()).unwrap_or(0),
+                    b.get("declared_target").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    b.get("reason").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                );
+                ka.cmp(&kb)
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
@@ -1960,6 +2044,9 @@ impl VectorStore for LadybugStore {
             let mut deferred_edges = Vec::new();
             let edge_now = chrono::Utc::now().timestamp();
 
+            // F6: collect resolved edge provenance entries to stamp on the row.
+            let mut resolved_edge_entries: Vec<serde_json::Value> = Vec::new();
+
             // Materialise the edges this memory declares. A target that does not exist
             // yet simply produces no edge: MATCH finds nothing and MERGE never runs.
             // That is deliberate -- a rule may name a file the ingester has not reached.
@@ -2053,6 +2140,60 @@ impl VectorStore for LadybugStore {
                         }
                     }
                 };
+                // F6: stamp edge provenance for this resolved declaration.
+                {
+                    let declared = edge.target_id.clone();
+                    let resolved = target.clone();
+                    let logical = crate::parser::generation::logical_path_of(&resolved).to_string();
+                    let orientation = if edge.points_at_target {
+                        "self_to_target"
+                    } else {
+                        "target_to_self"
+                    }
+                    .to_string();
+                    let file = payload
+                        .metadata
+                        .get("absolute_path")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let content_hash = payload
+                        .metadata
+                        .get("file_sha256")
+                        .or_else(|| payload.metadata.get("span_sha256"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let (line_start, line_end) = match payload
+                        .metadata
+                        .get("location_lines")
+                        .and_then(|v| v.as_str())
+                    {
+                        Some(s) if !s.trim().is_empty() => {
+                            let parts: Vec<&str> = s.split('-').collect();
+                            let start = parts.first().and_then(|p| p.trim().parse::<i64>().ok());
+                            let end = parts
+                                .get(1)
+                                .and_then(|p| p.trim().parse::<i64>().ok())
+                                .or(start);
+                            (start, end)
+                        }
+                        _ => (None, None),
+                    };
+                    let entry = serde_json::json!({
+                        "declaring_id": id,
+                        "rel_type": edge.rel_type,
+                        "declaration_index": edge.declaration_index,
+                        "declared_target": declared,
+                        "resolved_target": resolved,
+                        "logical_target": logical,
+                        "orientation": orientation,
+                        "file": file,
+                        "content_hash": content_hash,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "extractor": "upsert",
+                    });
+                    resolved_edge_entries.push(entry);
+                }
                 if !is_valid_relation_name(edge.rel_type) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
                         rel_type: edge.rel_type.to_string(),
@@ -2087,6 +2228,45 @@ impl VectorStore for LadybugStore {
                         skipped: "this edge materialization".to_string(),
                     });
                     eprintln!("[neurostrata:write-shape] edge query error: {}", e);
+                }
+            }
+
+            // F6: stamp edge_sources provenance on the declaring row's metadata.
+            if !resolved_edge_entries.is_empty() {
+                // Dedupe identical entries.
+                let mut deduped: Vec<serde_json::Value> = Vec::new();
+                for e in &resolved_edge_entries {
+                    if !deduped.iter().any(|d| d == e) {
+                        deduped.push(e.clone());
+                    }
+                }
+                // Build edge_sources array and merge into metadata.
+                let edge_sources = serde_json::json!(deduped);
+                // Read current metadata, merge edge_sources, write back.
+                let read_q = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.metadata",
+                    escape_ladybug_string(&namespace),
+                    escape_ladybug_string(&id)
+                );
+                if let Ok(mut res) = conn.query(&read_q) {
+                    if let Some(row) = res.next() {
+                        if let lbug::Value::String(meta_str) = &row[0] {
+                            if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                                if let Some(obj) = meta.as_object_mut() {
+                                    obj.insert("edge_sources".to_string(), edge_sources);
+                                    let new_meta = serde_json::to_string(&meta).unwrap_or_default();
+                                    let safe_new_meta = escape_ladybug_string(&new_meta);
+                                    let update_q = format!(
+                                        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                                        escape_ladybug_string(&namespace),
+                                        escape_ladybug_string(&id),
+                                        safe_new_meta
+                                    );
+                                    let _ = conn.query(&update_q);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
