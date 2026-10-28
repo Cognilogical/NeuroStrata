@@ -134,14 +134,21 @@ pub fn compute_facets(memory_type: &str, metadata: &serde_json::Value) -> Vec<St
 }
 
 /// Detect conflict candidates among active memories (F10). Returns (id, disputed_with_ids).
+/// Detect conflict candidates among active memories (F10). Returns (id, disputed_with_ids).
 pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String, Vec<String>)> {
     let now = chrono::Utc::now().timestamp();
-    // Filter expired memories first (F10-6).
+    // Filter expired memories first (F10-6). Also skip archived/mesh-conflicting/registry
+    // rows defensively; callers filter these too, but the function must not flag them.
     let active: Vec<&crate::traits::SearchResult> = memories
         .iter()
-        .filter(|m| match m.payload.metadata.get("valid_to") {
-            None => true,
-            Some(v) => v.is_null() || v.as_i64().unwrap_or(0) > now,
+        .filter(|m| {
+            if crate::registry::is_registry_row(&m.payload.metadata) { return false; }
+            if crate::synaptic_mesh::conflict::is_conflicting(&m.payload) { return false; }
+            if crate::handlers::archive_memory::is_archived(&m.payload) { return false; }
+            match m.payload.metadata.get("valid_to") {
+                None => true,
+                Some(v) => v.is_null() || v.as_i64().unwrap_or(0) > now,
+            }
         })
         .collect();
 
@@ -166,23 +173,51 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
                 }
                 _ => false,
             };
-            if !same_loc && !same_topo { continue; }
-            // opposing enforcement
+            // High cosine (cosine distance <= 0.15). score is distance (lower better).
+            let high_cosine = a.score <= 0.15 && b.score <= 0.15;
+
+            if !same_loc && !same_topo && !high_cosine { continue; }
+
+            // opposing enforcement: ENFORCED vs NOT_ENFORCED
             let enf_a = a.payload.metadata.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
             let enf_b = b.payload.metadata.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
-            let opposing_enf = !enf_a.is_empty() && !enf_b.is_empty() && enf_a != enf_b;
+            let opposing_enf = (enf_a == "ENFORCED" && enf_b == "NOT_ENFORCED")
+                || (enf_a == "NOT_ENFORCED" && enf_b == "ENFORCED");
+
             // opposing decision status
             let dec_a = a.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
             let dec_b = b.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
-            let opposing_dec = !dec_a.is_empty() && !dec_b.is_empty() && dec_a != dec_b;
-            // negation token opposition (word-boundary to avoid "no"/"not" substring false positives)
+            let b_failed = a.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed")
+                || b.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
+            // attempt outcome on the *other* row
+            let a_attempt_failed = a.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
+            let b_attempt_failed = b.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
+            let opposing_dec = (dec_a == "accepted" && (dec_b == "withdrawn" || dec_b == "superseded" || b_attempt_failed))
+                || (dec_b == "accepted" && (dec_a == "withdrawn" || dec_a == "superseded" || a_attempt_failed));
+
+            // negation token opposition (word-boundary)
             let neg_tokens = ["not", "never", "no", "don't", "cannot", "must not"];
             let ca = a.payload.content.to_lowercase();
             let cb = b.payload.content.to_lowercase();
             let a_neg = contains_word_boundary(&ca, &neg_tokens);
             let b_neg = contains_word_boundary(&cb, &neg_tokens);
             let neg_opposition = a_neg != b_neg;
-            if opposing_enf || opposing_dec || (same_loc && neg_opposition) {
+
+            let mut flag = false;
+            if same_loc || same_topo {
+                if opposing_enf || opposing_dec {
+                    flag = true;
+                }
+                if neg_opposition && high_cosine {
+                    flag = true;
+                }
+            }
+            if high_cosine && neg_opposition {
+                flag = true;
+            }
+            // avoid unused
+            let _ = b_failed;
+            if flag {
                 disputed_with.push(b.id.clone());
             }
         }

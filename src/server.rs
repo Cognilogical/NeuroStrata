@@ -2150,6 +2150,12 @@ async fn handle_get_snapshot(
     } else {
         crate::tools::procedure::procedures_due_strap(&all_memories, now)
     };
+    all_memories.retain(|r| match r.payload.metadata.get("valid_to") {
+        None => true,
+        Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
+    });
+    // F10: detect conflicts AFTER active-row filtering (valid_to, archived,
+    // mesh-conflicting, registry) so expired rows never participate.
     let conflicts = crate::domain::detect_conflicts(&all_memories);
     // Apply disputed metadata badge (F10) to in-memory results.
     for (id, disputed) in &conflicts {
@@ -2179,10 +2185,6 @@ async fn handle_get_snapshot(
         }
         r
     };
-    all_memories.retain(|r| match r.payload.metadata.get("valid_to") {
-        None => true,
-        Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
-    });
     all_memories.sort_by(|a, b| {
         let a_count = a
             .payload
@@ -3343,7 +3345,13 @@ async fn handle_search_memory(
                         }
                     }
 
-                    let report = render_search_results(&results);
+                    // F10: surface conflict candidates in recall as a warning badge.
+                    let conflicts = crate::domain::detect_conflicts(&results);
+                    let mut report = render_search_results(&results);
+                    if !conflicts.is_empty() {
+                        let arr: Vec<serde_json::Value> = conflicts.iter().map(|(id, dw)| serde_json::json!({"id": id, "disputed_with": dw})).collect();
+                        report.push_str(&format!("\n\nconflict_candidates: {}", serde_json::to_string(&arr).unwrap_or_default()));
+                    }
                     if !domain_requested {
                         report
                     } else {

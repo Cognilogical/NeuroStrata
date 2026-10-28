@@ -103,13 +103,17 @@ hex = "0.4"
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 openssl = { version = "0.10.81", features = ["vendored"] }
 
+ort = { version = "2.0.0-rc.13", optional = true }
+tokenizers = { version = "0.23.2", optional = true }
+ndarray = { version = "0.17.2", optional = true }
+
 [build-dependencies]
 cxx-build = "=1.0.138"
 
 [features]
 default = []
 learning-laya = []
-gliner = []
+gliner = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 
 [[test]]
