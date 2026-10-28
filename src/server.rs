@@ -2444,6 +2444,14 @@ async fn handle_get_snapshot(
                 ontology_warnings.len()
             ));
         }
+        // Enrichment state (F12/F14/F24): warn-first.
+        let rid = crate::registry::registry_row_id(namespace);
+        if let Ok(Some((_, reg_payload))) = store.get(namespace, &rid).await {
+            let es = crate::registry::enrichment_state(&reg_payload.metadata);
+            if es.get("state").and_then(|v| v.as_str()) == Some("failed") {
+                findings.push("  enrichment state: failed".to_string());
+            }
+        }
         if !findings.is_empty() {
             let mut report = String::from("DOCTOR REPORT:");
             for f in &findings {
