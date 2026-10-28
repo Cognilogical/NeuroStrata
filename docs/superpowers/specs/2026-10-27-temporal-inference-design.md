@@ -38,7 +38,11 @@ Bounded time-window reasoning over relation validity windows; deterministic, tra
 - `yjah` QueryBudget: bounded traversal.
 - No new core libraries.
 
-## 7. Interfaces / Files Touched (expected)
+## 7. Per-namespace isolation
+- Time-window reasoning per namespace; cross-namespace temporal queries only via `mhsp` inter-namespace traversal rules.
+- References `neurostrata-9fnf` (canonical IRI / RDF projection), `2hxl` (OWL reasoning), `yjah` (QueryBudget), `4gb2` (RDF-star provenance / temporal), `mhsp` (inter-namespace).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: temporal filter on edges.
 - `src/graph_read/temporal.rs` (new): time-window reasoning.

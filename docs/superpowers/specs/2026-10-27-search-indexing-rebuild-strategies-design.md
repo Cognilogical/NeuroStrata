@@ -40,7 +40,11 @@ Search index supports incremental updates (per-memory upsert/delete) with hash-g
 - `fastembed`: vector embedding, already present.
 - No new core libraries.
 
-## 7. Interfaces / Files Touched (expected)
+## 7. Per-namespace isolation
+- Index rebuild strategy (`incremental`/`partial`/`full`) configured per namespace; no cross-namespace without `mhsp` rules.
+- References `neurostrata-9fnf` (canonical IRI / RDF projection), `2hxl` (OWL reasoning), `yjah` (QueryBudget), `emrz` (hash reuse), `wtnn` (embeddings), `jwoa` (retrieval budget).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/index/store.rs` (new): indexed data structure + incremental hooks.
 - `src/store/ladybug.rs`: upsert/delete hooks feeding index.
