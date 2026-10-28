@@ -674,7 +674,153 @@ mod tests {
     }
 }
 
-/// Read the enrichment state record from a namespace's registry row (F12/F14/F24).
+/// Start an enrichment run: acquire the per-namespace lock. Returns Err if already locked.
+pub async fn enrichment_start(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    holder_id: &str,
+) -> Result<(), String> {
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            let Some(emb) = emb else {
+                return Err("registry row missing and no embedder provided".to_string());
+            };
+            let content = registry_content(namespace);
+            let vector = emb.embed(&content).await.map_err(|e| e.to_string())?;
+            (
+                vector,
+                MemoryPayload {
+                    content,
+                    user_id: "system".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: registry_metadata(&[]),
+                },
+            )
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut state = enrichment_state(&payload.metadata);
+    if state.get("lock_holder").and_then(|v| v.as_str()).is_some() {
+        return Err(format!("enrichment already locked by {}", state.get("lock_holder").unwrap()));
+    }
+    state = enrichment_state_record(
+        "in_progress",
+        state.get("watermark").and_then(|v| v.as_u64()).unwrap_or(0),
+        Some(holder_id),
+        state.get("telemetry").cloned().unwrap_or(serde_json::json!({})),
+    );
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        obj.insert("enrichment_state".to_string(), state);
+    }
+    store
+        .upsert(namespace, &registry_id, vector, payload)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Commit an enrichment run: set state=done, watermark, telemetry; clear lock.
+pub async fn enrichment_commit(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    watermark: u64,
+    telemetry: Value,
+) -> Result<(), String> {
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            let Some(emb) = emb else {
+                return Err("registry row missing and no embedder provided".to_string());
+            };
+            let content = registry_content(namespace);
+            let vector = emb.embed(&content).await.map_err(|e| e.to_string())?;
+            (
+                vector,
+                MemoryPayload {
+                    content,
+                    user_id: "system".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: registry_metadata(&[]),
+                },
+            )
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let state = enrichment_state_record("done", watermark, None, telemetry);
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        obj.insert("enrichment_state".to_string(), state);
+    }
+    store
+        .upsert(namespace, &registry_id, vector, payload)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Fail an enrichment run: set state=failed, record stage error in telemetry, clear lock.
+pub async fn enrichment_fail(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    stage: &str,
+    error: &str,
+) -> Result<(), String> {
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            let Some(emb) = emb else {
+                return Err("registry row missing and no embedder provided".to_string());
+            };
+            let content = registry_content(namespace);
+            let vector = emb.embed(&content).await.map_err(|e| e.to_string())?;
+            (
+                vector,
+                MemoryPayload {
+                    content,
+                    user_id: "system".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: registry_metadata(&[]),
+                },
+            )
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut state = enrichment_state(&payload.metadata);
+    let mut telemetry = state.get("telemetry").cloned().unwrap_or(serde_json::json!({}));
+    if let Some(obj) = telemetry.as_object_mut() {
+        let stage_obj = obj.entry(stage.to_string()).or_insert_with(|| serde_json::json!({}));
+        if let Some(so) = stage_obj.as_object_mut() {
+            let failures = so.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
+            so.insert("failures".to_string(), serde_json::json!(failures + 1));
+            so.insert("last_error".to_string(), serde_json::json!(error));
+        }
+    }
+    let watermark = state.get("watermark").and_then(|v| v.as_u64()).unwrap_or(0);
+    state = enrichment_state_record("failed", watermark, None, telemetry);
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        obj.insert("enrichment_state".to_string(), state);
+    }
+    store
+        .upsert(namespace, &registry_id, vector, payload)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
 pub fn enrichment_state(metadata: &Value) -> Value {
     metadata.get("enrichment_state").cloned().unwrap_or(serde_json::json!({
         "state": "pending",
