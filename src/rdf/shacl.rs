@@ -146,5 +146,99 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
         }
     }
 
+    // Required fields per memory_type (F18).
+    match payload.memory_type.as_str() {
+        "rule" => {
+            if let Some(source) = payload.metadata.get("source") {
+                let blank = source.as_str().map(|s| s.trim().is_empty()).unwrap_or(true);
+                if blank {
+                    out.push(ShaclViolation {
+                        field: "metadata.source".to_string(),
+                        why: "source must be non-blank for a rule".to_string(),
+                    });
+                }
+            } else {
+                out.push(ShaclViolation {
+                    field: "metadata.source".to_string(),
+                    why: "source is required for a rule".to_string(),
+                });
+            }
+            if let Some(enf) = payload.metadata.get("enforcement") {
+                match enf.as_str() {
+                    Some("ENFORCED") | Some("PARTIAL") | Some("NOT_ENFORCED") => {}
+                    _ => {
+                        out.push(ShaclViolation {
+                            field: "metadata.enforcement".to_string(),
+                            why: "enforcement must be ENFORCED, PARTIAL, or NOT_ENFORCED"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        "procedure" => {
+            if let Some(trigger) = payload.metadata.get("trigger") {
+                if let Some(s) = trigger.as_str() {
+                    let valid = s == "session-start"
+                        || s == "before-edit"
+                        || s == "after-mutation"
+                        || s.starts_with("every-n-sessions:")
+                        || s.starts_with("every-n-days:");
+                    if !valid {
+                        out.push(ShaclViolation {
+                            field: "metadata.trigger".to_string(),
+                            why: "trigger must be a valid enum or every-n-sessions:N / every-n-days:N".to_string(),
+                        });
+                    }
+                } else {
+                    out.push(ShaclViolation {
+                        field: "metadata.trigger".to_string(),
+                        why: "trigger must be a string".to_string(),
+                    });
+                }
+            } else {
+                out.push(ShaclViolation {
+                    field: "metadata.trigger".to_string(),
+                    why: "trigger is required for a procedure".to_string(),
+                });
+            }
+            if let Some(pc) = payload.metadata.get("performance_count") {
+                if !pc.is_i64() && !pc.is_u64() {
+                    out.push(ShaclViolation {
+                        field: "metadata.performance_count".to_string(),
+                        why: "performance_count must be an integer".to_string(),
+                    });
+                }
+            }
+        }
+        "task" => {
+            if let Some(task) = payload.metadata.get("task") {
+                if !task.is_object() {
+                    out.push(ShaclViolation {
+                        field: "metadata.task".to_string(),
+                        why: "task must be an object".to_string(),
+                    });
+                } else if let Some(status) = task.get("status") {
+                    let ok = status
+                        .as_str()
+                        .map(|s| matches!(s, "open" | "in_progress" | "blocked" | "done"))
+                        .unwrap_or(false);
+                    if !ok {
+                        out.push(ShaclViolation {
+                            field: "metadata.task.status".to_string(),
+                            why: "status must be open/in_progress/blocked/done".to_string(),
+                        });
+                    }
+                }
+            } else {
+                out.push(ShaclViolation {
+                    field: "metadata.task".to_string(),
+                    why: "task object is required for a task memory".to_string(),
+                });
+            }
+        }
+        _ => {}
+    }
+
     out
 }
