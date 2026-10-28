@@ -1,0 +1,18 @@
+# SHACL shapes for NeuroStrata memory payloads (in-house approximation).
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ns: <urn:neurostrata:ns#> .
+
+ns:MemoryShape a sh:NodeShape ;
+  sh:targetClass ns:Memory ;
+  sh:property [
+    sh:path ns:content ;
+    sh:minCount 1 ;
+  ] ;
+  sh:property [
+    sh:path ns:user_id ;
+    sh:minCount 1 ;
+  ] ;
+  sh:property [
+    sh:path ns:memory_type ;
+    sh:minCount 1 ;
+  ] .

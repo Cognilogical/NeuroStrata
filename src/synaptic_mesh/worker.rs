@@ -267,6 +267,7 @@ fn build_record(
         },
         content,
         metadata: projected_metadata(&entry.metadata),
+        rdf: None,
         relationships,
         // The record's revision id IS the outbox entry's idempotency key, so
         // re-applying an entry produces byte-identical output.

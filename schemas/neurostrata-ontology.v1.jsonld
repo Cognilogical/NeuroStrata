@@ -1,0 +1,17 @@
+{
+  "@context": {
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "owl": "http://www.w3.org/2002/07/owl#",
+    "ns": "urn:neurostrata:ns#"
+  },
+  "@graph": [
+    { "@id": "ns:Memory", "@type": "owl:Class" },
+    { "@id": "ns:Rule", "rdfs:subClassOf": "ns:Memory" },
+    { "@id": "ns:Fact", "rdfs:subClassOf": "ns:Memory" },
+    { "@id": "ns:Procedure", "rdfs:subClassOf": "ns:Memory" },
+    { "@id": "ns:Task", "rdfs:subClassOf": "ns:Memory" },
+    { "@id": "ns:governs", "@type": "owl:ObjectProperty", "rdfs:subPropertyOf": "ns:relatesTo" },
+    { "@id": "ns:contains", "@type": "owl:ObjectProperty", "rdfs:subPropertyOf": "ns:relatesTo" },
+    { "@id": "ns:dependsOn", "@type": "owl:ObjectProperty", "rdfs:subPropertyOf": "ns:relatesTo" }
+  ]
+}

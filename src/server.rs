@@ -540,6 +540,18 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_validate_shapes",
+                        "description": "Validate a memory against SHACL shape constraints. Returns violations (empty = valid).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The id of the memory to validate." },
+                                "namespace": { "type": "string", "description": "The exact project name." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_task_intake",
                         "description": "Submit text for durable task intake. Runs M2 lexical detection to find task-shaped statements, creates an immutable receipt (source_kind, source_revision, source_digest), and spawns candidate(s) with review_state=pending. Returns receipt and candidates. Explicit zeros when no candidates.",
                         "inputSchema": {
@@ -870,6 +882,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_distill" => {
                             result_text = handle_distill(arguments, store.clone()).await;
+                        }
+                        "neurostrata_validate_shapes" => {
+                            result_text = handle_validate_shapes(arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -2603,6 +2618,27 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
         }
         Ok(None) => format!("Memory {} not found.", id),
         Err(e) => format!("Error reading memory: {}", e),
+    }
+}
+
+async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let id = match arguments.get("id").and_then(|v| v.as_str()) {
+        Some(i) => i.to_string(),
+        None => return serde_json::json!({"ok":false,"error":"id missing"}).to_string(),
+    };
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return serde_json::json!({"ok":false,"error":"namespace missing"}).to_string(),
+    };
+    let namespace = resolve_namespace(&store, &namespace).await;
+    match store.get(&namespace, &id).await {
+        Ok(Some((_vec, payload))) => {
+            let violations = crate::rdf::shacl::validate_memory(&payload);
+            let v: Vec<serde_json::Value> = violations.iter().map(|x| serde_json::json!({"field":x.field,"why":x.why})).collect();
+            serde_json::json!({"ok":true,"id":id,"namespace":namespace,"violations":v,"count":v.len()}).to_string()
+        }
+        Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
+        Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
     }
 }
 
@@ -6827,6 +6863,7 @@ mod tests {
                 "neurostrata_archive_memory",
                 "neurostrata_feedback",
                 "neurostrata_distill",
+                "neurostrata_validate_shapes",
                 "neurostrata_task_intake",
                 "neurostrata_task_intake_list",
                 "neurostrata_task_intake_resolve",
@@ -8912,6 +8949,7 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
         let mut hasher = Sha256::new();
         hasher.update(digest_input.as_bytes());
         let source_digest = format!("{:x}", hasher.finalize());
+        let ck = if title.to_lowercase().contains("rule") { "rule" } else { "task" };
         let request = CreateReceiptRequest {
             namespace: namespace.clone(),
             source_kind: SourceKind::Conversation,
@@ -8919,7 +8957,10 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
             source_digest,
             text: desc.clone(),
             title: Some(title),
-            description: Some(desc),
+            description: Some(desc.clone()),
+            candidate_kind: Some(ck.to_string()),
+            payload: Some(serde_json::json!({"source":"distill","desc":desc})),
+            confidence: Some(0.8),
         };
         match intake_store.create_receipt(request).await {
             Ok(res) => {
