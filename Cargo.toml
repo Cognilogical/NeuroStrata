@@ -33,6 +33,12 @@ path = "tests/context/freshness_test.rs"
 name = "staged_publication_test"
 path = "tests/ingest/staged_publication_test.rs"
 
+# emrz: version-gated re-parse contract. Compiles the crate-free schema and
+# generation helpers from their real paths.
+[[test]]
+name = "version_gate_test"
+path = "tests/ingest/version_gate_test.rs"
+
 # Task 3: graph-read ranking contract. Compiles the crate-free
 # graph_read::memories_for_file module from its real path (see the file's
 # module comment) because the crate ships a binary target only.
