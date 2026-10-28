@@ -171,7 +171,7 @@ Inferred facets are stored as metadata, not as graph edges.
 - `search_with_domain`, `related`, and `memories_for_file` consume these methods.
 - Configuration:
   - `reasoning_enabled: bool` (default true),
-  - `governs_max_hops: u8` (default 3, range 1..=5),
+  - `governs_max_hops: u8` (default 2, range 1..=5; aligns with `yjah` spec `related.rs` default),
   - `reasoning_timeout_ms: u64` (default 50).
   - `closure_budget: QueryBudget` (max_hops 10 / max_nodes 5000 / max_edges 50000 / deadline 250ms, defaults from `yjah` spec).
 
