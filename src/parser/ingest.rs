@@ -13,8 +13,8 @@ use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 // target. These re-exports keep `ingest.rs` and the store naming the same
 // functions through the path they already use.
 pub use crate::parser::generation::{
-    generation_key, generation_scoped_id, logical_path_of, sha256_hex, split_scoped_id,
-    symbol_id, NAMESPACE_SEPARATOR,
+    generation_key, generation_scoped_id, ingest_version, logical_path_of, sha256_hex, split_scoped_id,
+    symbol_id, version_gate_tripped, NAMESPACE_SEPARATOR, PARSER_LOGIC_VERSION,
 };
 
 /// Schemas declare extensions bare ("rs"), but one passed via --schema-path may
@@ -297,6 +297,10 @@ pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
     fn file_skipped(&self, path: &str) { let _ = path; }
     fn relinked(&self, edges: usize);
+    /// Called once per run when the previous generation's `ingest_version`
+    /// differs from the current one (or is absent). Implementors surface this
+    /// as a warning; the ingest continues with a full re-parse.
+    fn version_gate_tripped(&self, _prev: &str, _current: &str) {}
 }
 
 /// An owned item streamed from the blocking producer to the async consumer.
@@ -341,8 +345,12 @@ fn run_producer(
     namespace: String,
     generation: u64,
     prev_file_map: std::collections::HashMap<String, String>,
+    force_reparse: bool,
+    ingest_version: String,
     observer: Option<std::sync::Arc<dyn IngestObserver>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut current_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let skipped_dirs = [
         "node_modules",
         "target",
@@ -479,14 +487,24 @@ fn run_producer(
         // Incremental skip: if this file's hash matches the previous active
         // generation, carry it forward instead of re-parsing/re-embedding.
         if is_file {
-            if let Some(prev_hash) = prev_file_map.get(&node_path) {
-                if prev_hash == file_sha256.as_deref().unwrap_or("") {
-                    if let Some(obs) = &observer {
-                        obs.file_skipped(&path_str);
+            if !force_reparse {
+                if let Some(prev_hash) = prev_file_map.get(&node_path) {
+                    if prev_hash == file_sha256.as_deref().unwrap_or("") {
+                        if let Some(obs) = &observer {
+                            obs.file_skipped(&path_str);
+                        }
+                        // Record the current hash so unchanged rows can be carried.
+                        if let Some(h) = file_sha256.as_deref() {
+                            current_hashes.insert(node_path.clone(), h.to_string());
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
+        }
+        // Record the current hash for every file the walk visits.
+        if let Some(h) = file_sha256.as_deref() {
+            current_hashes.insert(node_path.clone(), h.to_string());
         }
 
         // Apply backpressure: if the channel is full, block until space is
@@ -610,7 +628,7 @@ fn run_producer(
         );
     }
 
-    Ok(())
+    Ok(current_hashes)
 }
 
 /// Stamps the per-node `relative_path` onto a copy of the shared source
@@ -638,6 +656,7 @@ async fn run_consumer(
     zero_vector: Vec<f32>,
     generation: u64,
     source_identity: serde_json::Value,
+    ingest_version: &str,
 ) -> anyhow::Result<()> {
     while let Some(item) = rx.recv().await {
         match item {
@@ -660,6 +679,7 @@ async fn run_consumer(
                 if let Some(hash) = file_sha256 {
                     metadata.insert("file_sha256".to_string(), serde_json::json!(hash));
                 }
+                metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
 
                 let payload = MemoryPayload {
                     content: format!("Path: {}", node_path),
@@ -726,6 +746,7 @@ async fn run_consumer(
                         ]),
                     );
                     metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                    metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
                     metadata.insert(
                         "span_sha256".to_string(),
                         serde_json::json!(symbol.span_sha256),
@@ -797,6 +818,7 @@ async fn run_consumer(
                 metadata.insert("backticked".to_string(), serde_json::json!(section.backticked));
                 metadata.insert("links".to_string(), serde_json::json!(section.links));
                 metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
                 metadata.insert(
                     "contained_by".to_string(),
                     serde_json::json!([generation_scoped_id(namespace, generation, &node_path)]),
@@ -872,7 +894,7 @@ pub async fn ingest_directory(
 
     // Build prev_file_map: node_path -> file_sha256 for files in prev gen.
     let mut prev_file_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut prev_unchanged_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut prev_version: Option<String> = None;
     if prev_gen > 0 {
         if let Ok(rows) = vector_store.list(namespace, None, None).await {
             for r in rows {
@@ -885,7 +907,13 @@ pub async fn ingest_directory(
                 let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
                 if let Some(h) = hash {
                     prev_file_map.insert(tail.to_string(), h.clone());
-                    prev_unchanged_hashes.insert(h);
+                }
+                if prev_version.is_none() {
+                    if let Some(v) = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()) {
+                        if !v.is_empty() {
+                            prev_version = Some(v.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -911,12 +939,22 @@ pub async fn ingest_directory(
     let dir_path_owned = dir_path.to_path_buf();
     let schema_clone = schema.clone();
 
+    // Version gate: a changed (or missing) ingest_version stamps a full re-parse.
+    let current_version = ingest_version(&schema.fingerprint());
+    let force_reparse = prev_gen > 0 && version_gate_tripped(prev_version.as_deref(), &current_version);
+    if force_reparse {
+        if let Some(obs) = &observer {
+            obs.version_gate_tripped(prev_version.as_deref().unwrap_or("(none)"), &current_version);
+        }
+    }
+
     let (tx, rx) = mpsc::channel::<IngestItem>(256);
 
     // The blocking producer walks the filesystem and parses files on a
     // blocking thread, streaming owned results through the channel.
     let prev_file_map_clone = prev_file_map.clone();
     let observer_clone = observer.clone();
+    let current_version_clone = current_version.clone();
     let producer = tokio::task::spawn_blocking(move || {
         run_producer(
             dir_path_owned,
@@ -926,6 +964,8 @@ pub async fn ingest_directory(
             namespace_owned,
             generation,
             prev_file_map_clone,
+            force_reparse,
+            current_version_clone,
             observer_clone,
         )
     });
@@ -941,6 +981,7 @@ pub async fn ingest_directory(
         zero_vector,
         generation,
         source_identity_json,
+        &current_version,
     )
     .await;
 
@@ -948,8 +989,12 @@ pub async fn ingest_directory(
 
     // Any failure aborts the staging generation: the previous active generation
     // stays reachable, and this one's half-built tree is discarded.
+    let mut current_hashes = std::collections::HashMap::new();
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(()), Ok(Ok(()))) => None,
+        (Ok(()), Ok(Ok(h))) => {
+            current_hashes = h;
+            None
+        }
         (Err(e), _) => Some(e),
         (Ok(()), Ok(Err(e))) => Some(e),
         (Ok(()), Err(e)) => Some(anyhow::anyhow!("ingest producer panicked: {}", e)),
@@ -980,8 +1025,14 @@ pub async fn ingest_directory(
                 };
                 if gen != prev_gen { continue; }
                 let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+                // Carry a previous row only when its file is still present with
+                // the same bytes: deleted files and stale symbols from changed
+                // files drop out of the new generation.
                 let unchanged = match &hash {
-                    Some(h) => prev_unchanged_hashes.contains(h),
+                    Some(h) => {
+                        let file_path = tail.split('#').next().unwrap_or(&tail);
+                        current_hashes.get(file_path) == Some(h)
+                    }
                     None => true, // directories / no-hash nodes carried forward
                 };
                 if !unchanged { continue; }
@@ -1644,6 +1695,80 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn version_gate_trips_on_schema_change_and_deletion_does_not_resurrect() {
+        // First ingest publishes generation 1; nothing is skipped.
+        let tmp = std::env::temp_dir().join(format!("ns-version-gate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write file");
+        let db = std::env::temp_dir().join(format!("ns-version-gate-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("probe").await.expect("create the schema");
+
+        struct Recorder(std::sync::Mutex<(usize, usize)>); // (skipped, gate trips)
+        impl IngestObserver for Recorder {
+            fn file_ingested(&self, _path: &str, _symbols: usize) {}
+            fn file_skipped(&self, _path: &str) {
+                self.0.lock().unwrap().0 += 1;
+            }
+            fn relinked(&self, _edges: usize) {}
+            fn version_gate_tripped(&self, _prev: &str, _current: &str) {
+                self.0.lock().unwrap().1 += 1;
+            }
+        }
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let rec1 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec1.clone()))
+            .await
+            .expect("first ingest");
+        assert_eq!(rec1.0.lock().unwrap().0, 0, "first ingest has nothing to skip");
+        assert_eq!(rec1.0.lock().unwrap().1, 0, "first ingest does not trip the gate");
+
+        // Same schema: unchanged file is skipped and the gate stays quiet.
+        let rec2 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec2.clone()))
+            .await
+            .expect("second ingest");
+        assert_eq!(rec2.0.lock().unwrap().0, 1, "unchanged file skipped");
+        assert_eq!(rec2.0.lock().unwrap().1, 0, "version gate quiet");
+
+        // Changed schema (fingerprint differs): gate trips once, nothing is skipped.
+        let mut altered = schema.clone();
+        altered
+            .languages
+            .get_mut("rust")
+            .expect("shipped schema has rust")
+            .extensions
+            .push("rs2".to_string());
+        let rec3 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec3.clone()))
+            .await
+            .expect("third ingest");
+        assert_eq!(rec3.0.lock().unwrap().1, 1, "version gate tripped once");
+        assert_eq!(rec3.0.lock().unwrap().0, 0, "nothing skipped after a schema change");
+
+        // Deleting the file must not resurrect it in the next generation.
+        std::fs::remove_file(tmp.join("hello.rs")).expect("remove file");
+        let rec4 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
+        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec4.clone()))
+            .await
+            .expect("fourth ingest");
+        let gen4 = store
+            .active_generation("probe", &source_key_for(&tmp))
+            .await
+            .expect("read active generation");
+        let file_id = generation_scoped_id("probe", gen4, "hello.rs");
+        assert!(
+            store.get("probe", &file_id).await.expect("read").is_none(),
+            "deleted file must not be resurrected by carry-forward"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
 }
