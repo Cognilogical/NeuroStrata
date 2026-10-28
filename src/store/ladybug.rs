@@ -241,7 +241,12 @@ async fn search_inner(
                 let n = access_count.max(0) as f32;
                 let gain = 0.05 * (1.0 + n).ln();
                 let source_gain = if crate::traits::has_source(&metadata_val) { SOURCE_RANK_GAIN } else { 0.0 };
-                let capped_gain = (gain + source_gain).min(0.5 * distance);
+                let feedback_gain = metadata_val
+                    .get("feedback_score")
+                    .and_then(|v| v.as_f64())
+                    .map(|r| 0.05 * r as f32)
+                    .unwrap_or(0.0);
+                let capped_gain = (gain + source_gain + feedback_gain).min(0.5 * distance);
                 let boosted_distance = distance - capped_gain;
 
                 let sr = SearchResult {

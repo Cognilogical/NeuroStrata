@@ -2529,11 +2529,22 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
     let rating = match arguments.get("rating").and_then(|v| v.as_f64()) {
-        Some(r) => r.clamp(-1.0, 1.0),
+        Some(r) => r,
         None => return "ERROR: rating missing.".to_string(),
     };
+    // Validate range (F23-2, F23-3): reject out-of-range / NaN without writing.
+    if rating.is_nan() || rating.is_infinite() || rating < -1.0 || rating > 1.0 {
+        return "ERROR: rating must be in [-1, 1].".to_string();
+    }
     match store.get(namespace, &id).await {
         Ok(Some((vec, mut payload))) => {
+            // Reject registry rows (F23-4).
+            if crate::registry::is_registry_row(&payload.metadata) {
+                return "ERROR: cannot rate registry row.".to_string();
+            }
+            if payload.metadata.is_null() {
+                payload.metadata = serde_json::json!({});
+            }
             if let Some(obj) = payload.metadata.as_object_mut() {
                 obj.insert("feedback_score".to_string(), serde_json::json!(rating));
             }
