@@ -350,9 +350,12 @@ fn run_producer(
 ) -> anyhow::Result<(
     std::collections::HashSet<String>,
     std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, Vec<String>>,
 )> {
     let mut current_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current_hashes: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let skipped_dirs = [
         "node_modules",
@@ -608,6 +611,12 @@ fn run_producer(
                 }
             }
 
+            // Extract module/import dependencies (best-effort, warn-free).
+            let imports = extract_import_specifiers(&lang_name, &content);
+            if !imports.is_empty() {
+                raw_imports.insert(node_path.clone(), imports);
+            }
+
             if !pending.is_empty() {
                 let path_display = path.display().to_string();
                 // `file_sha256` is `Some` exactly when `content` is, so this is
@@ -635,7 +644,15 @@ fn run_producer(
         );
     }
 
-    Ok((current_paths, current_hashes))
+    // Resolve raw imports to in-repo file paths now that the full file set is known.
+    let mut resolved = std::collections::HashMap::new();
+    for (src, imports) in raw_imports {
+        let targets = resolve_dependency_paths(&src, &imports, &current_paths);
+        if !targets.is_empty() {
+            resolved.insert(src, targets);
+        }
+    }
+    Ok((current_paths, current_hashes, resolved))
 }
 /// Stamps the per-node `relative_path` onto a copy of the shared source
 /// identity. The identity is otherwise identical across a tree, but the path
@@ -1008,10 +1025,12 @@ pub async fn ingest_directory(
     // stays reachable, and this one's half-built tree is discarded.
     let mut current_hashes = std::collections::HashMap::new();
     let mut current_paths = std::collections::HashSet::new();
+    let mut dependency_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
-        (Ok(()), Ok(Ok((paths, hashes)))) => {
+        (Ok(()), Ok(Ok((paths, hashes, deps)))) => {
             current_paths = paths;
             current_hashes = hashes;
+            dependency_map = deps;
             None
         }
         (Err(e), _) => Some(e),
@@ -1072,6 +1091,21 @@ pub async fn ingest_directory(
             }
         }
         println!("Carried forward {} unchanged nodes", carried);
+    }
+
+    // Stamp DEPENDS_ON targets onto file nodes (best-effort, warn-first).
+    for (src_path, targets) in &dependency_map {
+        let src_id = crate::parser::ingest::generation_scoped_id(namespace, generation, src_path);
+        if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &src_id).await {
+            let target_ids: Vec<String> = targets
+                .iter()
+                .map(|t| crate::parser::ingest::generation_scoped_id(namespace, generation, t))
+                .collect();
+            if let Some(obj) = payload.metadata.as_object_mut() {
+                obj.insert("depends_on".to_string(), serde_json::json!(target_ids));
+            }
+            let _ = vector_store.upsert(namespace, &src_id, vec, payload).await;
+        }
     }
 
     // Atomically flip the active pointer onto this generation. Only now are its
@@ -2089,4 +2123,183 @@ pub async fn dry_run_directory(
         for (g, c) in &groups { report.push_str(&format!("  {} ({} files)\n", g, c)); }
     }
     Ok(report)
+}
+
+/// Best-effort extraction of import/module specifiers from source text.
+pub fn extract_import_specifiers(lang: &str, content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    match lang {
+        "rust" => {
+            // `mod foo;`
+            for cap in regex::Regex::new(r"(?m)\bmod\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;").unwrap().captures_iter(content) {
+                out.push(format!("mod:{}", &cap[1]));
+            }
+            // `use a::b::c;` or `use a::b::{x, y};`
+            for cap in regex::Regex::new(r"(?m)\buse\s+([a-zA-Z0-9_:\.]+)").unwrap().captures_iter(content) {
+                out.push(format!("use:{}", &cap[1]));
+            }
+            // `extern crate foo;`
+            for cap in regex::Regex::new(r"(?m)\bextern\s+crate\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap().captures_iter(content) {
+                out.push(format!("extern:{}", &cap[1]));
+            }
+        }
+        "python" => {
+            for line in content.lines() {
+                let t = line.trim();
+                if let Some(caps) = regex::Regex::new(r"^from\s+(\.+[A-Za-z0-9_\.]*|[A-Za-z0-9_\.]+)\s+import").unwrap().captures(t) {
+                    out.push(format!("from:{}", &caps[1]));
+                } else if let Some(caps) = regex::Regex::new(r"^import\s+([A-Za-z0-9_\.]+)").unwrap().captures(t) {
+                    out.push(format!("import:{}", &caps[1]));
+                }
+            }
+        }
+        "typescript" | "tsx" | "javascript" => {
+            for cap in regex::Regex::new(r#"(?m)(?:from|require)\s*\(?['"]([^'"]+)['"]"#).unwrap().captures_iter(content) {
+                out.push(format!("js:{}", &cap[1]));
+            }
+        }
+        "go" => {
+            for cap in regex::Regex::new(r#"(?m)"([^"]+)""#).unwrap().captures_iter(content) {
+                // only inside import blocks is hard; accept quoted paths
+                let p = &cap[1];
+                if p.contains('/') || p.contains('.') {
+                    out.push(format!("go:{}", p));
+                }
+            }
+        }
+        "java" => {
+            for cap in regex::Regex::new(r"(?m)^\s*import\s+([A-Za-z0-9_\.]+)\s*;").unwrap().captures_iter(content) {
+                out.push(format!("java:{}", &cap[1]));
+            }
+        }
+        _ => {}
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn resolve_dependency_paths(
+    current_rel: &str,
+    imports: &[String],
+    all_paths: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let current = std::path::Path::new(current_rel);
+    let parent = current.parent().unwrap_or(std::path::Path::new(""));
+    let exts = ["rs", "py", "ts", "tsx", "js", "jsx", "go", "java"];
+
+    for imp in imports {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(spec) = imp.strip_prefix("js:") {
+            if spec.starts_with('.') {
+                let base = parent.join(spec);
+                push_candidates(&mut candidates, &base, &exts);
+            } else {
+                // bare specifier: try as relative path anyway
+                push_candidates(&mut candidates, std::path::Path::new(spec), &exts);
+            }
+        } else if let Some(spec) = imp.strip_prefix("from:") {
+            if spec.starts_with('.') {
+                // python relative: .foo -> foo.py in same package, ..foo -> parent
+                let dots = spec.bytes().take_while(|b| *b == b'.').count();
+                let rest = &spec[dots..];
+                let mut base = parent.to_path_buf();
+                for _ in 1..dots {
+                    base = base.parent().unwrap_or(&base).to_path_buf();
+                }
+                let rest_path = rest.replace('.', "/");
+                if rest_path.is_empty() {
+                    // package import: __init__.py
+                    candidates.push(base.join("__init__.py").to_string_lossy().replace('\\', "/"));
+                } else {
+                    let base = base.join(&rest_path);
+                    push_candidates(&mut candidates, &base, &exts);
+                }
+            } else {
+                let base = spec.replace('.', "/");
+                // try at root and src/
+                push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+                push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+            }
+        } else if let Some(spec) = imp.strip_prefix("import:") {
+            let base = spec.replace('.', "/");
+            push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+            push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+        } else if let Some(spec) = imp.strip_prefix("mod:") {
+            let base = parent.join(spec);
+            push_candidates(&mut candidates, &base, &exts);
+            // mod foo; could be foo/mod.rs
+            candidates.push(parent.join(spec).join("mod.rs").to_string_lossy().replace('\\', "/"));
+        } else if let Some(spec) = imp.strip_prefix("use:") {
+            let spec = spec.trim_end_matches(';');
+            if let Some(rest) = spec.strip_prefix("crate::") {
+                let base = rest.replace("::", "/");
+                push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+                push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+            } else if let Some(rest) = spec.strip_prefix("super::") {
+                let base = rest.replace("::", "/");
+                let parent_parent = parent.parent().unwrap_or(parent);
+                push_candidates(&mut candidates, &parent_parent.join(&base), &exts);
+            } else if let Some(rest) = spec.strip_prefix("self::") {
+                let base = rest.replace("::", "/");
+                push_candidates(&mut candidates, &parent.join(&base), &exts);
+            } else if spec.contains("::") {
+                // external crate or module path; try as path under src
+                let base = spec.replace("::", "/");
+                push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+            }
+        } else if let Some(spec) = imp.strip_prefix("extern:") {
+            push_candidates(&mut candidates, std::path::Path::new("src").join(spec).as_path(), &exts);
+        } else if let Some(spec) = imp.strip_prefix("go:") {
+            let base = spec.trim_matches('"');
+            push_candidates(&mut candidates, std::path::Path::new(base), &exts);
+        } else if let Some(spec) = imp.strip_prefix("java:") {
+            let base = spec.replace('.', "/");
+            push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+            push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+        }
+
+        for cand in candidates {
+            let norm = normalize_rel_path(&cand);
+            if all_paths.contains(&norm) && norm != current_rel && !out.contains(&norm) {
+                out.push(norm);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn push_candidates(out: &mut Vec<String>, base: &std::path::Path, exts: &[&str]) {
+    let s = base.to_string_lossy().replace('\\', "/");
+    // strip leading ./
+    let s = s.trim_start_matches("./");
+    out.push(s.to_string());
+    for ext in exts {
+        out.push(format!("{}.{}", s, ext));
+    }
+    // index files
+    for ext in exts {
+        out.push(format!("{}/index.{}", s, ext));
+        out.push(format!("{}/mod.{}", s, ext));
+        out.push(format!("{}/__init__.py", s));
+    }
+}
+
+fn normalize_rel_path(p: &str) -> String {
+    // Resolve . and .. lexically.
+    let mut parts: Vec<String> = Vec::new();
+    for part in p.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            parts.pop();
+        } else {
+            parts.push(part.to_string());
+        }
+    }
+    parts.join("/")
 }
