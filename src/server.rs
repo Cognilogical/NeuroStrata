@@ -8543,6 +8543,23 @@ mod tests {
 async fn handle_distill(arguments: Value) -> String {
     let session_dir = arguments.get("session_dir").and_then(|v| v.as_str()).map(|s| s.to_string())
         .unwrap_or_else(|| ".NeuroStrata/sessions".to_string());
+
+    // J22 path containment: reject traversal / escape from project root.
+    if std::path::Path::new(&session_dir).components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return "ERROR: session_dir must not contain '..' traversal.".to_string();
+    }
+    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let resolved = if std::path::Path::new(&session_dir).is_absolute() {
+        std::path::PathBuf::from(&session_dir)
+    } else {
+        project_root.join(&session_dir)
+    };
+    let canon_root = project_root.canonicalize().unwrap_or_else(|_| project_root.clone());
+    let canon_resolved = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
+    if !canon_resolved.starts_with(&canon_root) {
+        return "ERROR: session_dir must be within the project root.".to_string();
+    }
+
     let path = std::path::Path::new(&session_dir);
     let mut candidates: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(path) {
