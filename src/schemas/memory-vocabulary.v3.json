@@ -38,7 +38,9 @@
       "direction": "directed",
       "source_role": "memory",
       "target_role": "memory",
-      "description": "Dependency edge: a module depends on another."
+      "definition": "Dependency edge: a module depends on another.",
+      "metadata_key": "depends_on",
+      "declaration_direction": "self_to_target"
     }
   },
   "memory_types": {

@@ -95,7 +95,7 @@
 
 ## Task 5: Plan 5 prerequisite
 
-- Author docs/superpowers/plans/2026-10-27-plan5-domain-facets-mesh.md reconciling already-landed src/rdf/ontology.rs & src/domain.rs against remaining F9/F15/F16/F17/F20/F21 before Plan 5 execution.
+- Author docs/superpowers/plans/2026-10-27-plan5-domain-facets-mesh.md reconciling already-landed src/rdf/ontology.rs & src/domain.rs against remaining F9/F15/F16/F17/F20/F21 before Plan 5 execution. (ns-fui0)
 
 ## Execution Handoff
 Execute natively after Argon+K3 re-vet of this revised plan.

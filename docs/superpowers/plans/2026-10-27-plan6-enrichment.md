@@ -244,7 +244,7 @@ Execute natively after Argon+K3 vetting.
 - **CAS:** registry row has `cas_version` (u64). Write: read current cas_version, merge, upsert with `WHERE cas_version = expected`; on mismatch → retry (max 3) or error "concurrent modification".
 - **Lease renewal:** lock holder renews lease every 5min (heartbeat) during long runs; if renewal fails, abort and release.
 - **Stale takeover:** lock older than 30min → new holder takes over (fencing invalidates old holder).
-- **rerun_passes production/consumption:** on lock contention, return `rerun_passes` = list of stages not yet completed (state=running → all remaining; state=failed → failed stage + downstream). Consumer re-runs those stages on next acquire.
+- **rerun_passes production/consumption:** on lock contention, return `rerun_passes` = list of stages not yet completed (state=running → all remaining; state=failed → failed stage + downstream). Consumer re-runs those stages on next acquire. (ns-kqpl)
 - **Idempotent partial retry:** re-running a completed stage produces identical outputs (no duplicate candidates, no double-counted telemetry).
 
 ### K3 — Candidate schema extension (F22/F5)
