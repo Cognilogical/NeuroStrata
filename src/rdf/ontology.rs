@@ -1,7 +1,7 @@
 use crate::domain;
 use crate::registry;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainEntry {
@@ -14,9 +14,9 @@ pub struct DomainEntry {
 #[derive(Debug, Clone, Default)]
 pub struct OntologyIndex {
     pub domains: Vec<DomainEntry>,
-    children: HashMap<String, Vec<String>>,
-    alias_map: HashMap<String, String>,
-    sub_properties: HashMap<String, Vec<String>>,
+    children: BTreeMap<String, Vec<String>>,
+    alias_map: BTreeMap<String, String>,
+    sub_properties: BTreeMap<String, Vec<String>>,
 }
 
 impl OntologyIndex {
@@ -59,14 +59,14 @@ impl OntologyIndex {
         }
 
         // Cycle guard: drop parent links that would create a cycle.
-        let slug_set: HashSet<String> = domains.iter().map(|d| d.slug.clone()).collect();
-        let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
+        let slug_set: BTreeSet<String> = domains.iter().map(|d| d.slug.clone()).collect();
+        let mut parent_map: BTreeMap<String, Option<String>> = BTreeMap::new();
         for d in &domains {
             parent_map.insert(d.slug.clone(), d.parent.clone());
         }
         // Detect cycles via DFS.
         for start in &slug_set {
-            let mut seen = HashSet::new();
+            let mut seen = BTreeSet::new();
             let mut cur = Some(start.clone());
             while let Some(s) = cur {
                 if !seen.insert(s.clone()) {
@@ -87,14 +87,14 @@ impl OntologyIndex {
             d.parent = parent_map.get(&d.slug).cloned().flatten();
         }
 
-        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for d in &domains {
             if let Some(parent) = &d.parent {
                 children.entry(parent.clone()).or_default().push(d.slug.clone());
             }
         }
 
-        let mut alias_map: HashMap<String, String> = HashMap::new();
+        let mut alias_map: BTreeMap<String, String> = BTreeMap::new();
         for d in &domains {
             for alias in &d.aliases {
                 alias_map.insert(alias.to_lowercase(), d.slug.clone());
@@ -107,12 +107,12 @@ impl OntologyIndex {
             domains,
             children,
             alias_map,
-            sub_properties: HashMap::new(),
+            sub_properties: BTreeMap::new(),
         }
     }
 
     pub fn expand_domain(&self, slug: &str) -> Vec<String> {
-        let mut out = HashSet::new();
+        let mut out = BTreeSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(slug.to_string());
         while let Some(cur) = queue.pop_front() {
@@ -137,7 +137,11 @@ impl OntologyIndex {
         if self.domains.iter().any(|d| d.slug == slug) {
             return Some(slug);
         }
-        self.alias_map.get(&raw.to_lowercase()).cloned()
+        // Normalize lookup key: try slug then lowercased raw then original lowercased.
+        self.alias_map
+            .get(&slug)
+            .or_else(|| self.alias_map.get(&raw.to_lowercase()))
+            .cloned()
     }
 
     pub fn expand_relation(&self, rel: &str) -> Vec<String> {

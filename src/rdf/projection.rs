@@ -1,5 +1,5 @@
 use crate::traits::MemoryPayload;
-use super::namespace::{field_predicate, graph_iri, memory_iri, ns_predicate, relation_predicate};
+use super::namespace::{field_predicate, graph_iri, ns_predicate, relation_predicate};
 use super::types::{EdgeProvenance, Quad, QuadObject, Tier};
 
 /// Project a single Memory row into RDF quads.
@@ -10,7 +10,7 @@ pub fn memory_to_quads(
     tier: Tier,
     generation: u64,
 ) -> Vec<Quad> {
-    let subject = memory_iri(id, payload.metadata.get("concept_iri").and_then(|v| v.as_str()));
+    let subject = format!("urn:neurostrata:memory:{}", id);
     let graph = Some(graph_iri(namespace, tier, generation));
 
     let mut quads = Vec::new();
@@ -123,6 +123,24 @@ pub fn memory_to_quads(
                 }
             }
             _ => {}
+        }
+    }
+    // concept_iri is emitted as a separate predicate (not as the RDF subject),
+    // so multiple memories sharing one concept keep distinct subjects.
+    if let Some(concept) = payload.metadata.get("concept_iri") {
+        let iris: Vec<String> = match concept {
+            serde_json::Value::String(s) => vec![s.clone()],
+            serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+            _ => vec![],
+        };
+        for iri in iris {
+            if iri.trim().is_empty() { continue; }
+            quads.push(Quad {
+                subject: subject.clone(),
+                predicate: ns_predicate("conceptIri"),
+                object: QuadObject::Iri(iri),
+                graph: graph.clone(),
+            });
         }
     }
     if let Some(facets) = payload.metadata.get("facets").and_then(|v| v.as_array()) {
@@ -239,11 +257,16 @@ mod tests {
     }
 
     #[test]
-    fn concept_iri_overrides_subject() {
+    fn concept_iri_does_not_override_subject() {
         let mut p = payload();
         p.metadata = json!({"concept_iri": "urn:example:foo"});
         let qs = memory_to_quads("m1", &p, "ns", Tier::Domain, 0);
-        assert!(qs.iter().all(|q| q.subject == "urn:example:foo"));
+        assert!(qs.iter().all(|q| q.subject == "urn:neurostrata:memory:m1"));
+        assert!(qs.iter().any(|q| q.predicate == "urn:neurostrata:ns#conceptIri"
+            && matches!(q.object, QuadObject::Iri(ref s) if s == "urn:example:foo")));
+        // Two memories sharing one concept keep distinct subjects.
+        let qs2 = memory_to_quads("m2", &p, "ns", Tier::Domain, 0);
+        assert!(qs2.iter().all(|q| q.subject == "urn:neurostrata:memory:m2"));
     }
 
     #[test]

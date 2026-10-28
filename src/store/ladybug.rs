@@ -780,9 +780,9 @@ pub struct LadybugStore {
     /// already exists. That is a write transaction per read, colliding with
     /// real writes for nothing.
     schema_ready: std::sync::atomic::AtomicBool,
-    /// Compiled ontology index (domain DAG, aliases, sub-properties). Swapped
-    /// on `refresh_ontology`; read lock-free via ArcSwap.
-    ontology: Arc<arc_swap::ArcSwap<crate::rdf::OntologyIndex>>,
+    /// Compiled ontology index per namespace (domain DAG, aliases, sub-properties).
+    /// Swapped on `refresh_ontology`; read lock-free via ArcSwap.
+    ontology: Arc<arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::rdf::OntologyIndex>>>,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1015,7 +1015,7 @@ impl LadybugStore {
             dirty: Dirty::default(),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
-            ontology: Arc::new(arc_swap::ArcSwap::from_pointee(crate::rdf::OntologyIndex::empty())),
+            ontology: Arc::new(arc_swap::ArcSwap::from_pointee(std::collections::BTreeMap::new())),
         })
     }
 
@@ -1975,16 +1975,119 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
+        // Capture raw topology before canonicalization (F17 preserve raw).
+        let raw_topology_original: Option<serde_json::Value> = payload
+            .metadata
+            .get("topology")
+            .and_then(|t| t.as_object())
+            .map(|obj| {
+                let mut m = serde_json::Map::new();
+                for key in ["component", "target_system"] {
+                    if let Some(v) = obj.get(key) {
+                        m.insert(key.to_string(), v.clone());
+                    }
+                }
+                serde_json::Value::Object(m)
+            });
+        let had_topology_original = payload.metadata.get("topology_original").is_some();
+        // Refresh ontology before canonicalization (per-namespace).
+        self.refresh_ontology(&namespace).await;
+        let ontology = self.get_ontology(&namespace);
         if let Some(topology) = payload.metadata.get_mut("topology") {
-            crate::rdf::canonicalize_topology(topology, &self.ontology.load());
+            crate::rdf::canonicalize_topology(topology, &ontology);
+        }
+        // Stamp topology_original if changed and not already present.
+        if !had_topology_original {
+            if let (Some(raw), Some(topo)) = (&raw_topology_original, payload.metadata.get("topology")) {
+                // Determine if any field changed.
+                let mut changed = false;
+                if let (Some(raw_obj), Some(topo_obj)) = (raw.as_object(), topo.as_object()) {
+                    for key in ["component", "target_system"] {
+                        if let (Some(Value::String(r)), Some(Value::String(c))) =
+                            (raw_obj.get(key), topo_obj.get(key))
+                        {
+                            if r != c {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    if let Some(obj) = payload.metadata.as_object_mut() {
+                        obj.insert("topology_original".to_string(), raw.clone());
+                    }
+                }
+            }
         }
         if payload.metadata.is_object() {
             let inferred = crate::domain::compute_facets(&payload.memory_type, &payload.metadata);
+            // Merge inferred facets with any manual facets (F16).
+            let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            if let Some(existing) = payload.metadata.get("facets").and_then(|v| v.as_array()) {
+                for f in existing {
+                    if let Some(s) = f.as_str() {
+                        merged.insert(s.to_string());
+                    }
+                }
+            }
+            for f in inferred {
+                merged.insert(f);
+            }
             if let Some(obj) = payload.metadata.as_object_mut() {
-                obj.insert("facets".to_string(), serde_json::json!(inferred));
+                obj.insert("facets".to_string(), serde_json::json!(merged.into_iter().collect::<Vec<_>>()));
             }
         }
 
+        // Write-side concept_iri stamping (F20): if metadata.concept_iri absent
+        // and metadata.domain resolves to v2 registry entry with concept_iri,
+        // stamp metadata.concept_iri (string or string[] for multi-domain).
+        if payload.metadata.get("concept_iri").is_none() {
+            if let Some(domain_val) = payload.metadata.get("domain").cloned() {
+                let domains: Vec<String> = match &domain_val {
+                    serde_json::Value::String(s) => vec![s.clone()],
+                    serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    _ => vec![],
+                };
+                // normalize slugs
+                let mut slugs: Vec<String> = domains.iter().filter_map(|d| crate::domain::normalize_domain_slug(d)).collect();
+                slugs.sort();
+                slugs.dedup();
+                if !slugs.is_empty() {
+                    // read registry
+                    let rid = crate::registry::registry_row_id(&namespace);
+                    if let Ok(Some((_, reg_payload))) = self.get(&namespace, &rid).await {
+                        let entries = crate::registry::registry_domain_entries(&reg_payload.metadata);
+                        let mut iris: Vec<String> = Vec::new();
+                        for slug in &slugs {
+                            for e in &entries {
+                                if e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()) {
+                                    if let Some(iri) = e.get("concept_iri").and_then(|v| v.as_str()) {
+                                        if !iri.trim().is_empty() && !iris.contains(&iri.to_string()) {
+                                            iris.push(iri.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Also apply ontology grounding (F21 annotate mode) from vocabulary? Defer.
+                        if !iris.is_empty() {
+                            let val = if iris.len() == 1 {
+                                serde_json::json!(iris[0])
+                            } else {
+                                // sorted
+                                let mut s = iris.clone();
+                                s.sort();
+                                s.dedup();
+                                serde_json::json!(s)
+                            };
+                            if let Some(obj) = payload.metadata.as_object_mut() {
+                                obj.insert("concept_iri".to_string(), val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut shape_warnings = write_shape_warnings(&payload);
         for v in crate::rdf::validate_memory(&payload) {
             shape_warnings.push(WriteShapeWarning {
@@ -2315,7 +2418,7 @@ impl VectorStore for LadybugStore {
         // Refresh the compiled ontology index from the namespace's registry row
         // (fail-soft: a missing row keeps the previous/empty index).
         self.refresh_ontology(namespace).await;
-        let ontology = self.ontology.load();
+        let ontology = self.get_ontology(namespace);
 
         let mut expanded: HashSet<String> = HashSet::new();
         for d in domains {
@@ -9997,7 +10100,7 @@ eurostrata\src\daemon.rs",
         store.upsert("probe", &registry_id, query_vec, payload).await.unwrap();
 
         store.refresh_ontology("probe").await;
-        let idx = store.ontology.load();
+        let idx = store.get_ontology("probe");
         assert_eq!(idx.canonical_slug("authentication"), Some("auth".to_string()));
         assert!(idx.expand_domain("auth").contains(&"tls".to_string()));
     }
@@ -10092,6 +10195,18 @@ impl LadybugStore {
         let idx = metadata
             .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(&m))
             .unwrap_or_default();
-        self.ontology.store(std::sync::Arc::new(idx));
+        // Insert into per-namespace map (read-modify-write on ArcSwap).
+        let cur = self.ontology.load();
+        let mut map: std::collections::BTreeMap<String, crate::rdf::OntologyIndex> = (**cur).clone();
+        map.insert(namespace.to_string(), idx);
+        self.ontology.store(std::sync::Arc::new(map));
+    }
+
+    /// Get the cached ontology index for a namespace, building on demand (empty if missing).
+    pub fn get_ontology(&self, namespace: &str) -> crate::rdf::OntologyIndex {
+        let cur = self.ontology.load();
+        cur.get(namespace)
+            .cloned()
+            .unwrap_or_default()
     }
 }

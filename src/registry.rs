@@ -222,15 +222,34 @@ pub fn validate_domain_entries(entries: &[Value]) -> Result<(), String> {
         }
     }
 
-    // Aliases must be unique across the namespace.
-    let mut seen_aliases = std::collections::HashSet::new();
+    // Aliases must be unique across the namespace (case-folded AND slug-normalized),
+    // and must not collide with any slug.
+    let mut seen_aliases = std::collections::BTreeSet::new();
+    let mut seen_alias_normalized = std::collections::BTreeSet::new();
+    // Collect slugs for collision check.
+    let slug_set: std::collections::BTreeSet<String> = slugs.iter().cloned().collect();
+    let slug_normalized_set: std::collections::BTreeSet<String> =
+        slugs.iter().filter_map(|s| crate::domain::normalize_domain_slug(s)).collect();
     for entry in entries {
         if let Some(arr) = entry.get("aliases").and_then(|v| v.as_array()) {
             for alias in arr {
                 if let Some(s) = alias.as_str() {
-                    let key = s.to_lowercase();
-                    if !seen_aliases.insert(key.clone()) {
-                        return Err(format!("duplicate alias '{}'", s));
+                    let lower = s.to_lowercase();
+                    if !seen_aliases.insert(lower.clone()) {
+                        return Err(format!("alias '{}' collides with an existing alias (case-folded)", s));
+                    }
+                    // slug-normalized collision
+                    if let Some(norm) = crate::domain::normalize_domain_slug(s) {
+                        if slug_set.contains(&norm) || slug_normalized_set.contains(&norm) {
+                            return Err(format!("alias '{}' collides with slug '{}'", s, norm));
+                        }
+                        if !seen_alias_normalized.insert(norm.clone()) {
+                            return Err(format!("alias '{}' collides with an existing alias (normalized)", s));
+                        }
+                    }
+                    // case-folded alias vs slug
+                    if slug_set.iter().any(|sl| sl.to_lowercase() == lower) {
+                        return Err(format!("alias '{}' collides with slug '{}'", s, s));
                     }
                 }
             }
@@ -261,19 +280,38 @@ pub async fn check_domain(
     raw_domain: &Value,
     register_domain: bool,
 ) -> Result<DomainCheck, String> {
-    let raw = match raw_domain.as_str() {
-        Some(raw) => raw,
-        None => {
+    // F9: accept string | string[].
+    let raws: Vec<String> = match raw_domain {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => {
             let registered = read_domains(store, namespace).await.unwrap_or_default();
             return Err(non_string_rejection(namespace, raw_domain, &registered));
         }
     };
-    // A string with no usable slug has no slug to register, and refusing it
-    // would leave the caller with no remedy. The write stores it as given.
-    let slug = match crate::domain::normalize_domain_slug(raw) {
-        Some(slug) => slug,
-        None => return Ok(ungoverned()),
-    };
+    // If array contained non-strings, reject.
+    if let Value::Array(arr) = raw_domain {
+        if arr.iter().any(|v| !v.is_string()) {
+            let registered = read_domains(store, namespace).await.unwrap_or_default();
+            return Err(non_string_rejection(namespace, raw_domain, &registered));
+        }
+    }
+
+    let mut slugs: Vec<String> = Vec::new();
+    for raw in &raws {
+        match crate::domain::normalize_domain_slug(raw) {
+            Some(slug) => slugs.push(slug),
+            None => { /* ungoverned slug; skip registration but not rejection */ }
+        }
+    }
+    slugs = sorted_unique(slugs);
+
+    if slugs.is_empty() {
+        return Ok(ungoverned());
+    }
 
     let cached = match store.get(namespace, &registry_row_id(namespace)).await {
         Ok(Some((_, payload))) => Some(registry_domains(&payload.metadata)),
@@ -287,12 +325,9 @@ pub async fn check_domain(
     };
 
     let cached = match cached {
-        // The bootstrap: the namespace's first domain write grandfathered every
-        // legacy domain at once. The write always succeeds; err toward
-        // registering more.
         None => {
             let mut seeded = derived_domains(store, namespace).await?;
-            seeded.push(slug);
+            seeded.extend(slugs.clone());
             return Ok(DomainCheck {
                 cache: Some(sorted_unique(seeded)),
                 warning: None,
@@ -301,18 +336,18 @@ pub async fn check_domain(
         Some(cached) => cached,
     };
 
-    if cached.contains(&slug) {
-        // The hot path: one read, no write.
+    // Check if all slugs are cached.
+    let missing: Vec<String> = slugs.iter().filter(|s| !cached.contains(s)).cloned().collect();
+    if missing.is_empty() {
         return Ok(ungoverned());
     }
 
-    // The reconcile: a cache miss is not a rejection when the namespace's own
-    // rows carry the slug. The same normalizer on both paths, or a never-used
-    // slug could slip through as a match.
+    // Reconcile: derive from rows.
     let derived = derived_domains(store, namespace).await?;
-    if derived.contains(&slug) {
+    let still_missing: Vec<String> = missing.iter().filter(|s| !derived.contains(s)).cloned().collect();
+    if still_missing.is_empty() {
         let mut repaired = cached;
-        repaired.extend(derived);
+        repaired.extend(slugs.clone());
         return Ok(DomainCheck {
             cache: Some(sorted_unique(repaired)),
             warning: None,
@@ -321,14 +356,14 @@ pub async fn check_domain(
 
     if register_domain {
         let mut accepted = cached;
-        accepted.push(slug);
+        accepted.extend(slugs.clone());
         return Ok(DomainCheck {
             cache: Some(sorted_unique(accepted)),
             warning: None,
         });
     }
 
-    Err(rejection(namespace, &slug, &cached))
+    Err(rejection(namespace, &still_missing[0], &cached))
 }
 
 /// Read-merge-write the registry under a process-wide mutex (the guard is held
@@ -345,18 +380,90 @@ pub async fn write_registry(
 
     let _guard = REGISTRY_MUTEX.lock().await;
     let registry_id = registry_row_id(namespace);
-    let mut wanted = match store.get(namespace, &registry_id).await {
-        Ok(Some((_, payload))) => merge(&registry_domains(&payload.metadata), domains),
-        Ok(None) => merge(&[], domains),
-        Err(e) => return Some(format!("the registry row could not be read: {}", e)),
+    // Read existing row (metadata + vector) for merge.
+    let existing = store.get(namespace, &registry_id).await.ok().flatten();
+    let existing_meta = existing.as_ref().map(|(_, p)| p.metadata.clone()).unwrap_or(serde_json::json!({}));
+    let existing_domains_slugs: Vec<String> = if existing_meta.get("domain_registry").is_some() {
+        // v2 entries -> slugs; v1 -> strings
+        registry_domain_entries(&existing_meta).iter()
+            .filter_map(|e| e.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string()))
+            .collect()
+    } else {
+        vec![]
     };
+    let is_v2 = existing_meta
+        .get("domain_registry")
+        .and_then(|r| r.get("version"))
+        .and_then(|v| v.as_u64()) == Some(2)
+        || existing_meta.get("domain_registry")
+            .and_then(|r| r.get("domains"))
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().any(|v| v.is_object()))
+            .unwrap_or(false);
+
+    let mut wanted_slugs = merge(&existing_domains_slugs, domains);
+    // Also include v1 registry_domains if present (backward compat).
+    let v1_slugs = registry_domains(&existing_meta);
+    wanted_slugs = merge(&wanted_slugs, &v1_slugs);
+
     let vector = match emb.embed(&registry_content(namespace)).await {
         Ok(vector) => vector,
         Err(e) => return Some(format!("the registry content could not be embedded: {}", e)),
     };
 
-    // At most three attempts: enough for a rare registration race, no more.
+    // At most three attempts.
     for _ in 0..3 {
+        // Build metadata preserving v2 entries + unrelated keys.
+        let mut meta = existing_meta.clone();
+        if meta.is_null() || !meta.is_object() {
+            meta = serde_json::json!({});
+        }
+        // Ensure object
+        if !meta.is_object() {
+            meta = serde_json::json!({});
+        }
+        let obj = meta.as_object_mut().unwrap();
+
+        if is_v2 || obj.get("domain_registry")
+            .and_then(|r| r.get("domains"))
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().any(|v| v.is_object()))
+            .unwrap_or(false)
+        {
+            // v2 path: preserve entries, add new slugs.
+            let mut entries = registry_domain_entries(&existing_meta);
+            // add missing slugs
+            for slug in &wanted_slugs {
+                if !entries.iter().any(|e| e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str())) {
+                    entries.push(serde_json::json!({
+                        "slug": slug,
+                        "parent": serde_json::Value::Null,
+                        "aliases": [],
+                        "concept_iri": serde_json::Value::Null,
+                    }));
+                }
+            }
+            // sort entries by slug
+            entries.sort_by(|a, b| {
+                let sa = a.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                let sb = b.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+                sa.cmp(sb)
+            });
+            let mut v2meta = registry_metadata_v2(&entries);
+            // merge v2meta.domain_registry into meta, preserving other keys
+            if let Some(dr) = v2meta.get("domain_registry").cloned() {
+                obj.insert("domain_registry".to_string(), dr);
+            }
+            obj.insert("eligibility".to_string(), serde_json::json!("private"));
+        } else {
+            // v1 path
+            let v1meta = registry_metadata(&wanted_slugs);
+            if let Some(dr) = v1meta.get("domain_registry").cloned() {
+                obj.insert("domain_registry".to_string(), dr);
+            }
+            obj.insert("eligibility".to_string(), serde_json::json!("private"));
+        }
+
         let payload = MemoryPayload {
             content: registry_content(namespace),
             user_id: "system".to_string(),
@@ -364,23 +471,34 @@ pub async fn write_registry(
             agent_name: None,
             location: String::new(),
             location_lines: String::new(),
-            metadata: registry_metadata(&wanted),
+            metadata: meta,
         };
+        // vector reuse if existing
+        let vec_to_use = existing.as_ref().map(|(v, _)| v.clone()).unwrap_or_else(|| vector.clone());
         if let Err(e) = store
-            .upsert(namespace, &registry_id, vector.clone(), payload)
+            .upsert(namespace, &registry_id, vec_to_use, payload)
             .await
         {
             return Some(format!("the registry row could not be written: {}", e));
         }
         match store.get(namespace, &registry_id).await {
             Ok(Some((_, landed))) => {
-                let landed = registry_domains(&landed.metadata);
-                // Every slug in the pre-write set must still be present: the
-                // check is against the whole set, not only the new slug.
-                if wanted.iter().all(|slug| landed.contains(slug)) {
+                let landed_slugs: Vec<String> = if landed.metadata.get("domain_registry")
+                    .and_then(|r| r.get("domains"))
+                    .and_then(|d| d.as_array())
+                    .map(|a| a.iter().any(|v| v.is_object()))
+                    .unwrap_or(false)
+                {
+                    registry_domain_entries(&landed.metadata).iter()
+                        .filter_map(|e| e.get("slug").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                        .collect()
+                } else {
+                    registry_domains(&landed.metadata)
+                };
+                if wanted_slugs.iter().all(|slug| landed_slugs.contains(slug)) {
                     return None;
                 }
-                wanted = merge(&landed, &wanted);
+                wanted_slugs = merge(&landed_slugs, &wanted_slugs);
             }
             Ok(None) => {
                 return Some("the registry row did not stick: it is absent after the write".to_string())
