@@ -1,7 +1,7 @@
 # Incremental Index — Add/Remove/Update Without Full Rebuild Design
 
 > Status: draft — awaiting Argon review.
-> Task: `neurostrata-iwrn` (Incremental index: add/remove/update without full rebuild, P3).
+> Task: `neurostrata-iwrn` (Incremental Index — Add/Remove/Update Without Full Rebuild Design).
 
 ## 1. Problem
 

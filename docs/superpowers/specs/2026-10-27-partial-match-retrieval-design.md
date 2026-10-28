@@ -1,7 +1,7 @@
 # Partial-Match Retrieval — Fuzzy Symbol Matching Without BM25 Design
 
 > Status: draft — awaiting Argon review.
-> Task: `neurostrata-ui0x` (Partial-match retrieval: fuzzy symbol matching without BM25, P3).
+> Task: `neurostrata-ui0x` (Partial-Match Retrieval — Fuzzy Symbol Matching Without BM25 Design).
 
 ## 1. Problem
 

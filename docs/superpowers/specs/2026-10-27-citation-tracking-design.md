@@ -1,7 +1,7 @@
 # Citation Tracking — Source Traceability Across Transformations Design
 
 > Status: draft — awaiting Argon review.
-> Task: `neurostrata-z3zw` (Citation tracking: source traceability across transformations, P3).
+> Task: `neurostrata-z3zw` (Citation Tracking — Source Traceability Across Transformations Design).
 
 ## 1. Problem
 
