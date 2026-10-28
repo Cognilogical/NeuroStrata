@@ -30,7 +30,16 @@ Add per-namespace enrichment lock; non-blocking read, exclusive write.
 - Acquire lock at enrichment start; release on completion or timeout.
 - Warn on contention.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `std::sync::Mutex` or `tokio::sync::Mutex`; NO `oxirs-core`/`scirs2`/`horned-owl`; no external lock libraries required.
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: enrichment lock per namespace (HashMap per namespace).
+- References `neurostrata-9fnf` (canonical layer), `yjah` (QueryBudget / transient inference), `2hxl` (BFS / closure), `4gb2` (provenance), `52dq` (GraphRAG hybrid), `mhsp` (inter-namespace).
+- Warn-first: lock contention reported (warning), never blocks reads.
+- Deterministic: fixed lock acquisition/release sequence.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: enrichment lock map.
 - `src/enrichment/` (new): lock acquisition / release.

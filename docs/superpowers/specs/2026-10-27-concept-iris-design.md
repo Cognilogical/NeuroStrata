@@ -30,7 +30,15 @@ Stamp concept IRI when shareable memory crosses SynapticMesh; receiver maps to l
 - Receiver resolves `concept_iri` against domain registry; maps to local slug.
 - Private domain slugs: not exported; shared ones: exported with `concept_iri`.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `oxrdf` for IRI normalization; `sha2` for canonical slug derivation; NO `oxirs-core`/`scirs2`/`horned-owl`.
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: concept IRI stamped only on shareable (`eligibility: shareable`) memories; private slugs never shared; receiver maps concept IRI → local slug. References `9fnf` (canonical direction / JSON primary), `yjah` (QueryBudget / bounded closure), `2hxl` (BFS), `4gb2` (provenance), `pjoa` (cross-namespace alignment), `mhsp` (inter-namespace traversal), `52dq` (GraphRAG hybrid).
+- Warn-first: malformed IRI / mesh import conflict → warning (non-fatal); mesh conflict preserved (not resolved).
+- Deterministic: fixed concept IRI derivation rules.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/synaptic_mesh/import.rs`: concept IRI stamping.
 - `src/rdf/ontology.rs`: concept IRI → slug resolution.

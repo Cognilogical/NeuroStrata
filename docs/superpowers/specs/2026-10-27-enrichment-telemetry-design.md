@@ -33,7 +33,16 @@ Record per-stage counts, failures, latency, and fingerprints for ingest/enrichme
 - Store telemetry in `src/telemetry/` (new) with `RwLock<HashMap<String, StageStats>>`.
 - Fingerprints: hash of input + extractor name to detect repeat runs.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation (explicit)
+- `tracing` (telemetry); NO `oxirs-core`/`scirs2`/`horned-owl`; `sha2` for fingerprint hash (`emrz`); `oxrdf` optional.
+
+## 7. Per-namespace isolation / references / constraints
+- Per-namespace isolation: telemetry per namespace (`namespace` key in stage stats).
+- References `neurostrata-9fnf` (canonical direction), `yjah` (QueryBudget / anomaly), `2hxl` (BFS), `4gb2` (provenance), `52dq` (GraphRAG hybrid), `mhsp` (inter-namespace).
+- Warn-first: telemetry failures non-fatal.
+- Deterministic: monotonic sequence, not wall-clock.
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/telemetry/enrichment.rs` (new): per-stage stats, fingerprints, latency.
 - `src/store/ladybug.rs`: telemetry hooks.
