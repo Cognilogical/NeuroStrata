@@ -397,6 +397,22 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_domain_registry",
+                        "description": "Domain registry CRUD: list/set/remove domain entries with parent, aliases, concept_iri. Validates DAG + alias uniqueness.",
+                        "inputSchema": {
+                            "type": "object",
+                            "required": ["action", "namespace"],
+                            "properties": {
+                                "action": { "enum": ["list", "set", "remove"] },
+                                "namespace": { "type": "string" },
+                                "slug": { "type": "string" },
+                                "parent": { "type": ["string", "null"] },
+                                "aliases": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+                                "concept_iri": { "type": ["string", "null"] }
+                            }
+                        }
+                    },
+                    {
                         "name": "neurostrata_bootstrap",
                         "description": "New project setup: creates the project's first task server-side and returns files to write (AGENTS.md, .NeuroStrata/docs), the hook install, and claim/ingest instructions as JSON for you to execute in order.",
                         "inputSchema": {
@@ -778,6 +794,9 @@ pub async fn process_mcp_request(
                         "neurostrata_task_validate" => {
                             result_text =
                                 crate::task::handle_task_validate(arguments, store.clone()).await;
+                        }
+                        "neurostrata_domain_registry" => {
+                            result_text = handle_domain_registry(arguments, store.clone()).await;
                         }
                         "neurostrata_task_intake" => {
                             result_text = crate::task::intake::handle_intake(
@@ -2558,6 +2577,177 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
     }
 }
 
+
+async fn handle_domain_registry(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"namespace missing"}}).to_string(),
+    };
+    let namespace = resolve_namespace(&store, &namespace).await;
+    let namespace = namespace.as_str();
+    let action = arguments.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+
+    let read_registry = || async {
+        match store.get(namespace, &crate::registry::registry_row_id(namespace)).await {
+            Ok(Some((_, payload))) => payload.metadata.clone(),
+            _ => serde_json::json!({}),
+        }
+    };
+
+    match action {
+        "list" => {
+            let meta = read_registry().await;
+            let entries = crate::registry::registry_domain_entries(&meta);
+            let version = meta.get("domain_registry").and_then(|r| r.get("version")).and_then(|v| v.as_u64()).unwrap_or(1) as i64;
+            let domains: Vec<serde_json::Value> = entries.into_iter().map(|e| serde_json::json!({
+                "slug": e.get("slug").cloned().unwrap_or(serde_json::Value::Null),
+                "parent": e.get("parent").cloned().unwrap_or(serde_json::Value::Null),
+                "aliases": e.get("aliases").cloned().unwrap_or(serde_json::json!([])),
+                "concept_iri": e.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null),
+            })).collect();
+            serde_json::json!({
+                "ok": true,
+                "registry": { "version": version, "domains": domains },
+                "warnings": []
+            }).to_string()
+        }
+        "set" => {
+            let slug_raw = match arguments.get("slug").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"slug missing"},"warnings":[]}).to_string(),
+            };
+            let slug = match crate::domain::normalize_domain_slug(&slug_raw) {
+                Some(s) => s,
+                None => {
+                    let meta = read_registry().await;
+                    return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"slug does not normalize"},"registry":{"version":1,"domains":crate::registry::registry_domain_entries(&meta)},"warnings":[]}).to_string();
+                }
+            };
+            if slug != slug_raw {
+                let meta = read_registry().await;
+                return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":format!("slug not normalized (expected {})",slug)},"registry":{"version":1,"domains":crate::registry::registry_domain_entries(&meta)},"warnings":[]}).to_string();
+            }
+            let meta = read_registry().await;
+            let mut entries = crate::registry::registry_domain_entries(&meta);
+            let idx = entries.iter().position(|e| e.get("slug").and_then(|s|s.as_str())==Some(&slug));
+            let parent = if arguments.get("parent").is_some() {
+                arguments.get("parent").cloned().unwrap_or(serde_json::Value::Null)
+            } else {
+                idx.and_then(|i| entries[i].get("parent").cloned()).unwrap_or(serde_json::Value::Null)
+            };
+            let aliases = if arguments.get("aliases").is_some() {
+                arguments.get("aliases").cloned().unwrap_or(serde_json::json!([]))
+            } else {
+                idx.and_then(|i| entries[i].get("aliases").cloned()).unwrap_or(serde_json::json!([]))
+            };
+            let concept_iri = if arguments.get("concept_iri").is_some() {
+                arguments.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null)
+            } else {
+                idx.and_then(|i| entries[i].get("concept_iri").cloned()).unwrap_or(serde_json::Value::Null)
+            };
+            let new_entry = serde_json::json!({
+                "slug": slug,
+                "parent": parent,
+                "aliases": aliases,
+                "concept_iri": concept_iri,
+            });
+            if let Some(i) = idx { entries[i] = new_entry; } else { entries.push(new_entry); }
+            if let Err(e) = crate::registry::validate_domain_entries(&entries) {
+                let code = if e.contains("cycle") { "CYCLE_DETECTED" }
+                    else if e.contains("alias") || e.contains("collides") { "ALIAS_COLLISION" }
+                    else if e.contains("parent") { "PARENT_NOT_FOUND" }
+                    else { "INVALID_SLUG" };
+                return serde_json::json!({"ok":false,"error":{"code":code,"message":e},"registry":{"version":2,"domains":crate::registry::registry_domain_entries(&meta)},"warnings":[]}).to_string();
+            }
+            // parent existence check
+            if let Some(p) = entries.iter().find(|e| e.get("slug").and_then(|s|s.as_str())==Some(&slug)) {
+                if let Some(parent) = p.get("parent").and_then(|v| v.as_str()) {
+                    if !entries.iter().any(|e| e.get("slug").and_then(|s|s.as_str())==Some(parent)) {
+                        return serde_json::json!({"ok":false,"error":{"code":"PARENT_NOT_FOUND","message":format!("parent {} not found",parent)},"registry":{"version":2,"domains":crate::registry::registry_domain_entries(&meta)},"warnings":[]}).to_string();
+                    }
+                }
+            }
+            // write
+            let mut meta2 = meta.clone();
+            if !meta2.is_object() { meta2 = serde_json::json!({}); }
+            let obj = meta2.as_object_mut().unwrap();
+            let v2 = crate::registry::registry_metadata_v2(&entries);
+            if let Some(dr) = v2.get("domain_registry").cloned() { obj.insert("domain_registry".to_string(), dr); }
+            obj.insert("eligibility".to_string(), serde_json::json!("private"));
+            let rid = crate::registry::registry_row_id(namespace);
+            let (vector, _) = match store.get(namespace, &rid).await {
+                Ok(Some(found)) => found,
+                _ => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"registry row missing"},"warnings":[]}).to_string(),
+            };
+            let payload = crate::traits::MemoryPayload {
+                content: crate::registry::registry_content(namespace),
+                user_id: "system".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: meta2,
+            };
+            if let Err(e) = store.upsert(namespace, &rid, vector, payload).await {
+                return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":e.to_string()},"warnings":[]}).to_string();
+            }
+            let meta3 = read_registry().await;
+            let domains: Vec<_> = crate::registry::registry_domain_entries(&meta3).into_iter().map(|e| serde_json::json!({
+                "slug": e.get("slug").cloned().unwrap_or(serde_json::Value::Null),
+                "parent": e.get("parent").cloned().unwrap_or(serde_json::Value::Null),
+                "aliases": e.get("aliases").cloned().unwrap_or(serde_json::json!([])),
+                "concept_iri": e.get("concept_iri").cloned().unwrap_or(serde_json::Value::Null),
+            })).collect();
+            let version = meta3.get("domain_registry").and_then(|r| r.get("version")).and_then(|v| v.as_u64()).unwrap_or(2) as i64;
+            serde_json::json!({"ok":true,"registry":{"version":version,"domains":domains},"warnings":[]}).to_string()
+        }
+        "remove" => {
+            let slug = match arguments.get("slug").and_then(|v| v.as_str()) {
+                Some(s) => s.to_string(),
+                None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"slug missing"}}).to_string(),
+            };
+            let meta = read_registry().await;
+            let entries = crate::registry::registry_domain_entries(&meta);
+            if entries.iter().any(|e| e.get("parent").and_then(|v|v.as_str())==Some(&slug)) {
+                let child = entries.iter().find(|e| e.get("parent").and_then(|v|v.as_str())==Some(&slug))
+                    .and_then(|e| e.get("slug").and_then(|v|v.as_str())).unwrap_or("");
+                return serde_json::json!({"ok":false,"error":{"code":"HAS_CHILDREN","message":format!("cannot remove '{}': child domain '{}' references it",slug,child)},"registry":{"version":2,"domains":entries},"warnings":[]}).to_string();
+            }
+            if !entries.iter().any(|e| e.get("slug").and_then(|v|v.as_str())==Some(&slug)) {
+                return serde_json::json!({"ok":false,"error":{"code":"NOT_FOUND","message":format!("'{}' not found",slug)},"registry":{"version":2,"domains":entries},"warnings":[]}).to_string();
+            }
+            let rows = store.list(namespace, None, None).await.unwrap_or_default();
+            let orphaned = rows.iter().filter(|r| {
+                !crate::registry::is_registry_row(&r.payload.metadata) &&
+                crate::domain::domain_key(&r.payload.metadata).as_deref()==Some(&slug)
+            }).count();
+            let new_entries: Vec<_> = entries.into_iter().filter(|e| e.get("slug").and_then(|v|v.as_str())!=Some(&slug)).collect();
+            let mut meta2 = meta.clone();
+            if !meta2.is_object() { meta2 = serde_json::json!({}); }
+            let obj = meta2.as_object_mut().unwrap();
+            let v2 = crate::registry::registry_metadata_v2(&new_entries);
+            if let Some(dr) = v2.get("domain_registry").cloned() { obj.insert("domain_registry".to_string(), dr); }
+            let rid = crate::registry::registry_row_id(namespace);
+            let (vector, _) = match store.get(namespace, &rid).await {
+                Ok(Some(found)) => found,
+                _ => return serde_json::json!({"ok":false,"error":{"code":"NOT_FOUND","message":"registry row missing"},"warnings":[]}).to_string(),
+            };
+            let payload = crate::traits::MemoryPayload {
+                content: crate::registry::registry_content(namespace),
+                user_id: "system".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: meta2,
+            };
+            let _ = store.upsert(namespace, &rid, vector, payload).await;
+            let meta3 = read_registry().await;
+            serde_json::json!({"ok":true,"registry":{"version":2,"domains":crate::registry::registry_domain_entries(&meta3)},"warnings":[],"removed":true,"orphaned_memories":orphaned}).to_string()
+        }
+        _ => serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"unknown action"}}).to_string(),
+    }
+}
 
 /// Retire a memory and store its replacement, keeping both.
 ///
@@ -6545,7 +6735,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_three_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_four_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -6583,6 +6773,7 @@ mod tests {
                 "neurostrata_task_list",
                 "neurostrata_task_complete",
                 "neurostrata_task_validate",
+                "neurostrata_domain_registry",
                 "neurostrata_bootstrap",
                 "neurostrata_task_setup",
                 "neurostrata_append_log",
