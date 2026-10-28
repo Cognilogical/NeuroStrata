@@ -104,11 +104,6 @@ Primary closure is in-tree BFS/DFS (matching `yjah` spec §1.19), applied via `Q
 - store the resulting closures in `OntologyIndex`,
 - discard any inferred triples not used by search, `related`, or domain expansion.
 
-- project the relevant TBox and ABox quads into an `oxrdf` dataset at index build time,
-- run the restricted rule set once per ontology/registry change,
-- store the resulting closures in `OntologyIndex`,
-- discard any inferred triples not used by search, `related`, or domain expansion.
-
 `reasonable` must be evaluated for deterministic output. If its output order is not deterministic, sort all inputs and outputs before use. If it cannot meet the profile or determinism requirements, use `sophia_reasoner` for the RDFS subset and a small, explicit Rust rule set for the OWL 2 RL additions.
 
 ### 5.3 Query-time closure
@@ -171,11 +166,14 @@ Inferred facets are stored as metadata, not as graph edges.
   - `inverse_of(iri) -> BTreeSet<Iri>`,
   - `is_transitive(iri) -> bool`,
   - `aliases_for(symbol) -> BTreeSet<String>`.
+  - `closure_subclasses(root, budget) -> ClosureResult<MemoryId>` (in-tree BFS, per `yjah` QueryBudget).
+  - `closure_governs(root, edges, budget) -> ClosureResult<MemoryId>` (bounded N hops).
 - `search_with_domain`, `related`, and `memories_for_file` consume these methods.
 - Configuration:
   - `reasoning_enabled: bool` (default true),
   - `governs_max_hops: u8` (default 3, range 1..=5),
   - `reasoning_timeout_ms: u64` (default 50).
+  - `closure_budget: QueryBudget` (max_hops 10 / max_nodes 5000 / max_edges 50000 / deadline 250ms, defaults from `yjah` spec).
 
 ## 7. Edge cases
 
