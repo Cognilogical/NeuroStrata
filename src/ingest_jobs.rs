@@ -199,6 +199,7 @@ impl IngestJobs {
                         vector_store,
                         &namespace,
                         Some(reporter),
+                        &[],
                     )
                     .await;
 

@@ -201,7 +201,8 @@ pub async fn process_mcp_request(
                                 "exact": { "type": "boolean", "description": "Run a deterministic exact-name pre-pass before the vector scan. Default true." },
                                 "facets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter results by epistemic facet (e.g. failed-attempt, enforced-rule, architecture-decision)." },
                                 "domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by domain slug(s) (OR)." },
-                                "node_sets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by node_set tag(s)." }
+                                "node_sets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by node_set tag(s)." },
+                                "node_set_mode": { "type": "string", "enum": ["all", "any"], "description": "AND/OR semantics for node_sets filter. Default any." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -3217,12 +3218,14 @@ async fn handle_search_memory(
             else { vec![] }
         })
         .unwrap_or_default();
+    let node_set_mode = arguments.get("node_set_mode").and_then(|v| v.as_str()).unwrap_or("any").to_string();
     // domains filter (OR) - thread into search_with_domain? Store filters by domains already via `domain` param.
     // For now, merge domains into the existing `domains` variable handling below.
 
     // The store now applies row-class filters and returns `limit` primaries
     // plus their bounded expansions. We ask for 5 primaries (the default page).
     const DEFAULT_LIMIT: usize = 5;
+    const FETCH_LIMIT: usize = 100;
 
     // An optional domain filter: a slug, or a list of slugs. Each value is
     // normalized here, so the store compares by slug on both sides and a
@@ -3257,7 +3260,7 @@ async fn handle_search_memory(
                 .search_with_domain(
                     namespace,
                     vec,
-                    DEFAULT_LIMIT,
+                    FETCH_LIMIT,
                     include_tasks,
                     include_archived,
                     &slugs,
@@ -3283,9 +3286,16 @@ async fn handle_search_memory(
                                 else { vec![] }
                             })
                             .unwrap_or_default();
-                        node_sets_filter.iter().any(|f| sets.contains(f))
+                        if node_set_mode == "all" {
+                            node_sets_filter.iter().all(|f| sets.contains(f))
+                        } else {
+                            node_sets_filter.iter().any(|f| sets.contains(f))
+                        }
                     });
                 }
+                // Pre-limit contract: filtering happened against the wider FETCH_LIMIT
+                // candidate set above; truncate to the default page size now.
+                results.truncate(DEFAULT_LIMIT);
                 if domain_requested {
                     let single_domain =
                         crate::registry::registry_domain_count(&store, namespace).await <= 1;
