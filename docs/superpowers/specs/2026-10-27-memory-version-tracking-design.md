@@ -39,7 +39,11 @@ Per-memory change log (create/update/delete events) with deterministic timestamp
 - `sha2` for event hashing (already present).
 - No `oxirs-core`/`scirs2`.
 
-## 7. Interfaces / Files Touched (expected)
+## 7. Per-namespace isolation
+- Event sequence per namespace; events keyed by namespace + memory_id.
+- References `neurostrata-9fnf` (RDF canonical direction), `yjah` (QueryBudget / bounded traversal), `2hxl` (OWL reasoning), `pjoa` (concept IRI), `4gb2` (provenance), `z9e7` (RDF canonical migration).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: event table, log query.
 - `src/doctor.rs`: change log surface.

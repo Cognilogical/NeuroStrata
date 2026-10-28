@@ -38,7 +38,11 @@ Deterministic partial-match / fuzzy symbol retrieval for memory names, KnownIds,
 - `std::string`: exact/prefix/substring/contains; no probabilistic ranking.
 - No new core libraries.
 
-## 7. Interfaces / Files Touched (expected)
+## 7. Per-namespace isolation
+- Partial-match index scoped per namespace; cross-namespace only via `pjoa` concept IRI alignment (`ooa1`).
+- References `neurostrata-9fnf` (canonical IRI normalization), `yjah` (QueryBudget/bounded traversal), `2hxl` (OWL reasoning), `wtnn` (similarity), `52dq` (GraphRAG hybrid), `jwoa` (retrieval budget).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: partial-match hooks.
 - `src/search/partial.rs` (new): deterministic fuzzy matching.

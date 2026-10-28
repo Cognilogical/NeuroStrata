@@ -41,7 +41,11 @@ Per-query retrieval budget (max_nodes/max_edges/max_hops/deadline) applied acros
 - Keyword sub-piece: deterministic symbol match capped.
 - Hybrid: score and cap; if budget exceeded, truncate and set `truncated: true`.
 
-## 7. Interfaces / Files Touched (expected)
+## 7. Per-namespace isolation
+- Retrieval budget applied per namespace (`ArcSwap` per namespace); cross-namespace only via `mhsp` inter-namespace traversal rules.
+- References `neurostrata-9fnf` (RDF canonical direction), `yjah` (QueryBudget), `2hxl` (in-tree BFS), `52dq` (GraphRAG hybrid), `wtnn` (similarity), `mhsp` (inter-namespace traversal).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/search/query_budget.rs` (new): per-query budget enforcement.
 - `src/graph_read/hybrid.rs`: budget integration.

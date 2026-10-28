@@ -31,7 +31,16 @@ Merge duplicate MemoryIds into one canonical ID per entity across namespaces; de
 - Merge: on ingest, compare canonical ID; if exists, merge aliases.
 - Cross-namespace: use `pjoa` concept IRI alignment.
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation
+- `sha2` for canonical ID derivation (already present).
+- `oxrdf` for IRI normalization / alignment (`9fnf`, `4gb2`).
+- No `oxirs-core`/`scirs2`/`horned-owl`.
+
+## 7. Per-namespace isolation
+- Canonical MemoryId derived per namespace; cross-namespace merge opt-in only via `pjoa` concept IRI alignment (`ooa1` spec).
+- References `neurostrata-9fnf` (JSON primary + RDF canonical direction), `2hxl` (OWL/RDFS reasoning), `4gb2` (RDF-star provenance), `yjah` (QueryBudget/bounded closure), `pjoa` (concept IRI alignment), `u5o1` (canonical slugs).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: canonical ID merge.
 - `src/rdf/ontology.rs`: canonical ID derivation.

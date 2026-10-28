@@ -39,7 +39,12 @@ Citation chain per memory: `source_file → extractor → generation → transfo
 - Chain: each stage appends; final memory has full chain.
 - Query: `citations(memory_id) -> Vec<CitationStep>`.
 
-## 7. Interfaces / Files Touched (expected)
+## 7. Per-namespace isolation
+- Citation chains stored per namespace; cross-namespace references via `pjoa` concept IRI alignment only.
+- References `neurostrata-9fnf` (RDF canonical direction / dual-write), `yjah` (QueryBudget/bounded closure), `2hxl` (in-tree BFS), `pjoa` (concept IRIs), `u5o1` (canonical slugs), `4gb2` (RDF-star provenance),
+`52dq` (GraphRAG hybrid), `mhsp` (inter-namespace traversal).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: citation field on memory row.
 - `src/ingest/staged_publication.rs`: citation stamp at each stage.

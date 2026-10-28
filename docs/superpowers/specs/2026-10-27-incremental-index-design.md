@@ -32,7 +32,17 @@ Incremental index updates for LadybugDB; single-node add/remove/update in O(log 
 - RDF projection delta: update `oxrdf` dataset incrementally.
 - Trigger: `staged_publication` commit (existing hook).
 
-## 6. Interfaces / Files Touched (expected)
+## 6. Library evaluation
+- `oxrdf`: RDF projection updates (`9fnf`, `2hxl`).
+- `sha2`: file-level hash reuse (`yjah`, `emrz`).
+- `fastembed`: embeddings (`wtnn`).
+- No `oxirs-core`/`scirs2`/`horned-owl`.
+
+## 7. Per-namespace isolation
+- Index updates scoped per namespace; partial/full rebuild controlled per namespace.
+- References `neurostrata-9fnf` (canonical IRI/RDF projection), `yjah` (QueryBudget/transient inference), `2hxl` (OWL/RDFS reasoning), `4gb2` (RDF-star provenance), `emrz` (hash reuse), `wtnn` (embeddings), `jwoa` (retrieval budget).
+
+## 8. Interfaces / Files Touched (expected)
 
 - `src/store/ladybug.rs`: incremental upsert/delete.
 - `src/rdf/projection.rs`: delta updates.
