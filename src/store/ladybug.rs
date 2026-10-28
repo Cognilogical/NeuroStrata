@@ -328,11 +328,11 @@ async fn search_inner(
 
                 // One-hop neighbor queries (outgoing and incoming)
                 let neighbor_out_q = format!(
-                    "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, true AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
+                    "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, e.extractor AS extractor, true AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
                     id_list, safe_ns, id_list, fetch_limit
                 );
                 let neighbor_in_q = format!(
-                    "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, false AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
+                    "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' AND NOT b.id IN [{}] RETURN DISTINCT b.id, b.content, b.user_id, b.memory_type, b.agent_name, b.location, b.location_lines, b.metadata, a.id, label(e) AS relation, e.extractor AS extractor, false AS outgoing ORDER BY b.id ASC, a.id ASC, relation ASC LIMIT {}",
                     id_list, safe_ns, id_list, fetch_limit
                 );
 
@@ -401,7 +401,8 @@ async fn search_inner(
 
                             let primary_id: String = format!("{}", row[8]);
                             let relation: String = format!("{}", row[9]);
-                            let outgoing: bool = row_flag_true(&row[10]);
+                            let extractor: String = format!("{}", row[10]);
+                            let outgoing: bool = row_flag_true(&row[11]);
                             if !supported_labels.contains(&relation.as_str()) { continue; }
 
                             let (src, tgt) = if outgoing {
@@ -425,11 +426,15 @@ async fn search_inner(
                             }
                             // Track distinct primary sources for co-occurrence ranking
                             entry.primary_sources.insert(primary_id);
+                            let mut derivation = Vec::new();
+                            if relation == "RELATES_TO" && extractor == "mention-detector" {
+                                derivation.push("mention-link".to_string());
+                            }
                             if !entry.evidence.iter().any(|e| e.kind == kind && norm_path(&e.path, &e.kind) == norm) {
                                 entry.evidence.push(crate::traits::SearchEvidence {
                                     kind,
                                     explanation: "This memory is one graph hop from a direct match.".to_string(),
-                                    derivation: vec![],
+                                    derivation,
                                     path: edges,
                                 });
                             }
@@ -788,6 +793,8 @@ pub struct LadybugStore {
     /// Compiled ontology index per namespace (domain DAG, aliases, sub-properties).
     /// Swapped on `refresh_ontology`; read lock-free via ArcSwap.
     ontology: Arc<arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::rdf::OntologyIndex>>>,
+    /// Cached active-generation symbol ids for mention detection.
+    mention_symbol_ids: Arc<tokio::sync::RwLock<Option<(std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>)>>>,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1021,6 +1028,7 @@ impl LadybugStore {
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(std::collections::BTreeMap::new())),
+            mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -1534,6 +1542,16 @@ impl<'a> KnownIds<'a> {
         self.ids.contains(id)
     }
 
+    /// Iterate the indexed ids (for mention candidate derivation).
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.ids.iter().copied()
+    }
+
+    /// Build the mention candidate map (candidate string -> symbol id).
+    pub fn mention_candidates(&self) -> std::collections::HashMap<String, String> {
+        crate::mention::build_candidates(self)
+    }
+
     /// Finds the node a declaration means, when it does not name one exactly.
     pub fn resolve(&self, declared: &str) -> Option<String> {
         // Trailing slashes name a directory the same way the path without
@@ -1724,7 +1742,9 @@ fn create_missing_edges(
     namespace: &str,
     generation: u64,
     now: i64,
+    extractor: &str,
 ) -> Result<usize> {
+    let safe_extractor = escape_ladybug_string(extractor);
     if !is_valid_relation_name(rel_type) {
         anyhow::bail!("invalid relation name for Cypher interpolation: {:?}", rel_type);
     }
@@ -1766,8 +1786,8 @@ fn create_missing_edges(
         // still produces nothing, exactly as before.
         let safe_ns = escape_ladybug_string(namespace);
         let query = format!(
-            "UNWIND [{}] AS e MATCH (a:Memory {{id: e.f}}), (b:Memory {{id: e.t}}) CREATE (a)-[:{} {{source: '{}', valid_from: {}, valid_to: 0, generation: {}, extractor: 'relink'}}]->(b) RETURN count(*)",
-            list, rel_type, safe_ns, now, generation
+            "UNWIND [{}] AS e MATCH (a:Memory {{id: e.f}}), (b:Memory {{id: e.t}}) CREATE (a)-[:{} {{source: '{}', valid_from: {}, valid_to: 0, generation: {}, extractor: '{}'}}]->(b) RETURN count(*)",
+            list, rel_type, safe_ns, now, generation, safe_extractor
         );
         for row in conn.query(&query)? {
             created += format!("{}", row[0]).parse::<usize>().unwrap_or(0);
@@ -1778,7 +1798,57 @@ fn create_missing_edges(
 }
 
 impl LadybugStore {
+    pub async fn active_generations_public(&self, namespace: &str) -> std::collections::HashSet<u64> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| Ok(crate::store::ladybug::active_generations_of(conn, &namespace)))
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn symbol_ids(&self, namespace: &str) -> Vec<String> {
+        let gens = self.active_generations_public(namespace).await;
+        let memories = self.list(namespace, Some("auto-ingestor"), None).await.unwrap_or_default();
+        let mut out = Vec::new();
+        for m in memories {
+            let mt = m.payload.memory_type.as_str();
+            if !matches!(mt, "code_ast" | "markdown" | "directory" | "file") {
+                continue;
+            }
+            match crate::parser::ingest::split_scoped_id(&m.id) {
+                Some((_, gen, _)) => {
+                    if !gens.is_empty() && !gens.contains(&gen) {
+                        continue;
+                    }
+                }
+                None => {
+                    if !gens.is_empty() {
+                        continue;
+                    }
+                }
+            }
+            out.push(m.id);
+        }
+        out
+    }
+
+    pub async fn mention_symbol_ids(&self, namespace: &str) -> std::sync::Arc<Vec<String>> {
+        let gens = self.active_generations_public(namespace).await;
+        {
+            let guard = self.mention_symbol_ids.read().await;
+            if let Some((cached_gens, vec)) = guard.as_ref() {
+                if *cached_gens == gens {
+                    return vec.clone();
+                }
+            }
+        }
+        let vec = std::sync::Arc::new(self.symbol_ids(namespace).await);
+        let mut guard = self.mention_symbol_ids.write().await;
+        *guard = Some((gens, vec.clone()));
+        vec
+    }
+
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
+
         let namespace = namespace.to_string();
         self.with_conn(move |conn| {
             // Collect active memory ids + metadata.
@@ -2196,6 +2266,31 @@ impl VectorStore for LadybugStore {
                 }
             }
         }
+        // Mention detection (OxiRS §1.8): only for agent/user-written rows.
+        let mut mentions_for_write: Vec<String> = Vec::new();
+        if payload.user_id != "auto-ingestor" {
+            let ids = self.mention_symbol_ids(&namespace).await;
+            let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
+            let mut mentions = crate::mention::detect_mentions(&payload.content, &payload.location, &known);
+            mentions.retain(|m| m != &id);
+            // Skip symbols already declared via related_to (declared intent wins).
+            if let Some(arr) = payload.metadata.get("related_to").and_then(|v| v.as_array()) {
+                let declared: std::collections::HashSet<String> =
+                    arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                mentions.retain(|m| !declared.contains(m));
+            }
+            if !mentions.is_empty() {
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    obj.insert("mentions".to_string(), serde_json::json!(mentions));
+                }
+            } else {
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    obj.remove("mentions");
+                }
+            }
+            mentions_for_write = mentions;
+        }
+
         let mut shape_warnings = write_shape_warnings(&payload);
         for v in crate::rdf::validate_memory(&payload) {
             shape_warnings.push(WriteShapeWarning {
@@ -2502,6 +2597,26 @@ impl VectorStore for LadybugStore {
                             }
                         }
                     }
+                }
+            }
+
+            // Materialize mention edges (delete old mention-detector rows, create fresh).
+            if !mentions_for_write.is_empty() {
+                let del_q = format!(
+                    "MATCH (a:Memory {{id: '{}'}})-[r:RELATES_TO]->(b:Memory) WHERE r.extractor = 'mention-detector' DELETE r",
+                    escape_ladybug_string(&id)
+                );
+                let _ = conn.query(&del_q);
+                for m in &mentions_for_write {
+                    let m_safe = escape_ladybug_string(m);
+                    let q = format!(
+                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:RELATES_TO {{source: '{}', valid_from: {}, valid_to: 0, generation: 0, extractor: 'mention-detector'}}]->(b)",
+                        escape_ladybug_string(&id),
+                        m_safe,
+                        escape_ladybug_string(&namespace),
+                        edge_now
+                    );
+                    let _ = conn.query(&q);
                 }
             }
 
@@ -3009,6 +3124,8 @@ impl VectorStore for LadybugStore {
         let mut wanted: std::collections::HashMap<&'static str, Vec<(String, String)>> =
             std::collections::HashMap::new();
         let mut by_suffix = 0usize;
+        let mut mention_pairs: Vec<(String, String)> = Vec::new();
+        let mut mention_updates: Vec<(String, String)> = Vec::new();
 
         for memory in &memories {
             // A retired memory no longer governs anything. Replaying its
@@ -3054,9 +3171,38 @@ impl VectorStore for LadybugStore {
                 };
                 wanted.entry(edge.rel_type).or_default().push(pair);
             }
+
+            // Mention linking (OxiRS §1.8): rediscover mentions against new index.
+            if memory.payload.user_id != "auto-ingestor" {
+                let mut mentions = crate::mention::detect_mentions(
+                    &memory.payload.content,
+                    &memory.payload.location,
+                    &known,
+                );
+                mentions.retain(|m| m != &memory.id);
+                if let Some(arr) = memory.payload.metadata.get("related_to").and_then(|v| v.as_array()) {
+                    let declared: std::collections::HashSet<String> =
+                        arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                    mentions.retain(|m| !declared.contains(m));
+                }
+                let mut meta = memory.payload.metadata.clone();
+                if mentions.is_empty() {
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.remove("mentions");
+                    }
+                } else {
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("mentions".to_string(), serde_json::json!(mentions));
+                    }
+                    for m in &mentions {
+                        mention_pairs.push((memory.id.clone(), m.clone()));
+                    }
+                }
+                mention_updates.push((memory.id.clone(), meta.to_string()));
+            }
         }
 
-        if wanted.is_empty() && active_paths.is_empty() {
+        if wanted.is_empty() && active_paths.is_empty() && mention_pairs.is_empty() {
             return Ok(0);
         }
 
@@ -3069,14 +3215,31 @@ impl VectorStore for LadybugStore {
 
         let namespace_owned = namespace.to_string();
         self.write_with_deadline("relinking the graph", move |conn| {
+            // Update mentions metadata rows.
+            for (id, meta) in &mention_updates {
+                let q = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
+                    escape_ladybug_string(&namespace_owned),
+                    escape_ladybug_string(id),
+                    escape_ladybug_string(meta)
+                );
+                let _ = conn.query(&q);
+            }
             // Retire stubs before replaying edges: the replayed declaration
             // then points at the real node, not the placeholder it replaced.
             let _ = retire_replaced_stubs(conn, &namespace_owned, &active_paths)?;
             let mut created = 0usize;
             let relink_now = chrono::Utc::now().timestamp();
             for (rel_type, pairs) in &wanted {
-                created += create_missing_edges(conn, rel_type, pairs, &namespace_owned, active_gen, relink_now)?;
+                created += create_missing_edges(conn, rel_type, pairs, &namespace_owned, active_gen, relink_now, "relink")?;
             }
+            // Delete old mention-detector edges, then recreate.
+            let del_q = format!(
+                "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' DELETE r",
+                escape_ladybug_string(&namespace_owned)
+            );
+            let _ = conn.query(&del_q);
+            created += create_missing_edges(conn, "RELATES_TO", &mention_pairs, &namespace_owned, active_gen, relink_now, "mention-detector")?;
             Ok(created)
         })
         .await
