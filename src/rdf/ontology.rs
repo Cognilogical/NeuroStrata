@@ -17,6 +17,8 @@ pub struct OntologyIndex {
     children: BTreeMap<String, Vec<String>>,
     alias_map: BTreeMap<String, String>,
     sub_properties: BTreeMap<String, Vec<String>>,
+    sub_classes: BTreeMap<String, BTreeSet<String>>,
+    equivalent: BTreeMap<String, String>,
 }
 
 impl OntologyIndex {
@@ -108,6 +110,8 @@ impl OntologyIndex {
             children,
             alias_map,
             sub_properties: BTreeMap::new(),
+            sub_classes: BTreeMap::new(),
+            equivalent: BTreeMap::new(),
         }
     }
 
@@ -145,16 +149,79 @@ impl OntologyIndex {
     }
 
     pub fn expand_relation(&self, rel: &str) -> Vec<String> {
-        let mut out = vec![rel.to_string()];
-        if let Some(supers) = self.sub_properties.get(rel) {
-            for s in supers {
-                if !out.contains(s) {
-                    out.push(s.clone());
+        // Transitive closure over subPropertyOf (RDFS).
+        let mut out = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        out.insert(rel.to_string());
+        queue.push_back(rel.to_string());
+        while let Some(cur) = queue.pop_front() {
+            if let Some(supers) = self.sub_properties.get(&cur) {
+                for s in supers {
+                    if out.insert(s.clone()) {
+                        queue.push_back(s.clone());
+                    }
+                }
+            }
+        }
+        let mut v: Vec<String> = out.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    pub fn add_sub_class(&mut self, child: &str, parent: &str) {
+        self.sub_classes
+            .entry(child.to_string())
+            .or_default()
+            .insert(parent.to_string());
+    }
+
+    pub fn super_classes(&self, class: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        if let Some(parents) = self.sub_classes.get(class) {
+            for p in parents {
+                queue.push_back(p.clone());
+            }
+        }
+        while let Some(cur) = queue.pop_front() {
+            if !out.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(parents) = self.sub_classes.get(&cur) {
+                for p in parents {
+                    if !out.contains(p) {
+                        queue.push_back(p.clone());
+                    }
                 }
             }
         }
         out
     }
+
+    pub fn expand_class(&self, class: &str) -> Vec<String> {
+        let mut out = BTreeSet::new();
+        out.insert(class.to_string());
+        for p in self.super_classes(class) {
+            out.insert(p);
+        }
+        // equivalence: include equivalent classes
+        if let Some(rep) = self.equivalent.get(class) {
+            out.insert(rep.clone());
+        }
+        let mut v: Vec<String> = out.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    pub fn add_equivalent(&mut self, a: &str, b: &str) {
+        self.equivalent.insert(a.to_string(), b.to_string());
+        self.equivalent.insert(b.to_string(), a.to_string());
+    }
+
+    pub fn equivalent_of(&self, class: &str) -> Option<String> {
+        self.equivalent.get(class).cloned()
+    }
+
 
     pub fn add_sub_property(&mut self, child: &str, parent: &str) {
         self.sub_properties

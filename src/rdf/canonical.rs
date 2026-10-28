@@ -24,3 +24,58 @@ pub fn canonicalize_known_ids_alias(raw: &str, index: &OntologyIndex) -> String 
         .canonical_slug(raw)
         .unwrap_or_else(|| domain::canonical_entity_slug(raw))
 }
+/// Render a memory as a deterministic N-Quads string (canonical RDF projection).
+/// This is a read-only projection; it does not change the primary store.
+pub fn memory_to_nquads(id: &str, payload: &crate::traits::MemoryPayload) -> String {
+    use crate::traits::MemoryPayload;
+    let _ = (id, payload);
+    let mut out = String::new();
+    let subj = format!("<urn:neurostrata:memory:{}>", id);
+    out.push_str(&format!("{} <urn:neurostrata:content> \"{}\" .\n", subj, escape_nq(&payload.content)));
+    out.push_str(&format!("{} <urn:neurostrata:memory_type> \"{}\" .\n", subj, escape_nq(&payload.memory_type)));
+    out.push_str(&format!("{} <urn:neurostrata:user_id> \"{}\" .\n", subj, escape_nq(&payload.user_id)));
+    if !payload.location.is_empty() {
+        out.push_str(&format!("{} <urn:neurostrata:location> \"{}\" .\n", subj, escape_nq(&payload.location)));
+    }
+    if let Some(obj) = payload.metadata.as_object() {
+        for (k, v) in obj {
+            let val = match v {
+                serde_json::Value::String(s) => format!("\"{}\"", escape_nq(s)),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => "null".to_string(),
+                other => format!("\"{}\"", escape_nq(&other.to_string())),
+            };
+            out.push_str(&format!("{} <urn:neurostrata:meta:{}> {} .\n", subj, escape_nq(k), val));
+        }
+    }
+    out
+}
+
+fn escape_nq(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::MemoryPayload;
+    use serde_json::json;
+
+    #[test]
+    fn memory_to_nquads_is_deterministic() {
+        let payload = MemoryPayload {
+            content: "hello".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "src/lib.rs".to_string(),
+            location_lines: "1".to_string(),
+            metadata: json!({"domain":"auth"}),
+        };
+        let a = memory_to_nquads("m1", &payload);
+        let b = memory_to_nquads("m1", &payload);
+        assert_eq!(a, b);
+        assert!(a.contains("urn:neurostrata:memory:m1"));
+    }
+}
