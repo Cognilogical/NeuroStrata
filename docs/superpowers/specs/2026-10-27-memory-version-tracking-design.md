@@ -1,7 +1,7 @@
 # Memory Version Tracking — Per-Memory Change Log Design
 
 > Status: draft — awaiting Argon review.
-> Task: `neurostrata-ixi3` (Memory version tracking: per-memory change log, P3).
+> Task: `neurostrata-ixi3` (Memory Version Tracking — Per-Memory Change Log Design).
 
 ## 1. Problem
 

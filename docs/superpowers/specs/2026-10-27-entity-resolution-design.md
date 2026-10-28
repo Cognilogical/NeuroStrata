@@ -1,7 +1,7 @@
 # Entity Resolution — Merge Canonical MemoryId Across Namespaces Design
 
 > Status: draft — awaiting Argon review.
-> Task: `neurostrata-epzj` (Entity resolution: merge canonical MemoryId across namespaces, P3).
+> Task: `neurostrata-epzj` (Entity Resolution — Merge Canonical MemoryId Across Namespaces Design).
 
 ## 1. Problem
 

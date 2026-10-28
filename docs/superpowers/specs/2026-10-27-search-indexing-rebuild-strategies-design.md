@@ -1,7 +1,7 @@
 # Search Index — Rebuild Strategies and Incremental Updates Design
 
 > Status: draft — awaiting Argon review.
-> Task: `neurostrata-umk8` (Search indexing rebuild strategies and incremental updates, P3).
+> Task: `neurostrata-umk8` (Search Index — Rebuild Strategies and Incremental Updates Design).
 
 ## 1. Problem
 

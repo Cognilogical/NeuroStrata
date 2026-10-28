@@ -1,7 +1,7 @@
 # Temporal Inference — Bounded Time-Window Reasoning Design
 
 > Status: draft — awaiting Argon review.
-> Task: `neurostrata-tjxf` (Temporal inference: bounded time-window reasoning, P3).
+> Task: `neurostrata-tjxf` (Temporal Inference — Bounded Time-Window Reasoning Design).
 
 ## 1. Problem
 
