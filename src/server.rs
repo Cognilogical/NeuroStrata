@@ -2588,12 +2588,17 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
             if payload.metadata.is_null() {
                 payload.metadata = serde_json::json!({});
             }
-            if let Some(obj) = payload.metadata.as_object_mut() {
+            let new_count = if let Some(obj) = payload.metadata.as_object_mut() {
+                let prev = obj.get("feedback_count").and_then(|v| v.as_i64()).unwrap_or(0);
+                let count = prev.saturating_add(1);
                 obj.insert("feedback_score".to_string(), serde_json::json!(rating));
-            }
+                obj.insert("feedback_count".to_string(), serde_json::json!(count));
+                obj.insert("feedback_updated_at".to_string(), serde_json::json!(chrono::Utc::now().to_rfc3339()));
+                count
+            } else { 0 };
             match store.upsert(namespace, &id, vec, payload).await {
-                Ok(_) => format!("Recorded feedback {} for {}.", rating, id),
-                Err(e) => format!("Failed to record feedback: {}", e),
+                Ok(_) => serde_json::json!({"ok":true,"id":id,"namespace":namespace,"feedback_score":rating,"feedback_count":new_count}).to_string(),
+                Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
             }
         }
         Ok(None) => format!("Memory {} not found.", id),
@@ -8903,7 +8908,10 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     let mut candidate_ids: Vec<String> = Vec::new();
     for (idx, (title, desc)) in proposed.into_iter().enumerate() {
         let digest_input = format!("{}:{}:{}", namespace, idx, desc);
-        let source_digest = format!("{:x}", md5_like(&digest_input));
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(digest_input.as_bytes());
+        let source_digest = format!("{:x}", hasher.finalize());
         let request = CreateReceiptRequest {
             namespace: namespace.clone(),
             source_kind: SourceKind::Conversation,
@@ -8937,10 +8945,3 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     out
 }
 
-fn md5_like(input: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    input.hash(&mut h);
-    h.finish()
-}

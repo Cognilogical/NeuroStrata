@@ -787,7 +787,6 @@ pub async fn enrichment_commit(
     };
     let telemetry = normalize_telemetry(telemetry);
     let watermark = normalize_watermark(watermark);
-    let _guard = ENRICHMENT_MUTEX.lock().await;
     let state = enrichment_state_record("done", watermark, None, None, Vec::new(), telemetry);
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("enrichment_state".to_string(), state);
@@ -834,15 +833,30 @@ pub async fn enrichment_fail(
     };
     let mut state = enrichment_state(&payload.metadata);
     let mut telemetry = state.get("telemetry").cloned().unwrap_or(serde_json::json!({}));
-    if let Some(obj) = telemetry.as_object_mut() {
-        let stage_obj = obj.entry(stage.to_string()).or_insert_with(|| serde_json::json!({}));
-        if let Some(so) = stage_obj.as_object_mut() {
-            let failures = so.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
-            so.insert("failures".to_string(), serde_json::json!(failures + 1));
-            so.insert("last_error".to_string(), serde_json::json!(error));
+    let mut stages = telemetry.get("stages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    // find or create stage entry
+    let mut found = false;
+    for st in stages.iter_mut() {
+        if st.get("name").and_then(|v| v.as_str()) == Some(stage) {
+            let failures = st.get("failures").and_then(|v| v.as_u64()).unwrap_or(0);
+            st.as_object_mut().unwrap().insert("failures".to_string(), serde_json::json!(failures + 1));
+            st.as_object_mut().unwrap().insert("last_error".to_string(), serde_json::json!(error));
+            found = true;
         }
     }
+    if !found {
+        stages.push(serde_json::json!({
+            "name": stage,
+            "count": 0,
+            "failures": 1,
+            "latency_ms": 0,
+            "fingerprint": "",
+            "last_error": error,
+        }));
+    }
+    telemetry = serde_json::json!({"stages": stages});
     let watermark = state.get("watermark").cloned().unwrap_or(serde_json::Value::Null);
+    let telemetry = normalize_telemetry(telemetry);
     state = enrichment_state_record("failed", normalize_watermark(watermark), None, None, Vec::new(), telemetry);
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("enrichment_state".to_string(), state);
