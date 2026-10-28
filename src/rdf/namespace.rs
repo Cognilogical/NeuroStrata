@@ -6,11 +6,8 @@ pub fn ns_predicate(name: &str) -> String {
     format!("{}{}", NS, name)
 }
 
-pub fn memory_iri(id: &str, concept_iri: Option<&str>) -> String {
-    match concept_iri {
-        Some(iri) if !iri.trim().is_empty() => iri.to_string(),
-        _ => format!("urn:neurostrata:memory:{}", id),
-    }
+pub fn memory_iri(id: &str, _concept_iri: Option<&str>) -> String {
+    format!("urn:neurostrata:memory:{}", id)
 }
 
 pub fn graph_iri(namespace: &str, tier: Tier, generation: u64) -> String {

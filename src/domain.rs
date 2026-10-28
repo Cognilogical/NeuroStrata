@@ -165,18 +165,25 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
             let same_loc = !a.payload.location.is_empty() && a.payload.location == b.payload.location;
             let topo_a = a.payload.metadata.get("topology");
             let topo_b = b.payload.metadata.get("topology");
-            let same_topo = match (topo_a, topo_b) {
+            // Topology conflict (K2): same (component, target_system) anchor but
+            // differing channel or credential_boundary (or opposing enforcement/negation).
+            let (same_topo_anchor, topo_differs) = match (topo_a, topo_b) {
                 (Some(ta), Some(tb)) => {
-                    ta.get("component") == tb.get("component")
+                    let same_anchor = ta.get("component") == tb.get("component")
                         && ta.get("target_system") == tb.get("target_system")
-                        && (ta.get("component").is_some() || ta.get("target_system").is_some())
+                        && (ta.get("component").is_some() || ta.get("target_system").is_some());
+                    if !same_anchor { (false, false) } else {
+                        let chan_diff = ta.get("channel") != tb.get("channel");
+                        let cred_diff = ta.get("credential_boundary") != tb.get("credential_boundary");
+                        (true, chan_diff || cred_diff)
+                    }
                 }
-                _ => false,
+                _ => (false, false),
             };
             // High cosine (cosine distance <= 0.15). score is distance (lower better).
             let high_cosine = a.score <= 0.15 && b.score <= 0.15;
 
-            if !same_loc && !same_topo && !high_cosine { continue; }
+            if !same_loc && !same_topo_anchor && !high_cosine { continue; }
 
             // opposing enforcement: ENFORCED vs NOT_ENFORCED
             let enf_a = a.payload.metadata.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
@@ -204,11 +211,22 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
             let neg_opposition = a_neg != b_neg;
 
             let mut flag = false;
-            if same_loc || same_topo {
+            // Topology facts: same anchor with differing channel/cred boundary -> conflict.
+            if same_topo_anchor && topo_differs {
+                flag = true;
+            }
+            if same_loc || same_topo_anchor {
                 if opposing_enf || opposing_dec {
                     flag = true;
                 }
                 if neg_opposition && high_cosine {
+                    flag = true;
+                }
+            }
+            // Opposite polarity for rules governing same target (topology or location).
+            if (same_loc || same_topo_anchor) && neg_opposition {
+                // only flag if at least one is a rule
+                if a.payload.memory_type == "rule" || b.payload.memory_type == "rule" {
                     flag = true;
                 }
             }

@@ -2110,9 +2110,11 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<crate::traits::UpsertReport> {
-        // AC3: canonicalize resolvable targets at write time via KnownIds
-        let canonicalized = crate::store::ladybug::KnownIds::new(vec![]).resolve("test_path");
-        let _ = canonicalized; // materialized when edges present
+        // AC3: canonicalize resolvable targets at write time via KnownIds::resolve.
+        // Fetch known symbol ids for this namespace and rewrite unqualified edge
+        // targets in payload.metadata to their qualified (resolved) form when
+        // unambiguous. Qualified targets are left untouched.
+        // (Performed below once payload is mutable; placeholder marker removed.)
         let namespace = namespace.to_string();
         // R14: reject empty/whitespace namespaces before hitting the store.
         if namespace.trim().is_empty() {
@@ -2121,6 +2123,30 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
+        // AC3: canonicalize resolvable (unqualified) edge targets at write time.
+        {
+            let ids = self.mention_symbol_ids(&namespace).await;
+            let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
+            for key in ["related_to", "contained_by", "governs", "extracted_from", "depends_on"] {
+                if let Some(arr) = payload.metadata.get(key).and_then(|v| v.as_array()).cloned() {
+                    let mut new_arr = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        if let Some(s) = item.as_str() {
+                            if !s.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                                if let Some(resolved) = known.resolve(s) {
+                                    new_arr.push(serde_json::Value::String(resolved));
+                                    continue;
+                                }
+                            }
+                        }
+                        new_arr.push(item);
+                    }
+                    if let Some(obj) = payload.metadata.as_object_mut() {
+                        obj.insert(key.to_string(), serde_json::Value::Array(new_arr));
+                    }
+                }
+            }
+        }
         // Capture raw topology before canonicalization (F17 preserve raw).
         let raw_topology_original: Option<serde_json::Value> = payload
             .metadata
