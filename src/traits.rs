@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn memory_vocabulary_v7_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 9);
+        assert_eq!(v["vocabulary_version"], 10);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));

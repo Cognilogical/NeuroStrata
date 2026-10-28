@@ -1,5 +1,5 @@
 {
-  "vocabulary_version": 9,
+  "vocabulary_version": 10,
   "relations": {
     "GOVERNS": {
       "direction": "directed",
@@ -68,6 +68,11 @@
           "type": "string",
           "nullable": true,
           "definition": "The wire id (from the wiring panel) that enforces this rule, or null. enforcement=ENFORCED with a null or dangling guard fails task_validate."
+        },
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
         }
       }
     },
@@ -131,28 +136,68 @@
               ]
             }
           }
+        },
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
         }
       }
     },
     "task": {
       "definition": "A tracked unit of work with a status. Reaches 'done' only through neurostrata_task_complete, which requires an extracted memory (Lock 2).",
-      "structural": false
+      "structural": false,
+      "fields": {
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
+        }
+      }
     },
     "directory": {
       "definition": "An ingested directory and structural container.",
-      "structural": true
+      "structural": true,
+      "fields": {
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
+        }
+      }
     },
     "file": {
       "definition": "An ingested non-Markdown file and code container.",
-      "structural": true
+      "structural": true,
+      "fields": {
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
+        }
+      }
     },
     "markdown": {
       "definition": "An ingested Markdown document node.",
-      "structural": true
+      "structural": true,
+      "fields": {
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
+        }
+      }
     },
     "symbol": {
       "definition": "An extracted code declaration or definition.",
-      "structural": false
+      "structural": false,
+      "fields": {
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
+        }
+      }
     },
     "procedure": {
       "definition": "A recurring attentional prompt: a procedure the agent performs on a schedule, after a trigger, or for a bounded number of repetitions. The cognitive sibling of Episodic Buffer; if a runner daemon ever materializes, its anatomical seat is Basal Ganglia.",
@@ -200,6 +245,11 @@
             "null"
           ],
           "definition": "Id of the most recent `append_log` entry produced by a `procedure_perform`. null = never performed."
+        },
+        "mentions": {
+          "type": "array",
+          "items": "string",
+          "definition": "Symbol ids mentioned in content/location (auto-detected)."
         }
       }
     }

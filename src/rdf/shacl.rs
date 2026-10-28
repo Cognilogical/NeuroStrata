@@ -72,6 +72,25 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
         }
     }
 
+    if let Some(mentions) = payload.metadata.get("mentions") {
+        match mentions {
+            Value::Array(arr) => {
+                if !arr.iter().all(|v| v.is_string()) {
+                    out.push(ShaclViolation {
+                        field: "metadata.mentions".to_string(),
+                        why: "mentions must be an array of strings".to_string(),
+                    });
+                }
+            }
+            _ => {
+                out.push(ShaclViolation {
+                    field: "metadata.mentions".to_string(),
+                    why: "mentions must be an array of strings".to_string(),
+                });
+            }
+        }
+    }
+
     if let Some(facets) = payload.metadata.get("facets") {
         match facets {
             Value::Array(arr) => {
