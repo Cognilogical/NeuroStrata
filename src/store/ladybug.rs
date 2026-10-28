@@ -244,10 +244,15 @@ async fn search_inner(
                 let feedback_gain = metadata_val
                     .get("feedback_score")
                     .and_then(|v| v.as_f64())
-                    .map(|r| 0.05 * r as f32)
+                    .map(|r| FEEDBACK_RANK_GAIN * (r as f32).clamp(-1.0, 1.0))
                     .unwrap_or(0.0);
-                let capped_gain = (gain + source_gain + feedback_gain).min(0.5 * distance);
-                let boosted_distance = distance - capped_gain;
+                let capped_gain = (gain + source_gain + feedback_gain)
+                    .clamp(-FEEDBACK_RANK_GAIN.min(0.5 * distance), 0.5 * distance);
+                let boosted_distance = if distance == 0.0 {
+                    0.0
+                } else {
+                    distance - capped_gain
+                };
 
                 let sr = SearchResult {
                     id: id.clone(),
@@ -1672,6 +1677,7 @@ fn is_mesh_conflicting(metadata: &Value) -> bool {
 /// memory about a different subject does not surface just because somebody
 /// dated it.
 const SOURCE_RANK_GAIN: f32 = 0.05;
+const FEEDBACK_RANK_GAIN: f32 = 0.05;
 
 /// Normalize an evidence path for dedup: a one-hop undirected relation's endpoints are sorted; a directed relation is order-sensitive.
 fn norm_path(
