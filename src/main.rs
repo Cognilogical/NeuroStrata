@@ -20,6 +20,7 @@ mod handlers;
 mod ingest_jobs;
 mod judgment;
 mod model_downloader;
+mod ontology_grounding;
 mod learning;
 mod parser;
 mod recall_metrics;

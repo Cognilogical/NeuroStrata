@@ -869,7 +869,7 @@ pub async fn process_mcp_request(
                             result_text = handle_feedback_memory(arguments, store.clone()).await;
                         }
                         "neurostrata_distill" => {
-                            result_text = handle_distill(arguments).await;
+                            result_text = handle_distill(arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -2429,6 +2429,19 @@ async fn handle_get_snapshot(
                 "  declared targets matching nothing: {} (e.g. {})",
                 missing,
                 missing_samples.join(", ")
+            ));
+        }
+        // Ontology warnings (F21): advisory, never blocks.
+        let ontology_warnings = match crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+        {
+            Some(ls) => ls.ontology_warnings(namespace).await,
+            None => Vec::new(),
+        };
+        if !ontology_warnings.is_empty() {
+            findings.push(format!(
+                "  ontology warnings: {}",
+                ontology_warnings.len()
             ));
         }
         if !findings.is_empty() {
@@ -8741,12 +8754,25 @@ mod tests {
 
 }
 
-async fn handle_distill(arguments: Value) -> String {
-    let session_dir = arguments.get("session_dir").and_then(|v| v.as_str()).map(|s| s.to_string())
+async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    // Parse namespace.
+    let namespace_raw = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.to_string(),
+        _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
+    };
+    let namespace = crate::server::resolve_namespace(&store, &namespace_raw).await;
+
+    // J22 path containment.
+    let session_dir = arguments
+        .get("session_dir")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
         .unwrap_or_else(|| ".NeuroStrata/sessions".to_string());
 
-    // J22 path containment: reject traversal / escape from project root.
-    if std::path::Path::new(&session_dir).components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if std::path::Path::new(&session_dir)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return "ERROR: session_dir must not contain '..' traversal.".to_string();
     }
     let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -8761,27 +8787,144 @@ async fn handle_distill(arguments: Value) -> String {
         return "ERROR: session_dir must be within the project root.".to_string();
     }
 
+    let dry_run = arguments.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Downcast to IntakeStore backend.
+    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::ladybug::LadybugStore>() {
+        Some(s) => s,
+        None => return "ERROR: Distill requires LadybugStore backend.".to_string(),
+    };
+
+    // Scan session logs and propose candidates (deterministic sort + dedup).
     let path = std::path::Path::new(&session_dir);
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if !p.is_file() { continue; }
-            if let Ok(content) = std::fs::read_to_string(&p) {
-                for line in content.lines() {
-                    let l = line.to_lowercase();
-                    if l.contains("todo:") || l.contains("we should also") || l.contains("later we need")
-                        || l.contains("remaining work:") || l.contains("follow-up:") {
-                        candidates.push(format!("- {}", line.trim()));
-                    }
+    let mut proposed: Vec<(String, String)> = Vec::new(); // (title, description)
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|rd| rd.flatten())
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+
+    for file in files {
+        let content = match std::fs::read_to_string(&file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+
+            // task action items
+            let task_marker = if lower.contains("todo:") {
+                Some("todo:")
+            } else if lower.contains("fixme:") {
+                Some("fixme:")
+            } else if lower.contains("follow-up:") || lower.contains("followup:") {
+                Some("follow-up:")
+            } else if lower.contains("remaining work:") {
+                Some("remaining work:")
+            } else if lower.contains("action item:") {
+                Some("action item:")
+            } else if lower.contains("we should also") || lower.contains("later we need") {
+                Some("task")
+            } else {
+                None
+            };
+
+            let title = if let Some(marker) = task_marker {
+                if marker == "task" {
+                    format!("[task] {}", trimmed.chars().take(120).collect::<String>())
+                } else {
+                    format!("[{}] {}", marker, trimmed.chars().take(120).collect::<String>())
                 }
+            } else if lower.contains("prefer")
+                || lower.contains("preference")
+                || lower.contains("constraint")
+                || lower.contains("decision")
+                || lower.contains("must ")
+                || lower.contains("should ")
+            {
+                format!(
+                    "[rule_candidate] {}",
+                    trimmed.chars().take(120).collect::<String>()
+                )
+            } else {
+                continue;
+            };
+
+            let dedup_key = trimmed.to_lowercase();
+            if !seen.insert(dedup_key) {
+                continue;
+            }
+            proposed.push((title, trimmed.to_string()));
+        }
+    }
+
+    if proposed.is_empty() {
+        return "No candidate rules/tasks found in session logs.".to_string();
+    }
+
+    // Dry run: report only.
+    if dry_run {
+        let lines: Vec<String> = proposed.iter().map(|(t, _)| format!("- {}", t)).collect();
+        return format!("Proposed candidates (dry-run, review-only):
+{}", lines.join("
+"));
+    }
+
+    // Route through IntakeStore (review-only; never auto-create Memory/Task).
+    use crate::traits::IntakeStore;
+    use crate::task::intake::{CreateReceiptRequest, SourceKind};
+    let source_revision = format!("distill:{}", session_dir);
+    let mut created = 0usize;
+    let mut candidate_ids: Vec<String> = Vec::new();
+    for (idx, (title, desc)) in proposed.into_iter().enumerate() {
+        let digest_input = format!("{}:{}:{}", namespace, idx, desc);
+        let source_digest = format!("{:x}", md5_like(&digest_input));
+        let request = CreateReceiptRequest {
+            namespace: namespace.clone(),
+            source_kind: SourceKind::Conversation,
+            source_revision: source_revision.clone(),
+            source_digest,
+            text: desc.clone(),
+            title: Some(title),
+            description: Some(desc),
+        };
+        match intake_store.create_receipt(request).await {
+            Ok(res) => {
+                created += res.candidate_count;
+                for c in res.candidates {
+                    candidate_ids.push(c.id);
+                }
+            }
+            Err(e) => {
+                return format!("ERROR creating intake receipt: {}", e);
             }
         }
     }
-    if candidates.is_empty() {
-        "No candidate rules/tasks found in session logs.".to_string()
-    } else {
-        format!("Proposed candidates (review-only):\n{}", candidates.join("\n"))
+
+    let mut out = format!(
+        "Proposed candidates (review-only): {} created.\n",
+        created
+    );
+    for id in candidate_ids {
+        out.push_str(&format!("- {}
+", id));
     }
+    out
 }
 
+fn md5_like(input: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    input.hash(&mut h);
+    h.finish()
+}

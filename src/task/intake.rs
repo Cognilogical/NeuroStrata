@@ -102,6 +102,20 @@ pub struct IntakeCandidate {
     pub cas_version: u64,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default = "default_candidate_kind")]
+    pub candidate_kind: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub source_span: Option<Value>,
+    #[serde(default)]
+    pub extractor_fingerprint: Option<String>,
+}
+
+fn default_candidate_kind() -> String {
+    "task".to_string()
 }
 
 /// Request to create an intake receipt.
@@ -256,6 +270,34 @@ pub fn create_candidates_from_intents(
     request: &CreateReceiptRequest,
     intents: Vec<DetectedIntent>,
 ) -> Vec<IntakeCandidate> {
+    // Explicit title wins: one deterministic candidate, no M2 re-splitting.
+    if let Some(title) = request.title.clone() {
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let candidate_kind = if title.starts_with("[rule_candidate]") {
+            "rule".to_string()
+        } else {
+            "task".to_string()
+        };
+        return vec![IntakeCandidate {
+            id: generate_candidate_id(namespace, receipt_id, 0),
+            namespace: namespace.to_string(),
+            receipt_id: receipt_id.to_string(),
+            title,
+            description: request.description.clone(),
+            review_state: ReviewState::Pending,
+            disposition: Disposition::Pending,
+            task_id: None,
+            cas_version: 1,
+            created_at: now.clone(),
+            updated_at: now,
+            candidate_kind,
+            payload: serde_json::Value::Null,
+            confidence: None,
+            source_span: None,
+            extractor_fingerprint: None,
+        }];
+    }
+
     let mut candidates = Vec::new();
 
     if intents.is_empty() {
@@ -281,6 +323,11 @@ pub fn create_candidates_from_intents(
             cas_version: 1,
             created_at: now.clone(),
             updated_at: now,
+            candidate_kind: "task".to_string(),
+            payload: serde_json::Value::Null,
+            confidence: None,
+            source_span: None,
+            extractor_fingerprint: None,
         });
     } else {
         // Create one candidate per distinct intent
@@ -299,6 +346,11 @@ pub fn create_candidates_from_intents(
                 cas_version: 1,
                 created_at: now.clone(),
                 updated_at: now,
+                candidate_kind: "task".to_string(),
+                payload: serde_json::Value::Null,
+                confidence: None,
+                source_span: None,
+                extractor_fingerprint: None,
             });
         }
     }

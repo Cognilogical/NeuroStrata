@@ -1910,6 +1910,11 @@ impl LadybugStore {
         }
         out
     }
+
+    /// Advisory ontology warnings for a namespace (F21). Never blocks.
+    pub async fn ontology_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
+        crate::ontology_grounding::ontology_warnings(self, namespace).await
+    }
 }
 
 #[async_trait]
@@ -1980,8 +1985,17 @@ impl VectorStore for LadybugStore {
             conn.query(create_receipts_table).ok();
 
             // PQTH: Intake candidates table (operational, not memory rows)
-            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
+            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, candidate_kind STRING, payload STRING, confidence DOUBLE, source_span STRING, extractor_fingerprint STRING, PRIMARY KEY (id))";
             conn.query(create_candidates_table).ok();
+            for stmt in [
+                "ALTER TABLE IntakeCandidate ADD candidate_kind STRING",
+                "ALTER TABLE IntakeCandidate ADD payload STRING",
+                "ALTER TABLE IntakeCandidate ADD confidence DOUBLE",
+                "ALTER TABLE IntakeCandidate ADD source_span STRING",
+                "ALTER TABLE IntakeCandidate ADD extractor_fingerprint STRING",
+            ] {
+                let _ = conn.query(stmt);
+            }
 
             // Source-scoped staged ingestion. Two row kinds live in this table:
             //   * the counter row, `id = namespace`, whose `counter` allocates
@@ -2109,11 +2123,12 @@ impl VectorStore for LadybugStore {
                 slugs.sort();
                 slugs.dedup();
                 if !slugs.is_empty() {
-                    // read registry
+                    // read registry (optional)
                     let rid = crate::registry::registry_row_id(&namespace);
-                    if let Ok(Some((_, reg_payload))) = self.get(&namespace, &rid).await {
+                    let reg_payload_opt = self.get(&namespace, &rid).await.ok().flatten();
+                    let mut iris: Vec<String> = Vec::new();
+                    if let Some((_, reg_payload)) = &reg_payload_opt {
                         let entries = crate::registry::registry_domain_entries(&reg_payload.metadata);
-                        let mut iris: Vec<String> = Vec::new();
                         for slug in &slugs {
                             for e in &entries {
                                 if e.get("slug").and_then(|s| s.as_str()) == Some(slug.as_str()) {
@@ -2125,20 +2140,57 @@ impl VectorStore for LadybugStore {
                                 }
                             }
                         }
-                        // Also apply ontology grounding (F21 annotate mode) from vocabulary? Defer.
-                        if !iris.is_empty() {
-                            let val = if iris.len() == 1 {
-                                serde_json::json!(iris[0])
-                            } else {
-                                // sorted
-                                let mut s = iris.clone();
-                                s.sort();
-                                s.dedup();
-                                serde_json::json!(s)
-                            };
-                            if let Some(obj) = payload.metadata.as_object_mut() {
-                                obj.insert("concept_iri".to_string(), val);
+                    }
+
+                    // Ontology grounding (F21): if registry did not provide iris, consult vocabulary.
+                    let mut strict_missing = false;
+                    if iris.is_empty() {
+                        let reg_meta = reg_payload_opt
+                            .as_ref()
+                            .map(|(_, p)| p.metadata.clone())
+                            .unwrap_or(serde_json::Value::Null);
+                        if let Some(cfg) = crate::ontology_grounding::resolve_config(&reg_meta) {
+                            match crate::ontology_grounding::load_vocabulary(&cfg.path) {
+                                Ok(vocab) => {
+                                    let v_iris = crate::ontology_grounding::concept_iris_from_vocabulary(&vocab, &slugs);
+                                    if v_iris.is_empty() {
+                                        if cfg.mode == "strict" {
+                                            strict_missing = true;
+                                        }
+                                    } else {
+                                        iris = v_iris;
+                                    }
+                                }
+                                Err(_) => {
+                                    // warnings handled by ontology_warnings surface
+                                }
                             }
+                        }
+                    }
+
+                    if !iris.is_empty() {
+                        let val = if iris.len() == 1 {
+                            serde_json::json!(iris[0])
+                        } else {
+                            let mut s = iris.clone();
+                            s.sort();
+                            s.dedup();
+                            serde_json::json!(s)
+                        };
+                        if let Some(obj) = payload.metadata.as_object_mut() {
+                            obj.insert("concept_iri".to_string(), val);
+                        }
+                    }
+
+                    if strict_missing {
+                        if let Some(obj) = payload.metadata.as_object_mut() {
+                            obj.insert(
+                                "validation_warning".to_string(),
+                                serde_json::json!(format!(
+                                    "ontology: no concept_iri for domain(s) {}",
+                                    slugs.join(", ")
+                                )),
+                            );
                         }
                     }
                 }
@@ -4433,15 +4485,17 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let safe_task_id = cand.task_id.as_ref().map(|t| escape_ladybug_string(t)).unwrap_or_default();
                 let safe_created = escape_ladybug_string(&cand.created_at);
                 let safe_updated = escape_ladybug_string(&cand.updated_at);
+                let safe_kind = escape_ladybug_string(&cand.candidate_kind);
+                let safe_payload = escape_ladybug_string(&serde_json::to_string(&cand.payload).unwrap_or_else(|_| "null".to_string()));
+                let safe_span = escape_ladybug_string(&cand.source_span.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()).unwrap_or_default());
+                let safe_fp = escape_ladybug_string(&cand.extractor_fingerprint.clone().unwrap_or_default());
+                let safe_conf = cand.confidence.unwrap_or(0.0);
 
                 let cand_query = format!(
-                    "MERGE (c:IntakeCandidate {{id: '{}'}})
-                     ON CREATE SET c.namespace = '{}', c.receipt_id = '{}', c.title = '{}',
-                         c.description = '{}', c.review_state = '{}', c.disposition = '{}',
-                         c.task_id = '{}', c.cas_version = {}, c.created_at = '{}', c.updated_at = '{}'",
+                    "MERGE (c:IntakeCandidate {{id: '{}' }})\n                     ON CREATE SET c.namespace = '{}', c.receipt_id = '{}', c.title = '{}',\n                         c.description = '{}', c.review_state = '{}', c.disposition = '{}',\n                         c.task_id = '{}', c.cas_version = {}, c.created_at = '{}', c.updated_at = '{}',\n                         c.candidate_kind = '{}', c.payload = '{}', c.confidence = {}, c.source_span = '{}', c.extractor_fingerprint = '{}'",
                     safe_cand_id, safe_ns, safe_receipt_id, safe_title, safe_desc,
                     safe_review_state, safe_disposition, safe_task_id, cand.cas_version,
-                    safe_created, safe_updated
+                    safe_created, safe_updated, safe_kind, safe_payload, safe_conf, safe_span, safe_fp
                 );
                 conn.query(&cand_query)?;
             }
@@ -4569,7 +4623,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 
             // Get paginated results
             let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at ORDER BY c.created_at DESC LIMIT {} OFFSET {}",
+                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint ORDER BY c.created_at DESC LIMIT {} OFFSET {}",
                 where_clause, limit, offset
             );
             let mut results = Vec::new();
@@ -4585,6 +4639,22 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
                 let created_at: String = format!("{}", row[9]);
                 let updated_at: String = format!("{}", row[10]);
+                let candidate_kind: String = format!("{}", row[11]);
+                let payload_str: String = format!("{}", row[12]);
+                let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
+                let source_span_str: String = format!("{}", row[14]);
+                let extractor_fingerprint: Option<String> = {
+                    let s = format!("{}", row[15]);
+                    if s.is_empty() { None } else { Some(s) }
+                };
+                let candidate_kind: String = format!("{}", row[11]);
+                let payload_str: String = format!("{}", row[12]);
+                let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
+                let source_span_str: String = format!("{}", row[14]);
+                let extractor_fingerprint: Option<String> = {
+                    let s = format!("{}", row[15]);
+                    if s.is_empty() { None } else { Some(s) }
+                };
 
                 let review_state = match review_state_str.as_str() {
                     "pending" => crate::task::intake::ReviewState::Pending,
@@ -4614,6 +4684,11 @@ impl crate::traits::IntakeStore for LadybugStore {
                     cas_version: cas_version as u64,
                     created_at,
                     updated_at,
+                    candidate_kind: if candidate_kind.is_empty() { "task".to_string() } else { candidate_kind },
+                    payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
+                    confidence,
+                    source_span: if source_span_str.is_empty() { None } else { serde_json::from_str(&source_span_str).ok() },
+                    extractor_fingerprint,
                 });
             }
 
@@ -4695,7 +4770,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 
             // Fetch updated candidate
             let fetch_query = format!(
-                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at",
+                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint",
                 safe_cand_id, safe_ns
             );
             let mut fetch_result = conn.query(&fetch_query)?;
@@ -4712,6 +4787,14 @@ impl crate::traits::IntakeStore for LadybugStore {
             let cas_version_db: i64 = format!("{}", row[8]).parse().unwrap_or(new_version as i64);
             let created_at: String = format!("{}", row[9]);
             let updated_at: String = format!("{}", row[10]);
+            let candidate_kind: String = format!("{}", row[11]);
+            let payload_str: String = format!("{}", row[12]);
+            let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
+            let source_span_str: String = format!("{}", row[14]);
+            let extractor_fingerprint: Option<String> = {
+                let s = format!("{}", row[15]);
+                if s.is_empty() { None } else { Some(s) }
+            };
 
             let review_state = match review_state_str.as_str() {
                 "pending" => crate::task::intake::ReviewState::Pending,
@@ -4741,6 +4824,11 @@ impl crate::traits::IntakeStore for LadybugStore {
                 cas_version: cas_version_db as u64,
                 created_at,
                 updated_at,
+                candidate_kind: if candidate_kind.is_empty() { "task".to_string() } else { candidate_kind },
+                payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
+                confidence,
+                source_span: if source_span_str.is_empty() { None } else { serde_json::from_str(&source_span_str).ok() },
+                extractor_fingerprint,
             };
 
             Ok(crate::task::intake::ResolveCandidateResult {
@@ -4823,7 +4911,7 @@ impl crate::traits::IntakeStore for LadybugStore {
             let safe_id = escape_ladybug_string(&id);
 
             let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at",
+                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint",
                 safe_id, safe_ns
             );
             let mut result = conn.query(&query)?;
@@ -4840,6 +4928,14 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
                 let created_at: String = format!("{}", row[9]);
                 let updated_at: String = format!("{}", row[10]);
+                let candidate_kind: String = format!("{}", row[11]);
+                let payload_str: String = format!("{}", row[12]);
+                let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
+                let source_span_str: String = format!("{}", row[14]);
+                let extractor_fingerprint: Option<String> = {
+                    let s = format!("{}", row[15]);
+                    if s.is_empty() { None } else { Some(s) }
+                };
 
                 let review_state = match review_state_str.as_str() {
                     "pending" => crate::task::intake::ReviewState::Pending,
@@ -4869,6 +4965,11 @@ impl crate::traits::IntakeStore for LadybugStore {
                     cas_version: cas_version as u64,
                     created_at,
                     updated_at,
+                    candidate_kind: if candidate_kind.is_empty() { "task".to_string() } else { candidate_kind },
+                    payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
+                    confidence,
+                    source_span: if source_span_str.is_empty() { None } else { serde_json::from_str(&source_span_str).ok() },
+                    extractor_fingerprint,
                 }))
             } else {
                 Ok(None)
