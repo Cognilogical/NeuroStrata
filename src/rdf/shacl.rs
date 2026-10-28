@@ -242,3 +242,22 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
 
     out
 }
+
+const ARTIFACT_TYPES: [&str; 6] = ["file", "directory", "markdown", "symbol", "code_ast", "doc_section"];
+const CONTAINER_TYPES: [&str; 3] = ["directory", "file", "markdown"];
+const CONTAINED_TYPES: [&str; 6] = ["directory", "file", "markdown", "symbol", "code_ast", "doc_section"];
+
+fn is_structural(t: &str) -> bool {
+    ARTIFACT_TYPES.contains(&t)
+        || t == "freshness_flag"
+        || t == "guard_event"
+}
+
+pub fn endpoint_role_allowed(rel_type: &str, source_type: &str, target_type: &str) -> bool {
+    match rel_type {
+        "GOVERNS" => source_type == "rule" || source_type == "fact",
+        "CONTAINS" => CONTAINED_TYPES.contains(&source_type) && CONTAINER_TYPES.contains(&target_type),
+        "EXTRACTED_FROM" => !is_structural(source_type) && target_type == "task",
+        _ => true,
+    }
+}

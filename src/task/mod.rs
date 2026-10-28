@@ -1545,6 +1545,10 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                         }));
                     }
                 }
+                let sw = ls.shape_warnings(&namespace).await;
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("shape_warnings".to_string(), serde_json::Value::Array(sw));
+                }
             }
             encode(&json)
         }
