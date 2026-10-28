@@ -1667,6 +1667,8 @@ fn preserved_edit_record(
         },
         content,
         metadata: Value::Object(metadata),
+        rdf: None,
+
         relationships: rels,
         update_id: Uuid::new_v4(),
         origin_mesh_epoch,
@@ -2784,6 +2786,8 @@ mod tests {
             },
             content: json!({ "text": text }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
@@ -3202,6 +3206,8 @@ mod tests {
                 "rehearsal_script": "the replacement",
             }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
@@ -3326,6 +3332,8 @@ mod tests {
             },
             content: json!({ "text": "the replacement" }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
@@ -3421,6 +3429,8 @@ mod tests {
                 "rehearsal_script": "the replacement",
             }),
             metadata: json!({ "eligibility": "shareable", "trust": "untrusted" }),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,

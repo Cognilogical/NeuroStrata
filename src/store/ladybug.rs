@@ -327,7 +327,7 @@ async fn search_inner(
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                let supported_labels = ["RELATES_TO", "CONTAINS", "GOVERNS"];
+                let supported_labels = ["RELATES_TO", "CONTAINS", "GOVERNS", "DEPENDS_ON", "EXTRACTED_FROM"];
                 let primary_set: std::collections::HashSet<&str> =
                     primary_ids.iter().map(|s| s.as_str()).collect();
 
@@ -957,9 +957,16 @@ impl LadybugStore {
             Ok(db) => db,
             Err(e) => {
                 let err_msg = e.to_string();
-                if !is_wal_integrity_failure(&err_msg) {
+                let checksum_mismatch = err_msg.contains("enableChecksums");
+                if checksum_mismatch {
+                    eprintln!("WARN: DB checksum config mismatch; reopening with checksums disabled.");
+                    match Database::new(&local_path, unverified_config()) {
+                        Ok(db) => db,
+                        Err(e2) => return Err(e2.into()),
+                    }
+                } else if !is_wal_integrity_failure(&err_msg) {
                     return Err(e.into());
-                }
+                } else {
 
                 eprintln!(
                     "ERROR: the write-ahead log failed verification: {}",
@@ -1022,6 +1029,7 @@ impl LadybugStore {
                         })?
                     }
                 }
+            }
             }
         };
 
@@ -2017,32 +2025,34 @@ impl VectorStore for LadybugStore {
                 }
             }
 
-            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
+            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
             conn.query(create_rel_table).ok();
 
-            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
+            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
             conn.query(create_contains_table).ok();
 
-            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
+            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
             conn.query(create_governs_table).ok();
 
             // Vocabulary v2: extraction edges (memory -> task) behind Lock 2.
-            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
+            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
             conn.query(create_extracted_table).ok();
 
             // F7: dependency edges (directed).
-            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING)";
+            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
             conn.query(create_depends_table).ok();
 
             // RDF projection (Phase 1): idempotent migration for DBs created before
             // edge provenance columns existed. LadybugDB supports ALTER ... ADD.
             const EDGE_PROVENANCE_TABLES: [&str; 5] = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"];
-            const EDGE_PROVENANCE_COLUMNS: [(&str, &str); 5] = [
+            const EDGE_PROVENANCE_COLUMNS: [(&str, &str); 7] = [
                 ("source", "STRING"),
                 ("valid_from", "INT64"),
                 ("valid_to", "INT64"),
                 ("generation", "INT64"),
                 ("extractor", "STRING"),
+                ("confidence", "DOUBLE"),
+                ("evidence_id", "STRING"),
             ];
             for table in EDGE_PROVENANCE_TABLES {
                 for (col, ty) in EDGE_PROVENANCE_COLUMNS {

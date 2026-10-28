@@ -4,6 +4,8 @@
 mod attempt;
 mod buffer;
 mod config;
+mod community;
+mod closure_budget;
 // The context DTOs are shipped ahead of the service that builds plans
 // (plan Task 2 of the agent-adoption plan). Nothing constructs them yet,
 // so the dead-code lint has no honest answer to give.
@@ -13,15 +15,21 @@ mod crash;
 mod daemon;
 mod domain;
 mod embed;
+mod explainable;
+mod rag_fusion;
+mod enrichment;
+mod fts;
 mod events;
 mod graph_read;
 mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
+mod kge;
 mod model_downloader;
 mod mention;
 mod ontology_grounding;
+mod pagerank;
 mod learning;
 mod parser;
 mod recall_metrics;
@@ -33,6 +41,17 @@ mod secrets;
 mod server;
 mod setup;
 mod source_context;
+mod cross_repo;
+mod multimodal;
+mod streaming;
+mod diff_privacy;
+mod digital_twin;
+mod graphql;
+mod ontology_drift;
+mod active_learning;
+mod guardrails;
+mod temporal;
+mod sparql;
 mod store;
 mod synaptic_mesh;
 mod task;
@@ -1010,6 +1029,17 @@ async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()
                 "    write an empty vector and was refused, so the Neural Gain Filter had nothing"
             );
             println!("    to rank by. Counts start rising again from the next search.");
+        }
+        // F11: surface enrichment_state and ontology_warnings from registry row.
+        for memory in &memories {
+            if crate::registry::is_registry_row(&memory.payload.metadata) {
+                if let Some(es) = memory.payload.metadata.get("enrichment_state") {
+                    println!("  [{}] enrichment_state: {}", ns, es);
+                }
+                if let Some(ow) = memory.payload.metadata.get("ontology_warnings") {
+                    println!("  [{}] ontology_warnings: {}", ns, ow);
+                }
+            }
         }
         println!();
     }

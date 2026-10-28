@@ -27,15 +27,13 @@ pub fn canonicalize_known_ids_alias(raw: &str, index: &OntologyIndex) -> String 
 /// Render a memory as a deterministic N-Quads string (canonical RDF projection).
 /// This is a read-only projection; it does not change the primary store.
 pub fn memory_to_nquads(id: &str, payload: &crate::traits::MemoryPayload) -> String {
-    use crate::traits::MemoryPayload;
-    let _ = (id, payload);
-    let mut out = String::new();
     let subj = format!("<urn:neurostrata:memory:{}>", id);
-    out.push_str(&format!("{} <urn:neurostrata:content> \"{}\" .\n", subj, escape_nq(&payload.content)));
-    out.push_str(&format!("{} <urn:neurostrata:memory_type> \"{}\" .\n", subj, escape_nq(&payload.memory_type)));
-    out.push_str(&format!("{} <urn:neurostrata:user_id> \"{}\" .\n", subj, escape_nq(&payload.user_id)));
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("{} <urn:neurostrata:content> \"{}\" .", subj, escape_nq(&payload.content)));
+    lines.push(format!("{} <urn:neurostrata:memory_type> \"{}\" .", subj, escape_nq(&payload.memory_type)));
+    lines.push(format!("{} <urn:neurostrata:user_id> \"{}\" .", subj, escape_nq(&payload.user_id)));
     if !payload.location.is_empty() {
-        out.push_str(&format!("{} <urn:neurostrata:location> \"{}\" .\n", subj, escape_nq(&payload.location)));
+        lines.push(format!("{} <urn:neurostrata:location> \"{}\" .", subj, escape_nq(&payload.location)));
     }
     if let Some(obj) = payload.metadata.as_object() {
         for (k, v) in obj {
@@ -46,10 +44,19 @@ pub fn memory_to_nquads(id: &str, payload: &crate::traits::MemoryPayload) -> Str
                 serde_json::Value::Null => "null".to_string(),
                 other => format!("\"{}\"", escape_nq(&other.to_string())),
             };
-            out.push_str(&format!("{} <urn:neurostrata:meta:{}> {} .\n", subj, escape_nq(k), val));
+            lines.push(format!("{} <urn:neurostrata:meta:{}> {} .", subj, escape_nq(k), val));
         }
     }
-    out
+    lines.sort();
+    if lines.is_empty() { String::new() } else { lines.join("\n") + "\n" }
+}
+
+/// SHA-256 digest of the canonical N-Quads projection.
+pub fn nquads_digest(nquads: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(nquads.as_bytes());
+    format!("{:x}", h.finalize())
 }
 
 fn escape_nq(s: &str) -> String {

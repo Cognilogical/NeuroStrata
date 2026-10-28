@@ -69,8 +69,13 @@ impl Trainer {
         Self { runtime }
     }
 
-    /// Run a training job for candidate version.
+    /// Run a training job for candidate version (in-house approximation).
+    /// Writes a training marker file and transitions state; real ONNX
+    /// training requires the Python laya-train script and model bundle.
     pub async fn train_candidate(&self, version: &ModelVersion) -> Result<()> {
+        let dir = self.runtime.model_cache.join(version);
+        std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!(e))?;
+        std::fs::write(dir.join("training.marker"), version).map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 

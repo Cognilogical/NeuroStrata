@@ -129,6 +129,15 @@ pub struct CreateReceiptRequest {
     /// Optional explicit title/description override (for manual intake)
     pub title: Option<String>,
     pub description: Option<String>,
+    /// Optional candidate kind override (rule/task/etc.)
+    #[serde(default)]
+    pub candidate_kind: Option<String>,
+    /// Optional payload for the candidate.
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// Optional confidence score.
+    #[serde(default)]
+    pub confidence: Option<f64>,
 }
 
 /// Request to list receipts.
@@ -273,11 +282,9 @@ pub fn create_candidates_from_intents(
     // Explicit title wins: one deterministic candidate, no M2 re-splitting.
     if let Some(title) = request.title.clone() {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let candidate_kind = if title.starts_with("[rule_candidate]") {
-            "rule".to_string()
-        } else {
-            "task".to_string()
-        };
+        let candidate_kind = request.candidate_kind.clone().unwrap_or_else(|| {
+            if title.starts_with("[rule_candidate]") { "rule".to_string() } else { "task".to_string() }
+        });
         return vec![IntakeCandidate {
             id: generate_candidate_id(namespace, receipt_id, 0),
             namespace: namespace.to_string(),
@@ -291,8 +298,8 @@ pub fn create_candidates_from_intents(
             created_at: now.clone(),
             updated_at: now,
             candidate_kind,
-            payload: serde_json::Value::Null,
-            confidence: None,
+            payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
+            confidence: request.confidence,
             source_span: None,
             extractor_fingerprint: None,
         }];
@@ -424,6 +431,9 @@ mod tests {
             text: "Just a note, no task here".to_string(),
             title: None,
             description: None,
+            candidate_kind: None,
+            payload: None,
+            confidence: None,
         };
         let candidates = create_candidates_from_intents("test", "rcpt-1", &request, vec![]);
         assert_eq!(candidates.len(), 1);
@@ -441,6 +451,9 @@ mod tests {
             text: "TODO: fix bug\nLater we need to refactor".to_string(),
             title: None,
             description: None,
+            candidate_kind: None,
+            payload: None,
+            confidence: None,
         };
         let intents = vec![
             DetectedIntent { marker: "todo:".to_string(), excerpt: "TODO: fix bug".to_string() },
@@ -503,6 +516,9 @@ pub async fn handle_intake(
         text,
         title,
         description,
+        candidate_kind: None,
+        payload: None,
+        confidence: None,
     };
 
     match intake_store.create_receipt(request).await {

@@ -199,12 +199,26 @@ pub(crate) fn procedures_due_strap_filtered(
         .into_iter()
         .filter(|row| {
             let trigger = row.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
-            let content_ok = memories
+            let mem = memories
                 .iter()
-                .find(|m| m.id == row.get("id").and_then(|v| v.as_str()).unwrap_or(""))
+                .find(|m| m.id == row.get("id").and_then(|v| v.as_str()).unwrap_or(""));
+            let content_ok = mem
                 .map(|m| m.payload.content.to_lowercase().contains(&needle))
                 .unwrap_or(false);
-            trigger.contains(&needle) || content_ok
+            // Domain-aware matching (F19): also match when the needle is a
+            // domain slug that the procedure's metadata.domain expands to.
+            let domain_ok = mem.map(|m| {
+                let domains: Vec<String> = match m.payload.metadata.get("domain") {
+                    Some(serde_json::Value::String(s)) => vec![s.clone()],
+                    Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    _ => vec![],
+                };
+                domains.iter().any(|d| {
+                    let slug = crate::domain::normalize_domain_slug(d).unwrap_or_else(|| d.to_lowercase());
+                    slug == needle || needle == slug || d.to_lowercase() == needle
+                })
+            }).unwrap_or(false);
+            trigger.contains(&needle) || content_ok || domain_ok
         })
         .collect();
     if filtered.is_empty() {

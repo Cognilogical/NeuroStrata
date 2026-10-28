@@ -9,6 +9,7 @@
 
 pub mod cli;
 pub mod conflict;
+pub mod federation;
 pub mod import;
 pub mod manifest;
 pub mod mesh_service;

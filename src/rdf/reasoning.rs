@@ -84,3 +84,22 @@ mod tests {
         assert!(!r.contains("c"));
     }
 }
+
+/// Query budget for bounded reasoning operations (OWL/RDFS spec).
+#[derive(Debug, Clone)]
+pub struct QueryBudget {
+    pub max_ms: u64,
+    pub max_nodes: usize,
+}
+
+impl Default for QueryBudget {
+    fn default() -> Self {
+        Self { max_ms: 50, max_nodes: 256 }
+    }
+}
+
+impl QueryBudget {
+    pub fn check_nodes(&self, n: usize) -> bool {
+        n <= self.max_nodes
+    }
+}

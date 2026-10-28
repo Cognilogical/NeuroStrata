@@ -17,6 +17,13 @@ use uuid::Uuid;
 /// On-disk schema version. Bumping is a breaking change for older daemons.
 pub const MESH_RECORD_SCHEMA_VERSION: &str = "synaptic-mesh-record/v1";
 
+/// Optional RDF projection block for a mesh record (canonical N-Quads).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RdfBlock {
+    pub nquads: String,
+    pub digest: String,
+}
+
 /// A single mesh record (memory or procedure).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MeshRecord {
@@ -36,6 +43,10 @@ pub struct MeshRecord {
     /// Per-record metadata. `eligibility` and `trust` are the gate fields
     /// the mesh-worker consults at publish time.
     pub metadata: serde_json::Value,
+    /// Optional RDF projection (canonical N-Quads + SHA-256 digest). None for
+    /// records that have not been projected yet.
+    #[serde(default)]
+    pub rdf: Option<RdfBlock>,
     pub relationships: Vec<Relationship>,
     /// Monotonic per-record id. Bumps on every accepted change. The pull
     /// diff uses `(id, update_id)` as the identity tuple; a record at the
@@ -167,6 +178,8 @@ mod tests {
             },
             content: serde_json::json!({"text": "fixture"}),
             metadata: serde_json::json!({"eligibility": "shareable"}),
+            rdf: None,
+
             relationships: vec![],
             update_id: Uuid::nil(),
             origin_mesh_epoch: 1,
