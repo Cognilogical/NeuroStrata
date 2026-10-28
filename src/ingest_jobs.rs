@@ -91,8 +91,9 @@ impl IngestObserver for ProgressReporter {
             .send_modify(|progress| progress.relinked_edges = Some(edges));
     }
 
-    fn version_gate_tripped(&self, prev: &str, current: &str) {
-        tracing::warn!(prev, current, "ingest version changed; re-parsing all files");
+    fn version_gate_tripped(&self, _prev: &str, _current: &str) {
+        // The warning is emitted once in ingest_directory itself so it covers
+        // every caller, including those with no observer.
     }
 }
 

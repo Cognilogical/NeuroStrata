@@ -51,6 +51,15 @@ fn ingest_version_changes_with_logic_version_or_fingerprint() {
 }
 
 #[test]
+fn fingerprint_is_stable_for_empty_and_one_language_schemas() {
+    let empty = ParserSchema::load(r#"{"languages":{}}"#).expect("parses");
+    assert_eq!(empty.fingerprint(), empty.fingerprint());
+    let one = ParserSchema::load(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{"functions":"(function_item) @fn"}}}}"#).expect("parses");
+    assert_eq!(one.fingerprint(), one.fingerprint());
+    assert_ne!(empty.fingerprint(), one.fingerprint());
+}
+
+#[test]
 fn version_gate_trips_only_when_stamp_is_missing_or_different() {
     assert!(!version_gate_tripped(Some("v1"), "v1"));
     assert!(version_gate_tripped(Some("v1"), "v2"));
