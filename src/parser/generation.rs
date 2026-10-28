@@ -95,6 +95,23 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// The parser logic version. Bump it whenever extraction changes in a way that
+/// must re-parse already-ingested nodes even though the schema is unchanged.
+pub const PARSER_LOGIC_VERSION: u32 = 1;
+
+/// The stamp stored beside ingested rows: which logic version and which schema
+/// fingerprint produced them. A change to either invalidates the stamp.
+pub fn ingest_version(schema_fingerprint: &str) -> String {
+    sha256_hex(format!("v{}:{}", PARSER_LOGIC_VERSION, schema_fingerprint).as_bytes())
+}
+
+/// Whether a stored stamp means the row must be re-parsed. A missing stamp is
+/// a pre-migration row written before this guarantee existed, so it also
+/// re-parses rather than being trusted.
+pub fn version_gate_tripped(prev: Option<&str>, current: &str) -> bool {
+    prev != Some(current)
+}
+
 /// Stable identity for one symbol.
 ///
 /// The last segment is the SHA-256 of the symbol's full (untruncated)
@@ -164,10 +181,7 @@ mod tests {
             generation_key("ns", "/b/worktree"),
             "the active pointer is keyed by source, so worktree B cannot overwrite A"
         );
-        assert_eq!(
-            generation_key("ns", "/a/worktree"),
-            "ns::/a/worktree"
-        );
+        assert_eq!(generation_key("ns", "/a/worktree"), "ns::/a/worktree");
     }
 
     #[test]

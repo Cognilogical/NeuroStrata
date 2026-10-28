@@ -90,6 +90,11 @@ impl IngestObserver for ProgressReporter {
         self.tx
             .send_modify(|progress| progress.relinked_edges = Some(edges));
     }
+
+    fn version_gate_tripped(&self, _prev: &str, _current: &str) {
+        // The warning is emitted once in ingest_directory itself so it covers
+        // every caller, including those with no observer.
+    }
 }
 
 /// The walk a caller should wait on instead of starting one, if there is one.
