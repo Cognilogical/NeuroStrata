@@ -3416,6 +3416,7 @@ async fn run() -> anyhow::Result<()> {
                                 // The CLI has nowhere to report progress to: it
                                 // is already printing each file as it goes.
                                 None,
+                                &[],
                             )
                             .await?;
                             println!("Ingestion complete.");

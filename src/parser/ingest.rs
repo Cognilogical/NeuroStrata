@@ -663,6 +663,7 @@ async fn run_consumer(
     generation: u64,
     source_identity: serde_json::Value,
     ingest_version: &str,
+    node_set: &[String],
 ) -> anyhow::Result<()> {
     while let Some(item) = rx.recv().await {
         match item {
@@ -686,6 +687,7 @@ async fn run_consumer(
                     metadata.insert("file_sha256".to_string(), serde_json::json!(hash));
                 }
                 metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
+                metadata.insert("node_set".to_string(), serde_json::json!(node_set));
 
                 let payload = MemoryPayload {
                     content: format!("Path: {}", node_path),
@@ -753,6 +755,7 @@ async fn run_consumer(
                     );
                     metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
                     metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
+                metadata.insert("node_set".to_string(), serde_json::json!(node_set));
                     metadata.insert(
                         "span_sha256".to_string(),
                         serde_json::json!(symbol.span_sha256),
@@ -825,6 +828,7 @@ async fn run_consumer(
                 metadata.insert("links".to_string(), serde_json::json!(section.links));
                 metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
                 metadata.insert("ingest_version".to_string(), serde_json::json!(ingest_version));
+                metadata.insert("node_set".to_string(), serde_json::json!(node_set));
                 metadata.insert(
                     "contained_by".to_string(),
                     serde_json::json!([generation_scoped_id(namespace, generation, &node_path)]),
@@ -865,7 +869,16 @@ pub async fn ingest_directory(
     vector_store: Arc<dyn VectorStore>,
     namespace: &str,
     observer: Option<Arc<dyn IngestObserver>>,
+    node_set: &[String],
 ) -> anyhow::Result<()> {
+    // Normalize node_set: sorted + deduped (C2 deterministic contract).
+    let node_set: Vec<String> = {
+        let mut v = node_set.to_vec();
+        v.sort();
+        v.dedup();
+        v
+    };
+
     // Prove the root is a readable directory before anything is staged. A
     // missing or mistyped path used to clear the namespace, walk nothing -- the
     // walker's errors were skipped -- and report success over an emptied graph.
@@ -985,6 +998,7 @@ pub async fn ingest_directory(
         generation,
         source_identity_json,
         &current_version,
+        &node_set,
     )
     .await;
 
@@ -1403,6 +1417,7 @@ mod tests {
             store.clone(),
             "probe",
             None,
+            &[],
         )
         .await;
 
@@ -1443,6 +1458,7 @@ mod tests {
             store.clone(),
             "test-ns",
             None,
+            &[],
         )
         .await;
 
@@ -1511,6 +1527,7 @@ mod tests {
             store.clone(),
             "shared-ns",
             None,
+            &[],
         )
         .await
         .expect("worktree a ingests");
@@ -1529,6 +1546,7 @@ mod tests {
             store.clone(),
             "shared-ns",
             None,
+            &[],
         )
         .await
         .expect("worktree b ingests");
@@ -1587,6 +1605,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await
         .expect("first ingest publishes");
@@ -1609,6 +1628,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await;
         assert!(outcome.is_err(), "a missing root is refused");
@@ -1658,6 +1678,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await
         .expect("first ingest publishes");
@@ -1682,6 +1703,7 @@ mod tests {
             store.clone(),
             "stage-ns",
             None,
+            &[],
         )
         .await;
         assert!(outcome.is_err(), "a mid-stage embed failure aborts the ingest");
@@ -1735,7 +1757,7 @@ mod tests {
 
         let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
         let rec1 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec1.clone()))
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec1.clone()), &[])
             .await
             .expect("first ingest");
         assert_eq!(rec1.0.lock().unwrap().0, 0, "first ingest has nothing to skip");
@@ -1743,7 +1765,7 @@ mod tests {
 
         // Same schema: unchanged file is skipped and the gate stays quiet.
         let rec2 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec2.clone()))
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec2.clone()), &[])
             .await
             .expect("second ingest");
         assert_eq!(rec2.0.lock().unwrap().0, 1, "unchanged file skipped");
@@ -1758,7 +1780,7 @@ mod tests {
             .extensions
             .push("rs2".to_string());
         let rec3 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
-        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec3.clone()))
+        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec3.clone()), &[])
             .await
             .expect("third ingest");
         assert_eq!(rec3.0.lock().unwrap().1, 1, "version gate tripped once");
@@ -1767,7 +1789,7 @@ mod tests {
         // Deleting the file must not resurrect it in the next generation.
         std::fs::remove_file(tmp.join("hello.rs")).expect("remove file");
         let rec4 = Arc::new(Recorder(std::sync::Mutex::new((0, 0))));
-        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec4.clone()))
+        ingest_directory(&tmp, &altered, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec4.clone()), &[])
             .await
             .expect("fourth ingest");
         let gen4 = store
@@ -1795,10 +1817,10 @@ mod tests {
         store.init("probe").await.expect("create the schema");
         let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
 
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
             .await
             .expect("first ingest");
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
             .await
             .expect("second ingest");
 
@@ -1828,7 +1850,7 @@ mod tests {
         let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
         let source_key = source_key_for(&tmp);
 
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
             .await
             .expect("first ingest");
 
@@ -1862,7 +1884,7 @@ mod tests {
             }
         }
         let rec = Arc::new(Rec(std::sync::Mutex::new(0)));
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()))
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()), &[])
             .await
             .expect("second ingest");
         assert_eq!(*rec.0.lock().unwrap(), 1, "pre-migration generation trips the gate");
@@ -1896,7 +1918,7 @@ mod tests {
         let schema = ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
         let source_key = source_key_for(&tmp);
 
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None)
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", None, &[])
             .await
             .expect("first ingest");
         let gen1 = store.active_generation("probe", &source_key).await.expect("read");
@@ -1925,7 +1947,7 @@ mod tests {
             }
         }
         let rec = Arc::new(Rec(std::sync::Mutex::new(0)));
-        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()))
+        ingest_directory(&tmp, &schema, Arc::new(ZeroEmbedder), store.clone(), "probe", Some(rec.clone()), &[])
             .await
             .expect("second ingest");
         assert_eq!(*rec.0.lock().unwrap(), 1, "mixed stamps must trip the gate");
