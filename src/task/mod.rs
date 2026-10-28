@@ -1529,7 +1529,25 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         return e;
     }
     match gate::run(&store, &namespace).await {
-        Ok(report) => encode(&report.validate_json()),
+        Ok(report) => {
+            let mut json = report.validate_json();
+            // F13: dangling-edge report (warn-only, never blocks gate).
+            if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+                .downcast_ref::<crate::store::LadybugStore>()
+            {
+                if let Ok(edges) = ls.dangling_edges(&namespace).await {
+                    let count = edges.len();
+                    let samples: Vec<_> = edges.into_iter().take(5).collect();
+                    if let Some(obj) = json.as_object_mut() {
+                        obj.insert("dangling_edges".to_string(), serde_json::json!({
+                            "total": count,
+                            "samples": samples,
+                        }));
+                    }
+                }
+            }
+            encode(&json)
+        }
         Err(e) => format!("ERROR: could not evaluate the task gate: {}", e),
     }
 }
