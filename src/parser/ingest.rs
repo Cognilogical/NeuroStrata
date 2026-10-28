@@ -900,7 +900,6 @@ pub async fn ingest_directory(
 
     // Build prev_file_map: node_path -> file_sha256 for files in prev gen.
     let mut prev_file_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut prev_version: Option<String> = None;
     let mut prev_stamps: Vec<String> = Vec::new();
     if prev_gen > 0 {
         if let Ok(rows) = vector_store.list(namespace, None, None).await {
@@ -914,13 +913,6 @@ pub async fn ingest_directory(
                 let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
                 if let Some(h) = hash {
                     prev_file_map.insert(tail.to_string(), h.clone());
-                }
-                if prev_version.is_none() {
-                    if let Some(v) = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()) {
-                        if !v.is_empty() {
-                            prev_version = Some(v.to_string());
-                        }
-                    }
                 }
                 let stamp = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 prev_stamps.push(stamp);
