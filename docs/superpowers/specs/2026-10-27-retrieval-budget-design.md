@@ -41,6 +41,15 @@ Per-query retrieval budget (max_nodes/max_edges/max_hops/deadline) applied acros
 - Keyword sub-piece: deterministic symbol match capped.
 - Hybrid: score and cap; if budget exceeded, truncate and set `truncated: true`.
 
+## 7. Determinism guarantee (K3 review)
+
+- **Budget truncation is a function of hard caps only.** `max_hops` / `max_nodes` / `max_edges` are deterministic; `deadline` is advisory and **never changes the result set** across identical inputs. If a deadline is hit, the traversal returns the same partial set it would have returned at the equivalent hard-cap hit.
+- **Neighbor ordering is deterministic before budget cuts.** BFS/DFS expands neighbors in stable, sorted order (sorted by canonical IRI / MemoryId) before any budget-based truncation.
+- **Vector sub-piece**: `fastembed` top-K capped at fixed K; deterministic ranking by cosine similarity; ties broken by MemoryId.
+- **Keyword sub-piece**: deterministic symbol match, sorted by exactness rank then MemoryId.
+- **Hybrid scoring**: fixed weights (`w_graph`, `w_vec`, `w_sym`) applied deterministically; no wall-clock dependence.
+- **`governs_max_hops` default = 2** (aligns with `yjah` spec `related.rs` default; range `1..=5`).
+
 ## 7. Per-namespace isolation
 - Retrieval budget applied per namespace (`ArcSwap` per namespace); cross-namespace only via `mhsp` inter-namespace traversal rules.
 - References `neurostrata-9fnf` (RDF canonical direction), `yjah` (QueryBudget), `2hxl` (in-tree BFS), `52dq` (GraphRAG hybrid), `wtnn` (similarity), `mhsp` (inter-namespace traversal).

@@ -23,8 +23,8 @@ Optional per-namespace JSON vocabulary; annotate mode; strict mode filtering at 
 ## 4. Scope
 
 - Per-namespace vocabulary file (`memory-ontology.vN.json`).
-- Annotate mode: stamps canonical type.
-- Strict mode: warns mismatches, filters unsupported concepts (non-fatal).
+- Annotate mode: stamps canonical type on ingested memories.
+- Strict mode: warn-first only — unsupported concepts preserved with a diagnostic `validation_warning` flag; **never dropped** (honors never-reject-writes policy).
 - Integration with `relink_edges`.
 
 ## 5. Approach
@@ -32,7 +32,7 @@ Optional per-namespace JSON vocabulary; annotate mode; strict mode filtering at 
 - Vocabulary file: per-namespace `docs/schemas/namespace-X/memory-ontology.vN.jsonld` (or fallback to global `docs/schemas/memory-ontology.v1.jsonld`).
 - Read vocabulary at namespace initialization.
 - Annotate: add `canonical_type` metadata to ingested memories.
-- Strict: warn-first (ValidationWarning) and skip unsupported concepts; continue ingest.
+- Strict: warn-first (ValidationWarning) and preserve unsupported concepts with `canonical_type = null`; continue ingest (no data loss).
 
 ## 6. Library evaluation
 

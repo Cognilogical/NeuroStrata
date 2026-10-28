@@ -149,6 +149,13 @@ pub struct BudgetExceeded {
 - Budget deadline reached mid-traversal: return partial results, do not block.
 - Private/structural/task rows (`eligibility != "shareable"`): exclude from closure and validation results (inherited from prior specs).
 
+### 7.1 Determinism guarantee (K3 review)
+
+- **Deadline is a soft cap, not a determinism boundary.** The deterministic budget is `max_hops` / `max_nodes` / `max_edges`; `deadline` is advisory only and **never changes the result set** across identical inputs. If a deadline is hit, the traversal returns the same partial set it would have returned at the equivalent `max_hops`/`max_nodes`/`max_edges` cap — the truncation is purely a function of the hard caps, not wall-clock time.
+- **Neighbor ordering is deterministic before budget cuts.** BFS/DFS expands neighbors in a stable, sorted order (sorted by canonical IRI / MemoryId) before any budget-based truncation. `ClosureResult.truncated` reflects only the hard-cap hit, not timing.
+- **Anomaly detection is deterministic** (Welford/EWMA over fixed samples; no wall-clock dependence).
+- **`governs_max_hops` default = 2** (aligns with `related.rs` default in `2hxl` spec; range `1..=5`).
+
 ## 8. Testing
 
 - Unit: closure over known subClassOf* chain returns all descendants.
