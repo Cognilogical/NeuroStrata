@@ -1,4 +1,5 @@
 pub mod canonical;
+pub mod rdf_star;
 pub mod owl;
 pub mod incremental;
 pub mod assertion;
@@ -11,6 +12,7 @@ pub mod shacl;
 pub mod types;
 
 pub use canonical::*;
+pub use rdf_star::*;
 pub use owl::*;
 pub use incremental::*;
 pub use assertion::*;

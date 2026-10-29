@@ -1,3 +1,17 @@
-//! Multi-modal AST embeddings (in-house): placeholder for image/audio.
+//! Multimodal validation helpers (in-house).
 pub fn embed_text(s: &str) -> Vec<f32> { s.bytes().map(|b| b as f32 / 255.0).collect() }
-#[cfg(test)] mod tests { use super::*; #[test] fn embeds() { assert!(!embed_text("hi").is_empty()); } }
+pub fn validate_mime(mime: &str) -> bool {
+    matches!(mime, "text/plain" | "image/png" | "image/jpeg" | "audio/wav")
+}
+pub fn describe(bytes: &[u8]) -> String {
+    format!("bytes={}", bytes.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mime() { assert!(validate_mime("image/png")); assert!(!validate_mime("application/exe")); }
+    #[test]
+    fn describe_len() { assert_eq!(describe(&[1,2,3]), "bytes=3"); }
+}

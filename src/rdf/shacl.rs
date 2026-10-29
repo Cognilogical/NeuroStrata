@@ -280,3 +280,18 @@ pub fn endpoint_role_allowed(rel_type: &str, source_type: &str, target_type: &st
         _ => true,
     }
 }
+
+/// Enforce shapes at a boundary: returns Err if any violations.
+pub fn enforce(payload: &crate::traits::MemoryPayload) -> std::result::Result<(), Vec<ShaclViolation>> {
+    let v = validate_memory(payload);
+    if v.is_empty() { Ok(()) } else { Err(v) }
+}
+
+/// Infer a minimal shape report from a payload (field presence).
+pub fn infer_shape(payload: &crate::traits::MemoryPayload) -> Vec<String> {
+    let mut fields = vec!["content".to_string(), "user_id".to_string(), "memory_type".to_string()];
+    if let Some(obj) = payload.metadata.as_object() {
+        for k in obj.keys() { fields.push(format!("metadata.{}", k)); }
+    }
+    fields
+}

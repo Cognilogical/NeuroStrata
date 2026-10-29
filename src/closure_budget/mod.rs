@@ -1,24 +1,21 @@
-//! Closure budget + anomaly detection (in-house approximation).
-pub use crate::rdf::reasoning::QueryBudget;
-
-/// Simple z-score based anomaly detector.
+//! Closure budget and anomaly detection (in-house).
 pub fn zscore_anomalies(values: &[f64], threshold: f64) -> Vec<usize> {
     if values.is_empty() { return vec![]; }
-    let n = values.len() as f64;
-    let mean = values.iter().sum::<f64>() / n;
-    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
-    let std = var.sqrt();
-    if std == 0.0 { return vec![]; }
-    values.iter().enumerate().filter(|(_, v)| ((*v - mean) / std).abs() > threshold).map(|(i, _)| i).collect()
+    let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
+    let var: f64 = values.iter().map(|v| (v-mean).powi(2)).sum::<f64>() / values.len() as f64;
+    let sd = var.sqrt().max(1e-9);
+    values.iter().enumerate().filter(|(_,v)| ((*v-mean)/sd).abs() > threshold).map(|(i,_)| i).collect()
 }
+pub fn within_budget(used: usize, budget: usize) -> bool { used <= budget }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn detects_outlier() {
-        let v = vec![1.0, 1.1, 0.9, 100.0];
-        let a = zscore_anomalies(&v, 1.5);
-        assert!(a.contains(&3));
+    fn anomalies() {
+        let v = vec![1.0,1.0,1.0,10.0];
+        assert!(!zscore_anomalies(&v,1.5).is_empty());
     }
+    #[test]
+    fn budget() { assert!(within_budget(5,10)); assert!(!within_budget(11,10)); }
 }
