@@ -45,31 +45,29 @@ Out of scope:
 ### 5.1 Data model
 - `metadata.visible_to: Vec<String>` (optional). Each entry is a principal identifier: a `user_id`, `node_id`, `did:key:...`, or `"*"` (wildcard = all authenticated principals in the namespace).
 - If absent or empty → unrestricted (namespace-level read).
-- `resource_owner` is derived from `metadata.user_id` if present, else `lifecycle.created_by`, else `verified_signer_did`.
+- `resource_owner` is derived from `metadata.user_id` if present, else `lifecycle.created_by`, else `verified_signer_did`. If all are absent, `resource_owner = ""`; then `allowed` treats no user as owner (write denied unless admin), and read access follows `acl`/unrestricted rules.
 
 ### 5.2 Helper semantics (`src/rebac.rs`)
 ```rust
 pub fn allowed(user: &str, resource_owner: &str, relation: &str, acl: &[String]) -> bool {
-    if user.is_empty() { return false; }          // no anonymous access
-    if user == "admin" { return true; }            // admin bypass (explicit)
-    if user == resource_owner { return true; }     // owner always allowed
-    if acl.is_empty() { return true; }            // unrestricted row
-    if acl.iter().any(|e| e == "*" || e == user) { return true; }
-    // relation-based: editors/owners imply viewer
+    if user.is_empty() { return false; }                       // no anonymous access
+    if user == "admin" { return true; }                        // admin bypass (explicit, logged)
+    if !resource_owner.is_empty() && user == resource_owner { return true; }  // owner always allowed
+    // v1: acl entries are viewer principals; editor/owner require ownership/admin
     match relation {
-        "viewer" => acl.iter().any(|e| e == user),
-        "editor" | "owner" => acl.iter().any(|e| e == user) && /* user has editor/owner role */ true,
+        "viewer" => acl.is_empty() || acl.iter().any(|e| e == "*" || e == user),
+        "editor" | "owner" => false, // only owner/admin (handled above) may write in v1
         _ => false,
     }
 }
 ```
 - `check(predicate: &str, user: &str, resource: &str) -> bool`: exact equality only — `predicate == user || predicate == resource || user == "admin"`. No substring matching. (Legacy helper retained for compatibility; prefer `allowed`.)
 
-Role semantics: `allowed` takes an additional `role: &str` parameter (`"viewer" | "editor" | "owner"`). A principal in `acl` with role `viewer` may read; `editor` may read+write; `owner` full control. For v1, `acl` entries are principal IDs with implicit `viewer` role; role granularity is v2.
+Role granularity (editor/owner roles beyond owner) is v2; v1 keeps `editor`/`owner` writes restricted to `resource_owner`/`admin`.
 
 ### 5.3 Principal identity resolution
-- MCP tools: `principal` resolved from daemon auth (bearer token → `node_id`/`user_id`) or an explicit `principal` parameter on read tools (default: daemon's own `node_id`).
-- Search/export/SPARQL: `principal` passed via `SearchFilters` / query context; default namespace owner.
+- MCP tools: `principal` is resolved from daemon/session auth context (bearer token → `node_id`/`user_id`/`verified_signer_did`). An explicit `principal` parameter is accepted ONLY when the caller is authenticated as `admin`; otherwise the client-supplied value is ignored and the authenticated principal is used.
+- Search/export/SPARQL: `principal` passed via `SearchFilters` / query context from the authenticated daemon principal; default namespace owner.
 - Admin: `"admin"` principal bypasses all checks (explicit, logged).
 
 ### 5.4 Enforcement
