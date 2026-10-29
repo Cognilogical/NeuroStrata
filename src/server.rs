@@ -9261,7 +9261,7 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(digest_input.as_bytes());
-        let source_digest = format!("{:x}", hasher.finalize());
+        let source_digest = hex::encode(hasher.finalize());
         let ck = if title.to_lowercase().contains("rule") { "rule" } else { "task" };
         let request = CreateReceiptRequest {
             namespace: namespace.clone(),

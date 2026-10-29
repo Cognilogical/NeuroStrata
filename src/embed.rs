@@ -174,7 +174,7 @@ pub fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: 
     let path = &candidates[0];
     let data = std::fs::read(path)
         .context("Failed to read model file for checksum verification")?;
-    let actual = format!("{:x}", Sha256::digest(&data));
+    let actual = hex::encode(Sha256::digest(&data));
     if actual != pinned_sha {
         return Err(anyhow!(
             "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",

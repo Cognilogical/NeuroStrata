@@ -1904,7 +1904,7 @@ pub(crate) fn hook_sha256() -> String {
     };
     let mut hasher = Sha256::new();
     hasher.update(body.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// True when `content` was written by NeuroStrata (contains the gate marker).
