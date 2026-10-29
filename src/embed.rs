@@ -43,8 +43,21 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
 
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
-        if let Ok(models) = serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
+        if let Ok(mut models) = serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
             if !models.is_empty() {
+                // Backfill known pins for configs written before supply-chain
+                // verification existed; unknown models remain unpinned and fail
+                // closed at load time.
+                for model in &mut models {
+                    if model.model_sha256.is_none()
+                        && model.model_name.eq_ignore_ascii_case("NomicEmbedTextV15")
+                    {
+                        model.model_sha256 = Some(
+                            "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+                                .to_string(),
+                        );
+                    }
+                }
                 return Ok(models);
             }
         }
@@ -60,15 +73,6 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
             api_model: None,
             // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
             model_sha256: Some("147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string()),
-        },
-        AcceptableEmbedder {
-            model_name: "BGEBaseENV15".to_string(),
-            dimensions: 768,
-            base_url: None,
-            api_key_env: None,
-            api_model: None,
-            // BGE pin pending a verified download; verification skipped when None.
-            model_sha256: None,
         },
     ];
 
@@ -240,9 +244,11 @@ impl FastEmbedder {
         // Supply-chain verification: if a pinned SHA-256 is specified, verify
         // the model file against it. This protects against cache poisoning
         // attacks where an attacker could replace a downloaded model.
-        if let Some(pinned_sha) = &target_model.model_sha256 {
-            verify_model_checksum(&cache_dir, &target_model.model_name, pinned_sha)?;
-        }
+        let pinned_sha = target_model
+            .model_sha256
+            .as_ref()
+            .ok_or_else(|| anyhow!("Embedder supply-chain error: model '{}' has no pinned SHA-256", target_model.model_name))?;
+        verify_model_checksum(&cache_dir, &target_model.model_name, pinned_sha)?;
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),

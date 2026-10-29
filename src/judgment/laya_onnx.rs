@@ -181,12 +181,56 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
         std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.join("model.onnx"), b"not-a-real-model").unwrap();
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        if let Ok(p) = LayaOnnxProvider::load(&dir, sem) {
-            assert!(!p.health_check().await.unwrap());
-            assert_eq!(p.state(), RuntimeState::Unavailable);
-        }
+        let p = LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
+        assert!(!p.health_check().await.unwrap());
+        assert_eq!(p.state(), RuntimeState::Unavailable);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn laya_load_missing_bundle_errors() {
+        let dir = std::env::temp_dir().join("ns-laya-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(LayaOnnxProvider::load(&dir, sem).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn laya_load_missing_model_errors() {
+        let dir = std::env::temp_dir().join("ns-laya-no-model");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
+        std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(LayaOnnxProvider::load(&dir, sem).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn laya_load_corrupt_manifest_errors() {
+        let dir = std::env::temp_dir().join("ns-laya-bad-manifest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{not json").unwrap();
+        std::fs::write(dir.join("model.onnx"), b"x").unwrap();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(LayaOnnxProvider::load(&dir, sem).is_err());
+
+        let dir2 = std::env::temp_dir().join("ns-laya-no-embedder");
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("manifest.json"), serde_json::to_string(&serde_json::json!({"foo":"bar"})).unwrap()).unwrap();
+        std::fs::write(dir2.join("model.onnx"), b"x").unwrap();
+        let sem2 = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(LayaOnnxProvider::load(&dir2, sem2).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
 
