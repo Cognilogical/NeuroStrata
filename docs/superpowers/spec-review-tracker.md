@@ -2,7 +2,7 @@
 
 | Spec | Task | Argon Review | Status |
 |---|---|---|---|
-| rdf-canonical-memory-data-model-migration | neurostrata-770f | REQUEST CHANGES (2026-10-28) | needs revision |
+| rdf-canonical-memory-data-model-migration | neurostrata-770f | APPROVED (2026-10-28) | ready for implementation |
 | owl-rdfs-reasoning | neurostrata-2xe9 | pending | needs review |
 | shacl-shape-validation | neurostrata-sgj4 | pending | needs review |
 | sparql-query-engine | neurostrata-gq46 | pending | needs review |

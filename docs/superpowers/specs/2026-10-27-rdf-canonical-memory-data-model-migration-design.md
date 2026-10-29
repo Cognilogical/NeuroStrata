@@ -94,6 +94,89 @@ Mesh records remain JSON envelopes for compatibility. In Phase 1 and Phase 2, ke
 - v1 records without `rdf` remain valid.
 - `schema_version` becomes `synaptic-mesh-record/v2` only in Phase 3, when legacy JSON fields may be omitted.
 
+### 5.2a Mesh wire predicate and datatype table
+
+Canonical mesh quads use these exact predicates and object kinds:
+
+| Field | Predicate | Object kind |
+|---|---|---|
+| memory id | `ns:id` | typed literal `xsd:string` |
+| namespace | `ns:namespace` | typed literal `xsd:string` |
+| memory type | `ns:memoryType` | typed literal `xsd:string` |
+| lifecycle state | `ns:lifecycleState` | typed literal `xsd:string` |
+| created_at | `ns:createdAt` | typed literal `xsd:dateTime` |
+| created_by | `ns:createdBy` | typed literal `xsd:string` |
+| superseded_by | `ns:supersededBy` | IRI `urn:neurostrata:memory:<id>` |
+| archived_at | `ns:archivedAt` | typed literal `xsd:dateTime` |
+| tombstoned_at | `ns:tombstonedAt` | typed literal `xsd:dateTime` |
+| content | `ns:content` | typed literal `xsd:string` |
+| procedure trigger | `ns:trigger` | typed literal `xsd:string` |
+| procedure initial_fires | `ns:initialFires` | typed literal `xsd:integer` | (neurostrata-770f) |
+| procedure valid_to | `ns:validTo` | typed literal `xsd:dateTime` |
+| procedure rehearsal_script | `ns:rehearsalScript` | typed literal `xsd:string` |
+| eligibility | `ns:eligibility` | typed literal `xsd:string` |
+| source | `ns:source` | typed literal `xsd:string` |
+| tags | `ns:tag` | typed literal `xsd:string` (one per tag, sorted) |
+| concept_iri | `ns:conceptIri` | IRI |
+| update_id | `ns:updateId` | typed literal `xsd:string` |
+| origin_mesh_epoch | `ns:originMeshEpoch` | typed literal `xsd:integer` |
+| trust | `ns:trust` | typed literal `xsd:string` |
+
+Omitted optional fields are simply absent; no sentinel values.
+
+### 5.2b Relationship mapping
+
+MeshRecord.relationships entries map as:
+
+- `{ "kind": "supersedes", "target": "<uuid>" }` → `ns:supersedes` → `urn:neurostrata:memory:<uuid>`
+- `{ "kind": "references", "target": "<uuid>" }` → `ns:references` → `urn:neurostrata:memory:<uuid>`
+
+LadybugDB graph relations (`ns:governs`, `ns:contains`, etc.) are separate local-graph predicates and are not part of the mesh wire profile.
+
+### 5.2c Publish-time lifecycle ordering
+
+`worker::build_record` must construct the canonical `rdf` block after preserving origin fields from any existing record in `worker::apply_one` (and in `import::preserved_edit_record` when supersede + content edit mints a new record). The `rdf` block and `canonical_hash` must reflect the final mutated JSON envelope, not the pre-preservation envelope.
+
+### 5.2d Canonical serialization rules
+
+1. Serialize each `oxrdf::Quad` using `oxrdf`/`oxttl` canonical N-Quads formatting (UTF-8, single spaces, space before `.`, `\n` terminator).
+2. Deduplicate lines.
+3. Sort lines by raw UTF-8 byte order (`[u8]::cmp`).
+4. Join with `\n` and include a trailing `\n`.
+5. Compute `sha256:<lowercase-hex>` over the exact UTF-8 bytes of `quads`.
+6. Local export profile serializes `serde_json::Value` with sorted object keys.
+
+### 5.2e Named graph IRI
+
+Authoritative form: `urn:neurostrata:graph:<namespace>:domain:gen:0`. `src/rdf/named_graphs.rs` must be aligned to this form (or the spec updated to the implemented form before Phase 1).
+
+### 5.2f Import validation (shadow reconstruction)
+
+In Phase 1 and Phase 2, `validate_record` must parse `rdf.quads`, reconstruct a shadow MeshRecord projection, and verify semantic equivalence with the JSON envelope fields before secret scanning, counter-key checks, and `classify_merge`. Default-deny any predicate not in the §5.2a allowlist.
+
+### 5.2g RdfBlock struct
+
+`src/synaptic_mesh/record.rs` must define:
+
+```rust
+pub struct RdfBlock {
+    pub schema: String,
+    pub format: String,
+    pub canonical_hash: String,
+    pub quads: String,
+}
+```
+
+with `#[serde(default, skip_serializing_if = "Option::is_none")]` on `MeshRecord.rdf`.
+
+### 5.2h MCP tool schemas
+
+`neurostrata_export_canonical_rdf` inputs: `{ namespace?: string, memory_id?: string, profile: "local"|"mesh", format: "n-quads"|"trig" }`. Returns `{ quads: string, canonical_hash: string }`.
+
+`neurostrata_validate_canonical_rdf` inputs: `{ namespace: string, memory_id: string }`. Returns `{ valid: bool, violations: string[] }`.
+
+Canonical hash claims apply only to `n-quads`; `trig` export is best-effort ordering.
+
 ### 5.3 Dual-write phase
 
 Phase 1 (dual-write):
@@ -197,7 +280,7 @@ Canonical RDF quads are available for memory exchange and export; mesh records c
 - `src/server.rs`: export and validation tools.
 - `Cargo.toml`: `oxrdf` (`rdf-12`), `oxttl`.
 
-## 6. Argon review resolutions (2026-10-28)
+## 11. Argon review resolutions (2026-10-28)
 
 1. **Mesh wire predicate & datatype table**: Add explicit mapping table for every MeshRecord field (lifecycle, update_id, origin_mesh_epoch, trust, procedure definition, curated metadata) to exact `urn:neurostrata:ns#...` predicates with XSD datatypes and round-trip rules.
 2. **Relationship vocabulary**: Map MeshRecord.relationships (`supersedes`, `references`) to `ns:supersedes` / `ns:references` targeting `urn:neurostrata:memory:<uuid>`.
