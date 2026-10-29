@@ -24,5 +24,5 @@
 | digital-twin | neurostrata-jk91 | APPROVED (2026-10-28) | ready for implementation |
 | rag-chat-optional-client | neurostrata-miuu | APPROVED (2026-10-28) | ready for implementation |
 | wasm-browser-edge-engine | neurostrata-6hjs | APPROVED (2026-10-28) | ready for implementation |
-| tdb2-storage-hygiene | neurostrata-rimc | pending | needs review |
+| tdb2-storage-hygiene | neurostrata-rimc | APPROVED (2026-10-28) | ready for implementation |
 """
