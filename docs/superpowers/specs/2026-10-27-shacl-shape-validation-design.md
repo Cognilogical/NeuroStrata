@@ -80,17 +80,49 @@ Each shape file declares:
 - closed-world `sh:closed` only where explicitly desired,
 - `sh:message` text suitable for user-facing warnings.
 
+### 3.1 Library selection (resolved)
+
+Do not use any third-party SHACL crate. Parse `.ttl` shape graphs with `oxttl` into `oxrdf::Dataset` and evaluate the fixed SHACL Core constraint set in-house in `src/rdf/shacl.rs`. Enforce `QueryBudget` between shapes and between focus nodes; return partial reports with a warning when the budget is exceeded. `oxirs-shacl`, `rudof`, `shacl-rust`, and `shacl-rs` are not dependencies. The core crate must not add `oxirs-core` (ctor/scirs2 bloat) or any LLM client.
+
 ### 5.1a Projection alignment
 
-`src/rdf/projection.rs` must emit the predicates and datatypes required by SHACL shapes:
+`src/rdf/projection.rs` must emit the predicates and datatypes required by SHACL shapes. Subject is strictly `urn:neurostrata:memory:<id>`; `metadata.concept_iri`, when present, is emitted as `ns:conceptIri`. `rdf:type` is emitted for `Memory`, `Fact`, `Rule`, `Procedure`, and `Task`. Memory fields are typed predicates (`content`, `user_id`, `memory_type`, `agent_name`, `location`, `location_lines`, `valid_from`, `valid_to`, `feedback_score`, `node_set`). Metadata fields are first-class predicates (`metadata.topology.*`, `metadata.attempt.*`, `metadata.governs`, `metadata.contained_by`, `metadata.related_to`, `metadata.extracted_from`). Edge declarations are projected as indexed predicates `ns:governs.0`, `ns:governs.1`, … (one per array element, 0-based) so SHACL reports `governs.0` rather than `governs`; qualified `ns::<id>` predicates are also emitted for target resolution. Non-string JSON scalars in `metadata` are projected as typed literals with XSD datatypes; non-object `metadata`, `metadata.topology`, `metadata.attempt`, and `metadata.task` are projected as a `ns:metadataType` typed literal (`object`/`null`/`array`/`scalar`) plus a raw `ns:metadataRaw` string so shapes can detect type mismatches before object traversal. SHACL shapes must not inspect `ldp#JSON` literals.
 
-- subject: strictly `urn:neurostrata:memory:<id>`; `metadata.concept_iri`, when present, is emitted as `ns:conceptIri`,
-- `rdf:type` for `Memory`, `Fact`, `Rule`, `Procedure`, and `Task`,
-- memory fields as typed predicates rather than opaque JSON literals (`content`, `user_id`, `memory_type`, `agent_name`, `location`, `location_lines`, `valid_from`, `valid_to`, `feedback_score`, `node_set`),
-- metadata fields as first-class predicates where shapes need to inspect them (`metadata.topology.*`, `metadata.attempt.*`, `metadata.governs`, `metadata.contained_by`, `metadata.related_to`, `metadata.extracted_from`),
-- edge declarations as parsed target strings or target stubs so edge shapes can validate syntax before resolution.
+**Class IRIs:**
 
-SHACL shapes must not attempt to inspect `ldp#JSON` literals.
+| Class | IRI |
+|---|---|
+| Memory | `urn:neurostrata:ns#Memory` |
+| Fact | `urn:neurostrata:ns#Fact` |
+| Rule | `urn:neurostrata:ns#Rule` |
+| Procedure | `urn:neurostrata:ns#Procedure` |
+| Task | `urn:neurostrata:ns#Task` |
+| MeshRecord | `urn:neurostrata:ns#MeshRecord` |
+
+**Predicate IRIs (memory-shapes.v1.ttl):**
+
+| Legacy dot-path | RDF predicate |
+|---|---|
+| `content` | `ns:content` |
+| `memory_type` | `ns:memoryType` |
+| `user_id` | `ns:userId` |
+| `agent_name` | `ns:agentName` |
+| `location` | `ns:location` |
+| `location_lines` | `ns:locationLines` |
+| `valid_from` | `ns:validFrom` |
+| `valid_to` | `ns:validTo` |
+| `feedback_score` | `ns:feedbackScore` |
+| `node_set` | `ns:nodeSet` |
+| `metadata.topology.<key>` | `ns:topology_<key>` |
+| `metadata.attempt.*` | `ns:attempt_*` |
+| `metadata.governs[i]` | `ns:governs.<i>` |
+| `metadata.contained_by` | `ns:containedBy` |
+| `metadata.related_to` | `ns:relatedTo` |
+| `metadata.extracted_from` | `ns:extractedFrom` |
+| `metadata.task.status` | `ns:taskStatus` |
+| `metadata.concept_iri` | `ns:conceptIri` |
+
+**Predicate IRIs (mesh-record-shapes.v1.ttl)** use the camelCase mesh wire profile predicates from the RDF canonical spec §5.2a (`ns:id`, `ns:namespace`, `ns:memoryType`, `ns:lifecycleState`, `ns:createdAt`, …).
 
 ### 5.2 Validation modes
 
@@ -115,6 +147,11 @@ At `upsert` and `relink_edges`:
 
 During transition, each field is validated by exactly one source: when SHACL is enabled for a field, the corresponding hand-written check is disabled for that field to avoid duplicate warnings. Topology and attempt shapes target only `Memory` rows whose `memory_type` is `fact`; on other types those metadata keys remain undeclared and accepted unchanged.
 
+Exact call graph (no duplicate warnings):
+- `upsert`: if `shacl_enabled`, call `validate_write_payload(payload)` (SHACL) and skip `write_shape_warnings`/`validate_memory` for the same fields; else call the legacy checks. Warnings are appended once to `UpsertReport.warnings`.
+- `relink_edges`: endpoint role checks validate against resolved target `memory_type`s and emit via `emit_write_shape_warning` only; SHACL is not re-run on edges here.
+- `write_shape_warnings` and `validate_memory` are not both called; `validate_memory` applies only to `fact` topology/attempt, matching `ladybug.rs`.
+
 The existing hand-written checks remain as fast pre-checks until SHACL parity tests pass. They are then either retained as fallbacks or removed in a later task (neurostrata-rzda).
 
 ### 5.4 Import and export
@@ -132,6 +169,7 @@ Validation reports use a stable JSON shape:
 
 ```json
 {
+  "valid": false,
   "conforms": false,
   "violations": [
     {
@@ -144,6 +182,8 @@ Validation reports use a stable JSON shape:
   ]
 }
 ```
+
+`valid` and `conforms` are equivalent aliases; both are returned for backward compatibility with canonical RDF tooling.
 
 - Severity is `warning` for write/import soft failures and `violation` for strict export checks.
 - Results are sorted by shape id, focus node, and path.
@@ -172,9 +212,26 @@ The core crate must not depend on an LLM client for validation.
 ## 6. Interfaces
 
 - Tools:
-  - `neurostrata_validate_memory_shape`
+  - `neurostrata_validate_shapes` (canonical name; `neurostrata_validate_memory_shape` is an alias)
   - `neurostrata_validate_rdf_export`
   - `neurostrata_validate_canonical_rdf` (wire-profile validator; registration shared with the canonical migration spec)
+
+Tool input/output JSON Schemas:
+
+`neurostrata_validate_shapes` / `neurostrata_validate_memory_shape`:
+- input: `{ namespace: string, memory_id: string }`
+- output: `{ valid: bool, conforms: bool, violations: Violation[] }`
+
+`neurostrata_validate_rdf_export`:
+- input: `{ namespace: string, memory_id?: string, strict?: bool }`
+- output: `{ valid: bool, conforms: bool, violations: Violation[] }`
+
+`neurostrata_validate_canonical_rdf`:
+- input: `{ namespace: string, memory_id: string }`
+- output: `{ valid: bool, conforms: bool, violations: Violation[] }`
+
+Violation shape: `{ shape: string, focus_node: string, path: string, severity: "warning"|"violation", message: string }`.
+
 - Store hooks:
   - `validate_write_payload(payload) -> Vec<WriteShapeWarning>`
   - `validate_rdf_dataset(dataset, mode) -> ValidationReport`
@@ -214,7 +271,7 @@ SHACL Core validation is available as a deterministic, warn-first layer over the
 - `src/store/ladybug.rs`: validation hooks in `upsert` and `relink_edges`.
 - `src/schemas/shacl/*.ttl` (new): versioned shape files.
 - `src/server.rs`: validation tools.
-- `Cargo.toml`: selected SHACL crate dependency.
+- `Cargo.toml`: `oxttl` + `oxrdf` (no third-party SHACL crate, no `oxirs-core`).
 ## 11. Argon review resolutions (2026-10-28)
 
 1. **Library selection:** Parse `.ttl` shape graphs with `oxttl` into `oxrdf::Dataset` and evaluate the fixed SHACL Core constraint set in-house in `src/rdf/shacl.rs` with per-shape/per-node `QueryBudget` checks. Do not use `oxirs-shacl`, `rudof`, or other third-party validators.
