@@ -215,3 +215,13 @@ SHACL Core validation is available as a deterministic, warn-first layer over the
 - `src/schemas/shacl/*.ttl` (new): versioned shape files.
 - `src/server.rs`: validation tools.
 - `Cargo.toml`: selected SHACL crate dependency.
+## 11. Argon review resolutions (2026-10-28)
+
+1. **Library selection:** Parse `.ttl` shape graphs with `oxttl` into `oxrdf::Dataset` and evaluate the fixed SHACL Core constraint set in-house in `src/rdf/shacl.rs` with per-shape/per-node `QueryBudget` checks. Do not use `oxirs-shacl`, `rudof`, or other third-party validators.
+2. **Existing code:** Keep `neurostrata_validate_shapes`; alias `neurostrata_validate_memory_shape` to it without breaking callers. Migrate `validate_memory`, `endpoint_role_allowed`, `enforce`, and `infer_shape` into the SHACL Core evaluator.
+3. **Duplicate-warning hazard:** Remove duplicate warnings from `write_shape_warnings` + `validate_memory`; `validate_memory` applies only to `fact` topology/attempt, matching `ladybug.rs`.
+4. **Projection rules for malformed JSON:** Project raw non-string JSON scalars with XSD datatypes or type-tag triples; preserve indexed edge declarations so `governs.0` and qualified `ns::id` checks have parity.
+5. **WriteShapeWarning visibility:** Move `WriteShapeWarning` to `src/traits.rs` with Serialize/Deserialize/PartialEq; extend `UpsertReport.warnings`; specify path-mapping table from RDF predicate IRIs to legacy dot-paths.
+6. **relink_edges:** Endpoint role checks validate against resolved target `memory_type`s and emit via `emit_write_shape_warning`.
+7. **Tool return schemas:** Reconcile `neurostrata_validate_canonical_rdf` to return both `valid`/`conforms` and structured `violations`; specify exact JSON Schemas for all three tools.
+8. **Predicate IRIs:** Specify exact class IRIs and predicate IRIs for `memory-shapes.v1.ttl` vs `mesh-record-shapes.v1.ttl`, including camelCase mesh wire profile predicates.
