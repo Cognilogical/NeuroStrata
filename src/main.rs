@@ -14,6 +14,7 @@ mod daemon;
 mod domain;
 mod embed;
 mod fts;
+mod gliner;
 mod events;
 mod graph_read;
 mod guard;
