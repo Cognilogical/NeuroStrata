@@ -19,8 +19,8 @@
 | rdf-star-provenance | neurostrata-as9v | APPROVED (2026-10-28) | ready for implementation |
 | tantivy-full-text-search | neurostrata-ljzz | APPROVED (2026-10-28) | ready for implementation |
 | full-text-search-lexical-upgrade | neurostrata-m0oz | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
-| time-series-episodic-metrics | neurostrata-ejiy | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
-| multimodal-validation | neurostrata-y062 | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
+| time-series-episodic-metrics | neurostrata-ejiy | APPROVED (2026-10-28) | ready for implementation |
+| multimodal-validation | neurostrata-y062 | APPROVED (2026-10-28) | ready for implementation |
 | digital-twin | neurostrata-jk91 | pending | needs review |
 | rag-chat-optional-client | neurostrata-miuu | pending | needs review |
 | wasm-browser-edge-engine | neurostrata-6hjs | pending | needs review |
