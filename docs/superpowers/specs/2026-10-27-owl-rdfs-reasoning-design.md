@@ -206,3 +206,13 @@ RDFS/OWL 2 RL reasoning is available as a deterministic, query-time layer over t
 - `src/store/ladybug.rs`: bounded `GOVERNS` traversal and filter expansion hooks.
 - `src/server.rs`: configuration and tool exposure if needed.
 - `Cargo.toml`: `reasonable` and/or `sophia_reasoner`, `oxrdf`, `oxttl`, `petgraph` (backup); NO `oxirs-core`/`scirs2`/`horned-owl`.
+
+## 11. Argon review resolutions (2026-10-28)
+
+1. **Materialization scope:** This spec remains query-time only; tasks `2xe9`/`duzn` requiring upsert materialization belong to a separate task and must not be conflated with this spec.
+2. **Library choice:** Primary implementation uses in-tree BFS/DFS for subClassOf*, subPropertyOf*, and bounded GOVERNS. `reasonable`/`sophia_reasoner` are evaluation-only; if they fail determinism or profile, fall back to in-tree closure. No tableau reasoner.
+3. **JSON-LD parser:** TBox loader uses deterministic `serde_json` JSON-LD parsing for `src/schemas/memory-ontology.v1.jsonld`; `oxttl` is not required for JSON-LD.
+4. **OntologyIndex directionality:** `sub_classes` maps child -> parents; `children` maps parent -> children. `closure_subclasses(root)` returns class IRIs, not MemoryIds.
+5. **QueryBudget:** Reuse existing `src/rdf/reasoning.rs::QueryBudget { max_ms, max_nodes }` and `yjah` budgets; wall-clock deadline may only truncate, never alter result sets; hard caps determine truncation.
+6. **EvidenceKind wire format:** `GovernsNhop { hops: u8 }` serializes as `governs_<hops>hop` for backward compatibility; `Ord` derived on `(hops, ...)`.
+7. **Write-time facets:** `enforced-rule`, `failed-attempt`, `architecture-decision` are derived from metadata predicates `rule_kind`, `attempt_status`, `decision_type`; inferred facets are marked `inferred: true` for bi-temporal retraction.
