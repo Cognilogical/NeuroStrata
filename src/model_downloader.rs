@@ -31,7 +31,7 @@ pub struct ModelRegistry {
     pub models: Vec<ModelEntry>,
 }
 
-const DEFAULT_REGISTRY: &str = r#"{"version":"0.4.14-bridge","models":[{"name":"laya-v1.11.1-onne","url":"https://github.com/NandhaKishorM/laya/releases/download/v0.4.14/laya-v1.11.1-onnx.tar.gz","sha256":"695a4fbb2fc63288f2e6a29054304b9f0f157b08e4c5da8bada9bdb6072aa5e8","path":"model.onnx","size_bytes":2656291,"files":null}]}"#;
+const DEFAULT_REGISTRY: &str = r#"{"version":"0.4.14-bridge","models":[{"name":"laya-v1.11.1-onnx","url":"https://github.com/NandhaKishorM/laya/releases/download/v0.4.14/laya-v1.11.1-onnx.tar.gz","sha256":"695a4fbb2fc63288f2e6a29054304b9f0f157b08e4c5da8bada9bdb6072aa5e8","path":"model.onnx","size_bytes":2656291,"files":null}]}"#;
 
 impl ModelRegistry {
     /// Load the registry from `<dir>/registry.json`. Creates a default

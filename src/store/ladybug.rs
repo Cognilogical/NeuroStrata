@@ -85,8 +85,8 @@ async fn search_inner(
                     }
                     let safe_ns = escape_ladybug_string(&namespace);
                     let exact_q = format!(
-                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata LIMIT {}",
-                        safe_ns, fetch_limit * 5
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
+                        safe_ns
                     );
                     if let Ok(rows) = conn.query(&exact_q) {
                         for row in rows {
@@ -103,6 +103,7 @@ async fn search_inner(
                             if !include_archived && is_archived(&metadata_val) { continue; }
                             if is_mesh_conflicting(&metadata_val) { continue; }
                             if crate::registry::is_registry_row(&metadata_val) { continue; }
+                            if !domain_keys.is_empty() && !crate::domain::domain_keys(&metadata_val).iter().any(|k| domain_keys.contains(k)) { continue; }
                             if !include_tasks && memory_type == "task" { continue; }
                             if STRUCTURAL_MEMORY_TYPES.contains(&memory_type.as_str()) { continue; }
                             let symbol = metadata_val.get("symbol").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
@@ -2660,9 +2661,9 @@ impl VectorStore for LadybugStore {
                     emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                         field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                         why: format!("endpoint role mismatch: {} (source={} target={})", edge.rel_type, payload.memory_type, target_type),
-                        skipped: "this edge materialization".to_string(),
+                        skipped: "warn-only: edge materialized despite role mismatch".to_string(),
                     });
-                    continue;
+                    // warn-only: do not skip edge materialization
                 }
                 // F18: GOVERNS source must be rule even when target missing/stubbed.
                 // (handled above for resolved targets; missing targets skip role check)
@@ -2688,10 +2689,8 @@ impl VectorStore for LadybugStore {
                         .or_else(|| payload.metadata.get("span_sha256"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    let (line_start, line_end) = match payload
-                        .metadata
-                        .get("location_lines")
-                        .and_then(|v| v.as_str())
+                    let (line_start, line_end) = match (if payload.location_lines.trim().is_empty() { None } else { Some(payload.location_lines.as_str()) })
+                        .or_else(|| payload.metadata.get("location_lines").and_then(|v| v.as_str()))
                     {
                         Some(s) if !s.trim().is_empty() => {
                             let parts: Vec<&str> = s.split('-').collect();

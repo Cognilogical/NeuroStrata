@@ -130,7 +130,7 @@ pub async fn process_mcp_request(
                                     },
                                     "description": "An array of file paths, line numbers, and symbols this memory governs. Memories MUST reference the specific documents they belong to."
                                 },
-                                "domain": { "type": "string", "description": "Optional category or domain this rule belongs to (e.g., 'frontend', 'database', 'devops', 'api'). It is stored normalized to a lowercase-kebab slug ('Database Access' becomes 'database-access'); a value that normalizes to nothing is stored exactly as given, and a non-string value is rejected." },
+                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional category or domain(s) this rule belongs to. Stored normalized to lowercase-kebab slug(s)." },
                                 "register_domain": { "type": "boolean", "description": "Set to true ONLY if the domain is genuinely new for this namespace; the registry rejects any other unregistered domain." },
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory IDs this rule connects to, forming a knowledge graph edge." },
                                 "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
@@ -547,7 +547,8 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name." },
-                                "session_dir": { "type": "string", "description": "Optional path to session logs directory. Defaults to .NeuroStrata/sessions." }
+                                "session_dir": { "type": "string", "description": "Optional path to session logs directory. Defaults to .NeuroStrata/sessions." },
+                                "dry_run": { "type": "boolean", "description": "If true, report candidates without writing." }
                             },
                             "required": ["namespace"]
                         }
@@ -825,7 +826,7 @@ pub async fn process_mcp_request(
                                 crate::task::handle_task_validate(arguments, store.clone()).await;
                         }
                         "neurostrata_domain_registry" => {
-                            result_text = handle_domain_registry(arguments, store.clone()).await;
+                            result_text = handle_domain_registry(arguments, emb.clone(), store.clone()).await;
                         }
                         "neurostrata_task_intake" => {
                             result_text = crate::task::intake::handle_intake(
@@ -1883,9 +1884,34 @@ async fn handle_add_memory(
     // the caller's own metadata -- so a stored domain is already a key. A
     // domain with no usable slug is stored exactly as it was given: the write
     // never guesses one (the registry check above rejected any non-string).
-    if let Some(slug) = crate::domain::domain_key(&metadata) {
-        if let Some(meta_obj) = metadata.as_object_mut() {
-            meta_obj.insert("domain".to_string(), Value::String(slug));
+    // F9: normalize domain in place, preserving string vs array.
+    if let Some(meta_obj) = metadata.as_object_mut() {
+        match meta_obj.get("domain").cloned() {
+            Some(Value::String(s)) => {
+                if let Some(slug) = crate::domain::normalize_domain_slug(&s) {
+                    meta_obj.insert("domain".to_string(), Value::String(slug));
+                }
+            }
+            Some(Value::Array(arr)) => {
+                let mut out: Vec<Value> = Vec::new();
+                let mut seen: Vec<String> = Vec::new();
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        if let Some(slug) = crate::domain::normalize_domain_slug(s) {
+                            if !seen.contains(&slug) {
+                                seen.push(slug.clone());
+                                out.push(Value::String(slug));
+                            }
+                        } else {
+                            out.push(v.clone());
+                        }
+                    } else {
+                        out.push(v.clone());
+                    }
+                }
+                meta_obj.insert("domain".to_string(), Value::Array(out));
+            }
+            _ => {}
         }
     }
     stamp_new_memory(&mut metadata);
@@ -2264,12 +2290,12 @@ async fn handle_get_snapshot(
                 "directory" | "file" | "markdown" | "freshness_flag" | "guard_event" | "task" | "procedure"
             )
         })
-        .filter(|r| crate::domain::domain_key(&r.payload.metadata).is_some())
+        .filter(|r| !crate::domain::domain_keys(&r.payload.metadata).is_empty())
         .collect();
     if mode == "explicit" {
         candidates.retain(|r| {
-            let slug = crate::domain::domain_key(&r.payload.metadata).unwrap();
-            requested_slugs.contains(&slug)
+            let keys = crate::domain::domain_keys(&r.payload.metadata);
+            keys.iter().any(|k| requested_slugs.contains(k))
         });
     }
     candidates.sort_by(|a, b| {
@@ -2311,7 +2337,7 @@ async fn handle_get_snapshot(
         if selected.len() >= 3 {
             break;
         }
-        let slug = crate::domain::domain_key(&r.payload.metadata).unwrap();
+        let slug = crate::domain::domain_keys(&r.payload.metadata).into_iter().next().unwrap_or_default();
         if mode == "recent_domain" {
             let count = selected_domains.iter().filter(|d| *d == &slug).count();
             if count >= 2 {
@@ -2325,7 +2351,7 @@ async fn handle_get_snapshot(
     let strap_entries: Vec<Value> = selected
         .iter()
         .map(|r| {
-            let slug = crate::domain::domain_key(&r.payload.metadata).unwrap();
+            let slug = crate::domain::domain_keys(&r.payload.metadata).into_iter().next().unwrap_or_default();
             let prefix = if crate::attempt::is_failed_attempt(&r.payload.metadata) {
                 crate::attempt::FAILED_ATTEMPT_PREFIX
             } else {
@@ -2659,7 +2685,7 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
 }
 
 
-async fn handle_domain_registry(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+async fn handle_domain_registry(arguments: Value, emb: Arc<dyn crate::traits::Embedder>, store: Arc<dyn VectorStore>) -> String {
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"namespace missing"}}).to_string(),
@@ -2726,6 +2752,15 @@ async fn handle_domain_registry(arguments: Value, store: Arc<dyn VectorStore>) -
             } else {
                 idx.and_then(|i| entries[i].get("concept_iri").cloned()).unwrap_or(serde_json::Value::Null)
             };
+            // Sort + dedup aliases (F15).
+            let aliases = if let Some(arr) = aliases.as_array() {
+                let mut v: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+                v.sort();
+                v.dedup();
+                serde_json::json!(v)
+            } else {
+                aliases
+            };
             let new_entry = serde_json::json!({
                 "slug": slug,
                 "parent": parent,
@@ -2756,9 +2791,12 @@ async fn handle_domain_registry(arguments: Value, store: Arc<dyn VectorStore>) -
             if let Some(dr) = v2.get("domain_registry").cloned() { obj.insert("domain_registry".to_string(), dr); }
             obj.insert("eligibility".to_string(), serde_json::json!("private"));
             let rid = crate::registry::registry_row_id(namespace);
-            let (vector, _) = match store.get(namespace, &rid).await {
-                Ok(Some(found)) => found,
-                _ => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"registry row missing"},"warnings":[]}).to_string(),
+            let vector = match store.get(namespace, &rid).await {
+                Ok(Some((v, _))) => v,
+                _ => match emb.embed(&crate::registry::registry_content(namespace)).await {
+                    Ok(v) => v,
+                    Err(e) => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":format!("registry bootstrap failed: {}", e)},"warnings":[]}).to_string(),
+                },
             };
             let payload = crate::traits::MemoryPayload {
                 content: crate::registry::registry_content(namespace),
@@ -2772,6 +2810,7 @@ async fn handle_domain_registry(arguments: Value, store: Arc<dyn VectorStore>) -
             if let Err(e) = store.upsert(namespace, &rid, vector, payload).await {
                 return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":e.to_string()},"warnings":[]}).to_string();
             }
+            if let Some(ls) = crate::traits::VectorStore::as_any(&*store).downcast_ref::<crate::store::ladybug::LadybugStore>() { ls.refresh_ontology(namespace).await; }
             let meta3 = read_registry().await;
             let domains: Vec<_> = crate::registry::registry_domain_entries(&meta3).into_iter().map(|e| serde_json::json!({
                 "slug": e.get("slug").cloned().unwrap_or(serde_json::Value::Null),
@@ -2800,7 +2839,7 @@ async fn handle_domain_registry(arguments: Value, store: Arc<dyn VectorStore>) -
             let rows = store.list(namespace, None, None).await.unwrap_or_default();
             let orphaned = rows.iter().filter(|r| {
                 !crate::registry::is_registry_row(&r.payload.metadata) &&
-                crate::domain::domain_key(&r.payload.metadata).as_deref()==Some(&slug)
+                crate::domain::domain_keys(&r.payload.metadata).iter().any(|k| k == &slug)
             }).count();
             let new_entries: Vec<_> = entries.into_iter().filter(|e| e.get("slug").and_then(|v|v.as_str())!=Some(&slug)).collect();
             let mut meta2 = meta.clone();
@@ -2823,6 +2862,7 @@ async fn handle_domain_registry(arguments: Value, store: Arc<dyn VectorStore>) -
                 metadata: meta2,
             };
             let _ = store.upsert(namespace, &rid, vector, payload).await;
+            if let Some(ls) = crate::traits::VectorStore::as_any(&*store).downcast_ref::<crate::store::ladybug::LadybugStore>() { ls.refresh_ontology(namespace).await; }
             let meta3 = read_registry().await;
             serde_json::json!({"ok":true,"registry":{"version":2,"domains":crate::registry::registry_domain_entries(&meta3)},"warnings":[],"removed":true,"orphaned_memories":orphaned}).to_string()
         }
@@ -4010,8 +4050,9 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
                 } else {
                     first.source.as_str()
                 };
-                // Validate terminal is result.id
-                if second.source != result.id && second.target != result.id {
+                // Validate terminal is result.id (use last edge so N-hop CONTAINS paths work).
+                let terminal = ev.path.last().unwrap();
+                if terminal.source != result.id && terminal.target != result.id {
                     continue;
                 }
                 let rendered_path = render_path(ev, orig);
@@ -9127,7 +9168,7 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
 
     // Scan session logs and propose candidates (deterministic sort + dedup).
     let path = std::path::Path::new(&session_dir);
-    let mut proposed: Vec<(String, String)> = Vec::new(); // (title, description)
+    let mut proposed: Vec<(String, String, String, usize)> = Vec::new(); // (title, description, file, line_no)
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
@@ -9144,7 +9185,7 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
             Ok(c) => c,
             Err(_) => continue,
         };
-        for line in content.lines() {
+        for (line_no, line) in content.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -9193,7 +9234,7 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
             if !seen.insert(dedup_key) {
                 continue;
             }
-            proposed.push((title, trimmed.to_string()));
+            proposed.push((title, trimmed.to_string(), file.display().to_string(), line_no + 1));
         }
     }
 
@@ -9203,7 +9244,7 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
 
     // Dry run: report only.
     if dry_run {
-        let lines: Vec<String> = proposed.iter().map(|(t, _)| format!("- {}", t)).collect();
+        let lines: Vec<String> = proposed.iter().map(|(t, _, _, _)| format!("- {}", t)).collect();
         return format!("Proposed candidates (dry-run, review-only):
 {}", lines.join("
 "));
@@ -9215,8 +9256,8 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     let source_revision = format!("distill:{}", session_dir);
     let mut created = 0usize;
     let mut candidate_ids: Vec<String> = Vec::new();
-    for (idx, (title, desc)) in proposed.into_iter().enumerate() {
-        let digest_input = format!("{}:{}:{}", namespace, idx, desc);
+    for (title, desc, file, line_no) in proposed.into_iter() {
+        let digest_input = format!("{}:{}:{}:{}:{}", namespace, file, line_no, title, desc);
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(digest_input.as_bytes());

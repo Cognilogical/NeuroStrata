@@ -1082,7 +1082,22 @@ pub async fn ingest_directory(
                 };
                 if !carry { continue; }
                 if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &id).await {
-                    payload.metadata.as_object_mut().map(|o| { o.insert("index_generation".to_string(), serde_json::json!(generation)); o.insert("ingest_version".to_string(), serde_json::json!(current_version)); });
+                    let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
+                    let new_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, generation, crate::parser::generation::NAMESPACE_SEPARATOR);
+                    payload.metadata.as_object_mut().map(|o| {
+                        o.insert("index_generation".to_string(), serde_json::json!(generation));
+                        o.insert("ingest_version".to_string(), serde_json::json!(current_version));
+                        // Fix contained_by generation prefixes (F2).
+                        if let Some(serde_json::Value::Array(arr)) = o.get("contained_by").cloned() {
+                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                            o.insert("contained_by".to_string(), serde_json::Value::Array(updated));
+                        }
+                        // Fix depends_on generation prefixes (F2).
+                        if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
+                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                            o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
+                        }
+                    });
                     let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
                     if vector_store.upsert(namespace, &new_id, vec, payload).await.is_ok() {
                         carried += 1;

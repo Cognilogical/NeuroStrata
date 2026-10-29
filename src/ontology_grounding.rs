@@ -37,7 +37,7 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     // Collect candidate entries as (slug, concept_iri).
-    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut entries: Vec<(String, String, Vec<String>)> = Vec::new();
 
     if let Some(arr) = vocab.as_array() {
         collect_entries_from_array(arr, &mut entries);
@@ -52,7 +52,7 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
             if let Some(cobj) = concepts.as_object() {
                 for (k, v) in cobj {
                     if let Some(iri) = value_to_iri(v) {
-                        entries.push((k.clone(), iri));
+                        entries.push((k.clone(), iri, Vec::new()));
                     }
                 }
             }
@@ -60,7 +60,7 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
             // top-level slug -> iri/object
             for (k, v) in obj {
                 if let Some(iri) = value_to_iri(v) {
-                    entries.push((k.clone(), iri));
+                    entries.push((k.clone(), iri, Vec::new()));
                 }
             }
         }
@@ -68,9 +68,12 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
 
     for slug in domains {
         let norm = crate::domain::normalize_domain_slug(slug).unwrap_or_else(|| slug.to_lowercase());
-        for (entry_slug, iri) in &entries {
+        for (entry_slug, iri, aliases) in &entries {
             let entry_norm = crate::domain::normalize_domain_slug(entry_slug).unwrap_or_else(|| entry_slug.to_lowercase());
-            if entry_norm == norm && !iri.trim().is_empty() && seen.insert(iri.clone()) {
+            let alias_match = aliases.iter().any(|a| {
+                crate::domain::normalize_domain_slug(a).unwrap_or_else(|| a.to_lowercase()) == norm
+            });
+            if (entry_norm == norm || alias_match) && !iri.trim().is_empty() && seen.insert(iri.clone()) {
                 out.push(iri.clone());
             }
         }
@@ -78,7 +81,7 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
     out
 }
 
-fn collect_entries_from_array(arr: &[Value], out: &mut Vec<(String, String)>) {
+fn collect_entries_from_array(arr: &[Value], out: &mut Vec<(String, String, Vec<String>)>) {
     for item in arr {
         if let Some(obj) = item.as_object() {
             let slug = obj
@@ -95,8 +98,13 @@ fn collect_entries_from_array(arr: &[Value], out: &mut Vec<(String, String)>) {
                 .or_else(|| obj.get("iri"))
                 .or_else(|| obj.get("uri"))
                 .and_then(value_to_iri);
+            let aliases = obj
+                .get("aliases")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
             if let (Some(s), Some(i)) = (slug, iri) {
-                out.push((s, i));
+                out.push((s, i, aliases));
             }
         }
     }
@@ -141,8 +149,23 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
         }
     };
     // malformed check: must be JSON object
-    if serde_json::from_str::<Value>(&content).is_err() {
-        out.push(Value::json_obj(namespace, "malformed", Some(cfg.path.clone()), "invalid JSON".to_string()));
+    let vocab = match serde_json::from_str::<Value>(&content) {
+        Ok(v) => v,
+        Err(_) => {
+            out.push(Value::json_obj(namespace, "malformed", Some(cfg.path.clone()), "invalid JSON".to_string()));
+            return out;
+        }
+    };
+    // out_of_vocabulary: report domains in registry with no concept_iri in vocab.
+    let entries = crate::registry::registry_domain_entries(&meta);
+    for e in &entries {
+        if let Some(slug) = e.get("slug").and_then(|v| v.as_str()) {
+            let iris = concept_iris_from_vocabulary(&vocab, &[slug.to_string()]);
+            if iris.is_empty() {
+                out.push(Value::json_obj(namespace, "out_of_vocabulary", Some(cfg.path.clone()),
+                    format!("domain '{}' has no concept_iri in vocabulary", slug)));
+            }
+        }
     }
     out
 }

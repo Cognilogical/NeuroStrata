@@ -180,8 +180,17 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
                 }
                 _ => (false, false),
             };
-            // High cosine (cosine distance <= 0.15). score is distance (lower better).
-            let high_cosine = a.score <= 0.15 && b.score <= 0.15;
+            // Pairwise content similarity (replaces query-score proxy). High when
+            // token Jaccard similarity >= 0.85 (i.e. cosine distance <= 0.15).
+            let tokens = |s: &str| -> std::collections::BTreeSet<String> {
+                s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).map(|t| t.to_string()).collect()
+            };
+            let ta = tokens(&a.payload.content);
+            let tb = tokens(&b.payload.content);
+            let inter = ta.intersection(&tb).count();
+            let union = ta.union(&tb).count().max(1);
+            let sim = inter as f64 / union as f64;
+            let high_cosine = sim >= 0.85;
 
             if !same_loc && !same_topo_anchor && !high_cosine { continue; }
 
