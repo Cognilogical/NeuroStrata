@@ -65,6 +65,7 @@ pub struct LexicalDoc {
     pub valid_to: Option<i64>,
     pub archived: bool,
     pub user_id: String,         // resource owner for ReBAC
+    pub visible_to: Vec<String>, // ReBAC ACL
     pub domains: Vec<String>,    // domain slugs
 }
 pub struct NamespaceIndex {
@@ -92,6 +93,7 @@ pub enum Field { Content, Symbol, Location }
 - Position tracking per field for phrase queries.
 - Empty tokens discarded.
 - Tokenizer binding is fixed: `content` → `tokenize_whitespace`; `symbol`, `location` → `tokenize_code`.
+- Query tokenization per field: a query clause is tokenized with the target field's tokenizer before matching; if no field is specified, the clause is evaluated against all fields using their respective tokenizers (a term matches if it matches in any field).
 
 ### 5.3 Indexing
 
@@ -134,7 +136,10 @@ Sort `ASC` by distance, tie-break `id ASC`.
 At query time:
 
 - namespace equality (required).
-- exclude if retired: `valid_to` is `Some(v)` with `v > 0 && v <= now` (matching `is_retired_at` in `ladybug.rs`); unless `as_of` provided and `valid_to` is `Some(v)` with `valid_from.unwrap_or(0) <= as_of && (v == 0 || as_of < v)` (historical). `valid_from`/`valid_to` are `Option<i64>`; `None` means unspecified (not retired).
+- Retirement filter:
+  - `as_of = None`: include row if `valid_to.map_or(true, |v| v <= 0 || v > now)` (active rows).
+  - `as_of = Some(ts)`: include row if `valid_from.unwrap_or(0) <= ts && valid_to.map_or(true, |v| v <= 0 || ts < v)`.
+  - `valid_from`/`valid_to` are `Option<i64>`; `None` means unspecified.
 - exclude archived unless `include_archived`.
 - exclude task rows unless `include_tasks`.
 - exclude structural/registry/mesh-conflicting always.
@@ -179,7 +184,7 @@ Reuse Tantivy spec §5.7 format: `\nMatch [lexical-inhouse]` on `DirectMatch` ro
 - Empty index: empty.
 - All terms missing: doc score 0 (excluded).
 - Fuzzy expansion cap (50) prevents blow-up.
-- Phrase with no adjacent match: no phrase boost.
+- Phrase with no adjacent match: document is excluded (phrase is a hard filter, not a boost).
 - Namespace isolation: no cross-namespace leakage.
 - Retired/superseded: filtered per `as_of`.
 
