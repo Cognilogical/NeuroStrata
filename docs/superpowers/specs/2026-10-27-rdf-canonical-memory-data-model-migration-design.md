@@ -196,3 +196,14 @@ Canonical RDF quads are available for memory exchange and export; mesh records c
 - `src/synaptic_mesh/import.rs`: canonical validation and application.
 - `src/server.rs`: export and validation tools.
 - `Cargo.toml`: `oxrdf` (`rdf-12`), `oxttl`.
+
+## 6. Argon review resolutions (2026-10-28)
+
+1. **Mesh wire predicate & datatype table**: Add explicit mapping table for every MeshRecord field (lifecycle, update_id, origin_mesh_epoch, trust, procedure definition, curated metadata) to exact `urn:neurostrata:ns#...` predicates with XSD datatypes and round-trip rules.
+2. **Relationship vocabulary**: Map MeshRecord.relationships (`supersedes`, `references`) to `ns:supersedes` / `ns:references` targeting `urn:neurostrata:memory:<uuid>`.
+3. **Publish-time lifecycle ordering**: Recompute `rdf` block after preserving origin fields in `worker::apply_one` and `import::preserved_edit_record`.
+4. **RdfBlock struct**: Replace fields in `src/synaptic_mesh/record.rs` to match `{schema, format, canonical_hash, quads}` and add serde defaults.
+5. **Import validation**: Parse `rdf.quads`, reconstruct shadow MeshRecord, verify semantic equivalence before secret scanning and classify_merge; default-deny unknown predicates.
+6. **Canonical serialization**: Specify oxrdf/oxttl formatting, sorted lines, trailing newline, sha256 lowercase hex.
+7. **Named graph IRI**: Align `src/rdf/named_graphs.rs` with `urn:neurostrata:graph:<namespace>:domain:gen:0` or update spec to authoritative form.
+8. **MCP tool schemas**: Specify exact JSON Schema for `neurostrata_export_canonical_rdf` and `neurostrata_validate_canonical_rdf`.
