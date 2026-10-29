@@ -1,6 +1,21 @@
-//! Neuro-symbolic guardrails (in-house): rule-based validation gate.
+//! Guardrails (in-house).
 pub fn guard(input: &str, forbidden: &[&str]) -> bool {
-    let lower = input.to_lowercase();
-    !forbidden.iter().any(|f| lower.contains(&f.to_lowercase()))
+    let low = input.to_lowercase();
+    !forbidden.iter().any(|f| low.contains(&f.to_lowercase()))
 }
-#[cfg(test)] mod tests { use super::*; #[test] fn blocks() { assert!(!guard("delete all", &["delete"])); assert!(guard("read", &["delete"])); } }
+pub fn redact(input: &str, secrets: &[&str]) -> String {
+    let mut out = input.to_string();
+    for s in secrets { out = out.replace(s, "[REDACTED]"); }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn blocks() { assert!(!guard("rm -rf /", &["rm -rf"])); }
+    #[test]
+    fn allows() { assert!(guard("hello", &["rm -rf"])); }
+    #[test]
+    fn redacts() { assert_eq!(redact("token=abc", &["abc"]), "token=[REDACTED]"); }
+}

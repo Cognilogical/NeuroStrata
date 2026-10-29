@@ -63,3 +63,38 @@ mod tests {
         assert!(out.get("x").unwrap().contains("b"));
     }
 }
+
+/// Materialize inferred triples from a base triple set using RDFS subclass rule.
+pub fn materialize_triples(triples: &[(String,String,String)]) -> Vec<(String,String,String)> {
+    let mut out: Vec<(String,String,String)> = triples.to_vec();
+    // subclass propagation: if (x rdf:type C) and (C rdfs:subClassOf D) then (x rdf:type D)
+    let mut subclasses: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for (s,p,o) in triples {
+        if p == "rdfs:subClassOf" { subclasses.entry(s.clone()).or_default().push(o.clone()); }
+    }
+    for (s,p,o) in triples {
+        if p == "rdf:type" {
+            if let Some(supers) = subclasses.get(o) {
+                for sup in supers {
+                    let t = (s.clone(), "rdf:type".to_string(), sup.clone());
+                    if !out.contains(&t) { out.push(t); }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod owl_extra_tests {
+    use super::*;
+    #[test]
+    fn materializes() {
+        let base = vec![
+            ("x".into(),"rdf:type".into(),"A".into()),
+            ("A".into(),"rdfs:subClassOf".into(),"B".into()),
+        ];
+        let out = materialize_triples(&base);
+        assert!(out.iter().any(|t| t == &("x".into(),"rdf:type".into(),"B".into())));
+    }
+}
