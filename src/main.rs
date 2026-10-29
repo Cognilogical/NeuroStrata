@@ -3369,11 +3369,11 @@ async fn run() -> anyhow::Result<()> {
                     Commands::Laya { model, out_dir } => {
                         let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
                         let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
-                        let _ = crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(
+                        crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(
                             &model_id,
                             &target_dir,
                         )
-                        .await;
+                        .await?;
                     }
                     Commands::Namespaces => {
                         run_namespaces(&read).await?;

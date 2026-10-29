@@ -37,6 +37,10 @@ impl LayaOnnxProvider {
         if !manifest_path.exists() {
             return Err(anyhow!("Bundle missing manifest.json"));
         }
+        let model_path = canonical.join("model.onnx");
+        if !model_path.exists() {
+            return Err(anyhow!("Bundle missing model.onnx"));
+        }
         // Read manifest to validate embedder identity
         let manifest_text = std::fs::read_to_string(&manifest_path)
             .map_err(|e| anyhow!(format!("Cannot read manifest: {e}")))?;
@@ -76,17 +80,10 @@ impl LayaOnnxProvider {
         })
         .await??;
 
-        // Ensure manifest.json exists for the provider to load
+        // Do not fabricate a manifest: the downloaded bundle must be complete.
         let manifest_path = target_path.join("manifest.json");
         if !manifest_path.exists() {
-            let manifest = serde_json::json!({
-                "model_path": "model.onnx",
-                "embedder_id": "laya-english-v0.4.14",
-                "embedder": "laya-english-v0.4.14",
-                "model_version": "v1.11.1",
-                "version": "v1.11.1"
-            });
-            std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+            return Err(anyhow!("Downloaded Laya bundle is missing manifest.json"));
         }
 
         println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());
@@ -105,12 +102,11 @@ impl JudgmentProvider for LayaOnnxProvider {
         // Inference runs inside spawn_blocking under the semaphore; the permit
         // is acquired first so concurrent requests are bounded.
         let _permit = self.inference_semaphore.acquire().await.unwrap();
-        let model_path = self.bundle_root.join("model.onnx");
-        if model_path.exists() && !candidates.is_empty() {
-            // Real ONNX inference is not yet wired; refuse to fabricate a score.
+        if !candidates.is_empty() {
+            // ONNX inference is not wired; never fabricate a duplicate score.
             return Err(anyhow!(
-                "Laya ONNX inference not implemented (model present at {})",
-                model_path.display()
+                "Laya ONNX inference not implemented (bundle: {})",
+                self.bundle_root.display()
             ));
         }
         Ok(vec![])
@@ -281,17 +277,10 @@ impl LearningRuntimeManager {
         })
         .await??;
 
-        // Ensure manifest.json exists for the provider to load
+        // Do not fabricate a manifest: the downloaded bundle must be complete.
         let manifest_path = target_path.join("manifest.json");
         if !manifest_path.exists() {
-            let manifest = serde_json::json!({
-                "model_path": "model.onnx",
-                "embedder_id": "laya-english-v0.4.14",
-                "embedder": "laya-english-v0.4.14",
-                "model_version": "v1.11.1",
-                "version": "v1.11.1"
-            });
-            std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+            return Err(anyhow!("Downloaded Laya bundle is missing manifest.json"));
         }
 
         println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());

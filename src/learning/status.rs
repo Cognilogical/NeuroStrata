@@ -30,7 +30,7 @@ impl Default for LearnStatus {
             previous_good_version: None,
             candidate_version: None,
             shadow_version: None,
-            runtime_state: RuntimeState::Ready,
+            runtime_state: RuntimeState::Unavailable,
             training_state: TrainingJobState::WaitingForData,
             pending_reason: None,
             unlabeled_observations: 0,
