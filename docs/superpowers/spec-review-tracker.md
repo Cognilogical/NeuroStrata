@@ -18,7 +18,7 @@
 | closure-budget-zstd-anomaly | neurostrata-g6mw | APPROVED (2026-10-28) | ready for implementation |
 | rdf-star-provenance | neurostrata-as9v | APPROVED (2026-10-28) | ready for implementation |
 | tantivy-full-text-search | neurostrata-ljzz | APPROVED (2026-10-28) | ready for implementation |
-| full-text-search-lexical-upgrade | neurostrata-m0oz | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
+| full-text-search-lexical-upgrade | neurostrata-m0oz | APPROVED (2026-10-28) | ready for implementation |
 | time-series-episodic-metrics | neurostrata-ejiy | APPROVED (2026-10-28) | ready for implementation |
 | multimodal-validation | neurostrata-y062 | APPROVED (2026-10-28) | ready for implementation |
 | digital-twin | neurostrata-jk91 | pending | needs review |
