@@ -116,10 +116,7 @@ graphql-parser = "0.4"
 # libssl/libcrypto on every target (its C++ core hard-requires OpenSSL), so
 # Windows now needs a vendored build to satisfy the linker. Apple targets keep
 # the system-path resolution that already works.
-[target.'cfg(not(target_vendor = "apple"))'.dependencies]
-openssl = { version = "0.10.81", features = ["vendored"] }
-
-ort = { version = "2.0.0-rc.13", optional = true }
+ort = { version = "2.0.0-rc.13" }
 tokenizers = { version = "0.23.2", optional = true }
 ndarray = { version = "0.17.2", optional = true }
 petgraph = { version = "0.8", optional = true }
@@ -127,13 +124,16 @@ leiden-rs = { version = "0.8", default-features = false, features = ["petgraph"]
 rand = { version = "0.10", optional = true }
 tantivy = { version = "0.27", optional = true }
 
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+openssl = { version = "0.10.81", features = ["vendored"] }
+
 [build-dependencies]
 cxx-build = "=1.0.138"
 
 [features]
 default = []
 learning-laya = []
-gliner = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+gliner = ["dep:tokenizers", "dep:ndarray"]
 community = ["dep:leiden-rs", "dep:petgraph"]
 kge = ["dep:ndarray", "dep:rand"]
 owl-petgraph = ["dep:petgraph"]
