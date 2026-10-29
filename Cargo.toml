@@ -52,6 +52,12 @@ path = "tests/graph_read/memories_for_file_test.rs"
 name = "related_test"
 path = "tests/graph_read/related_test.rs"
 
+# In-house lexical engine contract. Compiles the crate-free `fts` module from
+# its real path; it must stay std-only so the WASM crate can reuse it.
+[[test]]
+name = "lexical_test"
+path = "tests/fts/lexical_test.rs"
+
 [dependencies]
 tokio = { version = "1.53", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

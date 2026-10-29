@@ -136,6 +136,15 @@ pub struct DomainSearchOutcome {
     pub incomplete: bool,
 }
 
+/// The outcome of an in-house lexical search.
+#[derive(Debug, Clone)]
+pub struct LexicalSearchOutcome {
+    pub results: Vec<SearchResult>,
+    /// True when a requested domain filter actually selected the rows.
+    /// False covers both "no filter asked for" and the documented fallback.
+    pub domain_filter_applied: bool,
+}
+
 /// What an attempt to move a memory between namespaces found.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RelocateOutcome {
@@ -448,6 +457,31 @@ pub trait VectorStore: Send + Sync + AsAny {
             mode: DomainMatchMode::Vector,
             incomplete: false,
         })
+    }
+
+    /// Search with the in-house multi-field lexical engine.
+    ///
+    /// The default implementation refuses instead of returning an empty list:
+    /// a backend that cannot do lexical search must not look like a namespace
+    /// with no matching memories.
+    async fn search_lexical(
+        &self,
+        _namespace: &str,
+        _query: &str,
+        _limit: usize,
+        _include_tasks: bool,
+        _include_archived: bool,
+        _domains: &[String],
+        _principal: &str,
+        _fuzzy_max_distance: usize,
+    ) -> Result<LexicalSearchOutcome> {
+        anyhow::bail!("lexical-inhouse search is not supported by this store")
+    }
+
+    /// Rebuild the in-house lexical index from the store of record. Returns the
+    /// number of documents indexed.
+    async fn rebuild_lexical_index(&self, _namespace: Option<&str>) -> Result<usize> {
+        anyhow::bail!("lexical-inhouse search is not supported by this store")
     }
 
     /// Write a self-contained snapshot of the store into `dir`.
