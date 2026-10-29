@@ -13,7 +13,7 @@
 | federation | neurostrata-ahix | APPROVED (2026-10-28) | ready for implementation |
 | streaming-delta | neurostrata-7rgp | APPROVED (2026-10-28) | ready for implementation |
 | did-signed-mesh-records | neurostrata-39v2 | APPROVED (2026-10-28) | ready for implementation |
-| rebac | neurostrata-azjv | pending | needs review |
+| rebac | neurostrata-azjv | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
 | graphql-curated-read-api | neurostrata-ect5 | pending | needs review |
 | closure-budget-zstd-anomaly | neurostrata-g6mw | pending | needs review |
 | rdf-star-provenance | neurostrata-as9v | pending | needs review |
