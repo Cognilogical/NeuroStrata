@@ -72,11 +72,12 @@ All v1 records without these fields remain valid.
 
 ### 5.4 Key management
 - Private key stored at `<db_path_parent>/mesh_keys/<instance>.key` (PEM/PKCS8), mode 0600, outside the repo, never committed (`.gitignore`).
-- Public key / DID published in `MeshManifest` (`manifest.json`) under `signers: Vec<SignerEntry { did, public_key }>` with `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so existing manifests without a `signers` key remain valid.
+- Public key / DID published in `MeshManifest` (`manifest.json`) under `signers: Vec<SignerEntry { node_id, did, public_key }>` with `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so existing manifests without a `signers` key remain valid. `node_id` is the instance's `node_id` (e.g. `"node-abc123"` from `~/.NeuroStrata/mesh-node-id`), `did` is its `did:key`, `public_key` is base64 Ed25519 public key.
 - Config: `mesh_signing_key_path: Option<PathBuf>` (default `<db_path_parent>/mesh_keys/default.key`); if absent, signing disabled (warn once).
 
 ### 5.5 Publish path (`src/synaptic_mesh/worker.rs`)
-- In `build_record` / `drain_once`: if a signing key is configured, compute canonical payload bytes, sign with Ed25519, set `signature`, `signer_did`, `public_key` on the record before writing to outbox.
+- `lifecycle.created_by` remains the instance `node_id` (e.g. `"node-abc123"`); signing does NOT overwrite it with `signer_did`.
+- In `build_record` / `drain_once`: if a signing key is configured, compute canonical payload bytes, sign with Ed25519, set `signature`, `signer_did`, `public_key` on the record before writing to outbox. Register `(node_id, signer_did, public_key)` in `MeshManifest.signers` on first publish (idempotent).
 - If signing key absent, record is unsigned (no fields set); no error.
 - Signing failure (key load error) → log warning, publish unsigned (warn-first).
 
@@ -85,14 +86,14 @@ All v1 records without these fields remain valid.
   - If `signature` is `None`: proceed (unsigned), `created_by_verified: false`, no warning beyond "unsigned".
   - If `signature` present:
     - Resolve signer public key: from `record.public_key` (verify it matches `signer_did` via `did:key` decoding) or from `MeshManifest.signers`.
-    - Identity-binding rule: `created_by_verified` is set to `true` **only if** `signer_did == record.lifecycle.created_by` (or, when `MeshManifest.signers` is non-empty, `signer_did` is listed in `MeshManifest.signers` AND equals `record.lifecycle.created_by`). Arbitrary self-generated keypairs that do not match `lifecycle.created_by` are treated as `signer_mismatch` and never marked verified.
-    - Verify Ed25519 signature over canonical payload bytes.
-    - If valid and identity-bound: set `mesh_provenance.created_by_verified = true`, store `signer_did` as `verified_signer_did`.
-    - If invalid/corrupt/mismatch/identity-unbound: reject into `report.ignored` with structured reason `"invalid_signature"`, `"signer_mismatch"`, or `"identity_unbound"`; never mark verified; do not apply row.
+    - Verify Ed25519 signature over canonical payload bytes (if invalid → reject into `report.ignored` with `"invalid_signature"`; if `public_key` doesn't derive to `signer_did` → reject `"signer_mismatch"`).
+    - Identity-binding (Option A): set `created_by_verified = true` **only if** `MeshManifest.signers` contains an entry where `node_id == record.lifecycle.created_by` AND `did == record.signer_did` AND `public_key == record.public_key`. If the signature is valid but no such manifest entry exists (e.g. `signers` empty or different transition signer), import the record normally with `signature_verified: true` and `created_by_verified: false` — do NOT drop valid signed records into `report.ignored`.
+    - Store `signer_did` as `verified_signer_did` when `signature_verified` is true.
+    - If invalid/corrupt/mismatch: reject into `report.ignored` with structured reason `"invalid_signature"` or `"signer_mismatch"`; never mark verified; do not apply row.
 - `mesh_provenance` (line ~968) updated: `created_by_verified` reflects verification result; `claimed_created_by` retained for audit.
 
 ### 5.7 Reporting (`ApplyReport` / `format_apply_report`)
-- Add fields to `ApplyReport`: `signed_verified: usize`, `signed_invalid: usize`, `unsigned: usize`.
+- Add fields to `ApplyReport`: `signed_verified: usize` (signature valid), `signed_invalid: usize`, `unsigned: usize`, `identity_bound: usize` (created_by_verified true).
 - `format_apply_report` (line ~234) emits deterministic lines:
   - `signed verified: {n}`
   - `signed invalid: {n}` (with per-record reasons in verbose mode)
@@ -108,7 +109,8 @@ All v1 records without these fields remain valid.
 - `src/synaptic_mesh/record.rs`: `signature`, `signer_did`, `public_key` fields.
 - `src/synaptic_mesh/worker.rs`: signing flow in `build_record`/`drain_once`.
 - `src/synaptic_mesh/import.rs`: verification flow; `mesh_provenance` update; `ApplyReport` fields.
-- `MeshManifest`: `signers: Vec<SignerEntry { did, public_key }>`.
+- `MeshManifest`: `signers: Vec<SignerEntry { node_id, did, public_key }>` (serde default + skip empty).
+- `ApplyReport`: `signed_verified`, `signed_invalid`, `unsigned`, `identity_bound`.
 - Config: `mesh_signing_key_path: Option<PathBuf>`.
 
 ## 7. Edge cases
@@ -128,6 +130,8 @@ All v1 records without these fields remain valid.
 - Unit: canonical payload excludes signature field.
 - Integration: publish signed record → import → `created_by_verified: true`.
 - Integration: tampered record → rejected into `report.ignored`.
+- Integration: valid signature but unbound signer → imported with `signature_verified: true`, `created_by_verified: false`.
+- Integration: valid signature + manifest binding → `created_by_verified: true`.
 - Integration: unsigned record → imported, `created_by_verified: false`.
 - Reporting: `ApplyReport` counts correct; explicit zeros.
 
