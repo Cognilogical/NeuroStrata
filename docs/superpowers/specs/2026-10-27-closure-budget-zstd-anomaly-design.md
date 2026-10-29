@@ -89,11 +89,11 @@ pub struct BudgetExceeded {
     pub stage: String,
     pub visited: usize,
     pub truncated: bool,
-    pub deadline_remaining_ms: u64,
+    pub deadline_remaining_ms: u64, // ns-yjah
 }
 ```
 
-- `deadline` is advisory: if `Instant::now() > deadline`, emit a telemetry warning (`BudgetExceeded` with `deadline_remaining_ms: 0`) but continue returning the same partial set the hard caps would yield; never alter the result set by timing.
+- `deadline` is advisory: if `Instant::now() > deadline`, emit a telemetry warning (`BudgetExceeded` with `deadline_remaining_ms: 0`) but continue returning the same partial set the hard caps would yield; never alter the result set by timing. (ns-yjah)
 - `src/graph_read/related.rs` keeps its existing constants (`MAX_NODES=20`, `MAX_EDGES=40`, `governs_max_hops=2 default, 1..=5`) unchanged for `related_test.rs`; `QueryBudget` defaults are the closure-level caps, not the related-level caps.
 
 ### 5.3 zstd compression
@@ -124,7 +124,7 @@ pub struct BudgetExceeded {
 
 - Graph read (`src/graph_read/related.rs`, crate-free):
   - `pub struct QueryBudget { max_hops, max_nodes, max_edges, deadline }`
-  - `pub struct BudgetExceeded { stage, visited, truncated, deadline_remaining_ms }`
+  - `pub struct BudgetExceeded { stage, visited, truncated, deadline_remaining_ms }` (ns-yjah)
   - `pub struct ClosureResult<T> { items: Vec<T>, truncated: bool, budget_exceeded: Option<BudgetExceeded> }`
   - `pub struct EdgeSpec { ... }` (existing)
 - RDF (`src/rdf/ontology.rs`):
