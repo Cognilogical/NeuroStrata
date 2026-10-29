@@ -800,6 +800,12 @@ pub struct LadybugStore {
     ontology: Arc<arc_swap::ArcSwap<std::collections::BTreeMap<String, crate::rdf::OntologyIndex>>>,
     /// Cached active-generation symbol ids for mention detection.
     mention_symbol_ids: Arc<tokio::sync::RwLock<Option<(std::collections::HashSet<u64>, std::sync::Arc<Vec<String>>)>>>,
+    /// Lazily built in-house lexical index, partitioned by namespace.
+    lexical: Arc<std::sync::RwLock<crate::fts::LexicalIndex>>,
+    /// Namespaces whose lexical partition is loaded. A namespace absent here is
+    /// rebuilt from the database on the next query; mutations are no-ops until
+    /// then because the database is the source of truth.
+    lexical_loaded: Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1042,6 +1048,8 @@ impl LadybugStore {
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(std::collections::BTreeMap::new())),
             mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(None)),
+            lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
+            lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
         })
     }
 
@@ -2001,6 +2009,151 @@ impl LadybugStore {
     }
 }
 
+impl LadybugStore {
+    /// Build the lexical view of one stored row. The engine deliberately does
+    /// not parse JSON, so every filter flag is decided here, next to the store's
+    /// other row-class predicates.
+    fn lexical_doc(namespace: &str, id: &str, payload: &MemoryPayload) -> crate::fts::LexicalDoc {
+        let metadata = &payload.metadata;
+        let mut doc = crate::fts::LexicalDoc::new(
+            id.to_string(),
+            namespace.to_string(),
+            payload.memory_type.clone(),
+            payload.content.clone(),
+        );
+        doc.symbol = metadata
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        doc.location = payload.location.clone();
+        doc.valid_from = metadata.get("valid_from").and_then(|v| v.as_i64());
+        doc.valid_to = metadata.get("valid_to").and_then(|v| v.as_i64());
+        doc.archived = is_archived(metadata);
+        doc.user_id = payload.user_id.clone();
+        doc.visible_to = metadata
+            .get("visible_to")
+            .and_then(|v| v.as_array())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        doc.domains = crate::domain::domain_keys(metadata);
+        doc.structural = STRUCTURAL_MEMORY_TYPES.contains(&payload.memory_type.as_str());
+        doc.registry = crate::registry::is_registry_row(metadata);
+        doc.conflicting = is_mesh_conflicting(metadata);
+        doc
+    }
+
+    fn lexical_apply_doc(&self, doc: crate::fts::LexicalDoc) {
+        let loaded = self
+            .lexical_loaded
+            .read()
+            .expect("lexical loaded lock");
+        if !loaded.contains(&doc.namespace) {
+            return;
+        }
+        drop(loaded);
+        self.lexical
+            .write()
+            .expect("lexical index lock")
+            .upsert(doc);
+    }
+
+    fn lexical_remove_doc(&self, namespace: &str, id: &str) {
+        let loaded = self
+            .lexical_loaded
+            .read()
+            .expect("lexical loaded lock");
+        if !loaded.contains(namespace) {
+            return;
+        }
+        drop(loaded);
+        self.lexical
+            .write()
+            .expect("lexical index lock")
+            .remove(namespace, id);
+    }
+
+    fn lexical_remove_where<F>(&self, namespace: &str, predicate: F)
+    where
+        F: FnMut(&crate::fts::LexicalDoc) -> bool,
+    {
+        let loaded = self
+            .lexical_loaded
+            .read()
+            .expect("lexical loaded lock");
+        if !loaded.contains(namespace) {
+            return;
+        }
+        drop(loaded);
+        self.lexical
+            .write()
+            .expect("lexical index lock")
+            .remove_where(namespace, predicate);
+    }
+
+    async fn ensure_lexical_loaded(&self, namespace: &str) -> Result<()> {
+        if self
+            .lexical_loaded
+            .read()
+            .expect("lexical loaded lock")
+            .contains(namespace)
+        {
+            return Ok(());
+        }
+
+        let namespace_owned = namespace.to_string();
+        let docs = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&namespace_owned);
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
+                    safe_ns
+                );
+                let rows = conn.query(&query)?;
+                let mut docs = Vec::new();
+                for row in rows {
+                    let id: String = format!("{}", row[0]);
+                    let content: String = format!("{}", row[1]);
+                    let user_id: String = format!("{}", row[2]);
+                    let memory_type: String = format!("{}", row[3]);
+                    let location: String = format!("{}", row[4]);
+                    let metadata_str: String = format!("{}", row[5]);
+                    let metadata: Value =
+                        serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                    let payload = MemoryPayload {
+                        content,
+                        user_id,
+                        memory_type,
+                        agent_name: None,
+                        location,
+                        location_lines: String::new(),
+                        metadata,
+                    };
+                    docs.push(Self::lexical_doc(&namespace_owned, &id, &payload));
+                }
+                Ok(docs)
+            })
+            .await?;
+
+        {
+            let mut index = self.lexical.write().expect("lexical index lock");
+            for doc in docs {
+                index.add(doc);
+            }
+        }
+        self.lexical_loaded
+            .write()
+            .expect("lexical loaded lock")
+            .insert(namespace.to_string());
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
@@ -2345,7 +2498,8 @@ impl VectorStore for LadybugStore {
         // captured here so the closure stays `FnOnce + Send + 'static`.
         let dimensions = self.dimensions;
         let zero_vec = zero_vector_str(dimensions);
-        self.write_with_deadline("writing a memory", move |conn| {
+        let lexical_doc = Self::lexical_doc(&namespace, &id, &payload);
+        let outcome = self.write_with_deadline("writing a memory", move |conn| {
 
             let safe_id = escape_ladybug_string(&id);
             let safe_ns = escape_ladybug_string(&namespace);
@@ -2667,7 +2821,11 @@ impl VectorStore for LadybugStore {
                 deferred_edges,
             })
         })
-        .await
+        .await;
+        if outcome.is_ok() {
+            self.lexical_apply_doc(lexical_doc);
+        }
+        outcome
     }
 
     async fn search(
@@ -2733,6 +2891,91 @@ impl VectorStore for LadybugStore {
             exact,
         )
         .await
+    }
+
+    async fn search_lexical(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        domains: &[String],
+        principal: &str,
+        fuzzy_max_distance: usize,
+    ) -> Result<crate::traits::LexicalSearchOutcome> {
+        self.ensure_lexical_loaded(namespace).await?;
+        let options = crate::fts::SearchOptions {
+            now: chrono::Utc::now().timestamp(),
+            as_of: None,
+            include_tasks,
+            include_archived,
+            principal: principal.to_string(),
+            domains: domains.to_vec(),
+            fuzzy_max_distance: fuzzy_max_distance.min(2),
+            limit,
+        };
+        let outcome = self
+            .lexical
+            .read()
+            .expect("lexical index lock")
+            .search(namespace, query, &options);
+
+        let mut results = Vec::with_capacity(outcome.hits.len());
+        for hit in outcome.hits {
+            let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
+                continue;
+            };
+            results.push(SearchResult {
+                id: hit.id,
+                score: hit.score,
+                payload,
+                evidence: Some(vec![crate::traits::SearchEvidence {
+                    kind: crate::traits::EvidenceKind::DirectMatch,
+                    path: Vec::new(),
+                    explanation: "This memory matched the lexical query.".to_string(),
+                    derivation: vec!["lexical-inhouse".to_string()],
+                }]),
+            });
+        }
+
+        Ok(crate::traits::LexicalSearchOutcome {
+            results,
+            domain_filter_applied: outcome.domain_filter_applied,
+        })
+    }
+
+    async fn rebuild_lexical_index(&self, namespace: Option<&str>) -> Result<usize> {
+        let namespaces = match namespace {
+            Some(namespace) => vec![namespace.to_string()],
+            None => self.list_namespaces().await?,
+        };
+
+        {
+            let mut index = self.lexical.write().expect("lexical index lock");
+            let mut loaded = self
+                .lexical_loaded
+                .write()
+                .expect("lexical loaded lock");
+            for namespace in &namespaces {
+                index.clear_namespace(namespace);
+                loaded.remove(namespace);
+            }
+        }
+
+        let mut total = 0;
+        for namespace in &namespaces {
+            self.ensure_lexical_loaded(namespace).await?;
+            total += self
+                .lexical
+                .read()
+                .expect("lexical index lock")
+                .namespaces
+                .get(namespace)
+                .map(|partition| partition.len())
+                .unwrap_or(0);
+        }
+        Ok(total)
     }
 
     async fn nearest_by_raw_distance(
@@ -3008,7 +3251,9 @@ impl VectorStore for LadybugStore {
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();
-        self.write_with_deadline("deleting a memory", move |conn| {
+        let index_namespace = namespace.clone();
+        let index_id = id.clone();
+        let outcome = self.write_with_deadline("deleting a memory", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
 
@@ -3031,7 +3276,11 @@ impl VectorStore for LadybugStore {
             ))?;
             Ok(())
         })
-        .await
+        .await;
+        if outcome.is_ok() {
+            self.lexical_remove_doc(&index_namespace, &index_id);
+        }
+        outcome
     }
 
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
@@ -3051,8 +3300,11 @@ impl VectorStore for LadybugStore {
             return Ok(RelocateOutcome::Ingested);
         }
 
+        let index_id = id.to_string();
+        let index_from = from.to_string();
+        let index_to = to.to_string();
         let (id, from, to) = (id.to_string(), from.to_string(), to.to_string());
-        self.write_with_deadline("moving a memory", move |conn| {
+        let outcome = self.write_with_deadline("moving a memory", move |conn| {
             // One statement, so there is no moment at which the memory exists in
             // neither namespace, and the row keeps its id, vector and edges.
             let query = format!(
@@ -3064,7 +3316,14 @@ impl VectorStore for LadybugStore {
             conn.query(&query)?;
             Ok(RelocateOutcome::Moved)
         })
-        .await
+        .await;
+        if matches!(outcome, Ok(RelocateOutcome::Moved)) {
+            self.lexical_remove_doc(&index_from, &index_id);
+            let mut doc = Self::lexical_doc(&index_to, &index_id, &payload);
+            doc.namespace = index_to.clone();
+            self.lexical_apply_doc(doc);
+        }
+        outcome
     }
 
     async fn export_database(&self, dir: &str) -> Result<()> {
@@ -3289,7 +3548,8 @@ impl VectorStore for LadybugStore {
 
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
         let namespace = namespace.to_string();
-        self.write_with_deadline("clearing the ingested rows", move |conn| {
+        let index_namespace = namespace.clone();
+        let outcome = self.write_with_deadline("clearing the ingested rows", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
             // Every row the ingester owns: the AST symbols and the directory/file
@@ -3298,7 +3558,11 @@ impl VectorStore for LadybugStore {
             conn.query(&query)?;
             Ok(())
         })
-        .await
+        .await;
+        if outcome.is_ok() {
+            self.lexical_remove_where(&index_namespace, |doc| doc.user_id == "auto-ingestor");
+        }
+        outcome
     }
 
     async fn begin_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
@@ -5715,6 +5979,107 @@ eurostrata\src\daemon.rs",
             location_lines: String::new(),
             metadata,
         }
+    }
+
+    #[tokio::test]
+    async fn lexical_search_ranks_symbols_filters_namespaces_and_rebuilds() {
+        let store = retired_test_store().await;
+
+        let mut rule = retired_test_payload(
+            "rule",
+            "owner",
+            json!({"symbol": "searchIndex", "domain": "auth"}),
+        );
+        rule.content = "the lexical engine ranks documents".to_string();
+        rule.location = "src/fts/mod.rs".to_string();
+        store
+            .upsert("probe", "rule-1", vec![0.0; 4], rule)
+            .await
+            .unwrap();
+
+        let mut other = retired_test_payload("rule", "owner", json!({"domain": "auth"}));
+        other.content = "the lexical engine is documented elsewhere".to_string();
+        store
+            .upsert("probe", "rule-2", vec![0.0; 4], other)
+            .await
+            .unwrap();
+
+        let mut foreign = retired_test_payload("rule", "owner", json!({}));
+        foreign.content = "searchIndex in another namespace".to_string();
+        store
+            .upsert("other", "rule-3", vec![0.0; 4], foreign)
+            .await
+            .unwrap();
+
+        let outcome = store
+            .search_lexical("probe", "searchIndex", 10, false, false, &[], "admin", 2)
+            .await
+            .expect("lexical search");
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].id, "rule-1");
+        assert!(outcome.results[0]
+            .evidence
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.derivation.iter().any(|d| d == "lexical-inhouse")));
+
+        let rebuilt = store
+            .rebuild_lexical_index(Some("probe"))
+            .await
+            .expect("rebuild the lexical index");
+        assert_eq!(rebuilt, 2);
+    }
+
+    #[tokio::test]
+    async fn lexical_mutations_keep_a_loaded_index_in_step() {
+        let store = retired_test_store().await;
+        let mut payload = retired_test_payload("rule", "owner", json!({}));
+        payload.content = "alpha term".to_string();
+        store
+            .upsert("probe", "rule-1", vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+
+        // Force the lazy index to load, then mutate through the normal write paths.
+        assert_eq!(
+            store
+                .search_lexical("probe", "alpha", 10, false, false, &[], "admin", 2)
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+
+        payload.content = "beta term".to_string();
+        store
+            .upsert("probe", "rule-1", vec![0.0; 4], payload)
+            .await
+            .unwrap();
+        assert!(store
+            .search_lexical("probe", "alpha", 10, false, false, &[], "admin", 2)
+            .await
+            .unwrap()
+            .results
+            .is_empty());
+        assert_eq!(
+            store
+                .search_lexical("probe", "beta", 10, false, false, &[], "admin", 2)
+                .await
+                .unwrap()
+                .results
+                .len(),
+            1
+        );
+
+        store.delete("probe", "rule-1").await.unwrap();
+        assert!(store
+            .search_lexical("probe", "beta", 10, false, false, &[], "admin", 2)
+            .await
+            .unwrap()
+            .results
+            .is_empty());
     }
 
     #[tokio::test]

@@ -91,8 +91,21 @@ pub struct Config {
     #[serde(default)]
     pub allowed_external_dirs: Vec<PathBuf>,
 
+    /// Blend the in-house lexical distance into the default vector search.
+    /// Off by default: the vector track remains the shipped recall path.
+    #[serde(default)]
+    pub lexical_blend_inhouse: bool,
+
+    /// Maximum Levenshtein distance for fuzzy lexical clauses, clamped 0..=2.
+    #[serde(default = "default_lexical_fuzzy_max_distance")]
+    pub lexical_fuzzy_max_distance: usize,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+fn default_lexical_fuzzy_max_distance() -> usize {
+    2
 }
 
 impl Config {
@@ -119,6 +132,8 @@ impl Config {
                 deduplication: DeduplicationConfig::default(),
                 project_contexts: HashMap::new(),
                 allowed_external_dirs: Vec::new(),
+                lexical_blend_inhouse: false,
+                lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
                 extra: HashMap::new(),
             };
 
@@ -145,6 +160,7 @@ impl Config {
         if config.db_path.is_dir() {
             config.db_path = config.db_path.join("ladybug.db");
         }
+        config.lexical_fuzzy_max_distance = config.lexical_fuzzy_max_distance.min(2);
 
         Ok(config)
     }
@@ -422,6 +438,8 @@ mod tests {
             deduplication: DeduplicationConfig::default(),
             project_contexts: HashMap::new(),
             allowed_external_dirs: Vec::new(),
+            lexical_blend_inhouse: false,
+            lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
             extra: HashMap::new(),
         };
 

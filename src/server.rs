@@ -199,12 +199,25 @@ pub async fn process_mcp_request(
                                 "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." },
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." },
                                 "exact": { "type": "boolean", "description": "Run a deterministic exact-name pre-pass before the vector scan. Default true." },
+                                "mode": { "type": "string", "enum": ["vector", "lexical-inhouse"], "description": "Search track. 'vector' (default) uses embeddings; 'lexical-inhouse' uses the deterministic multi-field lexical engine and skips embedding entirely." },
+                                "principal": { "type": "string", "description": "Resolved authenticated principal for row-level visible_to checks. The local surface defaults to 'admin'." },
                                 "facets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter results by epistemic facet (e.g. failed-attempt, enforced-rule, architecture-decision)." },
                                 "domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by domain slug(s) (OR)." },
                                 "node_sets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by node_set tag(s)." },
                                 "node_set_mode": { "type": "string", "enum": ["all", "any"], "description": "AND/OR semantics for node_sets filter. Default any." }
                             },
                             "required": ["query", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_rebuild_lexical_index",
+                        "description": "Rebuild the in-house lexical index from the store of record. Use after bulk imports or when lexical search reports stale results. The Tantivy engine is a separate optional build and is disabled here.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Optional namespace to rebuild. Omit to rebuild every namespace." },
+                                "engine": { "type": "string", "enum": ["inhouse", "tantivy"], "description": "Engine to rebuild. Default inhouse; tantivy returns a disabled error in default builds." }
+                            }
                         }
                     },
                     {
@@ -731,6 +744,9 @@ pub async fn process_mcp_request(
                         "neurostrata_search_memory" => {
                             result_text =
                                 handle_search_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_rebuild_lexical_index" => {
+                            result_text = handle_rebuild_lexical_index(arguments, store.clone()).await;
                         }
                         "neurostrata_memories_for_file" => {
                             result_text = handle_memories_for_file(arguments, store.clone()).await;
@@ -3231,6 +3247,33 @@ async fn handle_supersede_memory(
     report
 }
 
+async fn handle_rebuild_lexical_index(
+    arguments: Value,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let engine = arguments
+        .get("engine")
+        .and_then(|v| v.as_str())
+        .unwrap_or("inhouse");
+    if engine != "inhouse" {
+        return "ERROR [ENGINE]: the tantivy lexical engine is disabled in this build (it requires the optional tantivy feature). Use engine 'inhouse'.".to_string();
+    }
+    let namespace = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    match store.rebuild_lexical_index(namespace.as_deref()).await {
+        Ok(documents) => format!(
+            "Rebuilt the in-house lexical index: {} document(s) indexed{}.",
+            documents,
+            namespace
+                .map(|ns| format!(" in namespace '{}'", ns))
+                .unwrap_or_default()
+        ),
+        Err(error) => format!("Failed to rebuild the lexical index: {error}"),
+    }
+}
+
 async fn handle_search_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,
@@ -3266,6 +3309,29 @@ async fn handle_search_memory(
         .get("exact")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let search_mode = arguments
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("vector");
+    if search_mode != "vector" && search_mode != "lexical-inhouse" {
+        return format!(
+            "ERROR [MODE]: unknown search mode '{}'. Use 'vector' (default) or 'lexical-inhouse'.",
+            search_mode
+        );
+    }
+    // No authenticated principal context exists on this local MCP surface yet;
+    // "admin" preserves the pre-ReBAC read contract. The parameter is accepted
+    // so a daemon with auth can pass the resolved principal through unchanged.
+    let principal = arguments
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("admin");
+    let fuzzy_max_distance = crate::config::Config::from_default_path()
+        .map(|config| config.lexical_fuzzy_max_distance.min(2))
+        .unwrap_or(2);
+    let lexical_blend_inhouse = crate::config::Config::from_default_path()
+        .map(|config| config.lexical_blend_inhouse)
+        .unwrap_or(false);
     let facets_filter: Vec<String> = arguments
         .get("facets")
         .map(|v| {
@@ -3318,6 +3384,103 @@ async fn handle_search_memory(
         .filter_map(crate::domain::normalize_domain_slug)
         .collect();
 
+    if search_mode == "lexical-inhouse" {
+        let outcome = match store
+            .search_lexical(
+                namespace,
+                &query,
+                FETCH_LIMIT,
+                include_tasks,
+                include_archived,
+                &slugs,
+                principal,
+                fuzzy_max_distance,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return format!("Failed to search the lexical index: {error}");
+            }
+        };
+
+        let mut results = outcome.results;
+        if !facets_filter.is_empty() {
+            results.retain(|r| {
+                let facets =
+                    crate::domain::compute_facets(&r.payload.memory_type, &r.payload.metadata);
+                facets_filter.iter().all(|f| facets.contains(f))
+            });
+        }
+        if !node_sets_filter.is_empty() {
+            results.retain(|r| {
+                let sets: Vec<String> = r
+                    .payload
+                    .metadata
+                    .get("node_set")
+                    .map(|v| {
+                        if let Some(s) = v.as_str() {
+                            vec![s.to_string()]
+                        } else if let Some(arr) = v.as_array() {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                .collect()
+                        } else {
+                            vec![]
+                        }
+                    })
+                    .unwrap_or_default();
+                if node_set_mode == "all" {
+                    node_sets_filter.iter().all(|f| sets.contains(f))
+                } else {
+                    node_sets_filter.iter().any(|f| sets.contains(f))
+                }
+            });
+        }
+        results.truncate(DEFAULT_LIMIT);
+
+        if results.is_empty() {
+            return "No relevant memories found.".to_string();
+        }
+
+        for res in &results {
+            if crate::traits::is_direct_match(&res.evidence) {
+                let store_clone = store.clone();
+                let ns_clone = namespace.to_string();
+                let id_clone = res.id.clone();
+                tokio::spawn(async move {
+                    let _ = store_clone
+                        .increment_access_count(&ns_clone, &id_clone)
+                        .await;
+                });
+            }
+        }
+
+        let conflicts = crate::domain::detect_conflicts(&results);
+        let mut report = render_search_results(&results);
+        if !conflicts.is_empty() {
+            let arr: Vec<serde_json::Value> = conflicts
+                .iter()
+                .map(|(id, dw)| serde_json::json!({"id": id, "disputed_with": dw}))
+                .collect();
+            report.push_str(&format!(
+                "\n\nconflict_candidates: {}",
+                serde_json::to_string(&arr).unwrap_or_default()
+            ));
+        }
+        if !domain_requested {
+            return report;
+        }
+        let mode_line = if slugs.is_empty() {
+            "domain filter: skipped — the domain did not normalize; the results are unfiltered (lexical)"
+        } else if outcome.domain_filter_applied {
+            "domain filter: applied (lexical)"
+        } else {
+            "domain filter: skipped — no row matched the domain; the results are unfiltered (lexical)"
+        };
+        return format!("{}\n\n{}", mode_line, report);
+    }
+
     if let Ok(_) = store.init(namespace).await {
         if let Ok(vec) = emb.embed(&query).await {
             if let Ok(outcome) = store
@@ -3356,6 +3519,92 @@ async fn handle_search_memory(
                             node_sets_filter.iter().any(|f| sets.contains(f))
                         }
                     });
+                }
+                // Optional in-house lexical blend (config-gated, off by default).
+                // Merge the lexical candidate set into the vector result set and
+                // re-score with the documented single rule. Vector-only rows
+                // substitute worst-case lexical distance 1.0; lexical-only rows
+                // substitute worst-case vector distance 1.0.
+                if lexical_blend_inhouse {
+                    let lexical_outcome = store
+                        .search_lexical(
+                            namespace,
+                            &query,
+                            FETCH_LIMIT,
+                            include_tasks,
+                            include_archived,
+                            &slugs,
+                            principal,
+                            fuzzy_max_distance,
+                        )
+                        .await;
+                    if let Ok(lexical_outcome) = lexical_outcome {
+                        let lexical_by_id: std::collections::HashMap<String, f32> =
+                            lexical_outcome.results.iter().map(|r| (r.id.clone(), r.score)).collect();
+                        let vector_ids: std::collections::HashSet<String> =
+                            results.iter().map(|r| r.id.clone()).collect();
+                        for res in &mut results {
+                            let lexical_distance = lexical_by_id.get(&res.id).copied().unwrap_or(1.0);
+                            res.score = 0.7 * res.score + 0.3 * lexical_distance;
+                        }
+                        for lex in lexical_outcome.results {
+                            if vector_ids.contains(&lex.id) {
+                                continue;
+                            }
+                            // Apply the same facet/node-set filters as the
+                            // vector candidates so the merged set stays consistent.
+                            if !facets_filter.is_empty() {
+                                let facets =
+                                    crate::domain::compute_facets(&lex.payload.memory_type, &lex.payload.metadata);
+                                if !facets_filter.iter().all(|f| facets.contains(f)) {
+                                    continue;
+                                }
+                            }
+                            if !node_sets_filter.is_empty() {
+                                let sets: Vec<String> = lex
+                                    .payload
+                                    .metadata
+                                    .get("node_set")
+                                    .map(|v| {
+                                        if let Some(s) = v.as_str() {
+                                            vec![s.to_string()]
+                                        } else if let Some(arr) = v.as_array() {
+                                            arr.iter()
+                                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                        } else {
+                                            vec![]
+                                        }
+                                    })
+                                    .unwrap_or_default();
+                                let keep = if node_set_mode == "all" {
+                                    node_sets_filter.iter().all(|f| sets.contains(f))
+                                } else {
+                                    node_sets_filter.iter().any(|f| sets.contains(f))
+                                };
+                                if !keep {
+                                    continue;
+                                }
+                            }
+                            let blended = 0.7 + 0.3 * lex.score;
+                            let mut lex = lex;
+                            lex.score = blended;
+                            if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
+                                lex.evidence = Some(vec![crate::traits::SearchEvidence {
+                                    kind: crate::traits::EvidenceKind::DirectMatch,
+                                    path: Vec::new(),
+                                    explanation: "This memory matched the lexical query.".to_string(),
+                                    derivation: vec!["lexical-inhouse".to_string()],
+                                }]);
+                            }
+                            results.push(lex);
+                        }
+                        results.sort_by(|a, b| {
+                            a.score
+                                .total_cmp(&b.score)
+                                .then_with(|| a.id.cmp(&b.id))
+                        });
+                    }
                 }
                 // Pre-limit contract: filtering happened against the wider FETCH_LIMIT
                 // candidate set above; truncate to the default page size now.
@@ -3702,7 +3951,12 @@ fn render_evidence_suffix(result: &SearchResult, remaining_bytes: usize) -> Opti
     // Try each evidence path in stored order; first that fits wins.
     for ev in evidence {
         let suffix = match ev.kind {
-            crate::traits::EvidenceKind::DirectMatch => continue,
+            crate::traits::EvidenceKind::DirectMatch => {
+                if ev.derivation.is_empty() {
+                    continue;
+                }
+                format!("\nMatch [{}]", ev.derivation.join(", "))
+            }
             crate::traits::EvidenceKind::OneHop => {
                 // Recover originating primary: endpoint other than result.id
                 let orig = ev.path.iter().find_map(|e| {
@@ -4837,6 +5091,23 @@ mod tests {
             text, "Failed to search database.",
             "the search path no longer hits ARRAY_DISTANCE's integer-array binder error: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn lexical_mode_skips_the_embedder_and_reports_the_lexical_derivation() {
+        let (store, id) = store_with_one_rule("probe").await;
+        let text = handle_search_memory(
+            serde_json::json!({
+                "namespace": "probe",
+                "query": "podman",
+                "mode": "lexical-inhouse"
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(text.contains(&id), "the lexical hit is rendered: {text}");
+        assert!(text.contains("lexical-inhouse"), "the derivation is visible: {text}");
     }
 
     /// A store holding two rules in two different domains, so a domain filter
@@ -6815,7 +7086,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_four_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_five_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -6843,6 +7114,7 @@ mod tests {
                 "neurostrata_ingest_directory",
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
+                "neurostrata_rebuild_lexical_index",
                 "neurostrata_memories_for_file",
                 "neurostrata_related",
                 "neurostrata_supersede_memory",
