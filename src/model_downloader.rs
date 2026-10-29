@@ -110,7 +110,7 @@ pub fn fetch_model(
     // Compute SHA-256
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    let actual_sha = format!("{:x}", hasher.finalize());
+    let actual_sha = hex::encode(hasher.finalize());
 
     if actual_sha != target_sha256 {
         let _ = std::fs::remove_file(out_path);
@@ -170,7 +170,7 @@ pub fn fetch_from_registry(
 
         let mut hasher = Sha256::new();
         hasher.update(&archive_bytes);
-        let actual_sha = format!("{:x}", hasher.finalize());
+        let actual_sha = hex::encode(hasher.finalize());
         if actual_sha != entry.sha256 {
             return Err(anyhow!(
                 "SHA-256 mismatch! Expected {}, got {}",
@@ -267,7 +267,7 @@ mod tests {
         let src = tmp.join("source.bin");
         let data = b"model-bytes";
         std::fs::write(&src, data).unwrap();
-        let hash = format!("{:x}", Sha256::digest(data));
+        let hash = hex::encode(Sha256::digest(data));
         let out = tmp.join("out.bin");
         let url = format!("file://{}", src.display());
         let written = fetch_model(&url, &hash, &out).unwrap();
@@ -328,7 +328,7 @@ mod tests {
         let archive = encoder.finish().unwrap();
         let archive_path = tmp.join("bundle.tar.gz");
         std::fs::write(&archive_path, &archive).unwrap();
-        let hash = format!("{:x}", Sha256::digest(&archive));
+        let hash = hex::encode(Sha256::digest(&archive));
 
         // Write a registry pointing at the local archive.
         let registry_json = format!(

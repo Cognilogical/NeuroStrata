@@ -56,7 +56,7 @@ pub fn nquads_digest(nquads: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(nquads.as_bytes());
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 fn escape_nq(s: &str) -> String {
