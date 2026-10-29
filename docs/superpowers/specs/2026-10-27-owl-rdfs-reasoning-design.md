@@ -34,11 +34,11 @@ Add **deterministic, query-time RDFS/OWL 2 RL reasoning** over the RDF projectio
 Prefer existing crates over an in-house rule engine:
 
 - In-tree bounded BFS/DFS (via `QueryBudget` from `yjah` spec) for `subClassOf*`, `subPropertyOf*`, and bounded transitive `GOVERNS`. This is primary because it satisfies determinism and the crate-free `related.rs` / `context/` test-compilation contract (see `yjah` AC-3).
-- `petgraph = "0.8.3"` as backup if multi-relation DAG / SCC algorithms are needed beyond BFS.
-- `reasonable` for OWL 2 RL reasoning over RDF graphs at ontology-index compile time. It is BSD-3-Clause, actively maintained, and supports RDF 1.2 behind its `rdf-12` feature.
-- `sophia_reasoner` for RDFS/Simple/RDF entailment if a narrower RDFS-only path is preferable.
+- In-tree bounded BFS/DFS (via `QueryBudget` from `yjah` spec) for `subClassOf*`, `subPropertyOf*`, and bounded transitive `GOVERNS`. This is primary.
 - `oxrdf` for RDF terms, triples, and quads shared with the projection layer.
-- Evaluate `reasonable` and `sophia_reasoner` against the required rule subset before implementation. If neither meets determinism or the restricted OWL 2 RL profile, fall back to the in-tree BFS/DFS closure (no Datalog engine needed for this rule subset).
+- `serde_json` for deterministic JSON-LD TBox loading.
+- `petgraph` is optional backup only if BFS/DFS cannot satisfy reachability/cycle guarantees.
+- `reasonable` and `sophia_reasoner` are evaluation-only; not added to Cargo.toml until a benchmark proves they meet determinism and the restricted profile.
 
 Do not add `horned-owl` (LGPL) or any OWL 2 DL reasoner. Reject `oxirs-core`/`oxirs-shacl`/`scirs2` (pulls `ctor` pre-main rustls hooks; per `yjah` and federation specs).
 
@@ -57,6 +57,7 @@ In scope:
 - Bounded transitive `GOVERNS` traversal with path evidence (BFS/DFS closure from `yjah` spec, `QueryBudget` applied per `related` and `search_with_domain`).
 - `OntologyIndex` compiled closure and `ArcSwap` lifecycle.
 - Domain, alias, and relation filter expansion in `search_with_domain`, `related`, and `memories_for_file`.
+- Write-time facets: `enforced-rule`, `failed-attempt`, `architecture-decision` are derived from metadata predicates `rule_kind`, `attempt_status`, `decision_type`; inferred facets are marked `inferred: true` for bi-temporal retraction.
 
 Out of scope:
 
@@ -97,14 +98,14 @@ It is held in a per-namespace map, `ArcSwap<BTreeMap<String, Arc<OntologyIndex>>
 
 ### 5.2 Rule engine
 
-Primary closure is in-tree BFS/DFS (matching `yjah` spec §1.19), applied via `QueryBudget` for bounded traversal. `petgraph` is a backup for complex DAGs if BFS/DFS cannot satisfy reachability or cycle guarantees. The compiled closure is stored in `OntologyIndex`, precomputed at index build time. At query time, `reasonable` (or `sophia_reasoner` for RDFS subset) can be used to derive transitive and equivalence closures if the rule subset is fully covered and deterministic, otherwise rely on the in-tree closure.
+Primary closure is in-tree BFS/DFS (matching `yjah` spec §1.19), applied via `QueryBudget` for bounded traversal. `petgraph` is an optional backup. The compiled closure is stored in `OntologyIndex`, precomputed at index build time from the TBox + ABox using `serde_json` JSON-LD loading and `oxrdf` terms.
 
 - project the relevant TBox and ABox quads into an `oxrdf` dataset at index build time,
 - run the restricted rule set once per ontology/registry change,
 - store the resulting closures in `OntologyIndex`,
 - discard any inferred triples not used by search, `related`, or domain expansion.
 
-`reasonable` must be evaluated for deterministic output. If its output order is not deterministic, sort all inputs and outputs before use. If it cannot meet the profile or determinism requirements, use `sophia_reasoner` for the RDFS subset and a small, explicit Rust rule set for the OWL 2 RL additions.
+`reasonable` and `sophia_reasoner` are not added to `Cargo.toml` unless a benchmark proves they meet determinism and the restricted profile; otherwise the in-tree closure is used.
 
 ### 5.3 Query-time closure
 
@@ -114,7 +115,7 @@ At read time:
 2. Expand the query domain via `subClassOf*` closure.
 3. Expand query identifiers via `altLabel`, `prefLabel`, `exactMatch`, and `KnownIds`.
 4. Expand relation filters via `subPropertyOf*`.
-5. For `search_with_domain`, attach inferred paths to `SearchEvidence` using `EvidenceKind::GovernsNhop { hops }`.
+5. For `search_with_domain`, attach inferred paths to `SearchEvidence` using `EvidenceKind::GovernsNhop { hops }`, serialized as `governs_<hops>hop`; `Ord` is derived on `(hops, ...)`.
 6. `related` and `memories_for_file` keep their existing crate-local evidence types (`EvidencePath`, `GraphMatchKind`) and do not import `SearchEvidence`; map them explicitly rather than conflating types.
 7. If any step fails, fall back to the baseline traversal without expansion.
 
@@ -166,14 +167,14 @@ Inferred facets are stored as metadata, not as graph edges.
   - `inverse_of(iri) -> BTreeSet<Iri>`,
   - `is_transitive(iri) -> bool`,
   - `aliases_for(symbol) -> BTreeSet<String>`.
-  - `closure_subclasses(root, budget) -> ClosureResult<MemoryId>` (in-tree BFS, per `yjah` QueryBudget).
-  - `closure_governs(root, edges, budget) -> ClosureResult<MemoryId>` (bounded N hops).
+  - `closure_subclasses(root, budget) -> ClosureResult<String>` (in-tree BFS, per `yjah` QueryBudget; returns class IRIs).
+  - `closure_governs(root, edges, budget) -> ClosureResult<String>` (bounded N hops; returns memory IRIs).
 - `search_with_domain`, `related`, and `memories_for_file` consume these methods.
 - Configuration:
   - `reasoning_enabled: bool` (default true),
   - `governs_max_hops: u8` (default 2, range 1..=5; aligns with `yjah` spec `related.rs` default),
   - `reasoning_timeout_ms: u64` (default 50).
-  - `closure_budget: QueryBudget` (max_hops 10 / max_nodes 5000 / max_edges 50000 / deadline 250ms, defaults from `yjah` spec).
+  - `closure_budget: QueryBudget` (max_ms 50 / max_nodes 256, defaults from `src/rdf/reasoning.rs`).
 
 ## 7. Edge cases
 
@@ -205,7 +206,7 @@ RDFS/OWL 2 RL reasoning is available as a deterministic, query-time layer over t
 - `src/rdf/reasoning.rs` (new): reasoner adapter and deterministic wrappers.
 - `src/store/ladybug.rs`: bounded `GOVERNS` traversal and filter expansion hooks.
 - `src/server.rs`: configuration and tool exposure if needed.
-- `Cargo.toml`: `reasonable` and/or `sophia_reasoner`, `oxrdf`, `oxttl`, `petgraph` (backup); NO `oxirs-core`/`scirs2`/`horned-owl`.
+- `Cargo.toml`: `oxrdf`, `petgraph` (optional backup); NO `oxirs-core`/`scirs2`/`horned-owl`/`reasonable`/`sophia_reasoner`/`oxttl` (unless later benchmark justifies).
 
 ## 11. Argon review resolutions (2026-10-28)
 
