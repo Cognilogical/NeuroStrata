@@ -37,3 +37,25 @@ mod tests {
         assert_eq!(r[0].get("s").unwrap(), "<s>");
     }
 }
+
+/// Custom SPARQL function `ns:salience(id, neural_gain, tombstoned)` honoring
+/// neural gain and tombstones: returns 0.0 for tombstoned rows.
+pub fn ns_salience(id: &str, neural_gain: f64, tombstoned: bool) -> f64 {
+    if tombstoned { return 0.0; }
+    let base = 1.0;
+    let _ = id;
+    base * neural_gain.max(0.0)
+}
+
+#[cfg(test)]
+mod salience_tests {
+    use super::*;
+    #[test]
+    fn tombstoned_zero() {
+        assert_eq!(ns_salience("x", 2.0, true), 0.0);
+    }
+    #[test]
+    fn gain_applied() {
+        assert_eq!(ns_salience("x", 2.0, false), 2.0);
+    }
+}

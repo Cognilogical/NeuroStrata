@@ -212,6 +212,12 @@ fn apply_one(
         record.origin_mesh_epoch = existing.origin_mesh_epoch;
     }
 
+    // Oversized-record size cap: refuse records larger than 1 MiB to keep
+    // mesh files bounded and reviewable.
+    let serialized = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+    if serialized.len() > 1_048_576 {
+        return Err(format!("mesh record exceeds 1 MiB size cap ({} bytes)", serialized.len()));
+    }
     write_record(&path, &record)?;
     Ok(ApplyOutcome::Applied)
 }
@@ -406,7 +412,7 @@ mod tests {
             "neurostrata-mesh-worker-{}-{}-{}",
             std::process::id(),
             tag,
-            Uuid::new_v4()
+            Uuid::now_v7()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -466,7 +472,7 @@ mod tests {
     /// A `created` entry for a shareable `rule`.
     fn created(id: &str, metadata: serde_json::Value) -> OutboxEntry {
         OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_CREATED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -502,7 +508,7 @@ mod tests {
     #[test]
     fn a_created_mutation_writes_a_record_that_round_trips() {
         let (mesh, outbox) = fixture("roundtrip", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let entry = created(&id.to_string(), shareable_metadata());
         outbox.append(&entry).unwrap();
 
@@ -536,7 +542,7 @@ mod tests {
     #[test]
     fn a_second_drain_is_a_no_op() {
         let (mesh, outbox) = fixture("second-drain", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
             .unwrap();
@@ -552,7 +558,7 @@ mod tests {
     #[test]
     fn a_pending_entry_applies_on_the_next_drain_after_a_crash() {
         let (mesh, outbox) = fixture("crash-before-drain", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
             .unwrap();
@@ -576,7 +582,7 @@ mod tests {
     #[test]
     fn a_crash_between_rename_and_mark_committed_retries_idempotently() {
         let (mesh, outbox) = fixture("crash-rename-commit", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let entry = created(&id.to_string(), shareable_metadata());
         outbox.append(&entry).unwrap();
 
@@ -605,7 +611,7 @@ mod tests {
         let (mesh, outbox) = fixture("batch", None);
         for _ in 0..3 {
             outbox
-                .append(&created(&Uuid::new_v4().to_string(), shareable_metadata()))
+                .append(&created(&Uuid::now_v7().to_string(), shareable_metadata()))
                 .unwrap();
         }
         let report = drain_once(&outbox, &mesh, "node-author").unwrap();
@@ -625,7 +631,7 @@ mod tests {
     #[test]
     fn a_foreign_origin_row_is_skipped_never_re_exported() {
         let (mesh, outbox) = fixture("foreign", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let mut metadata = shareable_metadata();
         metadata["mesh"] = json!({ "mesh_id": "imported-from-peer" });
         outbox.append(&created(&id.to_string(), metadata)).unwrap();
@@ -651,9 +657,9 @@ mod tests {
     #[test]
     fn a_procedure_record_omits_the_runtime_counters() {
         let (mesh, outbox) = fixture("procedure", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let entry = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_CREATED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -718,7 +724,7 @@ mod tests {
             "unreachable",
             Some("https://unreachable.invalid/team/mesh.git"),
         );
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         outbox
             .append(&created(&id.to_string(), shareable_metadata()))
             .unwrap();
@@ -738,21 +744,21 @@ mod tests {
     fn eligibility_absenting_or_private_is_not_published_shareable_is() {
         let (mesh, outbox) = fixture("eligibility", None);
 
-        let shareable_id = Uuid::new_v4();
+        let shareable_id = Uuid::now_v7();
         outbox
             .append(&created(
                 &shareable_id.to_string(),
                 json!({ "eligibility": "shareable" }),
             ))
             .unwrap();
-        let private_id = Uuid::new_v4();
+        let private_id = Uuid::now_v7();
         outbox
             .append(&created(
                 &private_id.to_string(),
                 json!({ "eligibility": "private" }),
             ))
             .unwrap();
-        let absent_id = Uuid::new_v4();
+        let absent_id = Uuid::now_v7();
         outbox
             .append(&created(&absent_id.to_string(), json!({})))
             .unwrap();
@@ -774,10 +780,10 @@ mod tests {
     #[test]
     fn a_superseded_entry_records_the_lifecycle_and_successor() {
         let (mesh, outbox) = fixture("superseded", None);
-        let old_id = Uuid::new_v4();
-        let new_id = Uuid::new_v4();
+        let old_id = Uuid::now_v7();
+        let new_id = Uuid::now_v7();
         let entry = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_SUPERSEDED.to_string(),
             id: old_id.to_string(),
             namespace: "ns".to_string(),
@@ -805,9 +811,9 @@ mod tests {
     #[test]
     fn an_archived_entry_records_the_lifecycle_and_tombstone() {
         let (mesh, outbox) = fixture("archived", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let entry = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_ARCHIVED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -835,7 +841,7 @@ mod tests {
     #[test]
     fn a_file_rename_fault_keeps_the_entry_pending_until_the_fault_clears() {
         let (mesh, outbox) = fixture("rename-fault", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let entry = created(&id.to_string(), shareable_metadata());
         outbox.append(&entry).unwrap();
         let before = git_count_or_zero(mesh.root());
@@ -898,7 +904,7 @@ mod tests {
     #[test]
     fn a_lifecycle_transition_preserves_the_origin_fields() {
         let (mesh, outbox) = fixture("origin-preserved", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
 
         // Create, then archive the same record.
         outbox
@@ -907,7 +913,7 @@ mod tests {
         drain_once(&outbox, &mesh, "node-author").unwrap();
 
         let archive = OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: OP_ARCHIVED.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),
@@ -955,7 +961,7 @@ mod tests {
     #[test]
     fn a_stale_epoch_entry_is_quarantined_named_and_stays_pending() {
         let (mesh, outbox) = fixture("stale-epoch", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let entry = created(&id.to_string(), shareable_metadata()); // epoch 1
         outbox.append(&entry).unwrap();
 
@@ -996,7 +1002,7 @@ mod tests {
     fn a_current_epoch_entry_drains_after_an_epoch_migration() {
         let (mesh, outbox) = fixture("current-epoch", None);
         let mesh = reopen_with_epoch(&mesh, 2); // migrate FIRST
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let mut entry = created(&id.to_string(), shareable_metadata());
         entry.epoch = 2; // born after the migration
         outbox.append(&entry).unwrap();
@@ -1024,8 +1030,8 @@ mod tests {
     #[test]
     fn a_mixed_batch_quarantines_stale_and_drains_current() {
         let (mesh, outbox) = fixture("mixed-epoch", None);
-        let stale_id = Uuid::new_v4();
-        let current_id = Uuid::new_v4();
+        let stale_id = Uuid::now_v7();
+        let current_id = Uuid::now_v7();
         let stale = created(&stale_id.to_string(), shareable_metadata()); // epoch 1
         outbox.append(&stale).unwrap();
         let mut current = created(&current_id.to_string(), shareable_metadata());
@@ -1058,7 +1064,7 @@ mod tests {
     #[test]
     fn a_published_fact_keeps_the_curated_metadata_envelope() {
         let (mesh, outbox) = fixture("curated-envelope", None);
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let topology = json!({
             "component": "api-gateway",
             "target_system": "ledger-service",

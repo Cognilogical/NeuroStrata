@@ -22,3 +22,26 @@ mod tests {
         assert!(s > -1e-5);
     }
 }
+
+
+/// RotatE score: -||h ∘ r - t|| (modulus rotation). Approximated with real-valued
+/// componentwise multiplication.
+pub fn rotate_score(head: &[f32], relation: &[f32], tail: &[f32]) -> f32 {
+    let n = head.len().min(relation.len()).min(tail.len());
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        let v = head[i] * relation[i] - tail[i];
+        sum += v * v;
+    }
+    -sum.sqrt()
+}
+
+/// ComplEx score: Re(<h, r, conj(t)>). Approximated with real components.
+pub fn complex_score(head: &[f32], relation: &[f32], tail: &[f32]) -> f32 {
+    let n = head.len().min(relation.len()).min(tail.len());
+    let mut sum = 0.0f32;
+    for i in 0..n {
+        sum += head[i] * relation[i] * tail[i];
+    }
+    sum
+}
