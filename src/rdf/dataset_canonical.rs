@@ -208,8 +208,8 @@ pub fn validate_canonical_rdf(
             ));
         }
         // Validate named graph
-        let expected_graph_unbracketed = format!("urn:neurostrata:graph:{}:domain:gen:0", record.namespace);
-        if *graph != expected_graph_unbracketed {
+        let expected_graph_bracketed = format!("<urn:neurostrata:graph:{}:domain:gen:0>", record.namespace);
+        if *graph != expected_graph_bracketed {
             violations.push(format!(
                 "line {}: graph {} does not match expected {}",
                 i + 1, graph, expected_graph
