@@ -1,8 +1,8 @@
 # Subclass/Transitive Closure + Query Budget + zstd + Anomaly Detection Design
 
-> Status: draft — pending Argon review.
+> Status: revised per Argon review — pending re-review.
 > Task: `neurostrata-yjah` (subclass/transitive closure + query budget + zstd + anomaly detection, OxiRS §1.19).
-> Companion: `docs/superpowers/specs/2026-10-27-owl-rdfs-reasoning-design.md`, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md` (RDF canonical store, not this spec), `docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md`, `docs/superpowers/specs/2026-10-27-shacl-shape-validation-design.md`.
+> Companion: `docs/superpowers/specs/2026-10-27-owl-rdfs-reasoning-design.md`, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md`, `docs/superpowers/specs/2026-10-27-shacl-shape-validation-design.md`.
 
 ## 1. Problem
 
@@ -10,175 +10,191 @@ NeuroStrata's graph contains `GOVERNS` / `CONTAINS` / `EXTRACTED_FROM` / `RELATE
 
 ## 2. Goal
 
-Add four bounded capabilities to NeuroStrata:
+Add four bounded capabilities:
 
-- **Transitive closure**: materialize `subClassOf*` descendants (subclasses) and `GOVERNS`-closure over `CONTAINS` / `RELATES_TO` edges; per-query expansion budget caps traversal depth/count.
-- **Query budget**: typed `QueryBudget` (`max_hops`, `max_nodes`, `max_edges`, `deadline`) with `BudgetExceeded` error; warms on overflow (warn-first), never panics.
+- **Transitive closure**: materialize `subClassOf*` descendants (class IRIs) and `GOVERNS`-closure over `CONTAINS`/`RELATES_TO` edges (memory IRIs); per-query expansion budget caps traversal depth/count.
+- **Query budget**: typed `QueryBudget` (`max_hops`, `max_nodes`, `max_edges`, `deadline`) with `BudgetExceeded` error; warn-first, never panics.
 - **zstd compression**: snapshots and SynapticMesh records compressed via `zstd` crate with streaming frames and `Read::take(MAX_DECOMPRESSED_BYTES)` zip-bomb cap.
 - **Anomaly detection**: online Welford + EWMA z-score detector over memory counts, enrichment failures, and per-stage latencies; emit structured anomaly events without blocking reads.
 
-All four are read-safe: closure and budget are graph-read-only; compression is write-path only; anomaly detection is telemetry-only (does not block or reject).
+All four are read-safe: closure and budget are graph-read-only; compression is write-path only; anomaly detection is telemetry-only.
 
 ## 3. Constraints
 
 - Bounded closure: bounded hop/depth budget per query; cycle guard; never materializes infinite chains.
 - Query budget applies per-query and per-stage; `BudgetExceeded` is a structured error (warn-first).
-- zstd: `zstd = "0.14.3"` via Cargo (not vendored), C `libzstd` FFI; streaming frames; strict decompress-size cap.
+- zstd: `zstd = "0.14.3"` via Cargo (C `libzstd` FFI); streaming frames; strict decompress-size cap.
 - Anomaly detection: online Welford (mean/std_dev/min/max) + EWMA z-score; never blocks read path; emits to telemetry/log only.
-- No `oxirs-core`, `oxirs-shacl`, `scirs2-*`, `oxiarc-zstd`, or `ruzstd` (decoder-only, cannot compress).
-- Zero LLM usage in closure/budget/compression/anomaly path.
+- No `oxirs-core`, `oxirs-shacl`, `scirs2-*`, `oxiarc-zstd`, or `ruzstd`.
+- Zero LLM usage.
 - LadybugDB remains sole store; closure is computed on demand (transient), not persisted as edges.
+- Determinism: `deadline` is advisory only and never changes the result set; hard caps (`max_hops`/`max_nodes`/`max_edges`) determine truncation.
 
 ## 3.1 Library evaluation
 
-| Capability | Selection | Crate | Version | License | MSRV | Source |
-|---|---|---|---|---|---|---|
-| Transitive closure | In-tree | `std` | — | MIT/Apache | 1.0 | `src/rdf/ontology.rs`, `src/graph_read/related.rs` |
-| Query budget | In-tree | `std` | — | MIT/Apache | 1.0 | `src/graph_read/related.rs` (`MAX_NODES`/`MAX_EDGES`) |
-| Zstd compression | External | `zstd` | `0.14.3` | BSD-3-Clause | 1.64 | `Cargo.toml` (C `libzstd`) |
-| Anomaly detection | In-tree | `std` | — | MIT/Apache | 1.0 | vendor `WelfordAccumulator` + EWMA z-score (mirroring oxirs-shacl's detector without scirs2) |
-| Anomaly (alt) | External | `rolling-stats` | `0.8.0` | MIT/Apache | ~1.60 | online Welford (as clean reference, provided zero-variance guard added) |
+| Capability | Selection | Crate | Version | License | Notes |
+|---|---|---|---|---|---|
+| Transitive closure (classes) | In-tree | `std` | — | MIT/Apache | `src/rdf/ontology.rs` (class IRIs) |
+| Transitive closure (memories) | In-tree | `std` | — | MIT/Apache | `src/graph_read/related.rs` (memory IRIs, crate-free) |
+| Query budget | In-tree | `std` | — | MIT/Apache | single canonical `QueryBudget` in `src/graph_read/related.rs` |
+| Zstd compression | External | `zstd` | `0.14.3` | BSD-3-Clause | C `libzstd` |
+| Anomaly detection | In-tree | `std` | — | MIT/Apache | vendor Welford + EWMA |
 
-- **Rejected**: `oxirs-shacl` (pulls `oxirs-core` → `ctor` pre-main TLS hook + `scirs2` bloat), `scirs2-stats` (banned), `oxiarc-zstd` (low maturity), `ruzstd` (decoder-only, cannot compress snapshots/mesh records).
-- **In-tree**: closure (bounded BFS/DFS + cycle guard), budget (`QueryBudget` struct + `BudgetExceeded`), anomaly (vendor Welford + EWMA z-score, mirroring `oxirs-shacl`'s Welford detector without `scirs2`).
-- `zstd` via Cargo; `BSD-3-Clause` added to license allowlist alongside `MIT OR Apache-2.0`.
+- **Rejected**: `oxirs-shacl`, `scirs2-stats`, `oxiarc-zstd`, `ruzstd`.
+- `zstd` via Cargo; `BSD-3-Clause` added to license allowlist (create `deny.toml` if absent).
 
 ## 4. Scope
 
 In scope:
-
-- Transitive closure over `subClassOf*` and `GOVERNS`-closure edges (GOVERNS authority respects `related.rs` caps: `governs_max_hops = 2` default, `1..=5` max).
-- `QueryBudget` enforcement on all closure + related-graph traversals.
-- zstd compression/decompression of SynapticMesh wire records and snapshot frames (not `<id>.json` tracked in Git; applies to snapshots/mesh bundles).
+- Transitive closure over `subClassOf*` (class IRIs) and `GOVERNS`-closure edges (memory IRIs).
+- `QueryBudget` enforcement on closure + related-graph traversals.
+- zstd compression/decompression of SynapticMesh wire records and snapshot frames (not `<id>.json` Git files).
 - Welford + EWMA z-score anomaly detector (telemetry/log only).
-- Closure results transient — never materialized as LadybugDB edges.
-- Warn-first on budget overflow (`truncated` flag + structured `BudgetExceeded`).
+- Closure results transient.
 
 Out of scope:
-
 - Persisted closure edges as store rows.
-- Full OWL 2 RL reasoning (use `petgraph` topo-sort only if needed later).
+- Full OWL 2 RL reasoning.
 - LLM-augmented anomaly scoring.
-- Datalog engine (`datafrog` is backup only if rules outgrow BFS).
-- Writing binary `.zst` files into SynapticMesh Git worktree `<id>.json` (stay with JSON).
+- Datalog engine.
+- Writing binary `.zst` files into SynapticMesh Git worktree `<id>.json`.
 
 ## 5. Approach
 
 ### 5.1 Transitive closure
 
-1. Build an adjacency map over `subClassOf*` edges (and optionally `GOVERNS`-closure over `CONTAINS` / `RELATES_TO`) from the local memory graph.
-2. Run bounded BFS/DFS with cycle guard (`visited: HashSet`) from each root class/entity.
-3. Honor `QueryBudget.max_hops` / `max_nodes` / `max_edges`; return partial results + `truncated: true` + `BudgetExceeded` if a budget is hit.
-4. Return descendant set (closure) as an ordered `Vec<MemoryId>`; stable ordering via insertion sort keyed by memory id.
-5. Closure is computed transiently per query; no edge materialization in LadybugDB.
+Two separate functions, no cross-module type leakage:
 
-### 5.2 Query budget
+1. `closure_subclasses(root: &str, index: &OntologyIndex, budget: &QueryBudget) -> ClosureResult<String>` in `src/rdf/ontology.rs`: returns class/domain IRIs (not MemoryIds). `OntologyIndex::sub_classes` maps `child -> parents`, `children` maps `parent -> children` (per OWL spec §11.4). BFS/DFS with cycle guard (`HashSet`). No `EdgeSpec` or `MemoryId` knowledge in `ontology.rs`.
 
-Add typed budget carried through graph-read traversals:
+2. `closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> ClosureResult<String>` in `src/graph_read/related.rs` (crate-free, compiled standalone by `tests/graph_read/related_test.rs`): returns memory IRIs. Operates on `EdgeSpec` from `related.rs`. No `OntologyIndex` import.
+
+Both:
+- Honor `QueryBudget.max_hops`/`max_nodes`/`max_edges`; return partial results + `truncated: true` + `BudgetExceeded` if a budget is hit.
+- Stable neighbor ordering (sorted by IRI) before budget cuts.
+- `ClosureResult<T> = { items: Vec<T>, truncated: bool, budget_exceeded: Option<BudgetExceeded> }`.
+
+### 5.2 Query budget (canonical definition)
+
+Single canonical definition in `src/graph_read/related.rs` (crate-free). `src/rdf/reasoning.rs::QueryBudget` is deprecated/removed; callers migrate to this one (or `reasoning.rs` re-exports it).
 
 ```rust
 pub struct QueryBudget {
-  pub max_hops: usize,      // default 10
-  pub max_nodes: usize,     // default 5000
-  pub max_edges: usize,     // default 50000
-  pub deadline: Instant,    // default 250ms
+    pub max_hops: usize,      // default 10
+    pub max_nodes: usize,     // default 5000
+    pub max_edges: usize,     // default 50000
+    pub deadline: Instant,    // default 250ms (advisory)
 }
-
 pub struct BudgetExceeded {
-  pub stage: String,
-  pub visited: usize,
-  pub truncated: bool,
-  pub deadline_remaining_ms: u64,
+    pub stage: String,
+    pub visited: usize,
+    pub truncated: bool,
+    pub deadline_remaining_ms: u64,
 }
 ```
 
-- `BudgetExceeded` error includes `stage`, `visited`, `truncated`, and `deadline_remaining_ms`.
-- Extend `src/graph_read/related.rs` (`MAX_NODES`/`MAX_EDGES`) into `QueryBudget`; keep defaults (`2 / 20 / 40`) unchanged for `related_test.rs`.
-- Warn-first: never reject a query solely for budget; return partial results with `truncated`.
+- `deadline` is advisory: if `Instant::now() > deadline`, emit a telemetry warning (`BudgetExceeded` with `deadline_remaining_ms: 0`) but continue returning the same partial set the hard caps would yield; never alter the result set by timing.
+- `src/graph_read/related.rs` keeps its existing constants (`MAX_NODES=20`, `MAX_EDGES=40`, `governs_max_hops=2 default, 1..=5`) unchanged for `related_test.rs`; `QueryBudget` defaults are the closure-level caps, not the related-level caps.
 
 ### 5.3 zstd compression
 
-- Compress SynapticMesh wire records and snapshot frames via `zstd = "0.14.3"` crate, C `libzstd` FFI.
-- Stream frames (`zstd::stream::read::Encoder` / `Decoder`).
-- Zip-bomb defense: decompress with `Read::take(MAX_DECOMPRESSED_BYTES as u64 + 1)`; return `Err(DecompressionError::PayloadTooLarge)` if `buf.len() > MAX_DECOMPRESSED_BYTES`.
-- Snapshot frames and mesh bundles compressed; `<id>.json` Git files remain plain JSON.
-- License: `BSD-3-Clause` added to `cargo-deny` allowlist.
+- `compress_snapshot(bytes: &[u8]) -> Result<Vec<u8>, CompressionError>` and `compress_mesh_bundle(bytes: &[u8]) -> Result<Vec<u8>, CompressionError>` (infallible removed; errors propagate).
+- `decompress_snapshot(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError>` and `decompress_mesh_bundle(...)` (zip-bomb cap).
+- `DecompressionError::PayloadTooLarge` when `buf.len() > max`.
+- Streaming frames via `zstd::stream::read::Encoder`/`Decoder`; `Read::take(max as u64 + 1)`.
+- Call sites:
+  - `LadybugStore::export_database` (`src/store/ladybug.rs:3070`) compresses the exported snapshot frame.
+  - SynapticMesh: compress mesh bundle on publish (`src/synaptic_mesh/worker.rs`), decompress on import (`src/synaptic_mesh/import.rs`). `<id>.json` Git files remain plain JSON (compression applies to in-memory bundle frames, not Git-tracked files).
+- `src/closure_budget/mod.rs` stub: deleted; replaced by `src/compression/zstd.rs` and `src/telemetry/anomaly.rs` (or retained as re-export shim). Disposition: delete the stub module and remove from `mod.rs` declarations.
 
 ### 5.4 Anomaly detection
 
-- Vendor online `WelfordAccumulator` (mean/std_dev/min/max over `f64`) + EWMA z-score detector (~45 LoC, mirroring `oxirs-shacl`'s Welford detector without `scirs2`).
-- Track per-namespace: memory count rate, enrichment failure rate, per-stage latency.
-- EWMA z-score > threshold (default 3.0) emits a structured `AnomalyEvent` to telemetry/log.
-- Thread-safe: use `RwLock<HashMap<MetricKind, RollingStats>>`; `MetricKind` is a finite enum (`MemoryCount`, `EnrichmentFailure`, `Latency`) to bound keys.
-- Zero-variance guard: when `std_dev <= f64::EPSILON`, treat `(value - mean).abs() <= EPSILON` as `z_score = 0.0`; otherwise clamp denominator to `min_std_dev = 1e-6`.
-- Alternative: `rolling-stats = "0.8.0"` via Cargo as reference; if used, provide zero-variance guard, thread-safe wrapper, and `enum MetricKind`.
+- Vendor online `WelfordAccumulator` (mean/std_dev/min/max over `f64`) + EWMA z-score detector.
+- Key: `RwLock<HashMap<AnomalyKey, RollingStats>>` where `AnomalyKey = (String /* namespace */, MetricKind, String /* stage */)` to avoid collapsing namespaces/stages.
+- `MetricKind` finite enum: `MemoryCount`, `EnrichmentFailure`, `Latency`.
+- EWMA z-score formula: `z_score = (sample - ewma) / std_dev.max(min_std_dev)` where `min_std_dev = 1e-6`; if `std_dev <= f64::EPSILON`, treat as `z_score = 0.0` when `|sample - mean| <= EPSILON`.
+- EWMA update: `ewma = alpha * sample + (1 - alpha) * ewma`, default `alpha = 0.2`.
+- Sample variance: `count - 1` (sample std_dev) when `count >= 2`; `0.0` otherwise.
+- Cooldown: `last_emit: Instant`; emit `AnomalyEvent` only if `now - last_emit >= cooldown` (default 60s) and `|z_score| > z_threshold` (default 3.0).
+- `AnomalyEvent { metric: MetricKind, value: f64, mean: f64, std_dev: f64, z_score: f64, namespace: String, stage: String }`.
+- Thread-safe; telemetry/log only; never blocks reads.
+- Alternative `rolling-stats = "0.8.0"` not used (in-tree chosen).
 
 ## 6. Interfaces
 
+- Graph read (`src/graph_read/related.rs`, crate-free):
+  - `pub struct QueryBudget { max_hops, max_nodes, max_edges, deadline }`
+  - `pub struct BudgetExceeded { stage, visited, truncated, deadline_remaining_ms }`
+  - `pub struct ClosureResult<T> { items: Vec<T>, truncated: bool, budget_exceeded: Option<BudgetExceeded> }`
+  - `pub struct EdgeSpec { ... }` (existing)
+- RDF (`src/rdf/ontology.rs`):
+  - `closure_subclasses(root: &str, index: &OntologyIndex, budget: &QueryBudget) -> ClosureResult<String>`
 - Graph read:
-  - `closure_subclasses(root: &str, index: &OntologyIndex, budget: &QueryBudget) -> ClosureResult<MemoryId>`
-  - `closure_governs(root: &str, index: &OntologyIndex, edges: &[EdgeSpec], budget: &QueryBudget) -> ClosureResult<MemoryId>`
-  - `pub struct QueryBudget { pub max_hops, max_nodes, max_edges, deadline }`
-  - `pub struct BudgetExceeded { pub stage, pub visited, pub truncated, pub deadline_remaining_ms }`
-- Compression:
-  - `compress_snapshot(bytes: &[u8]) -> Vec<u8>` (zstd)
+  - `closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> ClosureResult<String>`
+- Compression (`src/compression/zstd.rs`):
+  - `compress_snapshot(bytes: &[u8]) -> Result<Vec<u8>, CompressionError>`
   - `decompress_snapshot(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError>`
-  - `compress_mesh_bundle(bytes: &[u8]) -> Vec<u8>`
+  - `compress_mesh_bundle(bytes: &[u8]) -> Result<Vec<u8>, CompressionError>`
   - `decompress_mesh_bundle(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError>`
-- Anomaly detection:
-  - `WelfordAccumulator: add(sample: f64)`; `mean()`, `std_dev()`, `min()`, `max()`
-  - `pub enum MetricKind { MemoryCount, EnrichmentFailure, Latency }`
-  - `pub struct RollingStats { welford: WelfordAccumulator, ewma: f64, alpha: f64, z_threshold: f64, last_emit: Instant }`
-  - `pub struct AnomalyEvent { metric: MetricKind, value: f64, mean: f64, std_dev: f64, z_score: f64, namespace: String, stage: String }`
+- Anomaly (`src/telemetry/anomaly.rs`):
+  - `WelfordAccumulator { add, mean, std_dev, min, max }`
+  - `RollingStats { welford, ewma, alpha, z_threshold, last_emit }`
+  - `AnomalyEvent { ... }`
+  - `AnomalyKey = (String, MetricKind, String)`
 - Configuration:
-  - `closure_max_hops: usize` (default 10, but `related.rs` / `governs_max_hops` still caps at 2 default, max 5)
+  - `closure_max_hops: usize` (default 10)
   - `closure_max_nodes: usize` (default 5000)
   - `closure_max_edges: usize` (default 50000)
   - `closure_deadline_ms: u64` (default 250)
-  - `snapshot_max_decompressed_bytes: usize` (default 16 MiB, but for mesh snapshots use 1 MiB to align with `MAX_RECORD_BYTES`)
+  - `snapshot_max_decompressed_bytes: usize` (default 1 MiB for mesh; 16 MiB for snapshots)
   - `anomaly_zscore_threshold: f64` (default 3.0)
+  - `anomaly_cooldown_secs: u64` (default 60)
+  - `anomaly_alpha: f64` (default 0.2)
 
 ## 7. Edge cases
 
-- Self-loop (`subClassOf` to itself): cycle guard prevents infinite recursion.
-- Deep chain (> `max_hops`): partial closure + `truncated: true` + `BudgetExceeded`.
-- Disconnected entity (no subclasses): empty result set.
-- Oversized mesh bundle (> `max_decompressed_bytes`): reject with `DecompressionError::PayloadTooLarge`.
-- Zero-variance (`std_dev == 0.0`) division-by-zero in z-score: guard with `EPSILON` handling.
-- First sample in accumulator: no anomaly (`count < 2`).
-- Budget deadline reached mid-traversal: return partial results, do not block.
-- Private/structural/task rows (`eligibility != "shareable"`): exclude from closure and validation results (inherited from prior specs).
+- Self-loop: cycle guard prevents infinite recursion.
+- Deep chain (> max_hops): partial closure + truncated + BudgetExceeded.
+- Disconnected entity: empty result.
+- Oversized bundle (> max): `DecompressionError::PayloadTooLarge`.
+- Zero-variance: z_score = 0.0 (guarded).
+- First sample: no anomaly (count < 2).
+- Budget deadline mid-traversal: return partial, don't block.
+- Private/structural/task rows: excluded (inherited).
 
-### 7.1 Determinism guarantee (K3 review)
+### 7.1 Determinism
 
-- **Deadline is a soft cap, not a determinism boundary.** The deterministic budget is `max_hops` / `max_nodes` / `max_edges`; `deadline` is advisory only and **never changes the result set** across identical inputs. If a deadline is hit, the traversal returns the same partial set it would have returned at the equivalent `max_hops`/`max_nodes`/`max_edges` cap — the truncation is purely a function of the hard caps, not wall-clock time.
-- **Neighbor ordering is deterministic before budget cuts.** BFS/DFS expands neighbors in a stable, sorted order (sorted by canonical IRI / MemoryId) before any budget-based truncation. `ClosureResult.truncated` reflects only the hard-cap hit, not timing.
-- **Anomaly detection is deterministic** (Welford/EWMA over fixed samples; no wall-clock dependence).
-- **`governs_max_hops` default = 2** (aligns with `related.rs` default in `2hxl` spec; range `1..=5`).
+- `deadline` advisory only; never changes result set.
+- Neighbor ordering sorted before budget cuts.
+- Anomaly detection deterministic (Welford/EWMA over fixed samples).
 
 ## 8. Testing
 
-- Unit: closure over known subClassOf* chain returns all descendants.
-- Unit: cycle guard prevents infinite loop on self-referencing edge.
-- Unit: `BudgetExceeded` returned when `max_hops` exceeded.
-- Unit: `ClosureResult` carries `truncated: true` and partial `Vec<MemoryId>`.
-- Unit: zstd compress/decompress snapshot roundtrip.
-- Unit: `decompress_bounded` rejects payload > `max_decompressed_bytes` when `buf.len() > max`.
-- Unit: Welford mean/std_dev match manual computation.
-- Unit: zero-variance guard (all samples identical) => `z_score = 0.0`.
-- Unit: EWMA z-score emits `AnomalyEvent` for injected outlier; no anomaly for normal data.
-- Integration: closure applied to `related` graph traversal does not exceed deadline.
-- Integration: `related_for_seed_with_budget` exists and passes `related_test.rs`.
-- Performance: closure + budget stay within configured `deadline_ms`.
+- Unit: closure over known chain returns all descendants.
+- Unit: cycle guard on self-loop.
+- Unit: BudgetExceeded when max_hops exceeded.
+- Unit: ClosureResult truncated + partial Vec.
+- Unit: zstd roundtrip.
+- Unit: decompress_bounded rejects payload > max (buf.len() > max).
+- Unit: Welford mean/std_dev manual.
+- Unit: zero-variance guard.
+- Unit: EWMA emits AnomalyEvent for outlier.
+- Integration: closure + budget within deadline.
+- Integration: related_for_seed_with_budget passes related_test.rs.
+- Performance: closure + budget within deadline_ms.
 
 ## 9. Acceptance
 
-Bounded transitive closure over `subClassOf*` / `GOVERNS`-closure with per-query budget (warn-first, partial results, preserving `related.rs` constants); zstd compression of snapshots and mesh bundles with zip-bomb cap (no binary files in Git); online Welford + EWMA z-score anomaly detector (thread-safe, finite-key enum, zero-variance guard, telemetry/log only); all without `oxirs-core`, `scirs2`, `oxirs-shacl`, `oxiarc-zstd`, or `ruzstd`; zero LLM usage.
+Bounded transitive closure (class IRIs + memory IRIs) with canonical QueryBudget; zstd compression with zip-bomb cap and defined call sites; Welford+EWMA anomaly detector with namespace/stage-keyed state; no oxirs-core/scirs2/oxirs-shacl/oxiarc-zstd/ruzstd; zero LLM; deadline advisory only.
 
 ## 10. Files touched (expected)
 
-- `src/rdf/ontology.rs`: add `closure_subclasses` and `closure_governs` with bounded BFS/DFS.
-- `src/graph_read/related.rs`: add `related_for_seed_with_budget`; keep defaults (`2 / 20 / 40`) unchanged; add `pub struct QueryBudget` if `graph_read` is crate-free; add `pub struct BudgetExceeded`.
-- `src/compression/zstd.rs` (new): `compress_snapshot`, `decompress_snapshot`, `compress_mesh_bundle`, `decompress_mesh_bundle` with `Read::take` cap and exact-boundary unit test.
-- `src/telemetry/anomaly.rs` (new): `WelfordAccumulator`, `RollingStats` (with `MetricKind` enum and thread-safe `RwLock`), anomaly detection logic and `AnomalyEvent`.
-- `Cargo.toml`: add `zstd = "0.14.3"` and `BSD-3-Clause` to license allowlist.
+- `src/rdf/ontology.rs`: `closure_subclasses`.
+- `src/graph_read/related.rs`: `closure_governs`, canonical `QueryBudget`/`BudgetExceeded`/`ClosureResult`/`EdgeSpec`.
+- `src/rdf/reasoning.rs`: remove or re-export `QueryBudget` (migrate callers).
+- `src/compression/zstd.rs` (new): compress/decompress functions.
+- `src/telemetry/anomaly.rs` (new): Welford, RollingStats, AnomalyEvent, AnomalyKey.
+- `src/store/ladybug.rs`: export_database compression call site.
+- `src/synaptic_mesh/worker.rs`, `import.rs`: bundle compression call sites.
+- `src/closure_budget/mod.rs`: deleted (or re-export shim).
+- `Cargo.toml`: add `zstd = "0.14.3"`; license allowlist (create deny.toml if absent).
