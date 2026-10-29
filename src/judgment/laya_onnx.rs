@@ -81,7 +81,9 @@ impl LayaOnnxProvider {
         if !manifest_path.exists() {
             let manifest = serde_json::json!({
                 "model_path": "model.onnx",
+                "embedder_id": "laya-english-v0.4.14",
                 "embedder": "laya-english-v0.4.14",
+                "model_version": "v1.11.1",
                 "version": "v1.11.1"
             });
             std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
@@ -284,7 +286,9 @@ impl LearningRuntimeManager {
         if !manifest_path.exists() {
             let manifest = serde_json::json!({
                 "model_path": "model.onnx",
+                "embedder_id": "laya-english-v0.4.14",
                 "embedder": "laya-english-v0.4.14",
+                "model_version": "v1.11.1",
                 "version": "v1.11.1"
             });
             std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;

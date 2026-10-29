@@ -1989,6 +1989,17 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
         std::fs::remove_dir_all(&db).ok();
     }
+
+    #[test]
+    fn markdown_sections_extract_headings_backticks_links_and_skip_empty() {
+        let md = "# Heading\n\nbody with `sym` and [link](https://example.com)\n\n## Empty\n\n   \n\n## Second\nmore";
+        let secs = parse_markdown_sections(md);
+        assert_eq!(secs.len(), 2);
+        assert_eq!(secs[0].heading, "Heading");
+        assert!(secs[0].backticked.contains(&"sym".to_string()));
+        assert!(secs[0].links.contains(&"https://example.com".to_string()));
+        assert_eq!(secs[1].heading, "Second");
+    }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or
 /// downloading anything.
