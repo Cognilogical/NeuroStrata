@@ -46,7 +46,7 @@ use uuid::Uuid;
 use super::conflict::{self, ConflictKind};
 use super::manifest::Trust;
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
 };
 use super::storage::MeshStorage;
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
@@ -75,6 +75,9 @@ const RUNTIME_COUNTER_KEYS: [&str; 4] = [
 /// parsed, never applied — so an oversized JSON blob cannot force the daemon
 /// to materialize an arbitrarily large record.
 pub const MAX_RECORD_BYTES: usize = 1024 * 1024; // 1 MiB
+/// Per spec §5.5: maximum canonical N-Quads payload size and quad count.
+pub const MAX_RDF_QUADS_BYTES: usize = 512 * 1024; // 512 KiB
+pub const MAX_RDF_QUADS_COUNT: usize = 1000;
 
 /// What one replay pass did.
 #[derive(Debug, Clone)]
@@ -636,7 +639,7 @@ pub fn validate_record(
             MAX_RECORD_BYTES
         ));
     }
-    let record: MeshRecord =
+    let mut record: MeshRecord =
         serde_json::from_str(raw).map_err(|e| format!("unparseable MeshRecord ({e})"))?;
     if record.schema_version != MESH_RECORD_SCHEMA_VERSION {
         return Err(format!(
@@ -677,6 +680,27 @@ pub fn validate_record(
             "runtime procedure counters are strictly local; a shared record must not carry them"
                 .to_string(),
         );
+    }
+    // Canonical RDF validation (§5.2f, Phase 1: warn-and-apply-fallback).
+    // If the record carries an rdf block, verify its canonical_hash,
+    // predicate allowlist, and subject agreement. On violation, report it
+    // as a diagnostic but do NOT refuse the record — Phase 1 accepts the
+    // valid JSON envelope and emits the violation for audit.
+    if let Some(ref rdf_block) = record.rdf {
+        if let Err(violations) = crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block) {
+            // Phase 1: emit diagnostic (spec §5.3 warn-first); record is still
+            // applied. The violation is tagged into metadata for audit.
+            tracing::warn!(
+                target: "neurostrata::import::rdf",
+                "canonical RDF violation on {} (ns={}) — Phase 1 apply-with-diagnostic: {}",
+                record.id, record.namespace,
+                violations.join("; ")
+            );
+            if let Some(obj) = record.metadata.as_object_mut() {
+                obj.insert("rdf_diagnostic_violations".to_string(), json!(violations));
+                obj.insert("rdf_diagnostic_phase".to_string(), json!("1"));
+            }
+        }
     }
     // Secret scan (J15, import leg): the same scanner every local write
     // path answers to, run over the record's content and metadata before
@@ -1652,14 +1676,59 @@ fn preserved_edit_record(
     metadata.insert("eligibility".to_string(), json!("shareable"));
     metadata.insert("trust".to_string(), json!("untrusted"));
     metadata.insert("references".to_string(), json!([original_id]));
+
+    // Build canonical RDF block for the preserved-edit record (spec §5.2c).
+    // Always emit: Phase 1 dual-write.
+    let created_at = chrono::Utc::now();
+    let content_str = match &content {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(&content).unwrap_or_default(),
+    };
+    // Curated metadata for RDF projection
+    let eligibility = metadata.get("eligibility").and_then(|v| v.as_str());
+    let source = metadata.get("source").and_then(|v| v.as_str());
+    let tags: Vec<String> = metadata.get("tags").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let concept_iri = metadata.get("concept_iri").and_then(|v| v.as_str());
+    let rdf_relationships: Vec<(String, String)> = rels.iter()
+        .map(|r| (r.kind.clone(), r.target.to_string()))
+        .collect();
+    let state_str = "active";
+    let id = Uuid::new_v4();
+    let update_id = Uuid::new_v4();
+    let (nquads_text, digest_str) = crate::rdf::dataset_canonical::build_mesh_canonical_nquads(
+        &id.to_string(),
+        namespace,
+        &memory_type,
+        state_str,
+        &created_at.to_rfc3339(),
+        &created_by,
+        None,
+        None,
+        None,
+        &content_str,
+        eligibility,
+        source,
+        &tags,
+        concept_iri,
+        &rdf_relationships,
+        &update_id.to_string(),
+        origin_mesh_epoch,
+        "untrusted",
+        None,
+        None,
+        None,
+        None,
+    );
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
-        id: Uuid::new_v4(),
+        id,
         namespace: namespace.to_string(),
         memory_type,
         lifecycle: Lifecycle {
             state: LifecycleState::Active,
-            created_at: chrono::Utc::now(),
+            created_at,
             created_by,
             superseded_by: None,
             archived_at: None,
@@ -1667,10 +1736,14 @@ fn preserved_edit_record(
         },
         content,
         metadata: Value::Object(metadata),
-        rdf: None,
-
+        rdf: Some(RdfBlock {
+            schema: "neurostrata-rdf-record/v1".to_string(),
+            format: "n-quads".to_string(),
+            canonical_hash: digest_str,
+            quads: nquads_text,
+        }),
         relationships: rels,
-        update_id: Uuid::new_v4(),
+        update_id,
         origin_mesh_epoch,
         trust: Trust::Untrusted,
     }
