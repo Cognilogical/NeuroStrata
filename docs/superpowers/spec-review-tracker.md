@@ -8,7 +8,7 @@
 | sparql-query-engine | neurostrata-gq46 | APPROVED (2026-10-28) | ready for implementation |
 | kge-structural-embeddings | neurostrata-9c4w | APPROVED (2026-10-28) | ready for implementation |
 | community-detection | neurostrata-knq3 | APPROVED (2026-10-28) | ready for implementation |
-| entity-mention-linking | neurostrata-n1k9 | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
+| entity-mention-linking | neurostrata-n1k9 | APPROVED (2026-10-28) | ready for implementation |
 | graphrag-hybrid-search | neurostrata-6x0q | pending | needs review |
 | federation | neurostrata-ahix | pending | needs review |
 | streaming-delta | neurostrata-7rgp | pending | needs review |
