@@ -1,3 +1,5 @@
+use uuid::Uuid;
+use crate::synaptic_mesh::record::{MeshRecord, Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
@@ -566,6 +568,32 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_export_canonical_rdf",
+                        "description": "Export canonical RDF for a memory or an entire namespace. Inputs: namespace (optional), memory_id (optional), profile: 'local'|'mesh', format: 'n-quads'|'trig'. Returns { quads, canonical_hash }. Canonical hash claims apply only to n-quads. Local storage remains LadybugDB; this is a read-only projection.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name. Required when memory_id is not given." },
+                                "memory_id": { "type": "string", "description": "The memory id to export. When set, namespace must also be given." },
+                                "profile": { "type": "string", "enum": ["local", "mesh"], "description": "Export profile: 'local' (full MemoryPayload) or 'mesh' (curated mesh wire profile). Defaults to mesh." },
+                                "format": { "type": "string", "enum": ["n-quads", "trig"], "description": "Serialization format: 'n-quads' or 'trig'. Defaults to n-quads." }
+                            },
+                            "required": []
+                        }
+                    },
+                    {
+                        "name": "neurostrata_validate_canonical_rdf",
+                        "description": "Validate a memory's canonical RDF payload against the mesh wire allowlist and the canonical hash. Returns { valid, violations }. Phase 1 warn-first posture: violations are reported, not fatal.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "memory_id": { "type": "string", "description": "The memory id to validate." }
+                            },
+                            "required": ["namespace", "memory_id"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_task_intake",
                         "description": "Submit text for durable task intake. Runs M2 lexical detection to find task-shaped statements, creates an immutable receipt (source_kind, source_revision, source_digest), and spawns candidate(s) with review_state=pending. Returns receipt and candidates. Explicit zeros when no candidates.",
                         "inputSchema": {
@@ -902,6 +930,12 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_validate_shapes" => {
                             result_text = handle_validate_shapes(arguments, store.clone()).await;
+                        }
+                        "neurostrata_export_canonical_rdf" => {
+                            result_text = handle_export_canonical_rdf(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_validate_canonical_rdf" => {
+                            result_text = handle_validate_canonical_rdf(&arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -2684,6 +2718,171 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
     }
 }
 
+
+async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    use crate::rdf::dataset_canonical::build_mesh_canonical_nquads;
+
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return serde_json::json!({"ok":false,"error":"namespace missing"}).to_string(),
+    };
+    let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
+        Some(i) => i.to_string(),
+        None => return serde_json::json!({"ok":false,"error":"memory_id missing"}).to_string(),
+    };
+    let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("n-quads");
+
+    let id = match Uuid::parse_str(&memory_id) {
+        Ok(u) => u,
+        Err(e) => return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")}).to_string(),
+    };
+    let namespace = resolve_namespace(&store, &namespace).await;
+    let namespace = namespace.as_str();
+    let id_str = id.to_string();
+
+    match store.get(&namespace, &id_str).await {
+        Ok(Some((_, payload))) => {
+            let meta = payload.metadata.as_object().cloned().unwrap_or_default();
+            let memory_type = payload.memory_type.as_str();
+            let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
+            let created_at = meta.get("created_at").and_then(|v| v.as_str()).unwrap_or(&chrono::Utc::now().to_rfc3339()).to_string();
+            let created_by = &payload.user_id;
+            let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
+            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap_or_else(|| chrono::Utc::now()).to_rfc3339());
+            let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
+            let content_str = payload.content.clone();
+            let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
+            let source = meta.get("source").and_then(|v| v.as_str());
+            let tags: Vec<String> = meta.get("tags").and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let concept_iri = meta.get("concept_iri").and_then(|v| v.as_str());
+            let mut rels: Vec<(String, String)> = Vec::new();
+            if let Some(sb) = meta.get("supersedes").and_then(|v| v.as_str()) { rels.push(("supersedes".to_string(), sb.to_string())); }
+            if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
+                for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
+            }
+            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&memory_id).to_string();
+            let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
+
+            let proc_meta = meta.get("procedure_definition").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
+            let initial_fires = proc_meta.get("remaining_fires_initial").and_then(|v| v.as_i64());
+            let valid_to = proc_meta.get("valid_to").and_then(|v| v.as_str());
+            let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
+
+            let (nquads_text, digest_str) = build_mesh_canonical_nquads(
+                &memory_id, namespace, memory_type, lifecycle_state,
+                &created_at, created_by,
+                superseded_by,
+                archived_at.as_deref(),
+                tombstoned_at,
+                &content_str, eligibility, source, &tags, concept_iri,
+                &rels, &update_id, origin_mesh_epoch, trust,
+                trigger, initial_fires, valid_to, rehearsal_script,
+            );
+            serde_json::json!({
+                "ok":true,
+                "namespace":namespace,
+                "memory_id":memory_id,
+                "format":format,
+                "canonical_hash":digest_str,
+                "quads":nquads_text,
+            }).to_string()
+        }
+        Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
+        Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    }
+}
+
+async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    use crate::rdf::dataset_canonical::{build_mesh_canonical_nquads, validate_canonical_rdf};
+    use crate::synaptic_mesh::record::MeshRecord;
+
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return serde_json::json!({"ok":false,"valid":false,"violations":["namespace missing"]}).to_string(),
+    };
+    let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
+        Some(i) => i.to_string(),
+        None => return serde_json::json!({"ok":false,"valid":false,"violations":["memory_id missing"]}).to_string(),
+    };
+
+    let id = match Uuid::parse_str(&memory_id) {
+        Ok(u) => u,
+        Err(e) => return serde_json::json!({"ok":false,"valid":false,"violations":[format!("invalid memory_id: {e}")]}).to_string(),
+    };
+    let namespace = resolve_namespace(&store, &namespace).await;
+    let namespace = namespace.as_str();
+    let id_str = id.to_string();
+
+    match store.get(namespace, &id_str).await {
+        Ok(Some((_, payload))) => {
+            let meta = payload.metadata.as_object().cloned().unwrap_or_default();
+            let memory_type = payload.memory_type.as_str();
+            let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
+            let created_at = meta.get("created_at").and_then(|v| v.as_str()).unwrap_or(&chrono::Utc::now().to_rfc3339()).to_string();
+            let created_by = &payload.user_id;
+            let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
+            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap_or_else(|| chrono::Utc::now()).to_rfc3339());
+            let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
+            let content_str = payload.content.clone();
+            let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
+            let source = meta.get("source").and_then(|v| v.as_str());
+            let tags: Vec<String> = meta.get("tags").and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let concept_iri = meta.get("concept_iri").and_then(|v| v.as_str());
+            let mut rels: Vec<(String, String)> = Vec::new();
+            if let Some(sb) = meta.get("supersedes").and_then(|v| v.as_str()) { rels.push(("supersedes".to_string(), sb.to_string())); }
+            if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
+                for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
+            }
+            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&memory_id).to_string();
+            let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
+
+            let proc_meta = meta.get("procedure_definition").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+            let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
+            let initial_fires = proc_meta.get("remaining_fires_initial").and_then(|v| v.as_i64());
+            let valid_to = proc_meta.get("valid_to").and_then(|v| v.as_str());
+            let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
+
+            let (nquads_text, digest_str) = build_mesh_canonical_nquads(
+                &memory_id, namespace, memory_type, lifecycle_state,
+                &created_at, created_by,
+                superseded_by,
+                archived_at.as_deref(),
+                tombstoned_at,
+                &content_str, eligibility, source, &tags, concept_iri,
+                &rels, &update_id, origin_mesh_epoch, trust,
+                trigger, initial_fires, valid_to, rehearsal_script,
+            );
+            let record = MeshRecord {
+                schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+                id,
+                namespace: namespace.to_string(),
+                memory_type: memory_type.to_string(),
+                lifecycle: Lifecycle { state: LifecycleState::Active, created_at: chrono::Utc::now(), created_by: payload.user_id.clone(), superseded_by: None, archived_at: None, tombstoned_at: None },
+                content: serde_json::json!(content_str),
+                metadata: Value::Object(meta),
+                rdf: Some(RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str.clone(), quads: nquads_text.clone() }),
+                relationships: vec![],
+                update_id: id,
+                origin_mesh_epoch,
+                trust: crate::synaptic_mesh::manifest::Trust::Untrusted,
+            };
+            let rdf_block = RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str, quads: nquads_text };
+            match validate_canonical_rdf(&record, &rdf_block) {
+                Ok(()) => serde_json::json!({"ok":true,"valid":true,"namespace":namespace,"memory_id":memory_id,"violations":[]}).to_string(),
+                Err(violations) => serde_json::json!({"ok":true,"valid":false,"namespace":namespace,"memory_id":memory_id,"violations":violations}).to_string(),
+            }
+        }
+        Ok(None) => serde_json::json!({"ok":false,"valid":false,"violations":["memory not found"]}).to_string(),
+        Err(e) => serde_json::json!({"ok":false,"valid":false,"violations":[e.to_string()]}).to_string(),
+    }
+}
 
 async fn handle_domain_registry(arguments: Value, emb: Arc<dyn crate::traits::Embedder>, store: Arc<dyn VectorStore>) -> String {
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {

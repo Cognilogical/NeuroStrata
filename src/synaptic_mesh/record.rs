@@ -18,10 +18,16 @@ use uuid::Uuid;
 pub const MESH_RECORD_SCHEMA_VERSION: &str = "synaptic-mesh-record/v1";
 
 /// Optional RDF projection block for a mesh record (canonical N-Quads).
+///
+/// Per spec §5.2g: `RdfBlock { schema, format, canonical_hash, quads }`.
+/// `schema` = "neurostrata-rdf-record/v1", `format` = "n-quads",
+/// `canonical_hash` = "sha256:<hex>", `quads` = canonical N-Quads text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RdfBlock {
-    pub nquads: String,
-    pub digest: String,
+    pub schema: String,
+    pub format: String,
+    pub canonical_hash: String,
+    pub quads: String,
 }
 
 /// A single mesh record (memory or procedure).
@@ -43,9 +49,9 @@ pub struct MeshRecord {
     /// Per-record metadata. `eligibility` and `trust` are the gate fields
     /// the mesh-worker consults at publish time.
     pub metadata: serde_json::Value,
-    /// Optional RDF projection (canonical N-Quads + SHA-256 digest). None for
+    /// Optional RDF projection (canonical N-Quads + SHA-256). None for
     /// records that have not been projected yet.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdf: Option<RdfBlock>,
     pub relationships: Vec<Relationship>,
     /// Monotonic per-record id. Bumps on every accepted change. The pull

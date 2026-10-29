@@ -1,4 +1,5 @@
 pub mod canonical;
+pub mod dataset_canonical;
 pub mod namespace;
 pub mod ontology;
 pub mod projection;
@@ -7,6 +8,7 @@ pub mod types;
 pub mod types_oxrdf;
 
 pub use canonical::*;
+pub use dataset_canonical::*;
 pub use namespace::*;
 pub use ontology::*;
 pub use projection::*;

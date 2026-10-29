@@ -25,8 +25,9 @@ use super::outbox::{
     is_shareable_memory_type, Outbox, OutboxEntry, OP_ARCHIVED, OP_CREATED, OP_SUPERSEDED,
 };
 use super::record::{
-    Lifecycle, LifecycleState, MeshRecord, Relationship, MESH_RECORD_SCHEMA_VERSION,
+    Lifecycle, LifecycleState, MeshRecord, Relationship, RdfBlock, MESH_RECORD_SCHEMA_VERSION,
 };
+use crate::rdf::build_mesh_canonical_nquads;
 use super::storage::MeshStorage;
 
 /// What one drain did. Fielded so the daemon's loop can log it and the tests
@@ -210,6 +211,15 @@ fn apply_one(
         record.lifecycle.created_at = existing.lifecycle.created_at;
         record.lifecycle.created_by = existing.lifecycle.created_by.clone();
         record.origin_mesh_epoch = existing.origin_mesh_epoch;
+
+        // Rebuild the canonical RDF block from the post-mutation record so
+        // the exported quads reflect the new lifecycle state (spec §5.2c).
+        // The existing block is the source of truth for every other field.
+        if let Some(ref existing_rdf) = existing.rdf {
+            if let Some(new_rdf) = rebuild_rdf_block(&record, existing_rdf) {
+                record.rdf = Some(new_rdf);
+            }
+        }
     }
 
     // Oversized-record size cap: refuse records larger than 1 MiB to keep
@@ -258,6 +268,71 @@ fn build_record(
         }
     }
 
+    // Build canonical RDF block (Phase 1 dual-write: always emit canonical payload)
+    let created_at_str = created_at(entry).to_rfc3339();
+    let archived_at_str = archived_at.as_ref().map(|dt| dt.to_rfc3339());
+    let tombstoned_at_str = None::<String>; // Not set on creation
+    let superseded_by_str = superseded_by.as_ref().map(|u| u.to_string());
+    let update_id_str = entry.stable_op_id.to_string();
+    let trust_val = trust_from(&entry.metadata).to_string();
+
+    // Extract curated metadata
+    let eligibility = entry.metadata.get("eligibility").and_then(|v| v.as_str());
+    let source = entry.metadata.get("source").and_then(|v| v.as_str());
+    let tags: Vec<String> = entry.metadata.get("tags").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let concept_iri = entry.metadata.get("concept_iri").and_then(|v| v.as_str());
+
+    // Extract procedure definition fields (owned Strings so they outlive any
+    // further borrow; the def is dropped at the end of its if-block).
+    let (trigger, initial_fires, valid_to, rehearsal_script) = if entry.memory_type == "procedure" {
+        let def = procedure_definition(entry);
+        let trig = def.get("trigger").and_then(|v| v.as_str()).map(String::from);
+        let fires = def.get("remaining_fires_initial").and_then(|v| v.as_i64());
+        let vt = def.get("valid_to").and_then(|v| v.as_str()).map(String::from);
+        let rs = def.get("rehearsal_script").and_then(|v| v.as_str()).map(String::from);
+        (trig, fires, vt, rs)
+    } else {
+        (None, None, None, None)
+    };
+
+    // Build relationships vec for RDF
+    let rdf_relationships: Vec<(String, String)> = relationships.iter()
+        .map(|r| (r.kind.clone(), r.target.to_string()))
+        .collect();
+
+    // Content string for RDF (stringified JSON for procedure, plain text for memory)
+    let content_str = match &content {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(&content).unwrap_or_default(),
+    };
+
+    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
+        &id.to_string(),
+        &entry.namespace,
+        &entry.memory_type,
+        &format!("{:?}", state).to_lowercase(),
+        &created_at_str,
+        &node_id,
+        superseded_by_str.as_deref(),
+        archived_at_str.as_deref(),
+        tombstoned_at_str.as_deref(),
+        &content_str,
+        eligibility,
+        source,
+        &tags,
+        concept_iri,
+        &rdf_relationships,
+        &update_id_str,
+        epoch,
+        &trust_val,
+        trigger.as_deref(),
+        initial_fires,
+        valid_to.as_deref(),
+        rehearsal_script.as_deref(),
+    );
+
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
         id,
@@ -273,7 +348,12 @@ fn build_record(
         },
         content,
         metadata: projected_metadata(&entry.metadata),
-        rdf: None,
+        rdf: Some(RdfBlock {
+            schema: "neurostrata-rdf-record/v1".to_string(),
+            format: "n-quads".to_string(),
+            canonical_hash: digest_str,
+            quads: nquads_text,
+        }),
         relationships,
         // The record's revision id IS the outbox entry's idempotency key, so
         // re-applying an entry produces byte-identical output.
@@ -281,6 +361,63 @@ fn build_record(
         origin_mesh_epoch: epoch,
         trust: trust_from(&entry.metadata),
     }
+}
+
+/// Rebuild the canonical RDF block from a MeshRecord after lifecycle mutation.
+/// Uses the existing block only to preserve content/relationships (all come
+/// from the record itself); the lifecycle fields are taken from the record.
+fn rebuild_rdf_block(record: &MeshRecord, _existing: &RdfBlock) -> Option<RdfBlock> {
+    let id_str = record.id.to_string();
+    let namespace = &record.namespace;
+    let memory_type = &record.memory_type;
+    let state_str = format!("{:?}", record.lifecycle.state).to_lowercase();
+    let created_at_str = record.lifecycle.created_at.to_rfc3339();
+    let created_by = &record.lifecycle.created_by;
+    let superseded_by_str = record.lifecycle.superseded_by.as_ref().map(|u| u.to_string());
+    let archived_at_str = record.lifecycle.archived_at.as_ref().map(|dt| dt.to_rfc3339());
+    let tombstoned_at_str = record.lifecycle.tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
+    let content_str = match &record.content {
+        Value::String(s) => s.clone(),
+        _ => serde_json::to_string(&record.content).unwrap_or_default(),
+    };
+    let eligibility = record.metadata.get("eligibility").and_then(|v| v.as_str());
+    let source = record.metadata.get("source").and_then(|v| v.as_str());
+    let tags: Vec<String> = record.metadata.get("tags").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let concept_iri = record.metadata.get("concept_iri").and_then(|v| v.as_str());
+    let rdf_relationships: Vec<(String, String)> = record.relationships.iter()
+        .map(|r| (r.kind.clone(), r.target.to_string()))
+        .collect();
+    let update_id_str = record.update_id.to_string();
+    let epoch = record.origin_mesh_epoch;
+    let trust_val = format!("{:?}", record.trust).to_lowercase();
+    // Procedure fields: read from content definition if procedure
+    let (trigger, initial_fires, valid_to, rehearsal_script) = if record.memory_type == "procedure" {
+        if let Some(def) = record.content.as_object() {
+            let trig = def.get("trigger").and_then(|v| v.as_str()).map(String::from);
+            let fires = def.get("remaining_fires_initial").and_then(|v| v.as_i64());
+            let vt = def.get("valid_to").and_then(|v| v.as_str()).map(String::from);
+            let rs = def.get("rehearsal_script").and_then(|v| v.as_str()).map(String::from);
+            (trig, fires, vt, rs)
+        } else { (None, None, None, None) }
+    } else { (None, None, None, None) };
+
+    let (nquads_text, digest_str) = build_mesh_canonical_nquads(
+        &id_str, namespace, memory_type, &state_str,
+        &created_at_str, created_by,
+        superseded_by_str.as_deref(),
+        archived_at_str.as_deref(), tombstoned_at_str.as_deref(),
+        &content_str, eligibility, source, &tags, concept_iri,
+        &rdf_relationships, &update_id_str, epoch, &trust_val,
+        trigger.as_deref(), initial_fires, valid_to.as_deref(), rehearsal_script.as_deref(),
+    );
+    Some(RdfBlock {
+        schema: "neurostrata-rdf-record/v1".to_string(),
+        format: "n-quads".to_string(),
+        canonical_hash: digest_str,
+        quads: nquads_text,
+    })
 }
 
 /// The record's `metadata` object: the spec's curated subset. Eligibility is
