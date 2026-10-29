@@ -69,14 +69,25 @@ impl Trainer {
         Self { runtime }
     }
 
-    /// Run a training job for candidate version (in-house approximation).
-    /// Writes a training marker file and transitions state; real ONNX
-    /// training requires the Python laya-train script and model bundle.
+    /// Run a training job for candidate version.
+    ///
+    /// Laya training depends on an externally provisioned `laya-train`
+    /// runtime and a validated model bundle. This method does not fabricate
+    /// a training marker or report success when that runtime is absent.
     pub async fn train_candidate(&self, version: &ModelVersion) -> Result<()> {
-        let dir = self.runtime.model_cache.join(version);
-        std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!(e))?;
-        std::fs::write(dir.join("training.marker"), version).map_err(|e| anyhow::anyhow!(e))?;
-        Ok(())
+        if !self.runtime.python.exists() || !self.runtime.laya_train.exists() {
+            return Err(anyhow::anyhow!(
+                "Laya training runtime is unavailable (python: {}, laya-train: {})",
+                self.runtime.python.display(),
+                self.runtime.laya_train.display()
+            ));
+        }
+        // Real training is delegated to the provisioned laya-train runtime.
+        // This repository does not bundle that runtime, so candidate training
+        // is not available in this build.
+        Err(anyhow::anyhow!(
+            "Laya training is not wired to the local laya-train runtime"
+        ))
     }
 
     /// Transition job state (no-ops in Phase-0 stub).
@@ -109,5 +120,16 @@ mod tests {
         };
         assert_eq!(report.candidate, "v0.0.0-bridge");
         assert!(report.gold_metrics().is_none());
+    }
+
+    #[tokio::test]
+    async fn train_candidate_returns_err() {
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("/nonexistent/python"),
+            laya_train: PathBuf::from("/nonexistent/laya-train"),
+            model_cache: PathBuf::from(".cache/laya"),
+        }));
+        let res = t.train_candidate(&"v0.0.0".to_string()).await;
+        assert!(res.is_err());
     }
 }

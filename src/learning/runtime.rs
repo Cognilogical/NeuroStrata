@@ -22,7 +22,7 @@ impl LearningRuntimeManager {
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
-        RuntimeState::Ready
+        RuntimeState::Unavailable
     }
 
     /// Return the local training runtime configuration.

@@ -129,7 +129,11 @@ pub fn fetch_model(
 }
 
 /// Convenience: fetch from the registry by model ID.
-/// Returns the path to the written model file.
+///
+/// Handles both single-file entries and `.tar.gz` archives. For archives, the
+/// SHA-256 is verified over the archive bytes before extraction; extracted
+/// members are written under `registry_dir`. `entry.files`, when present, is
+/// used to verify that the expected artifacts exist after extraction.
 pub fn fetch_from_registry(
     model_id: &str,
     registry_dir: &Path,
@@ -140,14 +144,82 @@ pub fn fetch_from_registry(
         .ok_or_else(|| anyhow!("Model '{}' not found in registry", model_id))?
         .clone();
 
+    std::fs::create_dir_all(registry_dir).context("Failed to create model directory")?;
+
     let out_path = registry_dir.join(entry.path.clone().unwrap_or_else(|| "model.onnx".into()));
-    let written = fetch_model(&entry.url, &entry.sha256, &out_path)?;
 
-    // Save updated registry (in case new entry was added)
-    let new_registry = registry;
-    let _ = new_registry.write(registry_dir);
+    if entry.url.ends_with(".tar.gz") || entry.url.ends_with(".tgz") {
+        // Download the archive into memory first so its SHA-256 can be verified
+        // before any bytes are written to disk.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .context("HTTP client build failed")?;
+        let response = client.get(&entry.url).send().context("Download request failed")?;
+        if !response.status().is_success() {
+            return Err(anyhow!("HTTP {} for {}", response.status(), entry.url));
+        }
+        let archive_bytes = response.bytes().context("Failed to read response body")?;
 
-    Ok(written)
+        let mut hasher = Sha256::new();
+        hasher.update(&archive_bytes);
+        let actual_sha = format!("{:x}", hasher.finalize());
+        if actual_sha != entry.sha256 {
+            return Err(anyhow!(
+                "SHA-256 mismatch! Expected {}, got {}",
+                entry.sha256,
+                actual_sha
+            ));
+        }
+
+        // Extract safely: reject traversal and absolute paths.
+        let decoder = flate2::read::GzDecoder::new(&archive_bytes[..]);
+        let mut archive = tar::Archive::new(decoder);
+        for member in archive.entries().context("Failed to read tar entries")? {
+            let mut member = member.context("Failed to read tar member")?;
+            let entry_type = member.header().entry_type();
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                return Err(anyhow!("Unsafe link entry in archive"));
+            }
+            let path = member.path().context("Failed to read member path")?.into_owned();
+            if path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(anyhow!("Unsafe path in archive: {}", path.display()));
+            }
+            let dest = registry_dir.join(&path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).context("Failed to create extraction directory")?;
+            }
+            member.unpack(&dest).context("Failed to extract archive member")?;
+        }
+
+        if let Some(files) = &entry.files {
+            for file in files {
+                if !registry_dir.join(file).exists() {
+                    return Err(anyhow!("Archive missing expected file '{}'", file));
+                }
+            }
+        }
+
+        if !out_path.exists() {
+            return Err(anyhow!("Archive did not contain '{}'", out_path.display()));
+        }
+
+        let new_registry = registry;
+        let _ = new_registry.write(registry_dir);
+        Ok(out_path)
+    } else {
+        let written = fetch_model(&entry.url, &entry.sha256, &out_path)?;
+        if let Some(files) = &entry.files {
+            for file in files {
+                if !registry_dir.join(file).exists() {
+                    return Err(anyhow!("Downloaded bundle missing expected file '{}'", file));
+                }
+            }
+        }
+        let new_registry = registry;
+        let _ = new_registry.write(registry_dir);
+        Ok(written)
+    }
 }
 
 /// Hex encoding helper for SHA-256
