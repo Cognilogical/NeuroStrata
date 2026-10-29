@@ -31,7 +31,7 @@ Add RDF-star provenance annotations to the RDF projection of memory rows and edg
 Prefer existing crates over in-house parsing/serialization:
 
 - `oxrdf` with feature `rdf-12` for RDF 1.2 terms, triples, quads, and triple terms.
-- `oxttl` for Turtle-star, TriG-star, N-Triples-star, and N-Quads-star parsing and serialization.
+- `oxttl` with feature `rdf-12` for Turtle-star, TriG-star, N-Triples-star, and N-Quads-star parsing and serialization (both crates require `rdf-12` for triple-term output).
 - `sha2` for deterministic statement digests if an assertion IRI needs a content-derived suffix.
 - Evaluate `oxirs-star` only in the SPARQL spec; it is a heavier dependency and is not required for projection/export.
 
@@ -63,18 +63,21 @@ Out of scope:
 Each projected statement receives a stable assertion IRI. The assertion IRI is the subject of the provenance block; the quoted triple is linked to it with `rdf:reifies` (RDF 1.2 reifier syntax). This avoids collapsing multiple assertions of the same triple.
 
 ```
-urn:neurostrata:assertion:<namespace>:memory:<memory_id>:<predicate_slug>:<assertion_version>
+urn:neurostrata:assertion:<namespace>:memory:<memory_id>:<predicate_slug>:<object_discriminator>:<assertion_version>
 urn:neurostrata:assertion:<namespace>:edge:<relation>:<from_id>:<to_id>:g<generation>:v<valid_from>[:<ordinal>]
 ```
 
-- For a memory node statement, `<predicate_slug>` is the projected predicate and `<assertion_version>` is the active generation (or `valid_from` when generation is `0`). The memory id itself changes on supersede, so the new assertion IRI is distinct; `metadata.supersedes`/`metadata.superseded_by` are projected as `prov:wasDerivedFrom`/`prov:wasInvalidatedBy`.
-- For an edge statement, `<relation>` is one of the 5 relation types. `<from_id>` and `<to_id>` are percent-encoded. `<ordinal>` is appended only when multiple edges of the same type connect the same node pair; it is the deterministic index in id-sorted edge order.
+- `<namespace>` and `<memory_id>` are percent-encoded (`%3A` for `:`, `%2F` for `/`).
+- For a memory node statement, `<predicate_slug>` is the projected predicate. `<object_discriminator>` is `0` for single-valued predicates; for multi-valued predicates (`ns:domain`, `ns:facet`, `ns:conceptIri`, `ns:tag`), it is the zero-based index in the sorted object list (stable across runs). `<assertion_version>` is the active generation (or `valid_from` when generation is `0`).
+- The memory id changes on supersede, so the new assertion IRI is distinct; `metadata.supersedes`/`metadata.superseded_by` are projected as `prov:wasDerivedFrom`/`prov:wasInvalidatedBy`.
+- For an edge statement, `<relation>` is one of the 5 relation types. `<from_id>` and `<to_id>` are percent-encoded. `<ordinal>` is appended only when multiple edges of the same type connect the same node pair; it is the deterministic index in edge order sorted by `(generation ASC, valid_from ASC, extractor ASC, source ASC)` (not by id, since edges have no id column).
 - `<assertion_version>` records audit/version information; it is not the sole uniqueness key.
 - Assertion IRIs are projection identifiers, not LadybugDB primary keys.
+- Re-upsert of `mention-detector` edges changes `valid_from` (new `edge_now`), producing a new assertion IRI; the prior assertion IRI remains queryable via `neurostrata_provenance_for({ target: "assertion", iri })` (see §5.5).
 
 ### 5.2 Edge property schema
 
-Extend the 5 relation tables (`GOVERNS`, `CONTAINS`, `RELATES_TO`, `EXTRACTED_FROM`, `DEPENDS_ON`) with:
+Extend the 5 relation tables (`GOVERNS`, `CONTAINS`, `RELATES_TO`, `EXTRACTED_FROM`, `DEPENDS_ON`) with an 8th column `origin` (keeping the existing 7 `EDGE_PROVENANCE_COLUMNS`: `source`, `valid_from`, `valid_to`, `generation`, `extractor`, `confidence`, `evidence_id`):
 
 - `source STRING` — source key or origin namespace.
 - `valid_from INT64` — statement validity start (0 means unspecified).
@@ -82,9 +85,10 @@ Extend the 5 relation tables (`GOVERNS`, `CONTAINS`, `RELATES_TO`, `EXTRACTED_FR
 - `generation INT64` — ingest generation that created the edge.
 - `extractor STRING` — extractor name or `manual`.
 - `confidence DOUBLE` — 0.0..=1.0, default 1.0.
-- `origin STRING` — `user`, `agent`, `system`, or `mesh`.
+- `evidence_id STRING` — existing column (unchanged).
+- `origin STRING` — `user`, `agent`, `system`, or `mesh` (new, 8th column via `ALTER TABLE ... ADD origin STRING`).
 
-LadybugDB supports edge properties in our schema; no upstream source change is required. `confidence` and `origin` require extending `EDGE_PROVENANCE_COLUMNS` and `EdgeProvenance` in `src/rdf/types.rs`. `upsert` and `create_missing_edges` must write all 7 columns; `valid_from` is set only on edge creation (`ON CREATE`), not overwritten on re-upsert. `origin` defaults to `system` and `confidence` defaults to `1.0`.
+`EDGE_PROVENANCE_COLUMNS` in `src/store/ladybug.rs:2028-2056` and `EdgeProvenance` in `src/rdf/types.rs` are extended to 8. `project_namespace_rdf` (`ladybug.rs:10515`) is updated to `RETURN` all 8 columns. `upsert` and `create_missing_edges` write all 8; `valid_from` is set only on edge creation (`ON CREATE`), not overwritten on re-upsert. `origin` defaults to `system` and `confidence` defaults to `1.0`. `evidence_id` remains as-is (existing semantics).
 
 ### 5.3 Node provenance
 
@@ -103,7 +107,7 @@ The assertion IRI is the subject of the provenance block. The quoted triple is a
 
 ```turtle
 <urn:neurostrata:assertion:...> a ns:Assertion ;
-  rdf:reifies << s p o >> ;
+  rdf:reifies <<( s p o )>> ;
   ns:source "..." ;
   ns:extractor "..." ;
   ns:origin "..." ;
@@ -114,9 +118,11 @@ The assertion IRI is the subject of the provenance block. The quoted triple is a
 s p o .
 ```
 
+The object of `rdf:reifies` is a triple term `<<( s p o )>>` (RDF 1.2 / `oxttl` with `rdf-12`), not reified-triple sugar `<< s p o ~ :r >>`. Implementers must test against `oxttl` output, not hand-written strings.
+
 For an edge `s ns:relatesTo o`, the same annotation block is emitted using the edge's properties.
 
-Serialization should use `oxrdf` for RDF 1.2 terms and `oxttl` for Turtle-star, TriG-star, N-Triples-star, or N-Quads-star output. Do not hand-format RDF-star syntax; rely on `oxttl` for the exact quoted-triple/reifier serialization.
+Serialization uses `oxrdf` (feature `rdf-12`) for RDF 1.2 terms and `oxttl` (feature `rdf-12`) for Turtle-star, TriG-star, N-Triples-star, or N-Quads-star output. Do not hand-format RDF-star syntax.
 
 ### 5.5 Export and lookup
 
@@ -133,6 +139,7 @@ Serialization should use `oxrdf` for RDF 1.2 terms and `oxttl` for Turtle-star, 
 - Existing edges without properties read as unknown provenance (`source = null`, `extractor = null`, `confidence = 1.0`, `origin = system`).
 - No mutating backfill tool is provided. Backfilling current generation values onto historical edges would fabricate provenance.
 - Active edges are refreshed naturally during `relink_edges`; read-time projection supplies defaults for missing properties.
+- Companion spec `neurostrata-rdf-semantic-layer-design.md` §3.2 must be updated to remove the "one-time relink_edges backfill" claim and §3.3 to use the 4/5-segment assertion IRI grammar from §5.1 of this spec.
 
 ### 5.7 Validation
 
@@ -145,6 +152,10 @@ Warn-first SHACL-style checks:
 - Assertion IRI matches the namespace/id/version grammar.
 
 Invalid provenance produces a warning in export/lookup output and a `guard_event`-style diagnostic, but does not block search, export, or mesh.
+
+### 5.8a Privacy filtering of `ns:metadata`
+
+- During `neurostrata_export_rdf_star`, the raw `ns:metadata` literal quad is NOT emitted (it may contain `absolute_path`, `edge_sources.file`, private fields). Only allowlisted provenance predicates are projected (`ns:source`, `ns:extractor`, `ns:origin`, `ns:confidence`, `ns:validFrom`, `ns:validTo`, `ns:generation`). `metadata` is projected per-predicate (as in SHACL spec §5.1a), never as an opaque JSON literal. Quoted-triple annotations never include private domain slugs or local filesystem paths; use `concept_iri` for cross-namespace alignment.
 
 ### 5.8 Privacy and mesh
 
@@ -188,8 +199,8 @@ RDF-star provenance is available as a projection over LadybugDB: edges and memor
 
 ## 10. Files touched (expected)
 
-- `src/rdf/provenance.rs` (new): assertion IRI, projection, export, lookup.
-- `src/store/ladybug.rs`: edge property schema, relink/generation writes, read-time defaults.
+- `src/rdf/provenance.rs` (new): assertion IRI, projection, export, lookup. Consolidates and replaces `src/rdf/rdf_star.rs` (in-house quoted-triple serializer, prohibited), `src/rdf/assertion.rs` (UUIDv7 assertion IRI, contradicts deterministic grammar), and `src/rdf/namespace.rs::assertion_iri` (3-segment form) — all three are retired/removed.
+- `src/store/ladybug.rs`: edge property schema (8 columns), relink/generation writes, read-time defaults, `project_namespace_rdf` returns all 8 columns.
 - `src/server.rs`: tool registration and handlers.
 - `src/schemas`: provenance shape additions (if shapes are stored).
-- `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`: cross-reference (no duplicate implementation).
+- `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`: align §3.2 (backfill wording) and §3.3 (assertion IRI grammar) with this spec.
