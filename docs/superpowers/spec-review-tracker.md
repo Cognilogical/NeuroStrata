@@ -14,7 +14,7 @@
 | streaming-delta | neurostrata-7rgp | APPROVED (2026-10-28) | ready for implementation |
 | did-signed-mesh-records | neurostrata-39v2 | APPROVED (2026-10-28) | ready for implementation |
 | rebac | neurostrata-azjv | APPROVED (2026-10-28) | ready for implementation |
-| graphql-curated-read-api | neurostrata-ect5 | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
+| graphql-curated-read-api | neurostrata-ect5 | REQUEST CHANGES (2026-10-28) → revised v2, pending re-review | needs Argon re-review |
 | closure-budget-zstd-anomaly | neurostrata-g6mw | pending | needs review |
 | rdf-star-provenance | neurostrata-as9v | pending | needs review |
 | tantivy-full-text-search | neurostrata-ljzz | pending | needs review |
