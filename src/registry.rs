@@ -557,7 +557,7 @@ async fn derived_domains(
     let domains: Vec<String> = rows
         .iter()
         .filter(|row| !is_registry_row(&row.payload.metadata))
-        .filter_map(|row| crate::domain::domain_key(&row.payload.metadata))
+        .flat_map(|row| crate::domain::domain_keys(&row.payload.metadata))
         .collect();
     Ok(sorted_unique(domains))
 }

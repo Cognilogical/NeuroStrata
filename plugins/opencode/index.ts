@@ -519,6 +519,7 @@ export async function initialize(ctx: any): Promise<void> {
     const call: any = {
       name: toolName,
       args: input?.input ?? {},
+      session_id: input?.sessionID ?? null,
     };
     // Run guard validation (fail closed).
     if (!config.strictMode) return;
@@ -684,7 +685,7 @@ function callState(call: any): {
 } {
   const args = asRecord(call.args);
   return {
-    session_id: asString(args.session_id) ?? "unknown",
+    session_id: asString(call.session_id) ?? asString(args.session_id) ?? "unknown",
     active_task_id: asString(args.active_task_id) ?? null,
     worktree: asString(args.worktree) ?? process.cwd(),
   };

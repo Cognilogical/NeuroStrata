@@ -222,11 +222,7 @@ pub(crate) fn procedures_due_strap_filtered(
         })
         .collect();
     if filtered.is_empty() {
-        // fall back to all due
-        filtered = procedures_due(memories, now);
-    }
-    if filtered.is_empty() {
-        return "No procedures are due in this namespace.\n".to_string();
+        return "No procedures match the given filter.\n".to_string();
     }
     match serde_json::to_string_pretty(&filtered) {
         Ok(body) => format!("Procedures due ({}):\n{}", filtered.len(), body),
