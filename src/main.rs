@@ -52,6 +52,7 @@ mod active_learning;
 mod guardrails;
 mod temporal;
 mod sparql;
+mod gliner;
 mod store;
 mod synaptic_mesh;
 mod task;

@@ -1,4 +1,8 @@
 pub mod canonical;
+pub mod owl;
+pub mod incremental;
+pub mod assertion;
+pub mod named_graphs;
 pub mod namespace;
 pub mod ontology;
 pub mod projection;
@@ -7,6 +11,10 @@ pub mod shacl;
 pub mod types;
 
 pub use canonical::*;
+pub use owl::*;
+pub use incremental::*;
+pub use assertion::*;
+pub use named_graphs::*;
 pub use namespace::*;
 pub use ontology::*;
 pub use projection::*;

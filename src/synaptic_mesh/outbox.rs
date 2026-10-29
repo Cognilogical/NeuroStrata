@@ -301,7 +301,7 @@ mod tests {
             "neurostrata-outbox-{}-{}-{}",
             std::process::id(),
             tag,
-            Uuid::new_v4()
+            Uuid::now_v7()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -310,7 +310,7 @@ mod tests {
 
     fn entry(op: &str, id: &str) -> OutboxEntry {
         OutboxEntry {
-            stable_op_id: Uuid::new_v4(),
+            stable_op_id: Uuid::now_v7(),
             op: op.to_string(),
             id: id.to_string(),
             namespace: "ns".to_string(),

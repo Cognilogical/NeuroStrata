@@ -172,8 +172,13 @@ impl MeshOutbox {
         if !is_shareable_memory_type(&payload.memory_type) {
             return None;
         }
+        // Derived artifacts (KGE vectors, community labels, inferred edges)
+        // stay local/versioned derived data and never cross the mesh.
+        if payload.metadata.get("derived").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return None;
+        }
         Some(OutboxEntry {
-            stable_op_id: uuid::Uuid::new_v4(),
+            stable_op_id: uuid::Uuid::now_v7(),
             op: op.to_string(),
             id: id.to_string(),
             namespace: namespace.to_string(),
@@ -206,7 +211,7 @@ mod tests {
             "neurostrata-mesh-outbox-sub-{}-{}-{}",
             std::process::id(),
             tag,
-            uuid::Uuid::new_v4()
+            uuid::Uuid::now_v7()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -255,7 +260,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("created-db", outbox_dir.clone(), wake.clone()).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -300,7 +305,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("nonshareable-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -335,8 +340,8 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("superseded-db", outbox_dir.clone(), wake).await;
 
-        let old_id = uuid::Uuid::new_v4().to_string();
-        let new_id = uuid::Uuid::new_v4().to_string();
+        let old_id = uuid::Uuid::now_v7().to_string();
+        let new_id = uuid::Uuid::now_v7().to_string();
         for (id, metadata) in [
             (
                 &old_id,
@@ -389,7 +394,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("archived-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -430,7 +435,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("structural-ingest-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -467,7 +472,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("structural-ns-db", outbox_dir.clone(), wake).await;
 
-        let id = format!("src::{}", uuid::Uuid::new_v4());
+        let id = format!("src::{}", uuid::Uuid::now_v7());
         store
             .upsert(
                 "ns",
@@ -508,7 +513,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let (bus, store) = wired("procedure-def-db", outbox_dir.clone(), wake).await;
 
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = uuid::Uuid::now_v7().to_string();
         store
             .upsert(
                 "ns",
@@ -594,7 +599,7 @@ impl MeshOutbox {
 
                 // Build an outbox entry.
                 let entry = OutboxEntry {
-                    stable_op_id: uuid::Uuid::new_v4(),
+                    stable_op_id: uuid::Uuid::now_v7(),
                     op: OP_CREATED.to_string(),
                     id: sr.id.clone(),
                     namespace: ns.clone(),
