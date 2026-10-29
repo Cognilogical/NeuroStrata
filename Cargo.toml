@@ -93,10 +93,18 @@ reqwest = { version = "0.13", features = ["json", "blocking"] }
 # The crash breadcrumb needs the signal and file syscalls directly; it was
 # already in the tree as a transitive dependency, so this adds no download.
 libc = "0.2"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 tar = "0.4"
 flate2 = "1.1"
+oxrdf = { version = "0.3", features = ["rdf-12"] }
+oxttl = { version = "0.2", features = ["rdf-12"] }
+zstd = "0.14"
+spargebra = { version = "0.4", features = ["sparql-12"] }
+sparopt = { version = "0.3", features = ["sparql-12"] }
+spareval = { version = "0.2", features = ["sparql-12"] }
+sparesults = { version = "0.3", features = ["sparql-12"] }
+graphql-parser = "0.4"
 
 # native-tls (pulled in by reqwest, ureq and hf-hub) only needs OpenSSL on
 # platforms without a system TLS stack: Windows uses SChannel and Apple targets
@@ -114,6 +122,10 @@ openssl = { version = "0.10.81", features = ["vendored"] }
 ort = { version = "2.0.0-rc.13", optional = true }
 tokenizers = { version = "0.23.2", optional = true }
 ndarray = { version = "0.17.2", optional = true }
+petgraph = { version = "0.8", optional = true }
+leiden-rs = { version = "0.8", default-features = false, features = ["petgraph"], optional = true }
+rand = { version = "0.10", optional = true }
+tantivy = { version = "0.27", optional = true }
 
 [build-dependencies]
 cxx-build = "=1.0.138"
@@ -122,6 +134,11 @@ cxx-build = "=1.0.138"
 default = []
 learning-laya = []
 gliner = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+community = ["dep:leiden-rs", "dep:petgraph"]
+kge = ["dep:ndarray", "dep:rand"]
+owl-petgraph = ["dep:petgraph"]
+tantivy = ["dep:tantivy"]
+digital-twin = []
 
 
 [[test]]
