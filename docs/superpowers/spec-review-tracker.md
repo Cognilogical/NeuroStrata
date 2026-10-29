@@ -22,7 +22,7 @@
 | time-series-episodic-metrics | neurostrata-ejiy | APPROVED (2026-10-28) | ready for implementation |
 | multimodal-validation | neurostrata-y062 | APPROVED (2026-10-28) | ready for implementation |
 | digital-twin | neurostrata-jk91 | APPROVED (2026-10-28) | ready for implementation |
-| rag-chat-optional-client | neurostrata-miuu | pending | needs review |
+| rag-chat-optional-client | neurostrata-miuu | APPROVED (2026-10-28) | ready for implementation |
 | wasm-browser-edge-engine | neurostrata-6hjs | pending | needs review |
 | tdb2-storage-hygiene | neurostrata-rimc | pending | needs review |
 """
