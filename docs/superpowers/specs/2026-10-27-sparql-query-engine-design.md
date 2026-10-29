@@ -82,22 +82,29 @@ Use union-default-graph semantics: every projected quad is added both to its nam
 The projection must include:
 
 - memory nodes and metadata predicates,
-- relation edges as typed predicates, with endpoint IRIs resolved through each endpoint row's `concept_iri` when present,
+- relation edges as typed predicates, with endpoint IRIs kept as `urn:neurostrata:memory:<id>` (primary subject IRIs) so joins work; `ns:conceptIri` is emitted as a separate predicate for cross-concept alignment, but edge endpoints are NOT rewritten to `concept_iri`,
 - ontology classes and properties needed by OWL/RDFS reasoning,
-- named graphs for namespaces and tiers.
+- named graphs for namespaces and tiers,
 - `ns:validFrom`, `ns:validTo`, `ns:archived`, `ns:accessCount`, and `rdf:type` predicates for every memory node.
 
-Projection excludes retired, archived, mesh-conflicting, and registry rows. `include_retired` and `include_archived` flags (matching `export_graph` and `task_list`) control retired/archived inclusion. Mesh-conflicting and registry rows are never served. Private rows are excluded from mesh and remote use; local audit mode may include them explicitly.
+Projection excludes retired, archived, mesh-conflicting, and registry rows. `include_retired` and `include_archived` flags (matching `export_graph` and `task_list`) control retired/archived inclusion. Mesh-conflicting and registry rows are never served. Local `neurostrata_sparql_query` includes `eligibility: "private"` (or unset) rows in the target namespace by default, matching `search_memory`/`list`/`export_graph`; any future remote/federated entrypoint excludes non-shareable rows.
+
+An edge `(from, rel, to)` is projected **if and only if** both `from` and `to` are present in the post-filter set of visible node IDs for the query (excluding superseded generations, mesh-conflicting rows, registry rows, and—unless enabled by flags—retired and archived rows). No dangling edges to hidden/conflicting nodes are emitted.
+
+Named graph IRI derivation (per row): `urn:neurostrata:graph:<namespace>:<tier>:gen:<generation>`, where tier is `Global` if `namespace == "global"`, `Task` if `memory_type == "task"`, else `Domain`; generation is extracted via `split_scoped_id(&id)` or `0` for unscoped rows. `project_sparql_dataset(namespace, include_retired, include_archived)` derives tier/generation per row (the single `(tier, generation)` parameter on `project_namespace_rdf` is not used for SPARQL projection).
 
 ### 5.3 Custom functions
 
-Register NeuroStrata functions with the evaluator:
+Register NeuroStrata functions with the evaluator. They read only projected metadata via an `Arc<HashMap<NamedNode, RowMeta>>` captured at preparation time; no LadybugDB access during evaluation.
 
-- `ns:salience(?memory)` returns the memory's standalone neural gain: `0.05 * ln(1 + access_count) + source_gain`, as `xsd:double`. It does not use query-time vector distance.
-- `ns:validAt(?memory, ?timestamp)` returns whether the memory is valid at the timestamp.
-- `ns:isRetired(?memory)` returns whether the row is retired.
-
-These functions must read only the projected metadata and must not query LadybugDB during evaluation. At evaluator preparation time, capture an `Arc<HashMap<NamedNode, RowMeta>>` in each closure so term arguments can be resolved to row metadata without store access.
+- `ns:salience(?memory)` returns `xsd:double`:
+  - `access_count` clamped to `>= 0` before `ln(1 + n)`,
+  - `source_gain` = `0.05` (`SOURCE_RANK_GAIN`) when `crate::traits::has_source(&metadata)` is true else `0.0`,
+  - `feedback_gain` = `0.05 * feedback_score.clamp(-1.0, 1.0)` is **included**,
+  - formula: `0.05 * ln(1 + access_count_clamped) + source_gain + feedback_gain`.
+  - If `?memory` is not a known memory IRI, return `None` (SPARQL evaluation error), never panic.
+- `ns:validAt(?memory, ?timestamp)` returns `xsd:boolean`. Accepted timestamp literal types: `xsd:integer` (Unix seconds) and `xsd:dateTime`. The RDF datatypes emitted for `ns:validFrom`/`ns:validTo` in `src/rdf/projection.rs` are `xsd:integer` Unix seconds. Half-open interval check: `valid_from <= t && (valid_to.is_none() || valid_to == 0 || t < valid_to)`, matching `is_retired_at` in `ladybug.rs`. If `?memory` unknown, return `None`.
+- `ns:isRetired(?memory)` returns `xsd:boolean` using the same `is_retired_at` logic with a single query-start timestamp `now` captured once per query (used for both visibility filtering and `ns:isRetired`). If `?memory` unknown, return `None`.
 
 ### 5.4 Budgets
 
@@ -110,11 +117,16 @@ Configuration:
 - `sparql_max_algebra_nodes: usize` (default 1000)
 - `sparql_service_enabled: bool` (default false)
 
-If a budget is exceeded, return a structured partial result or error with the number of solutions produced so far. Memory is enforced through structural caps (`sparql_max_dataset_quads`, `sparql_max_algebra_nodes`) and streaming `Iterator::take(sparql_max_solutions)`, not through a global allocator.
+If a budget is exceeded, return the §5.5 envelope with `"timed_out": true` and the solutions collected up to cancellation (`solution_count: 0` if cancelled before the first solution); `truncated` remains false unless the solution cap was hit. Memory is enforced through structural caps (`sparql_max_dataset_quads`, `sparql_max_algebra_nodes`) and streaming `Iterator::take(sparql_max_solutions)`, not through a global allocator. There is no separate "mode" parameter; this contract is uniform.
 
 ### 5.5 Result formats
 
-Support JSON, CSV, and TSV output. Results are sorted according to SPARQL result ordering; if no ORDER BY is present, apply a deterministic tie-break by lexicographic order of projected variable names for `SELECT`, and by `(subject, predicate, object)` for `CONSTRUCT`/`DESCRIBE`.
+Support JSON, CSV, and TSV output. Results are sorted according to SPARQL result ordering; if no ORDER BY is present, apply a deterministic tie-break by comparing bound RDF term values across the lexicographically ordered projected variables for `SELECT`, and by `(subject, predicate, object)` for `CONSTRUCT`/`DESCRIBE`. Quad insertion into `oxrdf::Dataset` must be deterministic (sorted by `(s,p,o,g)`). `sparql_max_solutions` interacts with sorting as follows: when no ORDER BY is present, stream and truncate after the deterministic tie-break ordering has been established over the full result set (i.e., sort first, then take); when ORDER BY is present, apply ORDER BY then take.
+
+Query-form to format mapping:
+- `SELECT`: serialized via `sparesults` (JSON/CSV/TSV bindings).
+- `ASK`: JSON returns `{ "boolean": bool }`; CSV/TSV return a single-column `result` header with `true`/`false`.
+- `CONSTRUCT`/`DESCRIBE`: produce an RDF graph; for JSON/CSV/TSV, project triples into synthetic bindings `(?subject, ?predicate, ?object)` (one row per triple, sorted by `(s,p,o)`). `ntriples`/`turtle` may be added later as separate formats but are not in this spec.
 
 The MCP return envelope is:
 
@@ -147,13 +159,27 @@ The MCP return envelope is:
   - `list_namespace_edges(namespace) -> Vec<(MemoryId, Relation, MemoryId)>` for edge validation
 - Configuration as listed in §5.4.
 
-At query preparation time, pre-register the standard prefixes (`ns:`, `rdf:`, `rdfs:`, `owl:`, `skos:`, `xsd:`) so queries work without explicit PREFIX declarations. When enabled, the projection also includes an ontology graph (`urn:neurostrata:graph:<ns>:ontology`) containing the `OntologyIndex` triples (subClassOf, subPropertyOf, altLabel) for SPARQL-based domain reasoning.
+Pre-registered prefix table (available without explicit PREFIX):
+
+| Prefix | IRI |
+|---|---|
+| `ns:` | `urn:neurostrata:ns#` |
+| `mem:` | `urn:neurostrata:memory:` |
+| `class:` | `urn:neurostrata:class:` |
+| `dom:` | `urn:neurostrata:domain:` |
+| `rdf:` | `http://www.w3.org/1999/02/22-rdf-syntax-ns#` |
+| `rdfs:` | `http://www.w3.org/2000/01/rdf-schema#` |
+| `owl:` | `http://www.w3.org/2002/07/owl#` |
+| `skos:` | `http://www.w3.org/2004/02/skos/core#` |
+| `xsd:` | `http://www.w3.org/2001/XMLSchema#` |
+
+When enabled, the projection also includes an ontology graph (`urn:neurostrata:graph:<ns>:ontology`) containing the `OntologyIndex` triples (subClassOf, subPropertyOf, altLabel) for SPARQL-based domain reasoning.
 
 ## 7. Edge cases
 
 - Empty namespace: empty dataset, valid query, empty results.
 - Unsupported feature: structured error with feature name.
-- Timeout: partial results or timeout error depending on mode.
+- Timeout: return the §5.5 envelope with `"timed_out": true` and solutions collected up to cancellation.
 - Query references unknown prefix: parse error.
 - Query asks for retired rows without audit mode: no results for those rows.
 - Large result set: truncated at `sparql_max_solutions`.
@@ -177,4 +203,4 @@ A read-only SPARQL query tool is available over the projected memory graph: quer
 - `src/server.rs`: SPARQL tool.
 - `src/rdf/projection.rs`: ensure projection covers all queryable predicates.
 - `neurostrata-damg` (SPARQL 1.1/1.2 query tool).
-- `Cargo.toml`: `spargebra`, `sparopt`, `spareval`, `sparesults`.
+- `Cargo.toml`: `spargebra`, `sparopt`, `spareval`, `sparesults` with `rdf-12`/`sparql-12` feature flags enabled on `oxrdf`, `spargebra`, `spareval`, `sparesults` (unified version train).
