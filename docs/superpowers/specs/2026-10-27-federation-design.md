@@ -42,7 +42,7 @@ Add **read-only SPARQL federation** across NeuroStrata daemon instances using `S
 ## 3.2 Projection
 
 - `project_sparql_dataset(namespace, include_retired, include_archived) -> oxrdf::Dataset` — local projection.
-- `project_federated_sparql_dataset(namespace) -> oxrdf::Dataset` — remote-side projection that excludes private (`eligibility != "shareable"`), `structural`, `task`, `retired`, `archived`, mesh-conflicting, and registry rows. Filtering happens at the remote daemon during projection, never post-hoc on the caller.
+- `project_federated_sparql_dataset(namespace) -> oxrdf::Dataset` — remote-side projection that excludes private (`eligibility != "shareable"`), `structural`, `task`, `retired`, `archived`, mesh-conflicting, and registry rows. Filtering happens at the remote daemon during projection; the caller does NOT post-filter `SolutionMapping`s by row visibility (arbitrary SELECT bindings cannot carry row metadata).
 
 ## 4. Scope
 
@@ -53,9 +53,9 @@ In scope:
 - Namespace filtering: only namespaces explicitly served by the remote daemon are queryable.
 - Visibility enforcement: `retired=0` and `archived=0` required; mesh-conflicting and registry always excluded; `eligibility: "shareable"` required for mesh-shared rows.
 - Deterministic result serialization (JSON/CSV/TSV).
-- Custom NeuroStrata functions (`ns:salience`, etc.) are local-only and are rejected on the remote; remote endpoints only register `ns:salience` if explicitly enabled.
+- Custom NeuroStrata functions (`ns:salience`, etc.) are strictly local-only and are rejected on the remote. No config flag enables them remotely.
 - Executes the query with `spareval` over the transient dataset.
-- Returns W3C `application/sparql-results+json` (via `sparesults::QueryResultsSerializer`), NOT the MCP envelope — the caller unwraps the MCP envelope locally and feeds `results` to `sparesults` for parsing.
+- Wire contract: `POST /sparql` returns W3C `application/sparql-results+json` directly (standard SPARQL protocol). Truncation/timed-out/warning state cross via HTTP headers `X-NeuroStrata-Truncated`, `X-NeuroStrata-TimedOut`, `X-NeuroStrata-Warning`. The caller parses the body with `sparesults` and reads headers for status. (No MCP envelope on `/sparql`.)
 
 ## 5. Approach
 
@@ -64,10 +64,12 @@ In scope:
 1. Parse the SPARQL query with `spargebra`, detecting `GraphPattern::Service` (SERVICE) clauses.
 2. For each SERVICE pattern:
    a. Resolve the endpoint URI against `sparql_service_peers` (mapping to `(host:port, remote_namespace, bearer_token_env)`).
-   b. Format the inner query expression from the `spargebra` AST and pass it to a registered `spareval::ServiceHandler` backed by `reqwest`.
-   c. Execute the inner query locally via `spareval::QueryEvaluator::prepare(...).execute(...)` with the handler; `spareval` calls the handler to fetch remote results and merge them.
-   d. Apply namespace and visibility filters on the remote results before merging; remote `include_retired` and `include_archived` flags are denied. Only rows with `retired=0` and `archived=0` are forwarded; `eligibility: "shareable"` is required for mesh-shared rows.
+   b. Construct the remote query string from the `spargebra` `GraphPattern::Service` inner pattern: wrap it as `SELECT * WHERE { <inner pattern> }` and prepend pre-registered `PREFIX` declarations (from the SPARQL engine spec §6). Pass `remote_namespace` to the remote via the `?namespace=<remote_namespace>` query parameter on `POST /sparql`.
+   c. Execute the inner query locally via `spareval::QueryEvaluator::prepare(...).execute(...)` with the handler; `spareval` calls the handler to fetch remote results and merge them. The handler performs the HTTP POST and parses the W3C JSON body + headers.
+   d. Filtering happens entirely on the remote during projection (§3.2/§5.2); the caller does not post-filter `SolutionMapping`s.
 3. Merge all SERVICE results with local results, applying the same budgets and deterministic tie-breaks. If any SERVICE call exceeds its budget, return partial results with `truncated: true` and a structured warning.
+   - `SERVICE` (non-SILENT): network errors, timeouts, and `Denied` security errors fail the whole query.
+   - `SERVICE SILENT`: suppresses network errors and timeouts (binds a single empty solution mapping); security `Denied` errors are NEVER swallowed by `SILENT`.
 
 If a SERVICE pattern references an unconfigured peer or unauthorized namespace, return a structured `QueryEvaluationError::Denied` (not an empty result set).
 
@@ -84,7 +86,8 @@ Each NeuroStrata daemon exposes a `GET /sparql` (or `POST /sparql`) handler that
 - Applies namespace and visibility filters.
 - Does NOT register `ns:salience` or other custom NeuroStrata functions — custom functions are local-only and are rejected on the remote.
 - Executes the query with `spareval` over the transient dataset.
-- Returns W3C `application/sparql-results+json` (via `sparesults::QueryResultsSerializer`), NOT the MCP envelope — the caller unwraps the MCP envelope locally and feeds `results` to `sparesults` for parsing.
+- Returns W3C `application/sparql-results+json` directly (standard SPARQL protocol), plus HTTP headers `X-NeuroStrata-Truncated`, `X-NeuroStrata-TimedOut`, `X-NeuroStrata-Warning` for status. No MCP envelope on `/sparql`.
+- Does NOT register `ns:salience` or other custom NeuroStrata functions — custom functions are local-only and rejected on the remote.
 
 ### 5.3 Query budgets and capping
 
@@ -99,7 +102,7 @@ Each NeuroStrata daemon exposes a `GET /sparql` (or `POST /sparql`) handler that
 - No `SERVICE` by default; must be opt-in via `sparql_service_enabled: true`.
 - Each daemon only serves namespaces it explicitly configures; cross-daemon namespace access is denied unless the remote is explicitly configured to serve them.
 - `SERVICE` over untrusted hosts is sandboxed; query complexity limits prevent pathological requests.
-- Each daemon requires `Authorization: Bearer <daemon.token>` and validates `Host` header for non-loopback peers (`src/daemon.rs:202-233`); remote `/sparql` is blocked for loopback-only hosts without a peer-token allowlist.
+- Daemon binding: by default `127.0.0.1:34343`. To serve federation, set `daemon_bind_address` (config) to a non-loopback interface (e.g. `0.0.0.0:34343`) or front the daemon with a reverse proxy/SSH tunnel. `auth_middleware` keeps DNS-rebinding protection for local routes; `/sparql` is additionally gated by `sparql_service_enabled` and a `sparql_served_hosts` allowlist (Host header must match an entry) plus `Authorization: Bearer <token>` where the token is resolved from `bearer_token_env`.
 - No network access beyond the configured endpoint URL.
 
 ## 6. Interfaces
@@ -108,14 +111,17 @@ Each NeuroStrata daemon exposes a `GET /sparql` (or `POST /sparql`) handler that
   - `neurostrata_sparql_query(query, format?, namespace?, include_retired?, include_archived?)`
 - Configuration:
   - `sparql_service_enabled: bool` (default false)
-  - `sparql_service_peers: Vec<(String, String, String)>` — list of `(endpoint_url, remote_namespace, bearer_token_env)` triplets this daemon trusts for federation.
+  - `sparql_served_namespaces: Vec<String>` — namespaces this daemon exposes on `/sparql` (server-side; empty = none served).
+  - `sparql_served_hosts: Vec<String>` — Host-header allowlist for `/sparql` (e.g. `["peer.example.com"]`).
+  - `sparql_service_peers: Vec<SparqlServicePeer>` — outbound peers, where `SparqlServicePeer { endpoint_url: String, remote_namespace: String, bearer_token_env: String }` (named struct, not an opaque tuple, for `src/config.rs` serialization).
   - `sparql_timeout_ms: u64` (default 250)
   - `sparql_max_solutions: usize` (default 1000)
   - `sparql_max_dataset_quads: usize` (default 250000)
+  - `daemon_bind_address: String` (default `127.0.0.1:34343`)
 - Store/projection:
   - `project_sparql_dataset(namespace, include_retired, include_archived) -> oxrdf::Dataset`
   - `project_federated_sparql_dataset(namespace) -> oxrdf::Dataset`
-- Custom NeuroStrata functions (`ns:salience`, etc.) are local-only and are rejected on the remote; remote endpoints only register `ns:salience` if explicitly enabled.
+- Custom NeuroStrata functions (`ns:salience`, etc.) are strictly local-only and rejected on the remote (no enable flag).
 
 ## 7. Edge cases
 
@@ -144,4 +150,4 @@ Read-only SPARQL federation is available via `SERVICE` clauses: queries forward 
 - `src/rdf/federation.rs` (new): SERVICE forwarding (`spareval::ServiceHandler` adapter), remote client (`reqwest`), result merging.
 - `src/daemon.rs`: `GET /sparql` handler, `sparql_service_enabled` config, auth middleware (`bearer_token_env`).
 - `src/rdf/projection.rs`: add `project_federated_sparql_dataset`; ensure projection covers all federation queryable predicates.
-- `Cargo.toml`: `reqwest`, `sparesults`, `spargebra` (parser), `spareval` (evaluator with ServiceHandler), `oxrdf` (dataset). No `oxirs-federate`; no `oxirs-core`.
+- `Cargo.toml`: `reqwest`, `sparesults`, `spargebra`, `sparopt`, `spareval`, `oxrdf` with `rdf-12`/`sparql-12` feature flags (unified version train per SPARQL engine spec §10). No `oxirs-federate`; no `oxirs-core`.
