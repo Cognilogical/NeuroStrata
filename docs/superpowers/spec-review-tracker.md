@@ -11,7 +11,7 @@
 | entity-mention-linking | neurostrata-n1k9 | APPROVED (2026-10-28) | ready for implementation |
 | graphrag-hybrid-search | neurostrata-6x0q | APPROVED (2026-10-28) | ready for implementation |
 | federation | neurostrata-ahix | APPROVED (2026-10-28) | ready for implementation |
-| streaming-delta | neurostrata-7rgp | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
+| streaming-delta | neurostrata-7rgp | APPROVED (2026-10-28) | ready for implementation |
 | did-signed-mesh-records | neurostrata-39v2 | pending | needs review |
 | rebac | neurostrata-azjv | pending | needs review |
 | graphql-curated-read-api | neurostrata-ect5 | pending | needs review |
