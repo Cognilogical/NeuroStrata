@@ -94,7 +94,7 @@ Default mode blend (only if benchmark gate passes and config `lexical_blend = tr
 
 ### 5.5 Rebuild
 
-`neurostrata_rebuild_lexical_index(namespace?)`: drops index, re-scans LadybugDB for all non-structural, non-archived, non-deleted, non-conflicting memories in scope (superseded rows with `valid_to > 0` included with their `valid_to`), re-indexes. Idempotent. Reports counts.
+`neurostrata_rebuild_lexical_index(namespace?)`: drops index, re-scans LadybugDB for all non-structural, non-registry, non-conflicting, non-deleted memories in scope (archived and task rows included with their flags; superseded rows with `valid_to > 0` included with their `valid_to`), re-indexes. Idempotent. Reports counts.
 
 ### 5.6 Staleness
 
