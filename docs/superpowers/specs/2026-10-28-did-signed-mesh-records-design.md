@@ -46,15 +46,17 @@ Out of scope:
 ## 5. Approach
 
 ### 5.1 Cryptography (`src/did.rs`)
-Replace the HMAC pseudo-signing with Ed25519:
-- `generate_keypair() -> (PKey, String)` returns the private key handle and its `did:key` string.
-- `signer_did(pubkey: &[u8]) -> String` encodes the public key as `did:key:z6Mk...` (multicodec 0xed + multibase base58btc).
-- `sign(payload: &[u8], privkey: &PKey) -> Vec<u8>` (Ed25519).
-- `verify(payload: &[u8], pubkey: &[u8], sig: &[u8]) -> bool`.
+Replace the HMAC pseudo-signing with Ed25519 using the existing `openssl` crate (no new dependency):
+- `generate_keypair() -> (PKey<Private>, String)` uses `PKey::generate_ed25519()` and returns the private key handle plus its `did:key` string.
+- `signer_did(pubkey: &[u8]) -> String` encodes the public key as `did:key:z6Mk...` (multicodec prefix `[0xed, 0x01]` + multibase base58btc). Base58btc is implemented as a small self-contained encoder in `src/did.rs` (no `bs58` crate; `Cargo.toml` has none).
+- `sign(payload: &[u8], privkey: &PKey<Private>) -> Vec<u8>` uses `Signer::new_without_digest(privkey)` then `sign_oneshot`.
+- `verify(payload: &[u8], pubkey: &[u8], sig: &[u8]) -> bool` uses `Verifier::new_without_digest(pubkey_pkey)` then `verify_oneshot`.
+- Base64 encoding/decoding of signatures and public keys is implemented as a small self-contained encoder in `src/did.rs` (no `base64` crate; `Cargo.toml` has none).
+- `openssl` is currently target-gated in `Cargo.toml` under `[target.'cfg(not(target_vendor = "apple"))'.dependencies]`. Move `openssl` to unconditional `[dependencies]` (or specify the Apple-target fallback) so Ed25519 signing works on all targets. Document the change in §10.
 - No shared-secret HMAC; asymmetric only.
 
 ### 5.2 Canonical signing payload
-The signature covers a deterministic byte representation of the record **excluding** `signature`, `signer_did`-derived key material is not part of payload. Canonical bytes = `serde_json::to_vec` of a struct containing `(id, update_id, origin_mesh_epoch, lifecycle, content, metadata, relationships)` with sorted JSON object keys (via `serde_json::to_string_pretty` with a canonical serializer or `serde_json::to_vec` with `BTreeMap`-ordered fields). The `signature` field itself is excluded from the signed payload.
+The signature covers a deterministic byte representation of the record **excluding only** `signature`. Canonical bytes = `serde_json::to_vec` of a struct containing all `MeshRecord` fields except `signature`: `(schema_version, id, namespace, memory_type, lifecycle, content, metadata, rdf, relationships, update_id, origin_mesh_epoch, trust, signer_did, public_key)`, with sorted JSON object keys (via `serde_json::to_vec` with `BTreeMap`-ordered fields or a canonical serializer). The `signature` field itself is excluded from the signed payload. This prevents replay across namespaces, type mutation, and `rdf` tampering.
 
 ### 5.3 `MeshRecord` schema (`src/synaptic_mesh/record.rs`)
 Add to `MeshRecord`:
@@ -70,7 +72,7 @@ All v1 records without these fields remain valid.
 
 ### 5.4 Key management
 - Private key stored at `<db_path_parent>/mesh_keys/<instance>.key` (PEM/PKCS8), mode 0600, outside the repo, never committed (`.gitignore`).
-- Public key / DID published in `MeshManifest` (`manifest.json`) under `signers: [{ did, public_key }]` so peers can resolve and verify without a registry.
+- Public key / DID published in `MeshManifest` (`manifest.json`) under `signers: Vec<SignerEntry { did, public_key }>` with `#[serde(default, skip_serializing_if = "Vec::is_empty")]` so existing manifests without a `signers` key remain valid.
 - Config: `mesh_signing_key_path: Option<PathBuf>` (default `<db_path_parent>/mesh_keys/default.key`); if absent, signing disabled (warn once).
 
 ### 5.5 Publish path (`src/synaptic_mesh/worker.rs`)
@@ -83,9 +85,10 @@ All v1 records without these fields remain valid.
   - If `signature` is `None`: proceed (unsigned), `created_by_verified: false`, no warning beyond "unsigned".
   - If `signature` present:
     - Resolve signer public key: from `record.public_key` (verify it matches `signer_did` via `did:key` decoding) or from `MeshManifest.signers`.
+    - Identity-binding rule: `created_by_verified` is set to `true` **only if** `signer_did == record.lifecycle.created_by` (or, when `MeshManifest.signers` is non-empty, `signer_did` is listed in `MeshManifest.signers` AND equals `record.lifecycle.created_by`). Arbitrary self-generated keypairs that do not match `lifecycle.created_by` are treated as `signer_mismatch` and never marked verified.
     - Verify Ed25519 signature over canonical payload bytes.
-    - If valid: set `mesh_provenance.created_by_verified = true`, store `signer_did`.
-    - If invalid/corrupt/mismatch: reject into `report.ignored` with structured reason `"invalid_signature"` or `"signer_mismatch"`; never mark verified; do not apply row.
+    - If valid and identity-bound: set `mesh_provenance.created_by_verified = true`, store `signer_did` as `verified_signer_did`.
+    - If invalid/corrupt/mismatch/identity-unbound: reject into `report.ignored` with structured reason `"invalid_signature"`, `"signer_mismatch"`, or `"identity_unbound"`; never mark verified; do not apply row.
 - `mesh_provenance` (line ~968) updated: `created_by_verified` reflects verification result; `claimed_created_by` retained for audit.
 
 ### 5.7 Reporting (`ApplyReport` / `format_apply_report`)
@@ -140,4 +143,4 @@ Mesh records can be signed with Ed25519 on publish and verified on import; signe
 - `src/synaptic_mesh/import.rs`: verification flow, `mesh_provenance` update, `ApplyReport` fields.
 - `src/synaptic_mesh/manifest.rs`: `signers` list.
 - `.gitignore`: `mesh_keys/`.
-- `Cargo.toml`: no change (openssl already present).
+- `Cargo.toml`: move `openssl` from target-gated to unconditional `[dependencies]` (Apple fallback documented); no new crates (`base64`/`bs58` implemented in-house).

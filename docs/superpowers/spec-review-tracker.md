@@ -12,7 +12,7 @@
 | graphrag-hybrid-search | neurostrata-6x0q | APPROVED (2026-10-28) | ready for implementation |
 | federation | neurostrata-ahix | APPROVED (2026-10-28) | ready for implementation |
 | streaming-delta | neurostrata-7rgp | APPROVED (2026-10-28) | ready for implementation |
-| did-signed-mesh-records | neurostrata-39v2 | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
+| did-signed-mesh-records | neurostrata-39v2 | REQUEST CHANGES (2026-10-28) → revised v2, pending re-review | needs Argon re-review |
 | rebac | neurostrata-azjv | pending | needs review |
 | graphql-curated-read-api | neurostrata-ect5 | pending | needs review |
 | closure-budget-zstd-anomaly | neurostrata-g6mw | pending | needs review |
