@@ -10,7 +10,7 @@
 | community-detection | neurostrata-knq3 | APPROVED (2026-10-28) | ready for implementation |
 | entity-mention-linking | neurostrata-n1k9 | APPROVED (2026-10-28) | ready for implementation |
 | graphrag-hybrid-search | neurostrata-6x0q | APPROVED (2026-10-28) | ready for implementation |
-| federation | neurostrata-ahix | pending | needs review |
+| federation | neurostrata-ahix | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
 | streaming-delta | neurostrata-7rgp | pending | needs review |
 | did-signed-mesh-records | neurostrata-39v2 | pending | needs review |
 | rebac | neurostrata-azjv | pending | needs review |
