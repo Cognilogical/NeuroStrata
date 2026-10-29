@@ -2,7 +2,7 @@
 
 > Status: revised per Argon review — pending re-review.
 > Task: `neurostrata-ect5` (GraphQL curated read API, OxiRS §1.13).
-> Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`.
+> Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`.
 
 ## 1. Problem
 
@@ -24,7 +24,7 @@ Add a **curated, versioned, read-only GraphQL API** over the memory graph:
 - No auto-generated schema from vocabulary; schema is a versioned constant.
 - Read-only: any mutation operation returns a GraphQL error.
 - No LLM.
-- Schema version tied to `memory-vocabulary` version (currently v3 / vocabulary_version 9); schema SDL lives at `src/schemas/graphql/schema.v1.graphql` (embedded via `include_str!`).
+- Schema version tied to `memory-vocabulary` version (currently v3 / vocabulary_version 10); schema SDL lives at `src/schemas/graphql/schema.v1.graphql` (embedded via `include_str!`).
 
 ## 4. Scope
 
@@ -44,7 +44,7 @@ Out of scope:
 ## 5. Approach
 
 ### 5.1 Library
-Add `graphql-parser = "0.4"` (or `async-graphql` if approved) to `Cargo.toml` for parsing + validation. Given the no-async-runtime constraint in core, prefer `graphql-parser` for AST parsing and an in-house executor over `LadybugStore` (consistent with the in-house SPARQL evaluator approach). If `graphql-parser` is insufficient for execution, fall back to a hand-written recursive-descent parser for the curated subset.
+Add `graphql-parser = "0.4"` to `Cargo.toml` for AST parsing + validation. Execution is in-house over `LadybugStore` (no async runtime in core). `schema_from_vocabulary` is deleted from `src/graphql/mod.rs`; the schema is the curated SDL constant. No `async-graphql`.
 
 ### 5.2 Schema SDL (`src/schemas/graphql/schema.v1.graphql`)
 ```graphql
@@ -62,7 +62,7 @@ type Memory {
   feedbackScore: Float
   metadata: JSON
   mentions: [String!]
-  edges(first: Int, after: String): EdgeConnection!
+  edges(first: Int = 20, after: String): EdgeConnection!
 }
 
 type Edge {
@@ -71,13 +71,17 @@ type Edge {
   extractor: String
 }
 
+# Edge resolution does NOT traverse to target Memory; only targetId is returned.
+# Nested fan-out is forbidden; depth cap = 1 (no nested Memory under Edge).
+# max_visited_nodes = 1000 per query; timeout via graphql_timeout_ms (default 250).
+
 type EdgeConnection { edges: [Edge!]! pageInfo: PageInfo! }
 type MemoryConnection { edges: [MemoryEdge!]! pageInfo: PageInfo! }
 type MemoryEdge { cursor: String! node: Memory! }
 type PageInfo { hasNextPage: Boolean! endCursor: String }
 
 type Query {
-  memory(id: ID!): Memory
+  memory(id: ID!, namespace: String!): Memory
   memories(
     namespace: String!
     first: Int = 20
@@ -86,7 +90,15 @@ type Query {
     includeArchived: Boolean = false
     includeRetired: Boolean = false
   ): MemoryConnection!
-  search(text: String!, namespace: String!, first: Int = 20): MemoryConnection!
+  search(
+    text: String!
+    namespace: String!
+    first: Int = 20
+    after: String
+    memoryType: String
+    includeArchived: Boolean = false
+    includeRetired: Boolean = false
+  ): MemoryConnection!
 }
 
 scalar JSON
@@ -97,16 +109,21 @@ scalar JSON
 pub fn execute(
     store: &LadybugStore,
     namespace: &str,
-    principal: &str,
+    principal: &str,   // resolved from auth context, never client input (ReBAC §5.3)
     query: &str,
     variables: Option<&Value>,
 ) -> GraphQLResponse
 ```
 Returns `{ "data": ..., "errors": [...] }`. Parse errors, validation errors, and execution errors populate `errors`; partial data may still be returned.
 
-### 5.4 Pagination
+Principal resolution mirrors ReBAC §5.3: on `POST /graphql`, MCP `neurostrata_graphql_query`, and CLI, `principal` is derived from daemon/session auth; an explicit client-supplied `principal` is honored only for `admin`.
+
+`Memory.metadata` is returned with internal/sensitive keys stripped (`mesh`, `validation`, `visible_to` unless caller is allowed). Registry/mesh-conflict rows are hard-excluded even when queried by `id` (returns `null`).
+
+### 5.4 Pagination & ordering
 - `first` clamped to `[1, 100]`; default 20.
-- Cursor = base64 of the last returned `MemoryId` (or offset); `after` decodes to resume.
+- Deterministic sort: `memories` → `(valid_from DESC, id ASC)`; `search` → `(score ASC, id ASC)` (score is the existing search distance).
+- Cursor = base64 of the last returned `MemoryId` (the sort key tuple, not just id) so `after` resumes deterministically. Invalid/tampered `after` → GraphQL error `{ "message": "invalid cursor" }` (no panic, no silent reset).
 - `hasNextPage` computed from total count vs. returned.
 
 ### 5.5 Filtering & privacy
