@@ -111,7 +111,7 @@ pub struct BudgetExceeded {
 
 - Vendor online `WelfordAccumulator` (mean/std_dev/min/max over `f64`) + EWMA z-score detector.
 - Key: `RwLock<HashMap<AnomalyKey, RollingStats>>` where `AnomalyKey = (String /* namespace */, MetricKind, String /* stage */)` to avoid collapsing namespaces/stages.
-- `MetricKind` finite enum: `MemoryCount`, `EnrichmentFailure`, `Latency`.
+- `MetricKind` finite enum (canonical, shared with `src/time_series.rs`): `AccessCount`, `EnrichmentFailure`, `EnrichmentLatencyMs`, `RetrievalDistance`, `MemoryCount`, `IngestLatencyMs`. (`Latency` is an alias for `EnrichmentLatencyMs` in closure-budget code.)
 - EWMA z-score formula: `z_score = (sample - ewma) / std_dev.max(min_std_dev)` where `min_std_dev = 1e-6`; if `std_dev <= f64::EPSILON`, treat as `z_score = 0.0` when `|sample - mean| <= EPSILON`.
 - EWMA update: `ewma = alpha * sample + (1 - alpha) * ewma`, default `alpha = 0.2`.
 - Sample variance: `count - 1` (sample std_dev) when `count >= 2`; `0.0` otherwise.
