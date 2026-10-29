@@ -16,7 +16,7 @@ Add a **deterministic, LLM-free mention detector** that, for each memory, finds 
 
 In scope:
 - A mention detector over `MemoryPayload.content` and `location` against the active symbol index of the namespace.
-- Edge creation `memory -> symbol` using the existing `RELATES_TO` table with `extractor = "mention-detector"` and `source = memory.id`.
+- Edge creation `memory -> symbol` using the existing `RELATES_TO` table with `extractor = "mention-detector"` and `source = namespace` (matching the LadybugDB convention where `r.source` stores the namespace; `a.id` is already the source node).
 - Integration into the write path (upsert) and `relink_edges`, so edges stay consistent with content.
 - Surfacing mention edges in `SearchEvidence` (derivation `"mention-link"`).
 - A cap on mentions per memory to bound work.
@@ -35,6 +35,8 @@ Out of scope (named follow-ons):
 
 Reuse `KnownIds` (`src/store/ladybug.rs`). Build it from the **active generation's** symbol node ids for the namespace. Candidate structural memory types: `code_ast` (ingested AST symbols), `markdown` (doc sections), `directory`, `file`. Exclude auto-ingestor bookkeeping rows. Only generation-scoped ids are candidates, so stale generations never produce mentions.
 
+The candidate filter is identical in `upsert` and `relink_edges`: only active-generation structural symbol nodes; non-generation-scoped rows (rules/facts/tasks) are excluded from the candidate set in both paths, so `relink_edges` cannot link prose mentions of task/rule IDs that `upsert` ignores.
+
 During ingest, the ingestor itself must NOT run mention detection on its own generated rows (code-to-code mentions are noise and waste cycles). Detection runs only on rows written by agents/users (memory_type not in the structural set, or agent_name != "auto-ingestor" with non-structural type).
 
 ### 4.2 Candidate strings
@@ -51,8 +53,8 @@ For each symbol id, derive the mentionable strings:
 
 Do NOT compile a giant regex alternation (pathological backtracking + boundary bugs). Instead:
 1. Tokenize `content`/`location` into lexical spans. A span is a maximal run of non-whitespace characters, then split further on path/identifier separators only where needed. Concretely: split content on whitespace first; each token is matched **exactly** against a `HashMap<String, String>` mapping candidate string → symbol id. This is O(tokens) and avoids `\b` boundary bugs on paths like `src/foo.rs` appearing inside `path/to/src/foo.rs`.
-2. For each token, try the full token, then progressively strip surrounding punctuation (backticks, quotes, parentheses, trailing commas/periods) and re-lookup. A token matches only if, after stripping, it equals a candidate exactly.
-3. A candidate that is a short alias matches a token only if the token's **neighboring characters** (the char before/after the stripped token in the original content) are not `/`, `.`, `:`, or `_` (i.e., not part of a larger path/identifier), to prevent `path/to/foo.rs` from resolving to `foo.rs`.
+2. For each token, try the full token, then progressively strip surrounding punctuation (backticks, quotes, parentheses, trailing commas/periods) and re-lookup. A token matches only if, after stripping, it equals a candidate exactly. Record the stripped prefix/suffix characters removed.
+3. A candidate that is a short alias matches a token only if the stripped prefix and suffix characters (the characters removed in step 2) are not `/`, `.`, `:`, or `_`, AND the characters immediately before/after the stripped token in the original content are not `/`, `.`, `:`, or `_`. This prevents `path/to/foo.rs` from resolving to `foo.rs` even when punctuation stripping removes leading characters. Full logical paths and file paths are exempt from the neighbor guard (they match exactly).
 4. Collect resolved symbol ids, deduplicate, drop self (memory id == symbol id), cap at 32 (truncate + warn "mention cap reached").
 
 ### 4.4 Edge creation
@@ -61,7 +63,7 @@ For each resolved symbol id:
 - If `(memory, symbol)` already exists as a declared `related_to` edge, skip (declared intent wins).
 - Otherwise add to `metadata.mentions: [symbol_id, ...]`.
 
-Materialization (in `upsert` and `relink_edges`): for the memory, delete existing `RELATES_TO` rows with `extractor = 'mention-detector'` and `a.id = memory.id`, then batch-create fresh rows with `extractor = 'mention-detector'`, `source = memory.id`, `valid_from = now`, `valid_to = 0`, `generation = active_gen`. Idempotent.
+Materialization (in `upsert` and `relink_edges`): for the memory, **unconditionally** delete existing `RELATES_TO` rows with `extractor = 'mention-detector'` and `a.id = memory.id` (even when `detect_mentions` returns `[]`, so removing a reference does not orphan the edge), then batch-create fresh rows with `extractor = 'mention-detector'`, `source = namespace`, `valid_from = now`, `valid_to = 0`, `generation = active_gen`. Idempotent.
 
 ### 4.5 Search evidence
 
@@ -69,7 +71,7 @@ Update `neighbor_out_q` / `neighbor_in_q` in `search_inner` to also return `e.ex
 
 ### 4.6 Caching KnownIds on the store
 
-`LadybugStore::upsert` currently constructs `KnownIds::new(vec![])`. Add a cached `Arc<RwLock<Option<KnownIds>>>` (or rebuild per write batch) populated from the active generation's symbol ids on first use and invalidated on ingest/relink. Detection calls `store.known_ids(namespace)` instead of a full scan per memory. If the cache is empty/unavailable, detection is skipped with a warning (never blocks the write).
+`LadybugStore::upsert` currently constructs `KnownIds::new(vec![])`. Add a cached `Arc<RwLock<HashMap<(String, BTreeSet<u64>), CachedMentionIndex>>>` keyed by `(namespace, active_generations)` to avoid cross-namespace cache poisoning (namespaces can share generation numbers such as `{}` or `{1}`). `CachedMentionIndex` holds both the `KnownIds` and the precomputed `HashMap<String, String>` candidate map (candidate string → symbol id), so `detect_mentions` and `build_candidates` are not rebuilt per memory or per relink iteration. Populated from the active generation's structural symbol ids on first use; invalidated on ingest/relink. Detection calls `store.known_ids(namespace)` (resolving the active generations internally) instead of a full scan per memory. If the cache is empty/unavailable, detection is skipped with a warning (never blocks the write).
 
 ## 5. Data flow
 
@@ -103,7 +105,7 @@ Update `neighbor_out_q` / `neighbor_in_q` in `search_inner` to also return `e.ex
 
 ## 9. Acceptance
 
-A memory whose content names an ingested symbol gains a `mentions` array and a `RELATES_TO` edge (`extractor="mention-detector"`, `source=memory.id`) to that symbol; `search_memory` evidence cites `"mention-link"` for paths traversed via that edge. Re-ingest rediscovers mentions against the new generation.
+A memory whose content names an ingested symbol gains a `mentions` array and a `RELATES_TO` edge (`extractor="mention-detector"`, `source=namespace`) to that symbol; `search_memory` evidence cites `"mention-link"` for paths traversed via that edge. Re-ingest rediscovers mentions against the new generation.
 
 ## 10. Files touched (expected)
 
