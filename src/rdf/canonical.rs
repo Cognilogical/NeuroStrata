@@ -85,4 +85,28 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.contains("urn:neurostrata:memory:m1"));
     }
+
+    #[test]
+    fn dual_write_produces_digest() {
+        let payload = MemoryPayload {
+            content: "hello".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "src/lib.rs".to_string(),
+            location_lines: "1".to_string(),
+            metadata: json!({"domain":"auth"}),
+        };
+        let (nq, d) = dual_write("m1", &payload);
+        assert!(!nq.is_empty());
+        assert_eq!(d.len(), 64);
+    }
+}
+
+
+/// Dual-write helper: returns both JSON payload echo and N-Quads projection.
+pub fn dual_write(id: &str, payload: &crate::traits::MemoryPayload) -> (String, String) {
+    let nq = memory_to_nquads(id, payload);
+    let digest = nquads_digest(&nq);
+    (nq, digest)
 }
