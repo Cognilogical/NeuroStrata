@@ -17,7 +17,7 @@
 | graphql-curated-read-api | neurostrata-ect5 | APPROVED (2026-10-28) | ready for implementation |
 | closure-budget-zstd-anomaly | neurostrata-g6mw | APPROVED (2026-10-28) | ready for implementation |
 | rdf-star-provenance | neurostrata-as9v | APPROVED (2026-10-28) | ready for implementation |
-| tantivy-full-text-search | neurostrata-ljzz | pending | needs review |
+| tantivy-full-text-search | neurostrata-ljzz | REQUEST CHANGES (2026-10-28) → revised, pending re-review | needs Argon re-review |
 | full-text-search-lexical-upgrade | neurostrata-m0oz | pending | needs review |
 | time-series-episodic-metrics | neurostrata-ejiy | pending | needs review |
 | multimodal-validation | neurostrata-y062 | pending | needs review |

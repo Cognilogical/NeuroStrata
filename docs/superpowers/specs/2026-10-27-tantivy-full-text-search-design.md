@@ -40,11 +40,17 @@ Out of scope:
 
 ### 5.1 Feature gate
 
-Cargo feature `tantivy` adds dependency `tantivy = "0.22"` (or latest compatible). Without the feature, `neurostrata_search_memory` ignores `mode: "lexical"` with a clear "not enabled" message and the index code compiles to no-ops.
+Cargo feature `tantivy` adds dependency `tantivy = "0.22"` (or latest compatible). Without the feature:
+- `mode` parameter is still accepted in the `neurostrata_search_memory` schema (for forward compatibility).
+- Passing `mode: "lexical"` returns a deterministic error string: `"ERROR [LEXICAL]: Tantivy lexical search is not enabled in this build (--features tantivy)."`.
+- `neurostrata_rebuild_lexical_index` is registered as a stub returning the same disabled message.
+- Index code compiles to no-ops.
 
 ### 5.2 Index writer
 
 `LexicalIndex` struct wrapping `tantivy::Index`, `IndexWriter`, and `IndexReader`. Writer is `Mutex<IndexWriter>`; reader is `Arc<IndexReader>` rebuilt (reload) after commits. Commits happen on:
+
+Multi-process access: Tantivy's `IndexWriter` acquires an exclusive OS-level lock file (`<index_dir>/.tantivy-writer.lock`). Only the daemon process opens `IndexWriter`. CLI/stdio/MCP-proxy processes open a read-only `IndexReader` only; if they need to trigger a rebuild, they route through daemon HTTP (`POST /lexical/rebuild`). If a non-daemon process attempts to open `IndexWriter` and hits lock contention, it falls back to read-only reader mode and logs a warning (no crash).
 - upsert of a memory (add/replace document by id),
 - supersede (valid_to set),
 - archive,
@@ -52,12 +58,17 @@ Cargo feature `tantivy` adds dependency `tantivy = "0.22"` (or latest compatible
 - delete,
 - explicit `neurostrata_rebuild_lexical_index`.
 
-Commit is batched with a 200ms debounce to avoid per-write fsync storms; `rebuild` forces immediate commit.
+Commit is batched with a 200ms debounce to avoid per-write fsync storms; `rebuild` forces immediate commit. Because LadybugDB writes are serialized by `write_lock` and tests/agents require read-after-write, `upsert`/`delete`/`relocate` flush synchronously (commit immediately) when called; the 200ms debounce applies only to bulk rebuild/indexer background tasks. `search` additionally calls `reader.reload()` if a dirty flag is set, ensuring no stale reads.
+
+Mutation hooks in `LadybugStore` (behind `#[cfg(feature = "tantivy")]`): `upsert` inspects the incoming `payload` (checking `STRUCTURAL_MEMORY_TYPES`, `is_registry_row`, `is_archived`, `is_mesh_conflicting`, `is_retired_at`, `is_retired_at(now)`) to decide whether to upsert or delete the document in Tantivy; `delete`, `relocate` (move id across namespaces), `clear_ingested`, `handle_supersede_memory` (via `upsert` with `valid_to` set), and `archive_memory` (via `upsert` with `archived: true`) all route through the same upsert/delete decision. No separate `supersede`/`archive` methods exist in `LadybugStore` (both call `upsert` with updated metadata).
 
 ### 5.3 Indexing fields & tokenization
 
-For each memory (excluding structural types, hard-archived, deleted, and conflicting rows; superseded rows with `valid_to > 0` are KEPT with updated `valid_to` so historical `as_of` queries resolve):
-- `id` = memory id
+For each memory:
+- Excluded entirely: structural types (`STRUCTURAL_MEMORY_TYPES`), registry rows (`is_registry_row`), mesh-conflicting rows (`is_mesh_conflicting`), deleted rows.
+- Indexed with filtering at query time: archived rows (`is_archived`) and task rows (`memory_type == "task"`) ARE indexed (with `memory_type` and `valid_to`/`valid_from` fields) so `include_archived`/`include_tasks` can be honored; they are filtered at query time based on those flags.
+- Superseded rows (`valid_to > 0`) are KEPT with updated `valid_to` so historical `as_of` queries resolve.
+- `id` = composite key `"{namespace}::{memory_id}"` (namespace + id) to prevent cross-namespace collisions and to scope delete/replace by `(namespace, id)`. `namespace` is also a stored/indexed field for filtering.
 - `namespace` = namespace
 - `content` = content (Tantivy default tokenizer; acceptable for prose)
 - `symbol` = `metadata.symbol` if present else empty (code-aware tokenizer: split on `/`, `.`, `:`, `_`, camelCase boundaries, lowercase)
@@ -73,9 +84,11 @@ Code-aware tokenization is required because the default tokenizer splits on `_` 
 - Runs a Tantivy multi-field query over `content:symbol:location` with boosts content=1.0, symbol=2.0, location=1.5 (code-aware tokenization applied to query terms for symbol/location fields).
 - Does NOT seed Step 2 graph expansion: lexical primaries are returned directly (no 1-hop/2-hop expansion) to keep the mode pure and predictable. (Default mode continues to expand.)
 - Applies LadybugDB read-time filters (`is_retired_at`, domain slugs, `as_of`) by over-fetching `top_k * FETCH_MULTIPLIER` from Tantivy and verifying each candidate against LadybugDB; dropped candidates are replaced from the next Tantivy page.
+- Domain filter fallback mirrors `search_inner`: if the domain filter matches 0 rows among candidates, fall back to unfiltered results and report `domain filter: skipped — no row matched the domain; the results are unfiltered (lexical)` in the mode header.
 - Maps each surviving hit's `id` back to a `SearchResult` via LadybugDB lookup (payload/evidence come from the store, not the index).
-- `score` = `1.0 - (bm25 / max_bm25_in_result_set)` (clamped to [0,1]); if result set empty, score 0.0 (distance convention: lower better). `derivation: ["tantivy-lexical"]`.
+- `score` = `1.0 - (bm25 / max_bm25_in_result_set)` (clamped to [0,1]); if result set empty, score 0.0 (distance convention: lower better). `derivation: ["tantivy-lexical"]`. Lexical distance is raw normalized BM25 (no `capped_gain`/usage/provenance/feedback boost).
 - Sort `ASC` by score.
+- Blend (if enabled): `vector_distance` in `0.7 * vector_distance + 0.3 * lexical_distance` uses the boosted distance (with `capped_gain`); `lexical_distance` uses raw normalized BM25 distance. Vector-only candidates substitute worst-case lexical distance 1.0; lexical-only substitute worst-case vector distance 1.0.
 
 Default mode blend (only if benchmark gate passes and config `lexical_blend = true`): run lexical query in parallel with vector search; merge candidate sets; final distance = `0.7 * vector_distance + 0.3 * lexical_distance` for ids present in both, else `0.7 * vector_distance + 0.3` (vector-only, substituting worst-case lexical distance 1.0) or `0.7 + 0.3 * lexical_distance` (lexical-only, substituting worst-case vector distance 1.0). Documented single rule. Off by default until benchmark evidence.
 
@@ -89,13 +102,13 @@ Index stores `index_version` (crate version + schema version). On open, if misma
 
 ### 5.7 Evidence rendering
 
-`render_evidence_suffix` (`src/server.rs`) currently skips `EvidenceKind::DirectMatch`. Update it to render a non-empty `derivation` tag (e.g. `[tantivy-lexical]`) on `DirectMatch` rows so `derivation: ["tantivy-lexical"]` is visible in MCP output. Same fix benefits `exact-name`.
+`render_evidence_suffix` (`src/server.rs`) currently skips `EvidenceKind::DirectMatch`. Update it to render a non-empty `derivation` tag on `DirectMatch` rows with non-empty `derivation`: emit `\nMatch [{derivation joined by ", "}]` (e.g. `\nMatch [tantivy-lexical]` or `\nMatch [exact-name]`). This makes `derivation: ["tantivy-lexical"]` visible in MCP output and also fixes `exact-name` visibility. Exact string format: `\nMatch [tag1, tag2]` with tags in insertion order.
 
 ## 6. Interfaces
 
 - Cargo feature `tantivy`.
 - New module `src/lexical.rs` (or `src/search/lexical.rs`) behind `#[cfg(feature = "tantivy")]`.
-- `neurostrata_search_memory` gains `mode: "lexical"` (enum extended; non-tantivy builds reject with message).
+- `neurostrata_search_memory` gains `mode: "lexical"` and `as_of: Option<i64>` (enum extended; non-tantivy builds reject `mode="lexical"` with message). `as_of` is threaded through `VectorStore::search_with_domain` and `search_inner`.
 - New tool `neurostrata_rebuild_lexical_index` (namespace optional).
 - Config: `lexical_blend: bool` (default false).
 
