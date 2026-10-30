@@ -1,6 +1,6 @@
 # Streaming Delta (RDF Patch) Design
 
-> Status: revised per Argon review — pending re-review.
+> Status: **APPROVED** (2026-10-30).
 > Task: `neurostrata-7rgp` (Streaming delta (RDF Patch) for SynapticMesh, OxiRS §1.10).
 > Companion: `docs/superpowers/specs/2026-10-27-rdf-canonical-memory-data-model-migration-design.md`, `docs/superpowers/specs/2026-10-10-synaptic-mesh-design.md`.
 
@@ -53,10 +53,10 @@ pub struct Stream { pub events: Vec<Delta> }
 - `Stream::parse_patch(input: &str) -> Result<Vec<Delta>, ParseError>` round-trips.
 
 ### 5.2 N-Triples escaping
-- IRI: `<` + percent-encoded IRI + `>`.
+- IRI: `<` + standard N-Triples validated IRI (reject `< > " { } | ^ \`` and `U+0000..=U+0020`; `\uXXXX`-escape) + `>`.
 - Literal: `"..."` with `\"`, `\\`, `\n`, `\r`, `\t`, `\uXXXX` escaping; optional `^^<datatype>` or `@lang`.
 - Blank node: `_:label`.
-- Graph (named graph): `G <graphiri> { ... }` optional; default graph if absent.
+- Graph (named graph): optional; `A  <p> <o> <g> .` / `D  <p> <o> <g> .` W3C RDF Patch quad syntax; default graph (no named graph) if absent. Instead of `G <graphiri> { ... }` (TriG block).
 
 ### 5.3 SynapticMesh integration
 - On publish (`synaptic_mesh::outbox::publish`): build a `Stream` from the record's canonical RDF quads (added lines `A`), emit patch to outbox.

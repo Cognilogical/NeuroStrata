@@ -1,6 +1,6 @@
 # WASM Browser/Edge Engine Design
 
-> Status: revised per Argon blockers — pending Argon re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-6hjs` (WASM browser/edge engine, OxiRS §1.20).
 > Companion: `docs/superpowers/specs/2026-10-27-rdf-canonical-memory-data-model-migration-design.md`, `docs/superpowers/specs/2026-10-28-tdb2-storage-hygiene-design.md`.
 

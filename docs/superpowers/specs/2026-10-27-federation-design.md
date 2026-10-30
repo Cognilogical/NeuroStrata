@@ -1,6 +1,6 @@
 # Federation Design
 
-> Status: draft — pending Argon review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-k8tc` (Federation (SERVICE) across daemon instances, OxiRS §1.11).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md`.
 

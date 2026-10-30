@@ -1,6 +1,6 @@
 # SHACL Shape Validation Design
 
-> Status: draft — pending Argon review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-7zvo` (SHACL shape validation + AI constraint inference, OxiRS §1.3).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-owl-rdfs-reasoning-design.md`.
 

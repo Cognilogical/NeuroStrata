@@ -38,7 +38,7 @@ pub fn build_mesh_canonical_nquads(
     let mut lines: Vec<String> = Vec::new();
     let mut push = |line: String| { lines.push(line); };
 
-    push(format!("<urn:neurostrata:memory:{}> <{}> \"{}\"^^<{}> <{}> .", id, ns("id"), esc(id), str_dt, graph));
+    push(format!("<urn:neurostrata:memory:{}> <{}> <urn:neurostrata:memory:{}> <{}> .", id, ns("id"), id, graph));
     push(format!("<urn:neurostrata:memory:{}> <{}> \"{}\"^^<{}> <{}> .", id, ns("namespace"), esc(namespace), str_dt, graph));
     push(format!("<urn:neurostrata:memory:{}> <{}> \"{}\"^^<{}> <{}> .", id, ns("memoryType"), esc(memory_type), str_dt, graph));
     push(format!("<urn:neurostrata:memory:{}> <{}> \"{}\"^^<{}> <{}> .", id, ns("lifecycleState"), esc(lifecycle_state), str_dt, graph));
@@ -95,6 +95,76 @@ pub fn build_mesh_canonical_nquads(
     h.update(nquads_text.as_bytes());
     let digest = format!("sha256:{}", hex::encode(h.finalize()));
     (nquads_text, digest)
+}
+
+/// Rebuild the canonical mesh wire N-Quads for a MeshRecord (spec §5.2f
+/// shadow reconstruction). Extracts all fields from the record's own
+/// metadata + lifecycle + relationships so the reconstructed payload is
+/// independent of any caller-side escaping or ordering.
+fn rebuild_canonical_nquads(record: &crate::synaptic_mesh::record::MeshRecord) -> String {
+    use crate::synaptic_mesh::record::LifecycleState;
+    let meta = record.metadata.as_object().cloned().unwrap_or_default();
+    // Content: match worker.rs pattern — string directly, else JSON serialize
+    let content_str = match &record.content {
+        serde_json::Value::String(s) => s.clone(),
+        _ => serde_json::to_string(&record.content).unwrap_or_default(),
+    };
+    // Procedure fields: for "procedure" type, extract from content object (worker.rs pattern)
+    let (trigger, initial_fires, valid_to, rehearsal_script) = if record.memory_type == "procedure" {
+        if let Some(def) = record.content.as_object() {
+            let trig = def.get("trigger").and_then(|v| v.as_str()).map(String::from);
+            let fires = def.get("remaining_fires_initial").and_then(|v| v.as_i64());
+            let vt = def.get("valid_to").and_then(|v| v.as_str()).map(String::from);
+            let rs = def.get("rehearsal_script").and_then(|v| v.as_str()).map(String::from);
+            (trig, fires, vt, rs)
+        } else { (None, None, None, None) }
+    } else { (None, None, None, None) };
+    let tags: Vec<String> = meta.get("tags").and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let mut rels: Vec<(String, String)> = Vec::new();
+    if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
+        for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
+    }
+    for r in &record.relationships {
+        rels.push((r.kind.clone(), r.target.to_string()));
+    }
+    let created_at = record.lifecycle.created_at.to_rfc3339();
+    let archived_at = record.lifecycle.archived_at.map(|d| d.to_rfc3339());
+    let tombstoned_at = record.lifecycle.tombstoned_at.map(|d| d.to_rfc3339());
+    let superseded_by = record.lifecycle.superseded_by.map(|u| u.to_string());
+    let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
+    let source = meta.get("source").and_then(|v| v.as_str());
+    let concept_iri = meta.get("concept_iri").and_then(|v| v.as_str());
+    let update_id = record.update_id.to_string();
+    let trust = record.trust.to_string();
+    let (canonical, _digest) = build_mesh_canonical_nquads(
+        &record.id.to_string(), &record.namespace, &record.memory_type,
+        &record.lifecycle.state.to_string(), &created_at, &record.lifecycle.created_by,
+        superseded_by.as_deref(), archived_at.as_deref(), tombstoned_at.as_deref(),
+        &content_str, eligibility, source, &tags, concept_iri, &rels,
+        &update_id, record.origin_mesh_epoch, &trust,
+        trigger.as_deref(), initial_fires, valid_to.as_deref(), rehearsal_script.as_deref(),
+    );
+    canonical
+}
+
+/// Parse an N-Quads text into a sorted set of canonical quad lines.
+/// Returns (canonical lines, parsed error messages).
+fn canonical_quads(text: &str) -> (std::collections::BTreeSet<String>, Vec<String>) {
+    let mut set = std::collections::BTreeSet::new();
+    let mut errors: Vec<String> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        for q in oxttl::NQuadsParser::new().for_slice(trimmed.as_bytes()) {
+            match q {
+                Ok(qr) => { set.insert(qr.to_string()); }
+                Err(e) => { errors.push(format!("line {}: oxttl parse error: {}", i + 1, e)); }
+            }
+        }
+    }
+    (set, errors)
 }
 
 /// Canonical mesh wire predicate allowlist (spec §5.2a). Any predicate
@@ -215,57 +285,6 @@ pub fn validate_canonical_rdf(
                 i + 1, graph, expected_graph
             ));
         }
-        // Spec §5.2f shadow reconstruction: compare parsed object term
-        // against MeshRecord fields using oxttl N-Quads parsing.
-        for quad_res in oxttl::NQuadsParser::new().for_slice(line.trim().as_bytes()) {
-            match quad_res {
-                Ok(quad_ref) => {
-                    let pred_iri = quad_ref.predicate.as_str();
-                    let obj_term = quad_ref.object.as_ref();
-                    let obj_str = obj_term.to_string();
-                    // Map predicate -> expected object serialized form
-                    let expected_obj: Option<String> = match pred_iri {
-                        "urn:neurostrata:ns#id" => Some(format!("<urn:neurostrata:memory:{}>", record.id)),
-                        "urn:neurostrata:ns#namespace" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.namespace.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r"))),
-                        "urn:neurostrata:ns#memoryType" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.memory_type)),
-                        "urn:neurostrata:ns#lifecycleState" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.lifecycle.state)),
-                        "urn:neurostrata:ns#createdAt" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>", record.lifecycle.created_at.to_rfc3339())),
-                        "urn:neurostrata:ns#createdBy" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.lifecycle.created_by)),
-                        "urn:neurostrata:ns#supersededBy" => {
-                            if let Some(u) = record.lifecycle.superseded_by {
-                                Some(format!("<urn:neurostrata:memory:{}>", u))
-                            } else { Some("_ABSENT_".to_string()) }
-                        }
-                        "urn:neurostrata:ns#archivedAt" => {
-                            if let Some(dt) = record.lifecycle.archived_at {
-                                Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>", dt.to_rfc3339()))
-                            } else { Some("_ABSENT_".to_string()) }
-                        }
-                        "urn:neurostrata:ns#tombstonedAt" => {
-                            if let Some(dt) = record.lifecycle.tombstoned_at {
-                                Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>", dt.to_rfc3339()))
-                            } else { Some("_ABSENT_".to_string()) }
-                        }
-                        "urn:neurostrata:ns#content" => {
-                            let s = record.content.as_str().unwrap_or("").to_string();
-                            Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r")))
-                        }
-                        "urn:neurostrata:ns#updateId" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.update_id)),
-                        "urn:neurostrata:ns#originMeshEpoch" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", record.origin_mesh_epoch)),
-                        "urn:neurostrata:ns#trust" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.trust)),
-                        _ => None,
-                    };
-                    if let Some(exp) = expected_obj {
-                        if obj_str != exp {
-                            violations.push(format!("line {}: predicate {} object {} does not match MeshRecord (expected {})", i + 1, pred_iri, obj_str, exp));
-                        }
-                    }
-                }
-                Err(_) => {
-                    violations.push(format!("line {}: oxttl parse error for N-Quads object", i + 1));
-                }
-            }
-        }
         // Strip angle brackets from predicate for allowlist check
         let pred_unbracketed = if pred.starts_with('<') && pred.ends_with('>') {
             &pred[1..pred.len()-1]
@@ -277,6 +296,28 @@ pub fn validate_canonical_rdf(
                 "line {}: predicate {} is not in the mesh wire allowlist",
                 i + 1, pred
             ));
+        }
+    }
+    // Spec §5.2f shadow reconstruction: compare canonical N-Quads
+    // from MeshRecord against payload quads (single quad-set compare,
+    // not per-line — eliminates O(N²) parse and duplicate errors).
+    let rebuilt_text = rebuild_canonical_nquads(record);
+    let (rebuilt_set, rebuilt_errors) = canonical_quads(&rebuilt_text);
+    let (payload_set, payload_errors) = canonical_quads(&rdf.quads);
+    for e in rebuilt_errors.into_iter().chain(payload_errors) {
+        violations.push(e);
+    }
+    if rebuilt_set != payload_set {
+        violations.push("§5.2f shadow reconstruction: rebuilt MeshRecord N-Quads (canonical_quads) do not match payload N-Quads".to_string());
+        for q in rebuilt_set.iter() {
+            if !payload_set.contains(q) {
+                violations.push(format!("reconstructed-only quad: {}", q));
+            }
+        }
+        for q in payload_set.iter() {
+            if !rebuilt_set.contains(q) {
+                violations.push(format!("payload-only quad: {}", q));
+            }
         }
     }
     if violations.is_empty() {
@@ -312,5 +353,48 @@ mod tests {
         );
         assert_eq!(a, b, "N-Quads must be byte-identical");
         assert_eq!(da, db, "SHA-256 must match");
+    }
+
+    #[test]
+    fn validate_canonical_rdf_on_built_record() {
+        let tags = vec!["t1".to_string(), "t2".to_string()];
+        let uuid_str = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+        let update_id_val = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a14";
+        let (nquads, digest) = build_mesh_canonical_nquads(
+            uuid_str, "test.ns", "memory", "active",
+            "2026-10-30T12:00:00+00:00", "author-1",
+            Some("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12"),
+            Some("2026-10-30T13:00:00+00:00"), None,
+            "test content body", Some("shareable"), Some("owner"), &tags,
+            Some("https://example.com/concept/test"),
+            &[("supersedes".to_string(), "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13".to_string())],
+            &update_id_val, 3, "trusted",  // origin_mesh_epoch=3 matches MeshRecord
+            None, None, None, None,
+        );
+        use crate::synaptic_mesh::record::{LifecycleState, MeshRecord, RdfBlock};
+        use uuid::Uuid;
+        use chrono::{DateTime, Utc};
+        let record = MeshRecord {
+            schema_version: "v1".to_string(),
+            id: Uuid::parse_str(uuid_str).unwrap(),
+            namespace: "test.ns".to_string(),
+            memory_type: "memory".to_string(),
+            lifecycle: crate::synaptic_mesh::record::Lifecycle {
+                state: LifecycleState::Active,
+                created_at: DateTime::parse_from_rfc3339("2026-10-30T12:00:00+00:00").unwrap().with_timezone(&Utc),
+                created_by: "author-1".to_string(),
+                superseded_by: Some(Uuid::parse_str("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12").unwrap()),
+                archived_at: Some(DateTime::parse_from_rfc3339("2026-10-30T13:00:00+00:00").unwrap().with_timezone(&Utc)),
+                tombstoned_at: None,
+            },
+            content: serde_json::json!("test content body"),
+            metadata: serde_json::from_str(r#"{"tags":["t1","t2"],"eligibility":"shareable","source":"owner","concept_iri":"https://example.com/concept/test","supersedes":["a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13"],"update_id":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a14"}"#).unwrap(),
+            rdf: Some(RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest.clone(), quads: nquads.clone() }),
+            relationships: vec![crate::synaptic_mesh::record::Relationship { kind: "supersedes".to_string(), target: Uuid::parse_str("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13").unwrap() }],
+            update_id: Uuid::parse_str(update_id_val).unwrap(),
+            origin_mesh_epoch: 3,
+            trust: crate::synaptic_mesh::manifest::Trust::Trusted,
+        };
+        assert!(validate_canonical_rdf(&record, record.rdf.as_ref().unwrap()).is_ok(), "shadow reconstruction (§5.2f) must pass for built record");
     }
 }

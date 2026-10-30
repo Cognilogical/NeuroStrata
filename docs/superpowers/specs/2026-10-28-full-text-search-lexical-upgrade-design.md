@@ -1,6 +1,6 @@
 # Full-Text Search Lexical Upgrade Design
 
-> Status: draft — pending Argon review.
+> Status: **APPROVED** (2026-10-30).
 > Task: `neurostrata-m0oz` (full-text search lexical upgrade, OxiRS §1.9 in-house track).
 > Companion: `docs/superpowers/specs/2026-10-27-tantivy-full-text-search-design.md` (optional Tantivy track), `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`.
 
@@ -210,3 +210,15 @@ In-house multi-field lexical search available in default build; phrase/fuzzy/nam
 - `src/store/ladybug.rs`: mutation hooks (upsert/delete/relocate) rebuild index.
 - `src/server.rs`: mode enum + rebuild tool `engine` param.
 - `Cargo.toml`: no change.
+
+---
+
+## Argon Approval Record
+
+| Item | Status |
+|------|--------|
+| Spec | `full-text-search-lexical-upgrade` |
+| Task | `neurostrata-m0oz` |
+| Reviewer | Argon (Gemini 4 Argon) |
+| Decision | **APPROVED** (2026-10-30) |
+| Divergences resolved | `valid_to`/`retirement_visible` alignment with `is_retired_at`; domain ontology expansion in `search_lexical`; build-time exclusion of structural/registry/conflicting docs |

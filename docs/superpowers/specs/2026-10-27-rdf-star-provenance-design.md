@@ -1,6 +1,6 @@
 # RDF-star Provenance for Memory Statements Design
 
-> Status: revised per Argon review — pending user review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-4gb2` (RDF-star provenance, OxiRS §1.18).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md` (§3.2 edge provenance, §3.3 assertion identity).
 

@@ -1,6 +1,6 @@
 # Digital Twin Domain Module Design
 
-> Status: revised per Argon review — pending re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-jk91` (digital twin domain module, OxiRS §1.14 domain track).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-28-rebac-design.md`.
 

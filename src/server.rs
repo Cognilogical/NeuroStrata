@@ -2780,6 +2780,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
                 for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
             }
+            let update_id_raw = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str);
             let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str).to_string();
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
@@ -2892,7 +2893,8 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
             if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
                 for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
             }
-            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str).to_string();
+            let update_id_raw = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str);
+            let update_id = Uuid::parse_str(update_id_raw).unwrap_or(id).to_string();
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
 
@@ -2950,7 +2952,7 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
                 metadata: Value::Object(meta),
                 rdf: Some(RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str.clone(), quads: nquads_text.clone() }),
                 relationships: rels_converted,
-                update_id: id,
+                update_id: Uuid::parse_str(&update_id).unwrap_or(id),
                 origin_mesh_epoch,
                 trust: trust_enum,
             };

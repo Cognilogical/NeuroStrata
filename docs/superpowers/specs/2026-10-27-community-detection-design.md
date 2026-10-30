@@ -1,6 +1,6 @@
 # Community Detection (Louvain/Leiden) Design
 
-> Status: revised per Argon review (blocking gaps fixed) — pending user review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-vhx3` (Community detection, OxiRS §1.7).
 > Companion: `docs/design-oxirs-concepts.md` §1.7.
 

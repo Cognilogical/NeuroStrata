@@ -1,6 +1,6 @@
 # Storage Hygiene Design (TDB2 retired)
 
-> Status: revised per Argon blockers — pending Argon re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-rimc` (TDB2 / storage hygiene, OxiRS §1.20 storage track).
 > Companion: `docs/superpowers/specs/2026-10-27-closure-budget-zstd-anomaly-design.md`, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`.
 

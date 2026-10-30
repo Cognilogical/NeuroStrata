@@ -1,6 +1,6 @@
 # GraphRAG Hybrid Search Design
 
-> Status: revised per Argon review — pending re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-52dq` (GraphRAG hybrid search, vector × graph × keyword, P3).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-community-detection-design.md`, `docs/superpowers/specs/2026-10-27-entity-mention-linking-design.md`, `docs/superpowers/specs/2026-10-27-closure-budget-zstd-anomaly-design.md`.
 

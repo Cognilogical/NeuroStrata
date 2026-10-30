@@ -18,13 +18,16 @@ pub enum Field {
     Content,
     Symbol,
     Location,
+    Namespace,
+    MemoryType,
 }
 
 impl Field {
     pub fn tokenize(self, text: &str) -> Vec<String> {
         match self {
             Field::Content => tokenize_whitespace(text),
-            Field::Symbol | Field::Location => tokenize_code(text),
+            Field::Symbol | Field::Location | Field::Namespace => tokenize_code(text),
+            Field::MemoryType => tokenize_whitespace(text),
         }
     }
 
@@ -33,12 +36,14 @@ impl Field {
             Field::Content => 0,
             Field::Symbol => 1,
             Field::Location => 2,
+            Field::Namespace => 3,
+            Field::MemoryType => 4,
         }
     }
 }
 
-pub const ALL_FIELDS: [Field; 3] = [Field::Content, Field::Symbol, Field::Location];
-pub const DEFAULT_FIELD_WEIGHTS: [f64; 3] = [1.0, 2.0, 1.5];
+pub const ALL_FIELDS: [Field; 5] = [Field::Content, Field::Symbol, Field::Location, Field::Namespace, Field::MemoryType];
+pub const DEFAULT_FIELD_WEIGHTS: [f64; 5] = [1.0, 2.0, 1.5, 3.0, 0.5];
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 const MAX_FUZZY_EXPANSIONS: usize = 50;
@@ -99,6 +104,18 @@ impl LexicalDoc {
         }
     }
 
+    /// Build the tokenized view of every searchable field.
+    /// Returns (field, tokens) pairs in field order.
+    pub fn field_tokens(&self) -> Vec<(Field, Vec<String>)> {
+        vec![
+            (Field::Content, Field::Content.tokenize(&self.content)),
+            (Field::Symbol, Field::Symbol.tokenize(&self.symbol)),
+            (Field::Location, Field::Location.tokenize(&self.location)),
+            (Field::Namespace, Field::Namespace.tokenize(&self.namespace)),
+            (Field::MemoryType, Field::MemoryType.tokenize(&self.memory_type)),
+        ]
+    }
+
     fn key(&self) -> String {
         format!("{}::{}", self.namespace, self.id)
     }
@@ -119,7 +136,7 @@ pub struct NamespaceIndex {
     pub doc_freq: BTreeMap<String, usize>,
     pub doc_len: BTreeMap<String, usize>,
     pub avgdl: f64,
-    pub field_weights: [f64; 3],
+    pub field_weights: [f64; 5],
     total_len: usize,
 }
 
@@ -147,13 +164,7 @@ impl NamespaceIndex {
 
         let mut terms: BTreeSet<String> = BTreeSet::new();
         let mut doc_len = 0usize;
-        for field in ALL_FIELDS {
-            let text = match field {
-                Field::Content => &doc.content,
-                Field::Symbol => &doc.symbol,
-                Field::Location => &doc.location,
-            };
-            let tokens = field.tokenize(text);
+        for (field, tokens) in doc.field_tokens() {
             doc_len += tokens.len();
 
             let mut by_term: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -245,6 +256,11 @@ impl LexicalIndex {
     }
 
     pub fn add(&mut self, doc: LexicalDoc) {
+        // Non-recall material never enters the index → keeps BM25 N/df/avgdl
+        // computed over visible recall rows only (§5.6 filtering at build time).
+        if doc.structural || doc.registry || doc.conflicting {
+            return;
+        }
         let namespace = doc.namespace.clone();
         self.namespaces
             .entry(namespace)
@@ -624,10 +640,10 @@ fn doc_visible(doc: &LexicalDoc, opts: &SearchOptions) -> bool {
 
 fn retirement_visible(doc: &LexicalDoc, now: i64, as_of: Option<i64>) -> bool {
     match as_of {
-        None => doc.valid_to.map_or(true, |v| v <= 0 || v > now),
+        None => doc.valid_to.map_or(true, |v| v > 0 && v > now),
         Some(ts) => {
             doc.valid_from.unwrap_or(0) <= ts
-                && doc.valid_to.map_or(true, |v| v <= 0 || ts < v)
+                && doc.valid_to.map_or(true, |v| v > 0 && ts < v)
         }
     }
 }
