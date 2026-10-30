@@ -10,12 +10,10 @@
 //! See docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md for detailed spec.
 
 use crate::traits::MemoryPayload;
-use oxrdf::{Dataset, Graph, Literal, NamedNode, Subject, Term, Triple};
-use oxrdf::{NamedOrBlankNode, NamedNode as OxNamedNode};
+use oxrdf::{Dataset, Variable};
 use spargebra::SparqlParser;
 use spareval::QueryEvaluator;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
-use std::collections::HashMap;
 
 /// Configuration for SPARQL query execution.
 #[derive(Debug, Clone)]
@@ -94,58 +92,61 @@ pub fn execute_sparql_query(
         .parse_query(query_str)
         .map_err(|e| format!("SPARQL parse error: {}", e))?;
 
-    // Reject UPDATE queries
-    match &query {
-        spargebra::Query::Update(_) => {
-            return Err("SPARQL UPDATE not supported; use read-only queries".to_string());
-        }
-        _ => {}
-    }
+    // Reject UPDATE queries: spargebra separates UPDATE via parse_update; parse_query
+    // handles SELECT/ASK/CONSTRUCT/DESCRIBE only, so an UPDATE input errors here.
 
     // Build the dataset from namespace projection
     let dataset = project_sparql_dataset(namespace, include_retired, include_archived);
 
     // Prepare and evaluate with QueryEvaluator
     let evaluator = QueryEvaluator::new();
-    let prepared = evaluator.prepare(&query)
-        .map_err(|e| format!("SPARQL prepare error: {}", e))?;
+    let prepared = evaluator.prepare(&query);
 
-    // Execute query
-    let results = prepared.execute(dataset)
-        .map_err(|e| format!("SPARQL evaluation error: {}", e))?;
+    // Execute query (requires oxrdf Dataset impl of QueryableDataset)
+    let results = prepared.execute(&dataset).map_err(|e| format!("SPARQL evaluation error: {}", e))?;
 
     // Serialize results
     let mut output = Vec::new();
     let mut serializer = QueryResultsSerializer::from_format(format);
 
+    // Extract variables before take() (wrapper loses variables())
+    let results_vars: Vec<Variable> = match &results {
+        spareval::QueryResults::Solutions(sol_iter) => sol_iter.variables().to_vec(),
+        _ => Vec::new(),
+    };
+
+    let mut solution_count: usize = 0;
+
     match results {
         spareval::QueryResults::Boolean(b) => {
-            serializer.serialize_boolean_to_writer(&mut output, b)?;
+            serializer.serialize_boolean_to_writer(&mut output, b)
+                .map_err(|e| format!("serialize boolean: {}", e))?;
         }
         spareval::QueryResults::Solutions(mut solutions) => {
-            let solutions = solutions.take(config.max_solutions as u64);
+            let solutions = solutions.take(config.max_solutions);
             let mut serializer_solutions =
-                serializer.serialize_solutions_to_writer(&mut output, solutions.variables().to_vec())?;
+                serializer.serialize_solutions_to_writer(&mut output, results_vars)
+                    .map_err(|e| format!("serialize solutions start: {}", e))?;
             for solution in solutions {
-                serializer_solutions.serialize(&solution)?;
+                let sol = solution.map_err(|e| format!("evaluation error: {}", e))?;
+                serializer_solutions.serialize(&sol)
+                    .map_err(|e| format!("serialize solution: {}", e))?;
+                solution_count += 1;
             }
-            serializer_solutions.finish()?;
+            let _ = serializer_solutions.finish()
+                .map_err(|e| format!("serialize finish: {}", e))?;
         }
-        spareval::QueryResults::Triples(_) => {
-            return Err("CONSTRUCT/DESCRIBE triple output not yet implemented".to_string());
+        spareval::QueryResults::Graph(_) => {
+            return Err("CONSTRUCT/DESCRIBE: Graph serializer needed (not implemented)".to_string());
         }
     }
 
-    let results_string = String::from_utf8(output).map_err(|e| format!("UTF-8 error: {}", e))?;
+    let results_string = String::from_utf8(output)
+        .map_err(|e| format!("UTF-8 error: {}", e))?;
 
-    // Determine solution count and truncated flag
-    let (solution_count, truncated) = match results {
-        spareval::QueryResults::Boolean(_) => (1, false),
-        spareval::QueryResults::Solutions(_) => (config.max_solutions, false),
-        spareval::QueryResults::Triples(_) => (0, false),
-    };
+    let truncated = solution_count >= config.max_solutions;
 
-    Ok((results_string, solution_count, false, false))
+    Ok((results_string, solution_count, truncated, false))
 }
 
 /// Result types for SPARQL execution.
@@ -215,11 +216,7 @@ mod tests {
     #[test]
     fn test_update_query_rejected() {
         let q = SparqlParser::new().parse_query("INSERT DATA { <a> <b> <c> }");
-        assert!(q.is_ok());
-        match q.unwrap() {
-            spargebra::Query::Update(_) => assert!(true),
-            _ => panic!("expected Update query"),
-        }
+        assert!(q.is_err());
     }
 
     #[test]

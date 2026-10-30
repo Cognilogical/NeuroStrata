@@ -2996,9 +2996,9 @@ async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> 
     };
 
     let format = match arguments.get("format").and_then(|v| v.as_str()) {
-        Some("csv") => ResultFormat::Csv,
-        Some("tsv") => ResultFormat::Tsv,
-        _ => ResultFormat::Json,
+        Some("csv") => sparesults::QueryResultsFormat::Csv,
+        Some("tsv") => sparesults::QueryResultsFormat::Tsv,
+        _ => sparesults::QueryResultsFormat::Json,
     };
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
