@@ -1,0 +1,164 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ns: <https://neurostrata.org/vocab#> .
+
+# Memory shape — core memory validation
+ns:MemoryShape a sh:NodeShape ;
+    sh:targetClass ns:Memory ;
+    sh:property [
+        sh:path ns:content ;
+        sh:minCount 1 ;
+        sh:message "content must be non-empty" ;
+    ] ;
+    sh:property [
+        sh:path ns:user_id ;
+        sh:minCount 1 ;
+        sh:message "user_id must be non-empty" ;
+    ] ;
+    sh:property [
+        sh:path ns:memory_type ;
+        sh:minCount 1 ;
+        sh:message "memory_type must be non-empty" ;
+    ] ;
+    sh:property [
+        sh:path ns:location ;
+        sh:minCount 0 ;
+        sh:maxCount 1 ;
+    ] ;
+    sh:property [
+        sh:path ns:location_lines ;
+        sh:minCount 0 ;
+        sh:maxCount 1 ;
+    ] ;
+    sh:property [
+        sh:path ns:metadata ;
+        sh:minCount 0 ;
+        sh:maxCount 1 ;
+        sh:nodeKind sh:BlankNodeOrIRI ;
+        sh:message "metadata must be an object or null" ;
+    ] .
+
+# Domain metadata property shape
+ns:DomainPropertyShape a sh:PropertyShape ;
+    sh:path ns:domain ;
+    sh:or (
+        [ sh:datatype xsd:string ]
+        [ sh:nodeKind sh:List ; sh:qualifiedValueShape [ sh:datatype xsd:string ] ]
+    ) ;
+    sh:message "domain must be a string or array of strings" .
+
+# Mentions metadata property shape
+ns:MentionsPropertyShape a sh:PropertyShape ;
+    sh:path ns:mentions ;
+    sh:nodeKind sh:List ;
+    sh:qualifiedValueShape [ sh:datatype xsd:string ] ;
+    sh:message "mentions must be an array of strings" .
+
+# Facets metadata property shape
+ns:FacetsPropertyShape a sh:PropertyShape ;
+    sh:path ns:facets ;
+    sh:nodeKind sh:List ;
+    sh:qualifiedValueShape [ sh:datatype xsd:string ] ;
+    sh:message "facets must be an array of strings" .
+
+# Feedback score metadata property shape
+ns:FeedbackScorePropertyShape a sh:PropertyShape ;
+    sh:path ns:feedback_score ;
+    sh:datatype xsd:decimal ;
+    sh:minInclusive -1.0 ;
+    sh:maxInclusive 1.0 ;
+    sh:message "feedback_score must be a number in [-1, 1]" .
+
+# Topology metadata property shape — required keys
+ns:TopologyPropertyShape a sh:PropertyShape ;
+    sh:path ns:topology ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
+    sh:message "topology must be an object" ;
+    sh:property [
+        sh:path ns:component ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+    ] ;
+    sh:property [
+        sh:path ns:target_system ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+    ] ;
+    sh:property [
+        sh:path ns:channel ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+    ] ;
+    sh:property [
+        sh:path ns:credential_boundary ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+    ] ;
+    sh:property [
+        sh:path ns:reason ;
+        sh:minCount 1 ;
+        sh:datatype xsd:string ;
+    ] .
+
+# Attempt metadata property shape
+ns:AttemptPropertyShape a sh:PropertyShape ;
+    sh:path ns:attempt ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
+    sh:message "attempt must be an object" .
+
+# Rule memory type specific constraints
+ns:RuleShape a sh:NodeShape ;
+    sh:targetClass ns:Rule ;
+    sh:property [
+        sh:path ns:source ;
+        sh:minCount 1 ;
+        sh:message "source is required for a rule" ;
+    ] ;
+    sh:property [
+        sh:path ns:enforcement ;
+        sh:minCount 0 ;
+        sh:maxCount 1 ;
+        sh:in ( "ENFORCED" "PARTIAL" "NOT_ENFORCED" ) ;
+        sh:message "enforcement must be ENFORCED, PARTIAL, or NOT_ENFORCED" ;
+    ] .
+
+# Procedure memory type specific constraints
+ns:ProcedureShape a sh:NodeShape ;
+    sh:targetClass ns:Procedure ;
+    sh:property [
+        sh:path ns:trigger ;
+        sh:minCount 1 ;
+        sh:message "trigger is required for a procedure" ;
+        sh:or (
+            [ sh:in ( "session-start" "before-edit" "after-mutation" ) ]
+            [ sh:pattern "^every-n-sessions:\\d+$" ]
+            [ sh:pattern "^every-n-days:\\d+$" ]
+        ) ;
+        sh:message "trigger must be a valid enum or every-n-sessions:N / every-n-days:N" ;
+    ] ;
+    sh:property [
+        sh:path ns:performance_count ;
+        sh:minCount 0 ;
+        sh:maxCount 1 ;
+        sh:datatype xsd:integer ;
+        sh:message "performance_count must be an integer" ;
+    ] .
+
+# Task memory type specific constraints
+ns:TaskShape a sh:NodeShape ;
+    sh:targetClass ns:Task ;
+    sh:property [
+        sh:path ns:task ;
+        sh:minCount 1 ;
+        sh:message "task object is required for a task memory" ;
+        sh:nodeKind sh:BlankNodeOrIRI ;
+        sh:property [
+            sh:path ns:status ;
+            sh:minCount 0 ;
+            sh:maxCount 1 ;
+            sh:in ( "open" "in_progress" "blocked" "done" ) ;
+            sh:message "status must be open/in_progress/blocked/done" ;
+        ] ;
+    ] .

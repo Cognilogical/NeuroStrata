@@ -1,0 +1,32 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix ns: <https://neurostrata.org/vocab#> .
+
+# Mesh record validation shape
+ns:MeshRecordShape a sh:NodeShape ;
+    sh:targetClass ns:MeshRecord ;
+    sh:property [
+        sh:path ns:mesh_id ;
+        sh:minCount 1 ;
+        sh:message "mesh_id is required" ;
+    ] ;
+    sh:property [
+        sh:path ns:imported_at ;
+        sh:minCount 1 ;
+        sh:datatype xsd:dateTime ;
+        sh:message "imported_at must be a valid ISO-8601 datetime" ;
+    ] ;
+    sh:property [
+        sh:path ns:status ;
+        sh:minCount 1 ;
+        sh:maxCount 1 ;
+        sh:in ( "imported" "validated" "failed" ) ;
+        sh:message "status must be imported/validated/failed" ;
+    ] ;
+    sh:property [
+        sh:path ns:canonical_rdf ;
+        sh:minCount 1 ;
+        sh:nodeKind sh:IRI ;
+        sh:message "canonical_rdf must be a valid RDF graph IRI" ;
+    ] .

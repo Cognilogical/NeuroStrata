@@ -1,0 +1,38 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ns: <https://neurostrata.org/vocab#> .
+
+# Edge / relationship edge shape
+ns:EdgeShape a sh:NodeShape ;
+    sh:targetClass ns:Edge ;
+    sh:property [
+        sh:path ns:predicate ;
+        sh:minCount 1 ;
+        sh:message "edge predicate must be non-empty" ;
+    ] ;
+    sh:property [
+        sh:path ns:subject ;
+        sh:minCount 1 ;
+        sh:message "edge subject must be non-empty" ;
+    ] ;
+    sh:property [
+        sh:path ns:object ;
+        sh:minCount 1 ;
+        sh:message "edge object must be non-empty" ;
+    ] ;
+    sh:property [
+        sh:path ns:source ;
+        sh:minCount 0 ;
+        sh:maxCount 1 ;
+        sh:in ( "user" "system" ) ;
+        sh:message "edge source must be user or system" ;
+    ] .
+
+# Edge property shapes for individual predicate constraints
+ns:PredicatePropertyShape a sh:PropertyShape ;
+    sh:path ns:predicate ;
+    sh:datatype xsd:anyURI ;
+    sh:minInclusive "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" ;
+    sh:message "predicate must be a valid URI or RDF property" .

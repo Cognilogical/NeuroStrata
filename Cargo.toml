@@ -105,6 +105,7 @@ sparopt = { version = "0.3", features = ["sparql-12"] }
 spareval = { version = "0.2", features = ["sparql-12"] }
 sparesults = { version = "0.3", features = ["sparql-12"] }
 graphql-parser = "0.4"
+shacl = "0.3"
 
 # native-tls (pulled in by reqwest, ureq and hf-hub) only needs OpenSSL on
 # platforms without a system TLS stack: Windows uses SChannel and Apple targets
