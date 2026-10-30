@@ -215,6 +215,57 @@ pub fn validate_canonical_rdf(
                 i + 1, graph, expected_graph
             ));
         }
+        // Spec §5.2f shadow reconstruction: compare parsed object term
+        // against MeshRecord fields using oxttl N-Quads parsing.
+        for quad_res in oxttl::NQuadsParser::new().for_slice(line.trim().as_bytes()) {
+            match quad_res {
+                Ok(quad_ref) => {
+                    let pred_iri = quad_ref.predicate.as_str();
+                    let obj_term = quad_ref.object.as_ref();
+                    let obj_str = obj_term.to_string();
+                    // Map predicate -> expected object serialized form
+                    let expected_obj: Option<String> = match pred_iri {
+                        "urn:neurostrata:ns#id" => Some(format!("<urn:neurostrata:memory:{}>", record.id)),
+                        "urn:neurostrata:ns#namespace" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.namespace.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r"))),
+                        "urn:neurostrata:ns#memoryType" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.memory_type)),
+                        "urn:neurostrata:ns#lifecycleState" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.lifecycle.state)),
+                        "urn:neurostrata:ns#createdAt" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>", record.lifecycle.created_at.to_rfc3339())),
+                        "urn:neurostrata:ns#createdBy" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.lifecycle.created_by)),
+                        "urn:neurostrata:ns#supersededBy" => {
+                            if let Some(u) = record.lifecycle.superseded_by {
+                                Some(format!("<urn:neurostrata:memory:{}>", u))
+                            } else { Some("_ABSENT_".to_string()) }
+                        }
+                        "urn:neurostrata:ns#archivedAt" => {
+                            if let Some(dt) = record.lifecycle.archived_at {
+                                Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>", dt.to_rfc3339()))
+                            } else { Some("_ABSENT_".to_string()) }
+                        }
+                        "urn:neurostrata:ns#tombstonedAt" => {
+                            if let Some(dt) = record.lifecycle.tombstoned_at {
+                                Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>", dt.to_rfc3339()))
+                            } else { Some("_ABSENT_".to_string()) }
+                        }
+                        "urn:neurostrata:ns#content" => {
+                            let s = record.content.as_str().unwrap_or("").to_string();
+                            Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r")))
+                        }
+                        "urn:neurostrata:ns#updateId" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.update_id)),
+                        "urn:neurostrata:ns#originMeshEpoch" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", record.origin_mesh_epoch)),
+                        "urn:neurostrata:ns#trust" => Some(format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#string>", record.trust)),
+                        _ => None,
+                    };
+                    if let Some(exp) = expected_obj {
+                        if obj_str != exp {
+                            violations.push(format!("line {}: predicate {} object {} does not match MeshRecord (expected {})", i + 1, pred_iri, obj_str, exp));
+                        }
+                    }
+                }
+                Err(_) => {
+                    violations.push(format!("line {}: oxttl parse error for N-Quads object", i + 1));
+                }
+            }
+        }
         // Strip angle brackets from predicate for allowlist check
         let pred_unbracketed = if pred.starts_with('<') && pred.ends_with('>') {
             &pred[1..pred.len()-1]
