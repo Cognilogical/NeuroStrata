@@ -1,0 +1,44 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ns: <https://neurostrata.org/vocab#> .
+
+# Topology property shape — all 5 keys required, non-empty strings
+ns:TopologyPropertyShape a sh:PropertyShape ;
+    sh:path ns:topology ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
+    sh:message "topology must be an object with component, target_system, channel, credential_boundary, reason" ;
+    sh:property [
+        sh:path ns:component ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:datatype xsd:string ;
+        sh:minLength 1 ;
+        sh:message "component must be a non-empty string" ;
+    ] ;
+    sh:property [
+        sh:path ns:target_system ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:datatype xsd:string ;
+        sh:minLength 1 ;
+        sh:message "target_system must be a non-empty string" ;
+    ] ;
+    sh:property [
+        sh:path ns:channel ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:datatype xsd:string ;
+        sh:minLength 1 ;
+        sh:message "channel must be a non-empty string" ;
+    ] ;
+    sh:property [
+        sh:path ns:credential_boundary ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:datatype xsd:string ;
+        sh:minLength 1 ;
+        sh:message "credential_boundary must be a non-empty string" ;
+    ] ;
+    sh:property [
+        sh:path ns:reason ;
+        sh:minCount 1 ; sh:maxCount 1 ;
+        sh:datatype xsd:string ;
+        sh:minLength 1 ;
+        sh:message "reason must be a non-empty string" ;
+    ] .

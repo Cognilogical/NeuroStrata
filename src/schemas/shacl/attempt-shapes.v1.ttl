@@ -1,0 +1,13 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ns: <https://neurostrata.org/vocab#> .
+
+# Attempt metadata property — object with optional fields, no extra constraints
+ns:AttemptPropertyShape a sh:PropertyShape ;
+    sh:path ns:attempt ;
+    sh:nodeKind sh:BlankNodeOrIRI ;
+    sh:message "attempt must be an object" .
+
+# Optional sub-properties within attempt (if present)
+ns:AttemptSubPropertyShape a sh:PropertyShape ;
+    sh:message "attempt sub-properties must be objects or strings" .
