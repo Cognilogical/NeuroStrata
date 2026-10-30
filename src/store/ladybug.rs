@@ -2029,7 +2029,11 @@ impl LadybugStore {
             .to_string();
         doc.location = payload.location.clone();
         doc.valid_from = metadata.get("valid_from").and_then(|v| v.as_i64());
-        doc.valid_to = metadata.get("valid_to").and_then(|v| v.as_i64());
+        // Align with is_retired_at contract (ladybug.rs:5528): unparseable/non-null
+        // valid_to treated as 0 (retired); null → unspecified (active).
+        doc.valid_to = metadata.get("valid_to").and_then(|v| {
+            if v.is_null() { None } else { Some(v.as_i64().unwrap_or(0)) }
+        });
         doc.archived = is_archived(metadata);
         doc.user_id = payload.user_id.clone();
         doc.visible_to = metadata
@@ -2904,13 +2908,28 @@ impl VectorStore for LadybugStore {
         fuzzy_max_distance: usize,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
         self.ensure_lexical_loaded(namespace).await?;
+        self.refresh_ontology(namespace).await;
+        let ontology = self.get_ontology(namespace);
+        // Domain ontology expansion: expand domain slugs before filtering
+        // (mirrors search_with_domain at ladybug.rs:2895).
+        let mut expanded: Vec<String> = Vec::new();
+        for d in domains {
+            if let Some(slug) = ontology.canonical_slug(d) {
+                for e in ontology.expand_domain(&slug) {
+                    expanded.push(e);
+                }
+            } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
+                expanded.push(s);
+            }
+        }
+        let expanded_domains: Vec<String> = expanded.into_iter().collect();
         let options = crate::fts::SearchOptions {
             now: chrono::Utc::now().timestamp(),
             as_of: None,
             include_tasks,
             include_archived,
             principal: principal.to_string(),
-            domains: domains.to_vec(),
+            domains: expanded_domains,
             fuzzy_max_distance: fuzzy_max_distance.min(2),
             limit,
         };

@@ -1,6 +1,6 @@
 # Knowledge-Graph Embeddings (Structural Channel) Design
 
-> Status: revised per Argon review (blocking defects fixed) — pending user review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-84k2` (KGE structural channel, OxiRS §1.6).
 > Companion: `docs/design-oxirs-concepts.md` §1.6, `docs/design-cognee-concepts.md`.
 

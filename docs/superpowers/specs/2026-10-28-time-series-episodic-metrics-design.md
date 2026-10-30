@@ -1,6 +1,6 @@
 # Time-Series / Episodic Metrics Design
 
-> Status: draft — pending Argon review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-ejiy` (time-series episodic metrics, OxiRS §1.19 telemetry track).
 > Companion: `docs/superpowers/specs/2026-10-27-closure-budget-zstd-anomaly-design.md` (anomaly detection), `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`.
 

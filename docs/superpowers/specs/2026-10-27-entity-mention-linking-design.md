@@ -1,6 +1,6 @@
 # Entity / Mention Linking Design
 
-> Status: revised per Argon review (approve with changes) — pending user review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-q1mt` (Entity / mention linking, OxiRS §1.8).
 > Companion: `docs/design-oxirs-concepts.md` §1.8, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md` §13.
 

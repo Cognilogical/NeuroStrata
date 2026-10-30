@@ -1,6 +1,6 @@
 # OWL/RDFS Reasoning over Memory Graph Design
 
-> Status: revised per Argon review — pending user review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-2hxl` (OWL/RDFS reasoning over memory graph, OxiRS §1.2).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md` (§4, §3.4), `docs/superpowers/specs/2026-10-27-rdf-canonical-direction-design.md` (§2 Decision: JSON primary + RDF canonical transition), `docs/superpowers/specs/2026-10-27-closure-budget-zstd-anomaly-design.md` (`yjah`, QueryBudget and transitive closure primitives).
 

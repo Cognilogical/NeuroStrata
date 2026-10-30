@@ -1,6 +1,6 @@
 # RDF Canonical Memory Data Model Migration Design
 
-> Status: draft — pending Argon review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-z9e7` (RDF canonical memory data model migration, OxiRS §1.1).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-10-synaptic-mesh-design.md`.
 

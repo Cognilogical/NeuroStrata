@@ -1,6 +1,6 @@
 # SPARQL 1.1/1.2 Query Engine Design
 
-> Status: draft — pending Argon review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-damg` (SPARQL 1.1/1.2 query engine over memory graph, OxiRS §1.4).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-owl-rdfs-reasoning-design.md`.
 

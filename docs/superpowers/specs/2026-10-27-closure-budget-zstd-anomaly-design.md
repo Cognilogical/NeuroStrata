@@ -1,6 +1,6 @@
 # Subclass/Transitive Closure + Query Budget + zstd + Anomaly Detection Design
 
-> Status: revised per Argon review — pending re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-yjah` (subclass/transitive closure + query budget + zstd + anomaly detection, OxiRS §1.19).
 > Companion: `docs/superpowers/specs/2026-10-27-owl-rdfs-reasoning-design.md`, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md`, `docs/superpowers/specs/2026-10-27-shacl-shape-validation-design.md`.
 

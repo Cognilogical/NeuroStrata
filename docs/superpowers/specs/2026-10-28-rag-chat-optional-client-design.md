@@ -1,6 +1,6 @@
 # RAG Chat Optional Client Design
 
-> Status: revised per Argon blockers — pending Argon re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-miuu` (RAG chat optional client, OxiRS §1.13 client track).
 > Companion: `docs/superpowers/specs/2026-10-28-graphql-curated-read-api-design.md`, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`.
 

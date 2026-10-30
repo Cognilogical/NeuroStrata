@@ -1,6 +1,6 @@
 # DID / Signed Mesh Records Design
 
-> Status: revised per Argon review — pending re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-39v2` (DID / signed mesh records, OxiRS §1.12).
 > Companion: `docs/superpowers/specs/2026-10-10-synaptic-mesh-design.md`, `docs/superpowers/specs/2026-10-27-rdf-canonical-memory-data-model-migration-design.md`.
 

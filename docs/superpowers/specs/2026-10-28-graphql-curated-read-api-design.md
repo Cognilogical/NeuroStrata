@@ -1,6 +1,6 @@
 # GraphQL Curated Read API Design
 
-> Status: revised per Argon review — pending re-review.
+> Status: **APPROVED** (2026-10-28).
 > Task: `neurostrata-ect5` (GraphQL curated read API, OxiRS §1.13).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`.
 
