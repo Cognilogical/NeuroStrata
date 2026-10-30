@@ -595,6 +595,21 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_sparql_query",
+                        "description": "Execute a read-only SPARQL 1.1/1.2 query over the projected RDF memory graph. Supports SELECT, ASK, CONSTRUCT, DESCRIBE. Rejects SPARQL UPDATE and SERVICE by default. Returns { query_form, format, results, solution_count, truncated, timed_out }. Budgets: timeout_ms (default 250), max_solutions (1000), max_dataset_quads (250000), max_algebra_nodes (1000). Custom functions: ns:salience, ns:validAt, ns:isRetired.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string", "description": "SPARQL query string to execute." },
+                                "format": { "type": "string", "enum": ["json", "csv", "tsv"], "description": "Serialization format for SELECT results. Defaults to json." },
+                                "namespace": { "type": "string", "description": "The namespace to query against. Defaults to the configured namespace." },
+                                "include_retired": { "type": "boolean", "description": "Include retired memories. Defaults to false." },
+                                "include_archived": { "type": "boolean", "description": "Include archived memories. Defaults to false." }
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_task_intake",
                         "description": "Submit text for durable task intake. Runs M2 lexical detection to find task-shaped statements, creates an immutable receipt (source_kind, source_revision, source_digest), and spawns candidate(s) with review_state=pending. Returns receipt and candidates. Explicit zeros when no candidates.",
                         "inputSchema": {
@@ -937,6 +952,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_validate_canonical_rdf" => {
                             result_text = handle_validate_canonical_rdf(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_sparql_query" => {
+                            result_text = handle_sparql_query(&arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -2964,6 +2982,70 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
         }
         Ok(None) => serde_json::json!({"ok":false,"valid":false,"violations":["memory not found"]}).to_string(),
         Err(e) => serde_json::json!({"ok":false,"valid":false,"violations":[e.to_string()]}).to_string(),
+    }
+}
+
+async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    use crate::rdf::sparql::{execute_sparql_query};
+    use sparesults::QueryResultsFormat;
+    use std::collections::HashMap;
+
+    let query = match arguments.get("query").and_then(|v| v.as_str()) {
+        Some(q) => q.to_string(),
+        None => return serde_json::json!({"ok":false,"error":"query parameter required"}).to_string(),
+    };
+
+    let format = match arguments.get("format").and_then(|v| v.as_str()) {
+        Some("csv") => ResultFormat::Csv,
+        Some("tsv") => ResultFormat::Tsv,
+        _ => ResultFormat::Json,
+    };
+
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => "NeuroStrata".to_string(), // default namespace
+    };
+
+    let include_retired = arguments.get("include_retired").and_then(|v| v.as_bool()).unwrap_or(false);
+    let include_archived = arguments.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match execute_sparql_query(&query, &namespace, format, include_retired, include_archived) {
+        Ok((results, solution_count, truncated, timed_out)) => {
+            let query_form = if query.trim().to_uppercase().starts_with("ASK") {
+                "ask"
+            } else if query.trim().to_uppercase().starts_with("CONSTRUCT") {
+                "construct"
+            } else if query.trim().to_uppercase().starts_with("DESCRIBE") {
+                "describe"
+            } else {
+                "select"
+            };
+
+            let mut response = serde_json::json!({
+                "query_form": query_form,
+                "format": format.to_string().to_lowercase(),
+                "results": results,
+                "solution_count": solution_count,
+                "truncated": truncated,
+                "timed_out": timed_out,
+            });
+
+            // For ASK queries, the results is already JSON but let's ensure boolean format
+            if query_form == "ask" {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&results) {
+                    if let Some(boolean) = parsed.get("boolean") {
+                        response["results"] = serde_json::json!({ "boolean": boolean });
+                    }
+                }
+            }
+
+            serde_json::to_string(&response).unwrap_or_else(|e| {
+                serde_json::json!({"ok":false,"error":format!("serialization error: {}", e)}).to_string()
+            })
+        }
+        Err(e) => {
+            serde_json::json!({"ok":false,"error":e}).to_string()
+        }
     }
 }
 

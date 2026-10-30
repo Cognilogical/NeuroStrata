@@ -4,6 +4,7 @@ pub mod namespace;
 pub mod ontology;
 pub mod projection;
 pub mod shacl;
+pub mod sparql;
 pub mod reasoning;
 pub mod types;
 pub mod types_oxrdf;
