@@ -210,6 +210,69 @@ impl OntologyIndex {
             .push(parent.to_string());
     }
 
+    // New ontology mutators (2xe9 spec §5.1 / §11.4–11.6)
+    pub fn add_equivalent_class(&mut self, a: &str, b: &str) {
+        self.equivalent_class
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+        self.equivalent_class
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
+    }
+
+    pub fn add_equivalent_property(&mut self, a: &str, b: &str) {
+        self.equivalent_property
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+    }
+
+    pub fn add_inverse_of(&mut self, a: &str, b: &str) {
+        self.inverse_of
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+    }
+
+    pub fn add_transitive_property(&mut self, prop: &str) {
+        self.transitive_properties.insert(prop.to_string());
+    }
+
+    pub fn add_symmetric_property(&mut self, prop: &str) {
+        self.symmetric_properties.insert(prop.to_string());
+    }
+
+    pub fn add_broader(&mut self, narrow: &str, broad: &str) {
+        self.broader
+            .entry(narrow.to_string())
+            .or_default()
+            .insert(broad.to_string());
+        self.narrower
+            .entry(broad.to_string())
+            .or_default()
+            .insert(narrow.to_string());
+    }
+
+    pub fn add_exact_match(&mut self, a: &str, b: &str) {
+        self.exact_match
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+        self.exact_match
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
+    }
+
+    pub fn add_alt_label(&mut self, symbol: &str, label: &str) {
+        self.alt_labels
+            .entry(symbol.to_string())
+            .or_default()
+            .insert(label.to_string());
+    }
+
     // New methods for 2xe9 spec
     pub fn subclasses_of(&self, class: &str) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
@@ -298,7 +361,32 @@ impl OntologyIndex {
 
     pub fn aliases_for(&self, symbol: &str) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
-        // This would use the alias_map in a real implementation
+        if let Some(slug) = self.canonical_slug(symbol) {
+            out.insert(slug.clone());
+            if let Some(aliases) = self.alt_labels.get(&slug) {
+                for a in aliases {
+                    out.insert(a.clone());
+                }
+            }
+            // Also include aliases mapped via alias_map
+            if let Some(slug_from_alias) = self.alias_map.get(&symbol.to_lowercase()) {
+                out.insert(slug_from_alias.clone());
+            }
+        }
+        out
+    }
+
+    pub fn alt_labels_for(&self, symbol: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        if let Some(slug) = self.canonical_slug(symbol) {
+            if let Some(alt) = self.alt_labels.get(&slug) {
+                for a in alt { out.insert(a.clone()); }
+            }
+        }
+        // Direct lookup for symbols not yet registered as domain slugs
+        if let Some(alt) = self.alt_labels.get(symbol) {
+            for a in alt { out.insert(a.clone()); }
+        }
         out
     }
 
@@ -356,14 +444,21 @@ impl OntologyIndex {
     }
 
     pub fn closure_subclasses(&self, root: &str, budget: &QueryBudget) -> ClosureResult {
-        let mut result = ClosureResult { results: Vec::new(), evidence: Vec::new() };
+        let mut result = ClosureResult::default();
         let mut queue = VecDeque::new();
         let mut visited = BTreeSet::new();
+        let start = std::time::Instant::now();
 
         queue.push_back(root.to_string());
         visited.insert(root.to_string());
 
         while let Some(cur) = queue.pop_front() {
+            if start.elapsed().as_millis() as u64 > budget.max_ms {
+                break;
+            }
+            if result.results.len() >= budget.max_nodes {
+                break;
+            }
             if let Some(kids) = self.children.get(&cur) {
                 for k in kids {
                     if !visited.contains(k) {
@@ -379,9 +474,13 @@ impl OntologyIndex {
     }
 
     pub fn closure_governs(&self, root: &str, edges: &[String], budget: &QueryBudget) -> ClosureResult {
-        let mut result = ClosureResult { results: Vec::new(), evidence: Vec::new() };
-        let mut visited = BTreeSet::new();
+        let mut result = ClosureResult::default();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut frontier: VecDeque<String> = VecDeque::new();
+        let start = std::time::Instant::now();
+        let max_hops = 2usize;
 
+        // Hop 0: direct outgoing edges from root
         for edge in edges {
             let parts: Vec<String> = edge.split("::").map(|s| s.to_string()).collect();
             if parts.len() == 2 && parts[0] == root {
@@ -389,8 +488,36 @@ impl OntologyIndex {
                 if !visited.contains(target) {
                     visited.insert(target.clone());
                     result.results.push(target.clone());
+                    frontier.push_back(target.clone());
                 }
             }
+        }
+
+        // BFS for further bounded transitive hops (default 2 hops)
+        let mut current_hops = 1usize;
+        while current_hops < max_hops && start.elapsed().as_millis() as u64 <= budget.max_ms {
+            if result.results.len() >= budget.max_nodes {
+                break;
+            }
+            let frontier_len = frontier.len();
+            for _ in 0..frontier_len {
+                let node = match frontier.pop_front() {
+                    Some(n) => n,
+                    None => break,
+                };
+                for edge in edges {
+                    let parts: Vec<String> = edge.split("::").map(|s| s.to_string()).collect();
+                    if parts.len() == 2 && parts[0] == node {
+                        let target = &parts[1];
+                        if !visited.contains(target) {
+                            visited.insert(target.clone());
+                            result.results.push(target.clone());
+                            frontier.push_back(target.clone());
+                        }
+                    }
+                }
+            }
+            current_hops += 1;
         }
 
         result
