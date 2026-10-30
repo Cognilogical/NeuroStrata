@@ -1,5 +1,6 @@
 use uuid::Uuid;
-use crate::synaptic_mesh::record::{MeshRecord, Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
+use crate::synaptic_mesh::record::{MeshRecord, Relationship, Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
+use crate::synaptic_mesh::manifest::Trust;
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
@@ -2732,7 +2733,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
         }
     };
     let namespace = resolve_namespace(&store, &namespace).await;
-    let namespace = namespace.as_str();
+    let namespace_str = namespace.as_str();
     let profile = arguments.get("profile").and_then(|v| v.as_str()).unwrap_or("mesh");
     let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("n-quads");
     // N-Quads is the canonical serialization (spec §5.2d). Trig not yet supported.
@@ -2750,11 +2751,12 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
         None => return serde_json::json!({"ok":false,"error":"memory_id required for canonical RDF export"}).to_string(),
     };
 
-    match store.get(&namespace, &id_str).await {
+    match store.get(namespace_str, &id_str).await {
         Ok(Some((_, payload))) => {
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
             let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
+            let lifecycle_state_enum: LifecycleState = lifecycle_state.parse().unwrap_or(LifecycleState::Active);
             // created_at is required for deterministic canonical RDF (fail closed).
             let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
                 Some(t) => t.to_string(),
@@ -2782,6 +2784,22 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
 
+            // Convert trust string to Trust enum
+            let trust_enum = match trust {
+                "trusted" => Trust::Trusted,
+                "promoted" => Trust::Promoted,
+                _ => Trust::Untrusted,
+            };
+
+            // Convert rels (String,Uuid) to Vec<Relationship>
+            let mut rels_converted: Vec<Relationship> = Vec::new();
+            for (kind, target) in &rels {
+                if let Ok(target_uuid) = Uuid::parse_str(target) {
+                    let kind_str = if kind == "supersedes" { "supersedes" } else if kind == "references" { "references" } else { "references" };
+                    rels_converted.push(Relationship { kind: kind_str.to_string(), target: target_uuid });
+                }
+            }
+
             let proc_meta = meta.get("procedure_definition").and_then(|v| v.as_object()).cloned().unwrap_or_default();
             let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
             let initial_fires = proc_meta.get("remaining_fires_initial").and_then(|v| v.as_i64());
@@ -2789,7 +2807,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
             let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                &id_str, namespace, memory_type, lifecycle_state,
+                &id_str, namespace_str, memory_type, lifecycle_state,
                 &created_at, created_by,
                 superseded_by,
                 archived_at.as_deref(),
@@ -2798,14 +2816,25 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                 &rels, &update_id, origin_mesh_epoch, trust,
                 trigger, initial_fires, valid_to, rehearsal_script,
             );
-            serde_json::json!({
-                "ok":true,
-                "namespace":namespace,
-                "memory_id":id_str,
-                "format":format,
-                "canonical_hash":digest_str,
-                "quads":nquads_text,
-            }).to_string()
+            // Honor profile parameter: mesh = canonical N-Quads wire format; local = full MemoryPayload JSON.
+            match profile {
+                "mesh" => serde_json::json!({
+                    "ok":true,
+                    "namespace":namespace_str,
+                    "memory_id":id_str,
+                    "format":format,
+                    "canonical_hash":digest_str,
+                    "quads":nquads_text,
+                }).to_string(),
+                "local" => serde_json::json!({
+                    "ok":true,
+                    "namespace":namespace_str,
+                    "memory_id":id_str,
+                    "payload":payload,
+                    "canonical_hash":digest_str,
+                }).to_string(),
+                other => serde_json::json!({"ok":false,"error":format!("unsupported profile: {other}")}).to_string(),
+            }
         }
         Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
         Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
@@ -2814,7 +2843,8 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
 
 async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     use crate::rdf::dataset_canonical::{build_mesh_canonical_nquads, validate_canonical_rdf};
-    use crate::synaptic_mesh::record::MeshRecord;
+    use crate::synaptic_mesh::manifest::Trust;
+use crate::synaptic_mesh::record::{MeshRecord, Relationship};
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
@@ -2838,6 +2868,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
             let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
+            let lifecycle_state_enum: LifecycleState = lifecycle_state.parse().unwrap_or(LifecycleState::Active);
             // created_at is required for deterministic canonical RDF (fail closed).
             let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
                 Some(t) => t.to_string(),
@@ -2865,6 +2896,22 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
 
+            // Convert trust string to Trust enum
+            let trust_enum = match trust {
+                "trusted" => Trust::Trusted,
+                "promoted" => Trust::Promoted,
+                _ => Trust::Untrusted,
+            };
+
+            // Convert rels (String,Uuid) to Vec<Relationship>
+            let mut rels_converted: Vec<Relationship> = Vec::new();
+            for (kind, target) in &rels {
+                if let Ok(target_uuid) = Uuid::parse_str(target) {
+                    let kind_str = if kind == "supersedes" { "supersedes" } else if kind == "references" { "references" } else { "references" };
+                    rels_converted.push(Relationship { kind: kind_str.to_string(), target: target_uuid });
+                }
+            }
+
             let proc_meta = meta.get("procedure_definition").and_then(|v| v.as_object()).cloned().unwrap_or_default();
             let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
             let initial_fires = proc_meta.get("remaining_fires_initial").and_then(|v| v.as_i64());
@@ -2881,19 +2928,31 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
                 &rels, &update_id, origin_mesh_epoch, trust,
                 trigger, initial_fires, valid_to, rehearsal_script,
             );
+            let created_by_str = payload.user_id.clone();
+            let superseded_uuid = superseded_by.and_then(|s| Uuid::parse_str(s).ok());
+            let archived_dt = archived_at.as_ref().and_then(|t_str| chrono::DateTime::parse_from_rfc3339(t_str).ok().map(|dt| dt.with_timezone(&chrono::Utc)));
+            let tombstoned_dt = tombstoned_at.and_then(|t_str| chrono::DateTime::parse_from_rfc3339(t_str).ok().map(|dt| dt.with_timezone(&chrono::Utc)));
+            let lifecycle = Lifecycle {
+                state: lifecycle_state_enum,
+                created_at: chrono::DateTime::parse_from_rfc3339(&created_at).ok().map(|d| d.with_timezone(&chrono::Utc)).unwrap_or_else(|| chrono::Utc::now()),
+                created_by: created_by_str,
+                superseded_by: superseded_uuid,
+                archived_at: archived_dt,
+                tombstoned_at: tombstoned_dt,
+            };
             let record = MeshRecord {
                 schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
                 id,
                 namespace: namespace.to_string(),
                 memory_type: memory_type.to_string(),
-                lifecycle: Lifecycle { state: LifecycleState::Active, created_at: chrono::Utc::now(), created_by: payload.user_id.clone(), superseded_by: None, archived_at: None, tombstoned_at: None },
+                lifecycle,
                 content: serde_json::json!(content_str),
                 metadata: Value::Object(meta),
                 rdf: Some(RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str.clone(), quads: nquads_text.clone() }),
-                relationships: vec![],
+                relationships: rels_converted,
                 update_id: id,
                 origin_mesh_epoch,
-                trust: crate::synaptic_mesh::manifest::Trust::Untrusted,
+                trust: trust_enum,
             };
             let rdf_block = RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str, quads: nquads_text };
             match validate_canonical_rdf(&record, &rdf_block) {
