@@ -2724,31 +2724,47 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
-        None => return serde_json::json!({"ok":false,"error":"namespace missing"}).to_string(),
-    };
-    let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
-        Some(i) => i.to_string(),
-        None => return serde_json::json!({"ok":false,"error":"memory_id missing"}).to_string(),
-    };
-    let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("n-quads");
-
-    let id = match Uuid::parse_str(&memory_id) {
-        Ok(u) => u,
-        Err(e) => return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")}).to_string(),
+        None => {
+            if arguments.get("memory_id").is_some() {
+                return serde_json::json!({"ok":false,"error":"namespace required when memory_id given"}).to_string();
+            }
+            return serde_json::json!({"ok":false,"error":"namespace or memory_id required"}).to_string();
+        }
     };
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace = namespace.as_str();
-    let id_str = id.to_string();
+    let profile = arguments.get("profile").and_then(|v| v.as_str()).unwrap_or("mesh");
+    let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("n-quads");
+    // N-Quads is the canonical serialization (spec §5.2d). Trig not yet supported.
+    if format != "n-quads" {
+        return serde_json::json!({"ok":false,"error":format!("unsupported format: {format}")}).to_string();
+    }
+    let memory_id_opt: Option<String> = arguments.get("memory_id").and_then(|v| v.as_str()).map(String::from);
+
+    // memory_id is required for canonical N-Quads export (§5.2g).
+    let id_str = match &memory_id_opt {
+        Some(id) => match Uuid::parse_str(id) {
+            Ok(u) => u.to_string(),
+            Err(e) => return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")}).to_string(),
+        },
+        None => return serde_json::json!({"ok":false,"error":"memory_id required for canonical RDF export"}).to_string(),
+    };
 
     match store.get(&namespace, &id_str).await {
         Ok(Some((_, payload))) => {
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
             let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
-            let created_at = meta.get("created_at").and_then(|v| v.as_str()).unwrap_or(&chrono::Utc::now().to_rfc3339()).to_string();
+            // created_at is required for deterministic canonical RDF (fail closed).
+            let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => return serde_json::json!({"ok":false,"error":"created_at missing from memory metadata"}).to_string(),
+            };
             let created_by = &payload.user_id;
             let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
-            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap_or_else(|| chrono::Utc::now()).to_rfc3339());
+            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| {
+                chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339())
+            }).flatten();
             let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
             let content_str = payload.content.clone();
             let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
@@ -2762,7 +2778,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
                 for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
             }
-            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&memory_id).to_string();
+            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str).to_string();
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
 
@@ -2773,7 +2789,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
             let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                &memory_id, namespace, memory_type, lifecycle_state,
+                &id_str, namespace, memory_type, lifecycle_state,
                 &created_at, created_by,
                 superseded_by,
                 archived_at.as_deref(),
@@ -2785,7 +2801,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             serde_json::json!({
                 "ok":true,
                 "namespace":namespace,
-                "memory_id":memory_id,
+                "memory_id":id_str,
                 "format":format,
                 "canonical_hash":digest_str,
                 "quads":nquads_text,
@@ -2822,10 +2838,16 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
             let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
-            let created_at = meta.get("created_at").and_then(|v| v.as_str()).unwrap_or(&chrono::Utc::now().to_rfc3339()).to_string();
+            // created_at is required for deterministic canonical RDF (fail closed).
+            let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => return serde_json::json!({"ok":false,"error":"created_at missing from memory metadata"}).to_string(),
+            };
             let created_by = &payload.user_id;
             let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
-            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap_or_else(|| chrono::Utc::now()).to_rfc3339());
+            let archived_at = meta.get("archived_at").and_then(|v| v.as_i64()).map(|t| {
+                chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339())
+            }).flatten();
             let tombstoned_at = meta.get("tombstoned_at").and_then(|v| v.as_str());
             let content_str = payload.content.clone();
             let eligibility = meta.get("eligibility").and_then(|v| v.as_str());
@@ -2839,7 +2861,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
                 for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
             }
-            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&memory_id).to_string();
+            let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str).to_string();
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
 
@@ -2850,7 +2872,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
             let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
             let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                &memory_id, namespace, memory_type, lifecycle_state,
+                &id_str, namespace, memory_type, lifecycle_state,
                 &created_at, created_by,
                 superseded_by,
                 archived_at.as_deref(),
