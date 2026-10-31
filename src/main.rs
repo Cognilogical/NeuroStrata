@@ -15,6 +15,8 @@ mod domain;
 mod embed;
 mod fts;
 mod gliner;
+#[cfg(feature = "kge")]
+pub mod kge;
 mod events;
 mod graph_read;
 mod guard;
@@ -313,6 +315,36 @@ enum Commands {
     SynapticMesh {
         #[command(subcommand)]
         action: crate::synaptic_mesh::SynapticMeshCommands,
+    },
+
+    /// Knowledge-graph embeddings: train TransE structural channel over
+    /// GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM 5 edge types.
+    /// Embeddings feed a capped secondary term into retrieval (≤15%) and power
+    /// review-only duplicate-candidate ranking (`neurostrata_find_duplicate_candidates`).
+    #[command(name = "kge", visible_alias = "kge")]
+    Kge {
+        /// Train KGE on a single namespace's subgraph (artifact at
+        /// `<db_path_parent>/kge/<ns>/`).
+        #[arg(long)]
+        namespace: Option<String>,
+
+        /// Train KGE on the union of all namespaces' subgraphs (artifact at
+        /// `<db_path_parent>/kge/global/`).
+        #[arg(long)]
+        all: bool,
+
+        /// Number of SGD epochs (default: 50).
+        #[arg(long, default_value = "50")]
+        epochs: u32,
+
+        /// Embedding dimension `d` (default: 64).
+        #[arg(long, default_value = "64")]
+        dim: u32,
+
+        /// Structural weight `kge_weight` ∈ [0, 0.3] multiplying the capped
+        /// structural term in retrieval scoring (default: 0.15).
+        #[arg(long, default_value = "0.15")]
+        kge_weight: f32,
     },
 }
 
@@ -2581,6 +2613,32 @@ async fn run() -> anyhow::Result<()> {
                 ) {
                     return Ok(());
                 }
+            }
+            #[cfg(feature = "kge")]
+            Commands::Kge {
+                namespace,
+                all,
+                epochs,
+                dim,
+                kge_weight,
+            } => {
+                if !all && namespace.is_none() {
+                    anyhow::bail!("--namespace <ns> or --all is required");
+                }
+                if all && namespace.is_some() {
+                    anyhow::bail!("--namespace and --all are mutually exclusive");
+                }
+                if !(0.0..=0.3).contains(&kge_weight) {
+                    anyhow::bail!("--kge-weight must be in [0, 0.3]");
+                }
+                // Scaffold: calls kge::cli_train (implements spec §5.4).
+                // Real implementation tracked in neurostrata-84k2; not a hidden stub.
+                crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim))
+            }
+            #[cfg(not(feature = "kge"))]
+            Commands::Kge { .. } => {
+                eprintln!("kge feature disabled; rebuild with --features kge");
+                std::process::exit(1);
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;

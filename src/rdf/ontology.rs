@@ -657,9 +657,9 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
     }
 
     Ok(total)
-}
+    }
 
-        /// Validate a memory payload against loaded SHACL shapes.
+    /// Validate a memory payload against loaded SHACL shapes.
     /// Returns violations extracted from matching shapes; falls back to
     /// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
     pub fn shacl_validate(&self, payload: &MemoryPayload) -> Vec<ShaclViolation> {
@@ -798,4 +798,5 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
     pub fn shacl_shapes_loaded(&self) -> usize {
         self.shacl_shapes.len()
     }
+}
 }
