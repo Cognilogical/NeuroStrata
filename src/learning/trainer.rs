@@ -31,7 +31,6 @@ impl TrainingJobState {
             (GoldShadow, Promoted) | (GoldShadow, Failed(_)) => true,
             (Promoted, _) => false, // promoted is terminal
             (Failed(_), WaitingForData) => true, // retry from failed
-            (_, WaitingForData) => true,
             _ => false,
         }
     }
@@ -126,9 +125,11 @@ impl Trainer {
 
     /// Transition job state through the validated machine.
     /// Rejects invalid transitions (no fake progress).
-    pub fn transition(&self, state: TrainingJobState) -> Result<TrainingJobState> {
-        // No-op only when the state is terminal (Promoted / Failed with retry allowed)
-        Ok(state)
+    pub fn transition(&self, from: &TrainingJobState, to: TrainingJobState) -> Result<TrainingJobState> {
+        if !from.can_transit_to(&to) {
+            return Err(anyhow!("Invalid state transition: {:?} -> {:?}", from, to));
+        }
+        Ok(to)
     }
 
     /// Evaluate a candidate model using real evaluation reports.
@@ -205,13 +206,16 @@ mod tests {
     }
 
     #[test]
-    fn transition_no_fake_success() {
+    fn transition_validates_state_machine() {
         let t = Trainer::new(Arc::new(LocalTrainingRuntime {
             python: PathBuf::from("python"),
             laya_train: PathBuf::from("laya-train"),
             model_cache: PathBuf::from(".cache/laya"),
         }));
-        assert_eq!(t.transition(TrainingJobState::WaitingForData).unwrap(), TrainingJobState::WaitingForData);
+        assert_eq!(t.transition(&TrainingJobState::WaitingForData, TrainingJobState::Training).unwrap(), TrainingJobState::Training);
+        assert_eq!(t.transition(&TrainingJobState::Training, TrainingJobState::ProxyShadow).unwrap(), TrainingJobState::ProxyShadow);
+        assert!(t.transition(&TrainingJobState::Promoted, TrainingJobState::Training).is_err()); // terminal
+        assert!(t.transition(&TrainingJobState::WaitingForData, TrainingJobState::Promoted).is_err()); // invalid
     }
 
     #[test]
