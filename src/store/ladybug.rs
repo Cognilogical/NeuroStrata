@@ -1821,6 +1821,16 @@ fn create_missing_edges(
 }
 
 impl LadybugStore {
+    /// Public wrapper for internal list — used by SPARQL projection.
+    pub async fn list_memories(
+        &self,
+        namespace: &str,
+        user_id: Option<&str>,
+        memory_type: Option<&str>,
+    ) -> Result<Vec<SearchResult>> {
+        self.list(namespace, user_id, memory_type).await
+    }
+
     pub async fn active_generations_public(&self, namespace: &str) -> std::collections::HashSet<u64> {
         let namespace = namespace.to_string();
         self.with_conn(move |conn| Ok(crate::store::ladybug::active_generations_of(conn, &namespace)))

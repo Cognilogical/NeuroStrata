@@ -2988,7 +2988,6 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
 async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     use crate::rdf::sparql::{execute_sparql_query};
     use sparesults::QueryResultsFormat;
-    use std::collections::HashMap;
 
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
         Some(q) => q.to_string(),
@@ -3003,13 +3002,19 @@ async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> 
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
-        None => "NeuroStrata".to_string(), // default namespace
+        None => "NeuroStrata".to_string(),
     };
 
     let include_retired = arguments.get("include_retired").and_then(|v| v.as_bool()).unwrap_or(false);
     let include_archived = arguments.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    match execute_sparql_query(&query, &namespace, format, include_retired, include_archived) {
+    // Downcast to LadybugStore for SPARQL projection
+    let ladybug_store = match crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::ladybug::LadybugStore>() {
+        Some(ls) => ls,
+        None => return serde_json::json!({"ok":false,"error":"SPARQL requires LadybugStore backend"}).to_string(),
+    };
+
+    match execute_sparql_query(&query, &namespace, format, include_retired, include_archived, ladybug_store).await {
         Ok((results, solution_count, truncated, timed_out)) => {
             let query_form = if query.trim().to_uppercase().starts_with("ASK") {
                 "ask"
