@@ -331,7 +331,20 @@ impl LearningRuntimeManager {
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
-        RuntimeState::Unavailable
+        let runtime = match self.runtime() {
+            Ok(r) => r,
+            Err(_) => return RuntimeState::Unavailable,
+        };
+        // Check if laya-train binary is available at the expected location
+        let laya_train_available = runtime.laya_train.exists();
+        let python_available = runtime.python.exists();
+        let model_cache_ok = runtime.model_cache.exists();
+
+        if laya_train_available && python_available && model_cache_ok {
+            RuntimeState::Ready
+        } else {
+            RuntimeState::Provisioning
+        }
     }
 
     /// Return the local training runtime configuration.
