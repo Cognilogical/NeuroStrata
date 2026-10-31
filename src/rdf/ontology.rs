@@ -1,6 +1,9 @@
 use crate::domain;
 use crate::registry;
+use crate::rdf::shacl::{ShaclViolation, validate_memory};
+use crate::traits::MemoryPayload;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -25,9 +28,23 @@ pub struct DomainEntry {
     pub concept_iri: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShaclShapeDef {
+    pub shape_iri: String,
+    pub target_class: Option<String>,
+    pub property_constraints: Vec<(String, Option<String>)>,
+    pub min_counts: BTreeMap<String, u32>,
+    pub max_counts: BTreeMap<String, u32>,
+    pub datatypes: BTreeMap<String, String>,
+    pub in_values: BTreeMap<String, Vec<String>>,
+    pub node_kinds: BTreeMap<String, String>,
+    pub messages: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OntologyIndex {
     pub domains: Vec<DomainEntry>,
+    pub shacl_shapes: Vec<ShaclShapeDef>,
     children: BTreeMap<String, Vec<String>>,
     alias_map: BTreeMap<String, String>,
     sub_properties: BTreeMap<String, Vec<String>>,
@@ -146,6 +163,7 @@ impl OntologyIndex {
             exact_match: BTreeMap::new(),
             broader: BTreeMap::new(),
             narrower: BTreeMap::new(),
+            shacl_shapes: Vec::new(),
         }
     }
 
@@ -521,5 +539,263 @@ impl OntologyIndex {
         }
 
         result
+    }
+
+pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize> {
+    let ttl_files: Vec<PathBuf> = std::fs::read_dir(schemas_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ttl"))
+        .map(|e| e.path())
+        .collect();
+
+    let mut total = 0usize;
+    for path in ttl_files {
+        let content = std::fs::read_to_string(&path)?;
+        let parser = oxttl::TurtleParser::new();
+        let triples = parser.feed(content.as_bytes())?;
+        while let Some(Ok(q)) = parser.parse_next() {
+        
+        let mut cur_shape: Option<ShaclShapeDef> = None;
+        for q in triples {
+            let s = q.subject().to_string();
+            let p = q.predicate().to_string();
+            let o = q.object().to_string();
+
+            // sh:NodeShape declaration
+            if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                && o == "http://www.w3.org/ns/shacl#NodeShape" {
+                if let Some(sh) = cur_shape.take() {
+                    self.shacl_shapes.push(sh);
+                    total += 1;
+                }
+                cur_shape = Some(ShaclShapeDef {
+                    shape_iri: s.clone(),
+                    ..Default::default()
+                });
+            }
+
+            // sh:targetClass
+            if p == "http://www.w3.org/ns/shacl#targetClass" {
+                if let Some(sh) = cur_shape.as_mut() {
+                    sh.target_class = Some(o.clone());
+                }
+            }
+
+            // sh:message
+            if p == "http://www.w3.org/ns/shacl#message" {
+                if let Some(sh) = cur_shape.as_mut() {
+                    sh.messages.insert(o.clone(), o.clone());
+                }
+            }
+
+            // sh:property
+            if p == "http://www.w3.org/ns/shacl#property" {
+                if let Some(sh) = cur_shape.as_mut() {
+                    sh.property_constraints.push((o.clone(), None));
+                }
+            }
+
+            // sh:path
+            if p == "http://www.w3.org/ns/shacl#path" {
+                if let Some(last) = cur_shape.as_mut().and_then(|sh| sh.property_constraints.last_mut()) {
+                    last.0 = o.clone();
+                }
+            }
+
+            // sh:minCount
+            if p == "http://www.w3.org/ns/shacl#minCount" {
+                let val: u32 = o.parse().unwrap_or(0);
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.min_counts.insert(last.0.clone(), val);
+                    }
+                }
+            }
+
+            // sh:maxCount
+            if p == "http://www.w3.org/ns/shacl#maxCount" {
+                let val: u32 = o.parse().unwrap_or(u32::MAX);
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.max_counts.insert(last.0.clone(), val);
+                    }
+                }
+            }
+
+            // sh:datatype
+            if p == "http://www.w3.org/ns/shacl#datatype" {
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.datatypes.insert(last.0.clone(), o.clone());
+                    }
+                }
+            }
+
+            // sh:nodeKind
+            if p == "http://www.w3.org/ns/shacl#nodeKind" {
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.node_kinds.insert(last.0.clone(), o.clone());
+                    }
+                }
+            }
+
+            // sh:in
+            if p == "http://www.w3.org/ns/shacl#in" {
+                if let Some(shape_ref) = cur_shape.as_mut() {
+                    if let Some(last) = shape_ref.property_constraints.last_mut() {
+                        shape_ref.in_values.insert(last.0.clone(), Vec::new());
+                    }
+                }
+            }
+        }
+
+        if let Some(sh) = cur_shape.take() {
+            self.shacl_shapes.push(sh);
+            total += 1;
+        }
+    }
+
+    Ok(total)
+}
+
+        /// Validate a memory payload against loaded SHACL shapes.
+    /// Returns violations extracted from matching shapes; falls back to
+    /// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
+    pub fn shacl_validate(&self, payload: &MemoryPayload) -> Vec<ShaclViolation> {
+        if self.shacl_shapes.is_empty() {
+            return crate::rdf::shacl::validate_memory(payload);
+        }
+
+        // Evaluate each matching shape against payload metadata
+        let mut violations = Vec::new();
+        let memory_type = payload.memory_type.clone();
+
+        for shape in &self.shacl_shapes {
+            // Match shape to memory_type via targetClass (ns:Rule, ns:Procedure, ns:Task, etc.)
+            let shape_match = shape.target_class.as_deref().map_or(false, |tc| {
+                memory_type == tc.split('/').last().unwrap_or(&tc)
+                    || memory_type.to_lowercase() == tc.split('/').last().unwrap_or(&tc).to_lowercase()
+            });
+
+            if !shape_match && shape.target_class.is_some() {
+                continue; // shape not applicable to this memory type
+            }
+
+            // Only evaluate MemoryShape (targetClass = Memory) or matching type shape
+            if shape.target_class.is_none() {
+                // MemoryShape — core validation applies to all memories
+                for (path, _) in &shape.property_constraints {
+                    let path_violations = self.validate_path(payload, path, shape);
+                    violations.extend(path_violations);
+                }
+            }
+        }
+
+        violations
+    }
+
+    fn validate_path(&self, payload: &MemoryPayload, path: &str, shape: &ShaclShapeDef) -> Vec<ShaclViolation> {
+        let mut out = Vec::new();
+        let value = match payload.metadata.get(path.trim_start_matches("ns:")) {
+            Some(v) => v.clone(),
+            None => {
+                // Check min_count
+                if let Some(min) = shape.min_counts.get(path) {
+                    if *min > 0 {
+                        out.push(ShaclViolation {
+                            field: path.to_string(),
+                            why: format!("{} is required (minCount {})", path, min),
+                        });
+                    }
+                }
+                return out;
+            }
+        };
+
+        // max_count checks (object vs array)
+        if let Some(max) = shape.max_counts.get(path) {
+            match &value {
+                serde_json::Value::Array(arr) => {
+                    if arr.len() > *max as usize {
+                        out.push(ShaclViolation {
+                            field: path.to_string(),
+                            why: format!("{} exceeds maxCount {}", path, max),
+                        });
+                    }
+                }
+                _ if *max == 0 => {}
+                _ => {}
+            }
+        }
+
+        // datatype check
+        if let Some(dt) = shape.datatypes.get(path) {
+            match value {
+                serde_json::Value::String(_) => {
+                    if dt.contains("string") {
+                        // ok
+                    } else {
+                        out.push(ShaclViolation {
+                            field: path.to_string(),
+                            why: format!("{} must be {}", path, dt),
+                        });
+                    }
+                }
+                serde_json::Value::Number(n) => {
+                    if dt.contains("integer") || dt.contains("decimal") {
+                        // ok
+                    } else {
+                        out.push(ShaclViolation {
+                            field: path.to_string(),
+                            why: format!("{} must be {}", path, dt),
+                        });
+                    }
+                }
+                serde_json::Value::Object(_) if dt.contains("BlankNodeOrIRI") || dt.contains("BlankNode") => {
+                    // ok
+                }
+                serde_json::Value::Null => {
+                    if dt.contains("BlankNodeOrIRI") {
+                        // ok, null allowed for BlankNodeOrIRI
+                    } else {
+                        out.push(ShaclViolation {
+                            field: path.to_string(),
+                            why: format!("{} must be {}", path, dt),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // in values check
+        if let Some(allowed) = shape.in_values.get(path) {
+            if let Some(s) = value.as_str() {
+                if !allowed.iter().any(|a| a == s) {
+                    out.push(ShaclViolation {
+                        field: path.to_string(),
+                        why: format!("{} value '{}' not in allowed values {:?}", path, s, allowed),
+                    });
+                }
+            } else if let Some(arr) = value.as_array() {
+                for item in arr {
+                    if let Some(item_s) = item.as_str() {
+                        if !allowed.iter().any(|a| a == item_s) {
+                            out.push(ShaclViolation {
+                                field: path.to_string(),
+                                why: format!("{} value '{}' not in allowed values {:?}", path, item_s, allowed),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    pub fn shacl_shapes_loaded(&self) -> usize {
+        self.shacl_shapes.len()
     }
 }
