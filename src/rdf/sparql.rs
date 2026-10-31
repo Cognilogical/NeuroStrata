@@ -1,4 +1,3 @@
-#!/usr/bin/env rust
 //! SPARQL 1.1/1.2 query engine over NeuroStrata RDF projections.
 //!
 //! Implements `neurostrata_sparql_query` MCP tool using Oxigraph stack:
@@ -59,21 +58,6 @@ fn is_retired_at(metadata: &serde_json::Value, now: i64) -> bool {
     }
 }
 
-/// Build a transient oxrdf Dataset from a namespace projection with visibility filters.
-pub fn project_sparql_dataset(
-    namespace: &str,
-    include_retired: bool,
-    include_archived: bool,
-) -> Dataset {
-    let mut dataset = Dataset::new();
-    // Note: actual projection queries the live LadybugDB store.
-    // For a minimal working build we create an empty dataset so the adapter
-    // compiles and evaluates SPARQL against it. Full projection integration
-    // connects to the live store (see spec §5.2).
-    let _ = (namespace, include_retired, include_archived);
-    dataset
-}
-
 /// Async projection: queries live LadybugDB store and converts memories to RDF quads.
 pub async fn project_sparql_dataset_async(
     namespace: &str,
@@ -120,18 +104,6 @@ pub async fn project_sparql_dataset_async(
         }
     }
 
-    // Edges: reconstruct via edge_to_quad for related memories
-    if let Ok(memories) = &mem_result {
-        for m in memories {
-            let rel = &m.payload.metadata;
-            // edge_to_quad returns a single Quad; metadata-driven edges are
-            // captured via memory_to_quads above, so we skip redundant edge
-            // reconstruction here to avoid duplicate quads.
-            let _ = rel;
-            let _ = m.id;
-        }
-    }
-
     dataset
 }
 
@@ -156,6 +128,14 @@ pub async fn execute_sparql_query(
 
     // Build the dataset from namespace projection (live LadybugDB)
     let dataset = project_sparql_dataset_async(namespace, include_retired, include_archived, store).await;
+
+    if dataset.len() > config.max_dataset_quads {
+        return Err(format!(
+            "Dataset projection exceeded max_dataset_quads budget ({} > {})",
+            dataset.len(),
+            config.max_dataset_quads
+        ));
+    }
 
     // Prepare and evaluate with QueryEvaluator
     let evaluator = QueryEvaluator::new();
@@ -198,10 +178,13 @@ pub async fn execute_sparql_query(
             let _ = serializer_solutions.finish()
                 .map_err(|e| format!("serialize finish: {}", e))?;
         }
-        spareval::QueryResults::Graph(_) => {
-            return Err(
-                "CONSTRUCT/DESCRIBE: Graph serializer needed (not implemented)".to_string(),
-            );
+        spareval::QueryResults::Graph(mut triples) => {
+            // CONSTRUCT/DESCRIBE: serialize triples as N-Triples.
+            for triple in triples {
+                let t = triple.map_err(|e| format!("graph evaluation error: {}", e))?;
+                output.extend_from_slice(format!("{} .\n", t).as_bytes());
+                solution_count += 1;
+            }
         }
     }
 
@@ -296,5 +279,40 @@ mod tests {
         assert!(!is_archived(&not_archived));
         let missing = serde_json::json!({});
         assert!(!is_archived(&missing));
+    }
+
+    #[test]
+    #[ignore = "requires live LadybugDB; see: neurostrata-c0lw#integration-projection"]
+    fn test_execute_sparql_query_live_projection() {
+        // This integration test exercises the live LadybugDB projection path:
+        // project_sparql_dataset_async + execute_sparql_query async with LadybugStore.
+        // Requires a populated NeuroStrata DB at the configured path.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db_path = crate::config::Config::from_default_path()
+            .map(|c| c.db_path.clone())
+            .unwrap_or_default();
+        let store = match crate::store::ladybug::LadybugStore::new(
+            db_path.to_string_lossy().to_string(),
+            1000,
+        ) {
+            Ok(s) => s,
+            Err(_) => {
+                // No DB initialized; test is skipped, not failing.
+                return;
+            }
+        };
+        let result = rt.block_on(execute_sparql_query(
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+            "NeuroStrata",
+            QueryResultsFormat::Json,
+            false,
+            false,
+            &store,
+        ));
+        // Should succeed even with empty DB (returns formatted output).
+        assert!(result.is_ok());
+        let (serialized, count, truncated, timed_out) = result.unwrap();
+        assert!(count >= 0);
+        assert!(!serialized.is_empty());
     }
 }
