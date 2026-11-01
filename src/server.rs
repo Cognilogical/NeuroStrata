@@ -4835,6 +4835,11 @@ async fn handle_rebuild_communities(
 
     let unassigned_nodes = node_ids.len().saturating_sub(nodes_assigned);
 
+    // Also rebuild the on-disk Tantivy BM25 lexical index for the namespace.
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        let _ = ls.rebuild_tantivy_lexical(Some(namespace)).await;
+    }
+
     // Modularity is not currently exposed by detect_communities; return 0.0 as placeholder.
     let modularity = 0.0;
 

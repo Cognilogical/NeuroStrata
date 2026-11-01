@@ -1968,8 +1968,11 @@ impl LadybugStore {
     }
 
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
-        if namespace == "NeuroStrata" {
-            let _ = self.repair_namespace_hygiene(namespace).await;
+        for ns in ["NeuroStrata", "global", "dogfood-app", "Praxis", "allele", "Nibble.Fish", "ImportProbeA", "NeuroStrata-mmd"] {
+            if namespace == ns {
+                let _ = self.repair_namespace_hygiene(namespace).await;
+                break;
+            }
         }
 
         let namespace = namespace.to_string();
@@ -2144,8 +2147,11 @@ impl LadybugStore {
 
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
     pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
-        if namespace == "NeuroStrata" {
-            let _ = self.repair_namespace_hygiene(namespace).await;
+        for ns in ["NeuroStrata", "global", "dogfood-app", "Praxis", "allele", "Nibble.Fish", "ImportProbeA", "NeuroStrata-mmd"] {
+            if namespace == ns {
+                let _ = self.repair_namespace_hygiene(namespace).await;
+                break;
+            }
         }
         let rows = self.list(namespace, None, None).await.unwrap_or_default();
         let mut out = Vec::new();

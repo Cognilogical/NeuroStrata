@@ -214,6 +214,14 @@ mod tests {
         let mut r2 = make("r2", "rule", "Always use absolute file paths", serde_json::json!({"location":"AGENTS.md"}));
         r2.payload.location = "AGENTS.md".to_string();
         assert!(detect_conflicts(&[r1, r2]).is_empty());
+        // Unrelated rules sharing broad topology anchor (component+target_system) but no topic overlap -> no conflict
+        let u1 = make("u1", "rule", "Never expose internal tokens", serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}));
+        let u2 = make("u2", "rule", "Always validate JSON schema inputs", serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}));
+        assert!(detect_conflicts(&[u1, u2]).is_empty());
+        // Same topic + topology anchor with opposing negation -> conflict
+        let s1 = make("s1", "rule", "Never cache auth tokens in server", serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}));
+        let s2 = make("s2", "rule", "Always cache auth tokens in server", serde_json::json!({"topology":{"component":"server","target_system":"mcp"}}));
+        assert!(!detect_conflicts(&[s1, s2]).is_empty());
     }
 
     #[test]
@@ -499,7 +507,7 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
                 }
             }
             // Opposite polarity for rules governing same target (topology or location with topic overlap).
-            if (same_topo_anchor || (same_loc && sim >= 0.35)) && neg_opposition {
+            if (same_topo_anchor || same_loc) && sim >= 0.35 && neg_opposition {
                 // only flag if at least one is a rule
                 if a.payload.memory_type == "rule" || b.payload.memory_type == "rule" {
                     flag = true;
