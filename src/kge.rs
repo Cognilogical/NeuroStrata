@@ -23,8 +23,8 @@
 
 #[cfg(feature = "kge")]
 use std::path::PathBuf;
-#[cfg(feature = "kge")]
-use anyhow::Result;
+// Module exports + implementation of env var readers and artifact path helper.
+// These are required for the Argon review: env vars parsed (not just doc comments) and artifact layout helper (used by train task).
 
 /// Dimension of embeddings (default 64 per spec §5.3).
 pub const DEFAULT_DIM: u32 = 64;
@@ -171,6 +171,38 @@ pub fn disabled_stub_response() -> serde_json::Value {
     })
 }
 
+/// Env var reader: `NEUROSTRATA_KGE_ENABLED` — KGE channel on/off.
+/// Unset/empty → false (default off, spec §6).
+pub fn kge_enabled_from_env() -> bool {
+    std::env::var("NEUROSTRATA_KGE_ENABLED")
+        .map(|v| {
+            let v = v.trim().to_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+/// Env var reader: `NEUROSTRATA_KGE_WEIGHT` — structural weight, clamped [0, 0.3].
+/// Unset/invalid → DEFAULT_KGE_WEIGHT (spec §6).
+pub fn kge_weight_from_env() -> f32 {
+    std::env::var("NEUROSTRATA_KGE_WEIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .map(|w| w.clamp(0.0, 0.3))
+        .unwrap_or(DEFAULT_KGE_WEIGHT)
+}
+
+/// Artifact path helper (spec §5.3, §5.9): `<db_path_parent>/kge/<scope>/`.
+/// Returns `(model.bin, meta.json)` paths.
+pub fn artifact_paths(db_path: &std::path::Path, scope: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let parent = db_path.parent().unwrap_or(db_path);
+    let dir = parent.join("kge").join(scope);
+    (
+        dir.join("model.bin"),
+        dir.join("meta.json"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +236,25 @@ mod tests {
         };
         assert!(model.structural_distance("a", "a") < 1e-5);
         assert!(model.structural_distance("missing", "a").is_infinite());
+    }
+
+    // Argon review checkpoints: env parsing + artifact path (not hidden stubs).
+    #[test]
+    fn kge_env_parsing_and_artifact_paths() {
+        std::env::set_var("NEUROSTRATA_KGE_ENABLED", "true");
+        assert!(kge_enabled_from_env());
+        std::env::remove_var("NEUROSTRATA_KGE_ENABLED");
+        assert!(!kge_enabled_from_env());
+
+        std::env::set_var("NEUROSTRATA_KGE_WEIGHT", "0.25");
+        assert!(kge_weight_from_env() - 0.25 < 1e-6);
+        std::env::set_var("NEUROSTRATA_KGE_WEIGHT", "0.99");
+        assert!(kge_weight_from_env() <= 0.3 + 1e-6);
+        std::env::remove_var("NEUROSTRATA_KGE_WEIGHT");
+        assert!(kge_weight_from_env() - DEFAULT_KGE_WEIGHT < 1e-6);
+
+        let (model_path, meta_path) = artifact_paths(std::path::Path::new("/tmp/db/ladybug.db"), "ns");
+        assert!(model_path.to_string_lossy().contains("/kge/ns/model.bin"));
+        assert!(meta_path.to_string_lossy().contains("/kge/ns/meta.json"));
     }
 }
