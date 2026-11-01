@@ -121,9 +121,12 @@ impl JudgmentProvider for LayaOnnxProvider {
     /// Returns actual duplicate judgments using ONNX inference when available.
     async fn judge_duplicates(
         &self,
-        new_memory: &MemoryPayload,
+        _new_memory: &MemoryPayload,
         candidates: &[SearchResult],
     ) -> Result<Vec<DuplicateJudgment>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
         // Inference runs inside spawn_blocking under the semaphore; the permit
         // is acquired first so concurrent requests are bounded.
         let _permit = self.inference_semaphore.acquire().await.unwrap();
@@ -138,15 +141,10 @@ impl JudgmentProvider for LayaOnnxProvider {
     /// Health check - verify the provider is operational.
     /// Reports true when gliner feature is enabled and inference session is loaded.
     async fn health_check(&self) -> Result<bool> {
-        #[cfg(feature = "gliner")]
         {
             let is_healthy = self.inference_session().is_some() &&
                            self.state() == crate::judgment::RuntimeState::Ready;
             Ok(is_healthy)
-        }
-        #[cfg(not(feature = "gliner"))]
-        {
-            Ok(false)
         }
     }
 
@@ -190,15 +188,9 @@ mod tests {
                 evidence: None,
             };
             let res = p.judge_duplicates(&mem, &[cand]).await;
-            #[cfg(feature = "gliner")]
             {
                 // With gliner feature, session fails on fake model, so error expected
                 assert!(res.is_err() || res.unwrap().is_empty());
-            }
-            #[cfg(not(feature = "gliner"))]
-            {
-                assert!(res.is_err());
-                assert!(res.unwrap_err().to_string().contains("not implemented"));
             }
             // candidates empty -> Ok(empty)
             let res2 = p.judge_duplicates(&mem, &[]).await;
@@ -209,7 +201,6 @@ mod tests {
 
     #[tokio::test]
     async fn laya_health_check_reflects_session() {
-        #[cfg(feature = "gliner")]
         {
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
             let dir = std::env::temp_dir().join("ns-laya-health-check");
@@ -224,24 +215,10 @@ mod tests {
             assert!(!p.health_check().await.unwrap());
             let _ = std::fs::remove_dir_all(&dir);
         }
-        #[cfg(not(feature = "gliner"))]
-        {
-            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-            let dir = std::env::temp_dir().join("ns-laya-no-feature");
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let manifest = serde_json::json!({"embedder_id": "laya", "model_version": "v1"});
-            std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
-            std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
-            let p = LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
-            assert!(!p.health_check().await.unwrap());
-            let _ = std::fs::remove_dir_all(&dir);
-        }
     }
 
     #[tokio::test]
     async fn laya_ensure_ready_reports_ready() {
-        #[cfg(feature = "gliner")]
         {
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
             let dir = std::env::temp_dir().join("ns-laya-ready");
@@ -253,10 +230,6 @@ mod tests {
             let p = LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
             assert_eq!(p.state(), RuntimeState::Unavailable); // fake model fails session creation
             let _ = std::fs::remove_dir_all(&dir);
-        }
-        #[cfg(not(feature = "gliner"))]
-        {
-            assert_eq!(RuntimeState::Unavailable, RuntimeState::Unavailable);
         }
     }
 }

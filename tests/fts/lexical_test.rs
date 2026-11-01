@@ -243,6 +243,6 @@ fn domain_filter_falls_back_and_reports_the_skip() {
 fn field_weights_are_the_documented_defaults() {
     let index = LexicalIndex::new();
     assert_eq!(index.namespaces.len(), 0);
-    assert_eq!(fts::DEFAULT_FIELD_WEIGHTS, [1.0, 2.0, 1.5]);
+    assert_eq!(fts::DEFAULT_FIELD_WEIGHTS, [1.0, 2.0, 1.5, 3.0, 0.5]);
     assert_eq!(Field::Content, Field::Content);
 }

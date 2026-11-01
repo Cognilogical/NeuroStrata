@@ -194,22 +194,22 @@ pub fn quads_to_legacy(quads: &[Quad]) -> Vec<super::types::Quad> {
     
     quads.iter().map(|q| {
         let subject = match &q.subject {
-            NamedOrBlankNode::NamedNode(nn) => nn.to_string(),
+            NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
             NamedOrBlankNode::BlankNode(bn) => format!("_:{}", bn),
         };
-        let predicate = q.predicate.to_string();
+        let predicate = q.predicate.as_str().to_string();
         let object = match &q.object {
-            Term::NamedNode(nn) => QuadObject::Iri(nn.to_string()),
+            Term::NamedNode(nn) => QuadObject::Iri(nn.as_str().to_string()),
             Term::Literal(lit) => QuadObject::Literal {
                 value: lit.value().to_string(),
-                datatype: Some(lit.datatype().to_string()),
+                datatype: Some(lit.datatype().as_str().to_string()),
                 language: lit.language().map(|lang| lang.to_string()),
             },
             Term::BlankNode(bn) => QuadObject::Iri(format!("_:{}", bn)),
             Term::Triple(_) => QuadObject::Iri("urn:neurostrata:triple".to_string()),
         };
         let graph = match &q.graph_name {
-            GraphName::NamedNode(gn) => Some(gn.to_string()),
+            GraphName::NamedNode(gn) => Some(gn.as_str().to_string()),
             GraphName::BlankNode(bg) => Some(format!("_:{}", bg)),
             GraphName::DefaultGraph => None,
         };
@@ -273,22 +273,22 @@ mod tests {
         let subj = format!("urn:neurostrata:memory:m1");
         assert!(qs.iter().all(|q| {
             match &q.subject {
-                NamedOrBlankNode::NamedNode(nn) => nn.to_string() == subj,
+                NamedOrBlankNode::NamedNode(nn) => nn.as_str() == subj,
                 _ => false,
             }
         }));
         
         // Should have conceptIri as predicate with IRI object
         assert!(qs.iter().any(|q| {
-            q.predicate.to_string() == "urn:neurostrata:ns#conceptIri" &&
-            matches!(&q.object, Term::NamedNode(nn) if nn.to_string() == "urn:example:foo")
+            q.predicate.as_str() == "urn:neurostrata:ns#conceptIri" &&
+            matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:example:foo")
         }));
         
         // Two memories sharing one concept keep distinct subjects.
         let qs2 = memory_to_quads("m2", &p, "ns", Tier::Domain, 0);
         assert!(qs2.iter().all(|q| {
             match &q.subject {
-                NamedOrBlankNode::NamedNode(nn) => nn.to_string() == format!("urn:neurostrata:memory:m2"),
+                NamedOrBlankNode::NamedNode(nn) => nn.as_str() == format!("urn:neurostrata:memory:m2"),
                 _ => false,
             }
         }));
@@ -298,7 +298,7 @@ mod tests {
     fn edge_projects_relation() {
         let q = edge_to_quad("a", "GOVERNS", "b", None, Some(GraphName::DefaultGraph));
         assert_eq!(q.predicate, NamedNode::new_unchecked("urn:neurostrata:ns#governs"));
-        assert!(matches!(&q.object, Term::NamedNode(nn) if nn.to_string() == "urn:neurostrata:memory:b"));
+        assert!(matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:b"));
     }
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
         let rows = vec![("m1".to_string(), payload())];
         let edges = vec![("m1".to_string(), "GOVERNS".to_string(), "m2".to_string(), None)];
         let qs = rows_to_quads(&rows, "ns", Tier::Domain, 0, &edges);
-        assert!(qs.iter().any(|q| q.predicate.to_string().ends_with("#governs")));
+        assert!(qs.iter().any(|q| q.predicate.as_str().ends_with("#governs")));
     }
 
     #[test]

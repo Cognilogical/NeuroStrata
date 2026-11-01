@@ -156,15 +156,15 @@ impl OxRdfBridge {
         use crate::rdf::types::{Quad as NSQuad, QuadObject, Tier};
 
         let subject = match &quad.inner.subject {
-            NamedOrBlankNode::NamedNode(nn) => nn.to_string(),
+            NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
             NamedOrBlankNode::BlankNode(bn) => format!("_:{}", bn),
         };
-        let predicate = quad.inner.predicate.to_string();
+        let predicate = quad.inner.predicate.as_str().to_string();
         let object = match &quad.inner.object {
-            oxrdf::Term::NamedNode(nn) => QuadObject::Iri(nn.to_string()),
+            oxrdf::Term::NamedNode(nn) => QuadObject::Iri(nn.as_str().to_string()),
             oxrdf::Term::Literal(lit) => QuadObject::Literal {
                 value: lit.value().to_string(),
-                datatype: Some(lit.datatype().to_string()),
+                datatype: Some(lit.datatype().as_str().to_string()),
                 language: lit.language().map(|lang| lang.to_string()),
             },
             oxrdf::Term::BlankNode(bn) => QuadObject::Iri(format!("_:{}", bn)),
@@ -173,7 +173,7 @@ impl OxRdfBridge {
             },
         };
         let graph = match &quad.inner.graph_name {
-            GraphName::NamedNode(gn) => Some(gn.to_string()),
+            GraphName::NamedNode(gn) => Some(gn.as_str().to_string()),
             GraphName::BlankNode(bg) => Some(format!("_:{}", bg)),
             GraphName::DefaultGraph => None,
         };

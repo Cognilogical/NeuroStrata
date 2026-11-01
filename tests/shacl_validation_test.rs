@@ -6,15 +6,34 @@
 //! - Returns ShaclViolation objects without rejecting writes
 //! - Implements all constraints from the approved design
 //!
-//! Note: Integration test uses #[path = "../../src/rdf/shacl.rs"] since this
+//! Note: Integration test uses #[path = "../src/rdf/shacl.rs"] since this
 //! is a binary crate and test crates can't import internal modules directly.
 
 #![allow(dead_code)]
 
+// Minimal stand-in for the crate's MemoryPayload (src/traits.rs can't compile
+// standalone: it references crate::graph_read, crate::source_context and
+// crate::task::intake). shacl.rs only needs this struct via crate::traits::.
+pub mod traits {
+    use serde_json::Value;
+
+    #[derive(Debug, Clone)]
+    pub struct MemoryPayload {
+        pub content: String,
+        pub user_id: String,
+        pub memory_type: String,
+        pub agent_name: Option<String>,
+        pub location: String,
+        pub location_lines: String,
+        pub metadata: Value,
+    }
+}
+
 // Import SHACL validation module directly from source (binary crate can't import crate::)
-#[path = "../../src/rdf/shacl.rs"]
+#[path = "../src/rdf/shacl.rs"]
 mod shacl;
 
+use serde_json::Value;
 use shacl::{validate_memory, ShaclViolation};
 
 // Replicate MemoryPayload inline (same as src/traits.rs definition)

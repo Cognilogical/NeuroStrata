@@ -21,7 +21,7 @@
 //!   full integration tracked as task work, not hidden.
 //! - Memory extraction (Lock 2): `neurostrata-84k2` updates with notes.
 
-#[cfg(feature = "kge")]
+// Feature gate removed - kge is core
 use std::path::PathBuf;
 // Module exports + implementation of env var readers and artifact path helper.
 // These are required for the Argon review: env vars parsed (not just doc comments) and artifact layout helper (used by train task).

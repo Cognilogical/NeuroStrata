@@ -15,9 +15,7 @@ mod domain;
 mod embed;
 mod fts;
 mod gliner;
-#[cfg(feature = "kge")]
 pub mod kge;
-#[cfg(feature = "community")]
 pub mod community;
 mod events;
 mod graph_read;
@@ -2620,7 +2618,6 @@ async fn run() -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
-            #[cfg(feature = "kge")]
             Commands::Kge {
                 action: KgeCommands::Train {
                     namespace,
@@ -2642,11 +2639,6 @@ async fn run() -> anyhow::Result<()> {
                 // Scaffold: calls kge::cli_train (implements spec §5.4).
                 // Real implementation tracked in neurostrata-84k2; not a hidden stub.
                 crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim), Some(kge_weight))?;
-            }
-            #[cfg(not(feature = "kge"))]
-            Commands::Kge { .. } => {
-                eprintln!("kge feature disabled; rebuild with --features kge");
-                std::process::exit(1);
             }
             Commands::Shutdown => {
                 let config = Config::from_default_path()?;

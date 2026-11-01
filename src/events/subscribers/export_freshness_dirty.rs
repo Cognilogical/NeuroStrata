@@ -247,6 +247,7 @@ mod tests {
         let deadline = Instant::now() + FLAG_WAIT;
         loop {
             if let Some(payload) = flag_of(store, namespace).await {
+                tokio::task::yield_now().await;
                 return payload;
             }
             assert!(
@@ -480,6 +481,10 @@ mod tests {
         tokio::time::sleep(DISPATCH_WAIT).await;
 
         let payload = await_flag(&store, "audited").await;
+        let deadline = Instant::now() + FLAG_WAIT;
+        while bus.metrics().dispatcher_handled < 1 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(
             payload.metadata["dirty_reason"],
             serde_json::json!("guarded_action"),

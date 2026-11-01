@@ -1,7 +1,6 @@
-//! `community` — deterministic Leiden community detection (feature-gated).
+//! `community` — deterministic Leiden community detection.
 //! Spec: docs/superpowers/specs/2026-10-27-community-detection-design.md (APPROVED 2026-10-28).
 
-#[cfg(feature = "community")]
 mod inner {
     
     use leiden_rs::{GraphDataBuilder, Leiden, LeidenConfig, QualityType};
@@ -143,7 +142,6 @@ mod inner {
 }
 
 /// Structural memory types excluded from community size/hub computation (§5.2a).
-#[cfg(feature = "community")]
 pub const COMMUNITY_STRUCTURAL_TYPES: [&str; 6] = [
     "directory",
     "file",
@@ -153,10 +151,9 @@ pub const COMMUNITY_STRUCTURAL_TYPES: [&str; 6] = [
     "community_summary",
 ];
 
-#[cfg(feature = "community")]
 pub use inner::*;
 
-#[cfg(all(test, feature = "community"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
