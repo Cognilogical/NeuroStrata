@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::cmp::Ordering;
 
 /// Normalized vector distance in [0.0, 1.0] (lower = better).
 /// Reuses existing capped usage + provenance + feedback gain.
@@ -16,14 +16,25 @@ pub fn normalize_graph(count: u64) -> f32 {
     1.0 / (1.0 + count as f32)
 }
 
-/// Deterministic lexical/symbol distance in [0.0, 1.0].
-/// 0.0 = exact match, 1.0 = no match.
-pub fn normalize_sym(symbol_match: bool) -> f32 {
-    if symbol_match {
-        0.0
-    } else {
-        1.0
+/// Deterministic lexical/symbol distance in [0.0, 1.0] (spec §6.2).
+/// `0.0` = exact match; `0.25` = prefix match; `0.5` = token/substring match;
+/// `1.0` = no match.
+pub fn normalize_sym(grade: SymbolMatchGrade) -> f32 {
+    match grade {
+        SymbolMatchGrade::Exact => 0.0,
+        SymbolMatchGrade::Prefix => 0.25,
+        SymbolMatchGrade::TokenSubstring => 0.5,
+        SymbolMatchGrade::None => 1.0,
     }
+}
+
+/// Spec §6.2 symbol match grades (lower = better).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymbolMatchGrade {
+    Exact,
+    Prefix,
+    TokenSubstring,
+    None,
 }
 
 /// Combine normalized distances into hybrid score.
@@ -55,8 +66,14 @@ mod tests {
 
     #[test]
     fn normalize_sym_exact_vs_none() {
-        assert!((normalize_sym(true) - 0.0).abs() < 1e-6);
-        assert!((normalize_sym(false) - 1.0).abs() < 1e-6);
+        assert!((normalize_sym(SymbolMatchGrade::Exact) - 0.0).abs() < 1e-6);
+        assert!((normalize_sym(SymbolMatchGrade::None) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_sym_prefix_and_substring() {
+        assert!((normalize_sym(SymbolMatchGrade::Prefix) - 0.25).abs() < 1e-6);
+        assert!((normalize_sym(SymbolMatchGrade::TokenSubstring) - 0.5).abs() < 1e-6);
     }
 
     #[test]

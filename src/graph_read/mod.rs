@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::cmp::Ordering;
 
 /// Deterministic graph-read capability: deterministic, zero-embedding lookups beside the vector store (`VectorStore`).
 pub mod memories_for_file;

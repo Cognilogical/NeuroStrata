@@ -100,8 +100,22 @@ pub struct Config {
     #[serde(default = "default_lexical_fuzzy_max_distance")]
     pub lexical_fuzzy_max_distance: usize,
 
+    /// GraphRAG hybrid mode: opt-in normalized distance combination.
+    /// Off by default (spec §6.1, §7, §10, §11).
+    #[serde(default)]
+    pub hybrid_enabled: bool,
+
+    /// Hybrid scoring weights (vector, graph, symbol). Must sum to 1.0.
+    /// Defaults (0.5, 0.3, 0.2) per spec §6.2.
+    #[serde(default = "default_hybrid_weights")]
+    pub hybrid_weights: (f32, f32, f32),
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+fn default_hybrid_weights() -> (f32, f32, f32) {
+    (0.5, 0.3, 0.2)
 }
 
 fn default_lexical_fuzzy_max_distance() -> usize {
@@ -134,6 +148,8 @@ impl Config {
                 allowed_external_dirs: Vec::new(),
                 lexical_blend_inhouse: false,
                 lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
+                hybrid_enabled: false,
+                hybrid_weights: default_hybrid_weights(),
                 extra: HashMap::new(),
             };
 

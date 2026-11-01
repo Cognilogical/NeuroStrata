@@ -770,22 +770,38 @@ let incomplete = result_count >= fetch_limit;
 
             // Hybrid scoring: combine vector, graph, and symbol distances.
             // When search_mode is Hybrid, replace the default search score with the
-            // normalized hybrid distance.
-            let mut hybrid_results: Vec<SearchResult> = results.clone();
-            for sr in &mut hybrid_results {
-                let d_vec = sr.score.clamp(0.0, 1.0);
-                let co_count = sr.payload.metadata.get("co_occurrence_count")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let d_graph = crate::graph_read::hybrid::normalize_graph(co_count as u64);
-                let d_sym = crate::graph_read::hybrid::normalize_sym(false);
-                sr.score = crate::graph_read::hybrid::combine(d_vec, d_graph, d_sym, (0.5, 0.3, 0.2));
+            // When Hybrid mode is configured, compute normalized hybrid distance
+            // from vector distance, graph co-occurrence, and symbol match, then
+            // sort ASC by the hybrid score with MemoryId ASC tie-break.
+            if search_mode == crate::traits::SearchMode::Hybrid {
+                let mut hybrid_results: Vec<SearchResult> = results.clone();
+                for sr in &mut hybrid_results {
+                    let d_vec = sr.score.clamp(0.0, 1.0);
+                    // d_graph: co-occurrence from Step 2 primary_sources count.
+                    // At this point in the function the expansion data has been
+                    // consumed, so we approximate with metadata "co_occurrence_count"
+                    // (set during ingestion/search-expansion when available);
+                    // default to 0 → normalized graph distance of 1.0.
+                    let co_count = sr.payload.metadata
+                        .get("co_occurrence_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let d_graph = crate::graph_read::hybrid::normalize_graph(co_count as u64);
+                    // d_sym: literal bool; future: replace with actual symbol-match logic.
+                    let d_sym = crate::graph_read::hybrid::normalize_sym(crate::graph_read::hybrid::SymbolMatchGrade::None);
+                    sr.score = crate::graph_read::hybrid::combine(d_vec, d_graph, d_sym, (0.5, 0.3, 0.2));
+                }
+                // Sort ASC by hybrid score, tie-break MemoryId ASC.
+                hybrid_results.sort_by(|a, b| {
+                    let a_score = a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal);
+                    match a_score {
+                        std::cmp::Ordering::Less => std::cmp::Ordering::Less,
+                        std::cmp::Ordering::Greater => std::cmp::Ordering::Greater,
+                        std::cmp::Ordering::Equal => a.id.cmp(&b.id),
+                    }
+                });
+                let results: Vec<SearchResult> = hybrid_results.into_iter().take(limit).collect();
             }
-            let results = if search_mode == crate::traits::SearchMode::Hybrid {
-                hybrid_results.into_iter().take(limit).collect()
-            } else {
-                results
-            };
 
             Ok(DomainSearchOutcome { results, mode, incomplete })
         })
