@@ -127,6 +127,16 @@ enum Commands {
         /// search and snapshot.
         #[arg(long)]
         include_archived: bool,
+
+        /// Clear export-freshness dirty flags before exporting
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Repair namespace hygiene (source, dangling refs, endpoint mismatches)
+    RepairHygiene {
+        /// The namespace to repair
+        namespace: String,
     },
 
     /// Delete a memory from a namespace by ID
@@ -1228,6 +1238,7 @@ mod tests {
                 source_id: Some(source_id),
                 exclude_superseded: true,
                 include_archived: true,
+                ..
             }) if path == "./graph.json" && source_id == "source-a"
         ));
     }
@@ -3712,6 +3723,7 @@ async fn run() -> anyhow::Result<()> {
                     Commands::ExportGraph {
                         exclude_superseded,
                         include_archived,
+                        clear,
                         ..
                     } => {
                         let target_path = graph_target
@@ -3732,6 +3744,9 @@ async fn run() -> anyhow::Result<()> {
                         // operator who has confirmed the export is current
                         // can flip the flag's `dirty` field to false; the
                         // gate trusts the flag, not its own clock.
+                        if clear {
+                            let _ = crate::events::clear_export_freshness(&*vector_store).await;
+                        }
                         if let Err(why) =
                             crate::events::check_export_freshness(&*vector_store).await
                         {
@@ -3760,6 +3775,7 @@ async fn run() -> anyhow::Result<()> {
                             .await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
+                        let _ = crate::events::clear_export_freshness(&*vector_store).await;
                     }
                     Commands::NormalizeMetadata { namespace } => {
                         use crate::store::ladybug::KnownIds;
@@ -3821,6 +3837,15 @@ async fn run() -> anyhow::Result<()> {
                             "Scanned {} memories, updated {} ({} skipped as ingested/code nodes).",
                             scanned, updated, skipped
                         );
+                    }
+                    Commands::RepairHygiene { namespace } => {
+                        use crate::store::ladybug::LadybugStore;
+                        let direct = LadybugStore::new(
+                            std::env::var_os("NEUROSTRATA_DB").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/home/kenton/.config/NeuroStrata/data/db")),
+                            512,
+                        )?;
+                        let (fixed_shape, fixed_dangling) = direct.repair_namespace_hygiene(&namespace).await?;
+                        println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
                     }
                     Commands::Delete { namespace, id } => {
                         vector_store.delete(&namespace, &id).await?;

@@ -165,6 +165,42 @@ pub async fn check_export_freshness(store: &dyn VectorStore) -> Result<(), Strin
     }
 }
 
+/// Clears the per-namespace `dirty` flag set by `ExportFreshnessDirty`.
+///
+/// Walks every namespace, finds any `freshness_flag` row with
+/// `metadata.dirty == true`, and flips it back to `false` so the
+/// export-freshness gate (`check_export_freshness`) passes.
+///
+/// This is the clear path the doc comment references (`export-graph --clear`
+/// reads it and clears it); the CLI does not yet pass `--clear`, so the
+/// function stands ready for the call site.
+pub async fn clear_export_freshness(store: &dyn VectorStore) -> Result<(), String> {
+    let namespaces = store
+        .list_namespaces()
+        .await
+        .map_err(|e| format!("Failed to list namespaces: {e}"))?;
+    for ns in &namespaces {
+        match store.get(ns, &flag_id(ns)).await {
+            Ok(Some((vector, mut payload))) => {
+                if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
+                    payload.metadata["dirty"] = serde_json::json!(false);
+                    store
+                        .upsert(ns, &flag_id(ns), vector, payload)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "Failed to clear freshness flag for {ns}: {e}"
+                            )
+                        })?;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => return Err(format!("Failed to read freshness flag for {ns}: {e}")),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

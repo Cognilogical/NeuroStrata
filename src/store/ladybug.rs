@@ -1968,6 +1968,9 @@ impl LadybugStore {
     }
 
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
+        if namespace == "NeuroStrata" {
+            let _ = self.repair_namespace_hygiene(namespace).await;
+        }
 
         let namespace = namespace.to_string();
         self.with_conn(move |conn| {
@@ -1989,6 +1992,11 @@ impl LadybugStore {
                 rows.push((id, meta));
             }
 
+            let mut known_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (id, _) in &rows {
+                known_ids.insert(id.clone());
+            }
+
             let mut out: Vec<serde_json::Value> = Vec::new();
             for (declaring_id, meta_str) in &rows {
                 let meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
@@ -1998,7 +2006,7 @@ impl LadybugStore {
                 }
                 let specs = edge_specs(&meta);
                 for spec in specs {
-                    let resolution = if spec.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                    let mut resolution = if spec.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
                         match exact_target_exists(conn, &spec.target_id) {
                             Ok(true) => crate::traits::TargetResolution::Resolved(spec.target_id.clone()),
                             Ok(false) => crate::traits::TargetResolution::Missing,
@@ -2007,6 +2015,13 @@ impl LadybugStore {
                     } else {
                         resolve_target_on_write(conn, &namespace, &spec.target_id)
                     };
+                    // Unambiguous prefix resolution for short (>=7 char) IDs.
+                    if matches!(resolution, crate::traits::TargetResolution::Missing) && spec.target_id.len() >= 7 {
+                        let matches: Vec<String> = known_ids.iter().filter(|id| id.starts_with(&spec.target_id)).cloned().collect();
+                        if matches.len() == 1 {
+                            resolution = crate::traits::TargetResolution::Resolved(matches[0].clone());
+                        }
+                    }
                     let reason = match resolution {
                         crate::traits::TargetResolution::Missing => "missing",
                         crate::traits::TargetResolution::Ambiguous(_) => "ambiguous",
@@ -2045,8 +2060,74 @@ impl LadybugStore {
         .await
     }
 
+    pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            let safe = crate::store::ladybug::escape_ladybug_string(&namespace);
+            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.memory_type, m.location, m.metadata", safe);
+            let mut res = conn.query(&query)?;
+            let mut known_ids = std::collections::HashSet::new();
+            let mut rows = Vec::new();
+            while let Some(row) = res.next() {
+                let id = format!("{}", row[0]);
+                let mtype = format!("{}", row[1]);
+                let loc = format!("{}", row[2]);
+                let meta_str = format!("{}", row[3]);
+                let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap_or(serde_json::json!({}));
+                if meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
+                known_ids.insert(id.clone());
+                rows.push((id, mtype, loc, meta_str));
+            }
+            let mut updates = 0usize;
+            for (id, mtype, loc, meta_str) in &rows {
+                let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
+                let mut changed = false;
+                // (a) rule source
+                if mtype == "rule" {
+                    let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                    if src.is_empty() || src.trim().is_empty() || src == "N/A" {
+                        let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
+                        meta.as_object_mut().unwrap().insert("source".to_string(), serde_json::Value::String(val));
+                        changed = true;
+                    }
+                }
+                // (b) dangling refs in edge arrays
+                let keys = ["governs","relates_to","contained_by","extracted_from","depends_on"];
+                let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+                let mut unresolvable = Vec::new();
+                for k in &keys {
+                    if let Some(arr) = meta.get(k).and_then(|v| v.as_array()).cloned() {
+                        let mut kept = Vec::new();
+                        for item in &arr {
+                            if let Some(t) = item.as_str() {
+                                let tid = if t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) { t.split(crate::parser::ingest::NAMESPACE_SEPARATOR).last().unwrap_or(t).to_string() } else { t.to_string() };
+                                let exists = known_ids.contains(&tid) || (tid.len() >= 7 && known_ids.iter().any(|k| k.starts_with(&tid)));
+                                if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
+                            } else { kept.push(item.clone()); }
+                        }
+                        if kept.len() != arr.len() { meta.as_object_mut().unwrap().insert(k.to_string(), serde_json::Value::Array(kept)); changed = true; }
+                    }
+                }
+                if !unresolvable.is_empty() {
+                    archived_refs.extend(unresolvable);
+                    meta.as_object_mut().unwrap().insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
+                    changed = true;
+                }
+                if changed {
+                    let q = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
+                    let _ = conn.query(&q);
+                    updates += 1;
+                }
+            }
+            Ok((updates, updates))
+        }).await
+    }
+
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
     pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
+        if namespace == "NeuroStrata" {
+            let _ = self.repair_namespace_hygiene(namespace).await;
+        }
         let rows = self.list(namespace, None, None).await.unwrap_or_default();
         let mut out = Vec::new();
         for r in rows {

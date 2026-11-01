@@ -20,5 +20,6 @@ pub use self::subscriber::{
     SubscriberError,
 };
 pub use self::subscribers::{
-    check_export_freshness, EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog,
+    check_export_freshness, clear_export_freshness, EpisodicPointerEcho, ExportFreshnessDirty,
+    GuardEventLog,
 };
