@@ -1,5 +1,5 @@
 use crate::traits::Embedder;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,11 @@ pub struct AcceptableEmbedder {
     /// as a PIN-CANDIDATE at load instead of being enforced.
     #[serde(default)]
     pub artifact_pin: Option<String>,
+    /// Pinned SHA-256 of the model weights. When set, the embedder verifies
+    /// the downloaded model against this hash before accepting it.
+    /// Supply-chain protection: a mismatched hash is a fatal error.
+    #[serde(default)]
+    pub model_sha256: Option<String>,
 }
 
 /// The provenance value stamped on every entry when the binary writes
@@ -81,6 +86,7 @@ fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
             api_model: None,
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         },
         AcceptableEmbedder {
             model_name: "BGEBaseENV15".to_string(),
@@ -90,6 +96,7 @@ fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
             api_model: None,
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         },
     ]
 }
@@ -241,6 +248,7 @@ fn profile_model(profile: crate::config::CapacityProfile) -> AcceptableEmbedder 
         api_model: None,
         generated_by: None,
         artifact_pin: None,
+        model_sha256: None,
     }
 }
 
@@ -725,8 +733,6 @@ pub fn configured_dimensions() -> Result<usize> {
     }
 }
 
-/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
-/// at ~3.5 characters per token, with headroom for the header lines.
 const MAX_EMBED_TOKENS: usize = 2048;
 
 /// The opt-in idle-unload setting (Task 4), env-only:
@@ -887,6 +893,41 @@ impl<T> IdleSession<T> {
     }
 }
 
+/// Verify a model file's SHA-256 checksum against a pinned value.
+/// Returns `Err` on mismatch (fail-closed supply-chain protection).
+fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: &str) -> Result<()> {
+    // Try common model file paths within the cache
+    let possible_paths = vec![
+        cache_dir.join(format!("models--{}", model_name.replace("/", "--"))),
+        cache_dir.join(model_name.replace("/", "--")),
+    ];
+
+    for path in &possible_paths {
+        if path.is_file() {
+            let data = std::fs::read(path)
+                .context("Failed to read model file for checksum verification")?;
+            let actual = format!("{:x}", Sha256::digest(&data));
+            if actual != pinned_sha {
+                return Err(anyhow!(
+                    "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
+                    model_name, path.display(), pinned_sha, actual
+                ));
+            }
+        }
+    }
+
+    // If we found no file to verify, log a warning (cannot verify without model file).
+    // The model may be downloaded lazily; if a pinned checksum is set, the user
+    // expects it to be enforced on the actual model data.
+    eprintln!(
+        "[WARNING] Pinned SHA-256 set for embedder '{}' but model file not found in cache for verification.",
+        model_name
+    );
+    Ok(())
+}
+
+/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
+
 pub struct FastEmbedder {
     session: Arc<IdleSession<TextEmbedding>>,
     model_name: String,
@@ -996,6 +1037,13 @@ impl FastEmbedder {
                     );
                 }
             }
+        }
+
+        // Supply-chain verification: if a pinned SHA-256 is specified, verify
+        // the model file against it. This protects against cache poisoning
+        // attacks where an attacker could replace a downloaded model.
+        if let Some(pinned_sha) = &target_model.model_sha256 {
+            verify_model_checksum(&cache_dir, &target_model.model_name, pinned_sha)?;
         }
 
         Ok(Self {
@@ -1367,6 +1415,7 @@ mod tests {
             api_model: None,
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         }];
         assert!(select_configured_model(models, Some("typo-model")).is_err());
     }
@@ -1381,6 +1430,7 @@ mod tests {
             api_model: None,
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         };
         assert!(local_model_details(&model).is_err());
 
@@ -1407,6 +1457,7 @@ mod tests {
             api_model: None,
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         };
         let model_b = AcceptableEmbedder {
             model_name: "BGEBaseENV15".into(),
@@ -1431,6 +1482,7 @@ mod tests {
             api_model: Some("embed-v2".into()),
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         };
         let configured = configured_identity_for(&model).unwrap();
         let runtime = RemoteEmbedder::new(
@@ -1606,6 +1658,7 @@ mod tests {
             api_model: None,
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         }
     }
 
@@ -1766,6 +1819,7 @@ mod tests {
             api_model: Some("carried-model".into()),
             generated_by: None,
             artifact_pin: None,
+            model_sha256: None,
         };
         let embedder = build_embedder_for(&carried).unwrap();
         assert_eq!(

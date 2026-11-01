@@ -1,4 +1,4 @@
-use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
+use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use std::sync::Arc;
@@ -157,7 +157,9 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') or 'global'." },
-                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain slug(s) to surface in the domain strap, regardless of access_count." }
+                                "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain slug(s) to surface in the domain strap, regardless of access_count." },
+                                "project_root": { "type": "string", "description": "Optional absolute path to the project root. Used for git-hook hygiene and cached in the registry row." },
+                                "include_archived": { "type": "boolean", "description": "Include archived/tombstoned rows in the snapshot (audit escape hatch)." }
                             },
                             "required": ["namespace"]
                         }
@@ -194,6 +196,46 @@ pub async fn process_mcp_request(
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." }
                             },
                             "required": ["query", "namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_memories_for_file",
+                        "description": "Deterministic, zero-embedding lookup of the active rule/fact/procedure memories governing a file, a symbol, or its ancestor directories. Use it before reading or editing a file to surface the architectural constraints that apply to it. A backend without graph-read answers 'unsupported', never an empty list.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "path": { "type": "string", "description": "The file path (e.g. src/lib.rs), normalized the same way ingestion normalizes it." },
+                                "project_root": { "type": "string", "description": "Optional absolute path to the project root." },
+                                "symbol": { "type": "string", "description": "Optional code symbol (e.g. startSync()) to look up governance for." },
+                                "include_ancestors": { "type": "boolean", "description": "Include memories governing ancestor directories. Default true." },
+                                "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Memory types to return. Default [\"rule\",\"fact\",\"procedure\"]." },
+                                "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
+                                "limit": { "type": "integer", "description": "Max results. Default 5, max 20." }
+                            },
+                            "required": ["namespace", "path"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_related",
+                        "description": "Bounded 1-2 hop traversal of the knowledge graph from a seed node (a memory id, task id, or file path). Returns the nodes reached, the directed edges crossed (each marked with its semantic role: governance, structure, supporting, extraction), evidence paths, and a pagination cursor. RELATES_TO edges are supporting evidence only, never governance. Results are paginated (default 10, max 25 nodes) with a cursor that rechecks retirement/privacy on every page.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "id": { "type": "string", "description": "The seed node: a memory id, a task id, or a qualified file path." },
+                                "relations": { "type": "array", "items": { "type": "string" }, "description": "Relations to follow: GOVERNS, CONTAINS, RELATES_TO, EXTRACTED_FROM. Default all four." },
+                                "direction": { "type": "string", "enum": ["outgoing", "incoming", "both"], "description": "Traversal direction. Default both." },
+                                "max_hops": { "type": "integer", "description": "Traversal depth. Default 1, max 2." },
+                                "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Optional memory-type filter for returned nodes." },
+                                "limit": { "type": "integer", "description": "Nodes per page. Default 10, max 25." },
+                                "cursor": { "type": "object", "description": "Opaque pagination cursor from a previous next_cursor.", "properties": {
+                                    "fingerprint": { "type": "string" },
+                                    "generation": { "type": "integer" },
+                                    "offset": { "type": "integer" }
+                                } }
+                            },
+                            "required": ["namespace", "id"]
                         }
                     },
                     {
@@ -627,6 +669,12 @@ pub async fn process_mcp_request(
                         "neurostrata_search_memory" => {
                             result_text =
                                 handle_search_memory(arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_memories_for_file" => {
+                            result_text = handle_memories_for_file(arguments, store.clone()).await;
+                        }
+                        "neurostrata_related" => {
+                            result_text = handle_related(arguments, store.clone()).await;
                         }
                         "neurostrata_supersede_memory" => {
                             result_text = handle_supersede_memory(
@@ -1095,6 +1143,201 @@ async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
         format!("Existing namespaces: {:?}", namespaces)
     } else {
         "Failed to list namespaces.".to_string()
+    }
+}
+
+/// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
+/// `memories` (possibly empty) and `unsupported` -- an explicit flag, because a
+/// backend without graph-read must never be mistaken for "no rules apply".
+async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => {
+            return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to read from.".to_string();
+        }
+    };
+    let path = match arguments.get("path").and_then(|p| p.as_str()) {
+        Some(p) => p,
+        None => return "Missing 'path' parameter.".to_string(),
+    };
+    let namespace = resolve_namespace(&store, namespace).await;
+
+    let symbol = arguments.get("symbol").and_then(|s| s.as_str());
+    let include_ancestors = arguments
+        .get("include_ancestors")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let memory_types: Vec<String> = match arguments.get("memory_types") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    let exclude_ids: Vec<String> = match arguments.get("exclude_ids") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(crate::graph_read::memories_for_file::DEFAULT_LIMIT as u64)
+        as usize;
+
+    // `project_root` names the worktree being read, which pins the source (and
+    // therefore the active generation) the query resolves against -- the same
+    // key ingestion derives from the directory it walks. Absent a root, the
+    // store falls back to the most recently published generation.
+    let source: Option<String> = arguments
+        .get("project_root")
+        .and_then(|p| p.as_str())
+        .map(|root| crate::parser::ingest::source_key_for(std::path::Path::new(root)));
+
+    // The graph-read capability is optional per backend: only LadybugStore
+    // implements it (spec §4.6). Anything else answers `unsupported` -- never
+    // an empty list, which a caller would misread as "no rules govern this".
+    let Some(store) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    else {
+        return serde_json::json!({
+            "memories": [],
+            "unsupported": true,
+            "path": path,
+        })
+        .to_string();
+    };
+
+    match store
+        .memories_for_file(
+            &namespace,
+            source.as_deref(),
+            path,
+            symbol,
+            include_ancestors,
+            &memory_types,
+            &exclude_ids,
+            limit,
+        )
+        .await
+    {
+        Ok(hits) => {
+            serde_json::json!({
+                "memories": hits,
+                "unsupported": false,
+                "path": path,
+            })
+            .to_string()
+        }
+        Err(e) => serde_json::json!({
+            "memories": [],
+            "unsupported": false,
+            "path": path,
+            "error": e.to_string(),
+        })
+        .to_string(),
+    }
+}
+
+/// The `neurostrata_related` handler. Returns the bounded traversal result plus
+/// `unsupported` (false for LadybugStore) and `seed` echoing the queried node,
+/// so a backend without graph-read is never mistaken for "nothing is related".
+async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => {
+            return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace to read from.".to_string();
+        }
+    };
+    let seed = match arguments.get("id").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return "Missing 'id' parameter.".to_string(),
+    };
+    let namespace = resolve_namespace(&store, namespace).await;
+
+    let relations: Vec<String> = match arguments.get("relations") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let direction = crate::graph_read::related::parse_direction(
+        arguments.get("direction").and_then(|v| v.as_str()),
+    );
+    let max_hops = arguments
+        .get("max_hops")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(crate::graph_read::related::DEFAULT_MAX_HOPS as u64)
+        as usize;
+    let memory_types: Vec<String> = match arguments.get("memory_types") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(crate::graph_read::related::DEFAULT_LIMIT as u64)
+        as usize;
+    let cursor: Option<crate::graph_read::related::Cursor> = arguments
+        .get("cursor")
+        .and_then(|c| serde_json::from_value(c.clone()).ok());
+
+    let Some(store) = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+    else {
+        return serde_json::json!({
+            "nodes": [],
+            "edges": [],
+            "evidence": [],
+            "total": 0,
+            "truncated": false,
+            "unsupported": true,
+            "seed": seed,
+        })
+        .to_string();
+    };
+
+    match store
+        .related(
+            &namespace,
+            seed,
+            &relations,
+            direction,
+            max_hops,
+            &memory_types,
+            limit,
+            cursor.as_ref(),
+        )
+        .await
+    {
+        Ok(result) => {
+            let mut body = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("unsupported".to_string(), serde_json::json!(false));
+                obj.insert("seed".to_string(), serde_json::json!(seed));
+            }
+            body.to_string()
+        }
+        Err(e) => serde_json::json!({
+            "nodes": [],
+            "edges": [],
+            "evidence": [],
+            "total": 0,
+            "truncated": false,
+            "unsupported": false,
+            "seed": seed,
+            "error": e.to_string(),
+        })
+        .to_string(),
     }
 }
 
@@ -1776,6 +2019,40 @@ async fn handle_get_snapshot(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
+    // project_root: prefer explicit arg, fall back to cached registry value.
+    let project_root_arg = arguments
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let cached_root = if project_root_arg.is_none() {
+        let rid = crate::registry::registry_row_id(namespace);
+        store
+            .get(namespace, &rid)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(_, p)| {
+                p.metadata
+                    .get("project_root")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+    } else {
+        None
+    };
+    let project_root = project_root_arg.clone().or(cached_root);
+
+    // Cache an explicitly-provided project_root into the registry row (best-effort).
+    if let Some(pr) = &project_root_arg {
+        crate::registry::cache_project_root(&store, None, namespace, pr).await;
+    }
+
+    // Hook hygiene: auto-heal missing/stale pre-push hook (best-effort).
+    let hooks_line = project_root
+        .as_ref()
+        .map(|r| crate::task::hook_hygiene(std::path::Path::new(r)))
+        .unwrap_or_default();
+
     let mut all_memories = store
         .list(namespace, None, None)
         .await
@@ -1990,6 +2267,109 @@ async fn handle_get_snapshot(
         )
     };
 
+    // ── Doctor scheduling (in-memory, throttled) ──────────────────────────
+    let rid = crate::registry::registry_row_id(namespace);
+    let reg_found = store.get(namespace, &rid).await.ok().flatten();
+    let (reg_vec_opt, reg_payload_opt) = match reg_found {
+        Some((v, p)) => (Some(v), Some(p)),
+        None => (None, None),
+    };
+    let now_ts = chrono::Utc::now().timestamp();
+    let mut doctor_state: serde_json::Value = reg_payload_opt
+        .as_ref()
+        .and_then(|p| p.metadata.get("doctor_state"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let session_counter = doctor_state
+        .get("session_counter")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        + 1;
+    let last_run_version = doctor_state
+        .get("last_run_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let last_run_ts = doctor_state
+        .get("last_run_ts")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let current_version = env!("CARGO_PKG_VERSION");
+    let trigger = last_run_version != current_version
+        || session_counter % 20 == 0
+        || (now_ts - last_run_ts) > 7 * 86400;
+
+    let mut doctor_report: Option<String> = None;
+    if trigger {
+        let known = crate::store::ladybug::KnownIds::new(all_memories.iter().map(|m| m.id.as_str()));
+        let mut unqualified_ingested = 0usize;
+        let mut resolvable = 0usize;
+        let mut missing = 0usize;
+        let mut missing_samples: Vec<String> = Vec::new();
+        for m in &all_memories {
+            if m.payload.user_id == "auto-ingestor"
+                && !crate::parser::ingest::is_qualified(namespace, &m.id)
+            {
+                unqualified_ingested += 1;
+            }
+            for edge in crate::store::ladybug::edge_specs(&m.payload.metadata) {
+                if known.contains(&edge.target_id) {
+                    continue;
+                }
+                match known.resolve(&edge.target_id) {
+                    Some(_) => resolvable += 1,
+                    None => {
+                        missing += 1;
+                        if missing_samples.len() < 3 {
+                            missing_samples.push(edge.target_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut findings: Vec<String> = Vec::new();
+        if unqualified_ingested > 0 {
+            findings.push(format!(
+                "  unqualified ingested nodes: {} (re-ingest to qualify)",
+                unqualified_ingested
+            ));
+        }
+        if resolvable > 0 {
+            findings.push(format!(
+                "  resolvable declared targets (older form): {}",
+                resolvable
+            ));
+        }
+        if missing > 0 {
+            findings.push(format!(
+                "  declared targets matching nothing: {} (e.g. {})",
+                missing,
+                missing_samples.join(", ")
+            ));
+        }
+        if !findings.is_empty() {
+            let mut report = String::from("DOCTOR REPORT:");
+            for f in &findings {
+                report.push('\n');
+                report.push_str(f);
+            }
+            doctor_report = Some(report);
+        }
+    }
+
+    // Update doctor_state.
+    doctor_state["session_counter"] = serde_json::json!(session_counter);
+    if trigger {
+        doctor_state["last_run_version"] = serde_json::json!(current_version);
+        doctor_state["last_run_ts"] = serde_json::json!(now_ts);
+    }
+    if let (Some(vec), Some(mut payload)) = (reg_vec_opt, reg_payload_opt) {
+        if let Some(obj) = payload.metadata.as_object_mut() {
+            obj.insert("doctor_state".to_string(), doctor_state);
+        }
+        let _ = store.upsert(namespace, &rid, vec, payload).await;
+    }
+
     all_memories.truncate(5);
 
     let body = if all_memories.is_empty() {
@@ -1998,10 +2378,18 @@ async fn handle_get_snapshot(
         serde_json::to_string_pretty(&all_memories)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
-    let snapshot = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        task_head, procedures, registered_domains_line, domain_strap, body
-    );
+    let mut parts: Vec<String> = vec![task_head.to_string()];
+    if !hooks_line.is_empty() {
+        parts.push(hooks_line.clone());
+    }
+    if let Some(dr) = &doctor_report {
+        parts.push(dr.clone());
+    }
+    parts.push(procedures.to_string());
+    parts.push(registered_domains_line.to_string());
+    parts.push(domain_strap.to_string());
+    parts.push(body.to_string());
+    let snapshot = parts.join("\n");
 
     Ok(match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
@@ -3777,6 +4165,7 @@ mod tests {
                 cb_failure_threshold: 3,
                 cb_backoff_initial_seconds: 1,
                 cb_backoff_max_seconds: 60,
+                laya_bundle_path: "artifacts/laya-bundle".to_string(),
             };
             let _ = &mut cfg;
             let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
@@ -3833,6 +4222,7 @@ mod tests {
                 max_candidates: 5,
                 cb_failure_threshold: 3,
                 cb_backoff_initial_seconds: 1,
+                laya_bundle_path: "artifacts/laya-bundle".to_string(),
                 cb_backoff_max_seconds: 60,
             };
             let checker = Arc::new(crate::judgment::DeduplicationChecker::new_with_provider(cfg, provider));
@@ -3901,6 +4291,7 @@ mod tests {
                 confidence_threshold: 0.5,
                 max_candidates: 5,
                 cb_failure_threshold: 3,
+                laya_bundle_path: "artifacts/laya-bundle".to_string(),
                 cb_backoff_initial_seconds: 1,
                 cb_backoff_max_seconds: 60,
             };
@@ -4489,6 +4880,22 @@ mod tests {
         (store, id)
     }
 
+    /// A backend without graph-read must answer `unsupported: true`, never an
+    /// empty list -- which a caller would misread as "no rules govern this".
+    #[tokio::test]
+    async fn unsupported_backend_returns_unsupported_true() {
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let arguments = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+        });
+        let text = handle_memories_for_file(arguments, store).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["unsupported"], serde_json::json!(true));
+        assert_eq!(parsed["memories"], serde_json::json!([]));
+        assert_eq!(parsed["path"], serde_json::json!("src/lib.rs"));
+    }
+
     #[tokio::test]
     async fn editing_a_memory_into_another_namespace_keeps_it() {
         let (store, id) = store_with_one_rule("probe").await;
@@ -4744,7 +5151,9 @@ mod tests {
             serde_json::json!({
                 "content": "rule with a not-yet-ingested target",
                 "namespace": "probe",
-                "metadata": { "governs": ["src/not-ingested.rs"] }
+                // A qualified cross-namespace target never gets a stub
+                // (spec §3.2), so it still defers with `missing`.
+                "metadata": { "governs": ["other-ns::src/not-ingested.rs"] }
             }),
             Arc::new(StubEmbedder),
             store,
@@ -6179,7 +6588,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_one_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -6207,6 +6616,8 @@ mod tests {
                 "neurostrata_ingest_directory",
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
+                "neurostrata_memories_for_file",
+                "neurostrata_related",
                 "neurostrata_supersede_memory",
                 "neurostrata_procedure_perform",
                 "neurostrata_task_create",

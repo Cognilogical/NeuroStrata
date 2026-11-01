@@ -6,6 +6,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+pub use crate::graph_read::memories_for_file::{GraphMatchKind, MemoryHit};
+pub use crate::graph_read::related::{
+    Cursor as RelatedCursor, Direction as RelatedDirection, RelatedResult,
+};
+
 /// Trait for downcasting VectorStore to concrete implementations.
 pub trait AsAny {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -164,6 +169,38 @@ pub enum RelocateOutcome {
     SameNamespace,
 }
 
+
+/// Embedding-space identity persisted on namespace metadata. Enforcement on
+/// every vector path ensures incompatible spaces are never mixed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct EmbeddingDescriptor {
+    pub provider: String,
+    pub model: String,
+    pub revision: String,
+    pub dims: usize,
+    pub normalization: String,
+    pub preprocessing: String,
+    pub distance_metric: String,
+}
+
+impl EmbeddingDescriptor {
+    pub fn unknown() -> Self {
+        Self {
+            provider: "unknown".into(),
+            model: "unknown".into(),
+            revision: "unknown".into(),
+            dims: 0,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "unknown".into(),
+        }
+    }
+
+    pub fn compatible(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 /// The core interface for generating vector embeddings from text.
 /// By making this a trait, we can swap between Local (FastEmbed/ONNX),
 /// Remote (Ollama), or Cloud (OpenAI) implementations.
@@ -193,6 +230,19 @@ pub trait Embedder: Send + Sync {
     /// override it.
     fn session_loaded_snapshot(&self) -> Option<bool> {
         None
+    }
+
+    /// Stable identity of the embedding space this embedder produces.
+    fn embedding_descriptor(&self) -> EmbeddingDescriptor {
+        EmbeddingDescriptor {
+            provider: "unknown".into(),
+            model: self.embedder_id().to_string(),
+            revision: "unknown".into(),
+            dims: self.dimensions(),
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
     }
 }
 
@@ -333,7 +383,60 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// and re-creates every code node, taking those edges with it -- and the
     /// rules pointing at that code are not rewritten, so the links stay lost
     /// until something replays them (bead neurostrata-sij).
-    async fn relink_edges(&self, namespace: &str) -> Result<usize>;
+    async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize>;
+
+    /// Begin a staged ingestion: allocate a fresh generation for this namespace
+    /// and source and return it. Nodes written against it are invisible to edge
+    /// resolution until `publish_generation` flips the active pointer onto it.
+    ///
+    /// The generation is keyed by `(namespace, source_key)`, so two concurrent
+    /// worktrees of one repository (two sources) never overwrite each other's
+    /// active pointer.
+    ///
+    /// Default `0` = a store without staged ingestion publishes as it writes.
+    async fn begin_generation(&self, _namespace: &str, _source_key: &str) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Atomically make `generation` the active generation for `namespace` and
+    /// `source_key`. The previous active generation's nodes remain as history,
+    /// unreachable through edge resolution.
+    async fn publish_generation(
+        &self,
+        _namespace: &str,
+        _source_key: &str,
+        _generation: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Discard a staged generation's nodes, leaving the previous active
+    /// generation untouched. Used when a build fails midway so a half-built
+    /// tree never becomes visible.
+    async fn abort_generation(
+        &self,
+        _namespace: &str,
+        _source_key: &str,
+        _generation: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// The generation currently active for `namespace` and `source_key`
+    /// (`0` = none published).
+    async fn active_generation(&self, _namespace: &str, _source_key: &str) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// The ids of every node in `generation`. A storage-level primitive for
+    /// generation-scoped filtering and tests; the default returns nothing.
+    async fn generation_nodes(
+        &self,
+        _namespace: &str,
+        _generation: u64,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 
     /// List all memories, optionally filtered by user_id and/or memory_type.
     /// Pushing filters into the query (rather than filtering in Rust) avoids
@@ -434,6 +537,53 @@ pub trait VectorStore: Send + Sync + AsAny {
     }
 }
 
+/// Graph-read capability, exposed beside `VectorStore` rather than folded into
+/// it (spec §4.6): file nodes carry a zero vector, so any backend that only
+/// knows vector search cannot answer these and must say so. A backend that
+/// does not implement `GraphRead` is reached through `AsAny` and answered with
+/// `unsupported`, never an empty result.
+#[async_trait]
+pub trait GraphRead: Send + Sync {
+    /// Deterministic, zero-embedding lookup of the active `rule`/`fact`/
+    /// `procedure` memories governing a file, symbol, or its ancestors.
+    ///
+    /// `source` (a source key) selects the active generation to resolve node
+    /// ids against; `None` uses the most recently published generation.
+    /// `memory_types` is empty meaning "no type filter"; `limit` is capped at
+    /// `MAX_LIMIT` by the implementation. `exclude_ids` names memory ids to
+    /// drop, and is applied *before* `limit` so an excluded hit never crowds
+    /// out a live one.
+    async fn memories_for_file(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>>;
+
+    /// Bounded 1–2 hop traversal from a seed node (spec §4.2). `relations`
+    /// empty means all four; `direction` controls orientation; `max_hops` is
+    /// clamped to `[1, 2]`; `memory_types` empty means no type filter; `limit`
+    /// is clamped to `[1, MAX_LIMIT]`. `cursor` resumes a page only when its
+    /// fingerprint and generation still match the current query and store, so
+    /// retirement/privacy are rechecked on every page.
+    async fn related(
+        &self,
+        namespace: &str,
+        seed: &str,
+        relations: &[String],
+        direction: RelatedDirection,
+        max_hops: usize,
+        memory_types: &[String],
+        limit: usize,
+        cursor: Option<&RelatedCursor>,
+    ) -> Result<RelatedResult>;
+}
+
 /// Trait for durable task intake ledger operations (PQTH).
 /// Separate from VectorStore because intake uses operational tables, not memory rows.
 #[async_trait::async_trait]
@@ -490,7 +640,7 @@ mod tests {
     #[test]
     fn memory_vocabulary_v7_parses_and_has_exact_relations() {
         let v = memory_vocabulary();
-        assert_eq!(v["vocabulary_version"], 7);
+        assert_eq!(v["vocabulary_version"], 8);
         let rels = v["relations"].as_object().unwrap();
         assert!(rels.contains_key("GOVERNS"));
         assert!(rels.contains_key("CONTAINS"));

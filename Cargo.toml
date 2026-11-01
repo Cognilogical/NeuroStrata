@@ -1,12 +1,51 @@
 [package]
 name = "neurostrata-mcp"
-version = "1.13.0"
+version = "1.14.3"
 edition = "2021"
 exclude = ["tools/runtime-validation/**"]
 
 [[bin]]
 name = "neurostrata-mcp"
 path = "src/main.rs"
+
+# The context DTO contract lives in its own integration test target: the
+# crate ships a binary only, so the test compiles the module from its real
+# source path instead of importing a library that does not exist.
+[[test]]
+name = "context_model_test"
+path = "tests/context/model_test.rs"
+
+
+# Task 2: shared context service contract. Compiles the crate-free context
+# modules from their real paths (see the file's module comment).
+[[test]]
+name = "context_service_test"
+path = "tests/context/service_test.rs"
+
+
+[[test]]
+name = "context_freshness_test"
+path = "tests/context/freshness_test.rs"
+
+# Task 5: source/generation-scoped staged ingestion contract. Compiles the
+# id/hash helpers from their real path (see the file's module comment) because
+# the crate ships a binary target only.
+[[test]]
+name = "staged_publication_test"
+path = "tests/ingest/staged_publication_test.rs"
+
+# Task 3: graph-read ranking contract. Compiles the crate-free
+# graph_read::memories_for_file module from its real path (see the file's
+# module comment) because the crate ships a binary target only.
+[[test]]
+name = "memories_for_file_test"
+path = "tests/graph_read/memories_for_file_test.rs"
+
+# Task 4: bounded `related` traversal contract. Compiles the crate-free
+# graph_read::related module from its real path (see the file's module comment).
+[[test]]
+name = "related_test"
+path = "tests/graph_read/related_test.rs"
 
 [dependencies]
 tokio = { version = "1.53", features = ["full"] }
@@ -39,7 +78,7 @@ regex = "1.13"
 cxx = "=1.0.138"
 lbug = "0.20.4"
 axum = "0.8"
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
 # The embedder's remote-URL validation matches on url::Host; the crate was
 # already in the tree as a transitive dependency (via reqwest), so this
 # adds no download.
@@ -69,3 +108,29 @@ cxx-build = "=1.0.138"
 [features]
 default = []
 learning-laya = []
+
+
+[[test]]
+name = "v8_decision_test"
+path = "tests/vocabulary/v8_decision_test.rs"
+
+
+
+[[test]]
+name = "receipt_test"
+path = "tests/receipts/receipt_test.rs"
+
+
+[[test]]
+name = "egress_test"
+path = "tests/privacy/egress_test.rs"
+
+
+[[test]]
+name = "upgraded_search_test"
+path = "tests/search/upgraded_search_test.rs"
+
+
+[[test]]
+name = "validator_test"
+path = "tests/guard/validator_test.rs"

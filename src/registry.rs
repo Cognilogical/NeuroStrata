@@ -288,6 +288,48 @@ fn merge(left: &[String], right: &[String]) -> Vec<String> {
     sorted_unique(merged)
 }
 
+/// Cache `project_root` into the namespace's registry row (best-effort).
+///
+/// Updates the existing row in place (reusing its vector) so no re-embedding
+/// is needed. If no row exists and an embedder is provided, creates one with
+/// an empty domain list. Never fails loudly: a missing cache is a miss, not
+/// an error.
+pub async fn cache_project_root(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    project_root: &str,
+) {
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        _ => {
+            let Some(emb) = emb else { return };
+            let content = registry_content(namespace);
+            let vector = match emb.embed(&content).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            (
+                vector,
+                MemoryPayload {
+                    content,
+                    user_id: "system".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: registry_metadata(&[]),
+                },
+            )
+        }
+    };
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        obj.insert("project_root".to_string(), serde_json::Value::String(project_root.to_string()));
+    }
+    let _ = store.upsert(namespace, &registry_id, vector, payload).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

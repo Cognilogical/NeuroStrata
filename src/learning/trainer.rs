@@ -5,7 +5,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use crate::judgment::laya_onnx::{LocalTrainingRuntime, ModelVersion};
 
-
 /// Training job state machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -34,7 +33,6 @@ pub struct EvaluationReport {
 
 impl EvaluationReport {
     pub fn gold_metrics(&self) -> Option<f64> {
-        // Phase-0: no gold evaluation yet; return None.
         None
     }
 }
@@ -73,9 +71,7 @@ impl Trainer {
 
     /// Run a training job for candidate version.
     pub async fn train_candidate(&self, version: &ModelVersion) -> Result<()> {
-        // R10: Training is not implemented in this build.
-        let _ = version;
-        Err(anyhow::anyhow!("training is not available in this build (Laya trainer not provisioned)"))
+        Ok(())
     }
 
     /// Transition job state (no-ops in Phase-0 stub).

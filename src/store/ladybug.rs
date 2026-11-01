@@ -12,8 +12,8 @@ use lbug::{Connection, Database, SystemConfig};
 use crate::domain::domain_key;
 use crate::traits::{
     is_internal_ingest_stage_namespace, is_reserved_ingest_destination, DomainMatchMode,
-    DomainSearchOutcome, MemoryPayload, RelocateOutcome, SearchResult, VectorStore,
-    INTERNAL_INGEST_STAGE_PREFIX,
+    DomainSearchOutcome, GraphMatchKind, GraphRead, MemoryHit, MemoryPayload,
+    RelocateOutcome, SearchResult, VectorStore, INTERNAL_INGEST_STAGE_PREFIX,
 };
 
 struct IngestStageLease {
@@ -2998,6 +2998,88 @@ fn exact_target_exists(conn: &Connection, id: &str) -> Result<bool> {
     Ok(rows.next().is_some())
 }
 
+/// The generation currently active for one source (`0` = none published).
+fn active_generation_of_source(conn: &Connection, namespace: &str, source_key: &str) -> u64 {
+    let key = crate::parser::ingest::generation_key(namespace, source_key);
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.active_generation",
+        escape_ladybug_string(&key)
+    );
+    match conn.query(&query) {
+        Ok(mut rows) => match rows.next() {
+            Some(row) => format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64,
+            None => 0,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// The most recently published generation for a namespace across all sources.
+/// Used to resolve a declared edge target on write, where the source is not
+/// carried: the latest tree is the best available answer. A query that cannot
+/// run reports `0` rather than failing, so resolution degrades to "no
+/// generation" instead of erroring out of a write it is only trying to guide.
+fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    match conn.query(&query) {
+        Ok(rows) => {
+            let mut latest: u64 = 0;
+            for row in rows {
+                if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+                    if g > 0 {
+                        latest = latest.max(g as u64);
+                    }
+                }
+            }
+            latest
+        }
+        Err(_) => 0,
+    }
+}
+
+/// The set of active generations for a namespace, one per source that has
+/// published. Read surfaces (`list`, `export_graph`) drop rows from a
+/// superseded generation against this set.
+fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections::HashSet<u64> {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut gens = std::collections::HashSet::new();
+    if let Ok(rows) = conn.query(&query) {
+        for row in rows {
+            if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+                if g > 0 {
+                    gens.insert(g as u64);
+                }
+            }
+        }
+    }
+    gens
+}
+
+/// The active `(namespace, generation)` pairs across every namespace, for the
+/// whole-graph read surface (`export_graph`). A generation-scoped node whose
+/// pair is absent was superseded by a later publish and is dropped.
+fn all_active_generations(conn: &Connection) -> std::collections::HashSet<(String, u64)> {
+    let query = "MATCH (g:IngestGeneration) WHERE g.active_generation > 0 RETURN g.namespace, g.active_generation";
+    let mut pairs = std::collections::HashSet::new();
+    if let Ok(rows) = conn.query(query) {
+        for row in rows {
+            let ns = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+            if let Ok(g) = format!("{}", row[1]).parse::<i64>() {
+                if g > 0 {
+                    pairs.insert((ns, g as u64));
+                }
+            }
+        }
+    }
+    pairs
+}
+
 /// The ids a namespace actually holds, indexed so a declaration can be resolved
 /// without scanning them.
 ///
@@ -3022,26 +3104,58 @@ pub struct KnownIds<'a> {
 }
 
 impl<'a> KnownIds<'a> {
+    /// Index every id. A bare path is reachable exactly as-is; a qualified or
+    /// generation-scoped id is reachable by its logical path. No generation
+    /// filter: used by tests and by callers that have already narrowed the set.
     pub fn new(ids: impl IntoIterator<Item = &'a str>) -> Self {
-        let ids: std::collections::HashSet<&'a str> =
-            ids.into_iter().filter(|id| !id.is_empty()).collect();
+        Self::build(ids, None)
+    }
 
+    /// Index only the active generation's nodes. A generation-scoped id whose
+    /// generation is not `active_gen` is left out, and so is any id that is not
+    /// generation-scoped at all (a rule/task UUID, or a pre-generation
+    /// qualified id) -- only the published generation is reachable.
+    pub fn active(ids: impl IntoIterator<Item = &'a str>, active_gen: u64) -> Self {
+        Self::build(ids, Some(active_gen))
+    }
+
+    fn build(ids: impl IntoIterator<Item = &'a str>, active_gen: Option<u64>) -> Self {
+        let mut id_set: std::collections::HashSet<&'a str> =
+            std::collections::HashSet::new();
         let mut by_path: std::collections::HashMap<&'a str, Option<&'a str>> =
             std::collections::HashMap::new();
-        for id in &ids {
-            if let Some(cut) = id.find(crate::parser::ingest::NAMESPACE_SEPARATOR) {
-                let path = &id[cut + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
-                if path.is_empty() {
-                    continue;
+
+        for id in ids.into_iter().filter(|id| !id.is_empty()) {
+            if let Some(active) = active_gen {
+                match crate::parser::ingest::split_scoped_id(id) {
+                    Some((_, gen, _)) => {
+                        if gen != active {
+                            continue; // a stale generation is not reachable
+                        }
+                    }
+                    // Not generation-scoped: not part of any active generation.
+                    None => continue,
                 }
-                by_path
-                    .entry(path)
-                    .and_modify(|slot| *slot = None)
-                    .or_insert(Some(id));
+            }
+
+            id_set.insert(id);
+            // Only namespace- (or generation-) scoped ids are indexed by their
+            // logical path; a bare id stays reachable exactly as-is.
+            if id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                let path = crate::parser::ingest::logical_path_of(id);
+                if !path.is_empty() {
+                    by_path
+                        .entry(path)
+                        .and_modify(|slot| *slot = None)
+                        .or_insert(Some(id));
+                }
             }
         }
 
-        Self { ids, by_path }
+        Self {
+            ids: id_set,
+            by_path,
+        }
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -3050,6 +3164,9 @@ impl<'a> KnownIds<'a> {
 
     /// Finds the node a declaration means, when it does not name one exactly.
     pub fn resolve(&self, declared: &str) -> Option<String> {
+        // Trailing slashes name a directory the same way the path without
+        // one does; the ingested node id carries no trailing slash.
+        let declared = declared.trim_end_matches('/');
         // Deliberately before normalisation: an id stored with backslashes is
         // still matched by naming it exactly, as it always was.
         if self.ids.contains(declared) {
@@ -3424,8 +3541,21 @@ impl VectorStore for LadybugStore {
             conn.query(create_receipts_table).ok();
 
             // PQTH: Intake candidates table (operational, not memory rows)
-            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version LONG, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
+            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, PRIMARY KEY (id))";
             conn.query(create_candidates_table).ok();
+
+            // Source-scoped staged ingestion. Two row kinds live in this table:
+            //   * the counter row, `id = namespace`, whose `counter` allocates
+            //     the next generation number (shared across sources so the
+            //     generation-scoped node ids never collide);
+            //   * a pointer row per source, `id = namespace::source_key`, whose
+            //     `active_generation` names that source's published generation
+            //     (0 = none). The pointer flip is the atomic publish step, and
+            //     keying it by source is what keeps worktree B from overwriting
+            //     worktree A's active generation.
+            let create_generation_table = "CREATE NODE TABLE IngestGeneration (id STRING, namespace STRING, source_key STRING, active_generation INT64, counter INT64, PRIMARY KEY (id))";
+            conn.query(create_generation_table).ok();
+
 
             // Task 7 row-identity audit: classify the store's rows by
             // (namespace, id) identity. A row whose namespace property is
@@ -3645,6 +3775,10 @@ impl VectorStore for LadybugStore {
         // Parse shape warnings from the ORIGINAL payload before the write.
         let shape_warnings = write_shape_warnings(&payload);
         let pk_ready = self.pk_ready();
+        // The stub materializer needs the embedding width for its zero vector;
+        // captured here so the closure stays `FnOnce + Send + 'static`.
+        let dimensions = self.dimensions;
+        let zero_vec = zero_vector_str(dimensions);
         self.write_with_deadline("writing a memory", move |conn| {
 
             if let Some(generation) = &staged_generation {
@@ -3821,6 +3955,42 @@ impl VectorStore for LadybugStore {
                 } else {
                     match resolve_target_on_write(conn, &namespace, &edge.target_id) {
                         crate::traits::TargetResolution::Resolved(found) => found,
+                        // Spec §3.2: a GOVERNS target that names a file not yet
+                        // ingested auto-materialises a stub `file` node so the
+                        // edge forms immediately instead of waiting for an
+                        // ingest that may never come. Only the unqualified,
+                        // unambiguous `Missing` case stubs -- an ambiguous or
+                        // failed resolution, or a qualified cross-namespace id,
+                        // still defers.
+                        crate::traits::TargetResolution::Missing
+                            if edge.rel_type == "GOVERNS" =>
+                        {
+                            match materialize_stub_file_node(
+                                conn,
+                                &namespace,
+                                &edge.target_id,
+                                &zero_vec,
+                                pk_ready,
+                            ) {
+                                Ok(stub_id) => stub_id,
+                                Err(e) => {
+                                    deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                        rel_type: edge.rel_type.to_string(),
+                                        declared_target: edge.target_id.clone(),
+                                        declaration_index: edge.declaration_index,
+                                        resolution: crate::traits::TargetResolution::Failed(
+                                            e.to_string(),
+                                        ),
+                                    });
+                                    emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                        field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                        why: "stub materialization failed".to_string(),
+                                        skipped: "this edge materialization".to_string(),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                         resolution @ crate::traits::TargetResolution::Missing
                         | resolution @ crate::traits::TargetResolution::Ambiguous(_)
                         | resolution @ crate::traits::TargetResolution::Failed(_) => {
@@ -4702,17 +4872,33 @@ impl VectorStore for LadybugStore {
         self.dirty.is_set()
     }
 
-    async fn relink_edges(&self, namespace: &str) -> Result<usize> {
+    async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize> {
         // Declarations live in each memory's metadata, which survives ingestion;
         // only the edges themselves are lost with the nodes. Replaying them is
         // therefore a read of what is already stored, not a guess.
         let memories = self.list(namespace, None, None).await?;
+        let active_gen = self.active_generation(namespace, source_key).await?;
+
+        // The published generation's logical paths. A stub materialised before
+        // the file was ingested is a placeholder; once the real node arrives it
+        // must be retired so the placeholder never shadows the real tree.
+        let active_paths: std::collections::HashSet<String> = memories
+            .iter()
+            .filter_map(|m| match crate::parser::ingest::split_scoped_id(&m.id) {
+                Some((_, gen, _)) if gen == active_gen => {
+                    Some(crate::parser::ingest::logical_path_of(&m.id).to_string())
+                }
+                _ => None,
+            })
+            .collect();
 
         // Ids stored before node ids became repository-relative are absolute, so
         // a rule written to match them declares C:/proj/src/foo.rs and matches
         // nothing now. Resolve those by path suffix against the ids that do
-        // exist, and leave an ambiguous suffix alone rather than guess.
-        let known = KnownIds::new(memories.iter().map(|m| m.id.as_str()));
+        // exist, and leave an ambiguous suffix alone rather than guess. Only the
+        // active generation's nodes are reachable: a rule always re-attaches to
+        // this source's published tree, never to a superseded one.
+        let known = KnownIds::active(memories.iter().map(|m| m.id.as_str()), active_gen);
 
         // Grouped by relationship because the type is part of the statement and
         // cannot be a value in it: three groups, so three statements, whatever
@@ -4728,6 +4914,16 @@ impl VectorStore for LadybugStore {
             // may still point at it.
             if is_retired(&memory.payload.metadata) {
                 continue;
+            }
+            // An ingested node from a superseded generation must not have its
+            // structural (`contained_by`) edges replayed: only this source's
+            // active generation is live. Rules, facts and tasks (never
+            // generation-scoped) are always live.
+            if memory.payload.user_id == "auto-ingestor" {
+                match crate::parser::ingest::split_scoped_id(&memory.id) {
+                    Some((_, gen, _)) if gen == active_gen => {}
+                    _ => continue,
+                }
             }
             // Emit any shape warnings from this memory's metadata.
             let warnings = write_shape_warnings(&memory.payload);
@@ -4757,7 +4953,7 @@ impl VectorStore for LadybugStore {
             }
         }
 
-        if wanted.is_empty() {
+        if wanted.is_empty() && active_paths.is_empty() {
             return Ok(0);
         }
 
@@ -4768,7 +4964,11 @@ impl VectorStore for LadybugStore {
             );
         }
 
+        let namespace_owned = namespace.to_string();
         self.write_with_deadline("relinking the graph", move |conn| {
+            // Retire stubs before replaying edges: the replayed declaration
+            // then points at the real node, not the placeholder it replaced.
+            let _ = retire_replaced_stubs(conn, &namespace_owned, &active_paths)?;
             let mut created = 0usize;
             for (rel_type, pairs) in &wanted {
                 created += create_missing_edges(conn, rel_type, pairs)?;
@@ -5077,12 +5277,164 @@ impl VectorStore for LadybugStore {
         Ok(published)
     }
 
+    async fn begin_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        self.write_with_deadline("beginning a staging generation", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_sk = escape_ladybug_string(&source_key);
+
+            // Read the current counter (default 0), then write counter + 1 in
+            // the same write turn. The single-writer lock serialises this
+            // against every other store write, so the read and the bump are one
+            // atomic step and no two begins hand out the same generation. The
+            // counter is shared across sources (keyed by namespace alone), so a
+            // generation number never collides between two worktrees.
+            let read = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.counter",
+                safe_ns
+            );
+            let mut current: i64 = 0;
+            if let Ok(mut rows) = conn.query(&read) {
+                if let Some(row) = rows.next() {
+                    current = format!("{}", row[0]).parse::<i64>().unwrap_or(0);
+                }
+            }
+            let next = (current.max(0) as u64).saturating_add(1);
+
+            let write = format!(
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '', g.counter = {}, g.active_generation = 0 ON MATCH SET g.counter = {}",
+                safe_ns, safe_ns, next, next
+            );
+            conn.query(&write)?;
+
+            // Ensure this source has a pointer row. Its active generation is
+            // left untouched here: it stays on the last published generation
+            // until `publish_generation` flips it.
+            let pointer = format!(
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '{}', g.counter = 0, g.active_generation = 0",
+                escape_ladybug_string(&crate::parser::ingest::generation_key(
+                    &namespace,
+                    &source_key
+                )),
+                safe_ns,
+                safe_sk
+            );
+            conn.query(&pointer)?;
+
+            Ok(next)
+        })
+        .await
+    }
+
+    async fn publish_generation(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        self.write_with_deadline("publishing a staging generation", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_sk = escape_ladybug_string(&source_key);
+            // The flip is one statement on this source's pointer row: the active
+            // pointer moves to `generation` and the previous generation's rows
+            // stay as history. Another source's pointer is untouched.
+            let write = format!(
+                "MERGE (g:IngestGeneration {{id: '{}'}}) ON CREATE SET g.namespace = '{}', g.source_key = '{}', g.counter = 0, g.active_generation = {} ON MATCH SET g.active_generation = {}",
+                escape_ladybug_string(&crate::parser::ingest::generation_key(
+                    &namespace,
+                    &source_key
+                )),
+                safe_ns,
+                safe_sk,
+                generation,
+                generation
+            );
+            conn.query(&write)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn abort_generation(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        self.write_with_deadline("aborting a staging generation", move |conn| {
+            // A staged node's id is `ns::<generation>::<path>`, so every row of
+            // this generation shares the prefix. Nothing else matches it, and
+            // the previous generation is untouched.
+            let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' DETACH DELETE m",
+                escape_ladybug_string(&prefix)
+            );
+            conn.query(&query)?;
+
+            // Defensive: if this source's pointer somehow already names the
+            // aborted generation (abort is normally pre-publish), clear it so
+            // the superseded generation is never reachable.
+            let clear = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.active_generation = {} SET g.active_generation = 0",
+                escape_ladybug_string(&crate::parser::ingest::generation_key(
+                    &namespace,
+                    &source_key
+                )),
+                generation
+            );
+            conn.query(&clear)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn active_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        self.with_conn(move |conn| {
+            Ok(active_generation_of_source(conn, &namespace, &source_key))
+        })
+        .await
+    }
+
+    async fn generation_nodes(&self, namespace: &str, generation: u64) -> Result<Vec<String>> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.id STARTS WITH '{}' RETURN m.id",
+                escape_ladybug_string(&prefix)
+            );
+            let mut rows = conn.query(&query)?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next() {
+                ids.push(format!("{}", row[0]));
+            }
+            Ok(ids)
+        })
+        .await
+    }
+
     async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
         let namespace = namespace.to_string();
         let user_id = user_id.map(|v| v.to_string());
         let memory_type = memory_type.map(|v| v.to_string());
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
+
+            // The active generations for this namespace, read once so every
+            // generation-scoped row can be checked against them below. A row
+            // from a superseded generation is dropped; a row that is not
+            // generation-scoped (a rule, fact, task, or legacy id) is always
+            // kept, so the full-DB diagnostic callers keep seeing everything
+            // they always did.
+            let active_gens = active_generations_of(conn, &namespace);
 
             // Build WHERE clause with optional filters (R15: push into Cypher).
             let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
@@ -5101,6 +5453,11 @@ impl VectorStore for LadybugStore {
 
             for row in result {
                 let id: String = format!("{}", row[0]);
+                if let Some((_, gen, _)) = crate::parser::ingest::split_scoped_id(&id) {
+                    if !active_gens.contains(&gen) {
+                        continue; // superseded generation: not reachable
+                    }
+                }
                 let content: String = format!("{}", row[1]);
                 let uid: String = format!("{}", row[2]);
                 let memory_type: String = format!("{}", row[3]);
@@ -5248,10 +5605,13 @@ impl VectorStore for LadybugStore {
             let hidden_stage_namespaces =
                 read_hidden_stage_namespaces(conn, &db_path, &path_aliases)?;
 
-            // 1. Fetch all nodes
+            // 1. Fetch all nodes. Generation-scoped nodes from a superseded
+            //    generation are dropped against the live `(namespace, gen)`
+            //    set read once below, matching `list`'s superseded filter.
             let mut nodes = Vec::new();
             let mut retired_ids = std::collections::HashSet::new();
             let mut hidden_stage_ids = std::collections::HashSet::new();
+            let active_gens = all_active_generations(conn);
             let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
             let mut result_nodes = conn.query(query_nodes)?;
 
@@ -5265,6 +5625,16 @@ impl VectorStore for LadybugStore {
                 let memory_type = if let lbug::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
                 let content = if let lbug::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
                 let location = if let lbug::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
+
+                // A generation-scoped node whose `(namespace, generation)` is not
+                // live was superseded: excluded from the export and its edges
+                // dropped below (via `retired_ids`), exactly as `list` does.
+                if let Some((_, gen, _)) = crate::parser::ingest::split_scoped_id(&id) {
+                    if !active_gens.contains(&(namespace.clone(), gen)) {
+                        retired_ids.insert(id.clone());
+                        continue;
+                    }
+                }
 
                 let mut absolute_path = "".to_string();
                 let mut domain = None;
@@ -5517,6 +5887,787 @@ impl crate::traits::AsAny for LadybugStore {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// A zero vector of `dimensions` floats, decimal-formatted for the engine's
+/// `ARRAY_DISTANCE` binder (R16) -- the shape structural nodes store.
+fn zero_vector_str(dimensions: usize) -> String {
+    format!("[{}]", vec!["0.0"; dimensions].join(","))
+}
+
+/// Materialises a stub `file` node for a `GOVERNS` target that does not exist
+/// yet (spec §3.2). The stub carries the legacy two-segment qualified id
+/// (`namespace::path`), so `logical_path_of` still recovers the bare path a
+/// rule names, and a later ingest replaces it. `ON CREATE` only: an existing
+/// node is never overwritten.
+fn materialize_stub_file_node(
+    conn: &Connection,
+    namespace: &str,
+    declared: &str,
+    zero_vec: &str,
+    pk_ready: bool,
+) -> Result<String> {
+    // A declaration that names a directory carries a trailing slash (the same
+    // convention `KnownIds::resolve` already honours); an unindexed ancestor
+    // directory must materialise as `directory` so the graph-read's
+    // `AncestorDirectory` match finds it.
+    let is_directory = declared.ends_with('/');
+    let node_path = crate::parser::ingest::normalize_node_path(declared);
+    if node_path.is_empty() {
+        anyhow::bail!("cannot materialise a stub node for an empty path");
+    }
+    let stub_id = crate::parser::ingest::qualified_id(namespace, &node_path);
+    let safe_id = escape_ladybug_string(&stub_id);
+    let safe_ns = escape_ladybug_string(namespace);
+    let safe_location = escape_ladybug_string(&node_path);
+    let memory_type = if is_directory { "directory" } else { "file" };
+    let metadata = serde_json::json!({ "stub": true, "absolute_path": node_path });
+    let safe_metadata = escape_ladybug_string(&serde_json::to_string(&metadata)?);
+    // On a pk-keyed table the primary key is create input: the MERGE
+    // pattern must carry the derived pk (the same shape the upsert's
+    // prepared MERGE uses), or the engine refuses the create. In legacy
+    // mode the fragment is empty and the statement is unchanged.
+    let pk_pattern = if pk_ready {
+        format!(
+            "pk: '{}', ",
+            escape_ladybug_string(&memory_pk(namespace, &stub_id))
+        )
+    } else {
+        String::new()
+    };
+    let query = format!(
+        "MERGE (m:Memory {{{}id: '{}'}}) ON CREATE SET m.namespace = '{}', m.content = '', m.user_id = 'auto-ingestor', m.memory_type = '{}', m.agent_name = 'neurostrata-stub', m.location = '{}', m.location_lines = '', m.metadata = '{}', m.embedding = {}",
+        pk_pattern, safe_id, safe_ns, memory_type, safe_location, safe_metadata, zero_vec
+    );
+    conn.query(&query)?;
+    Ok(stub_id)
+}
+
+/// Deletes stub nodes (`agent_name = 'neurostrata-stub'`) whose logical path is
+/// now held by the published generation, so a placeholder never shadows the
+/// real ingested node that replaced it.
+fn retire_replaced_stubs(
+    conn: &Connection,
+    namespace: &str,
+    active_paths: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    let query = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.agent_name = 'neurostrata-stub' RETURN m.id",
+        escape_ladybug_string(namespace)
+    );
+    let mut rows = conn.query(&query)?;
+    let mut stubs = Vec::new();
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        let path = crate::parser::ingest::logical_path_of(&id);
+        if active_paths.contains(path) {
+            stubs.push(id);
+        }
+    }
+    let mut removed = 0usize;
+    for id in stubs {
+        let del = format!(
+            "MATCH (m:Memory {{id: '{}'}}) DETACH DELETE m",
+            escape_ladybug_string(&id)
+        );
+        conn.query(&del)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Whether `ancestor` is a directory prefix of `path`: strict, at a `/`
+/// boundary, so `src` matches `src/lib.rs` but `sr` and `src/lib` do not match
+/// `src/lib.rs`.
+fn is_ancestor_of(ancestor: &str, path: &str) -> bool {
+    !ancestor.is_empty()
+        && ancestor != path
+        && path.starts_with(ancestor)
+        && path[ancestor.len()..].starts_with('/')
+}
+
+/// Whether a symbol node's logical path (`path#kind:name@hash`) is the named
+/// symbol in `path`.
+fn is_symbol_of(logical_path: &str, path: &str, symbol: &str) -> bool {
+    let Some(rest) = logical_path.strip_prefix(path) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('#') else {
+        return false;
+    };
+    let Some((_kind, name_at_hash)) = rest.split_once(':') else {
+        return false;
+    };
+    let name = name_at_hash.split('@').next().unwrap_or(name_at_hash);
+    name == symbol
+}
+
+/// Runs one edge query and turns its rows into hits. `kind_of` maps a returned
+/// target id to the match kind it represents; `edge_name` names the relation in
+/// the explanation (`governs` vs `relates to`).
+fn edge_hits_from_rows(
+    conn: &Connection,
+    query: &str,
+    memory_types: &[String],
+    kind_of: impl Fn(&str) -> GraphMatchKind,
+    edge_name: &str,
+) -> Result<Vec<MemoryHit>> {
+    let now = chrono::Utc::now().timestamp();
+    let mut rows = conn.query(query)?;
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next() {
+        let target_id = format!("{}", row[0]);
+        let id = format!("{}", row[1]);
+        let content = format!("{}", row[2]);
+        let memory_type = format!("{}", row[3]);
+        let metadata: Value =
+            serde_json::from_str(&format!("{}", row[4])).unwrap_or(Value::Null);
+
+        if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &memory_type) {
+            continue;
+        }
+        if is_archived(&metadata) || is_retired_at(&metadata, now) || is_mesh_conflicting(&metadata)
+        {
+            continue;
+        }
+        let access_count = metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        hits.push(MemoryHit {
+            id,
+            memory_type,
+            content,
+            match_kind: kind_of(&target_id),
+            access_count,
+            explanation: format!("{} {}", edge_name, target_id),
+            metadata,
+        });
+    }
+    Ok(hits)
+}
+
+/// The graph-edge paths that reach a governing or related memory: direct
+/// `GOVERNS` onto the candidate targets, 2-hop symbol governance
+/// (`memory -GOVERNS-> symbol <-CONTAINS- file`), and `RELATES_TO` onto the
+/// candidate targets in both directions (the relation is undirected).
+fn graph_hits_from_edges(
+    conn: &Connection,
+    namespace: &str,
+    candidates: &[(String, GraphMatchKind)],
+    file_ids: &[String],
+    memory_types: &[String],
+) -> Result<Vec<MemoryHit>> {
+    let safe_ns = escape_ladybug_string(namespace);
+    let mut hits = Vec::new();
+
+    if !candidates.is_empty() {
+        let id_list = candidates
+            .iter()
+            .map(|(id, _)| format!("'{}'", escape_ladybug_string(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let kind_by_id: std::collections::HashMap<&str, GraphMatchKind> = candidates
+            .iter()
+            .map(|(id, kind)| (id.as_str(), *kind))
+            .collect();
+
+        let governs_query = format!(
+            "MATCH (m:Memory)-[:GOVERNS]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            id_list, safe_ns
+        );
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &governs_query,
+            memory_types,
+            |target| {
+                kind_by_id
+                    .get(target)
+                    .copied()
+                    .unwrap_or(GraphMatchKind::MetadataFallback)
+            },
+            "governs",
+        )?);
+
+        // RELATES_TO is undirected, so both orientations are queried explicitly
+        // (the stored edge is still a directed row).
+        let relates_out_query = format!(
+            "MATCH (m:Memory)-[:RELATES_TO]->(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            id_list, safe_ns
+        );
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &relates_out_query,
+            memory_types,
+            |_| GraphMatchKind::Related,
+            "relates to",
+        )?);
+        let relates_in_query = format!(
+            "MATCH (m:Memory)<-[:RELATES_TO]-(t:Memory) WHERE t.id IN [{}] AND m.namespace = '{}' RETURN t.id, m.id, m.content, m.memory_type, m.metadata",
+            id_list, safe_ns
+        );
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &relates_in_query,
+            memory_types,
+            |_| GraphMatchKind::Related,
+            "relates to",
+        )?);
+    }
+
+    if !file_ids.is_empty() {
+        let file_list = file_ids
+            .iter()
+            .map(|id| format!("'{}'", escape_ladybug_string(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "MATCH (m:Memory)-[:GOVERNS]->(sym:Memory)<-[:CONTAINS]-(f:Memory) WHERE f.id IN [{}] AND m.namespace = '{}' RETURN sym.id, m.id, m.content, m.memory_type, m.metadata",
+            file_list, safe_ns
+        );
+        hits.extend(edge_hits_from_rows(
+            conn,
+            &query,
+            memory_types,
+            |_| GraphMatchKind::SymbolTwoHop,
+            "governs",
+        )?);
+    }
+
+    Ok(hits)
+}
+
+/// Whether an id is reachable under the active generation set: a
+/// generation-scoped id is reachable only when its generation is active, while
+/// a non-scoped id (a rule/fact/procedure id, or a pre-generation stub) is
+/// always reachable.
+fn is_active_id(id: &str, active_gens: &std::collections::HashSet<u64>) -> bool {
+    match crate::parser::ingest::split_scoped_id(id) {
+        Some((_, gen, _)) => active_gens.contains(&gen),
+        None => true,
+    }
+}
+
+/// Discovers the target nodes a query can match: the exact file node, the
+/// exact symbol nodes (when a symbol is named), and the ancestor directory
+/// nodes (when `include_ancestors`). The lookups are location-scoped Cypher
+/// queries rather than a whole-namespace scan, and each row is then narrowed
+/// to the active generation set so a superseded tree never contributes.
+fn discover_candidates(
+    conn: &Connection,
+    safe_ns: &str,
+    path: &str,
+    symbol: Option<&str>,
+    include_ancestors: bool,
+    active_gens: &std::collections::HashSet<u64>,
+) -> Result<(Vec<String>, Vec<(String, GraphMatchKind)>)> {
+    let mut file_ids: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, GraphMatchKind)> = Vec::new();
+
+    // The file node and its symbol nodes share `location = path`: the file's
+    // logical path is the path itself, a symbol's is `path#kind:name@hash`.
+    let safe_path = escape_ladybug_string(path);
+    let query = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id",
+        safe_ns, safe_path
+    );
+    let mut rows = conn.query(&query)?;
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        if !is_active_id(&id, active_gens) {
+            continue;
+        }
+        let logical = crate::parser::ingest::logical_path_of(&id);
+        if logical == path {
+            file_ids.push(id.clone());
+            candidates.push((id.clone(), GraphMatchKind::ExactFile));
+        } else if let Some(sym) = symbol {
+            if is_symbol_of(logical, path, sym) {
+                candidates.push((id.clone(), GraphMatchKind::ExactSymbol));
+            }
+        }
+    }
+
+    if include_ancestors {
+        let dir_query = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.memory_type = 'directory' RETURN m.id, m.location",
+            safe_ns
+        );
+        let mut rows = conn.query(&dir_query)?;
+        while let Some(row) = rows.next() {
+            let id = format!("{}", row[0]);
+            if !is_active_id(&id, active_gens) {
+                continue;
+            }
+            let location = format!("{}", row[1]);
+            if is_ancestor_of(&location, path) {
+                candidates.push((id.clone(), GraphMatchKind::AncestorDirectory));
+            }
+        }
+    }
+
+    Ok((file_ids, candidates))
+}
+
+/// The metadata fallback: a memory whose `metadata.governs` declares the path
+/// (or an ancestor) but whose edge never materialised -- e.g. the declaration
+/// predates the stub behaviour, or the target is outside the ingested tree.
+///
+/// The query is scoped to the memory types asked for (rules/facts/procedures
+/// by default), so the ingested AST bulk -- file/symbol/directory rows, which
+/// never carry a `governs` declaration -- is never scanned.
+fn add_metadata_fallback_conn(
+    conn: &Connection,
+    safe_ns: &str,
+    hits: &mut Vec<MemoryHit>,
+    path: &str,
+    include_ancestors: bool,
+    memory_types: &[String],
+) -> Result<()> {
+    // An empty `memory_types` means "no type filter" (the trait contract), so
+    // the type condition is omitted entirely; a non-empty list is pushed into
+    // the WHERE clause so only those rows are read.
+    let type_condition = if memory_types.is_empty() {
+        None
+    } else {
+        let list = memory_types
+            .iter()
+            .map(|t| format!("'{}'", escape_ladybug_string(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!("m.memory_type IN [{}]", list))
+    };
+    let where_clause = match &type_condition {
+        Some(tc) => format!("m.namespace = '{}' AND {}", safe_ns, tc),
+        None => format!("m.namespace = '{}'", safe_ns),
+    };
+    let query = format!(
+        "MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.memory_type, m.metadata",
+        where_clause
+    );
+    let now = chrono::Utc::now().timestamp();
+    let mut rows = conn.query(&query)?;
+    while let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        let content = format!("{}", row[1]);
+        let memory_type = format!("{}", row[2]);
+        let metadata: Value =
+            serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+        if is_archived(&metadata)
+            || is_retired_at(&metadata, now)
+            || is_mesh_conflicting(&metadata)
+        {
+            continue;
+        }
+        let governs = match metadata.get("governs") {
+            Some(Value::Array(arr)) => arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+            _ => continue,
+        };
+        for declared in governs {
+            let normalized = crate::parser::ingest::normalize_node_path(declared);
+            let matched =
+                normalized == path || (include_ancestors && is_ancestor_of(&normalized, path));
+            if matched {
+                let access_count = metadata
+                    .get("access_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                hits.push(MemoryHit {
+                    id,
+                    memory_type,
+                    content,
+                    match_kind: GraphMatchKind::MetadataFallback,
+                    access_count,
+                    explanation: format!("declares governs {}", normalized),
+                    metadata,
+                });
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Keep the best hit per memory id: a lower match-kind priority wins, so a
+/// direct `GOVERNS` edge is never shadowed by a weaker metadata-fallback hit.
+fn dedup_hits(hits: &mut Vec<MemoryHit>) {
+    use std::collections::hash_map::Entry;
+    let mut best: std::collections::HashMap<String, MemoryHit> = std::collections::HashMap::new();
+    for hit in hits.drain(..) {
+        match best.entry(hit.id.clone()) {
+            Entry::Vacant(e) => {
+                e.insert(hit);
+            }
+            Entry::Occupied(mut e) => {
+                if hit.match_kind.priority() < e.get().match_kind.priority() {
+                    e.insert(hit);
+                }
+            }
+        }
+    }
+    hits.extend(best.into_values());
+}
+
+#[async_trait::async_trait]
+impl GraphRead for LadybugStore {
+    async fn memories_for_file(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        path: &str,
+        symbol: Option<&str>,
+        include_ancestors: bool,
+        memory_types: &[String],
+        exclude_ids: &[String],
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        let namespace = namespace.to_string();
+        let path = crate::parser::ingest::normalize_node_path(path);
+        let symbol = symbol.map(|s| s.to_string());
+        let memory_types = memory_types.to_vec();
+        let exclude_ids = exclude_ids.to_vec();
+        let limit = limit.min(crate::graph_read::memories_for_file::MAX_LIMIT);
+        let source = source.map(|s| s.to_string());
+
+        let ns = namespace.clone();
+        let path_c = path.clone();
+        let sym_c = symbol.clone();
+        let types = memory_types.clone();
+
+        let mut hits = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&ns);
+
+                // A source key pins the query to that source's active
+                // generation; `None` keeps every published generation (the
+                // same set `list` reads).
+                let active_gens: std::collections::HashSet<u64> = match &source {
+                    Some(s) => {
+                        let g = active_generation_of_source(conn, &ns, s);
+                        if g > 0 {
+                            [g].into_iter().collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        }
+                    }
+                    None => active_generations_of(conn, &ns),
+                };
+
+                let (file_ids, candidates) = discover_candidates(
+                    conn,
+                    &safe_ns,
+                    &path_c,
+                    sym_c.as_deref(),
+                    include_ancestors,
+                    &active_gens,
+                )?;
+
+                let mut hits =
+                    graph_hits_from_edges(conn, &ns, &candidates, &file_ids, &types)?;
+
+                add_metadata_fallback_conn(
+                    conn,
+                    &safe_ns,
+                    &mut hits,
+                    &path_c,
+                    include_ancestors,
+                    &types,
+                )?;
+
+                Ok(hits)
+            })
+            .await?;
+
+        // Exclusion happens before the limit is applied, so an excluded hit
+        // never crowds out a live one.
+        if !exclude_ids.is_empty() {
+            hits.retain(|h| !exclude_ids.iter().any(|e| e == &h.id));
+        }
+
+        dedup_hits(&mut hits);
+        crate::graph_read::memories_for_file::rank_hits(&mut hits);
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    async fn related(
+        &self,
+        namespace: &str,
+        seed: &str,
+        relations: &[String],
+        direction: crate::graph_read::related::Direction,
+        max_hops: usize,
+        memory_types: &[String],
+        limit: usize,
+        cursor: Option<&crate::graph_read::related::Cursor>,
+    ) -> Result<crate::graph_read::related::RelatedResult> {
+        let namespace = namespace.to_string();
+        let seed = seed.to_string();
+        let relations = relations.to_vec();
+        let memory_types = memory_types.to_vec();
+        let max_hops = crate::graph_read::related::clamp_max_hops(max_hops);
+        let limit = crate::graph_read::related::clamp_limit(limit);
+
+        let ns = namespace.clone();
+        let seed_c = seed.clone();
+        let rels = relations.clone();
+
+        let (nodes, edges, generation) = self
+            .with_conn(move |conn| {
+                fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops)
+            })
+            .await?;
+
+        Ok(crate::graph_read::related::graph_read_related(
+            &seed,
+            &nodes,
+            &edges,
+            &relations,
+            direction,
+            max_hops,
+            &memory_types,
+            limit,
+            generation,
+            cursor,
+        ))
+    }
+}
+
+/// How many edge rows one traversal level may fetch (bounding the Cypher read;
+/// the in-memory traversal applies the tighter `MAX_NODES`/`MAX_EDGES` budget).
+const RELATED_FETCH_LIMIT: usize = 500;
+
+/// Fetch the bounded subgraph within `max_hops` of `seed`: the seed node plus
+/// its neighbours out to the hop limit, each row-class-filtered (retired /
+/// archived / mesh-conflicting / registry / superseded generation). Returns the
+/// in-memory `NodeSpec`/`EdgeSpec` lists the pure traversal consumes, plus the
+/// active generation the cursor fingerprint must match.
+fn fetch_related_subgraph(
+    conn: &Connection,
+    namespace: &str,
+    seed: &str,
+    relations: &[String],
+    max_hops: usize,
+) -> Result<(
+    Vec<crate::graph_read::related::NodeSpec>,
+    Vec<crate::graph_read::related::EdgeSpec>,
+    u64,
+)> {
+    use crate::graph_read::related::{EdgeSpec, NodeSpec};
+
+    let safe_ns = escape_ladybug_string(namespace);
+    let now = chrono::Utc::now().timestamp();
+    let active_gens = active_generations_of(conn, namespace);
+    let generation = active_gens.iter().copied().max().unwrap_or(0);
+
+    let allowed: std::collections::HashSet<&str> = if relations.is_empty() {
+        crate::graph_read::related::DEFAULT_RELATIONS
+            .iter()
+            .copied()
+            .collect()
+    } else {
+        relations
+            .iter()
+            .map(String::as_str)
+            .filter(|r| crate::graph_read::related::is_allowed_relation(r))
+            .collect()
+    };
+
+    let to_node_spec = |id: String,
+                        memory_type: String,
+                        content: String,
+                        metadata: &Value|
+     -> NodeSpec {
+        let visible = is_active_id(&id, &active_gens)
+            && !is_archived(metadata)
+            && !is_retired_at(metadata, now)
+            && !is_mesh_conflicting(metadata)
+            && !crate::registry::is_registry_row(metadata);
+        NodeSpec {
+            id,
+            memory_type,
+            content,
+            domain: metadata
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            freshness: metadata
+                .get("verification")
+                .and_then(|v| v.get("status"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+            lifecycle: metadata
+                .get("superseded_by")
+                .and_then(|v| v.as_str())
+                .map(|_| "superseded".to_string()),
+            visible,
+        }
+    };
+
+    let mut nodes: std::collections::HashMap<String, NodeSpec> =
+        std::collections::HashMap::new();
+    let mut edges: Vec<EdgeSpec> = Vec::new();
+
+    // Resolve the seed: an exact id first (memory/task/qualified id), then a
+    // normalized path against `location` (file/symbol nodes).
+    let mut seed_id: Option<String> = None;
+    let exact_q = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.id, m.memory_type, m.content, m.metadata",
+        safe_ns,
+        escape_ladybug_string(seed)
+    );
+    let mut rows = conn.query(&exact_q)?;
+    if let Some(row) = rows.next() {
+        let id = format!("{}", row[0]);
+        let memory_type = format!("{}", row[1]);
+        let content = format!("{}", row[2]);
+        let metadata: Value = serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+        seed_id = Some(id.clone());
+        nodes.insert(
+            id.clone(),
+            to_node_spec(id, memory_type, content, &metadata),
+        );
+    }
+
+    if seed_id.is_none() {
+        let normalized = crate::parser::ingest::normalize_node_path(seed);
+        let loc_q = format!(
+            "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.location = '{}' RETURN m.id, m.memory_type, m.content, m.metadata ORDER BY m.memory_type ASC",
+            safe_ns,
+            escape_ladybug_string(&normalized)
+        );
+        let mut rows = conn.query(&loc_q)?;
+        // Prefer the file node over a symbol over any other row.
+        let mut candidate: Option<(String, String, String, Value)> = None;
+        while let Some(row) = rows.next() {
+            let id = format!("{}", row[0]);
+            let memory_type = format!("{}", row[1]);
+            let content = format!("{}", row[2]);
+            let metadata: Value =
+                serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+            let prefer = match (candidate.as_ref().map(|c| c.1.as_str()), memory_type.as_str()) {
+                (_, "file") => true,
+                (Some("file"), _) => false,
+                (Some("symbol"), "directory") => false,
+                _ => candidate.is_none(),
+            };
+            if prefer || candidate.is_none() {
+                candidate = Some((id, memory_type, content, metadata));
+            }
+        }
+        if let Some((id, memory_type, content, metadata)) = candidate {
+            seed_id = Some(id.clone());
+            nodes.insert(id.clone(), to_node_spec(id, memory_type, content, &metadata));
+        }
+    }
+
+    let Some(seed_id) = seed_id else {
+        return Ok((Vec::new(), Vec::new(), generation));
+    };
+
+    // BFS out to `max_hops`, fetching both orientations (the pure traversal
+    // reapplies the direction allowlist). Only same-namespace neighbours are
+    // ever read, so the traversal can never leak across namespaces.
+    let mut frontier: Vec<String> = vec![seed_id.clone()];
+    let mut seen: std::collections::HashSet<String> = [seed_id].into_iter().collect();
+
+    for _hop in 0..max_hops {
+        if frontier.is_empty() {
+            break;
+        }
+        let id_list = frontier
+            .iter()
+            .map(|id| format!("'{}'", escape_ladybug_string(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut next_frontier = Vec::new();
+
+        let out_q = format!(
+            "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' RETURN a.id, label(e), b.id, b.memory_type, b.content, b.metadata LIMIT {}",
+            id_list, safe_ns, RELATED_FETCH_LIMIT
+        );
+        {
+            let mut rows = conn.query(&out_q)?;
+            while let Some(row) = rows.next() {
+                let frontier_id = format!("{}", row[0]);
+                let relation = format!("{}", row[1]);
+                let neighbor_id = format!("{}", row[2]);
+                let neighbor_type = format!("{}", row[3]);
+                let neighbor_content = format!("{}", row[4]);
+                let neighbor_meta: Value =
+                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
+                if !allowed.contains(relation.as_str()) {
+                    continue;
+                }
+                edges.push(EdgeSpec {
+                    source: frontier_id.clone(),
+                    relation: relation.clone(),
+                    target: neighbor_id.clone(),
+                });
+                if !nodes.contains_key(&neighbor_id) {
+                    nodes.insert(
+                        neighbor_id.clone(),
+                        to_node_spec(
+                            neighbor_id.clone(),
+                            neighbor_type,
+                            neighbor_content,
+                            &neighbor_meta,
+                        ),
+                    );
+                }
+                if !seen.contains(&neighbor_id) {
+                    seen.insert(neighbor_id.clone());
+                    next_frontier.push(neighbor_id);
+                }
+            }
+        }
+
+        let in_q = format!(
+            "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' RETURN a.id, label(e), b.id, b.memory_type, b.content, b.metadata LIMIT {}",
+            id_list, safe_ns, RELATED_FETCH_LIMIT
+        );
+        {
+            let mut rows = conn.query(&in_q)?;
+            while let Some(row) = rows.next() {
+                let frontier_id = format!("{}", row[0]);
+                let relation = format!("{}", row[1]);
+                let neighbor_id = format!("{}", row[2]);
+                let neighbor_type = format!("{}", row[3]);
+                let neighbor_content = format!("{}", row[4]);
+                let neighbor_meta: Value =
+                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
+                if !allowed.contains(relation.as_str()) {
+                    continue;
+                }
+                edges.push(EdgeSpec {
+                    source: neighbor_id.clone(),
+                    relation: relation.clone(),
+                    target: frontier_id.clone(),
+                });
+                if !nodes.contains_key(&neighbor_id) {
+                    nodes.insert(
+                        neighbor_id.clone(),
+                        to_node_spec(
+                            neighbor_id.clone(),
+                            neighbor_type,
+                            neighbor_content,
+                            &neighbor_meta,
+                        ),
+                    );
+                }
+                if !seen.contains(&neighbor_id) {
+                    seen.insert(neighbor_id.clone());
+                    next_frontier.push(neighbor_id);
+                }
+            }
+        }
+
+        frontier = next_frontier;
+    }
+
+    let nodes: Vec<NodeSpec> = nodes.into_values().collect();
+    Ok((nodes, edges, generation))
 }
 
 /// IntakeStore implementation for LadybugStore (PQTH durable intake ledger).
@@ -6131,31 +7282,42 @@ fn is_retired_at(metadata: &Value, now: i64) -> bool {
 }
 
 /// The ids a declared edge target could stand for when it is not already a
-/// qualified id: the declaration qualified by the memory's own namespace, and
-/// every separator-anchored suffix of it, bare and qualified. A suffix is how a
+/// qualified id: the declaration generation-scoped into the active generation,
+/// and every separator-anchored suffix of it, bare and scoped. A suffix is how a
 /// legacy absolute path finds the file it meant.
-fn declared_target_candidates(namespace: &str, declared: &str) -> Vec<String> {
+fn declared_target_candidates(namespace: &str, active_gen: u64, declared: &str) -> Vec<String> {
     let declared = declared.replace('\\', "/");
-    let mut candidates = vec![crate::parser::ingest::qualified_id(namespace, &declared)];
+    let mut candidates =
+        vec![crate::parser::ingest::generation_scoped_id(namespace, active_gen, &declared)];
     for (cut, _) in declared.match_indices('/') {
         let suffix = &declared[cut + 1..];
         if !suffix.is_empty() {
             candidates.push(suffix.to_string());
-            candidates.push(crate::parser::ingest::qualified_id(namespace, suffix));
+            candidates.push(crate::parser::ingest::generation_scoped_id(
+                namespace,
+                active_gen,
+                suffix,
+            ));
         }
     }
     candidates
 }
 
-/// Chooses among the ids that exist: the memory's own namespace first, then the
-/// id exactly as declared, then a suffix -- but only one. An ambiguous suffix
-/// produces no edge, because a wrong edge is worse than a missing one.
+/// Chooses among the ids that exist: the memory's own namespace first (in the
+/// active generation), then the id exactly as declared, then a suffix -- but
+/// only one. An ambiguous suffix produces no edge, because a wrong edge is
+/// worse than a missing one.
 fn pick_declared_target(
     namespace: &str,
+    active_gen: u64,
     declared: &str,
     found: &[String],
 ) -> crate::traits::TargetResolution {
-    let qualified = crate::parser::ingest::qualified_id(namespace, &declared.replace('\\', "/"));
+    let qualified = crate::parser::ingest::generation_scoped_id(
+        namespace,
+        active_gen,
+        &declared.replace('\\', "/"),
+    );
     if found.iter().any(|id| *id == qualified) {
         return crate::traits::TargetResolution::Resolved(qualified);
     }
@@ -6225,7 +7387,8 @@ fn resolve_target_on_write(
     namespace: &str,
     declared: &str,
 ) -> crate::traits::TargetResolution {
-    let candidates = declared_target_candidates(namespace, declared)
+    let active_gen = active_generation_of(conn, namespace);
+    let candidates = declared_target_candidates(namespace, active_gen, declared)
         .iter()
         .map(|c| format!("'{}'", escape_ladybug_string(c)))
         .collect::<Vec<_>>()
@@ -6244,7 +7407,7 @@ fn resolve_target_on_write(
     while let Some(row) = rows.next() {
         found.push(format!("{}", row[0]));
     }
-    pick_declared_target(namespace, declared, &found)
+    pick_declared_target(namespace, active_gen, declared, &found)
 }
 
 /// Fails a future that outstays its deadline, with a message that says what was
@@ -7400,6 +8563,25 @@ mod tests {
     /// the refusal is expected no later; the 1024-row bound is ~5x
     /// headroom over the probe's 208 and is unreachable unless the cap
     /// is not enforced at all.
+    ///
+    /// Re-tuned 2026-11-01 (owner's decision, fork forward-merge to
+    /// upstream v1.14.3-patch): upstream's IngestGeneration DDL adds
+    /// a table whose pages shift the checkpoint's buffer-pool
+    /// geometry in the merged tree. With the original 4 KiB filler
+    /// the pool starved at row ~127, and with 2 KiB filler at row
+    /// ~255 — in both cases the pool died with the data file short
+    /// of its 1024-page group (807 and 968 pages respectively), so
+    /// the buffer-pool error fired before the frame-group accounting
+    /// could. (Disabling only the IngestGeneration DDL restored the
+    /// pre-merge behaviour exactly: refusal at row 174 via the
+    /// max-DB-size error, with per-row file growth byte-identical
+    /// between the trees.) At 1 KiB filler the per-checkpoint merge
+    /// working set stays small enough that the data file completes
+    /// its group: the max-DB-size refusal was observed at row 455
+    /// with the data file at 1023 pages. The 1024-row bound is ~2.2x
+    /// headroom over that observation and remains unreachable unless
+    /// the cap is not enforced at all. The assertion itself is
+    /// unchanged: the refusal must be the engine's max-DB-size error.
     #[tokio::test]
     #[ignore = "child worker: spawned by profile_cap_refusal_fires_at_reduced_cap"]
     async fn profile_cap_refusal_child_worker() {
@@ -7515,19 +8697,22 @@ mod tests {
     }
 
     /// Deterministic incompressible filler: xorshift64* output, hex
-    /// encoded — 256 words become a 4 KiB string. Hex of pseudo-random
+    /// encoded — 64 words become a 1 KiB string. Hex of pseudo-random
     /// bytes carries 4 bits of entropy per stored character, so even
     /// ideal entropy coding could at best halve it — where
     /// repeated-character filler compresses ~1000:1 and plateaus at
     /// ~2.2 MB, never approaching any cap (CI fix loop round 2 probe).
     /// The width is deliberately narrow: at 32 KiB per row the buffer
     /// pool starved during checkpoint merges before the size cap could
-    /// fire (round 4 probe — see the child worker's row math). The
-    /// growth loop's row bound is sized to survive the halving.
+    /// fire (round 4 probe — see the child worker's row math), and the
+    /// 2026-11-01 re-tune (see the child worker's row math) narrowed
+    /// the filler from 4 KiB to 1 KiB because the merged tree's
+    /// checkpoint pool geometry leaves less headroom. The growth
+    /// loop's row bound is sized to survive the halving.
     fn incompressible_filler(seed: u64) -> String {
         let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
-        let mut out = String::with_capacity(4 * 1024);
-        for _ in 0..256 {
+        let mut out = String::with_capacity(1024);
+        for _ in 0..64 {
             state ^= state >> 12;
             state ^= state << 25;
             state ^= state >> 27;
@@ -8922,6 +10107,11 @@ mod tests {
         }
     }
 
+    /// The canonical source key used by the relink/publish seed helpers. A real
+    /// ingest derives it from the directory path (`source_key_for`); the unit
+    /// tests pin a stable literal so the source-scoped pointer is deterministic.
+    const PROBE_SOURCE: &str = "/worktrees/probe";
+
     /// The resolution rule as every caller now reaches it: build the index
     /// once, then ask it.
     fn resolve(declared: &str, known: &[String]) -> Option<String> {
@@ -9908,7 +11098,7 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        store.relink_edges("probe").await.expect("relink");
+        store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
 
         assert_eq!(
             governs_edges_from(&store, "live-rule").await,
@@ -9981,32 +11171,37 @@ eurostrata\src\daemon.rs",
 
     #[test]
     fn a_declaration_prefers_its_own_namespace_then_its_exact_id_then_one_suffix() {
-        let both = vec!["probe::src/a.rs".to_string(), "src/a.rs".to_string()];
+        // Generation 5 is active; the qualified form is now generation-scoped.
+        let scoped = crate::parser::ingest::generation_scoped_id("probe", 5, "src/a.rs");
+        let both = vec![scoped.clone(), "src/a.rs".to_string()];
         assert!(matches!(
-            pick_declared_target("probe", "src/a.rs", &both),
-            crate::traits::TargetResolution::Resolved(ref id) if id == "probe::src/a.rs"
+            pick_declared_target("probe", 5, "src/a.rs", &both),
+            crate::traits::TargetResolution::Resolved(ref id) if *id == scoped
         ));
         assert!(matches!(
-            pick_declared_target("probe", "src/a.rs", &["src/a.rs".to_string()]),
+            pick_declared_target("probe", 5, "src/a.rs", &["src/a.rs".to_string()]),
             crate::traits::TargetResolution::Resolved(ref id) if id == "src/a.rs"
         ));
         assert!(matches!(
-            pick_declared_target("probe", "C:/old/src/a.rs", &["probe::src/a.rs".to_string()]),
-            crate::traits::TargetResolution::Resolved(ref id) if id == "probe::src/a.rs"
+            pick_declared_target("probe", 5, "C:/old/src/a.rs", &[scoped.clone()]),
+            crate::traits::TargetResolution::Resolved(ref id) if *id == scoped
         ));
         assert!(
             matches!(
                 pick_declared_target(
                     "probe",
+                    5,
                     "C:/old/src/a.rs",
-                    &["probe::src/a.rs".to_string(), "probe::a.rs".to_string()]
+                    &[
+                        scoped.clone(),
+                        crate::parser::ingest::generation_scoped_id("probe", 5, "a.rs"),
+                    ]
                 ),
                 crate::traits::TargetResolution::Ambiguous(_)
             ),
             "an ambiguous suffix is left alone"
         );
-        assert!(declared_target_candidates("probe", "C:/old/src/a.rs")
-            .contains(&"probe::src/a.rs".to_string()));
+        assert!(declared_target_candidates("probe", 5, "C:/old/src/a.rs").contains(&scoped));
     }
 
     #[tokio::test]
@@ -11091,7 +12286,10 @@ eurostrata\src\daemon.rs",
                 retired_test_payload(
                     "rule",
                     "agent",
-                    json!({ "governs": ["src/not-ingested.rs"] }),
+                    // A qualified cross-namespace target never gets a stub
+                    // (spec §3.2: stubs are only for the unqualified missing
+                    // case), so it still defers with `Missing`.
+                    json!({ "governs": ["other-ns::src/not-ingested.rs"] }),
                 ),
             )
             .await
@@ -11102,7 +12300,7 @@ eurostrata\src\daemon.rs",
         assert_eq!(report.deferred_edges[0].rel_type, "GOVERNS");
         assert_eq!(
             report.deferred_edges[0].declared_target,
-            "src/not-ingested.rs"
+            "other-ns::src/not-ingested.rs"
         );
         assert_eq!(report.deferred_edges[0].declaration_index, 0);
         assert!(matches!(
@@ -11111,21 +12309,315 @@ eurostrata\src\daemon.rs",
         ));
     }
 
+    /// Spec §3.2: an unqualified `GOVERNS` target that resolves to `Missing`
+    /// auto-materialises a stub `file` node, so the edge forms immediately.
+    #[tokio::test]
+    async fn a_missing_unqualified_governs_target_materialises_a_stub_file_node() {
+        let store = retired_test_store().await;
+        let report = store
+            .upsert(
+                "probe",
+                "rule-governing-unindexed-file",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({ "governs": ["src/not-ingested.rs"] }),
+                ),
+            )
+            .await
+            .expect("memory write remains fail-soft");
+
+        assert_eq!(report.id, "rule-governing-unindexed-file");
+        assert!(
+            report.deferred_edges.is_empty(),
+            "a stubbed GOVERNS target materialises, not defers: {:?}",
+            report.deferred_edges
+        );
+
+        // The stub exists under the legacy qualified id with a zero vector and
+        // the structural `file` shape, marked `stub: true`.
+        let stub_id = crate::parser::ingest::qualified_id("probe", "src/not-ingested.rs");
+        let (vector, payload) = store
+            .get("probe", &stub_id)
+            .await
+            .expect("read the stub back")
+            .expect("the stub file node exists");
+        assert_eq!(payload.memory_type, "file");
+        assert_eq!(payload.user_id, "auto-ingestor");
+        assert_eq!(payload.agent_name.as_deref(), Some("neurostrata-stub"));
+        assert_eq!(
+            payload.metadata.get("stub").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            payload.metadata.get("absolute_path").and_then(|v| v.as_str()),
+            Some("src/not-ingested.rs")
+        );
+        assert_eq!(vector, vec![0.0; 4]);
+
+        // The rule now finds the file through the graph-read capability.
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/not-ingested.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert!(
+            hits.iter()
+                .any(|h| h.id == "rule-governing-unindexed-file"),
+            "the governing rule surfaces for the stubbed file: {:?}",
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// A rule that governs a *directory* (`src/`) surfaces for an unindexed
+    /// file inside it (`src/foo.rs`) through the `AncestorDirectory` match. The
+    /// stub materialised for the directory carries `memory_type = "directory"`,
+    /// not `"file"`, so the ancestor match recognises it.
+    #[tokio::test]
+    async fn unindexed_file_returns_parent_directory_rules() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "dir-governing-rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/"] })),
+            )
+            .await
+            .expect("memory write remains fail-soft");
+
+        // The directory stub is a directory, not a file.
+        let stub_id = crate::parser::ingest::qualified_id("probe", "src");
+        let (_, payload) = store
+            .get("probe", &stub_id)
+            .await
+            .expect("read the stub back")
+            .expect("the directory stub exists");
+        assert_eq!(payload.memory_type, "directory");
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/foo.rs",
+                None,
+                true,
+                &["rule".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        assert!(
+            hits.iter().any(|h| h.id == "dir-governing-rule"),
+            "the directory-governing rule surfaces for an unindexed file inside it: {:?}",
+            hits.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        let hit = hits
+            .iter()
+            .find(|h| h.id == "dir-governing-rule")
+            .expect("the rule is among the hits");
+        assert_eq!(hit.match_kind, GraphMatchKind::AncestorDirectory);
+    }
+
+    /// A memory linked by a `RELATES_TO` edge (not a `GOVERNS` edge) surfaces
+    /// for the file it relates to, with the `Related` match kind. The relation
+    /// is undirected, but the stored row is directed, so both orientations must
+    /// be queried (finding 1).
+    #[tokio::test]
+    async fn a_related_memory_surfaces_for_the_file_it_relates_to() {
+        let store = retired_test_store().await;
+
+        // Target first: the write-shape validator refuses edges whose target
+        // row does not exist yet.
+        let mut file_payload = retired_test_payload("file", "auto-ingestor", json!({}));
+        file_payload.location = "src/a.rs".to_string();
+        store
+            .upsert("probe", "probe::src/a.rs", vec![0.0; 4], file_payload)
+            .await
+            .unwrap();
+        // The out-orientation: the memory declares the file, so the stored edge
+        // is `memory -RELATES_TO-> file`.
+        store
+            .upsert(
+                "probe",
+                "related-memory",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "fact",
+                    "agent",
+                    json!({ "related_to": ["probe::src/a.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let hits = store
+            .memories_for_file(
+                "probe",
+                None,
+                "src/a.rs",
+                None,
+                true,
+                &["fact".to_string()],
+                &[],
+                5,
+            )
+            .await
+            .expect("graph read succeeds");
+        let hit = hits
+            .iter()
+            .find(|h| h.id == "related-memory")
+            .expect("the related memory surfaces: {:?}");
+        assert_eq!(hit.match_kind, GraphMatchKind::Related);
+        assert!(hit.explanation.contains("relates to"));
+    }
+
+    /// The `related` traversal reaches a depth-2 neighbour through a real
+    /// `RELATES_TO` chain, marks every crossed edge `Supporting` (never
+    /// `Governance`), and starts from the seed's exact id.
+    #[tokio::test]
+    async fn related_traverses_a_depth_two_relates_to_chain() {
+        let store = retired_test_store().await;
+        let zero = vec![0.0f32; 4];
+
+        // Targets first: the write-shape validator refuses edges whose target
+        // row does not exist yet.
+        store
+            .upsert("probe", "deep", zero.clone(), retired_test_payload("fact", "agent", json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "mid",
+                zero.clone(),
+                retired_test_payload("fact", "agent", json!({ "related_to": ["deep"] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "seed",
+                zero,
+                retired_test_payload("rule", "agent", json!({ "related_to": ["mid"] })),
+            )
+            .await
+            .unwrap();
+
+        let result = store
+            .related(
+                "probe",
+                "seed",
+                &[],
+                crate::graph_read::related::Direction::Both,
+                2,
+                &[],
+                25,
+                None,
+            )
+            .await
+            .expect("related traversal succeeds");
+
+        let ids: Vec<&str> = result.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["seed", "mid", "deep"]);
+        assert_eq!(result.total, 3);
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|e| e.role == crate::graph_read::related::EdgeRole::Supporting),
+            "RELATES_TO edges are supporting, never governance: {:?}",
+            result.edges
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|e| e.source == "mid" && e.target == "deep"),
+            "the depth-2 hop is present as an edge"
+        );
+    }
+
+    /// A stub materialised for an unindexed file is retired once the real node
+    /// is ingested and published, so the placeholder never shadows the real
+    /// tree (finding 3).
+    #[tokio::test]
+    async fn ingesting_the_real_node_retires_its_stub() {
+        let store = retired_test_store().await;
+
+        // The rule names a file that is not yet ingested: a stub materialises.
+        store
+            .upsert(
+                "probe",
+                "rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": ["src/not-ingested.rs"] })),
+            )
+            .await
+            .unwrap();
+        let stub_id = crate::parser::ingest::qualified_id("probe", "src/not-ingested.rs");
+        assert!(
+            store.get("probe", &stub_id).await.unwrap().is_some(),
+            "the stub exists before ingestion"
+        );
+
+        // The real node arrives, staged and published as generation 1.
+        let real_id =
+            crate::parser::ingest::generation_scoped_id("probe", 1, "src/not-ingested.rs");
+        store
+            .upsert(
+                "probe",
+                &real_id,
+                vec![0.0; 4],
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store.publish_generation("probe", PROBE_SOURCE, 1).await.unwrap();
+
+        store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
+
+        assert!(
+            store.get("probe", &stub_id).await.unwrap().is_none(),
+            "the stub is retired once the real node is ingested"
+        );
+        assert!(
+            store.get("probe", &real_id).await.unwrap().is_some(),
+            "the real node remains"
+        );
+    }
+
     /// Ingestion qualifies node ids, and a rule names the file the way a human
     /// writes it. The edge has to form when the rule is written, not only after
     /// the next ingest happens to relink it.
     #[tokio::test]
     async fn a_rule_added_after_ingest_governs_the_file_it_names() {
         let store = retired_test_store().await;
+        // Ingestion stages the file as a generation-scoped node and publishes
+        // generation 1; the rule written afterwards names the bare path and must
+        // attach to the published tree, not to a superseded one.
+        let file_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
         store
             .upsert(
                 "probe",
-                "probe::src/a.rs",
+                &file_id,
                 vec![0.0; 4],
                 retired_test_payload("file", "auto-ingestor", json!({})),
             )
             .await
             .unwrap();
+        store.publish_generation("probe", PROBE_SOURCE, 1).await.unwrap();
         store
             .upsert(
                 "probe",
@@ -11512,10 +13004,14 @@ eurostrata\src\daemon.rs",
                 escape_ladybug_string(metadata)
             )
         };
+        // Ingested nodes are generation-scoped now, and generation 1 is the
+        // published tree the relink must attach to. The file row therefore
+        // carries the scoped id, and the active pointer is flipped below.
+        let file_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
         let rows = [
             seed("rule", r#"{"governs": ["src/a.rs"]}"#),
             seed("legacy", r#"{"governs": ["C:/old/checkout/src/a.rs"]}"#),
-            seed("src/a.rs", "{}"),
+            seed(&file_id, "{}"),
         ];
         for row in rows {
             store
@@ -11526,6 +13022,10 @@ eurostrata\src\daemon.rs",
                 .await
                 .expect("seed a memory");
         }
+        store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .expect("publish generation 1");
         store
     }
 
@@ -11549,7 +13049,7 @@ eurostrata\src\daemon.rs",
     async fn relinking_replays_every_declaration_once() {
         let store = store_with_two_declarations().await;
 
-        let created = store.relink_edges("probe").await.expect("relink");
+        let created = store.relink_edges("probe", PROBE_SOURCE).await.expect("relink");
         assert_eq!(created, 2, "both declarations name a node that exists");
         assert_eq!(governs_count(&store).await, 2);
     }
@@ -11562,9 +13062,9 @@ eurostrata\src\daemon.rs",
     async fn relinking_twice_creates_nothing_the_second_time() {
         let store = store_with_two_declarations().await;
 
-        assert_eq!(store.relink_edges("probe").await.expect("first"), 2);
+        assert_eq!(store.relink_edges("probe", PROBE_SOURCE).await.expect("first"), 2);
         assert_eq!(
-            store.relink_edges("probe").await.expect("second"),
+            store.relink_edges("probe", PROBE_SOURCE).await.expect("second"),
             0,
             "the edges already exist, so none are created"
         );
@@ -11671,8 +13171,89 @@ eurostrata\src\daemon.rs",
             .await
             .expect("seed a memory");
 
-        assert_eq!(store.relink_edges("probe").await.expect("relink"), 0);
+        assert_eq!(store.relink_edges("probe", PROBE_SOURCE).await.expect("relink"), 0);
         assert_eq!(governs_count(&store).await, 0);
+    }
+
+    /// A superseded generation's rows are hidden from the read surfaces once a
+    /// later publish flips the source's active pointer, while the live rows
+    /// remain reachable. Exercises the source-scoped pointer and the
+    /// `list`/`export_graph` superseded filters directly (finding 6).
+    #[tokio::test]
+    async fn superseded_generations_are_hidden_from_list_and_export() {
+        let store = retired_test_store().await;
+        let zero = vec![0.0f32; 4];
+
+        // Stage and publish generation 1 for source A.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen1_id,
+                zero.clone(),
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.active_generation("probe", "source-a").await.unwrap(),
+            1
+        );
+
+        // A second publish of the same source supersedes generation 1.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen2_id,
+                zero.clone(),
+                retired_test_payload("file", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.active_generation("probe", "source-a").await.unwrap(),
+            2
+        );
+
+        // list: only the active generation's row is reachable.
+        let listed = store.list("probe", None, None).await.unwrap();
+        let listed_ids: Vec<String> = listed.into_iter().map(|r| r.id).collect();
+        assert!(listed_ids.contains(&gen2_id), "the active generation is listed");
+        assert!(
+            !listed_ids.contains(&gen1_id),
+            "the superseded generation is not listed"
+        );
+
+        // export_graph: the same filter drops the superseded row.
+        let graph = store
+            .export_graph(false, false, &std::collections::HashMap::new(), None)
+            .await
+            .unwrap();
+        let exported_ids: Vec<String> = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            exported_ids.iter().any(|id| id == &gen2_id),
+            "the active generation is exported"
+        );
+        assert!(
+            !exported_ids.iter().any(|id| id == &gen1_id),
+            "the superseded generation is not exported"
+        );
     }
 
     /// `get` reads back the embedding it stored.
@@ -15945,3 +17526,4 @@ eurostrata\src\daemon.rs",
         eprintln!("PROBE BINDING: supported — asserted via bound MERGE + FLOAT[4] round-trip");
     }
 }
+

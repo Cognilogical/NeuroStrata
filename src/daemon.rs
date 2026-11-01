@@ -1862,7 +1862,7 @@ mod tests {
             }
             Ok(0)
         }
-        async fn relink_edges(&self, _namespace: &str) -> anyhow::Result<usize> {
+        async fn relink_edges(&self, _namespace: &str, _source_key: &str) -> anyhow::Result<usize> {
             Ok(0)
         }
         async fn list(

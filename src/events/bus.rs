@@ -98,7 +98,7 @@ impl VectorStore for StoreNotAttached {
     async fn clear_ingested(&self, _namespace: &str) -> anyhow::Result<()> {
         Err(Self::err())
     }
-    async fn relink_edges(&self, _namespace: &str) -> anyhow::Result<usize> {
+    async fn relink_edges(&self, _namespace: &str, _source_key: &str) -> anyhow::Result<usize> {
         Err(Self::err())
     }
     async fn list(
@@ -1320,7 +1320,7 @@ mod tests {
         async fn clear_ingested(&self, _namespace: &str) -> anyhow::Result<()> {
             Err(anyhow!("recording store: unused by this test"))
         }
-        async fn relink_edges(&self, _namespace: &str) -> anyhow::Result<usize> {
+        async fn relink_edges(&self, _namespace: &str, _source_key: &str) -> anyhow::Result<usize> {
             Err(anyhow!("recording store: unused by this test"))
         }
         async fn list(

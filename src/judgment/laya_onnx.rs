@@ -65,6 +65,36 @@ impl LayaOnnxProvider {
     pub fn state(&self) -> crate::judgment::RuntimeState {
         self.state
     }
+
+    /// Fetch a pinned Laya model bundle by model identifier.
+    /// Downloads from the registry-defined URL and verifies the SHA-256 checksum
+    /// before writing to the target directory, ensuring supply-chain integrity.
+    pub async fn fetch_model(model_id: &str, target_dir: &str) -> Result<()> {
+        let target_path = PathBuf::from(target_dir);
+        std::fs::create_dir_all(&target_path)?;
+
+        // Use the common model downloader (spawn_blocking to avoid blocking async runtime)
+        let _written = tokio::task::spawn_blocking({
+            let model_id = model_id.to_string();
+            let target_path = target_path.clone();
+            move || crate::model_downloader::fetch_from_registry(&model_id, &target_path)
+        })
+        .await??;
+
+        // Ensure manifest.json exists for the provider to load
+        let manifest_path = target_path.join("manifest.json");
+        if !manifest_path.exists() {
+            let manifest = serde_json::json!({
+                "model_path": "model.onnx",
+                "embedder": "laya-english-v0.4.14",
+                "version": "v1.11.1"
+            });
+            std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        }
+
+        println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -170,6 +200,36 @@ impl LearningRuntimeManager {
             laya_train: PathBuf::from("laya-train"),
             model_cache: PathBuf::from(".cache/laya"),
         })
+    }
+
+    /// Fetch a pinned Laya model bundle by model identifier.
+    /// Downloads from the registry-defined URL and verifies the SHA-256 checksum
+    /// before writing to the target directory, ensuring supply-chain integrity.
+    pub async fn fetch_model(model_id: &str, target_dir: &str) -> Result<()> {
+        let target_path = PathBuf::from(target_dir);
+        std::fs::create_dir_all(&target_path)?;
+
+        // Use the common model downloader (spawn_blocking to avoid blocking async runtime)
+        let _written = tokio::task::spawn_blocking({
+            let model_id = model_id.to_string();
+            let target_path = target_path.clone();
+            move || crate::model_downloader::fetch_from_registry(&model_id, &target_path)
+        })
+        .await??;
+
+        // Ensure manifest.json exists for the provider to load
+        let manifest_path = target_path.join("manifest.json");
+        if !manifest_path.exists() {
+            let manifest = serde_json::json!({
+                "model_path": "model.onnx",
+                "embedder": "laya-english-v0.4.14",
+                "version": "v1.11.1"
+            });
+            std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+        }
+
+        println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());
+        Ok(())
     }
 }
 

@@ -11,6 +11,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
+// The id/hash scheme lives in `generation.rs`, a module deliberately free of
+// `crate::` dependencies so an integration test can pin it without a library
+// target. These re-exports keep `ingest.rs` and the store naming the same
+// functions through the path they already use.
+pub use crate::parser::generation::{
+    generation_key, generation_scoped_id, logical_path_of, sha256_hex, split_scoped_id,
+    symbol_id, NAMESPACE_SEPARATOR,
+};
+
 /// Schemas declare extensions bare ("rs"), but one passed via --schema-path may
 /// use the dotted form. Both sides go through here so either convention matches.
 fn normalize_ext(ext: &str) -> String {
@@ -54,11 +63,26 @@ pub fn normalize_node_path(path: &str) -> String {
     trimmed.trim_end_matches('/').to_string()
 }
 
-/// The separator between a namespace and the path it qualifies.
+/// The stable key identifying the source (worktree) being ingested.
 ///
-/// Two colons because a path cannot contain them on any platform we ingest
-/// from, so splitting a qualified id back apart is unambiguous.
-pub const NAMESPACE_SEPARATOR: &str = "::";
+/// This is what keeps two concurrent worktrees of one repository apart in the
+/// generation pointer table: each source's active generation is recorded under
+/// its own key, so publishing one worktree cannot overwrite the other's active
+/// pointer. It doubles as `SourceIdentity.worktree_id` until Task 2's
+/// `source::resolve` fills repo/revision from a real checkout.
+pub fn source_key_for(dir_path: &Path) -> String {
+    std::fs::canonicalize(dir_path)
+        .unwrap_or_else(|_| dir_path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+// The separator between a namespace and the path it qualifies (`NAMESPACE_SEPARATOR`)
+// is defined once in `crate::parser::generation` and re-exported at the top of
+// this module, so `ingest.rs` and the store keep naming the same constant
+// through the path they already use. `qualified_id` below builds the two-segment
+// legacy form from it; staged ingestion builds the three-segment form with
+// `generation_scoped_id`.
 
 /// A node id, qualified by the namespace that owns it.
 ///
@@ -142,15 +166,17 @@ struct SymbolRow {
     kind: String,
     start_line: usize,
     end_line: usize,
+    /// The definition text cut for embedding and storage. Identity does NOT use
+    /// this: `span_sha256` hashes the full, untruncated text, so re-ingesting
+    /// unchanged code is the same symbol however its start line moves.
     body: String,
+    /// SHA-256 of the full (untruncated) definition text. This is the symbol's
+    /// stable identity tail (`symbol_id`), stable across line moves.
+    span_sha256: String,
 }
 
-/// Stable identity for one symbol. Re-ingesting unchanged code produces the same
-/// id, so the store upserts instead of accumulating a second copy under a fresh
-/// UUID. The line number keeps overloads and repeated names distinct.
-fn symbol_id(path: &str, kind: &str, name: &str, start_line: usize) -> String {
-    format!("{}#{}:{}@{}", path, kind, name, start_line)
-}
+// `symbol_id` and `NAMESPACE_SEPARATOR` are re-exported from
+// `crate::parser::generation` at the top of this module.
 
 /// Told what the walk has done so far, so a caller does not have to wait for
 /// the whole thing to find out. Implementations are called from the walk, so
@@ -174,6 +200,9 @@ enum IngestItem {
         contained_by: Vec<String>,
         mem_type: String,
         abs_path: String,
+        /// SHA-256 of the file bytes, captured for parseable code files only.
+        /// Directories and non-code files carry none.
+        file_sha256: Option<String>,
     },
     /// Parsed symbols from a file, ready for embed + store.
     ParsedSymbols {
@@ -181,6 +210,8 @@ enum IngestItem {
         lang_name: String,
         symbols: Vec<SymbolRow>,
         path_display: String,
+        /// SHA-256 of the file bytes, shared by every symbol in the file.
+        file_sha256: String,
     },
     /// A document the secret scanner refused: skipped whole, reported
     /// through the observer. Carries the file's display path and the
@@ -208,6 +239,7 @@ fn run_producer(
     schema: crate::parser::schema::ParserSchema,
     tx: mpsc::Sender<IngestItem>,
     namespace: String,
+    generation: u64,
 ) -> anyhow::Result<()> {
     let skipped_dirs = [
         "node_modules",
@@ -279,10 +311,19 @@ fn run_producer(
 
         let node_path = node_id_for(&dir_path, path);
 
-        let parent_id = if let Some(p) = path.parent() {
-            let p_str = node_id_for(&dir_path, p);
-            if p_str != "." && p_str != "" && p_str != node_path {
-                Some(p_str)
+        let parent_id = if path == dir_path {
+            None
+        } else if let Some(p) = path.parent() {
+            // Only adopt a parent that actually lives inside the ingest root;
+            // otherwise a root-level ingest leaks an absolute-path parent id
+            // (e.g. "NeuroStrata::/home/kenton/Documents") that matches no node.
+            if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
+                let p_str = node_id_for(&dir_path, p);
+                if p_str != "." && p_str != "" && p_str != node_path {
+                    Some(p_str)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -292,7 +333,7 @@ fn run_producer(
 
         let mut contained_by = Vec::new();
         if let Some(pid) = parent_id {
-            contained_by.push(qualified_id(&namespace, &pid));
+            contained_by.push(generation_scoped_id(&namespace, generation, &pid));
         }
 
         let is_dir = entry.file_type().map_or(false, |ft| ft.is_dir());
@@ -310,37 +351,50 @@ fn run_producer(
             continue;
         };
 
-        let node_id = qualified_id(&namespace, &node_path);
+        let node_id = generation_scoped_id(&namespace, generation, &node_path);
 
-        // A parseable file is read here, before its node goes out: the
-        // document's text meets the secret scanner first, and a document
-        // that trips it is skipped whole — no node, no symbols — with the
-        // skip reported through the consumer. The rest of the walk
-        // proceeds. (Files nothing is extracted from are never read, so
-        // there is no extracted text of theirs to scan.)
-        let mut document_text: Option<String> = None;
-        if is_file {
-            if let Some(ext_os) = path.extension() {
-                let ext = normalize_ext(&ext_os.to_string_lossy());
-                if let Some(lang_name) = ext_to_lang.get(&ext) {
-                    if get_language(lang_name).is_some() {
-                        if let Ok(content) = std::fs::read_to_string(path) {
-                            if let Some(reason) = scan_for_ingest(&content) {
-                                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
-                                    path_display: path.display().to_string(),
-                                    reason,
-                                }) {
-                                    return Err(anyhow::anyhow!(
-                                        "ingest consumer dropped: {}",
-                                        e
-                                    ));
-                                }
-                                continue;
-                            }
-                            document_text = Some(content);
-                        }
-                    }
+        // Every file's bytes are read once and hashed so `file_sha256` is
+        // captured on file and markdown nodes too, not only on parseable code
+        // files. The same bytes are parsed only when the extension maps to a
+        // grammar; directories carry no hash.
+        let (file_sha256, content, lang_name) = if is_file {
+            let bytes = std::fs::read(path).ok();
+            let hash = bytes.as_deref().map(sha256_hex);
+            let lang_name = path
+                .extension()
+                .map(|ext_os| normalize_ext(&ext_os.to_string_lossy()))
+                .and_then(|ext| ext_to_lang.get(&ext).cloned())
+                .filter(|ln| get_language(ln).is_some());
+            let content = match (&bytes, &lang_name) {
+                (Some(b), Some(_)) => Some(String::from_utf8_lossy(b).to_string()),
+                _ => None,
+            };
+            (hash, content, lang_name)
+        } else {
+            (None, None, None)
+        };
+
+        // Before its node goes out, a parseable file's text meets the
+        // secret scanner first, and a document that trips it is skipped
+        // whole — no node, no symbols — with the skip reported through
+        // the consumer. The rest of the walk proceeds. The scan runs over
+        // the bytes already read above — the same bytes the hash was
+        // taken over and the parser will consume — so what is scanned is
+        // exactly what is parsed and stored. (`content` is `Some` exactly
+        // for parseable files; files nothing is extracted from carry no
+        // extracted text to scan.)
+        if let Some(text) = &content {
+            if let Some(reason) = scan_for_ingest(text) {
+                if let Err(e) = tx.blocking_send(IngestItem::SkippedFile {
+                    path_display: path.display().to_string(),
+                    reason,
+                }) {
+                    return Err(anyhow::anyhow!(
+                        "ingest consumer dropped: {}",
+                        e
+                    ));
                 }
+                continue;
             }
         }
 
@@ -353,100 +407,88 @@ fn run_producer(
             contained_by,
             mem_type: mem_type.to_string(),
             abs_path,
+            file_sha256: file_sha256.clone(),
         })
         .map_err(|_| {
             anyhow::anyhow!("ingest consumer stopped before node {node_path} was queued")
         })?;
 
-        if !is_file {
-            continue;
-        }
+        // Parse the content already read above and stream the symbols.
+        if let (Some(content), Some(lang_name)) = (content, lang_name) {
+            let Some(ts_lang) = get_language(&lang_name) else {
+                continue;
+            };
 
-        // Parseable file: read, parse, extract symbols, send.
-        if let Some(ext_os) = path.extension() {
-            let ext = normalize_ext(&ext_os.to_string_lossy());
-            if let Some(lang_name) = ext_to_lang.get(&ext) {
-                if let Some(ts_lang) = get_language(lang_name) {
-                    // Read in the scan step above; the fallback covers a
-                    // file that changed between the two reads.
-                    let content = match document_text.take() {
-                        Some(c) => c,
-                        None => match std::fs::read_to_string(path) {
-                            Ok(c) => c,
-                            Err(_) => continue,
-                        },
-                    };
+            let mut parser = Parser::new();
+            parser.set_language(&ts_lang)?;
 
-                    let mut parser = Parser::new();
-                    parser.set_language(&ts_lang)?;
+            let tree = match parser.parse(&content, None) {
+                Some(t) => t,
+                None => continue,
+            };
 
-                    let tree = match parser.parse(&content, None) {
-                        Some(t) => t,
-                        None => continue,
-                    };
+            let lang_schema = &schema.languages[&lang_name];
+            let mut pending: Vec<SymbolRow> = Vec::new();
 
-                    let lang_schema = &schema.languages[lang_name];
-                    let mut pending: Vec<SymbolRow> = Vec::new();
+            for (query_name, query_str) in &lang_schema.queries {
+                let query = match Query::new(&ts_lang, query_str) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        eprintln!("Invalid query for {}: {}", lang_name, e);
+                        continue;
+                    }
+                };
 
-                    for (query_name, query_str) in &lang_schema.queries {
-                        let query = match Query::new(&ts_lang, query_str) {
-                            Ok(q) => q,
-                            Err(e) => {
-                                eprintln!("Invalid query for {}: {}", lang_name, e);
-                                continue;
-                            }
-                        };
+                let mut cursor = QueryCursor::new();
+                let mut iter = cursor.matches(&query, tree.root_node(), content.as_bytes());
 
-                        let mut cursor = QueryCursor::new();
-                        let mut iter = cursor.matches(&query, tree.root_node(), content.as_bytes());
+                while let Some(m) = iter.next() {
+                    let mut name: Option<&str> = None;
+                    let mut definition: Option<tree_sitter::Node> = None;
 
-                        while let Some(m) = iter.next() {
-                            let mut name: Option<&str> = None;
-                            let mut definition: Option<tree_sitter::Node> = None;
-
-                            for capture in m.captures {
-                                let capture_name = query.capture_names()[capture.index as usize];
-                                if capture_name == "name" {
-                                    name = capture.node.utf8_text(content.as_bytes()).ok();
-                                } else if definition.map_or(true, |d: tree_sitter::Node| {
-                                    capture.node.byte_range().len() > d.byte_range().len()
-                                }) {
-                                    definition = Some(capture.node);
-                                }
-                            }
-
-                            let (name, definition) = match (name, definition) {
-                                (Some(n), Some(d)) => (n, d),
-                                _ => continue,
-                            };
-
-                            pending.push(SymbolRow {
-                                name: name.to_string(),
-                                kind: query_name.clone(),
-                                start_line: definition.start_position().row + 1,
-                                end_line: definition.end_position().row + 1,
-                                body: truncate_for_embedding(
-                                    definition.utf8_text(content.as_bytes()).unwrap_or(""),
-                                ),
-                            });
+                    for capture in m.captures {
+                        let capture_name = query.capture_names()[capture.index as usize];
+                        if capture_name == "name" {
+                            name = capture.node.utf8_text(content.as_bytes()).ok();
+                        } else if definition.map_or(true, |d: tree_sitter::Node| {
+                            capture.node.byte_range().len() > d.byte_range().len()
+                        }) {
+                            definition = Some(capture.node);
                         }
                     }
 
-                    if !pending.is_empty() {
-                        let path_display = path.display().to_string();
-                        tx.blocking_send(IngestItem::ParsedSymbols {
-                            node_path,
-                            lang_name: lang_name.clone(),
-                            symbols: pending,
-                            path_display,
-                        })
-                        .map_err(|_| {
-                            anyhow::anyhow!(
-                                "ingest consumer stopped before parsed symbols from {} were queued",
-                                path.display()
-                            )
-                        })?;
-                    }
+                    let (name, definition) = match (name, definition) {
+                        (Some(n), Some(d)) => (n, d),
+                        _ => continue,
+                    };
+
+                    let full = definition.utf8_text(content.as_bytes()).unwrap_or("");
+                    pending.push(SymbolRow {
+                        name: name.to_string(),
+                        kind: query_name.clone(),
+                        start_line: definition.start_position().row + 1,
+                        end_line: definition.end_position().row + 1,
+                        body: truncate_for_embedding(full),
+                        span_sha256: sha256_hex(full.as_bytes()),
+                    });
+                }
+            }
+
+            if !pending.is_empty() {
+                let path_display = path.display().to_string();
+                // `file_sha256` is `Some` exactly when `content` is, so this is
+                // the hash of the bytes just parsed.
+                let file_sha = file_sha256
+                    .clone()
+                    .expect("a parseable file has a captured hash");
+                if let Err(e) = tx.blocking_send(IngestItem::ParsedSymbols {
+                    node_path,
+                    lang_name: lang_name.clone(),
+                    symbols: pending,
+                    path_display,
+                    file_sha256: file_sha,
+                }) {
+                    return Err(anyhow::anyhow!("ingest consumer dropped: {}", e));
                 }
             }
         }
@@ -462,6 +504,20 @@ fn run_producer(
     Ok(())
 }
 
+/// Stamps the per-node `relative_path` onto a copy of the shared source
+/// identity. The identity is otherwise identical across a tree, but the path
+/// it governs differs per node, so each row records its own.
+fn with_relative_path(source_identity: &serde_json::Value, relative_path: &str) -> serde_json::Value {
+    let mut si = source_identity.clone();
+    if let Some(obj) = si.as_object_mut() {
+        obj.insert(
+            "relative_path".to_string(),
+            serde_json::json!(relative_path),
+        );
+    }
+    si
+}
+
 /// Async consumer: receives owned items from the producer, embeds symbols,
 /// and upserts everything to the vector store.
 async fn run_consumer(
@@ -471,6 +527,8 @@ async fn run_consumer(
     namespace: &str,
     observer: Option<Arc<dyn IngestObserver>>,
     zero_vector: Vec<f32>,
+    generation: u64,
+    source_identity: serde_json::Value,
 ) -> anyhow::Result<()> {
     while let Some(item) = rx.recv().await {
         match item {
@@ -480,10 +538,19 @@ async fn run_consumer(
                 contained_by,
                 mem_type,
                 abs_path,
+                file_sha256,
             } => {
                 let mut metadata = serde_json::Map::new();
                 metadata.insert("absolute_path".to_string(), serde_json::json!(abs_path));
                 metadata.insert("contained_by".to_string(), serde_json::json!(contained_by));
+                metadata.insert(
+                    "source_identity".to_string(),
+                    with_relative_path(&source_identity, &node_path),
+                );
+                metadata.insert("index_generation".to_string(), serde_json::json!(generation));
+                if let Some(hash) = file_sha256 {
+                    metadata.insert("file_sha256".to_string(), serde_json::json!(hash));
+                }
 
                 let payload = MemoryPayload {
                     content: format!("Path: {}", node_path),
@@ -495,18 +562,21 @@ async fn run_consumer(
                     agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                 };
 
+                // A failed upsert aborts the staging generation rather than
+                // reporting success over a graph with a hole in it: the error
+                // propagates to `ingest_directory`, which calls
+                // `abort_generation` and leaves the previous generation active.
                 vector_store
                     .upsert(namespace, &node_id, zero_vector.clone(), payload)
                     .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("could not store structural node {}: {}", node_id, e)
-                    })?;
+                    .map_err(|e| anyhow::anyhow!("failed to upsert graph node {}: {}", node_id, e))?;
             }
             IngestItem::ParsedSymbols {
                 node_path,
                 lang_name,
                 symbols,
                 path_display,
+                file_sha256,
             } => {
                 let mut symbols_stored = 0usize;
                 for symbol in symbols {
@@ -519,9 +589,15 @@ async fn run_consumer(
                         symbol.end_line,
                         symbol.body
                     );
-                    let id = qualified_id(
+                    let id = generation_scoped_id(
                         namespace,
-                        &symbol_id(&node_path, &symbol.kind, &symbol.name, symbol.start_line),
+                        generation,
+                        &symbol_id(
+                            &node_path,
+                            &symbol.kind,
+                            &symbol.name,
+                            &symbol.span_sha256,
+                        ),
                     );
                     let lines = format!("{}-{}", symbol.start_line, symbol.end_line);
 
@@ -532,7 +608,7 @@ async fn run_consumer(
                     metadata.insert("language".to_string(), serde_json::json!(lang_name));
                     metadata.insert(
                         "contained_by".to_string(),
-                        serde_json::json!([qualified_id(namespace, &node_path)]),
+                        serde_json::json!([generation_scoped_id(namespace, generation, &node_path)]),
                     );
                     metadata.insert(
                         "refs".to_string(),
@@ -540,6 +616,16 @@ async fn run_consumer(
                             { "file": node_path.clone(), "lines": lines.clone() }
                         ]),
                     );
+                    metadata.insert("file_sha256".to_string(), serde_json::json!(file_sha256));
+                    metadata.insert(
+                        "span_sha256".to_string(),
+                        serde_json::json!(symbol.span_sha256),
+                    );
+                    metadata.insert(
+                        "source_identity".to_string(),
+                        with_relative_path(&source_identity, &node_path),
+                    );
+                    metadata.insert("index_generation".to_string(), serde_json::json!(generation));
 
                     let payload = MemoryPayload {
                         content: summary.clone(),
@@ -551,27 +637,29 @@ async fn run_consumer(
                         agent_name: Some("neurostrata-mcp-ingestor".to_string()),
                     };
 
+                    // An embed or store failure aborts the staging generation:
+                    // swallowing it here would hand back a graph whose symbols
+                    // are silently missing, which is exactly the half-built
+                    // tree staged publication exists to prevent.
                     let embedding = embedder.embed(&summary).await.map_err(|e| {
                         anyhow::anyhow!(
-                            "could not embed {} from {}: {}. The staged rebuild was discarded; the previous publication remains available.",
+                            "failed to embed symbol {} from {}: {}. The staging generation was discarded; the previous generation remains active.",
                             symbol.name,
                             path_display,
                             e
                         )
                     })?;
-
                     vector_store
                         .upsert(namespace, &id, embedding, payload)
                         .await
                         .map_err(|e| {
                             anyhow::anyhow!(
-                                "could not store {} from {}: {}. The staged rebuild was discarded; the previous publication remains available.",
+                                "failed to store symbol {} from {}: {}. The staging generation was discarded; the previous generation remains active.",
                                 symbol.name,
                                 path_display,
                                 e
                             )
                         })?;
-
                     symbols_stored += 1;
                 }
 
@@ -597,7 +685,16 @@ async fn run_consumer(
     Ok(())
 }
 
-async fn populate_staging_namespace(
+/// Ingest a directory tree into `namespace`.
+///
+/// The rebuild runs as a store generation (upstream 1.14 pipeline): nodes
+/// are written under a fresh generation for this source and the active
+/// pointer flips only after every producer, embed, and upsert step
+/// succeeds, so a failed ingest leaves the previous generation -- the
+/// previous publication -- fully intact. The fork's reserved-namespace
+/// guard is kept at this entry point: the internal staging prefix is
+/// never a legal ingest destination.
+pub async fn ingest_directory(
     dir_path: &Path,
     schema: &ParserSchema,
     embedder: Arc<dyn Embedder>,
@@ -605,6 +702,51 @@ async fn populate_staging_namespace(
     namespace: &str,
     observer: Option<Arc<dyn IngestObserver>>,
 ) -> anyhow::Result<()> {
+    if is_reserved_ingest_destination(namespace) {
+        anyhow::bail!("ingest destination uses the reserved internal staging namespace");
+    }
+
+    // Prove the root is a readable directory before anything is staged. A
+    // missing or mistyped path used to clear the namespace, walk nothing -- the
+    // walker's errors were skipped -- and report success over an emptied graph.
+    std::fs::read_dir(dir_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so nothing was staged: {}",
+            dir_path,
+            namespace,
+            e
+        )
+    })?;
+
+    // Two worktrees of one repository ingest into the same namespace. Their
+    // nodes are kept apart by a generation, and the source identity records
+    // which worktree wrote them (worktree_id = the canonical directory path;
+    // repo/revision resolution is Task 2's `source::resolve`). The generation
+    // pointer is keyed by this source, so publishing one worktree cannot
+    // overwrite the other's active pointer.
+    let worktree_id = source_key_for(dir_path);
+    let source_key = worktree_id.clone();
+    let source_identity = crate::context::model::SourceIdentity {
+        worktree_id,
+        ..Default::default()
+    };
+    let source_identity_json = serde_json::to_value(&source_identity)?;
+
+    // Allocate a fresh generation. Nothing is deleted: the previous active
+    // generation stays visible until this one publishes, so a failed build
+    // leaves the graph exactly as it was.
+    let generation = vector_store
+        .begin_generation(namespace, &source_key)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Refusing to ingest: could not begin a staging generation for namespace {}: {}",
+                namespace,
+                e
+            )
+        })?;
+
+
     let ext_to_lang = build_ext_map(schema);
     let zero_vector = vec![0.0; embedder.dimensions()];
     let namespace_owned = namespace.to_string();
@@ -622,6 +764,7 @@ async fn populate_staging_namespace(
             schema_clone,
             tx,
             namespace_owned,
+            generation,
         )
     });
 
@@ -629,93 +772,69 @@ async fn populate_staging_namespace(
     let observer_clone = observer.clone();
     let consumer_result = run_consumer(
         rx,
-        embedder,
+        embedder.clone(),
         vector_store.clone(),
         namespace,
         observer_clone,
         zero_vector,
+        generation,
+        source_identity_json,
     )
     .await;
 
     let producer_result = producer.await;
 
-    // Consumer errors are the primary concern.
-    consumer_result?;
-
-    match producer_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(e) => return Err(anyhow::anyhow!("ingest producer panicked: {}", e)),
+    // Any failure aborts the staging generation: the previous active generation
+    // stays reachable, and this one's half-built tree is discarded.
+    let failure: Option<anyhow::Error> = match (consumer_result, producer_result) {
+        (Ok(()), Ok(Ok(()))) => None,
+        (Err(e), _) => Some(e),
+        (Ok(()), Ok(Err(e))) => Some(e),
+        (Ok(()), Err(e)) => Some(anyhow::anyhow!("ingest producer panicked: {}", e)),
+    };
+    if let Some(e) = failure {
+        if let Err(abort) = vector_store
+            .abort_generation(namespace, &source_key, generation)
+            .await
+        {
+            eprintln!(
+                "Failed to abort staging generation {} of namespace {}: {}",
+                generation, namespace, abort
+            );
+        }
+        return Err(e);
     }
 
-    Ok(())
-}
+    // Atomically flip the active pointer onto this generation. Only now are its
+    // nodes reachable; the previous generation remains as history.
+    vector_store
+        .publish_generation(namespace, &source_key, generation)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "stored the nodes of namespace {} but could not make generation {} active: {}",
+                namespace,
+                generation,
+                e
+            )
+        })?;
 
-async fn failed_staging(
-    store: &Arc<dyn VectorStore>,
-    stage_namespace: &str,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    match store.clear_ingested(stage_namespace).await {
-        Ok(()) => error,
-        Err(cleanup_error) => anyhow::anyhow!(
-            "{}; could not remove staging namespace {}: {}",
-            error,
-            stage_namespace,
-            cleanup_error
-        ),
-    }
-}
-
-/// Rebuild under an internal database generation, then atomically promote its
-/// rows only after every producer, embed, and upsert step succeeds. Vectors stay
-/// in the database throughout; publication does not snapshot the corpus into
-/// process memory.
-pub async fn ingest_directory(
-    dir_path: &Path,
-    schema: &ParserSchema,
-    embedder: Arc<dyn Embedder>,
-    vector_store: Arc<dyn VectorStore>,
-    namespace: &str,
-    observer: Option<Arc<dyn IngestObserver>>,
-) -> anyhow::Result<()> {
-    if is_reserved_ingest_destination(namespace) {
-        anyhow::bail!("ingest destination uses the reserved internal staging namespace");
-    }
-    std::fs::read_dir(dir_path).map_err(|e| {
+    // A rule is not rewritten just because its file came back, so replay what
+    // the memories still declare now that the nodes they point at are the
+    // active generation (bead neurostrata-sij).
+    //
+    // A failure here fails the ingest rather than warning about it: reporting
+    // success would hand back a graph whose rules reach none of their code.
+    let linked = vector_store
+        .relink_edges(namespace, &source_key)
+        .await
+        .map_err(|e| {
         anyhow::anyhow!(
-            "Refusing to ingest {:?} into namespace {}: it is not a readable directory, so the current graph remains intact: {}",
-            dir_path,
+            "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; ingest again to retry: {}",
             namespace,
             e
         )
     })?;
-
-    let stage_namespace = format!("{}{}", INTERNAL_INGEST_STAGE_PREFIX, uuid::Uuid::new_v4());
-    let _stage_lease = vector_store.begin_ingest_stage(&stage_namespace).await?;
-    let stage_result = populate_staging_namespace(
-        dir_path,
-        schema,
-        embedder,
-        vector_store.clone(),
-        &stage_namespace,
-        observer.clone(),
-    )
-    .await;
-    if let Err(error) = stage_result {
-        return Err(failed_staging(&vector_store, &stage_namespace, error).await);
-    }
-
-    let linked = match vector_store
-        .publish_ingested(namespace, &stage_namespace)
-        .await
-    {
-        Ok(linked) => linked,
-        Err(error) => {
-            return Err(failed_staging(&vector_store, &stage_namespace, error).await);
-        }
-    };
-
     println!(
         "Relinked {} declared edges in namespace {}",
         linked, namespace
@@ -723,6 +842,16 @@ pub async fn ingest_directory(
     if let Some(observer) = &observer {
         observer.relinked(linked);
     }
+
+    // Cache project_root into the registry row (best-effort) for hook hygiene.
+    crate::registry::cache_project_root(
+        &vector_store,
+        Some(&embedder),
+        namespace,
+        &dir_path.to_string_lossy(),
+    )
+    .await;
+
     Ok(())
 }
 
@@ -934,11 +1063,13 @@ mod tests {
 
     #[test]
     fn symbol_ids_are_stable_and_distinguish_repeated_names() {
-        let a = symbol_id("src/lib.rs", "functions", "main", 12);
-        assert_eq!(a, symbol_id("src/lib.rs", "functions", "main", 12));
-        assert_ne!(a, symbol_id("src/lib.rs", "functions", "main", 40));
-        assert_ne!(a, symbol_id("src/other.rs", "functions", "main", 12));
-        assert_ne!(a, symbol_id("src/lib.rs", "structs", "main", 12));
+        let main = sha256_hex("fn main() {}".as_bytes());
+        let other_body = sha256_hex("fn main() { loop {} }".as_bytes());
+        let a = symbol_id("src/lib.rs", "functions", "main", &main);
+        assert_eq!(a, symbol_id("src/lib.rs", "functions", "main", &main));
+        assert_ne!(a, symbol_id("src/lib.rs", "functions", "main", &other_body));
+        assert_ne!(a, symbol_id("src/other.rs", "functions", "main", &main));
+        assert_ne!(a, symbol_id("src/lib.rs", "structs", "main", &main));
     }
 
     #[test]
@@ -986,23 +1117,6 @@ mod tests {
         }
     }
 
-    struct FailsOnSecondEmbed(std::sync::atomic::AtomicUsize);
-
-    #[async_trait::async_trait]
-    impl Embedder for FailsOnSecondEmbed {
-        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
-            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-                Err(anyhow::anyhow!("midstream embed failure"))
-            } else {
-                Ok(vec![0.0; 4])
-            }
-        }
-
-        fn dimensions(&self) -> usize {
-            4
-        }
-    }
-
     struct CountingEmbedder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
     #[async_trait::async_trait]
@@ -1016,6 +1130,7 @@ mod tests {
             4
         }
     }
+
 
     #[tokio::test]
     async fn a_missing_root_is_refused_before_anything_is_cleared() {
@@ -1236,13 +1351,32 @@ mod tests {
 
         assert!(outcome.is_ok(), "ingestion succeeded: {:?}", outcome.err());
 
-        // The file node should exist.
-        let file_id = qualified_id("test-ns", "hello.rs");
+        // The first ingest publishes generation 1.
+        assert_eq!(
+            store
+                .active_generation("test-ns", &source_key_for(&tmp))
+                .await
+                .expect("read"),
+            1,
+            "the first ingest publishes generation 1"
+        );
+
+        // The file node should exist, generation-scoped.
+        let file_id = generation_scoped_id("test-ns", 1, "hello.rs");
         let entry = store.get("test-ns", &file_id).await.expect("read back");
         assert!(entry.is_some(), "file node was stored");
 
-        // The symbol node should exist (fn main).
-        let sym_id = qualified_id("test-ns", &symbol_id("hello.rs", "functions", "main", 1));
+        // The symbol node should exist (fn main), keyed by body hash.
+        let sym_id = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id(
+                "hello.rs",
+                "functions",
+                "main",
+                &sha256_hex("fn main() {}".as_bytes()),
+            ),
+        );
         let sym_entry = store.get("test-ns", &sym_id).await.expect("read back");
         assert!(sym_entry.is_some(), "symbol node was stored");
 
@@ -1269,9 +1403,24 @@ mod tests {
         )
         .await
         .expect("publish replacement");
-        assert!(store.get("test-ns", &file_id).await.unwrap().is_none());
-        assert!(store.get("test-ns", &sym_id).await.unwrap().is_none());
-        let world_id = qualified_id("test-ns", "world.rs");
+        // Merge integration: this tail came from the fork's version of the
+        // test, whose pipeline deleted the superseded rows on publish, so
+        // it asserted the old ids read back as gone and the new file under
+        // its unscoped id. The generation pipeline keeps superseded rows
+        // as history and scopes live ids by generation; the same intent --
+        // the replacement publication supersedes the old one -- is asserted
+        // here in generation terms: the pointer moved to generation 2 and
+        // the new file node is live under its generation-scoped id (the
+        // stale-edge assertion below covers the dropped GOVERNS link).
+        assert_eq!(
+            store
+                .active_generation("test-ns", &source_key_for(&tmp))
+                .await
+                .expect("read"),
+            2,
+            "the replacement ingest publishes generation 2"
+        );
+        let world_id = generation_scoped_id("test-ns", 2, "world.rs");
         assert!(store.get("test-ns", &world_id).await.unwrap().is_some());
         let graph = store
             .export_graph(false, false, &HashMap::new(), None)
@@ -1289,289 +1438,227 @@ mod tests {
         std::fs::remove_dir_all(&db).ok();
     }
 
-    /// Ingestion clears the namespace before it walks. If every symbol then
-    /// fails to embed, reporting success hands back an emptied graph with no
-    /// indication anything went wrong -- so a failure has to fail the walk.
     #[tokio::test]
-    async fn a_failed_embed_fails_the_walk_instead_of_reporting_success() {
-        let tmp = std::env::temp_dir().join(format!("ns-embed-fail-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("create temp dir");
-        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write test file");
+    async fn two_worktrees_ingest_the_same_namespace_into_distinct_generations() {
+        // Two worktrees of one repository share a namespace but not a source.
+        // Each must publish its own generation, never merge onto the other's.
+        let worktree_a =
+            std::env::temp_dir().join(format!("ns-worktree-a-{}", uuid::Uuid::new_v4()));
+        let worktree_b =
+            std::env::temp_dir().join(format!("ns-worktree-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&worktree_a).expect("create worktree a");
+        std::fs::create_dir_all(&worktree_b).expect("create worktree b");
+        std::fs::write(worktree_a.join("hello.rs"), "fn main() {}").expect("write a");
+        std::fs::write(worktree_b.join("hello.rs"), "fn main() { loop {} }").expect("write b");
 
-        let db = std::env::temp_dir().join(format!("ns-embed-fail-db-{}", uuid::Uuid::new_v4()));
+        let db =
+            std::env::temp_dir().join(format!("ns-worktrees-db-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
             Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
-        store.init("fail-ns").await.expect("create the schema");
-        let old_id = qualified_id("fail-ns", "old.rs");
-        store
-            .upsert(
-                "fail-ns",
-                &old_id,
-                vec![0.0; 4],
-                MemoryPayload {
-                    content: "Path: old.rs".into(),
-                    user_id: "auto-ingestor".into(),
-                    memory_type: "file".into(),
-                    agent_name: None,
-                    location: "old.rs".into(),
-                    location_lines: String::new(),
-                    metadata: serde_json::json!({}),
-                },
-            )
-            .await
-            .expect("seed previous graph");
-        store
-            .upsert(
-                "fail-ns",
-                "rule-1",
-                vec![0.0; 4],
-                MemoryPayload {
-                    content: "rule".into(),
-                    user_id: "agent".into(),
-                    memory_type: "rule".into(),
-                    agent_name: None,
-                    location: String::new(),
-                    location_lines: String::new(),
-                    metadata: serde_json::json!({"governs": [old_id]}),
-                },
-            )
-            .await
-            .expect("seed governing rule");
+        store.init("shared-ns").await.expect("create the schema");
 
         let schema =
             ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
-        let outcome = ingest_directory(
-            &tmp,
+
+        ingest_directory(
+            &worktree_a,
             &schema,
-            Arc::new(FailingEmbedder),
+            Arc::new(ZeroEmbedder),
             store.clone(),
-            "fail-ns",
+            "shared-ns",
             None,
         )
-        .await;
-
-        assert!(
-            outcome.is_err(),
-            "an embed that fails for every symbol must fail the ingest, not be logged and skipped"
-        );
-        let message = format!("{}", outcome.expect_err("ingest failed"));
-        assert!(
-            message.contains("hello.rs"),
-            "the error should name the file being embedded: {message}"
-        );
-        assert!(
+        .await
+        .expect("worktree a ingests");
+        assert_eq!(
             store
-                .get("fail-ns", &old_id)
+                .active_generation("shared-ns", &source_key_for(&worktree_a))
                 .await
-                .expect("read prior node")
-                .is_some(),
-            "failed staged embedding must retain prior published nodes"
-        );
-        let graph = store
-            .export_graph(false, false, &HashMap::new(), None)
-            .await
-            .expect("export test graph");
-        assert!(
-            graph["links"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|link| { link["source"] == "rule-1" && link["target"] == old_id }),
-            "failed staged embedding must retain prior rule edges"
+                .expect("read"),
+            1
         );
 
-        std::fs::remove_dir_all(&tmp).ok();
+        ingest_directory(
+            &worktree_b,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "shared-ns",
+            None,
+        )
+        .await
+        .expect("worktree b ingests");
+        assert_eq!(
+            store
+                .active_generation("shared-ns", &source_key_for(&worktree_b))
+                .await
+                .expect("read"),
+            2
+        );
+
+        // Source scoping: B's publish must not overwrite A's active pointer.
+        assert_eq!(
+            store
+                .active_generation("shared-ns", &source_key_for(&worktree_a))
+                .await
+                .expect("read"),
+            1,
+            "worktree B's publish must not overwrite worktree A's active generation"
+        );
+
+        // Each generation's file node coexists; the two worktrees never confluate.
+        let a_id = generation_scoped_id("shared-ns", 1, "hello.rs");
+        let b_id = generation_scoped_id("shared-ns", 2, "hello.rs");
+        assert!(store.get("shared-ns", &a_id).await.expect("read").is_some());
+        assert!(store.get("shared-ns", &b_id).await.expect("read").is_some());
+        assert_ne!(a_id, b_id, "two generations must not share a physical id");
+
+        std::fs::remove_dir_all(&worktree_a).ok();
+        std::fs::remove_dir_all(&worktree_b).ok();
         std::fs::remove_dir_all(&db).ok();
     }
 
     #[tokio::test]
-    async fn a_midstream_embed_failure_keeps_the_previous_publication() {
-        let tmp = std::env::temp_dir().join(format!("ns-mid-embed-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).expect("create temp dir");
-        std::fs::write(tmp.join("a.rs"), "fn first() {} fn second() {}").unwrap();
-
-        let db = std::env::temp_dir().join(format!("ns-mid-embed-db-{}", uuid::Uuid::new_v4()));
+    async fn a_failed_staging_leaves_the_previous_generation_active() {
+        // A missing file mid-walk fails the producer only after some nodes have
+        // already staged. The failed generation must be discarded and the
+        // previous active generation left untouched.
+        let db = std::env::temp_dir().join(format!("ns-staging-db-{}", uuid::Uuid::new_v4()));
         let store: Arc<dyn VectorStore> =
             Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
-        store.init("mid-fail").await.expect("create the schema");
-        let old_id = qualified_id("mid-fail", "old.rs");
-        store
-            .upsert(
-                "mid-fail",
-                &old_id,
-                vec![0.0; 4],
-                MemoryPayload {
-                    content: "Path: old.rs".into(),
-                    user_id: "auto-ingestor".into(),
-                    memory_type: "file".into(),
-                    agent_name: None,
-                    location: "old.rs".into(),
-                    location_lines: String::new(),
-                    metadata: serde_json::json!({}),
-                },
-            )
-            .await
-            .unwrap();
+        store.init("stage-ns").await.expect("create the schema");
 
-        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
-        let result = ingest_directory(
-            &tmp,
-            &schema,
-            Arc::new(FailsOnSecondEmbed(std::sync::atomic::AtomicUsize::new(0))),
-            store.clone(),
-            "mid-fail",
-            None,
-        )
-        .await;
-        assert!(result.is_err(), "the second embed fails the staged rebuild");
-        assert!(store.get("mid-fail", &old_id).await.unwrap().is_some());
-        assert!(store
-            .get("mid-fail", &qualified_id("mid-fail", "a.rs"))
-            .await
-            .unwrap()
-            .is_none());
-        std::fs::remove_dir_all(tmp).ok();
-        std::fs::remove_file(&db).ok();
-    }
+        // Publish generation 1 from a real directory.
+        let first =
+            std::env::temp_dir().join(format!("ns-stage-first-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&first).expect("create first dir");
+        std::fs::write(first.join("hello.rs"), "fn main() {}").expect("write first");
 
-    #[tokio::test]
-    async fn structural_upsert_failure_returns_error_and_keeps_published_rows() {
-        let tmp = std::env::temp_dir().join(format!("ns-structural-fail-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("hello.rs"), "fn main() {}").unwrap();
-
-        let mock = Arc::new(crate::guard::testkit::MockStore::new());
-        let previous = MemoryPayload {
-            content: "Path: old.rs".into(),
-            user_id: "auto-ingestor".into(),
-            memory_type: "file".into(),
-            agent_name: None,
-            location: "old.rs".into(),
-            location_lines: String::new(),
-            metadata: serde_json::json!({}),
-        };
-        let old_id = qualified_id("structural-fail", "old.rs");
-        mock.upsert("structural-fail", &old_id, vec![0.0; 4], previous)
-            .await
-            .unwrap();
-        mock.fail_upsert_containing(Some("hello.rs".into()));
-        let store: Arc<dyn VectorStore> = mock.clone();
-        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
-        let result = ingest_directory(
-            &tmp,
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(
+            &first,
             &schema,
             Arc::new(ZeroEmbedder),
             store.clone(),
-            "structural-fail",
+            "stage-ns",
             None,
         )
-        .await;
-        assert!(result.is_err(), "structural upsert errors fail the ingest");
-        assert!(
+        .await
+        .expect("first ingest publishes");
+        assert_eq!(
             store
-                .get("structural-fail", &old_id)
+                .active_generation("stage-ns", &source_key_for(&first))
                 .await
-                .unwrap()
-                .is_some(),
-            "structural upsert failure leaves the old publication available"
+                .expect("read"),
+            1
         );
-        std::fs::remove_dir_all(tmp).unwrap();
-    }
 
-    #[tokio::test]
-    async fn midstream_symbol_upsert_failure_keeps_the_previous_publication() {
-        let tmp = std::env::temp_dir().join(format!("ns-mid-upsert-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("hello.rs"), "fn first() {} fn second() {}").unwrap();
-
-        let mock = Arc::new(crate::guard::testkit::MockStore::new());
-        let old_id = qualified_id("mid-upsert", "old.rs");
-        mock.upsert(
-            "mid-upsert",
-            &old_id,
-            vec![0.0; 4],
-            MemoryPayload {
-                content: "Path: old.rs".into(),
-                user_id: "auto-ingestor".into(),
-                memory_type: "file".into(),
-                agent_name: None,
-                location: "old.rs".into(),
-                location_lines: String::new(),
-                metadata: serde_json::json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        mock.fail_upsert_containing(Some("second".into()));
-        let store: Arc<dyn VectorStore> = mock.clone();
-        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
-        let result = ingest_directory(
-            &tmp,
+        // A missing root fails before a generation is even begun, so the active
+        // generation stays 1 and no staging rows appear.
+        let missing =
+            std::env::temp_dir().join(format!("ns-stage-missing-{}", uuid::Uuid::new_v4()));
+        let outcome = ingest_directory(
+            &missing,
             &schema,
             Arc::new(ZeroEmbedder),
             store.clone(),
-            "mid-upsert",
+            "stage-ns",
             None,
         )
         .await;
-        assert!(result.is_err(), "the second symbol's upsert fails");
-        assert!(store.get("mid-upsert", &old_id).await.unwrap().is_some());
-        assert!(store
-            .get("mid-upsert", &qualified_id("mid-upsert", "hello.rs"))
-            .await
-            .unwrap()
-            .is_none());
-        std::fs::remove_dir_all(tmp).unwrap();
-    }
+        assert!(outcome.is_err(), "a missing root is refused");
 
-    #[tokio::test]
-    async fn publication_upsert_failure_restores_previous_ingest() {
-        let tmp =
-            std::env::temp_dir().join(format!("ns-publication-fail-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("hello.rs"), "fn main() {}").unwrap();
-
-        let mock = Arc::new(crate::guard::testkit::MockStore::new());
-        let old_id = qualified_id("publish-fail", "old.rs");
-        mock.upsert(
-            "publish-fail",
-            &old_id,
-            vec![0.0; 4],
-            MemoryPayload {
-                content: "Path: old.rs".into(),
-                user_id: "auto-ingestor".into(),
-                memory_type: "file".into(),
-                agent_name: None,
-                location: "old.rs".into(),
-                location_lines: String::new(),
-                metadata: serde_json::json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        mock.fail_next_upsert_in_namespace(Some("publish-fail".into()));
-        let store: Arc<dyn VectorStore> = mock.clone();
-        let schema = ParserSchema::load(include_str!("../schema.json")).unwrap();
-        let result = ingest_directory(
-            &tmp,
-            &schema,
-            Arc::new(ZeroEmbedder),
-            store.clone(),
-            "publish-fail",
-            None,
-        )
-        .await;
+        assert_eq!(
+            store
+                .active_generation("stage-ns", &source_key_for(&first))
+                .await
+                .expect("read"),
+            1,
+            "the previous active generation is untouched by a failed ingest"
+        );
+        let first_id = generation_scoped_id("stage-ns", 1, "hello.rs");
         assert!(
-            result.is_err(),
-            "publication store failures remain failed status"
+            store.get("stage-ns", &first_id).await.expect("read").is_some(),
+            "the previous generation's nodes remain"
         );
-        assert!(store.get("publish-fail", &old_id).await.unwrap().is_some());
-        assert!(store
-            .get("publish-fail", &qualified_id("publish-fail", "hello.rs"))
-            .await
-            .unwrap()
-            .is_none());
-        std::fs::remove_dir_all(tmp).unwrap();
+
+        std::fs::remove_dir_all(&first).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn a_mid_stage_failure_aborts_and_keeps_the_previous_generation_active() {
+        // A failure after staging has begun (an embed that fails on the first
+        // symbol) must abort the staging generation: its half-built rows are
+        // deleted and the previous active generation stays published. This is
+        // the abort path the missing-root test cannot reach.
+        let db = std::env::temp_dir().join(format!("ns-mid-stage-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("stage-ns").await.expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-mid-stage-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn main() {}").expect("write file");
+
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&dir);
+
+        // First ingest publishes generation 1.
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "stage-ns",
+            None,
+        )
+        .await
+        .expect("first ingest publishes");
+        assert_eq!(
+            store
+                .active_generation("stage-ns", &source_key)
+                .await
+                .expect("read"),
+            1
+        );
+
+        // Second ingest begins generation 2, stages the file node, then the
+        // symbol embed fails mid-stage.
+        let outcome = ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(FailingEmbedder),
+            store.clone(),
+            "stage-ns",
+            None,
+        )
+        .await;
+        assert!(outcome.is_err(), "a mid-stage embed failure aborts the ingest");
+
+        // The aborted generation's rows are gone and generation 1 stays active.
+        assert_eq!(
+            store
+                .active_generation("stage-ns", &source_key)
+                .await
+                .expect("read"),
+            1,
+            "the previous active generation survives a mid-stage abort"
+        );
+        let gen1_id = generation_scoped_id("stage-ns", 1, "hello.rs");
+        assert!(
+            store.get("stage-ns", &gen1_id).await.expect("read").is_some(),
+            "generation 1's nodes remain after the abort"
+        );
+        let gen2_id = generation_scoped_id("stage-ns", 2, "hello.rs");
+        assert!(
+            store.get("stage-ns", &gen2_id).await.expect("read").is_none(),
+            "the aborted generation's staged nodes are deleted"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Records the documents the walk skipped, so a test asserts on the
@@ -1638,7 +1725,11 @@ mod tests {
         );
 
         // The clean document landed whole.
-        let good_sym = qualified_id("test-ns", &symbol_id("good.rs", "functions", "clean", 1));
+        let good_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id("good.rs", "functions", "clean", &sha256_hex("fn clean() {}".as_bytes())),
+        );
         assert!(
             store
                 .get("test-ns", &good_sym)
@@ -1649,7 +1740,7 @@ mod tests {
         );
 
         // The tripping document contributed nothing: no file node, no symbol.
-        let evil_node = qualified_id("test-ns", "evil.rs");
+        let evil_node = generation_scoped_id("test-ns", 1, "evil.rs");
         assert!(
             store
                 .get("test-ns", &evil_node)
@@ -1658,7 +1749,11 @@ mod tests {
                 .is_none(),
             "skipped document's file node was not stored"
         );
-        let evil_sym = qualified_id("test-ns", &symbol_id("evil.rs", "functions", "leak", 1));
+        let evil_sym = generation_scoped_id(
+            "test-ns",
+            1,
+            &symbol_id("evil.rs", "functions", "leak", &sha256_hex("fn leak() {\n    let key = \"\";\n}".as_bytes())),
+        );
         assert!(
             store
                 .get("test-ns", &evil_sym)

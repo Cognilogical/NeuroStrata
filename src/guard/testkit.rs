@@ -386,7 +386,7 @@ impl VectorStore for MockStore {
         Ok(0)
     }
 
-    async fn relink_edges(&self, _namespace: &str) -> Result<usize> {
+    async fn relink_edges(&self, _namespace: &str, _source_key: &str) -> Result<usize> {
         Ok(0)
     }
 
