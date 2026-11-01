@@ -15,3 +15,6 @@ pub use self::episodic_pointer_echo::EpisodicPointerEcho;
 pub use self::export_freshness_dirty::{check_export_freshness, clear_export_freshness, ExportFreshnessDirty};
 pub use self::guard_event_log::GuardEventLog;
 pub use self::mesh_outbox::MeshOutbox;
+pub mod post_ingest_normalize;
+#[allow(unused_imports)]
+pub use self::post_ingest_normalize::PostIngestNormalize;

@@ -1261,8 +1261,8 @@ async fn handle_context_plan(
     embedder: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
 ) -> String {
-    use crate::context::{ContextItem, ContextPlan, Budget, rank_dedup_budget, render_plan_text, CONTEXT_PLAN_SCHEMA_VERSION};
-    use crate::context::model::{Degradation};
+    use crate::context::{ContextService, ContextItem, Budget, render_plan_text, CONTEXT_PLAN_SCHEMA_VERSION};
+    use crate::context::model::{ContextRequest, SourceIdentity, EgressPolicy};
     let namespace = arguments.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
     let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
@@ -1299,17 +1299,20 @@ async fn handle_context_plan(
     }
     let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
     let budget = Budget::from(token_budget);
-    let truncation = items.len() > max_items;
-    let mut deduped = rank_dedup_budget(items, budget);
-    if deduped.len() > max_items {
-        deduped.truncate(max_items);
-    }
-    let mut plan = ContextPlan::new("context-plan", Degradation::Supported);
+    let service = ContextService::new_with(Some(1u8), Some(2u8));
+    let req = ContextRequest {
+        session_id: namespace.into(),
+        context_epoch: 1,
+        event_id: "context-plan".into(),
+        trigger: "handle_context_plan".into(),
+        source: SourceIdentity::default(),
+        policy: EgressPolicy::default(),
+    };
+    let plan = service.plan_with_items(&req, items, budget, max_items);
+    let mut plan = plan;
     plan.schema_version = CONTEXT_PLAN_SCHEMA_VERSION.to_string();
     plan.applied_scope = namespace.to_string();
     plan.event_id = "context-plan".into();
-    plan.items = deduped;
-    plan.truncation = truncation;
     if format == "text" {
         render_plan_text(&plan)
     } else {
@@ -6140,40 +6143,7 @@ async fn handle_guard_list_rules(
 }
 
 async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) -> String {
-    let id = match arguments.get("id").and_then(|v| v.as_str()) {
-        Some(i) => i,
-        None => {
-            return "Missing 'id' parameter. Ids are returned by neurostrata_search_memory."
-                .to_string()
-        }
-    };
-    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
-        Some(n) => n,
-        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string(),
-    };
-    let namespace = resolve_namespace(&store, namespace).await;
-    let namespace = namespace.as_str();
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
-    }
-
-    match store.get(namespace, id).await {
-        Ok(Some((_, payload))) => {
-            let store_clone = store.clone();
-            let ns_clone = namespace.to_string();
-            let id_clone = id.to_string();
-            tokio::spawn(async move {
-                let _ = store_clone.increment_access_count(&ns_clone, &id_clone).await;
-            });
-            let _ = crate::recall_metrics::record_promotion(namespace, id);
-            format_memory(id, &payload)
-        }
-        Ok(None) => format!(
-            "No memory with id '{}' in namespace '{}'. Ids come from neurostrata_search_memory; check the namespace with neurostrata_list_namespaces.",
-            id, namespace
-        ),
-        Err(e) => format!("Failed to read memory '{}': {}", id, e),
-    }
+    crate::handlers::memory::handle_get_memory(arguments, store).await
 }
 
 #[cfg(test)]

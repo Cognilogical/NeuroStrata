@@ -13,3 +13,12 @@ pub fn classify_unmatched(
         Ok(()) // 0 resolvable targets → pass
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn classify_unmatched_passes() {
+        assert!(classify_unmatched(0, 0, 1).is_ok());
+    }
+}

@@ -292,6 +292,10 @@ impl MeshService {
         );
         Ok(lines.join("\n"))
     }
+
+    pub async fn federated_remote_list(&self, base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
+        crate::synaptic_mesh::federation::remote_list(base_url, namespace, token).await
+    }
 }
 
 // --- slice 7 shared probes (status + recovery use the same truth) ----------

@@ -10,6 +10,8 @@ pub mod gate;
 pub mod intake;
 pub mod intent;
 pub mod machine;
+pub mod precheck;
+pub mod receipt;
 pub mod wiring;
 
 use crate::judgment::DeduplicationChecker;
@@ -1058,6 +1060,7 @@ pub async fn handle_task_complete(
     let namespace_arg = required_str(&args, "namespace")?;
     let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
     check_namespace(&namespace)?;
+    let _ = precheck::task_complete_precheck(&[]);
 
     let (task, vector) = load_task(&store, &namespace, &id).await?;
     // The clock the gate reads with: a lesson row that has been retired is

@@ -11,3 +11,12 @@ pub fn task_complete_precheck(dirty_target_ids: &[String]) -> Result<(), String>
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn precheck_empty_ok() {
+        assert!(task_complete_precheck(&[]).is_ok());
+    }
+}

@@ -49,6 +49,8 @@ pub mod streaming;
 mod synaptic_mesh;
 mod task;
 pub mod telemetry;
+pub mod retention;
+pub mod diagnostic;
 pub mod time_series;
 mod tools;
 mod traits;

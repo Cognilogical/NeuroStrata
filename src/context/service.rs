@@ -109,6 +109,23 @@ impl ContextService {
         out
     }
 
+    pub fn plan_with_items<R>(&self, request: R, candidates: Vec<super::model::ContextItem>, budget: super::plan::Budget, max_items: usize) -> ContextPlan
+    where
+        R: AsRef<ContextRequest>,
+    {
+        let mut plan = self.plan(request);
+        if self.has_graph_read {
+            let total = candidates.len();
+            let mut deduped = super::plan::rank_dedup_budget(candidates, budget);
+            if deduped.len() > max_items {
+                deduped.truncate(max_items);
+            }
+            plan.truncation = total > deduped.len();
+            plan.items = deduped;
+        }
+        plan
+    }
+
     pub fn render_plan(plan: impl AsRef<ContextPlan>) -> String {
         Self::render(plan)
     }
@@ -150,5 +167,19 @@ mod tests {
         let plan = ContextPlan::new("evt", Degradation::Unsupported);
         let text = ContextService::render(&plan);
         assert!(text.contains("context-plan"));
+    }
+
+    #[test]
+    fn plan_with_items_budgets_and_populates_when_supported() {
+        use super::super::model::{ContextItem};
+        let service = ContextService::new_with(Some(1u8), Some(2u8));
+        let req = request();
+        let items = vec![
+            ContextItem { id: "i1".into(), memory_type: "m".into(), content: "c1".into(), freshness: None },
+        ];
+        let plan = service.plan_with_items(&req, items, super::super::plan::Budget::from(1024usize), 10);
+        assert_eq!(plan.items.len(), 1);
+        assert!(!plan.truncation);
+        assert_eq!(plan.degradation, Degradation::Supported);
     }
 }

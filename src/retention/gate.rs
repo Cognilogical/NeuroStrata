@@ -8,10 +8,16 @@ pub fn budget_verified(p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
 pub fn retention_gate(receipt_exists: bool) -> bool {
     receipt_exists // retention requires receipt present
 }
-fn t8_complete() {}
-fn t9_complete() {}
-fn t10_complete() {}
-fn t11_complete() {}
-fn t12_complete() {}
-fn t13_complete() {}
-fn t14_complete() {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn budget_verified_ok() {
+        assert!(budget_verified(50.0, 50.0));
+    }
+    #[test]
+    fn retention_gate_requires_receipt() {
+        assert!(retention_gate(true));
+        assert!(!retention_gate(false));
+    }
+}
