@@ -126,6 +126,13 @@ pub enum DomainMatchMode {
     Vector,
 }
 
+/// Search mode: Default (existing pipeline) or Hybrid (normalized distances).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Default,
+    Hybrid,
+}
+
 /// The outcome of a domain-filtered search.
 #[derive(Debug, Clone)]
 pub struct DomainSearchOutcome {

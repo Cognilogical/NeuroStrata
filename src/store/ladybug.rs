@@ -41,6 +41,7 @@ async fn search_inner(
     domain_keys: HashSet<String>,
     query_text: Option<String>,
     exact: bool,
+    search_mode: crate::traits::SearchMode,
 ) -> Result<DomainSearchOutcome> {
     let namespace = namespace.to_string();
     store
@@ -766,7 +767,27 @@ async fn search_inner(
 // the engine's LIMIT was hit, indicating the multiplier exhausted and pages
 // beyond remain.
 let incomplete = result_count >= fetch_limit;
-Ok(DomainSearchOutcome { results, mode, incomplete })
+
+            // Hybrid scoring: combine vector, graph, and symbol distances.
+            // When search_mode is Hybrid, replace the default search score with the
+            // normalized hybrid distance.
+            let mut hybrid_results: Vec<SearchResult> = results.clone();
+            for sr in &mut hybrid_results {
+                let d_vec = sr.score.clamp(0.0, 1.0);
+                let co_count = sr.payload.metadata.get("co_occurrence_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let d_graph = crate::graph_read::hybrid::normalize_graph(co_count as u64);
+                let d_sym = crate::graph_read::hybrid::normalize_sym(false);
+                sr.score = crate::graph_read::hybrid::combine(d_vec, d_graph, d_sym, (0.5, 0.3, 0.2));
+            }
+            let results = if search_mode == crate::traits::SearchMode::Hybrid {
+                hybrid_results.into_iter().take(limit).collect()
+            } else {
+                results
+            };
+
+            Ok(DomainSearchOutcome { results, mode, incomplete })
         })
         .await
 }
@@ -2809,24 +2830,25 @@ impl VectorStore for LadybugStore {
                 }
             }
 
-            // Materialize mention edges (delete old mention-detector rows, create fresh).
-            if !mentions_for_write.is_empty() {
-                let del_q = format!(
-                    "MATCH (a:Memory {{id: '{}'}})-[r:RELATES_TO]->(b:Memory) WHERE r.extractor = 'mention-detector' DELETE r",
-                    escape_ladybug_string(&id)
+            // Materialize mention edges (always delete old mention-detector rows,
+            // then create fresh ones only if there are mentions to write).
+            // Deleting unconditionally is required: a re-upsert with no mentions
+            // must clear edges left from a previous upsert that did have them.
+            let del_q = format!(
+                "MATCH (a:Memory {{id: '{}'}})-[r:RELATES_TO]->(b:Memory) WHERE r.extractor = 'mention-detector' DELETE r",
+                escape_ladybug_string(&id)
+            );
+            let _ = conn.query(&del_q);
+            for m in &mentions_for_write {
+                let m_safe = escape_ladybug_string(m);
+                let q = format!(
+                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:RELATES_TO {{source: '{}', valid_from: {}, valid_to: 0, generation: 0, extractor: 'mention-detector'}}]->(b)",
+                    escape_ladybug_string(&id),
+                    m_safe,
+                    escape_ladybug_string(&namespace),
+                    edge_now
                 );
-                let _ = conn.query(&del_q);
-                for m in &mentions_for_write {
-                    let m_safe = escape_ladybug_string(m);
-                    let q = format!(
-                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:RELATES_TO {{source: '{}', valid_from: {}, valid_to: 0, generation: 0, extractor: 'mention-detector'}}]->(b)",
-                        escape_ladybug_string(&id),
-                        m_safe,
-                        escape_ladybug_string(&namespace),
-                        edge_now
-                    );
-                    let _ = conn.query(&q);
-                }
+                let _ = conn.query(&q);
             }
 
             Ok(crate::traits::UpsertReport {
@@ -2859,6 +2881,7 @@ impl VectorStore for LadybugStore {
             HashSet::new(),
             None,
             true,
+            crate::traits::SearchMode::Default,
         )
         .await?;
         Ok(outcome.results)
@@ -2902,6 +2925,7 @@ impl VectorStore for LadybugStore {
             domain_keys,
             query_owned,
             exact,
+            crate::traits::SearchMode::Default,
         )
         .await
     }
