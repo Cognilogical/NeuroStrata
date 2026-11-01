@@ -151,7 +151,7 @@ impl KgeModel {
 
 /// CLI entry point scaffold (spec §5.4):
 /// `neurostrata-mcp kge train [--namespace <ns>|--all] [--epochs N] [--dim D]`.
-pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: Option<u32>) -> anyhow::Result<()> {
+pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: Option<u32>, kge_weight: Option<f32>) -> anyhow::Result<()> {
     // Real training: extract triples from LadybugDB via `store.list_memories()`,
     // filter by active generation + active edges (spec §5.2), train TransE
     // (SGD, margin ranking, sorted triple order, fixed seed 42, L2 normalization

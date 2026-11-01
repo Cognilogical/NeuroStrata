@@ -552,14 +552,13 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
     for path in ttl_files {
         let content = std::fs::read_to_string(&path)?;
         let parser = oxttl::TurtleParser::new();
-        let triples = parser.feed(content.as_bytes())?;
-        while let Some(Ok(q)) = parser.parse_next() {
-        
         let mut cur_shape: Option<ShaclShapeDef> = None;
-        for q in triples {
-            let s = q.subject().to_string();
-            let p = q.predicate().to_string();
-            let o = q.object().to_string();
+
+        for q in parser.for_reader(content.as_bytes()) {
+            let q = q?;
+            let s = q.subject.to_string();
+            let p = q.predicate.to_string();
+            let o = q.object.to_string();
 
             // sh:NodeShape declaration
             if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
@@ -657,11 +656,11 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
     }
 
     Ok(total)
-    }
+}
 
-    /// Validate a memory payload against loaded SHACL shapes.
-    /// Returns violations extracted from matching shapes; falls back to
-    /// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
+/// Validate a memory payload against loaded SHACL shapes.
+/// Returns violations extracted from matching shapes; falls back to
+/// hardcoded `crate::rdf::shacl::validate_memory` if no shapes are loaded.
     pub fn shacl_validate(&self, payload: &MemoryPayload) -> Vec<ShaclViolation> {
         if self.shacl_shapes.is_empty() {
             return crate::rdf::shacl::validate_memory(payload);
@@ -731,7 +730,7 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
 
         // datatype check
         if let Some(dt) = shape.datatypes.get(path) {
-            match value {
+            match &value {
                 serde_json::Value::String(_) => {
                     if dt.contains("string") {
                         // ok
@@ -742,7 +741,7 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
                         });
                     }
                 }
-                serde_json::Value::Number(n) => {
+                serde_json::Value::Number(_n) => {
                     if dt.contains("integer") || dt.contains("decimal") {
                         // ok
                     } else {
@@ -798,5 +797,4 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
     pub fn shacl_shapes_loaded(&self) -> usize {
         self.shacl_shapes.len()
     }
-}
 }

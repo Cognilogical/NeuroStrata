@@ -42,3 +42,4 @@ target/
 plugins/opencode/dist/
 plugins/opencode/node_modules/
 plugins/opencode/@opencode/
+kge/

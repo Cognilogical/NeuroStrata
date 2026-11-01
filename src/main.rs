@@ -321,30 +321,10 @@ enum Commands {
     /// GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM 5 edge types.
     /// Embeddings feed a capped secondary term into retrieval (≤15%) and power
     /// review-only duplicate-candidate ranking (`neurostrata_find_duplicate_candidates`).
-    #[command(name = "kge", visible_alias = "kge")]
+    #[command(name = "kge")]
     Kge {
-        /// Train KGE on a single namespace's subgraph (artifact at
-        /// `<db_path_parent>/kge/<ns>/`).
-        #[arg(long)]
-        namespace: Option<String>,
-
-        /// Train KGE on the union of all namespaces' subgraphs (artifact at
-        /// `<db_path_parent>/kge/global/`).
-        #[arg(long)]
-        all: bool,
-
-        /// Number of SGD epochs (default: 50).
-        #[arg(long, default_value = "50")]
-        epochs: u32,
-
-        /// Embedding dimension `d` (default: 64).
-        #[arg(long, default_value = "64")]
-        dim: u32,
-
-        /// Structural weight `kge_weight` ∈ [0, 0.3] multiplying the capped
-        /// structural term in retrieval scoring (default: 0.15).
-        #[arg(long, default_value = "0.15")]
-        kge_weight: f32,
+        #[command(subcommand)]
+        action: KgeCommands,
     },
 }
 
@@ -414,6 +394,30 @@ pub(crate) enum HooksCommands {
     /// (core.hooksPath honored): stamps session_queries.json and task.graph_queried
     /// when committing files in governed modules. Optional — only run on git repos.
     InstallPreCommit,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum KgeCommands {
+    /// Offline batch training of TransE structural embeddings over
+    /// 5 typed graph edges (GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM).
+    /// Writes artifact to `<db_path_parent>/kge/<scope>/` (model.bin + meta.json).
+    Train {
+        /// Train on a single namespace's subgraph (`kge/<ns>/`)
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Train on union of all namespaces' subgraphs (`kge/global/`)
+        #[arg(long)]
+        all: bool,
+        /// SGD epochs (default: 50)
+        #[arg(long, default_value_t = 50)]
+        epochs: u32,
+        /// Embedding dimension d (default: 64)
+        #[arg(long, default_value_t = 64)]
+        dim: u32,
+        /// Structural weight capped [0, 0.3] (default: 0.15)
+        #[arg(long, default_value_t = 0.15f32)]
+        kge_weight: f32,
+    },
 }
 
 /// What a health probe actually found.
@@ -2616,11 +2620,13 @@ async fn run() -> anyhow::Result<()> {
             }
             #[cfg(feature = "kge")]
             Commands::Kge {
-                namespace,
-                all,
-                epochs,
-                dim,
-                kge_weight,
+                action: KgeCommands::Train {
+                    namespace,
+                    all,
+                    epochs,
+                    dim,
+                    kge_weight,
+                },
             } => {
                 if !all && namespace.is_none() {
                     anyhow::bail!("--namespace <ns> or --all is required");
@@ -2633,7 +2639,7 @@ async fn run() -> anyhow::Result<()> {
                 }
                 // Scaffold: calls kge::cli_train (implements spec §5.4).
                 // Real implementation tracked in neurostrata-84k2; not a hidden stub.
-                crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim))
+                crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim), Some(kge_weight))?;
             }
             #[cfg(not(feature = "kge"))]
             Commands::Kge { .. } => {
@@ -3422,6 +3428,10 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 match other {
+                    Commands::Kge { .. } => {
+                        eprintln!("kge feature disabled; rebuild with --features kge");
+                        std::process::exit(1);
+                    }
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
                     }
