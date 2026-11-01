@@ -3,6 +3,7 @@
 
 mod attempt;
 mod buffer;
+pub mod compression;
 mod config;
 // The context DTOs are shipped ahead of the service that builds plans
 // (plan Task 2 of the agent-adoption plan). Nothing constructs them yet,
@@ -11,10 +12,13 @@ mod config;
 mod context;
 mod crash;
 mod daemon;
+pub mod did;
+pub mod digital_twin;
 mod domain;
 mod embed;
 mod fts;
 mod gliner;
+pub mod graphql;
 pub mod kge;
 pub mod community;
 mod events;
@@ -23,11 +27,15 @@ mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
+pub mod lexical;
 mod model_downloader;
 mod mention;
+pub mod multimodal;
 mod ontology_grounding;
 mod learning;
 mod parser;
+pub mod rag_chat;
+pub mod rebac;
 mod recall_metrics;
 mod receipts;
 mod rdf;
@@ -37,9 +45,13 @@ mod secrets;
 mod server;
 mod setup;
 mod source_context;
+pub mod storage;
 mod store;
+pub mod streaming;
 mod synaptic_mesh;
 mod task;
+pub mod telemetry;
+pub mod time_series;
 mod tools;
 mod traits;
 
@@ -326,6 +338,38 @@ enum Commands {
         #[command(subcommand)]
         action: KgeCommands,
     },
+
+    /// Storage hygiene, snapshot checksums, and WAL status
+    #[command(name = "storage")]
+    Storage {
+        #[command(subcommand)]
+        action: StorageCommands,
+    },
+
+    /// Local-first RAG chat over project memories
+    #[command(name = "chat")]
+    Chat {
+        #[command(subcommand)]
+        action: ChatCommands,
+    },
+
+    /// Time-series and episodic metrics query/list
+    #[command(name = "metrics")]
+    Metrics {
+        #[command(subcommand)]
+        action: MetricsCommands,
+    },
+
+    /// Curated read-only GraphQL query execution
+    #[command(name = "graphql")]
+    Graphql {
+        /// GraphQL query document
+        #[arg(short, long)]
+        query: String,
+        /// Target namespace
+        #[arg(short, long, default_value = "NeuroStrata")]
+        namespace: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -417,6 +461,50 @@ pub(crate) enum KgeCommands {
         /// Structural weight capped [0, 0.3] (default: 0.15)
         #[arg(long, default_value_t = 0.15f32)]
         kge_weight: f32,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum StorageCommands {
+    /// Report store size, WAL size, and snapshot hygiene status
+    Status,
+    /// Verify SHA-256 checksums of an exported snapshot directory
+    VerifySnapshot {
+        #[arg(short, long)]
+        dir: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum ChatCommands {
+    /// Ask a question over project memories using local-first RAG
+    Ask {
+        #[arg(short, long)]
+        namespace: String,
+        #[arg(short, long)]
+        question: String,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+pub(crate) enum MetricsCommands {
+    /// List active time-series metric series
+    List {
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Query time-series samples for a metric
+    Query {
+        #[arg(short, long)]
+        namespace: String,
+        #[arg(short, long)]
+        kind: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
 }
 
@@ -3422,9 +3510,86 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 match other {
-                    Commands::Kge { .. } => {
-                        eprintln!("kge feature disabled; rebuild with --features kge");
-                        std::process::exit(1);
+                    Commands::Storage { action } => match action {
+                        StorageCommands::Status => {
+                            let out =
+                                crate::server::handle_storage_status(vector_store.clone()).await;
+                            println!("{}", out);
+                        }
+                        StorageCommands::VerifySnapshot { dir } => {
+                            match crate::storage::verify_snapshot(std::path::Path::new(&dir)) {
+                                Ok(report) => {
+                                    if report.valid {
+                                        println!("Verified snapshot in {}: valid", dir);
+                                    } else {
+                                        eprintln!(
+                                            "Snapshot verification failed: {:?}",
+                                            report.error
+                                        );
+                                        std::process::exit(1);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Snapshot verification failed: {}", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    },
+                    Commands::Chat { action } => match action {
+                        ChatCommands::Ask {
+                            namespace,
+                            question,
+                            top_k,
+                        } => {
+                            let args = serde_json::json!({
+                                "namespace": namespace,
+                                "question": question,
+                                "top_k": top_k,
+                            });
+                            let out = crate::server::handle_chat_ask(
+                                &args,
+                                embedder.clone(),
+                                vector_store.clone(),
+                            )
+                            .await;
+                            println!("{}", out);
+                        }
+                    },
+                    Commands::Metrics { action } => match action {
+                        MetricsCommands::List { namespace } => {
+                            let args = serde_json::json!({ "namespace": namespace });
+                            let out =
+                                crate::server::handle_metrics_list(&args, vector_store.clone())
+                                    .await;
+                            println!("{}", out);
+                        }
+                        MetricsCommands::Query {
+                            namespace,
+                            kind,
+                            name,
+                            limit,
+                        } => {
+                            let args = serde_json::json!({
+                                "namespace": namespace,
+                                "kind": kind,
+                                "name": name,
+                                "limit": limit,
+                            });
+                            let out =
+                                crate::server::handle_metrics_query(&args, vector_store.clone())
+                                    .await;
+                            println!("{}", out);
+                        }
+                    },
+                    Commands::Graphql { query, namespace } => {
+                        let args = serde_json::json!({
+                            "query": query,
+                            "namespace": namespace,
+                        });
+                        let out =
+                            crate::server::handle_graphql_query(&args, vector_store.clone()).await;
+                        println!("{}", out);
                     }
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
@@ -3778,6 +3943,7 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::Setup { .. }
                     | Commands::ProjectContext { .. }
                     | Commands::BusMetrics
+                    | Commands::Kge { .. }
                     | Commands::Hooks { .. } => unreachable!(),
                 }
             }

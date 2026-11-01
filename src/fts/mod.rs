@@ -50,7 +50,7 @@ const MAX_FUZZY_EXPANSIONS: usize = 50;
 
 /// A document as the lexical index sees it. The store derives the filter flags
 /// from metadata when it builds the document; the engine never parses JSON.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LexicalDoc {
     pub id: String,
     pub namespace: String,

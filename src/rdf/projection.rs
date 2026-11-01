@@ -131,6 +131,149 @@ pub fn memory_to_quads(
         }
     }
 
+    // ReBAC visible_to projection: `<mem_iri> ns:visibleTo "<principal>:<role>"`
+    if let Some(vt) = payload.metadata.get("visible_to").and_then(|v| v.as_array()) {
+        for entry in vt {
+            if let (Some(p), Some(r)) = (
+                entry.get("principal").and_then(|v| v.as_str()),
+                entry.get("role").and_then(|v| v.as_str()),
+            ) {
+                lit_quad!(
+                    ns_predicate("visibleTo"),
+                    format!("{}:{}", p, r),
+                    xsd_string.clone()
+                );
+            }
+        }
+    }
+
+    // Digital twin RDF projection
+    if payload.memory_type == "digital_twin" {
+        if let Some(dt) = payload.metadata.get("digital_twin").and_then(|v| v.as_object()) {
+            let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer");
+            quads.push(Quad {
+                subject: subject.clone(),
+                predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("TwinState"))),
+                graph_name: graph.clone(),
+            });
+            if let Some(twin_id) = dt.get("twin_id").and_then(|v| v.as_str()) {
+                lit_quad!(ns_predicate("twinId"), twin_id.to_string(), xsd_string.clone());
+            }
+            if let Some(obs) = dt.get("observed_at").and_then(|v| v.as_i64()) {
+                lit_quad!(ns_predicate("observedAt"), obs.to_string(), xsd_int.clone());
+            }
+            if let Some(props) = dt.get("properties").and_then(|v| v.as_object()) {
+                for (k, v) in props {
+                    json_quad!(
+                        ns_predicate(&format!("twinProp_{}", k)),
+                        v.to_string(),
+                        ldp_json.clone()
+                    );
+                }
+            }
+        }
+    }
+
+    // Multimodal attachment RDF projection
+    if let Some(atts) = payload.metadata.get("attachments").and_then(|v| v.as_array()) {
+        let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer");
+        for (idx, att) in atts.iter().enumerate() {
+            let Some(obj) = att.as_object() else { continue };
+            let raw_id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sanitized_id: String = raw_id
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                .collect();
+            let bnode_id = if sanitized_id.is_empty() {
+                format!("att_{}_{}", id.replace('-', "_"), idx)
+            } else {
+                format!("att_{}_{}", id.replace('-', "_"), sanitized_id)
+            };
+            let bnode = oxrdf::BlankNode::new_unchecked(bnode_id);
+            let bnode_subj = NamedOrBlankNode::BlankNode(bnode.clone());
+            quads.push(Quad {
+                subject: subject.clone(),
+                predicate: NamedNode::new_unchecked(ns_predicate("hasAttachment")),
+                object: Term::BlankNode(bnode),
+                graph_name: graph.clone(),
+            });
+            quads.push(Quad {
+                subject: bnode_subj.clone(),
+                predicate: NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("Attachment"))),
+                graph_name: graph.clone(),
+            });
+            if !raw_id.is_empty() {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentId")),
+                    object: Term::Literal(Literal::new_typed_literal(raw_id.to_string(), xsd_string.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+            if let Some(mime) = obj.get("mime").and_then(|v| v.as_str()) {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentMime")),
+                    object: Term::Literal(Literal::new_typed_literal(mime.to_string(), xsd_string.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+            if let Some(sz) = obj.get("size_bytes").and_then(|v| v.as_u64()) {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentSizeBytes")),
+                    object: Term::Literal(Literal::new_typed_literal(sz.to_string(), xsd_int.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+            if let Some(dig) = obj.get("digest").and_then(|v| v.as_str()) {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentDigest")),
+                    object: Term::Literal(Literal::new_typed_literal(dig.to_string(), xsd_string.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+            if let Some(uri) = obj.get("uri").and_then(|v| v.as_str()) {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentUri")),
+                    object: Term::Literal(Literal::new_typed_literal(uri.to_string(), xsd_string.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+            if let Some(w) = obj.get("width").and_then(|v| v.as_u64()) {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentWidth")),
+                    object: Term::Literal(Literal::new_typed_literal(w.to_string(), xsd_int.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+            if let Some(h) = obj.get("height").and_then(|v| v.as_u64()) {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentHeight")),
+                    object: Term::Literal(Literal::new_typed_literal(h.to_string(), xsd_int.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+            if let Some(alt) = obj.get("alt_text").and_then(|v| v.as_str()) {
+                quads.push(Quad {
+                    subject: bnode_subj.clone(),
+                    predicate: NamedNode::new_unchecked(ns_predicate("attachmentAltText")),
+                    object: Term::Literal(Literal::new_typed_literal(alt.to_string(), xsd_string.clone())),
+                    graph_name: graph.clone(),
+                });
+            }
+        }
+    }
+
     // Add RDF type declaration to the graph name
     quads.push(Quad {
         subject: subject.clone(),

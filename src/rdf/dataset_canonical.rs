@@ -394,6 +394,10 @@ mod tests {
             update_id: Uuid::parse_str(update_id_val).unwrap(),
             origin_mesh_epoch: 3,
             trust: crate::synaptic_mesh::manifest::Trust::Trusted,
+            signer_did: None,
+            public_key: None,
+            signature: None,
+            patch: None,
         };
         assert!(validate_canonical_rdf(&record, record.rdf.as_ref().unwrap()).is_ok(), "shadow reconstruction (§5.2f) must pass for built record");
     }

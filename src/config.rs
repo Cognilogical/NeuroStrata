@@ -110,8 +110,44 @@ pub struct Config {
     #[serde(default = "default_hybrid_weights")]
     pub hybrid_weights: (f32, f32, f32),
 
+    #[serde(default)]
+    pub storage_hygiene: crate::storage::snapshot::StorageHygieneConfig,
+
+    #[serde(default)]
+    pub rag_chat: crate::rag_chat::RagChatConfig,
+
+    #[serde(default)]
+    pub multimodal: crate::multimodal::MultimodalConfig,
+
+    #[serde(default)]
+    pub federation_allowed_hosts: Vec<String>,
+
+    #[serde(default)]
+    pub mesh_signing_key_path: Option<PathBuf>,
+
+    #[serde(default = "default_metrics_ring_capacity")]
+    pub metrics_ring_capacity: usize,
+
+    #[serde(default = "default_metrics_ewma_alpha")]
+    pub metrics_ewma_alpha: f64,
+
+    #[serde(default = "default_metrics_flush_interval_secs")]
+    pub metrics_flush_interval_secs: u64,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+fn default_metrics_ring_capacity() -> usize {
+    1024
+}
+
+fn default_metrics_ewma_alpha() -> f64 {
+    0.2
+}
+
+fn default_metrics_flush_interval_secs() -> u64 {
+    60
 }
 
 fn default_hybrid_weights() -> (f32, f32, f32) {
@@ -150,6 +186,14 @@ impl Config {
                 lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
                 hybrid_enabled: false,
                 hybrid_weights: default_hybrid_weights(),
+                storage_hygiene: crate::storage::snapshot::StorageHygieneConfig::default(),
+                rag_chat: crate::rag_chat::RagChatConfig::default(),
+                multimodal: crate::multimodal::MultimodalConfig::default(),
+                federation_allowed_hosts: Vec::new(),
+                mesh_signing_key_path: None,
+                metrics_ring_capacity: default_metrics_ring_capacity(),
+                metrics_ewma_alpha: default_metrics_ewma_alpha(),
+                metrics_flush_interval_secs: default_metrics_flush_interval_secs(),
                 extra: HashMap::new(),
             };
 
@@ -458,6 +502,14 @@ mod tests {
             lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
             hybrid_enabled: false,
             hybrid_weights: default_hybrid_weights(),
+            storage_hygiene: crate::storage::StorageHygieneConfig::default(),
+            rag_chat: crate::rag_chat::RagChatConfig::default(),
+            multimodal: crate::multimodal::MultimodalConfig::default(),
+            federation_allowed_hosts: Vec::new(),
+            mesh_signing_key_path: None,
+            metrics_ring_capacity: default_metrics_ring_capacity(),
+            metrics_ewma_alpha: default_metrics_ewma_alpha(),
+            metrics_flush_interval_secs: default_metrics_flush_interval_secs(),
             extra: HashMap::new(),
         };
 

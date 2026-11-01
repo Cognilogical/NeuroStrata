@@ -179,6 +179,17 @@ fn apply_one(
     if policy.require_record_eligibility && !is_eligible(&entry.metadata) {
         return Ok(ApplyOutcome::Skipped);
     }
+    // ReBAC mesh boundary: restricted memories (`visible_to` without `*` or
+    // matching mesh peer principal) stay local and are never published.
+    let peer_principals: Vec<String> = mesh
+        .manifest()
+        .signers
+        .iter()
+        .map(|s| s.did.clone())
+        .collect();
+    if !crate::rebac::can_publish_to_mesh(&entry.metadata, &peer_principals) {
+        return Ok(ApplyOutcome::Skipped);
+    }
     let id = match Uuid::parse_str(&entry.id) {
         Ok(id) => id,
         Err(_) => return Ok(ApplyOutcome::Skipped),
@@ -360,7 +371,38 @@ fn build_record(
         update_id: entry.stable_op_id,
         origin_mesh_epoch: epoch,
         trust: trust_from(&entry.metadata),
+        signature: None,
+        signer_did: None,
+        public_key: None,
+        patch: None,
     }
+}
+
+/// Sign a [`MeshRecord`] in place using the Ed25519 keypair at `key_path`.
+pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), String> {
+    let (pkey, did, pubkey) = crate::did::load_or_generate_keypair(key_path)?;
+    record.signer_did = Some(did);
+    record.public_key = Some(hex::encode(&pubkey));
+    record.signature = None;
+    let payload = if let Some(ref rdf_block) = record.rdf {
+        crate::did::signing_payload(
+            &rdf_block.quads,
+            &record.update_id.to_string(),
+            record.origin_mesh_epoch,
+        )
+    } else {
+        let val = serde_json::to_value(&*record).map_err(|e| e.to_string())?;
+        crate::did::canonical_signing_bytes(&val)?
+    };
+    let sig = crate::did::sign(&payload, &pkey)?;
+    record.signature = Some(crate::did::encode_base64(&sig));
+    Ok(())
+}
+
+/// Compress a batch of mesh records with zstd for bundle transport.
+pub fn compress_record_bundle(records: &[MeshRecord], level: i32) -> Result<Vec<u8>, String> {
+    let json_bytes = serde_json::to_vec(records).map_err(|e| e.to_string())?;
+    crate::compression::zstd::compress(&json_bytes, level).map_err(|e| e.to_string())
 }
 
 /// Rebuild the canonical RDF block from a MeshRecord after lifecycle mutation.

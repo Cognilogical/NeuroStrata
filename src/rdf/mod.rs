@@ -1,8 +1,10 @@
 pub mod canonical;
 pub mod dataset_canonical;
+pub mod federation;
 pub mod namespace;
 pub mod ontology;
 pub mod projection;
+pub mod provenance;
 pub mod shacl;
 pub mod sparql;
 pub mod reasoning;

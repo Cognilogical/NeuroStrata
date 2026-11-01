@@ -2331,6 +2331,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "neurostrata-wasm"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

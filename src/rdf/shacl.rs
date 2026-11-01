@@ -11,6 +11,7 @@ static EMBEDDED_SHAPES: &[(&str, &str)] = &[
     ("edge-shapes.v1.ttl", include_str!("../schemas/shacl/edge-shapes.v1.ttl")),
     ("topology-shapes.v1.ttl", include_str!("../schemas/shacl/topology-shapes.v1.ttl")),
     ("mesh-record-shapes.v1.ttl", include_str!("../schemas/shacl/mesh-record-shapes.v1.ttl")),
+    ("multimodal-shapes.v1.ttl", include_str!("../schemas/shacl/multimodal-shapes.v1.ttl")),
 ];
 
 pub fn embedded_ttl_shapes() -> &'static [(&'static str, &'static str)] {
@@ -297,7 +298,62 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
                 });
             }
         }
+        "digital_twin" => {
+            if let Some(dt) = payload.metadata.get("digital_twin") {
+                if let Some(obj) = dt.as_object() {
+                    if obj.get("twin_id").and_then(|v| v.as_str()).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                        out.push(ShaclViolation {
+                            field: "metadata.digital_twin.twin_id".to_string(),
+                            why: "twin_id is required and must be a non-empty string".to_string(),
+                        });
+                    }
+                    if obj.get("observed_at").and_then(|v| v.as_i64()).map(|ts| ts <= 0).unwrap_or(true) {
+                        out.push(ShaclViolation {
+                            field: "metadata.digital_twin.observed_at".to_string(),
+                            why: "observed_at is required and must be a positive integer".to_string(),
+                        });
+                    }
+                    if !obj.get("properties").map(|v| v.is_object()).unwrap_or(false) {
+                        out.push(ShaclViolation {
+                            field: "metadata.digital_twin.properties".to_string(),
+                            why: "properties is required and must be an object".to_string(),
+                        });
+                    }
+                } else {
+                    out.push(ShaclViolation {
+                        field: "metadata.digital_twin".to_string(),
+                        why: "digital_twin must be an object".to_string(),
+                    });
+                }
+            } else {
+                out.push(ShaclViolation {
+                    field: "metadata.digital_twin".to_string(),
+                    why: "digital_twin object is required for a digital_twin memory".to_string(),
+                });
+            }
+        }
         _ => {}
+    }
+
+    if let Some(vt) = payload.metadata.get("visible_to") {
+        for err in crate::rebac::validate_visible_to(vt) {
+            out.push(ShaclViolation {
+                field: "metadata.visible_to".to_string(),
+                why: err,
+            });
+        }
+    }
+
+    if payload.metadata.get("attachments").is_some() {
+        let cfg = crate::multimodal::MultimodalConfig::default();
+        for w in crate::multimodal::validate_metadata_attachments(&payload.metadata, &cfg, None) {
+            if w.is_strict_failure(cfg.require_dimensions) {
+                out.push(ShaclViolation {
+                    field: "metadata.attachments".to_string(),
+                    why: w.to_string(),
+                });
+            }
+        }
     }
 
     out

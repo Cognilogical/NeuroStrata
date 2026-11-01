@@ -34,6 +34,16 @@ pub struct MeshManifest {
     pub namespaces: Vec<String>,
     pub policy: MeshPolicy,
     pub remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signers: Vec<SignerEntry>,
+}
+
+/// Authorized signer entry in a mesh manifest (`2026-10-28-did-signed-mesh-records-design.md` §5.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerEntry {
+    pub did: String,
+    pub public_key: String,
+    pub role: String,
 }
 
 /// The team's sharing policy. Every field is enforced by the mesh-worker at
@@ -116,6 +126,7 @@ mod tests {
             namespaces: vec!["stripe-api".to_string()],
             policy: MeshPolicy::default(),
             remote: Some("https://github.com/team-cognilogical/mesh-stripe-api.git".to_string()),
+            signers: Vec::new(),
         };
 
         let json = serde_json::to_string(&manifest).expect("serialize manifest");

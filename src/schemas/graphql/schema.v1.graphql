@@ -1,0 +1,65 @@
+type Memory {
+  id: ID!
+  namespace: String!
+  memoryType: String!
+  content: String
+  userId: String
+  agentName: String
+  location: String
+  locationLines: [Int!]
+  validFrom: Int
+  validTo: Int
+  feedbackScore: Float
+  metadata: JSON
+  mentions: [String!]
+  edges(first: Int = 20, after: String): EdgeConnection!
+}
+
+type Edge {
+  targetId: ID!
+  relation: String!
+  extractor: String
+}
+
+type EdgeConnection {
+  edges: [Edge!]!
+  pageInfo: PageInfo!
+}
+
+type MemoryConnection {
+  edges: [MemoryEdge!]!
+  pageInfo: PageInfo!
+}
+
+type MemoryEdge {
+  cursor: String!
+  node: Memory!
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
+}
+
+type Query {
+  memory(id: ID!, namespace: String!): Memory
+  memories(
+    namespace: String!
+    first: Int = 20
+    after: String
+    memoryType: String
+    includeArchived: Boolean = false
+    includeRetired: Boolean = false
+  ): MemoryConnection!
+  search(
+    text: String!
+    namespace: String!
+    first: Int = 20
+    after: String
+    memoryType: String
+    includeArchived: Boolean = false
+    includeRetired: Boolean = false
+  ): MemoryConnection!
+}
+
+scalar JSON

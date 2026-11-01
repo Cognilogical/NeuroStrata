@@ -806,3 +806,111 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
         self.shacl_shapes.len()
     }
 }
+
+/// Bounded transitive closure over `OntologyIndex::children` (subclass / child-domain hierarchy)
+/// enforcing `crate::graph_read::related::QueryBudget` (`max_hops`, `max_nodes`, `max_edges`, `deadline`).
+pub fn closure_subclasses(
+    root: &str,
+    index: &OntologyIndex,
+    budget: &crate::graph_read::related::QueryBudget,
+) -> crate::graph_read::related::ClosureResult<String> {
+    let mut items: Vec<String> = Vec::new();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+    if let Some(canon) = index.canonical_slug(root).or_else(|| Some(root.to_string())) {
+        visited.insert(canon.clone());
+        items.push(canon.clone());
+        queue.push_back((canon, 0));
+    }
+
+    let mut truncated = false;
+    let mut edges_crossed = 0usize;
+
+    while let Some((cur, depth)) = queue.pop_front() {
+        if depth >= budget.max_hops {
+            truncated = true;
+            continue;
+        }
+        let mut kids: Vec<String> = index
+            .children
+            .get(&cur)
+            .cloned()
+            .unwrap_or_default();
+        // Also include inverse of `sub_classes` if populated via RDF triples (`child -> parent`).
+        for (child, parents) in &index.sub_classes {
+            if parents.contains(&cur) {
+                kids.push(child.clone());
+            }
+        }
+        kids.sort();
+        kids.dedup();
+
+        for k in kids {
+            if visited.contains(&k) {
+                continue;
+            }
+            if items.len() >= budget.max_nodes {
+                let rem = budget
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as u64;
+                return crate::graph_read::related::ClosureResult {
+                    items,
+                    truncated: true,
+                    budget_exceeded: Some(crate::graph_read::related::BudgetExceeded {
+                        stage: "closure_subclasses".to_string(),
+                        visited: visited.len(),
+                        truncated: true,
+                        deadline_remaining_ms: rem,
+                    }),
+                };
+            }
+            edges_crossed += 1;
+            if edges_crossed > budget.max_edges {
+                let rem = budget
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis() as u64;
+                return crate::graph_read::related::ClosureResult {
+                    items,
+                    truncated: true,
+                    budget_exceeded: Some(crate::graph_read::related::BudgetExceeded {
+                        stage: "closure_subclasses".to_string(),
+                        visited: visited.len(),
+                        truncated: true,
+                        deadline_remaining_ms: rem,
+                    }),
+                };
+            }
+            visited.insert(k.clone());
+            items.push(k.clone());
+            queue.push_back((k, depth + 1));
+        }
+    }
+
+    let now = std::time::Instant::now();
+    let budget_exceeded = if truncated {
+        Some(crate::graph_read::related::BudgetExceeded {
+            stage: "closure_subclasses".to_string(),
+            visited: items.len(),
+            truncated: true,
+            deadline_remaining_ms: budget.deadline.saturating_duration_since(now).as_millis() as u64,
+        })
+    } else if now > budget.deadline {
+        Some(crate::graph_read::related::BudgetExceeded {
+            stage: "closure_subclasses".to_string(),
+            visited: items.len(),
+            truncated: false,
+            deadline_remaining_ms: 0,
+        })
+    } else {
+        None
+    };
+
+    crate::graph_read::related::ClosureResult {
+        items,
+        truncated,
+        budget_exceeded,
+    }
+}

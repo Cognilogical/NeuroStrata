@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/neurostrata-wasm"]
+
 [package]
 name = "neurostrata-mcp"
 version = "1.14.3"

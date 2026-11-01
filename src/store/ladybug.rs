@@ -884,6 +884,10 @@ pub struct LadybugStore {
     /// rebuilt from the database on the next query; mutations are no-ops until
     /// then because the database is the source of truth.
     lexical_loaded: Arc<std::sync::RwLock<std::collections::BTreeSet<String>>>,
+    /// In-memory ring-buffer & rolling aggregate time-series metrics store.
+    pub metrics: Arc<crate::time_series::TimeSeriesStore>,
+    /// Optional disk-backed Tantivy full-text index, opened lazily.
+    pub tantivy_lexical: Arc<std::sync::RwLock<Option<crate::lexical::TantivyLexicalIndex>>>,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1128,6 +1132,10 @@ impl LadybugStore {
             mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(None)),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
+            metrics: Arc::new(crate::time_series::TimeSeriesStore::new(
+                crate::time_series::SeriesConfig::default(),
+            )),
+            tantivy_lexical: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -1738,13 +1746,15 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
 /// lives, or record that a machine operation happened, not what it says, so
 /// they carry no meaning for a similarity search: directory ingestion's nodes,
 /// and the thalamic bus's sentinel and audit rows.
-const STRUCTURAL_MEMORY_TYPES: [&str; 6] = [
+const STRUCTURAL_MEMORY_TYPES: [&str; 8] = [
     "directory",
     "file",
     "markdown",
     "freshness_flag",
     "guard_event",
     "community_summary",
+    "digital_twin",
+    "digital_twin_schema",
 ];
 
 /// Row-class predicates for filtering at the store seam.
@@ -2142,6 +2152,31 @@ impl LadybugStore {
     }
 
     fn lexical_apply_doc(&self, doc: crate::fts::LexicalDoc) {
+        if let Some(ref idx) = *self.tantivy_lexical.read().expect("tantivy lock") {
+            let mut meta = serde_json::Map::new();
+            if !doc.symbol.is_empty() {
+                meta.insert("symbol".to_string(), Value::String(doc.symbol.clone()));
+            }
+            if let Some(vf) = doc.valid_from {
+                meta.insert("valid_from".to_string(), Value::Number(vf.into()));
+            }
+            if let Some(vt) = doc.valid_to {
+                meta.insert("valid_to".to_string(), Value::Number(vt.into()));
+            }
+            if doc.archived {
+                meta.insert("archived".to_string(), Value::Number(1.into()));
+            }
+            let payload = MemoryPayload {
+                content: doc.content.clone(),
+                user_id: doc.user_id.clone(),
+                memory_type: doc.memory_type.clone(),
+                agent_name: None,
+                location: doc.location.clone(),
+                location_lines: String::new(),
+                metadata: Value::Object(meta),
+            };
+            let _ = idx.upsert_memory(&doc.namespace, &doc.id, &payload);
+        }
         let loaded = self
             .lexical_loaded
             .read()
@@ -2157,6 +2192,9 @@ impl LadybugStore {
     }
 
     fn lexical_remove_doc(&self, namespace: &str, id: &str) {
+        if let Some(ref idx) = *self.tantivy_lexical.read().expect("tantivy lock") {
+            let _ = idx.delete_memory(namespace, id);
+        }
         let loaded = self
             .lexical_loaded
             .read()
@@ -2245,6 +2283,345 @@ impl LadybugStore {
             .insert(namespace.to_string());
         Ok(())
     }
+
+    pub fn local_path(&self) -> &std::path::Path {
+        &self.local_path
+    }
+
+    pub fn metrics(&self) -> &crate::time_series::TimeSeriesStore {
+        &self.metrics
+    }
+
+    pub fn tantivy_index_dir(&self) -> PathBuf {
+        let mut os = self.local_path.as_os_str().to_os_string();
+        os.push(".tantivy");
+        PathBuf::from(os)
+    }
+
+    fn ensure_tantivy_open(&self) -> Result<()> {
+        if self.tantivy_lexical.read().expect("tantivy lock").is_some() {
+            return Ok(());
+        }
+        let dir = self.tantivy_index_dir();
+        let idx = crate::lexical::TantivyLexicalIndex::open_or_create(&dir)?;
+        *self.tantivy_lexical.write().expect("tantivy lock") = Some(idx);
+        Ok(())
+    }
+
+    /// Rebuild the disk-backed Tantivy lexical index from stored Memory rows.
+    pub async fn rebuild_tantivy_lexical(&self, namespace: Option<&str>) -> Result<(usize, String)> {
+        self.init("default").await?;
+        let ns_opt = namespace.map(|s| s.to_string());
+        let rows_data = self
+            .with_conn(move |conn| {
+                let query = match &ns_opt {
+                    Some(ns) => format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.namespace, m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
+                        escape_ladybug_string(ns)
+                    ),
+                    None => "MATCH (m:Memory) RETURN m.namespace, m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata".to_string(),
+                };
+                let rows = conn.query(&query)?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let ns: String = format!("{}", row[0]);
+                    let id: String = format!("{}", row[1]);
+                    let content: String = format!("{}", row[2]);
+                    let user_id: String = format!("{}", row[3]);
+                    let memory_type: String = format!("{}", row[4]);
+                    let location: String = format!("{}", row[5]);
+                    let metadata_str: String = format!("{}", row[6]);
+                    let metadata: Value =
+                        serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                    let payload = MemoryPayload {
+                        content,
+                        user_id,
+                        memory_type,
+                        agent_name: None,
+                        location,
+                        location_lines: String::new(),
+                        metadata,
+                    };
+                    out.push((ns, id, payload));
+                }
+                Ok(out)
+            })
+            .await?;
+
+        self.ensure_tantivy_open()?;
+        let indexed = {
+            let guard = self.tantivy_lexical.read().expect("tantivy lock");
+            let idx = guard.as_ref().expect("tantivy open");
+            idx.rebuild(&rows_data)?
+        };
+        Ok((indexed, crate::lexical::INDEX_VERSION.to_string()))
+    }
+
+    /// Search using the disk-backed Tantivy lexical index, hydrating payloads from LadybugDB.
+    pub async fn search_tantivy_lexical(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        domains: &[String],
+        principal: &str,
+    ) -> Result<crate::traits::LexicalSearchOutcome> {
+        self.init(namespace).await?;
+        if self.tantivy_lexical.read().expect("tantivy lock").is_none() {
+            let _ = self.rebuild_tantivy_lexical(Some(namespace)).await?;
+        }
+        let hits = {
+            let guard = self.tantivy_lexical.read().expect("tantivy lock");
+            let idx = guard.as_ref().expect("tantivy open");
+            idx.search(
+                namespace,
+                query,
+                limit.max(1) * 4,
+                include_tasks,
+                include_archived,
+                None,
+            )?
+        };
+        let mut candidates = Vec::new();
+        for hit in hits {
+            if let Some((_, payload)) = self.get(namespace, &hit.id).await? {
+                if !include_tasks && payload.memory_type == "task" {
+                    continue;
+                }
+                let vis = crate::rebac::extract_visible_to(&payload.metadata);
+                if !crate::rebac::allowed(principal, &payload.user_id, "viewer", &vis) {
+                    continue;
+                }
+                candidates.push(crate::traits::SearchResult {
+                    id: hit.id,
+                    score: hit.score,
+                    payload,
+                    evidence: Some(vec![crate::traits::SearchEvidence {
+                        kind: crate::traits::EvidenceKind::DirectMatch,
+                        path: Vec::new(),
+                        explanation: "Matched via Tantivy full-text lexical index.".to_string(),
+                        derivation: vec!["lexical".to_string()],
+                    }]),
+                });
+            }
+        }
+        let mut domain_filter_applied = false;
+        let mut results = if !domains.is_empty() {
+            let filtered: Vec<_> = candidates
+                .iter()
+                .filter(|r| {
+                    let row_domains = crate::domain::domain_keys(&r.payload.metadata);
+                    domains.iter().any(|d| row_domains.contains(d))
+                })
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                domain_filter_applied = true;
+                filtered
+            } else {
+                candidates
+            }
+        } else {
+            candidates
+        };
+        results.truncate(limit);
+        Ok(crate::traits::LexicalSearchOutcome {
+            results,
+            domain_filter_applied,
+        })
+    }
+
+    /// Flush buffered time-series metrics into the `MemoryMetric` node table.
+    pub async fn flush_metrics(&self) -> Result<usize> {
+        self.init("default").await?;
+        let batch = self.metrics.take_unflushed(None);
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let mut total_written = 0usize;
+        for (key, samples, max_seq) in batch {
+            let (ns, kind, name) = key.clone();
+            let kind_str = kind.as_str().to_string();
+            let count = samples.len();
+            self.write_with_deadline("flushing time-series metrics", move |conn| {
+                let safe_ns = escape_ladybug_string(&ns);
+                let safe_kind = escape_ladybug_string(&kind_str);
+                let safe_name = escape_ladybug_string(&name);
+                for s in &samples {
+                    let safe_id = escape_ladybug_string(&s.id);
+                    let labels_json =
+                        serde_json::to_string(&s.labels).unwrap_or_else(|_| "{}".to_string());
+                    let safe_labels = escape_ladybug_string(&labels_json);
+                    let q = format!(
+                        "MERGE (m:MemoryMetric {{id: '{}'}}) SET m.namespace = '{}', m.kind = '{}', m.name = '{}', m.ts = {}, m.value = {}, m.labels = '{}'",
+                        safe_id, safe_ns, safe_kind, safe_name, s.ts, s.value, safe_labels
+                    );
+                    conn.query(&q)?;
+                }
+                Ok(())
+            })
+            .await?;
+            self.metrics.mark_flushed(&key, max_seq);
+            total_written += count;
+        }
+        self.dirty.mark();
+        Ok(total_written)
+    }
+
+    /// Query persisted `MemoryMetric` samples from LadybugDB, merged with in-memory samples.
+    pub async fn query_db_metrics(
+        &self,
+        namespace: &str,
+        kind: crate::time_series::MetricKind,
+        name: &str,
+        since_ts: Option<i64>,
+        until_ts: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<crate::time_series::Sample>> {
+        self.init(namespace).await?;
+        let ns_owned = namespace.to_string();
+        let kind_str = kind.as_str().to_string();
+        let name_owned = name.to_string();
+        let db_samples = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&ns_owned);
+                let safe_kind = escape_ladybug_string(&kind_str);
+                let safe_name = escape_ladybug_string(&name_owned);
+                let q = format!(
+                    "MATCH (m:MemoryMetric) WHERE m.namespace = '{}' AND m.kind = '{}' AND m.name = '{}' RETURN m.id, m.ts, m.value, m.labels",
+                    safe_ns, safe_kind, safe_name
+                );
+                let rows = conn.query(&q)?;
+                let mut out = Vec::new();
+                for row in rows {
+                    let id = format!("{}", row[0]);
+                    let ts = format!("{}", row[1]).parse::<i64>().unwrap_or(0);
+                    let value = format!("{}", row[2]).parse::<f64>().unwrap_or(0.0);
+                    let labels_str = format!("{}", row[3]);
+                    let labels: std::collections::BTreeMap<String, String> =
+                        serde_json::from_str(&labels_str).unwrap_or_default();
+                    out.push(crate::time_series::Sample {
+                        id,
+                        seq: 0,
+                        ts,
+                        value,
+                        labels,
+                    });
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap_or_default();
+
+        let key = (namespace.to_string(), kind, name.to_string());
+        let mut samples = self.metrics.range(
+            &key,
+            since_ts.unwrap_or(i64::MIN),
+            until_ts.unwrap_or(i64::MAX),
+            &db_samples,
+        );
+        if limit > 0 && samples.len() > limit {
+            let start = samples.len() - limit;
+            samples = samples.split_off(start);
+        }
+        Ok(samples)
+    }
+
+    /// Export a namespace's lexical documents and graph edges for WASM edge snapshot.
+    pub async fn export_wasm_snapshot(
+        &self,
+        namespace: &str,
+        include_retired: bool,
+    ) -> Result<(
+        Vec<crate::fts::LexicalDoc>,
+        Vec<crate::graph_read::related::EdgeSpec>,
+    )> {
+        self.init(namespace).await?;
+        let ns_owned = namespace.to_string();
+        let now_ts = chrono::Utc::now().timestamp();
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&ns_owned);
+            let q = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
+                safe_ns
+            );
+            let rows = conn.query(&q)?;
+            let mut docs = Vec::new();
+            for row in rows {
+                let id = format!("{}", row[0]);
+                let content = format!("{}", row[1]);
+                let user_id = format!("{}", row[2]);
+                let memory_type = format!("{}", row[3]);
+                let location = format!("{}", row[4]);
+                let metadata_str = format!("{}", row[5]);
+                let metadata: Value =
+                    serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                let payload = MemoryPayload {
+                    content,
+                    user_id,
+                    memory_type,
+                    agent_name: None,
+                    location,
+                    location_lines: String::new(),
+                    metadata,
+                };
+                let doc = Self::lexical_doc(&ns_owned, &id, &payload);
+                if !include_retired {
+                    if let Some(vt) = doc.valid_to {
+                        if vt <= now_ts {
+                            continue;
+                        }
+                    }
+                    if doc.archived {
+                        continue;
+                    }
+                }
+                docs.push(doc);
+            }
+
+            let mut edges = Vec::new();
+            for (table, rel_name) in [
+                ("RELATES_TO", "related_to"),
+                ("CONTAINS", "contained_by"),
+                ("GOVERNS", "governs"),
+                ("EXTRACTED_FROM", "extracted_from"),
+                ("DEPENDS_ON", "depends_on"),
+            ] {
+                let eq = format!(
+                    "MATCH (a:Memory)-[r:{}]->(b:Memory) WHERE a.namespace = '{}' AND b.namespace = '{}' RETURN a.id, b.id, r.source, r.valid_from, r.valid_to",
+                    table, safe_ns, safe_ns
+                );
+                if let Ok(erows) = conn.query(&eq) {
+                    for erow in erows {
+                        let from = format!("{}", erow[0]);
+                        let to = format!("{}", erow[1]);
+                        let src_str = format!("{}", erow[2]);
+                        let vf = format!("{}", erow[3]).parse::<i64>().ok().filter(|v| *v > 0);
+                        let vt = format!("{}", erow[4]).parse::<i64>().ok().filter(|v| *v > 0);
+                        if !include_retired {
+                            if let Some(vt_val) = vt {
+                                if vt_val <= now_ts {
+                                    continue;
+                                }
+                            }
+                        }
+                        let _ = src_str;
+                        let _ = vf;
+                        edges.push(crate::graph_read::related::EdgeSpec {
+                            source: from,
+                            relation: rel_name.to_string(),
+                            target: to,
+                        });
+                    }
+                }
+            }
+
+            Ok((docs, edges))
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -2271,27 +2648,27 @@ impl VectorStore for LadybugStore {
                 }
             }
 
-            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
+            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
             conn.query(create_rel_table).ok();
 
-            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
+            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
             conn.query(create_contains_table).ok();
 
-            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
+            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
             conn.query(create_governs_table).ok();
 
             // Vocabulary v2: extraction edges (memory -> task) behind Lock 2.
-            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
+            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
             conn.query(create_extracted_table).ok();
 
             // F7: dependency edges (directed).
-            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING)";
+            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
             conn.query(create_depends_table).ok();
 
             // RDF projection (Phase 1): idempotent migration for DBs created before
             // edge provenance columns existed. LadybugDB supports ALTER ... ADD.
             const EDGE_PROVENANCE_TABLES: [&str; 5] = ["RELATES_TO", "CONTAINS", "GOVERNS", "EXTRACTED_FROM", "DEPENDS_ON"];
-            const EDGE_PROVENANCE_COLUMNS: [(&str, &str); 7] = [
+            const EDGE_PROVENANCE_COLUMNS: [(&str, &str); 8] = [
                 ("source", "STRING"),
                 ("valid_from", "INT64"),
                 ("valid_to", "INT64"),
@@ -2299,6 +2676,7 @@ impl VectorStore for LadybugStore {
                 ("extractor", "STRING"),
                 ("confidence", "DOUBLE"),
                 ("evidence_id", "STRING"),
+                ("origin", "STRING"),
             ];
             for table in EDGE_PROVENANCE_TABLES {
                 for (col, ty) in EDGE_PROVENANCE_COLUMNS {
@@ -2340,6 +2718,9 @@ impl VectorStore for LadybugStore {
             //     worktree A's active generation.
             let create_generation_table = "CREATE NODE TABLE IngestGeneration (id STRING, namespace STRING, source_key STRING, active_generation INT64, counter INT64, PRIMARY KEY (id))";
             conn.query(create_generation_table).ok();
+
+            let create_metric_table = "CREATE NODE TABLE MemoryMetric (id STRING, namespace STRING, kind STRING, name STRING, ts INT64, value DOUBLE, labels STRING, PRIMARY KEY (id))";
+            conn.query(create_metric_table).ok();
 
             Ok(())
         })
@@ -3475,6 +3856,8 @@ impl VectorStore for LadybugStore {
             dir.join("manifest.json"),
             serde_json::to_string_pretty(&manifest)?,
         )?;
+        crate::storage::snapshot::write_checksums(&dir)
+            .map_err(|e| anyhow::anyhow!("could not write snapshot checksums: {}", e))?;
         Ok(())
     }
 

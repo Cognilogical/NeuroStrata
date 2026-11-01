@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 /// The four relations the traversal may follow (vocabulary v7).
 pub const DEFAULT_RELATIONS: [&str; 5] = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
@@ -213,7 +214,7 @@ pub struct NodeSpec {
 }
 
 /// One in-memory edge the store hands to the traversal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EdgeSpec {
     pub source: String,
     pub relation: String,
@@ -508,3 +509,188 @@ mod tests {
         assert_eq!(snippet_of("hello world", 5), "hello…");
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct QueryBudget {
+    pub max_hops: usize,
+    pub max_nodes: usize,
+    pub max_edges: usize,
+    pub deadline: Instant,
+}
+
+impl Default for QueryBudget {
+    fn default() -> Self {
+        Self {
+            max_hops: 10,
+            max_nodes: 5000,
+            max_edges: 50000,
+            deadline: Instant::now() + Duration::from_millis(250),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetExceeded {
+    pub stage: String,
+    pub visited: usize,
+    pub truncated: bool,
+    pub deadline_remaining_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClosureResult<T> {
+    pub items: Vec<T>,
+    pub truncated: bool,
+    pub budget_exceeded: Option<BudgetExceeded>,
+}
+
+pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> ClosureResult<String> {
+    let mut items: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+    // Include root in the closure result.
+    if !items.contains(&root.to_string()) {
+        items.push(root.to_string());
+    }
+    visited.insert(root.to_string());
+    queue.push_back((root.to_string(), 0));
+
+    let mut truncated = false;
+    let mut edge_crossed = 0usize;
+
+    while let Some((current, depth)) = queue.pop_front() {
+        // Gather outgoing GOVERNS neighbors sorted lexicographically.
+        let mut neighbors: Vec<String> = Vec::new();
+        for edge in edges {
+            if edge.relation == "GOVERNS" && edge.source == current {
+                neighbors.push(edge.target.clone());
+            }
+        }
+        neighbors.sort();
+        neighbors.dedup();
+        if depth >= budget.max_hops {
+            if neighbors.iter().any(|n| !visited.contains(n)) {
+                truncated = true;
+            }
+            continue;
+        }
+        for neighbor in neighbors {
+            if visited.contains(&neighbor) {
+                continue;
+            }
+            // Hard cap on nodes.
+            if items.len() >= budget.max_nodes {
+                truncated = true;
+                // Stop expanding further.
+                let len = items.len();
+                return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+            }
+            // Hard cap on edges.
+            edge_crossed += 1;
+            if edge_crossed > budget.max_edges {
+                truncated = true;
+                let len = items.len();
+                return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+            }
+            visited.insert(neighbor.clone());
+            items.push(neighbor.clone());
+            queue.push_back((neighbor, depth + 1));
+        }
+    }
+
+    let len = items.len();
+    build_result(items, truncated, budget, false, "closure_governs".to_string(), len)
+}
+
+fn build_result(
+    items: Vec<String>,
+    truncated: bool,
+    budget: &QueryBudget,
+    hard_truncated: bool,
+    stage: String,
+    visited: usize,
+) -> ClosureResult<String> {
+    let mut truncated_final = truncated || hard_truncated;
+    let mut budget_exceeded: Option<BudgetExceeded> = None;
+    if truncated_final {
+        budget_exceeded = Some(BudgetExceeded {
+            stage: stage.clone(),
+            visited,
+            truncated: true,
+            deadline_remaining_ms: budget.deadline.saturating_duration_since(Instant::now()).as_millis() as u64,
+        });
+    }
+    // Deadline advisory: if past deadline and no budget exceeded yet, set advisory.
+    if !truncated_final && Instant::now() > budget.deadline {
+        budget_exceeded = Some(BudgetExceeded {
+            stage: stage.clone(),
+            visited,
+            truncated: false,
+            deadline_remaining_ms: 0,
+        });
+    }
+    ClosureResult {
+        items,
+        truncated: truncated_final,
+        budget_exceeded,
+    }
+}
+
+#[cfg(test)]
+mod closure_tests {
+    use super::*;
+
+    #[test]
+    fn chain_closure() {
+        let edges = vec![
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string() },
+            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string() },
+        ];
+        let budget = QueryBudget::default();
+        let result = closure_governs("A", &edges, &budget);
+        assert!(!result.truncated);
+        assert_eq!(result.items, vec!["A", "B", "C"]);
+        assert!(result.budget_exceeded.is_none());
+    }
+
+    #[test]
+    fn cycle_guard_self_loop() {
+        let edges = vec![
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "A".to_string() },
+        ];
+        let budget = QueryBudget::default();
+        let result = closure_governs("A", &edges, &budget);
+        assert!(!result.truncated);
+        assert_eq!(result.items, vec!["A"]);
+    }
+
+    #[test]
+    fn max_hops_truncation_and_budget_exceeded() {
+        let edges = vec![
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string() },
+            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string() },
+            EdgeSpec { source: "C".to_string(), relation: "GOVERNS".to_string(), target: "D".to_string() },
+        ];
+        let mut budget = QueryBudget::default();
+        budget.max_hops = 1;
+        let result = closure_governs("A", &edges, &budget);
+        assert!(result.truncated);
+        assert_eq!(result.items, vec!["A", "B"]);
+        assert!(result.budget_exceeded.is_some());
+        let exceeded = result.budget_exceeded.unwrap();
+        assert_eq!(exceeded.stage, "closure_governs");
+        assert!(exceeded.truncated);
+    }
+
+    #[test]
+    fn disconnected_root() {
+        let edges: Vec<EdgeSpec> = vec![];
+        let budget = QueryBudget::default();
+        let result = closure_governs("X", &edges, &budget);
+        assert!(!result.truncated);
+        assert_eq!(result.items, vec!["X"]);
+        assert!(result.budget_exceeded.is_none());
+    }
+}
+

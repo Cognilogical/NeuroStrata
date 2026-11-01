@@ -1,0 +1,72 @@
+@prefix ns: <http://example.org/ns#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ns:AttachmentShape a sh:NodeShape ;
+  sh:targetClass ns:Attachment ;
+  sh:property [
+    sh:path ns:attachmentId ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string
+  ] ;
+  sh:property [
+    sh:path ns:attachmentMime ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+    sh:in (
+      "text/plain"
+      "text/markdown"
+      "text/csv"
+      "image/png"
+      "image/jpeg"
+      "image/gif"
+      "image/webp"
+      "audio/wav"
+      "audio/mpeg"
+      "audio/ogg"
+      "application/pdf"
+    )
+  ] ;
+  sh:property [
+    sh:path ns:attachmentSizeBytes ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:integer ;
+    sh:minInclusive 1
+  ] ;
+  sh:property [
+    sh:path ns:attachmentDigest ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+    sh:pattern "^sha256:[0-9a-f]{64}$"
+  ] ;
+  sh:property [
+    sh:path ns:attachmentUri ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string
+  ] ;
+  sh:property [
+    sh:path ns:attachmentWidth ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:integer ;
+    sh:minInclusive 1
+  ] ;
+  sh:property [
+    sh:path ns:attachmentHeight ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:integer ;
+    sh:minInclusive 1
+  ] ;
+  sh:property [
+    sh:path ns:attachmentAltText ;
+    sh:minCount 0 ;
+    sh:maxCount 1 ;
+    sh:datatype xsd:string ;
+    sh:maxLength 500
+  ] .

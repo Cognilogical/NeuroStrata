@@ -30,6 +30,10 @@ pub mod traits {
 }
 
 // Import SHACL validation module directly from source (binary crate can't import crate::)
+#[path = "../src/rebac.rs"]
+pub mod rebac;
+#[path = "../src/multimodal/mod.rs"]
+pub mod multimodal;
 #[path = "../src/rdf/shacl.rs"]
 mod shacl;
 

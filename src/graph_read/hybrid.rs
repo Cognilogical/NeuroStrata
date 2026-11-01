@@ -46,6 +46,33 @@ pub fn combine(
     let (w_vec, w_graph, w_sym) = weights;
     d_vec * w_vec + d_graph * w_graph + d_sym * w_sym
 }
+
+/// Compute symbol match grade between a query text and a list of candidate symbols.
+/// Lower grade = better match.
+pub fn compute_symbol_match(query: &str, candidate_symbols: &[String]) -> SymbolMatchGrade {
+    // Simple implementation: exact match first, prefix next, token substring last.
+    let query_lower = query.to_lowercase();
+    for sym in candidate_symbols {
+        let sym_lower = sym.to_lowercase();
+        if sym_lower == query_lower {
+            return SymbolMatchGrade::Exact;
+        }
+    }
+    for sym in candidate_symbols {
+        let sym_lower = sym.to_lowercase();
+        if sym_lower.starts_with(&query_lower) {
+            return SymbolMatchGrade::Prefix;
+        }
+    }
+    for sym in candidate_symbols {
+        let sym_lower = sym.to_lowercase();
+        if sym_lower.contains(&query_lower) {
+            return SymbolMatchGrade::TokenSubstring;
+        }
+    }
+    SymbolMatchGrade::None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

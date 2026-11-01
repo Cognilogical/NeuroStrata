@@ -66,6 +66,7 @@ impl MeshStorage {
             namespaces: namespaces.to_vec(),
             policy: MeshPolicy::default(),
             remote: remote.map(str::to_string),
+            signers: Vec::new(),
         };
         write_manifest(&root, &manifest)?;
 

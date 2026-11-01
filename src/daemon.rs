@@ -813,6 +813,10 @@ pub(crate) async fn start_daemon_on(
         .route("/cli/read", post(handle_cli_read))
         .route("/tasks/gate", post(handle_tasks_gate))
         .route("/bus/metrics", post(handle_bus_metrics))
+        .route("/sparql", post(handle_http_sparql))
+        .route("/graphql", post(handle_http_graphql))
+        .route("/chat/ask", post(handle_http_chat_ask))
+        .route("/storage/status", get(handle_http_storage_status))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -1511,6 +1515,54 @@ async fn handle_tasks_gate(
         );
     }
     Ok(Json(report.gate_json()))
+}
+
+async fn handle_http_sparql(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_sparql_query(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_graphql(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_graphql_query(&req, state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_chat_ask(
+    State(state): State<AppState>,
+    Json(req): Json<serde_json::Value>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_chat_ask(
+        &req,
+        state.embedder.clone(),
+        state.vector_store.clone(),
+    )
+    .await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+}
+
+async fn handle_http_storage_status(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let body = crate::server::handle_storage_status(state.vector_store.clone()).await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
 }
 
 #[cfg(test)]

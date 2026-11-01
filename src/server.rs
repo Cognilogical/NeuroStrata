@@ -203,7 +203,7 @@ pub async fn process_mcp_request(
                                 "include_tasks": { "type": "boolean", "description": "Include memory_type 'task' rows in the results. They are excluded by default so task titles do not pollute rule recall." },
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional domain filter. A slug, or a list of slugs. Normalized to lowercase-kebab. A filter that matches nothing is skipped rather than emptying the results, and the report says which happened." },
                                 "exact": { "type": "boolean", "description": "Run a deterministic exact-name pre-pass before the vector scan. Default true." },
-                                "mode": { "type": "string", "enum": ["vector", "lexical-inhouse"], "description": "Search track. 'vector' (default) uses embeddings; 'lexical-inhouse' uses the deterministic multi-field lexical engine and skips embedding entirely." },
+                                "mode": { "type": "string", "enum": ["vector", "lexical", "lexical-inhouse"], "description": "Search track. 'vector' (default) uses embeddings; 'lexical' uses the disk-backed Tantivy full-text engine; 'lexical-inhouse' uses the deterministic in-memory lexical engine." },
                                 "principal": { "type": "string", "description": "Resolved authenticated principal for row-level visible_to checks. The local surface defaults to 'admin'." },
                                 "facets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter results by epistemic facet (e.g. failed-attempt, enforced-rule, architecture-decision)." },
                                 "domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by domain slug(s) (OR)." },
@@ -215,12 +215,12 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_rebuild_lexical_index",
-                        "description": "Rebuild the in-house lexical index from the store of record. Use after bulk imports or when lexical search reports stale results. The Tantivy engine is a separate optional build and is disabled here.",
+                        "description": "Rebuild the lexical index (in-house or disk-backed Tantivy) from the store of record. Use after bulk imports or when lexical search reports stale results.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "Optional namespace to rebuild. Omit to rebuild every namespace." },
-                                "engine": { "type": "string", "enum": ["inhouse", "tantivy"], "description": "Engine to rebuild. Default inhouse; tantivy returns a disabled error in default builds." }
+                                "engine": { "type": "string", "enum": ["inhouse", "tantivy"], "description": "Engine to rebuild ('inhouse' default or 'tantivy')." }
                             }
                         }
                     },
@@ -691,6 +691,157 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace", "candidate_id", "disposition", "cas_version"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_twin_get",
+                        "description": "Retrieve the current or historical versioned state of a digital twin in a namespace.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "twin_id": { "type": "string", "description": "Digital twin identifier." },
+                                "version": { "type": "integer", "description": "Optional historical version number." }
+                            },
+                            "required": ["namespace", "twin_id"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_twin_set",
+                        "description": "Update or replace the numeric variable state of a digital twin, validating against any attached schema.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "twin_id": { "type": "string", "description": "Digital twin identifier." },
+                                "variables": { "type": "object", "description": "Map of variable names to finite numeric values." },
+                                "merge": { "type": "boolean", "description": "Merge into existing state (default true) or replace." },
+                                "schema_id": { "type": "string", "description": "Optional digital_twin_schema memory ID." },
+                                "source": { "type": "string", "description": "Optional telemetry source identifier." }
+                            },
+                            "required": ["namespace", "twin_id", "variables"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_twin_diff",
+                        "description": "Compute variable delta between two versions of a digital twin.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "twin_id": { "type": "string", "description": "Digital twin identifier." },
+                                "from_version": { "type": "integer", "description": "Base version number." },
+                                "to_version": { "type": "integer", "description": "Target version number." }
+                            },
+                            "required": ["namespace", "twin_id", "from_version", "to_version"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_twin_list",
+                        "description": "List all digital twins in a namespace with their latest version and variable count.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_export_rdf_star",
+                        "description": "Export a namespace or single memory as W3C RDF 1.2 N-Triples-star / N-Quads-star with reified provenance.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "memory_id": { "type": "string", "description": "Optional single memory ID to export." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_provenance_for",
+                        "description": "Inspect structured node and edge provenance and validation warnings for a memory.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "memory_id": { "type": "string", "description": "The memory ID to inspect." }
+                            },
+                            "required": ["namespace", "memory_id"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_storage_status",
+                        "description": "Report LadybugDB store byte size, WAL size, WAL warning threshold status, and snapshot hygiene.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "neurostrata_graphql_query",
+                        "description": "Execute a read-only GraphQL query against the curated NeuroStrata schema.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string", "description": "GraphQL query document." },
+                                "variables": { "type": "object", "description": "Optional GraphQL variables object." },
+                                "principal": { "type": "string", "description": "Optional ReBAC principal (defaults to 'admin')." }
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_metrics_query",
+                        "description": "Query time-series metric samples and rolling aggregates for a namespace, kind, and metric name.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "kind": { "type": "string", "description": "Metric kind (e.g. retrieval_latency_ms, recall_hit_rate)." },
+                                "name": { "type": "string", "description": "Metric series name." },
+                                "since_ts": { "type": "integer", "description": "Optional lower timestamp bound." },
+                                "until_ts": { "type": "integer", "description": "Optional upper timestamp bound." },
+                                "limit": { "type": "integer", "description": "Max samples to return (default 100)." }
+                            },
+                            "required": ["namespace", "kind", "name"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_metrics_list",
+                        "description": "List active time-series metric keys and rolling summaries in a namespace.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Optional namespace filter." }
+                            }
+                        }
+                    },
+                    {
+                        "name": "neurostrata_chat_ask",
+                        "description": "Ask a natural-language question over NeuroStrata memory using local-first RAG synthesis with citations.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "question": { "type": "string", "description": "Question to answer from memory context." },
+                                "top_k": { "type": "integer", "description": "Max memories to retrieve (default 5, max 20)." },
+                                "principal": { "type": "string", "description": "Optional ReBAC principal (defaults to 'admin')." }
+                            },
+                            "required": ["namespace", "question"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_export_wasm_snapshot",
+                        "description": "Export a portable JSON snapshot of lexical docs and graph edges for the neurostrata-wasm edge engine.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "include_retired": { "type": "boolean", "description": "Include retired/archived rows (default false)." }
+                            },
+                            "required": ["namespace"]
+                        }
                     }
                 ]
             });
@@ -996,6 +1147,42 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_sparql_query" => {
                             result_text = handle_sparql_query(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_twin_get" => {
+                            result_text = handle_twin_get(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_twin_set" => {
+                            result_text = handle_twin_set(&arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_twin_diff" => {
+                            result_text = handle_twin_diff(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_twin_list" => {
+                            result_text = handle_twin_list(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_export_rdf_star" => {
+                            result_text = handle_export_rdf_star(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_provenance_for" => {
+                            result_text = handle_provenance_for(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_storage_status" => {
+                            result_text = handle_storage_status(store.clone()).await;
+                        }
+                        "neurostrata_graphql_query" => {
+                            result_text = handle_graphql_query(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_metrics_query" => {
+                            result_text = handle_metrics_query(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_metrics_list" => {
+                            result_text = handle_metrics_list(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_chat_ask" => {
+                            result_text = handle_chat_ask(&arguments, emb.clone(), store.clone()).await;
+                        }
+                        "neurostrata_export_wasm_snapshot" => {
+                            result_text = handle_export_wasm_snapshot(&arguments, store.clone()).await;
                         }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
@@ -3097,6 +3284,10 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
                 update_id: Uuid::parse_str(&update_id).unwrap_or(id),
                 origin_mesh_epoch,
                 trust: trust_enum,
+                signer_did: None,
+                public_key: None,
+                signature: None,
+                patch: None,
             };
             let rdf_block = RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest_str, quads: nquads_text };
             match validate_canonical_rdf(&record, &rdf_block) {
@@ -3109,7 +3300,7 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
     }
 }
 
-async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     use crate::rdf::sparql::{execute_sparql_query};
     use sparesults::QueryResultsFormat;
 
@@ -3176,6 +3367,593 @@ async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> 
             serde_json::json!({"ok":false,"error":e}).to_string()
         }
     }
+}
+
+pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let Some(twin_id) = arguments.get("twin_id").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"twin_id required"}).to_string();
+    };
+    let req_version = arguments.get("version").and_then(|v| v.as_u64());
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let rows_raw = match store.list(&namespace, None, None).await {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    };
+    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
+        .into_iter()
+        .map(|r| (r.id, r.payload))
+        .collect();
+    if let Some(v) = req_version {
+        let hist = crate::digital_twin::twin_history_from_rows(&rows, twin_id, 0);
+        if let Some((ver, ts, state)) = hist.into_iter().find(|(ver, _, _)| *ver == v) {
+            return serde_json::json!({
+                "ok": true,
+                "namespace": namespace,
+                "twin_id": twin_id,
+                "version": ver,
+                "valid_from": ts,
+                "variables": state,
+            })
+            .to_string();
+        }
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("version {} not found for twin '{}'", v, twin_id)
+        })
+        .to_string();
+    }
+    match crate::digital_twin::get_twin_state_from_rows(&rows, twin_id) {
+        Some(state) => {
+            let summaries = crate::digital_twin::list_twins_from_rows(&rows);
+            let latest_version = summaries
+                .into_iter()
+                .find(|s| s.twin_id == twin_id)
+                .map(|s| s.twin_version)
+                .unwrap_or(1);
+            serde_json::json!({
+                "ok": true,
+                "namespace": namespace,
+                "twin_id": twin_id,
+                "version": latest_version,
+                "variables": state,
+            })
+            .to_string()
+        }
+        None => serde_json::json!({
+            "ok": false,
+            "error": format!("digital twin '{}' not found", twin_id)
+        })
+        .to_string(),
+    }
+}
+
+pub(crate) async fn handle_twin_set(
+    arguments: &Value,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let Some(twin_id) = arguments.get("twin_id").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"twin_id required"}).to_string();
+    };
+    let Some(vars_obj) = arguments.get("variables").and_then(|v| v.as_object()) else {
+        return serde_json::json!({"ok":false,"error":"variables object required"}).to_string();
+    };
+    let merge = arguments
+        .get("merge")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let schema_id = arguments
+        .get("schema_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let source = arguments
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let mut vars = std::collections::BTreeMap::new();
+    for (k, v) in vars_obj {
+        let Some(f) = v.as_f64() else {
+            return serde_json::json!({"ok":false,"error":format!("variable '{}' must be numeric", k)}).to_string();
+        };
+        vars.insert(k.clone(), f);
+    }
+
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let rows_raw = store.list(&namespace, None, None).await.unwrap_or_default();
+    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
+        .into_iter()
+        .map(|r| (r.id, r.payload))
+        .collect();
+    let summaries = crate::digital_twin::list_twins_from_rows(&rows);
+    let prev = summaries.into_iter().find(|s| s.twin_id == twin_id);
+    let next_version = prev.as_ref().map(|s| s.twin_version + 1).unwrap_or(1);
+
+    let mut base_payload = if merge {
+        if let Some(ref p) = prev {
+            rows.iter()
+                .find(|(id, _)| id == &p.id)
+                .map(|(_, pl)| pl.clone())
+                .unwrap_or_else(|| crate::traits::MemoryPayload {
+                    content: format!("Digital twin state for {}", twin_id),
+                    user_id: "system".to_string(),
+                    memory_type: "digital_twin".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                })
+        } else {
+            crate::traits::MemoryPayload {
+                content: format!("Digital twin state for {}", twin_id),
+                user_id: "system".to_string(),
+                memory_type: "digital_twin".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({}),
+            }
+        }
+    } else {
+        crate::traits::MemoryPayload {
+            content: format!("Digital twin state for {}", twin_id),
+            user_id: "system".to_string(),
+            memory_type: "digital_twin".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        }
+    };
+
+    if let Err(e) = crate::digital_twin::set_state(&mut base_payload, &vars, merge) {
+        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
+    }
+    let state_after = crate::digital_twin::get_state(&base_payload);
+
+    let eff_schema_id = schema_id.or_else(|| prev.and_then(|p| p.schema_id));
+    let mut violations = Vec::new();
+    if let Some(ref sid) = eff_schema_id {
+        if let Ok(Some((_, schema_payload))) = store.get(&namespace, sid).await {
+            let schema = crate::digital_twin::TwinSchema::from_metadata(&schema_payload.metadata);
+            violations = crate::digital_twin::validate_state(&state_after, schema.as_ref());
+        }
+    }
+
+    let now_ts = chrono::Utc::now().timestamp();
+    if let Some(meta) = base_payload.metadata.as_object_mut() {
+        meta.insert("valid_from".to_string(), serde_json::json!(now_ts));
+        if let Some(twin_obj) = meta.get_mut("twin").and_then(|t| t.as_object_mut()) {
+            twin_obj.insert("id".to_string(), serde_json::json!(twin_id));
+            twin_obj.insert("version".to_string(), serde_json::json!(next_version));
+            if let Some(ref s) = eff_schema_id {
+                twin_obj.insert("schema_id".to_string(), serde_json::json!(s));
+            }
+            if let Some(ref src) = source {
+                twin_obj.insert("source".to_string(), serde_json::json!(src));
+            }
+        }
+    }
+    base_payload.content = format!(
+        "Digital twin '{}' v{}: {:?}",
+        twin_id, next_version, state_after
+    );
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let vec = emb
+        .embed(&base_payload.content)
+        .await
+        .unwrap_or_else(|_| vec![0.0; emb.dimensions()]);
+    if let Err(e) = store.upsert(&namespace, &id, vec, base_payload).await {
+        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "id": id,
+        "namespace": namespace,
+        "twin_id": twin_id,
+        "version": next_version,
+        "variables": state_after,
+        "violations": violations,
+    })
+    .to_string()
+}
+
+pub(crate) async fn handle_twin_diff(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let Some(twin_id) = arguments.get("twin_id").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"twin_id required"}).to_string();
+    };
+    let Some(from_version) = arguments.get("from_version").and_then(|v| v.as_u64()) else {
+        return serde_json::json!({"ok":false,"error":"from_version required"}).to_string();
+    };
+    let Some(to_version) = arguments.get("to_version").and_then(|v| v.as_u64()) else {
+        return serde_json::json!({"ok":false,"error":"to_version required"}).to_string();
+    };
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let rows_raw = match store.list(&namespace, None, None).await {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    };
+    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
+        .into_iter()
+        .map(|r| (r.id, r.payload))
+        .collect();
+    match crate::digital_twin::twin_diff_from_rows(&rows, twin_id, from_version, to_version) {
+        Ok(deltas) => serde_json::json!({
+            "ok": true,
+            "namespace": namespace,
+            "twin_id": twin_id,
+            "from_version": from_version,
+            "to_version": to_version,
+            "deltas": deltas,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    }
+}
+
+pub(crate) async fn handle_twin_list(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let rows_raw = match store.list(&namespace, None, None).await {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    };
+    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
+        .into_iter()
+        .map(|r| (r.id, r.payload))
+        .collect();
+    let twins = crate::digital_twin::list_twins_from_rows(&rows);
+    serde_json::json!({
+        "ok": true,
+        "namespace": namespace,
+        "twins": twins,
+    })
+    .to_string()
+}
+
+pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let memory_id_filter = arguments.get("memory_id").and_then(|v| v.as_str());
+    let format = arguments
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("n-triples-star");
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let rows_raw = match store.list(&namespace, None, None).await {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    };
+    let mut all_quads = Vec::new();
+    let mut all_warnings = Vec::new();
+    for r in rows_raw {
+        if let Some(mid) = memory_id_filter {
+            if r.id != mid {
+                continue;
+            }
+        }
+        let (quads, warnings) = crate::rdf::provenance::project_memory_rdf_star(
+            &namespace,
+            &r.id,
+            &r.payload,
+            crate::rdf::types::Tier::Domain,
+            0,
+        );
+        all_quads.extend(quads);
+        all_warnings.extend(warnings);
+    }
+    let flatten = format == "n-triples-star" || format == "turtle-star";
+    match crate::rdf::provenance::serialize_rdf_star(&all_quads, format, flatten) {
+        Ok(rdf_star) => serde_json::json!({
+            "ok": true,
+            "namespace": namespace,
+            "quad_count": all_quads.len(),
+            "rdf_star": rdf_star,
+            "warnings": all_warnings,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({"ok":false,"error":e}).to_string(),
+    }
+}
+
+pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let Some(memory_id) = arguments.get("memory_id").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"memory_id required"}).to_string();
+    };
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    match store.get(&namespace, memory_id).await {
+        Ok(Some((_, payload))) => {
+            let prov = crate::rdf::provenance::extract_node_provenance(&payload.metadata, 0);
+            let warnings = crate::rdf::provenance::validate_node_provenance(memory_id, &prov);
+            let edges = crate::store::ladybug::edge_specs(&payload.metadata);
+            let edge_count = edges.len();
+            serde_json::json!({
+                "ok": true,
+                "namespace": namespace,
+                "memory_id": memory_id,
+                "provenance": prov,
+                "edge_count": edge_count,
+                "warnings": warnings,
+            })
+            .to_string()
+        }
+        Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
+        Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    }
+}
+
+pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String {
+    let cfg = crate::config::Config::from_default_path()
+        .map(|c| c.storage_hygiene)
+        .unwrap_or_default();
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        let status = crate::storage::compute_storage_status(ls.local_path(), &cfg);
+        return serde_json::to_string(&status)
+            .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}).to_string());
+    }
+    let db_path = crate::config::Config::from_default_path()
+        .map(|c| std::path::PathBuf::from(c.db_path))
+        .unwrap_or_else(|_| std::path::PathBuf::from(".NeuroStrata/db"));
+    let status = crate::storage::compute_storage_status(&db_path, &cfg);
+    serde_json::to_string(&status)
+        .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}).to_string())
+}
+
+pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    let Some(query) = arguments.get("query").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"data":null,"errors":[{"message":"query required"}]}).to_string();
+    };
+    let variables = arguments.get("variables");
+    let principal = arguments
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("admin");
+    let ns_raw = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            variables
+                .and_then(|v| v.get("namespace"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("NeuroStrata");
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    let rows_raw = store.list(&namespace, None, None).await.unwrap_or_default();
+    let mut records = Vec::with_capacity(rows_raw.len());
+    let mut edges_by_source: std::collections::HashMap<
+        String,
+        Vec<(String, String, Option<String>)>,
+    > = std::collections::HashMap::new();
+    for r in rows_raw {
+        let specs = crate::store::ladybug::edge_specs(&r.payload.metadata);
+        let mapped: Vec<(String, String, Option<String>)> = specs
+            .into_iter()
+            .map(|e| (e.target_id, e.rel_type.to_string(), Some("metadata".to_string())))
+            .collect();
+        if !mapped.is_empty() {
+            edges_by_source.insert(r.id.clone(), mapped);
+        }
+        records.push((r.id, r.payload));
+    }
+    let resp = crate::graphql::execute_on_records(
+        &records,
+        &edges_by_source,
+        &namespace,
+        principal,
+        query,
+        variables,
+    );
+    serde_json::to_string(&resp).unwrap_or_else(|e| {
+        serde_json::json!({"data":null,"errors":[{"message":e.to_string()}]}).to_string()
+    })
+}
+
+pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    use std::str::FromStr;
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let Some(kind_str) = arguments.get("kind").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"kind required"}).to_string();
+    };
+    let Some(name) = arguments.get("name").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"name required"}).to_string();
+    };
+    let Ok(kind) = crate::time_series::MetricKind::from_str(kind_str) else {
+        return serde_json::json!({"ok":false,"error":format!("unknown metric kind '{}'", kind_str)}).to_string();
+    };
+    let since_ts = arguments.get("since_ts").and_then(|v| v.as_i64());
+    let until_ts = arguments.get("until_ts").and_then(|v| v.as_i64());
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100) as usize;
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        let samples = ls
+            .query_db_metrics(&namespace, kind, name, since_ts, until_ts, limit)
+            .await
+            .unwrap_or_default();
+        let key = (namespace.clone(), kind, name.to_string());
+        let agg = ls.metrics().aggregate(&key);
+        return serde_json::json!({
+            "ok": true,
+            "namespace": namespace,
+            "kind": kind.as_str(),
+            "name": name,
+            "samples": samples,
+            "aggregate": agg,
+        })
+        .to_string();
+    }
+    serde_json::json!({
+        "ok": true,
+        "namespace": namespace,
+        "kind": kind.as_str(),
+        "name": name,
+        "samples": [],
+        "aggregate": null,
+    })
+    .to_string()
+}
+
+pub(crate) async fn handle_metrics_list(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
+    let ns_raw = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("NeuroStrata");
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        let keys = ls.metrics().list_keys(&namespace);
+        let series: Vec<Value> = keys
+            .into_iter()
+            .map(|((ns, kind, name), sample_count)| {
+                let agg = ls.metrics().aggregate(&(ns.clone(), kind, name.clone()));
+                serde_json::json!({
+                    "namespace": ns,
+                    "kind": kind.as_str(),
+                    "name": name,
+                    "sample_count": sample_count,
+                    "aggregate": agg,
+                })
+            })
+            .collect();
+        return serde_json::json!({
+            "ok": true,
+            "series": series,
+        })
+        .to_string();
+    }
+    serde_json::json!({
+        "ok": true,
+        "series": [],
+    })
+    .to_string()
+}
+
+pub(crate) async fn handle_chat_ask(
+    arguments: &Value,
+    emb: Arc<dyn crate::traits::Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let Some(question) = arguments.get("question").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"question required"}).to_string();
+    };
+    let top_k = arguments
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 20) as usize;
+    let cfg = crate::config::Config::from_default_path()
+        .map(|c| c.rag_chat)
+        .unwrap_or_default();
+    let principal = arguments
+        .get("principal")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&cfg.default_principal);
+    let namespace = resolve_namespace(&store, ns_raw).await;
+
+    let provider: Arc<dyn crate::rag_chat::LlmProvider> =
+        if cfg.provider == "openai" || cfg.provider == "openai-compatible" {
+            if let Some(ref url) = cfg.base_url {
+                match crate::rag_chat::OpenAiCompatibleProvider::new(
+                    url,
+                    cfg.api_key_env.as_deref(),
+                    &cfg.model,
+                    std::time::Duration::from_secs(cfg.timeout_secs.max(1)),
+                    cfg.allow_remote_base_url,
+                ) {
+                    Ok(p) => Arc::new(p),
+                    Err(e) => {
+                        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string()
+                    }
+                }
+            } else {
+                Arc::new(crate::rag_chat::OfflineProvider)
+            }
+        } else {
+            Arc::new(crate::rag_chat::OfflineProvider)
+        };
+
+    match crate::rag_chat::ask(
+        store,
+        emb,
+        &namespace,
+        principal,
+        question,
+        top_k,
+        None,
+        cfg.max_context_chars,
+        provider,
+        false,
+        false,
+        cfg.remote_egress_allowed,
+    )
+    .await
+    {
+        Ok(resp) => serde_json::to_string(&resp)
+            .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}).to_string()),
+        Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+    }
+}
+
+pub(crate) async fn handle_export_wasm_snapshot(
+    arguments: &Value,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
+        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
+    };
+    let include_retired = arguments
+        .get("include_retired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let namespace = resolve_namespace(&store, ns_raw).await;
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        match ls.export_wasm_snapshot(&namespace, include_retired).await {
+            Ok((docs, edges)) => {
+                return serde_json::json!({
+                    "ok": true,
+                    "namespace": namespace,
+                    "doc_count": docs.len(),
+                    "edge_count": edges.len(),
+                    "docs": docs,
+                    "edges": edges,
+                })
+                .to_string();
+            }
+            Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+        }
+    }
+    serde_json::json!({
+        "ok": true,
+        "namespace": namespace,
+        "doc_count": 0,
+        "edge_count": 0,
+        "docs": [],
+        "edges": [],
+    })
+    .to_string()
 }
 
 async fn handle_domain_registry(arguments: Value, emb: Arc<dyn crate::traits::Embedder>, store: Arc<dyn VectorStore>) -> String {
@@ -3788,13 +4566,42 @@ async fn handle_rebuild_lexical_index(
         .get("engine")
         .and_then(|v| v.as_str())
         .unwrap_or("inhouse");
-    if engine != "inhouse" {
-        return "ERROR [ENGINE]: the tantivy lexical engine is disabled in this build (it requires the optional tantivy feature). Use engine 'inhouse'.".to_string();
-    }
     let namespace = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    if engine == "tantivy" {
+        if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+            return match ls.rebuild_tantivy_lexical(namespace.as_deref()).await {
+                Ok((documents, version)) => format!(
+                    "Rebuilt the Tantivy lexical index ({}): {} document(s) indexed{}.",
+                    version,
+                    documents,
+                    namespace
+                        .map(|ns| format!(" in namespace '{}'", ns))
+                        .unwrap_or_default()
+                ),
+                Err(error) => format!("Failed to rebuild the Tantivy lexical index: {error}"),
+            };
+        }
+        return match store.rebuild_lexical_index(namespace.as_deref()).await {
+            Ok(documents) => format!(
+                "Rebuilt the Tantivy lexical index ({}): {} document(s) indexed{}.",
+                crate::lexical::INDEX_VERSION,
+                documents,
+                namespace
+                    .map(|ns| format!(" in namespace '{}'", ns))
+                    .unwrap_or_default()
+            ),
+            Err(error) => format!("Failed to rebuild the lexical index: {error}"),
+        };
+    }
+    if engine != "inhouse" {
+        return format!(
+            "ERROR [ENGINE]: unknown lexical engine '{}'. Use 'inhouse' or 'tantivy'.",
+            engine
+        );
+    }
     match store.rebuild_lexical_index(namespace.as_deref()).await {
         Ok(documents) => format!(
             "Rebuilt the in-house lexical index: {} document(s) indexed{}.",
@@ -4177,9 +4984,9 @@ async fn handle_search_memory(
         .get("mode")
         .and_then(|v| v.as_str())
         .unwrap_or("vector");
-    if search_mode != "vector" && search_mode != "lexical-inhouse" {
+    if search_mode != "vector" && search_mode != "lexical" && search_mode != "lexical-inhouse" {
         return format!(
-            "ERROR [MODE]: unknown search mode '{}'. Use 'vector' (default) or 'lexical-inhouse'.",
+            "ERROR [MODE]: unknown search mode '{}'. Use 'vector' (default), 'lexical', or 'lexical-inhouse'.",
             search_mode
         );
     }
@@ -4248,20 +5055,48 @@ async fn handle_search_memory(
         .filter_map(crate::domain::normalize_domain_slug)
         .collect();
 
-    if search_mode == "lexical-inhouse" {
-        let outcome = match store
-            .search_lexical(
-                namespace,
-                &query,
-                FETCH_LIMIT,
-                include_tasks,
-                include_archived,
-                &slugs,
-                principal,
-                fuzzy_max_distance,
-            )
-            .await
-        {
+    if search_mode == "lexical" || search_mode == "lexical-inhouse" {
+        let outcome_res = if search_mode == "lexical" {
+            if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+                ls.search_tantivy_lexical(
+                    namespace,
+                    &query,
+                    FETCH_LIMIT,
+                    include_tasks,
+                    include_archived,
+                    &slugs,
+                    principal,
+                )
+                .await
+            } else {
+                store
+                    .search_lexical(
+                        namespace,
+                        &query,
+                        FETCH_LIMIT,
+                        include_tasks,
+                        include_archived,
+                        &slugs,
+                        principal,
+                        fuzzy_max_distance,
+                    )
+                    .await
+            }
+        } else {
+            store
+                .search_lexical(
+                    namespace,
+                    &query,
+                    FETCH_LIMIT,
+                    include_tasks,
+                    include_archived,
+                    &slugs,
+                    principal,
+                    fuzzy_max_distance,
+                )
+                .await
+        };
+        let outcome = match outcome_res {
             Ok(outcome) => outcome,
             Err(error) => {
                 return format!("Failed to search the lexical index: {error}");
@@ -8009,6 +8844,18 @@ mod tests {
                 "neurostrata_task_intake",
                 "neurostrata_task_intake_list",
                 "neurostrata_task_intake_resolve",
+                "neurostrata_twin_get",
+                "neurostrata_twin_set",
+                "neurostrata_twin_diff",
+                "neurostrata_twin_list",
+                "neurostrata_export_rdf_star",
+                "neurostrata_provenance_for",
+                "neurostrata_storage_status",
+                "neurostrata_graphql_query",
+                "neurostrata_metrics_query",
+                "neurostrata_metrics_list",
+                "neurostrata_chat_ask",
+                "neurostrata_export_wasm_snapshot",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.

@@ -66,6 +66,18 @@ pub struct MeshRecord {
     pub origin_mesh_epoch: u32,
     /// Local trust flag. Mirrors the spec's trust model.
     pub trust: super::manifest::Trust,
+    /// Optional Ed25519 signature over canonical N-Quads + update_id + origin_mesh_epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Optional DID of the signing node (`did:key:z6Mk...` or `did:neurostrata:node:<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_did: Option<String>,
+    /// Optional hex-encoded 32-byte Ed25519 public key (`64` lowercase hex chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Optional streaming RDF delta patch (`neurostrata-rdf-patch/v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<crate::streaming::Stream>,
 }
 
 /// Lifecycle state and provenance for a mesh record.
@@ -190,6 +202,10 @@ mod tests {
             update_id: Uuid::nil(),
             origin_mesh_epoch: 1,
             trust: super::super::manifest::Trust::Trusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         }
     }
 

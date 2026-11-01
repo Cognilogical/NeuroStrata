@@ -111,6 +111,14 @@ pub struct ApplyReport {
     /// §"Concurrent merge policy": "report combination"), never resolved by
     /// timestamp.
     pub combinations: Vec<String>,
+    /// Records whose Ed25519 signature verified cleanly.
+    pub verified_signed: usize,
+    /// Records accepted without a signature (warn-first Phase 1).
+    pub unsigned_accepted: usize,
+    /// Records rejected due to an invalid Ed25519 signature or DID/pubkey mismatch.
+    pub signature_rejected: usize,
+    /// Records rejected because `signer_did` is not in a non-empty `manifest.signers`.
+    pub unauthorized_signer: usize,
 }
 
 /// Where the accepted-head cursor lives for a mesh checkout: a sibling
@@ -339,6 +347,10 @@ pub async fn apply_changed(
         conflicted: 0,
         conflicted_ids: Vec::new(),
         combinations: Vec::new(),
+        verified_signed: 0,
+        unsigned_accepted: 0,
+        signature_rejected: 0,
+        unauthorized_signer: 0,
     };
 
     // Divergence detection (documented cursor strategy, §"Concurrent merge
@@ -388,6 +400,24 @@ pub async fn apply_changed(
         if let Err(reason) = epoch_gate(record.origin_mesh_epoch, manifest_epoch) {
             report.ignored.push(format!("{rel}: {reason}"));
             continue;
+        }
+        match verify_record_signature(&record, &mesh.manifest().signers) {
+            SignatureDisposition::Verified => {
+                report.verified_signed += 1;
+            }
+            SignatureDisposition::Unsigned => {
+                report.unsigned_accepted += 1;
+            }
+            SignatureDisposition::Invalid(reason) => {
+                report.signature_rejected += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
+            SignatureDisposition::Unauthorized(reason) => {
+                report.unauthorized_signer += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
         }
         match apply_one(
             root,
@@ -1339,18 +1369,24 @@ async fn apply_effective(
             metadata.insert("trust".to_string(), json!(policy.to_string()));
         }
     }
-    metadata.insert(
-        "mesh".to_string(),
-        mesh_provenance(
-            mesh_id,
-            &record.update_id,
-            &record.lifecycle.created_by,
-            record.origin_mesh_epoch,
-            state,
-            superseded_by,
-            head_signature,
-        ),
+    let mut mesh_prov = mesh_provenance(
+        mesh_id,
+        &record.update_id,
+        &record.lifecycle.created_by,
+        record.origin_mesh_epoch,
+        state,
+        superseded_by,
+        head_signature,
     );
+    if record.signature.is_some() {
+        if let Some(ref did) = record.signer_did {
+            if let Some(obj) = mesh_prov.as_object_mut() {
+                obj.insert("verified_signer_did".to_string(), json!(did));
+                obj.insert("signature_verified".to_string(), json!(true));
+            }
+        }
+    }
+    metadata.insert("mesh".to_string(), mesh_prov);
     apply_lifecycle_markers(
         &mut metadata,
         state,
@@ -1746,7 +1782,103 @@ fn preserved_edit_record(
         update_id,
         origin_mesh_epoch,
         trust: Trust::Untrusted,
+        signature: None,
+        signer_did: None,
+        public_key: None,
+        patch: None,
     }
+}
+
+/// Outcome of Ed25519 signature verification on a [`MeshRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureDisposition {
+    Verified,
+    Unsigned,
+    Invalid(String),
+    Unauthorized(String),
+}
+
+/// Verify optional Ed25519 signature + DID/pubkey consistency + manifest allowlist.
+pub fn verify_record_signature(
+    record: &MeshRecord,
+    signers: &[super::manifest::SignerEntry],
+) -> SignatureDisposition {
+    let has_sig = record.signature.is_some();
+    let has_did = record.signer_did.is_some();
+    let has_pub = record.public_key.is_some();
+    if !has_sig && !has_did && !has_pub {
+        return SignatureDisposition::Unsigned;
+    }
+    let (Some(sig_b64), Some(did), Some(pub_hex)) =
+        (&record.signature, &record.signer_did, &record.public_key)
+    else {
+        return SignatureDisposition::Invalid(
+            "partial signature fields: signature, signer_did, and public_key must all be present"
+                .to_string(),
+        );
+    };
+    let Ok(pub_bytes) = hex::decode(pub_hex) else {
+        return SignatureDisposition::Invalid("invalid hex in public_key".to_string());
+    };
+    if pub_bytes.len() != 32 {
+        return SignatureDisposition::Invalid("public_key must be 32 bytes".to_string());
+    }
+    if did.starts_with("did:key:z") {
+        let expected_did = crate::did::signer_did(&pub_bytes);
+        if &expected_did != did {
+            return SignatureDisposition::Invalid(
+                "signer_did does not match public_key".to_string(),
+            );
+        }
+    }
+    let Ok(sig_bytes) = crate::did::decode_base64(sig_b64) else {
+        return SignatureDisposition::Invalid("invalid base64 in signature".to_string());
+    };
+    let payload_rdf = record.rdf.as_ref().map(|rdf_block| {
+        crate::did::signing_payload(
+            &rdf_block.quads,
+            &record.update_id.to_string(),
+            record.origin_mesh_epoch,
+        )
+    });
+    let payload_json = serde_json::to_value(record)
+        .ok()
+        .and_then(|v| crate::did::canonical_signing_bytes(&v).ok());
+
+    let verified = payload_rdf
+        .as_ref()
+        .map(|p| crate::did::verify(p, &pub_bytes, &sig_bytes))
+        .unwrap_or(false)
+        || payload_json
+            .as_ref()
+            .map(|p| crate::did::verify(p, &pub_bytes, &sig_bytes))
+            .unwrap_or(false);
+
+    if !verified {
+        return SignatureDisposition::Invalid("Ed25519 signature verification failed".to_string());
+    }
+
+    if !signers.is_empty()
+        && !signers
+            .iter()
+            .any(|s| &s.did == did && s.public_key.eq_ignore_ascii_case(pub_hex))
+    {
+        return SignatureDisposition::Unauthorized(format!(
+            "signer {did} is not in manifest.signers allowlist"
+        ));
+    }
+
+    SignatureDisposition::Verified
+}
+
+/// Decompress a zstd-compressed mesh record bundle with bounded output size.
+pub fn decompress_record_bundle(bytes: &[u8]) -> Result<Vec<MeshRecord>, String> {
+    let raw = crate::compression::zstd::decompress_bounded(
+        bytes,
+        crate::compression::zstd::DEFAULT_MESH_MAX_DECOMPRESSED_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
+    serde_json::from_slice(&raw).map_err(|e| e.to_string())
 }
 
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
@@ -2865,6 +2997,10 @@ mod tests {
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         }
     }
 
@@ -3285,6 +3421,10 @@ mod tests {
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         };
 
         let store = fresh_store("dirb-proc").await;
@@ -3411,6 +3551,10 @@ mod tests {
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         };
 
         let store = fresh_store("dirb-meta").await;
@@ -3508,6 +3652,10 @@ mod tests {
             update_id: Uuid::new_v4(),
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
         };
 
         let store = fresh_store("dirb-trusted").await;

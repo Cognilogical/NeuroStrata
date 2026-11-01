@@ -123,6 +123,12 @@ pub async fn execute_sparql_query(
         .parse_query(query_str)
         .map_err(|e| format!("SPARQL parse error: {}", e))?;
 
+    let service_endpoints = crate::rdf::federation::inspect_service_clauses(&query)
+        .map_err(|e| format!("SPARQL federation error: {}", e))?;
+    if !service_endpoints.is_empty() && !config.service_enabled {
+        return Err("SPARQL SERVICE federation is disabled by default".to_string());
+    }
+
     // Reject UPDATE queries: spargebra separates UPDATE via parse_update; parse_query
     // handles SELECT/ASK/CONSTRUCT/DESCRIBE only, so an UPDATE input errors here.
 
