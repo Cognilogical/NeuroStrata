@@ -1267,7 +1267,7 @@ async fn handle_context_plan(
     let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
     let max_items = arguments.get("max_items").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-    let _max_bytes = arguments.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(1024) as usize;
+    let max_bytes = arguments.get("max_bytes").and_then(|v| v.as_u64()).map(|b| b as usize);
     let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("json");
 
     let vector = match embedder.embed(query).await {
@@ -1297,9 +1297,13 @@ async fn handle_context_plan(
             freshness: None,
         });
     }
-    let budget = Budget::from(max_items);
+    let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
+    let budget = Budget::from(token_budget);
     let truncation = items.len() > max_items;
-    let deduped = rank_dedup_budget(items, budget);
+    let mut deduped = rank_dedup_budget(items, budget);
+    if deduped.len() > max_items {
+        deduped.truncate(max_items);
+    }
     let mut plan = ContextPlan::new("context-plan", Degradation::Supported);
     plan.schema_version = CONTEXT_PLAN_SCHEMA_VERSION.to_string();
     plan.applied_scope = namespace.to_string();
@@ -11235,15 +11239,34 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     #[tokio::test]
     async fn test_handle_context_plan_returns_budgeted_plan() {
         use crate::context::{ContextPlan, Degradation, CONTEXT_PLAN_SCHEMA_VERSION};
-        let args_json = serde_json::json!({"namespace":"test","max_items":2,"format":"json"});
+        let args_json = serde_json::json!({"namespace":"test","max_items":2,"format":"json","query":"test"});
         let embedder = Arc::new(LocalStubEmbedder);
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-test"), 4).expect("open"));
         store.init("test").await.unwrap();
+        let seed = vec![0.1f32; 4];
+        store.upsert(
+            "test",
+            "plan-seed",
+            seed,
+            crate::traits::MemoryPayload {
+                content: "SHACL validation".to_string(),
+                user_id: "test".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("insert seed");
         let result_json = handle_context_plan(&args_json, embedder.clone(), store.clone()).await;
         let plan: ContextPlan = serde_json::from_str(&result_json).expect("json parses");
         assert_eq!(plan.schema_version, CONTEXT_PLAN_SCHEMA_VERSION);
         assert!(plan.event_id.contains("context-plan") || plan.event_id == "context-plan");
         assert!(plan.degradation == Degradation::Supported || plan.degradation == Degradation::Unsupported);
+        let val: serde_json::Value = serde_json::from_str(&result_json).unwrap();
+        assert!(!val["items"].as_array().unwrap().is_empty());
         // Text format
         let args_text = serde_json::json!({"namespace":"test","format":"text"});
         let text_result = handle_context_plan(&args_text, embedder.clone(), store.clone()).await;
