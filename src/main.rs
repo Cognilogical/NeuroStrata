@@ -6,7 +6,6 @@ mod attempt;
 mod buffer;
 pub mod compression;
 mod config;
-#[allow(dead_code)]
 mod context;
 mod crash;
 mod daemon;

@@ -2283,6 +2283,28 @@ async fn handle_add_memory(
         crate::tools::procedure::stamp_local_trust(&mut metadata);
     }
 
+    // Multimodal attachment validation (warn-first; strict aborts the write).
+    let multimodal_warnings = crate::multimodal::validate_metadata_attachments(
+        &metadata,
+        &crate::multimodal::MultimodalConfig::default(),
+        None,
+    );
+    if metadata
+        .get("multimodal_strict")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && multimodal_warnings.iter().any(|w| w.is_strict_failure(false))
+    {
+        return format!(
+            "ERROR [MULTIMODAL]: strict attachment validation failed: {}",
+            multimodal_warnings
+                .iter()
+                .map(|w| w.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     // Honour an unambiguous Governs line in the prose (guinea-pig Option 2):
     // a declared pointer that is written but never honoured is the worst of
     // both worlds. Locations and explicit metadata already wrote governs;
@@ -2315,6 +2337,27 @@ async fn handle_add_memory(
                 o.insert("source".to_string(), serde_json::Value::String(
                     resolved_source.unwrap_or_else(|| "agent".to_string()),
                 ));
+            }
+        }
+    }
+
+    // Optional GLiNER-style entity candidate extraction (review-only).
+    if arguments
+        .get("extract_entities")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || metadata
+            .get("extract_entities")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        let cands = crate::gliner::extract_candidates(content);
+        if !cands.is_empty() {
+            if let Some(o) = metadata.as_object_mut() {
+                o.insert(
+                    "gliner_candidates".to_string(),
+                    serde_json::to_value(&cands).unwrap_or_default(),
+                );
             }
         }
     }
@@ -2431,6 +2474,9 @@ async fn handle_add_memory(
                     {
                         msg.push_str(&format!("\nRegistry warning: {}", warning));
                     }
+                }
+                for w in &multimodal_warnings {
+                    msg.push_str(&format!("\\nMultimodal warning: {}", w));
                 }
                 // TASK NUDGE: advisory when a non-task/procedure memory's content
                 // carries task-shaped markers.
@@ -7500,6 +7546,90 @@ mod tests {
             reply
         );
         assert!(reply.contains("metadata"), "{}", reply);
+    }
+
+    #[tokio::test]
+    async fn test_handle_add_memory_multimodal_warnings_and_gliner_candidates() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // (a) extract_entities: true -> gliner_candidates non-empty, all review_only.
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "LadybugDB and FastEmbedder run locally",
+                "namespace": "probe",
+                "extract_entities": true,
+            }),
+            emb.clone(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(added.starts_with("Successfully added memory"), "{}", added);
+
+        let stored = store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|r| r.payload.content == "LadybugDB and FastEmbedder run locally")
+            .expect("the memory is stored");
+        let cands = stored.payload.metadata.get("gliner_candidates")
+            .and_then(|v| v.as_array())
+            .expect("gliner_candidates array");
+        assert!(!cands.is_empty(), "candidates should be non-empty");
+        for c in cands {
+            assert_eq!(c.get("review_only"), Some(&serde_json::json!(true)));
+        }
+
+        // (b) invalid attachment, non-strict -> "Multimodal warning:" in response.
+        let reply_warn = handle_add_memory(
+            serde_json::json!({
+                "content": "memory with bad mime",
+                "namespace": "probe",
+                "create_new_namespace": true,
+                "metadata": { "attachments": [{ "id": "a", "mime": "application/x-evil", "size_bytes": 10, "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "uri": "file:///x" }] },
+            }),
+            emb.clone(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply_warn.contains("Multimodal warning:"), "{}", reply_warn);
+
+        // AttachmentsNotArray non-strict.
+        let reply_arr = handle_add_memory(
+            serde_json::json!({
+                "content": "memory with attachments not array",
+                "namespace": "probe",
+                "create_new_namespace": true,
+                "metadata": { "attachments": "not-an-array" },
+            }),
+            emb.clone(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply_arr.contains("Multimodal warning:"), "{}", reply_arr);
+
+        // strict -> "ERROR [MULTIMODAL]:"
+        let reply_strict = handle_add_memory(
+            serde_json::json!({
+                "content": "strict bad attachment",
+                "namespace": "probe",
+                "create_new_namespace": true,
+                "metadata": { "multimodal_strict": true, "attachments": "not-an-array" },
+            }),
+            emb.clone(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply_strict.contains("ERROR [MULTIMODAL]:"), "{}", reply_strict);
     }
 
     /// The write path normalizes a string domain to its slug, so a stored
