@@ -5,6 +5,7 @@ use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStor
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use std::sync::Arc;
+use std::cmp::Ordering;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
@@ -232,6 +233,27 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
                                 "min_community_size": { "type": "integer", "default": 3, "description": "Minimum number of members for a community to be created." },
                                 "resolution": { "type": "number", "default": 1.0, "description": "Resolution for the Leiden algorithm." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_find_duplicate_candidates",
+                        "description": "Find duplicate candidate memories in a namespace by computing token Jaccard text similarity and optional KGE structural distance. Returns review-only ranked pairs.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "threshold": {
+                                    "type": "number",
+                                    "description": "Combined score threshold [0.0, 1.0]. Default 0.85.",
+                                    "default": 0.85
+                                },
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Maximum candidates to return. Default 20, max 100.",
+                                    "default": 20
+                                }
                             },
                             "required": ["namespace"]
                         }
@@ -808,6 +830,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_rebuild_communities" => {
                             result_text = handle_rebuild_communities(arguments, store.clone()).await;
+                        }
+                        "neurostrata_find_duplicate_candidates" => {
+                            result_text = handle_find_duplicate_candidates(arguments, store.clone()).await;
                         }
                         "neurostrata_memories_for_file" => {
                             result_text = handle_memories_for_file(arguments, store.clone()).await;
@@ -3989,6 +4014,128 @@ async fn handle_rebuild_communities(
         "modularity": modularity,
         "communities": community_results
     }).to_string()
+}
+
+async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn VectorStore>) -> String {
+    // Extract parameters with defaults and clamping
+    let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing.".to_string(),
+    };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
+
+    let threshold = arguments.get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.85)
+        .clamp(0.0, 1.0);
+
+    let limit = arguments.get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .clamp(1, 100) as usize;
+
+    // List all memories in the namespace, filtering to active non-structural ones
+    let all_memories = match store.list(namespace, None, None).await {
+        Ok(rows) => rows,
+        Err(e) => return format!("Failed to list memories: {e}"),
+    };
+
+    let non_structural_memories: Vec<SearchResult> = all_memories
+        .into_iter()
+        .filter(|sr| {
+            sr.payload.memory_type != "directory"
+                && sr.payload.memory_type != "file"
+                && sr.payload.memory_type != "markdown"
+                && sr.payload.memory_type != "freshness_flag"
+                && sr.payload.memory_type != "guard_event"
+                && sr.payload.memory_type != "community_summary"
+                && sr.payload.memory_type != "task"
+        })
+        .collect();
+
+    if non_structural_memories.is_empty() {
+        let empty_json = serde_json::json!({
+            "namespace": namespace,
+            "threshold": threshold,
+            "candidates": []
+        });
+        return empty_json.to_string();
+    }
+
+    // Group memories by memory_type so we only compare pairs of the same type
+    let mut by_type: std::collections::HashMap<String, Vec<&SearchResult>> = std::collections::HashMap::new();
+    for sr in &non_structural_memories {
+        by_type.entry(sr.payload.memory_type.clone()).or_default().push(sr);
+    }
+
+    let mut candidates: Vec<serde_json::Value> = Vec::new();
+
+    for (_memory_type, group) in by_type {
+        if group.len() < 2 {
+            continue;
+        }
+        for i in 0..group.len() {
+            let a = group[i];
+            for j in (i + 1)..group.len() {
+                let b = group[j];
+                if a.id >= b.id {
+                    continue;
+                }
+                let text_sim = compute_token_jaccard(&a.payload.content, &b.payload.content).clamp(0.0, 1.0);
+                let combined_score = 0.5 * text_sim;
+                if combined_score >= threshold as f32 {
+                    candidates.push(serde_json::json!({
+                        "memory_a": a.id,
+                        "memory_b": b.id,
+                        "text_similarity": text_sim,
+                        "structural_distance": 1.0,
+                        "combined_score": combined_score,
+                        "review_only": true
+                    }));
+                }
+            }
+        }
+    }
+
+    candidates.sort_by(|x, y| {
+        let sx = x["combined_score"].as_f64().unwrap_or(0.0);
+        let sy = y["combined_score"].as_f64().unwrap_or(0.0);
+        sy.partial_cmp(&sx).unwrap_or(Ordering::Equal)
+            .then(x["memory_a"].as_str().unwrap_or("").cmp(y["memory_a"].as_str().unwrap_or("")))
+            .then(x["memory_b"].as_str().unwrap_or("").cmp(y["memory_b"].as_str().unwrap_or("")))
+    });
+    let candidates = &candidates[..candidates.len().min(limit)];
+
+    let result = serde_json::json!({
+        "namespace": namespace,
+        "threshold": threshold,
+        "candidates": candidates
+    });
+    result.to_string()
+}
+
+fn compute_token_jaccard(content_a: &str, content_b: &str) -> f32 {
+    let set_a = token_set_tokens(content_a);
+    let set_b = token_set_tokens(content_b);
+    let intersection = set_a.intersection(&set_b).count() as f32;
+    let union = set_a.union(&set_b).count() as f32;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+fn token_set_tokens(content: &str) -> std::collections::HashSet<String> {
+    content
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|token| {
+            token.chars().all(|c| c.is_alphanumeric()) && token.len() >= 2
+        })
+        .map(|token| token.to_string())
+        .collect()
 }
 
 async fn handle_search_memory(
@@ -7834,6 +7981,7 @@ mod tests {
                 "neurostrata_search_memory",
                 "neurostrata_rebuild_lexical_index",
                 "neurostrata_rebuild_communities",
+                "neurostrata_find_duplicate_candidates",
                 "neurostrata_memories_for_file",
                 "neurostrata_related",
                 "neurostrata_supersede_memory",

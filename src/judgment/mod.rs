@@ -96,13 +96,13 @@ pub fn select_dedup_providers(
     let (active, shadow): (Option<Arc<dyn JudgmentProvider>>, Option<Arc<dyn JudgmentProvider>>) = match config.provider {
         DedupProviderMode::Auto => {
             // Auto: local heuristic as active, Laya local as shadow if available
-            let active = Some(Arc::new(crate::judgment::provider::MockJudgmentProvider) as Arc<dyn JudgmentProvider>);
+            let active = Some(Arc::new(crate::judgment::provider::HeuristicJudgmentProvider) as Arc<dyn JudgmentProvider>);
             let shadow = laya;
             (active, shadow)
         }
         DedupProviderMode::Heuristic => {
             // Heuristic: local heuristic only, no shadow
-            let active = Some(Arc::new(crate::judgment::provider::MockJudgmentProvider) as Arc<dyn JudgmentProvider>);
+            let active = Some(Arc::new(crate::judgment::provider::HeuristicJudgmentProvider) as Arc<dyn JudgmentProvider>);
             (active, None)
         }
         DedupProviderMode::LayaLocal => {
