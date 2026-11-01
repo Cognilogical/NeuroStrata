@@ -1,6 +1,8 @@
 use crate::domain;
 use crate::registry;
 use crate::rdf::shacl::{ShaclViolation, validate_memory};
+use oxrdf::NamedOrBlankNode;
+use oxrdf::Term;
 use crate::traits::MemoryPayload;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -556,9 +558,16 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
 
         for q in parser.for_reader(content.as_bytes()) {
             let q = q?;
-            let s = q.subject.to_string();
-            let p = q.predicate.to_string();
-            let o = q.object.to_string();
+            let s = match q.subject {
+                NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
+                _ => q.subject.to_string(),
+            };
+            let p = q.predicate.as_str().to_string();
+            let o = match q.object {
+                Term::NamedNode(nn) => nn.as_str().to_string(),
+                Term::Literal(lit) => lit.value().to_string(),
+                _ => q.object.to_string(),
+            };
 
             // sh:NodeShape declaration
             if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
@@ -681,9 +690,8 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
                 continue; // shape not applicable to this memory type
             }
 
-            // Only evaluate MemoryShape (targetClass = Memory) or matching type shape
-            if shape.target_class.is_none() {
-                // MemoryShape — core validation applies to all memories
+            // Evaluate Memory target shapes (Memory) and matching type shapes
+            if shape.target_class.as_deref().map_or(false, |tc| tc.ends_with("Memory")) || shape_match {
                 for (path, _) in &shape.property_constraints {
                     let path_violations = self.validate_path(payload, path, shape);
                     violations.extend(path_violations);

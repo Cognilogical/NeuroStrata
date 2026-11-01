@@ -43,6 +43,15 @@ async fn search_inner(
     exact: bool,
     search_mode: crate::traits::SearchMode,
 ) -> Result<DomainSearchOutcome> {
+    let search_mode = if std::env::var("NEUROSTRATA_HYBRID_SEARCH")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+        && search_mode == crate::traits::SearchMode::Default
+    {
+        crate::traits::SearchMode::Hybrid
+    } else {
+        search_mode
+    };
     let namespace = namespace.to_string();
     store
         .with_conn(move |conn| {
@@ -787,8 +796,31 @@ let incomplete = result_count >= fetch_limit;
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
                     let d_graph = crate::graph_read::hybrid::normalize_graph(co_count as u64);
-                    // d_sym: literal bool; future: replace with actual symbol-match logic.
-                    let d_sym = crate::graph_read::hybrid::normalize_sym(crate::graph_read::hybrid::SymbolMatchGrade::None);
+                    // d_sym: compute symbol match grade from query and candidate symbols
+                    let mut candidate_symbols: Vec<String> = Vec::new();
+                    if let Some(syms) = sr.payload.metadata.get("symbols").and_then(|v| v.as_array()) {
+                        for s in syms {
+                            if let Some(st) = s.as_str() {
+                                candidate_symbols.push(st.to_string());
+                            }
+                        }
+                    }
+                    if let Some(governs) = sr.payload.metadata.get("governs").and_then(|v| v.as_array()) {
+                        for g in governs {
+                            if let Some(gt) = g.as_str() {
+                                candidate_symbols.push(gt.to_string());
+                            }
+                        }
+                    }
+                    if !sr.payload.location.is_empty() {
+                        candidate_symbols.push(sr.payload.location.clone());
+                    }
+                    candidate_symbols.push(sr.id.clone());
+                    let sym_grade = crate::graph_read::hybrid::compute_symbol_match(
+                        query_text.as_deref().unwrap_or(""),
+                        &candidate_symbols,
+                    );
+                    let d_sym = crate::graph_read::hybrid::normalize_sym(sym_grade);
                     sr.score = crate::graph_read::hybrid::combine(d_vec, d_graph, d_sym, (0.5, 0.3, 0.2));
                 }
                 // Sort ASC by hybrid score, tie-break MemoryId ASC.
@@ -806,6 +838,14 @@ let incomplete = result_count >= fetch_limit;
             Ok(DomainSearchOutcome { results, mode, incomplete })
         })
         .await
+}
+
+#[derive(Debug, Default, Clone)]
+struct CommunityNodeMeta {
+    domain: String,
+    access_count: i64,
+    salience: f32,
+    content: String,
 }
 
 pub struct LadybugStore {
@@ -1698,12 +1738,13 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
 /// lives, or record that a machine operation happened, not what it says, so
 /// they carry no meaning for a similarity search: directory ingestion's nodes,
 /// and the thalamic bus's sentinel and audit rows.
-const STRUCTURAL_MEMORY_TYPES: [&str; 5] = [
+const STRUCTURAL_MEMORY_TYPES: [&str; 6] = [
     "directory",
     "file",
     "markdown",
     "freshness_flag",
     "guard_event",
+    "community_summary",
 ];
 
 /// Row-class predicates for filtering at the store seam.

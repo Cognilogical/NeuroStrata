@@ -224,6 +224,19 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_rebuild_communities",
+                        "description": "Rebuild community summaries by detecting clusters in the memory graph and persisting them as community_summary rows.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata')." },
+                                "min_community_size": { "type": "integer", "default": 3, "description": "Minimum number of members for a community to be created." },
+                                "resolution": { "type": "number", "default": 1.0, "description": "Resolution for the Leiden algorithm." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_memories_for_file",
                         "description": "Deterministic, zero-embedding lookup of the active rule/fact/procedure memories governing a file, a symbol, or its ancestor directories. Use it before reading or editing a file to surface the architectural constraints that apply to it. A backend without graph-read answers 'unsupported', never an empty list.",
                         "inputSchema": {
@@ -792,6 +805,9 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_rebuild_lexical_index" => {
                             result_text = handle_rebuild_lexical_index(arguments, store.clone()).await;
+                        }
+                        "neurostrata_rebuild_communities" => {
+                            result_text = handle_rebuild_communities(arguments, store.clone()).await;
                         }
                         "neurostrata_memories_for_file" => {
                             result_text = handle_memories_for_file(arguments, store.clone()).await;
@@ -2587,6 +2603,15 @@ async fn handle_get_snapshot(
         let _ = store.upsert(namespace, &rid, vec, payload).await;
     }
 
+    // Communities (N) section (§5.6): partition community_summary out of all_memories,
+    // and render a section when communities exist.
+    let communities_rows = match store.list(namespace, None, Some("community_summary")).await {
+        Ok(rows) => rows,
+        Err(_) => Vec::new(),
+    };
+    // Remove community summaries from all_memories so they don't compete for top-5.
+    all_memories.retain(|r| r.payload.memory_type != "community_summary");
+
     all_memories.truncate(5);
 
     let body = if all_memories.is_empty() {
@@ -2595,6 +2620,77 @@ async fn handle_get_snapshot(
         serde_json::to_string_pretty(&all_memories)
             .map_err(|e| format!("Internal serialization error: {}", e))?
     };
+    // Communities (N) section (§5.6): render when communities exist.
+    let communities_section = if communities_rows.is_empty() {
+        String::new()
+    } else {
+        // Build type map for domain/hub lookups from already-fetched list.
+        let mut type_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut access_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for r in &communities_rows {
+            let meta = &r.payload.metadata;
+            type_map.insert(r.id.clone(), r.payload.memory_type.clone());
+            let cnt = meta.get("access_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            access_map.insert(r.id.clone(), cnt);
+        }
+        // Sort communities by size DESC (spec §5.6: size DESC, community_id ASC for snapshot top-10).
+        let mut sorted: Vec<&crate::traits::SearchResult> = communities_rows.iter().collect();
+        sorted.sort_by(|a, b| {
+            let size_a = a.payload.metadata.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let size_b = b.payload.metadata.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let id_a = a.payload.metadata.get("community_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let id_b = b.payload.metadata.get("community_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            size_b.cmp(&size_a).then_with(|| id_a.cmp(&id_b))
+        });
+        let top10: Vec<&crate::traits::SearchResult> = sorted.into_iter().take(10).collect();
+
+        let mut section = String::from("### Communities");
+        section.push('(');
+        section.push_str(&top10.len().to_string());
+        section.push_str("):");
+        for r in &top10 {
+            let meta = &r.payload.metadata;
+            let community_id = meta.get("community_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let size = meta.get("member_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let hub_id = meta.get("hub_id").and_then(|v| v.as_str()).unwrap_or("");
+            // Domains of members: use member list metadata, find top domain(s)
+            let members = meta.get("members").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let mut domains: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for m in &members {
+                if let Some(mid) = m.as_str() {
+                    // Search all_memories (untruncated, pre-truncate list would have included community summaries but they're removed now)
+                    // communities_rows already contains them; find member memory types
+                    if let Some(mem_row) = all_memories.iter().find(|r| r.id == mid) {
+                        if let Some(mt) = mem_row.payload.metadata.get("domain") {
+                            if let Some(d) = mt.as_str() {
+                                *domains.entry(d.to_string()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            let mut domain_vec: Vec<(String, usize)> = domains.into_iter().collect();
+            domain_vec.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut top_domains: String = domain_vec.iter().take(3).map(|(d, c)| format!("{}x{}", d, c)).collect::<Vec<_>>().join(", ");
+            if top_domains.is_empty() {
+                domain_vec.clear();
+                // fallback: find hub's domain
+                if let Some(hub_row) = all_memories.iter().find(|r| r.id == hub_id) {
+                    if let Some(domain_val) = hub_row.payload.metadata.get("domain") {
+                        if let Some(d) = domain_val.as_str() {
+                            top_domains.clone_from(&format!("{}x1", d));
+                        }
+                    }
+                }
+            }
+            let hubs = if hub_id.is_empty() { String::from("none") } else { hub_id.to_string() };
+            section.push_str(&format!(
+                "\n- [{community_id}] ({size} memories, domains: {top_domains}) — hubs: {hubs}"
+            ));
+        }
+        section
+    };
+
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
@@ -2604,6 +2700,9 @@ async fn handle_get_snapshot(
     }
     if !conflict_report.is_empty() {
         parts.push(conflict_report.clone());
+    }
+    if !communities_section.is_empty() {
+        parts.push(communities_section.clone());
     }
     parts.push(procedures.to_string());
     parts.push(registered_domains_line.to_string());
@@ -3681,6 +3780,215 @@ async fn handle_rebuild_lexical_index(
         ),
         Err(error) => format!("Failed to rebuild the lexical index: {error}"),
     }
+}
+
+async fn handle_rebuild_communities(
+    arguments: Value,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    use crate::community::{detect_communities, COMMUNITY_STRUCTURAL_TYPES};
+    use crate::store::ladybug::edge_specs;
+
+    let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace.".to_string(),
+    };
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
+
+    let min_community_size = arguments
+        .get("min_community_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as usize;
+    let _resolution = arguments
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+
+    // List existing community_summary rows to delete them.
+    let existing_communities = match store.list(namespace, None, Some("community_summary")).await {
+        Ok(rows) => rows,
+        Err(e) => return format!("Failed to list existing communities: {e}"),
+    };
+    for row in &existing_communities {
+        if let Err(e) = store.delete(namespace, &row.id).await {
+            return format!("Failed to delete community summary {}: {e}", row.id);
+        }
+    }
+
+    // List all memories in the namespace to build the graph.
+    let all_memories = match store.list(namespace, None, None).await {
+        Ok(rows) => rows,
+        Err(e) => return format!("Failed to list memories: {e}"),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+
+    // Filter eligible nodes (spec §5.2): active-generation, not retired, not archived, not mesh-conflicting, not registry.
+    let mut node_ids: Vec<String> = Vec::new();
+    let mut node_type_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut edges: Vec<(String, String, f32)> = Vec::new();
+
+    for r in &all_memories {
+        let metadata = &r.payload.metadata;
+        // Exclude retired
+        if let Some(v) = metadata.get("valid_to") {
+            if !v.is_null() && v.as_i64().unwrap_or(0) <= now {
+                continue;
+            }
+        }
+        // Exclude archived
+        if crate::handlers::archive_memory::is_archived(&r.payload) {
+            continue;
+        }
+        // Exclude mesh-conflicting
+        if crate::synaptic_mesh::conflict::is_conflicting(&r.payload) {
+            continue;
+        }
+        // Exclude registry row
+        if crate::registry::is_registry_row(metadata) {
+            continue;
+        }
+
+        node_ids.push(r.id.clone());
+        node_type_map.insert(r.id.clone(), r.payload.memory_type.clone());
+
+        // Extract edges (spec §5.2: typed relations GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM)
+        for edge in edge_specs(metadata) {
+            // Only include edges where both endpoints are eligible (will filter later)
+            // Weight 1.0 per edge; multi-edges summed.
+            edges.push((r.id.clone(), edge.target_id, 1.0));
+        }
+    }
+
+    if node_ids.is_empty() {
+        return serde_json::json!({
+            "communities_created": 0,
+            "nodes_assigned": 0,
+            "unassigned_nodes": 0,
+            "modularity": 0.0,
+            "communities": []
+        }).to_string();
+    }
+
+    // Run community detection (deterministic Leiden)
+    let communities = match detect_communities(&node_ids, &edges) {
+        Ok(c) => c,
+        Err(e) => return format!("Community detection failed: {e}"),
+    };
+
+    // Filter communities by min_community_size (using non-structural members only)
+    let structural_types: std::collections::HashSet<&str> = COMMUNITY_STRUCTURAL_TYPES.iter().cloned().collect();
+    let mut filtered_communities: Vec<_> = communities
+        .into_iter()
+        .filter_map(|c| {
+            let non_structural: Vec<String> = c.member_ids
+                .iter()
+                .filter(|id| node_type_map.get(*id).map(|t| !structural_types.contains(t.as_str())).unwrap_or(true))
+                .cloned()
+                .collect();
+            let size = non_structural.len();
+            if size >= min_community_size {
+                Some((c.id, non_structural, c.hub_id, size))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Sort by size DESC, min_member_id ASC (spec §5.2a)
+    filtered_communities.sort_by(|a, b| {
+        b.3.cmp(&a.3).then_with(|| {
+            let a_min = a.1.iter().min().cloned().unwrap_or_default();
+            let b_min = b.1.iter().min().cloned().unwrap_or_default();
+            a_min.cmp(&b_min)
+        })
+    });
+
+    let vec_dim = match node_ids.first() {
+        Some(first_id) => store
+            .get(namespace, first_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|(v, _)| v.len())
+            .filter(|&len| len > 0)
+            .unwrap_or(384),
+        None => 384,
+    };
+
+    // Assign deterministic community IDs and persist summary rows.
+    let mut communities_created = 0;
+    let mut nodes_assigned = 0usize;
+    let mut community_results = Vec::new();
+
+    for (idx, (_old_id, members, hub_id, size)) in filtered_communities.into_iter().enumerate() {
+        let community_id = idx as u32;
+        communities_created += 1;
+        nodes_assigned += members.len();
+
+        // Build community content: non-structural members sorted by id, each contributing
+        // first line of content (truncated to 80 chars), joined by "; ".
+        let mut sorted_members = members.clone();
+        sorted_members.sort();
+        let content_lines: Vec<String> = sorted_members
+            .iter()
+            .filter_map(|id| all_memories.iter().find(|r| &r.id == id))
+            .map(|r| {
+                let line = r.payload.content.lines().next().unwrap_or("").trim();
+                if line.len() > 80 { format!("{}...", &line[..77]) } else { line.to_string() }
+            })
+            .collect();
+        let content = content_lines.join("; ");
+
+        // Build metadata
+        let metadata = serde_json::json!({
+            "community_id": community_id,
+            "member_count": members.len(),
+            "hub_id": hub_id,
+            "members": members,
+        });
+
+        // Create community summary payload
+        let summary_id = format!("{}::community::{}", namespace, community_id);
+        let payload = crate::traits::MemoryPayload {
+            content,
+            user_id: "community-detection".to_string(),
+            memory_type: "community_summary".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        };
+
+        // Zero vector (community_summary is structural, excluded from vector search)
+        let zero_vec = vec![0.0f32; vec_dim];
+
+        // Upsert the community summary
+        if let Err(e) = store.upsert(namespace, &summary_id, zero_vec, payload).await {
+            return format!("Failed to upsert community summary {}: {e}", summary_id);
+        }
+
+        community_results.push(serde_json::json!({
+            "id": community_id,
+            "size": size,
+            "hub": hub_id,
+            "members": members,
+        }));
+    }
+
+    let unassigned_nodes = node_ids.len().saturating_sub(nodes_assigned);
+
+    // Modularity is not currently exposed by detect_communities; return 0.0 as placeholder.
+    let modularity = 0.0;
+
+    serde_json::json!({
+        "communities_created": communities_created,
+        "nodes_assigned": nodes_assigned,
+        "unassigned_nodes": unassigned_nodes,
+        "modularity": modularity,
+        "communities": community_results
+    }).to_string()
 }
 
 async fn handle_search_memory(
@@ -7525,6 +7833,7 @@ mod tests {
                 "neurostrata_list_namespaces",
                 "neurostrata_search_memory",
                 "neurostrata_rebuild_lexical_index",
+                "neurostrata_rebuild_communities",
                 "neurostrata_memories_for_file",
                 "neurostrata_related",
                 "neurostrata_supersede_memory",

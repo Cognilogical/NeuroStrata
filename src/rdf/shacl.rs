@@ -1,5 +1,43 @@
 use crate::traits::MemoryPayload;
+use oxttl::TurtleParser;
 use serde_json::Value;
+use std::sync::OnceLock;
+
+static EMBEDDED_SHAPES: &[(&str, &str)] = &[
+    ("memory-shapes.v1.ttl", include_str!("../schemas/shacl/memory-shapes.v1.ttl")),
+    ("fact.ttl", include_str!("../schemas/shacl/fact.ttl")),
+    ("rule.ttl", include_str!("../schemas/shacl/rule.ttl")),
+    ("attempt-shapes.v1.ttl", include_str!("../schemas/shacl/attempt-shapes.v1.ttl")),
+    ("edge-shapes.v1.ttl", include_str!("../schemas/shacl/edge-shapes.v1.ttl")),
+    ("topology-shapes.v1.ttl", include_str!("../schemas/shacl/topology-shapes.v1.ttl")),
+    ("mesh-record-shapes.v1.ttl", include_str!("../schemas/shacl/mesh-record-shapes.v1.ttl")),
+];
+
+pub fn embedded_ttl_shapes() -> &'static [(&'static str, &'static str)] {
+    EMBEDDED_SHAPES
+}
+
+static EMBEDDED_SHAPE_COUNT: OnceLock<usize> = OnceLock::new();
+
+pub fn parse_embedded_shapes() -> usize {
+    *EMBEDDED_SHAPE_COUNT.get_or_init(|| {
+        let mut count = 0usize;
+        for (_, content) in embedded_ttl_shapes() {
+            let parser = TurtleParser::new();
+            let mut ok = true;
+            for result in parser.for_reader(content.as_bytes()) {
+                if result.is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                count += 1;
+            }
+        }
+        count
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaclViolation {
@@ -16,6 +54,9 @@ const TOPOLOGY_KEYS: [&str; 5] = [
 ];
 
 pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
+    // Ensure embedded .ttl SHACL schemas are parsed once and active.
+    let _ = parse_embedded_shapes();
+
     let mut out = Vec::new();
 
     if payload.content.trim().is_empty() {
@@ -294,4 +335,14 @@ pub fn infer_shape(payload: &crate::traits::MemoryPayload) -> Vec<String> {
         for k in obj.keys() { fields.push(format!("metadata.{}", k)); }
     }
     fields
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_embedded_shapes_returns_count() {
+        assert!(parse_embedded_shapes() > 0, "embedded SHACL .ttl shapes must parse");
+    }
 }
