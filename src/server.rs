@@ -1775,6 +1775,26 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("unsupported".to_string(), serde_json::json!(false));
                 obj.insert("seed".to_string(), serde_json::json!(seed));
+                if arguments.get("closure_governs").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let edges: Vec<crate::graph_read::related::EdgeSpec> = result
+                        .edges
+                        .iter()
+                        .map(|e| crate::graph_read::related::EdgeSpec {
+                            source: e.source.clone(),
+                            relation: e.relation.clone(),
+                            target: e.target.clone(),
+                        })
+                        .collect();
+                    let closure = crate::graph_read::related::closure_governs(
+                        seed,
+                        &edges,
+                        &crate::graph_read::related::QueryBudget::default(),
+                    );
+                    obj.insert(
+                        "closure_governs".to_string(),
+                        serde_json::json!({ "nodes": closure.items, "truncated": closure.truncated }),
+                    );
+                }
             }
             body.to_string()
         }
@@ -2396,6 +2416,18 @@ async fn handle_add_memory(
             metadata,
         };
 
+        if arguments.get("shacl_enforce").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if let Err(violations) = crate::rdf::shacl::enforce(&payload) {
+                return format!("ERROR [SHACL]: {:?}", violations);
+            }
+        }
+        let include_rdf_projection = arguments.get("include_rdf_projection").and_then(|v| v.as_bool()).unwrap_or(false);
+        let rdf_projection_info = if include_rdf_projection {
+            Some((crate::rdf::canonical::dual_write("pending", &payload).1, crate::rdf::shacl::infer_shape(&payload)))
+        } else {
+            None
+        };
+
         match embed_dedup_and_upsert(
             &store,
             &emb,
@@ -2477,6 +2509,10 @@ async fn handle_add_memory(
                 }
                 for w in &multimodal_warnings {
                     msg.push_str(&format!("\\nMultimodal warning: {}", w));
+                }
+                // TASK NUDGE: advisory when a non-task/procedure memory's content
+                if let Some((rdf_digest, shape_fields)) = rdf_projection_info {
+                    msg.push_str(&format!("\nRDF Digest: {}\nInferred Shape Fields: {}", rdf_digest, shape_fields.join(", ")));
                 }
                 // TASK NUDGE: advisory when a non-task/procedure memory's content
                 // carries task-shaped markers.
@@ -7659,6 +7695,45 @@ mod tests {
         )
         .await;
         assert!(reply_strict.contains("ERROR [MULTIMODAL]:"), "{}", reply_strict);
+    }
+
+    #[tokio::test]
+    async fn test_handle_add_memory_shacl_enforce_and_rdf_projection() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // shacl_enforce: valid payload should succeed.
+        let added = handle_add_memory(
+            serde_json::json!({
+                "content": "a valid memory",
+                "namespace": "probe",
+                "shacl_enforce": true,
+            }),
+            emb.clone(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(added.starts_with("Successfully added memory"), "{}", added);
+
+        // include_rdf_projection: true appends RDF Digest and Inferred Shape Fields.
+        let projected = handle_add_memory(
+            serde_json::json!({
+                "content": "projected memory",
+                "namespace": "probe",
+                "create_new_namespace": true,
+                "include_rdf_projection": true,
+                "metadata": { "domain": "auth" },
+            }),
+            emb.clone(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(projected.contains("RDF Digest:"), "{}", projected);
+        assert!(projected.contains("Inferred Shape Fields:"), "{}", projected);
     }
 
     /// The write path normalizes a string domain to its slug, so a stored

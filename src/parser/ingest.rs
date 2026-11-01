@@ -916,6 +916,8 @@ pub async fn ingest_directory(
     // overwrite the other's active pointer.
     let worktree_id = source_key_for(dir_path);
     let source_key = worktree_id.clone();
+    let ingest_start = std::time::Instant::now();
+    let _ = crate::registry::enrichment_start(&vector_store, Some(&embedder), namespace, &source_key).await;
     let source_identity = crate::context::model::SourceIdentity {
         worktree_id,
         ..Default::default()
@@ -1047,6 +1049,7 @@ pub async fn ingest_directory(
                 generation, namespace, abort
             );
         }
+        let _ = crate::registry::enrichment_fail(&vector_store, Some(&embedder), namespace, "ingest", &e.to_string()).await;
         return Err(e);
     }
 
@@ -1172,10 +1175,6 @@ pub async fn ingest_directory(
 
     // Watermark + stage telemetry on the namespace registry row (F12).
     let current_version = ingest_version(&schema.fingerprint());
-    let current_hashes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for path_str in &current_paths {
-        if let Some(_h) = current_hashes.get(path_str) { break; }
-    }
     // Compute deterministic source_digest over sorted (path, hash) pairs.
     let mut digest_entries: Vec<(String, String)> = current_hashes
         .iter()
@@ -1199,7 +1198,7 @@ pub async fn ingest_directory(
             "name": "ingest",
             "count": current_paths.len(),
             "failures": 0,
-            "latency_ms": 0,
+            "latency_ms": ingest_start.elapsed().as_millis() as u64,
             "fingerprint": current_version,
         }]
     });
@@ -2151,6 +2150,7 @@ use super::x;"#;
         let wm = state.get("watermark").expect("watermark");
         assert!(wm.get("extractor_fingerprint").is_some(), "fingerprint");
         assert!(wm.get("source_digest").is_some(), "source_digest");
+        assert_ne!(wm.get("source_digest").and_then(|v| v.as_str()).unwrap_or(""), "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "source_digest must not be empty hash");
         assert!(wm.get("last_enriched_at").is_some(), "last_enriched_at");
 
         // Second ingest with unchanged files -> generation 2, carries forward unchanged nodes.
