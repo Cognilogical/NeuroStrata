@@ -37,7 +37,7 @@
 //! The overlay file remains the durable source of truth for [`status_lines`]
 //! and for [`Overlay`]-driven re-presentation; the metadata marker is its
 //! live reflection in the store.
-
+#[cfg(test)]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -109,8 +109,8 @@ impl Overlay {
     /// The live suppression signal reads the row's `metadata.mesh.conflict`
     /// marker (via [`is_conflicting_metadata`]) rather than this set, because
     /// the store read paths carry no `mesh_dir`. This remains the overlay's
-    /// own query for `status_lines`/future read sites that do resolve the dir.
-    #[allow(dead_code)]
+    /// own query, exercised by the overlay round-trip tests.
+    #[cfg(test)]
     pub fn unresolved_ids(&self, namespace: &str) -> HashSet<String> {
         self.conflicts
             .iter()
@@ -256,10 +256,9 @@ pub fn is_conflicting(payload: &MemoryPayload) -> bool {
     is_conflicting_metadata(&payload.metadata)
 }
 
-/// Status lines for the `mesh status` surface (wired by the orchestrator at
-/// merge — slice 6 exports it, slice 7 owns `mesh_service::status_report`).
-/// Never fails: a missing/corrupt overlay yields an empty report.
-#[allow(dead_code)] // slice-7 seam: mesh_service::status_report wires it
+/// Status lines for the `mesh status` surface (called by
+/// `mesh_service::status_report`). Never fails: a missing/corrupt overlay
+/// yields an empty report.
 pub fn status_lines(mesh_dir: &Path) -> Vec<String> {
     let overlay = load_overlay(mesh_dir);
     let unresolved: Vec<&ConflictEntry> = overlay

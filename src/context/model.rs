@@ -45,13 +45,14 @@ macro_rules! state_enum {
 
         impl $name {
             /// Every state of this dimension, in declaration order.
+            /// Test-only (tests/context compiles `model.rs` via `#[path]`).
+            #[cfg(test)]
             pub const ALL: &'static [$name] = &[ $( $name::$variant, )+ ];
 
             /// The canonical token for this state.
             pub fn as_str(&self) -> &'static str {
                 match self {
-                    $( $name::$variant => $token, )+
-                }
+                    $( $name::$variant => $token, )+                }
             }
 
             /// Parse a canonical token.
@@ -332,6 +333,17 @@ impl AsRef<ContextPlan> for ContextPlan {
 }
 
 
+/// Result of a qualified lookup, distinguishing denial from not-found.
+/// Test-only: the `tests/privacy` crate compiles `model.rs` via `#[path]`
+/// and exercises the vocabulary; production never branches on it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupStatus {
+    Found,
+    NotFound,
+    Denied,
+}
+
 impl EgressPolicy {
     pub fn allow() -> Self {
         Self { allowed: true, reason: None }
@@ -348,10 +360,27 @@ impl EgressPolicy {
     }
 }
 
-/// Result of a qualified lookup, distinguishing denial from not-found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LookupStatus {
-    Found,
-    NotFound,
-    Denied,
+#[cfg(test)]
+mod all_states_tests {
+    use super::*;
+
+    /// The `ALL` slabs exist for the external `tests/context` DTO contract
+    /// test; this probe keeps them honest and consumed.
+    #[test]
+    fn all_state_slabs_are_non_empty() {
+        assert!(!SourceCurrency::ALL.is_empty());
+        assert!(!SemanticValidation::ALL.is_empty());
+        assert!(!Coverage::ALL.is_empty());
+        assert!(!DecisionLifecycle::ALL.is_empty());
+        assert!(!Degradation::ALL.is_empty());
+    }
+
+    /// `LookupStatus` is the tests/privacy egress vocabulary; keep it useful
+    /// here too: denial must never collapse into not-found.
+    #[test]
+    fn lookup_status_denial_is_distinct() {
+        assert_ne!(LookupStatus::Denied, LookupStatus::NotFound);
+        assert_ne!(LookupStatus::Denied, LookupStatus::Found);
+        assert_ne!(LookupStatus::NotFound, LookupStatus::Found);
+    }
 }

@@ -211,11 +211,8 @@ pub fn project_memory_rdf_star(
     tier: crate::rdf::types::Tier,
     generation: u64,
 ) -> (Vec<oxrdf::Quad>, Vec<ProvenanceWarning>) {
-    use crate::rdf::namespace::{field_predicate, graph_iri, ns_predicate};
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
-        "urn:neurostrata:memory:{}",
-        id
-    )));
+    use crate::rdf::namespace::{field_predicate, graph_iri, memory_iri, ns_predicate};
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(memory_iri(id, None)));
     let graph = GraphName::NamedNode(NamedNode::new_unchecked(graph_iri(
         namespace, tier, generation,
     )));

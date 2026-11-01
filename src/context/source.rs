@@ -90,13 +90,8 @@ pub fn resolve_source(path: impl AsRef<str>, project_root: impl AsRef<str>) -> S
     resolve(path, project_root)
 }
 
-/// The stable source key (canonical worktree path) used by ingestion's
-/// generation pointer table. Mirrors `parser::ingest::source_key_for` so the
-/// two stay aligned.
-pub fn source_key(project_root: impl AsRef<str>) -> String {
-    canonical(project_root.as_ref())
-}
-
+/// The stable source key derivation lives in `parser::ingest::source_key_for`;
+/// context code shares it verbatim.
 #[cfg(test)]
 mod tests {
     use super::*;

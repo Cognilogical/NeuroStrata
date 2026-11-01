@@ -293,8 +293,28 @@ impl MeshService {
         Ok(lines.join("\n"))
     }
 
+    /// Remote peer probe: listed for the CLI/status surface when the daemon
+    /// runs long-lived; today only the test surface exercises it, so it is
+    /// compiled with tests.
+    #[cfg(test)]
     pub async fn federated_remote_list(&self, base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
         crate::synaptic_mesh::federation::remote_list(base_url, namespace, token).await
+    }
+}
+
+#[cfg(test)]
+mod async_surface_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn federated_remote_list_fails_soft_on_unreachable_peer() {
+        // The mesh is fail-soft everywhere: an unreachable peer answers as a
+        // rendered Err, never as a crash or a silent success line.
+        let svc = MeshService::new(std::env::temp_dir());
+        let res = svc
+            .federated_remote_list("http://127.0.0.1:1", "ns", "t")
+            .await;
+        assert!(res.is_err());
     }
 }
 

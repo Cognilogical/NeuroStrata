@@ -839,16 +839,7 @@ let incomplete = result_count >= fetch_limit;
         .await
 }
 
-#[derive(Debug, Default, Clone)]
-struct CommunityNodeMeta {
-    domain: String,
-    access_count: i64,
-    salience: f32,
-    content: String,
-}
-
 pub struct LadybugStore {
-    #[allow(dead_code)]
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
@@ -3485,9 +3476,10 @@ impl VectorStore for LadybugStore {
         let ontology = self.get_ontology(namespace);
 
         let mut expanded: HashSet<String> = HashSet::new();
+        let reasoner = crate::rdf::reasoning::ReasoningAdapter::new();
         for d in domains {
             if let Some(slug) = ontology.canonical_slug(d) {
-                for e in ontology.expand_domain(&slug) {
+                for e in reasoner.expand_domain(&ontology, &slug) {
                     expanded.insert(e);
                 }
             } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
@@ -5943,144 +5935,6 @@ impl crate::traits::IntakeStore for LadybugStore {
         })
         .await
         .map_err(|e| format!("Failed to resolve candidate: {}", e))
-    }
-
-    async fn get_receipt(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeReceipt>, String> {
-        let namespace = namespace.to_string();
-        let id = id.to_string();
-
-        self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
-
-            let query = format!(
-                "MATCH (r:IntakeReceipt) WHERE r.id = '{}' AND r.namespace = '{}' RETURN r.id, r.namespace, r.source_kind, r.source_revision, r.source_digest, r.detected_intents, r.raw_text, r.created_at",
-                safe_id, safe_ns
-            );
-            let mut result = conn.query(&query)?;
-
-            if let Some(row) = result.next() {
-                let receipt_id: String = format!("{}", row[0]);
-                let ns: String = format!("{}", row[1]);
-                let source_kind_str: String = format!("{}", row[2]);
-                let source_revision: String = format!("{}", row[3]);
-                let source_digest: String = format!("{}", row[4]);
-                let detected_intents_str: String = format!("{}", row[5]);
-                let raw_text: String = format!("{}", row[6]);
-                let created_at: String = format!("{}", row[7]);
-
-                let source_kind = match source_kind_str.as_str() {
-                    "conversation" => crate::task::intake::SourceKind::Conversation,
-                    "manual" => crate::task::intake::SourceKind::Manual,
-                    "imported" => crate::task::intake::SourceKind::Imported,
-                    "tool" => crate::task::intake::SourceKind::Tool,
-                    _ => crate::task::intake::SourceKind::Conversation,
-                };
-
-                let detected_intents: Vec<crate::task::intake::DetectedIntent> =
-                    serde_json::from_str(&detected_intents_str).unwrap_or_default();
-
-                Ok(Some(crate::task::intake::IntakeReceipt {
-                    id: receipt_id,
-                    namespace: ns,
-                    source_kind,
-                    source_revision,
-                    source_digest,
-                    detected_intents,
-                    raw_text,
-                    created_at,
-                }))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
-        .map_err(|e| format!("Failed to get receipt: {}", e))
-    }
-
-    async fn get_candidate(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeCandidate>, String> {
-        let namespace = namespace.to_string();
-        let id = id.to_string();
-
-        self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
-
-            let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint",
-                safe_id, safe_ns
-            );
-            let mut result = conn.query(&query)?;
-
-            if let Some(row) = result.next() {
-                let cand_id: String = format!("{}", row[0]);
-                let ns: String = format!("{}", row[1]);
-                let receipt_id: String = format!("{}", row[2]);
-                let title: String = format!("{}", row[3]);
-                let description: String = format!("{}", row[4]);
-                let review_state_str: String = format!("{}", row[5]);
-                let disposition_str: String = format!("{}", row[6]);
-                let task_id: String = format!("{}", row[7]);
-                let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
-                let created_at: String = format!("{}", row[9]);
-                let updated_at: String = format!("{}", row[10]);
-                let candidate_kind: String = format!("{}", row[11]);
-                let payload_str: String = format!("{}", row[12]);
-                let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
-                let source_span_str: String = format!("{}", row[14]);
-                let extractor_fingerprint: Option<String> = {
-                    let s = format!("{}", row[15]);
-                    if s.is_empty() { None } else { Some(s) }
-                };
-
-                let review_state = match review_state_str.as_str() {
-                    "pending" => crate::task::intake::ReviewState::Pending,
-                    "inreview" => crate::task::intake::ReviewState::InReview,
-                    "accepted" => crate::task::intake::ReviewState::Accepted,
-                    "dismissed" => crate::task::intake::ReviewState::Dismissed,
-                    _ => crate::task::intake::ReviewState::Pending,
-                };
-
-                let disposition = match disposition_str.as_str() {
-                    "pending" => crate::task::intake::Disposition::Pending,
-                    "created" => crate::task::intake::Disposition::Created,
-                    "linked" => crate::task::intake::Disposition::Linked,
-                    "dismissed" => crate::task::intake::Disposition::Dismissed,
-                    _ => crate::task::intake::Disposition::Pending,
-                };
-
-                Ok(Some(crate::task::intake::IntakeCandidate {
-                    id: cand_id,
-                    namespace: ns,
-                    receipt_id,
-                    title,
-                    description: if description.is_empty() { None } else { Some(description) },
-                    review_state,
-                    disposition,
-                    task_id: if task_id.is_empty() { None } else { Some(task_id) },
-                    cas_version: cas_version as u64,
-                    created_at,
-                    updated_at,
-                    candidate_kind: if candidate_kind.is_empty() { "task".to_string() } else { candidate_kind },
-                    payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
-                    confidence,
-                    source_span: if source_span_str.is_empty() { None } else { serde_json::from_str(&source_span_str).ok() },
-                    extractor_fingerprint,
-                }))
-            } else {
-                Ok(None)
-            }
-        })
-        .await
-        .map_err(|e| format!("Failed to get candidate: {}", e))
     }
 }
 

@@ -86,11 +86,6 @@ impl OxRdfDataset {
         self.inner.insert(&quad.inner)
     }
 
-    /// Check if the dataset contains a quad.
-    pub fn contains(&self, quad: &OxRdfQuad) -> bool {
-        self.inner.contains(&quad.inner)
-    }
-
     /// Number of quads in the dataset.
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -99,15 +94,6 @@ impl OxRdfDataset {
     /// Whether the dataset is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
-    }
-
-    /// Convert dataset to N-Quads string.
-    pub fn to_nquads(&self) -> String {
-        self.inner
-            .iter()
-            .map(|q| q.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
 
@@ -188,11 +174,6 @@ impl OxRdfBridge {
     ) -> GraphName {
         let iri = format!("urn:neurostrata:graph:{}:{}:gen:{}", namespace, tier.as_str(), generation);
         GraphName::NamedNode(NamedNode::new_unchecked(iri))
-    }
-
-    /// Convert NeuroStrata's graph IRI string to an oxrdf GraphName.
-    pub fn graph_iri_to_graph_name(graph_iri: &str) -> GraphName {
-        GraphName::NamedNode(NamedNode::new_unchecked(graph_iri.to_string()))
     }
 }
 

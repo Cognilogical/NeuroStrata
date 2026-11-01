@@ -6,6 +6,10 @@
 //! fetching and row-class filtering; this module owns the traversal bounds,
 //! cycle termination, edge-role assignment and cursor pagination, so those are
 //! what is pinned here.
+//!
+//! The module is compiled wholesale, so prod-only items are quiesced here
+//! (same pattern as tests/context/model_test.rs).
+#![allow(dead_code)]
 
 #[path = "../../src/graph_read/related.rs"]
 mod related;

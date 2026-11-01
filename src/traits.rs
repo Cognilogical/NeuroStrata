@@ -591,20 +591,6 @@ pub trait IntakeStore: Send + Sync {
         &self,
         request: crate::task::intake::ResolveCandidateRequest,
     ) -> Result<crate::task::intake::ResolveCandidateResult, String>;
-
-    /// Get a single receipt by ID.
-    async fn get_receipt(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeReceipt>, String>;
-
-    /// Get a single candidate by ID.
-    async fn get_candidate(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::intake::IntakeCandidate>, String>;
 }
 
 #[cfg(test)]

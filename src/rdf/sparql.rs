@@ -38,6 +38,9 @@ impl Default for SparqlConfig {
 }
 
 /// Escape a string for safe use in LadybugDB Cypher queries.
+/// Test-only helper: production queries go through spargebra, not string
+/// interpolation into Cypher.
+#[cfg(test)]
 fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
@@ -57,8 +60,7 @@ pub fn parser_with_prefixes() -> SparqlParser {
 }
 
 fn is_archived(metadata: &serde_json::Value) -> bool {
-    metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false)
-}
+    metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false)}
 
 fn is_mesh_conflicting(metadata: &serde_json::Value) -> bool {
     crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
@@ -141,23 +143,35 @@ pub async fn project_sparql_dataset_with_meta_async(
     (dataset, meta_map)
 }
 
-/// Async projection: queries live LadybugDB store and converts memories to RDF quads.
-pub async fn project_sparql_dataset_async(
-    namespace: &str,
-    include_retired: bool,
-    include_archived: bool,
-    store: &crate::store::ladybug::LadybugStore,
-) -> Dataset {
-    project_sparql_dataset_with_meta_async(namespace, include_retired, include_archived, store).await.0
-}
-
 /// Build a QueryEvaluator with the 3 NeuroStrata custom functions registered.
 pub fn evaluator_with_custom_functions(
     meta_map: std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>,
     now: i64,
 ) -> QueryEvaluator {
+    custom_functions_on(QueryEvaluator::new(), meta_map, now)
+}
+
+/// Same as [`evaluator_with_custom_functions`], plus the HTTP default SERVICE
+/// handler for federated endpoints.
+pub fn evaluator_with_custom_functions_and_service(
+    meta_map: std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>,
+    now: i64,
+    handler: crate::rdf::federation::HttpServiceHandler,
+) -> QueryEvaluator {
+    custom_functions_on(
+        QueryEvaluator::new().with_default_service_handler(handler),
+        meta_map,
+        now,
+    )
+}
+
+fn custom_functions_on(
+    base: QueryEvaluator,
+    meta_map: std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>,
+    now: i64,
+) -> QueryEvaluator {
     use oxrdf::{NamedNode, Term, Literal};
-    QueryEvaluator::new()
+    base
         .with_custom_function(
             NamedNode::new("urn:neurostrata:ns#salience").unwrap(),
             {
@@ -217,6 +231,48 @@ pub fn evaluator_with_custom_functions(
         )
 }
 
+/// The algebra tree of a parsed query (SELECT/ASK/CONSTRUCT/DESCRIBE share the
+/// same shape).
+pub(crate) fn sparql_pattern(query: &spargebra::Query) -> &spargebra::algebra::GraphPattern {
+    match query {
+        spargebra::Query::Select { pattern, .. }
+        | spargebra::Query::Construct { pattern, .. }
+        | spargebra::Query::Describe { pattern, .. }
+        | spargebra::Query::Ask { pattern, .. } => pattern,
+    }
+}
+
+/// Count the nodes of an algebra tree (BGP, joins, filters, SERVICE, ...).
+/// The budget cap stops pathologically large queries before evaluation.
+pub(crate) fn count_algebra_nodes(pattern: &spargebra::algebra::GraphPattern) -> usize {
+    use spargebra::algebra::GraphPattern as GP;
+    1 + match pattern {
+        GP::Join { left, right } => {
+            count_algebra_nodes(left) + count_algebra_nodes(right)
+        }
+        GP::Union { left, right } => {
+            count_algebra_nodes(left) + count_algebra_nodes(right)
+        }
+        GP::Minus { left, right } => {
+            count_algebra_nodes(left) + count_algebra_nodes(right)
+        }
+        GP::LeftJoin { left, right, .. } => {
+            count_algebra_nodes(left) + count_algebra_nodes(right)
+        }
+        GP::Filter { inner, .. } => count_algebra_nodes(inner),
+        GP::Graph { inner, .. } => count_algebra_nodes(inner),
+        GP::Extend { inner, .. } => count_algebra_nodes(inner),
+        GP::OrderBy { inner, .. } => count_algebra_nodes(inner),
+        GP::Project { inner, .. } => count_algebra_nodes(inner),
+        GP::Group { inner, .. } => count_algebra_nodes(inner),
+        GP::Distinct { inner } => count_algebra_nodes(inner),
+        GP::Reduced { inner } => count_algebra_nodes(inner),
+        GP::Slice { inner, .. } => count_algebra_nodes(inner),
+        GP::Service { inner, .. } => count_algebra_nodes(inner),
+        _ => 0,
+    }
+}
+
 /// Evaluate a SPARQL query over the projected namespace dataset.
 pub async fn execute_sparql_query(
     query_str: &str,
@@ -226,12 +282,25 @@ pub async fn execute_sparql_query(
     include_archived: bool,
     store: &crate::store::ladybug::LadybugStore,
 ) -> Result<(String, usize, bool, bool), String> {
-    let config = SparqlConfig::default();
+    let config = get_sparql_config();
+    if !config.enabled {
+        return Err("SPARQL engine is disabled".to_string());
+    }
 
     // Parse the SPARQL query using spargebra with pre-registered prefixes
     let query = parser_with_prefixes()
         .parse_query(query_str)
         .map_err(|e| format!("SPARQL parse error: {}", e))?;
+
+    // Algebra-size budget: a query whose tree exceeds the node cap is refused
+    // before any dataset is built, regardless of what it would evaluate to.
+    let algebra_nodes = count_algebra_nodes(sparql_pattern(&query));
+    if algebra_nodes > config.max_algebra_nodes {
+        return Err(format!(
+            "SPARQL query exceeded max_algebra_nodes budget ({} > {})",
+            algebra_nodes, config.max_algebra_nodes
+        ));
+    }
 
     let service_endpoints = crate::rdf::federation::inspect_service_clauses(&query)
         .map_err(|e| format!("SPARQL federation error: {}", e))?;
@@ -254,12 +323,37 @@ pub async fn execute_sparql_query(
         ));
     }
 
-    // Prepare and evaluate with QueryEvaluator (custom functions registered)
+    // Prepare and evaluate with QueryEvaluator (custom functions registered);
+    // federated SERVICE endpoints get the HTTP default handler when enabled.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let evaluator = evaluator_with_custom_functions(meta_arc, now);
+    let evaluator = if !service_endpoints.is_empty() && config.service_enabled {
+        let handler = crate::rdf::federation::HttpServiceHandler {
+            config: crate::rdf::federation::FederationConfig {
+                service_enabled: true,
+                timeout_ms: config.timeout_ms,
+                max_solutions: config.max_solutions,
+                max_dataset_quads: config.max_dataset_quads,
+                ..Default::default()
+            },
+        };
+        evaluator_with_custom_functions_and_service(meta_arc.clone(), now, handler)
+    } else {
+        evaluator_with_custom_functions(meta_arc, now)
+    };
+
+    // Timeout budget: the engine's cancellation token preempts a query that
+    // runs past `timeout_ms` (between evaluation steps) instead of merely
+    // reporting overrun afterwards.
+    let cancel_token = spareval::CancellationToken::new();
+    let evaluator = evaluator.with_cancellation_token(cancel_token.clone());
+    let timeout_ms = config.timeout_ms;
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+        cancel_token.cancel();
+    });
     let prepared = evaluator.prepare(&query);
     let results = prepared
         .execute(&dataset)
@@ -314,26 +408,6 @@ pub async fn execute_sparql_query(
     let truncated = solution_count >= config.max_solutions;
 
     Ok((results_string, solution_count, truncated, false))
-}
-
-/// Result types for SPARQL execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum QueryForm {
-    Select,
-    Ask,
-    Construct,
-    Describe,
-}
-
-/// Result wrapper for SPARQL tool.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SparqlResult {
-    pub query_form: QueryForm,
-    pub format: QueryResultsFormat,
-    pub results: String,
-    pub solution_count: usize,
-    pub truncated: bool,
-    pub timed_out: bool,
 }
 
 /// Global configuration for SPARQL execution.

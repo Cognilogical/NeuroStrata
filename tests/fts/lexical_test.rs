@@ -3,6 +3,9 @@
 //! The crate ships a binary only, so the module is compiled from its real
 //! source path -- the same pattern `tests/graph_read/related_test.rs` uses.
 //! The module must stay `std`-only so the WASM crate can reuse it by path.
+//! The module is compiled wholesale, so prod-only methods land unused here.
+
+#![allow(dead_code)]
 
 #[path = "../../src/fts/mod.rs"]
 mod fts;

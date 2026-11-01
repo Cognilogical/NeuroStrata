@@ -195,47 +195,6 @@ pub struct ResolveCandidateResult {
     pub task_id: Option<String>,
 }
 
-/// Trait for intake storage operations.
-#[async_trait::async_trait]
-pub trait IntakeStore: Send + Sync {
-    /// Create intake receipt and candidate(s) atomically.
-    async fn create_receipt(
-        &self,
-        request: CreateReceiptRequest,
-    ) -> Result<CreateReceiptResult, String>;
-
-    /// List receipts with pagination.
-    async fn list_receipts(
-        &self,
-        request: ListReceiptsRequest,
-    ) -> Result<IntakeListResponse<IntakeReceipt>, String>;
-
-    /// List candidates with filters and pagination.
-    async fn list_candidates(
-        &self,
-        request: ListCandidatesRequest,
-    ) -> Result<IntakeListResponse<IntakeCandidate>, String>;
-
-    /// Resolve a candidate with CAS (atomic compare-and-swap).
-    async fn resolve_candidate(
-        &self,
-        request: ResolveCandidateRequest,
-    ) -> Result<ResolveCandidateResult, String>;
-
-    /// Get a single receipt by ID.
-    async fn get_receipt(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<IntakeReceipt>, String>;
-
-    /// Get a single candidate by ID.
-    async fn get_candidate(
-        &self,
-        namespace: &str,
-        id: &str,
-    ) -> Result<Option<IntakeCandidate>, String>;
-}
 
 /// Generate a deterministic ID for a receipt.
 pub fn generate_receipt_id(namespace: &str, source_digest: &str) -> String {

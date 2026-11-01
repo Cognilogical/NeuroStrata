@@ -90,24 +90,6 @@ where
     out
 }
 
-/// Alias for the same operation.
-pub fn rank_and_dedup<I, T>(items: I, budget: impl Into<Budget>) -> Vec<ContextItem>
-where
-    I: IntoIterator<Item = T>,
-    T: Borrow<ContextItem>,
-{
-    rank_dedup_budget(items, budget)
-}
-
-/// Alias kept for callers that name it after the budget application.
-pub fn apply_budget<I, T>(items: I, budget: impl Into<Budget>) -> Vec<ContextItem>
-where
-    I: IntoIterator<Item = T>,
-    T: Borrow<ContextItem>,
-{
-    rank_dedup_budget(items, budget)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

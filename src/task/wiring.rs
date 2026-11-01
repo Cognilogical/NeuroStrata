@@ -19,10 +19,6 @@ pub enum RunsIn {
     /// The project's own chokepoint: CI job, CMS publish step, render
     /// submission, deploy script. Generic on purpose.
     ProjectPipeline,
-    /// No machine exists; the prompt is the mechanism. Last resort. No
-    /// shipped wire uses it today — that is the point of the category.
-    #[allow(dead_code)]
-    AgentReminder,
 }
 
 impl RunsIn {
@@ -31,7 +27,6 @@ impl RunsIn {
             RunsIn::Core => "core",
             RunsIn::GitPrePush => "git-pre-push",
             RunsIn::ProjectPipeline => "project-pipeline",
-            RunsIn::AgentReminder => "agent-reminder",
         }
     }
 }

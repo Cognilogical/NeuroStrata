@@ -37,11 +37,6 @@ pub fn render_plan(plan: &ContextPlan) -> String {
     out
 }
 
-/// Alias kept for callers that name it after the plan.
-pub fn render_context_plan(plan: &ContextPlan) -> String {
-    render(plan)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

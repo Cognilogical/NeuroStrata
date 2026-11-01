@@ -1,3 +1,7 @@
+// The module is compiled wholesale from its real path, so prod-only methods
+// are quiesced here (same pattern as tests/context/model_test.rs).
+#![allow(dead_code)]
+
 #[path = "../../src/receipts/store.rs"]
 mod store;
 

@@ -1872,6 +1872,8 @@ pub fn verify_record_signature(
 }
 
 /// Decompress a zstd-compressed mesh record bundle with bounded output size.
+/// Compiled with tests only — see `worker::compress_record_bundle`.
+#[cfg(test)]
 pub fn decompress_record_bundle(bytes: &[u8]) -> Result<Vec<MeshRecord>, String> {
     let raw = crate::compression::zstd::decompress_bounded(
         bytes,
@@ -1882,6 +1884,7 @@ pub fn decompress_record_bundle(bytes: &[u8]) -> Result<Vec<MeshRecord>, String>
 }
 
 /// Read a compressed bundle from disk and decompress it.
+#[cfg(test)]
 pub fn read_compressed_bundle(bundle_path: &Path) -> Result<Vec<MeshRecord>, String> {
     let bytes = std::fs::read(bundle_path).map_err(|e| e.to_string())?;
     decompress_record_bundle(&bytes)

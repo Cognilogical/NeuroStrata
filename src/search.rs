@@ -12,6 +12,8 @@ pub struct SearchFilters {
 }
 
 impl SearchFilters {
+    /// Test-only constructor (production filters carry explicit intent).
+    #[cfg(test)]
     pub fn default_filters() -> Self {
         Self {
             include_code_ast: false,

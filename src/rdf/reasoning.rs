@@ -1,14 +1,13 @@
-use crate::traits::EvidenceEdge;
-use crate::traits::EvidenceKind;
-use crate::traits::MemoryPayload;
-use crate::traits::SearchEvidence;
-use crate::traits::SearchResult;
+#[cfg(test)]
+use crate::traits::{EvidenceEdge, EvidenceKind, MemoryPayload, SearchEvidence, SearchResult};
+#[cfg(test)]
 use crate::rdf::ontology::ClosureResult;
 use crate::rdf::ontology::OntologyIndex;
 use crate::rdf::ontology::QueryBudget;
+#[cfg(test)]
 use serde_json::json;
-use std::collections::BTreeSet;
-use std::collections::VecDeque;
+#[cfg(test)]
+use std::collections::{BTreeSet, VecDeque};
 
 /// Configuration for deterministic reasoning.
 #[derive(Debug, Clone, Copy)]
@@ -42,10 +41,12 @@ impl ReasoningAdapter {
         Self { config: ReasoningConfig::default() }
     }
 
+    #[cfg(test)]
     pub fn new_with(config: ReasoningConfig) -> Self {
         Self { config }
     }
 
+    #[cfg(test)]
     fn empty_payload() -> MemoryPayload {
         MemoryPayload {
             content: String::new(),
@@ -60,13 +61,17 @@ impl ReasoningAdapter {
 
     /// Expand domain via subClassOf* closure (RDFS §5.3 query-time expansion).
     pub fn expand_domain(&self, ontology: &OntologyIndex, domain: &str) -> Vec<String> {
-        if !self.config.reasoning_enabled {
+        if !self.config.reasoning_enabled
+            || self.config.governs_max_hops == 0
+            || self.config.closure_budget.max_nodes == 0
+        {
             return vec![domain.to_string()];
         }
         ontology.expand_domain(domain)
     }
 
     /// Expand identifiers via exactMatch / altLabels equivalence closure.
+    #[cfg(test)]
     pub fn expand_identifiers(&self, ontology: &OntologyIndex, query: &str) -> Vec<String> {
         if !self.config.reasoning_enabled {
             return vec![query.to_string()];
@@ -88,6 +93,7 @@ impl ReasoningAdapter {
     }
 
     /// Expand relation filters via subPropertyOf* closure.
+    #[cfg(test)]
     pub fn expand_relation(&self, ontology: &OntologyIndex, relation: &str) -> Vec<String> {
         if !self.config.reasoning_enabled {
             return vec![relation.to_string()];
@@ -96,6 +102,7 @@ impl ReasoningAdapter {
     }
 
     /// Bounded transitive GOVERNS closure (default 2 hops, §5.5).
+    #[cfg(test)]
     pub fn closure_governs(&self, ontology: &OntologyIndex, root: &str, edges: &[String]) -> ClosureResult {
         let _ = ontology;
         let mut result = ClosureResult::default();
@@ -171,6 +178,7 @@ impl ReasoningAdapter {
     }
 
     /// Execute reasoning-backed search expansion over domain, query, and edges.
+    #[cfg(test)]
     pub fn execute(
         &self,
         ontology: &OntologyIndex,
@@ -233,5 +241,28 @@ impl ReasoningAdapter {
             });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_adapter_expands_and_executes_within_budget() {
+        let idx = OntologyIndex::from_registry_metadata(&json!({
+            "domain_registry": {
+                "domains": [
+                    {"slug": "auth", "aliases": ["authn"]},
+                    {"slug": "tls", "parent": "auth", "aliases": ["ssl"]}
+                ]
+            }
+        }));
+        let adapter = ReasoningAdapter::new_with(ReasoningConfig::default());
+        assert!(adapter.expand_domain(&idx, "auth").contains(&"tls".to_string()));
+        assert!(adapter.expand_identifiers(&idx, "ssl").contains(&"tls".to_string()));
+        assert!(!adapter.expand_relation(&idx, "GOVERNS").is_empty());
+        let results = adapter.execute(&idx, "auth", "ssl", &["tls::src/tls.rs".to_string()]);
+        assert!(results.iter().any(|r| r.id == "src/tls.rs"));
     }
 }

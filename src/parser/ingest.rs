@@ -975,7 +975,7 @@ pub async fn ingest_directory(
     // Version gate: a changed (or missing) ingest_version stamps a full re-parse.
     // A mixed previous generation (any row missing or differing) trips too.
     let current_version = ingest_version(&schema.fingerprint());
-    let offending_stamp = prev_stamps.iter().find(|s| s.is_empty() || s.as_str() != current_version).cloned();
+    let offending_stamp = prev_stamps.iter().find(|s| crate::parser::generation::version_gate_tripped(if s.is_empty() { None } else { Some(s.as_str()) }, &current_version)).cloned();
     let force_reparse = prev_gen > 0 && offending_stamp.is_some();
     if force_reparse {
         let warn_prev = offending_stamp.as_deref().filter(|s| !s.is_empty()).unwrap_or("(none)");

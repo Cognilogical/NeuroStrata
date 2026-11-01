@@ -153,24 +153,7 @@ impl GuardValidator {
     /// mutating actions (write/edit/bash-mutating). Returns the legal
     /// transition message when blocked (Unpreflighted, no task claim,
     /// or BreathRequired state requires a note).
-    pub fn guard_validate(
-        &self,
-        session_id: &str,
-        active_task_id: Option<&str>,
-        worktree: &str,
-        _action_type: &str,
-        is_mutating: bool,
-    ) -> (bool, Option<String>) {
-        self.guard_validate_with_mutations(
-            session_id,
-            active_task_id,
-            worktree,
-            _action_type,
-            is_mutating,
-            0,
-        )
-    }
-
+    ///
     /// Same preflight, but the caller supplies how many mutations have run
     /// since the last `task_update` note (the Breath counter).
     pub fn guard_validate_with_mutations(

@@ -11,6 +11,7 @@ pub struct Receipt {
 }
 
 impl Receipt {
+    #[cfg(test)]
     pub fn is_current(&self, head_sha: &str, dirty_tree_hash: &str) -> bool {
         self.head_sha == head_sha && self.dirty_tree_hash == dirty_tree_hash
     }

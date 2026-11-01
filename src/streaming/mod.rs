@@ -56,15 +56,6 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-fn contains_stripped_counter(text: &str) -> bool {
-    for counter in STRIPPED_PROCEDURE_COUNTERS {
-        if text.contains(counter) {
-            return true;
-        }
-    }
-    false
-}
-
 fn check_privacy(line_content: &str, line: usize) -> Result<(), ParseError> {
     for counter in STRIPPED_PROCEDURE_COUNTERS {
         if line_content.contains(counter) {
@@ -221,103 +212,6 @@ pub fn format_term(raw: &str) -> Result<String, ParseError> {
     // Per spec: handles <iri>, _:bnode, or "literal"...
     // For plain unquoted non-IRI, wrap as literal
     Ok(format_literal(raw, None, None))
-}
-
-fn tokenize_term(token: &str, line: usize) -> Result<(String, &str), ParseError> {
-    // Try quoted literal first
-    if token.starts_with('"') {
-        let mut literal = String::from("\"");
-        let mut rest = &token[1..];
-        // Scan for closing unescaped quote
-        let mut chars = rest.chars();
-        while let Some(ch) = chars.next() {
-            if ch == '\\' {
-                // Escaped char
-                if let Some(next) = chars.next() {
-                    match next {
-                        'n' => { literal.push('\\'); literal.push('n'); }
-                        'r' => { literal.push('\\'); literal.push('r'); }
-                        't' => { literal.push('\\'); literal.push('t'); }
-                        '"' => { literal.push('\\'); literal.push('"'); }
-                        '\\' => { literal.push('\\'); literal.push('\\'); }
-                        _ => {
-                            if next == 'u' || next == 'U' {
-                                // \uXXXX
-                                let mut hex = String::new();
-                                for _ in 0..4 {
-                                    if let Some(h) = chars.next() {
-                                        hex.push(h);
-                                    }
-                                }
-                                literal.push('\\');
-                                literal.push('u');
-                                literal.push_str(&hex);
-                            } else {
-                                literal.push('\\');
-                                literal.push(next);
-                            }
-                        }
-                    }
-                } else {
-                    return Err(ParseError::MalformedLine {
-                        line,
-                        message: format!("unterminated escaped literal in term: {}", token),
-                    });
-                }
-            } else if ch == '"' {
-                // End of quoted literal
-                rest = chars.as_str();
-                break;
-            } else {
-                literal.push(ch);
-            }
-        }
-        // Now rest may contain ^^<datatype> or @lang
-        let _full_lit = format!("{}\"", literal);
-        // Wait - literal currently holds the inner content with escapes preserved
-        // Actually let's rebuild properly
-        // Reconstruct quoted string with escaped content preserved as original escapes
-        // Instead, let's just return the original token up to quote + rest
-        let quote_end_pos = token.len() - rest.len();
-        let quoted_part = &token[..quote_end_pos + 1];
-        let remaining = rest;
-        let mut result = quoted_part.to_string();
-        // Add remaining (datatype/lang)
-        result.push_str(remaining);
-        return Ok((result, remaining));
-    }
-    // Blank node
-    if token.starts_with("_:") {
-        let label = token;
-        return Ok((label.to_string(), &token[token.len()..]));
-    }
-    // IRI <...>
-    if token.starts_with('<') {
-        let mut depth = 1;
-        let chars = token.chars().enumerate();
-        for (i, ch) in chars {
-            if i == 0 {
-                continue;
-            }
-            if ch == '<' {
-                depth += 1;
-            } else if ch == '>' {
-                depth -= 1;
-                if depth == 0 {
-                    let iri = token[..i + 1].to_string();
-                    return Ok((iri, &token[i + 1..]));
-                }
-            }
-        }
-        return Err(ParseError::InvalidTerm {
-            line,
-            term: token.to_string(),
-        });
-    }
-    Err(ParseError::InvalidTerm {
-        line,
-        term: token.to_string(),
-    })
 }
 
 impl Stream {

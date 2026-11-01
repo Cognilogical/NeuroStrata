@@ -65,8 +65,6 @@ impl MockStore {
 
     /// List of (namespace, id) pairs that have had `increment_access_count` called.
     /// Used by tests to verify the access count was incremented.
-    /// Temporarily allowed until Task 6's tests consume it.
-    #[allow(dead_code)]
     pub(crate) fn incremented_ids(&self) -> Vec<(String, String)> {
         self.incremented_ids
             .lock()
@@ -76,8 +74,6 @@ impl MockStore {
 
     /// Configure whether `search` and `search_with_domain` should fail.
     /// Used by tests to exercise error paths.
-    /// Temporarily allowed until Task 6's tests consume it.
-    #[allow(dead_code)]
     pub(crate) fn set_search_fails(&self, fails: bool) {
         *self.search_fails.lock().expect("mock store lock") = fails;
     }

@@ -1,5 +1,4 @@
 //! Bounded 1–2 hop traversal primitives for the `related` graph-read tool.
-#![allow(dead_code)]
 //!
 //! Like `graph_read::memories_for_file`, this module is deliberately free of
 //! `crate::` dependencies (serde + std only) so
@@ -451,18 +450,6 @@ pub fn graph_read_related(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn node(id: &str, memory_type: &str, visible: bool) -> NodeSpec {
-        NodeSpec {
-            id: id.to_string(),
-            memory_type: memory_type.to_string(),
-            content: format!("content of {id}"),
-            domain: None,
-            freshness: None,
-            lifecycle: None,
-            visible,
-        }
-    }
 
     #[test]
     fn relation_allowlist_rejects_unknown_relations() {

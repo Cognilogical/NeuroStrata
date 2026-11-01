@@ -19,10 +19,6 @@ pub fn graph_iri(namespace: &str, tier: Tier, generation: u64) -> String {
     )
 }
 
-pub fn assertion_iri(namespace: &str, id: &str, version: u64) -> String {
-    format!("urn:neurostrata:assertion:{}:{}:{}", namespace, id, version)
-}
-
 /// Map a LadybugDB relation type to its RDF predicate.
 pub fn relation_predicate(rel_type: &str) -> String {
     let camel = match rel_type {

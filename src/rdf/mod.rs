@@ -5,11 +5,12 @@ pub mod namespace;
 pub mod ontology;
 pub mod projection;
 pub mod provenance;
+pub mod reasoning;
 pub mod shacl;
 pub mod sparql;
-pub mod reasoning;
-pub mod types;
+#[cfg(test)]
 pub mod types_oxrdf;
+pub mod types;
 
 pub use canonical::*;
 pub use dataset_canonical::*;

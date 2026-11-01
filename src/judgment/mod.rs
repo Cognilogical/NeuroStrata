@@ -180,10 +180,16 @@ impl DeduplicationChecker {
             if !self.circuit_breaker.allow_request() {
                 tracing::debug!(
                     provider = provider.name(),
+                    cb_state = %self.circuit_breaker.state(),
+                    failures = self.circuit_breaker.failure_count(),
                     "Circuit breaker open, skipping deduplication"
                 );
                 return None;
             }
+        }
+        // The shadow provider records alongside without gating the write.
+        if let Some(shadow) = &self.provider_set.shadow {
+            let _ = shadow.judge_duplicates(new_memory, candidates).await;
         }
 
         // Apply timeout to judgment call
@@ -218,6 +224,8 @@ impl DeduplicationChecker {
                 tracing::warn!(
                     provider = "judgment",
                     error = %e,
+                    cb_state = %self.circuit_breaker.state(),
+                    failures = self.circuit_breaker.failure_count(),
                     "Judgment provider error"
                 );
                 if let Some(_provider) = &self.provider_set.active {

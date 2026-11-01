@@ -51,7 +51,19 @@ impl LearningRecorder {
         Ok(())
     }
 
-    pub async fn record_blob_hash(&self, _payload_hash: &PayloadHash, _input: &crate::traits::MemoryPayload) -> Result<()> {
+    pub async fn record_blob_hash(&self, payload_hash: &PayloadHash, input: &crate::traits::MemoryPayload) -> Result<()> {
+        let path = self.root.join("blob_index.jsonl");
+        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        let entry = serde_json::json!({
+            "connection_id": self.connection_id,
+            "payload_hash": payload_hash.0,
+            "memory_type": input.memory_type,
+            "user_id": input.user_id,
+        });
+        let line = serde_json::to_string(&entry)?;
+        f.write_all(line.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.flush()?;
         Ok(())
     }
 }

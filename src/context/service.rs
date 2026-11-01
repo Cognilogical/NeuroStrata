@@ -17,10 +17,6 @@ pub struct ContextService {
 }
 
 impl ContextService {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Construct from two optional capabilities. The booleans are derived from
     /// `Option::is_some`, so the service never claims a capability it was not
     /// given.
@@ -32,46 +28,15 @@ impl ContextService {
         }
     }
 
-    /// Alias for `new_with`.
-    pub fn from_capabilities<V, G>(vector_store: Option<V>, graph_read: Option<G>) -> Self {
-        Self::new_with(vector_store, graph_read)
-    }
-
-    /// A service with no capabilities: every plan is `Unsupported`.
-    pub fn unsupported() -> Self {
-        Self::default()
-    }
-
-    pub fn without_graph_read() -> Self {
-        Self::default()
-    }
-
-    pub fn without_capabilities() -> Self {
-        Self::default()
-    }
-
-    pub fn new_unsupported() -> Self {
-        Self::default()
-    }
-
-    pub fn has_graph_read(&self) -> bool {
-        self.has_graph_read
-    }
-
-    pub fn has_vector_store(&self) -> bool {
-        self.has_vector_store
-    }
-
-    pub fn is_supported(&self) -> bool {
-        self.has_graph_read
-    }
-
+    /// A service plan is only full when BOTH capabilities are present: ranking
+    /// needs the store, freshness needs the graph read. A missing half still
+    /// yields a plan, but flagged `Unsupported`.
     pub fn plan<R>(&self, request: R) -> ContextPlan
     where
         R: AsRef<ContextRequest>,
     {
         let req = request.as_ref();
-        let degradation = if self.has_graph_read {
+        let degradation = if self.has_graph_read && self.has_vector_store {
             Degradation::Supported
         } else {
             Degradation::Unsupported
@@ -85,28 +50,11 @@ impl ContextService {
 
     /// Render `plan` as compact text. Associated function (call as
     /// `ContextService::render(&plan)`).
+    /// Render `plan` as compact text. Test-only — production renders via the
+    /// free `render` re-exported from `context`.
+    #[cfg(test)]
     pub fn render(plan: impl AsRef<ContextPlan>) -> String {
-        let plan = plan.as_ref();
-        let mut out = String::new();
-        out.push_str(&format!(
-            "context-plan {} (generation {}, scope {}, degradation: {})\n",
-            plan.event_id, plan.index_generation, plan.applied_scope, plan.degradation
-        ));
-        if plan.items.is_empty() {
-            out.push_str("(no items)\n");
-        } else {
-            for item in &plan.items {
-                out.push_str("- ");
-                out.push_str(&item.memory_type);
-                out.push_str(": ");
-                out.push_str(&item.content);
-                out.push('\n');
-            }
-        }
-        if plan.truncation {
-            out.push_str("… (truncated)\n");
-        }
-        out
+        super::render::render(plan.as_ref())
     }
 
     pub fn plan_with_items<R>(&self, request: R, candidates: Vec<super::model::ContextItem>, budget: super::plan::Budget, max_items: usize) -> ContextPlan
@@ -124,10 +72,6 @@ impl ContextService {
             plan.items = deduped;
         }
         plan
-    }
-
-    pub fn render_plan(plan: impl AsRef<ContextPlan>) -> String {
-        Self::render(plan)
     }
 }
 

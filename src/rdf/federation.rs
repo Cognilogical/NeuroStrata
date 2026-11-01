@@ -432,8 +432,23 @@ pub struct HttpServiceHandler {
     pub config: FederationConfig,
 }
 
+impl spareval::DefaultServiceHandler for HttpServiceHandler {
+    type Error = FederationError;
+
+    fn handle(
+        &self,
+        service_name: &oxrdf::NamedNode,
+        pattern: &GraphPattern,
+        _base_iri: Option<&oxiri::Iri<String>>,
+    ) -> Result<spareval::QuerySolutionIter<'static>, FederationError> {
+        self.execute(service_name, pattern)
+    }
+}
+
 impl HttpServiceHandler {
-    pub fn handle(
+    /// Resolve the peer for a SERVICE endpoint IRI, fetch its result over HTTP
+    /// and convert the SPARQL-results JSON into an owned solution iterator.
+    pub fn execute(
         &self,
         service_name: &oxrdf::NamedNode,
         pattern: &GraphPattern,
@@ -479,14 +494,23 @@ impl HttpServiceHandler {
             .build()
             .map_err(|e| FederationError::Network(format!("{}", e)))?;
 
-        let resp = client
+        let send_result = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/sparql-query")
             .header("Accept", "application/sparql-results+json")
             .body(inner_str)
-            .send()
-            .map_err(|e| FederationError::Network(format!("{}", e)))?;
+            .send();
+        let resp = match send_result {
+            Ok(r) => r,
+            Err(e) if e.is_timeout() => {
+                return Err(FederationError::Timeout(format!(
+                    "peer {} did not answer within {}ms",
+                    endpoint_str, self.config.timeout_ms
+                )));
+            }
+            Err(e) => return Err(FederationError::Network(format!("{}", e))),
+        };
 
         let status = resp.status();
         if !status.is_success() {

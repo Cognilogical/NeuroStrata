@@ -19,6 +19,9 @@ pub fn canonicalize_topology(topology: &mut Value, index: &OntologyIndex) {
 }
 
 /// Canonicalize a raw entity alias to a slug, using the ontology when possible.
+/// Compiled with tests only: production entity-slugging uses
+/// `domain::canonical_entity_slug` via the ontology index directly.
+#[cfg(test)]
 pub fn canonicalize_known_ids_alias(raw: &str, index: &OntologyIndex) -> String {
     index
         .canonical_slug(raw)

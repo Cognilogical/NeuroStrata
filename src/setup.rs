@@ -119,17 +119,6 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn verify_daemon_linux() -> Result<bool> {
-    let port = std::env::var("NEUROSTRATA_DAEMON_PORT").unwrap_or_else(|_| "34343".to_string());
-    let url = format!("http://127.0.0.1:{}/health", port);
-    let status = std::process::Command::new("curl")
-        .args(["-s", "-f", &url])
-        .status()
-        .context("curl health check")?;
-    Ok(status.success())
-}
-
-#[cfg(target_os = "linux")]
 fn wait_for_healthy_linux(timeout_secs: u64) -> Result<bool> {
     let port = std::env::var("NEUROSTRATA_DAEMON_PORT").unwrap_or_else(|_| "34343".to_string());
     let url = format!("http://127.0.0.1:{}/health", port);

@@ -1490,7 +1490,7 @@ pub async fn handle_task_complete(
         let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session_for_receipt.clone(),
-            task_id: id.clone(),
+            task_id: binding.task_id.clone(),
             event_id: event_id.clone(),
             outcome: "completed".to_string(),
             exposed_ids: vec![format!("{}:{}", namespace, id)],
@@ -2269,8 +2269,9 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
                     None
                 }
             }
-            wiring::RunsIn::AgentReminder => None,
         };
+        // Note: "no machine exists" is intentionally absent from RunsIn — a
+        // wire category the catalog never ships cannot claim coverage.
         if w.runs_in == wiring::RunsIn::ProjectPipeline && resolved.is_none() {
             uncovered.push(w.id);
         }

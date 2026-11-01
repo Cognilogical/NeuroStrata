@@ -167,9 +167,13 @@ impl JudgmentProvider for LayaOnnxProvider {
 
         // Fail-closed: without a valid inference session and Ready state,
         // do not return fabricated judgments.
-        if self.inference_session.is_none() || self.state != crate::judgment::RuntimeState::Ready {
+        if self.state() != crate::judgment::RuntimeState::Ready
+            || self.inference_session().is_none()
+        {
             anyhow::bail!("Laya ONNX inference session unavailable (model not loaded or invalid)");
         }
+        // Bound concurrent inference: one permit per judge_duplicates call.
+        let _permit = self.inference_semaphore.acquire().await.ok();
 
         // Obtain a tokenizer: bundled tokenizer.json if present, otherwise
         // fall back to subword/whitespace token IDs.
@@ -198,7 +202,7 @@ impl JudgmentProvider for LayaOnnxProvider {
 
             let token_overlap = if union == 0 { 0.0f32 } else { intersection as f32 / union as f32 };
 
-            let similarity = if let Some(lock) = self.inference_session.as_ref() {
+            let similarity = if let Some(lock) = self.inference_session() {
                 let mut session = lock.lock().unwrap();
                 // Try real ONNX execution with 2-float feature vector
                 let jaccard_sim = token_overlap;
@@ -459,32 +463,8 @@ impl LearningRuntimeManager {
             model_cache: PathBuf::from(".cache/laya"),
         })
     }
-
-    /// Fetch a pinned Laya model bundle by model identifier.
-    /// Downloads from the registry-defined URL and verifies the SHA-256 checksum
-    /// before writing to the target directory, ensuring supply-chain integrity.
-    pub async fn fetch_model(model_id: &str, target_dir: &str) -> Result<()> {
-        let target_path = PathBuf::from(target_dir);
-        std::fs::create_dir_all(&target_path)?;
-
-        // Use the common model downloader (spawn_blocking to avoid blocking async runtime)
-        let _written = tokio::task::spawn_blocking({
-            let model_id = model_id.to_string();
-            let target_path = target_path.clone();
-            move || crate::model_downloader::fetch_from_registry(&model_id, &target_path)
-        })
-        .await??;
-
-        // Do not fabricate a manifest: the downloaded bundle must be complete.
-        let manifest_path = target_path.join("manifest.json");
-        if !manifest_path.exists() {
-            return Err(anyhow!("Downloaded Laya bundle is missing manifest.json"));
-        }
-
-        println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());
-        Ok(())
-    }
 }
+
 #[cfg(test)]
 mod ensure_ready_tests {
     use super::*;

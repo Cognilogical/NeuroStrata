@@ -515,8 +515,7 @@ pub async fn write_registry(
 }
 
 /// The number of domains the cache holds (0 when the row is absent). Task 7's
-/// `single_domain_bypasses` counter reads this; not consumed yet.
-#[allow(dead_code)]
+/// `single_domain_bypasses` counter reads this.
 pub async fn registry_domain_count(store: &Arc<dyn VectorStore>, namespace: &str) -> usize {
     match store.get(namespace, &registry_row_id(namespace)).await {
         Ok(Some((_, payload))) => registry_domains(&payload.metadata).len(),

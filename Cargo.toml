@@ -108,6 +108,7 @@ spargebra = { version = "0.4", features = ["sparql-12"] }
 sparopt = { version = "0.3", features = ["sparql-12"] }
 spareval = { version = "0.2", features = ["sparql-12"] }
 sparesults = { version = "0.3", features = ["sparql-12"] }
+oxiri = "0.2"
 graphql-parser = "0.4"
 shacl = "0.3"
 

@@ -733,7 +733,17 @@ pub(crate) async fn start_daemon_on(
             match DeduplicationChecker::new(config) {
                 Ok(checker) => {
                     tracing::info!("Memory deduplication enabled with judgment model");
-                    Some(Arc::new(checker))
+                    let checker = Arc::new(checker);
+                    // One-shot provider health probe at startup; the result only
+                    // informs the log (baseline write path stays allowed).
+                    tokio::spawn({
+                        let probe = checker.clone();
+                        async move {
+                            let healthy = probe.health_check().await;
+                            tracing::debug!(healthy, "Dedup judgment provider health probe");
+                        }
+                    });
+                    Some(checker)
                 }
                 Err(e) => {
                     tracing::warn!("Failed to initialize deduplication checker: {}", e);
@@ -817,6 +827,8 @@ pub(crate) async fn start_daemon_on(
         .route("/graphql", post(handle_http_graphql))
         .route("/chat/ask", post(handle_http_chat_ask))
         .route("/storage/status", get(handle_http_storage_status))
+        .route("/learning/status", get(handle_http_learning_status))
+        .route("/learning/control", post(handle_http_learning_control))
         .route("/shutdown", post(handle_shutdown))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -1192,7 +1204,10 @@ fn checkpoint_backoff(failures: u32) -> std::time::Duration {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ShutdownCause {
     /// Windows kills the process roughly five seconds after this, whatever it
-    /// is doing.
+    /// is doing. The runtime only constructs it from the Windows console-close
+    /// signal; on non-Windows prod builds the variant (and its budget arms)
+    /// are compiled out, and it exists there only for the budget tests.
+    #[cfg(any(windows, test))]
     ConsoleClosing,
     /// Everything else: /shutdown, Ctrl-C, SIGTERM. Nothing outside is counting
     /// down, so it can wait out a busy engine.
@@ -1201,6 +1216,7 @@ enum ShutdownCause {
 
 fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
     match cause {
+        #[cfg(any(windows, test))]
         ShutdownCause::ConsoleClosing => std::time::Duration::from_secs(4),
         ShutdownCause::Requested => std::time::Duration::from_secs(60),
     }
@@ -1211,6 +1227,7 @@ fn final_checkpoint_budget(cause: ShutdownCause) -> std::time::Duration {
 /// mid-walk leaves the namespace cleared and only partly rebuilt.
 fn ingest_wait_budget(cause: ShutdownCause) -> std::time::Duration {
     match cause {
+        #[cfg(any(windows, test))]
         ShutdownCause::ConsoleClosing => std::time::Duration::ZERO,
         ShutdownCause::Requested => std::time::Duration::from_secs(300),
     }
@@ -1519,13 +1536,108 @@ async fn handle_tasks_gate(
 
 async fn handle_http_sparql(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
+    // `{"federated": true}` names this daemon as a remote SPARQL peer: route
+    // to the federation handler on the underlying LadybugStore. Opt-in per
+    // deployment: service_enabled and the served-host/namespace allowlists
+    // come from env, and everything is denied until configured.
+    if req.get("federated").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let config = crate::rdf::federation::FederationConfig {
+            service_enabled: env_flag("NEUROSTRATA_SPARQL_SERVICE_ENABLED"),
+            served_namespaces: env_csv("NEUROSTRATA_SPARQL_SERVED_NAMESPACES"),
+            served_hosts: env_csv("NEUROSTRATA_SPARQL_SERVED_HOSTS"),
+            service_peers: env_peers("NEUROSTRATA_SPARQL_SERVICE_PEERS"),
+            ..Default::default()
+        };
+        let report = match (
+            crate::traits::VectorStore::as_any(state.vector_store.as_ref())
+                .downcast_ref::<crate::store::ladybug::LadybugStore>(),
+            req.get("query").and_then(|v| v.as_str()),
+            req.get("namespace").and_then(|v| v.as_str()),
+        ) {
+            (Some(ladybug), Some(query_str), Some(namespace)) => {
+                let host = headers
+                    .get(axum::http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    .map(std::borrow::ToOwned::to_owned);
+                crate::rdf::federation::handle_remote_sparql_request(
+                    query_str,
+                    namespace,
+                    host.as_deref(),
+                    None,
+                    &config,
+                    ladybug,
+                )
+                .await
+            }
+            (None, _, _) | (_, None, _) | (_, _, None) => {
+                Err(crate::rdf::federation::FederationError::Denied(
+                    "federated query requires a LadybugStore backend, a query, and a namespace"
+                        .into(),
+                ))
+            }
+        };
+        let body = match report {
+            Ok(r) => serde_json::json!({
+                "ok": true,
+                "body": r.body,
+                "solution_count": r.solution_count,
+                "truncated": r.truncated,
+                "timed_out": r.timed_out,
+                "warnings": r.warnings,
+            }),
+            Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
+        };
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        );
+    }
     let body = crate::server::handle_sparql_query(&req, state.vector_store.clone()).await;
     (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn env_csv(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `url,namespace,token_env;url,namespace,token_env` — outbound SERVICE peers.
+fn env_peers(name: &str) -> Vec<crate::rdf::federation::SparqlServicePeer> {
+    std::env::var(name)
+        .map(|v| {
+            v.split(';')
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| {
+                    let segs: Vec<&str> = p.split(',').map(str::trim).collect();
+                    crate::rdf::federation::SparqlServicePeer {
+                        endpoint_url: segs.first().unwrap_or(&"").to_string(),
+                        remote_namespace: segs.get(1).unwrap_or(&"").to_string(),
+                        bearer_token_env: segs.get(2).unwrap_or(&"").to_string(),
+                    }
+                })
+                .filter(|p| !p.endpoint_url.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn handle_http_graphql(
@@ -1563,6 +1675,23 @@ async fn handle_http_storage_status(
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
+}
+
+async fn handle_http_learning_status() -> (axum::http::StatusCode, axum::Json<crate::learning::status::LearnStatus>) {
+    let status = crate::learning::control::load_status(&crate::learning::control::default_learning_dir());
+    (axum::http::StatusCode::OK, axum::Json(status))
+}
+
+async fn handle_http_learning_control(
+    axum::Json(req): axum::Json<crate::learning::control::LearningControlRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    match crate::learning::control::apply_control(&req) {
+        Ok(res) => (axum::http::StatusCode::OK, axum::Json(serde_json::to_value(res).unwrap_or_default())),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"ok": false, "error": e})),
+        ),
+    }
 }
 
 #[cfg(test)]

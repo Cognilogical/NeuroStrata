@@ -16,5 +16,3 @@ pub use self::export_freshness_dirty::{check_export_freshness, clear_export_fres
 pub use self::guard_event_log::GuardEventLog;
 pub use self::mesh_outbox::MeshOutbox;
 pub mod post_ingest_normalize;
-#[allow(unused_imports)]
-pub use self::post_ingest_normalize::PostIngestNormalize;

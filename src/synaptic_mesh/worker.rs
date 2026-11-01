@@ -420,12 +420,17 @@ pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), Strin
 }
 
 /// Compress a batch of mesh records with zstd for bundle transport.
+/// Compiled with tests only: no shipped mesh flow writes bundles yet (the
+/// spec's `NEUROSTRATA_MESH_BUNDLE_ZSTD` opt-in remains a follow-up), and
+/// the round-trip tests exercise the full path.
+#[cfg(test)]
 pub fn compress_record_bundle(records: &[MeshRecord], level: i32) -> Result<Vec<u8>, String> {
     let json_bytes = serde_json::to_vec(records).map_err(|e| e.to_string())?;
     crate::compression::zstd::compress(&json_bytes, level).map_err(|e| e.to_string())
 }
 
 /// Write a compressed bundle to `<mesh_root>/bundles/<bundle_name>.bundle.zst`.
+#[cfg(test)]
 pub fn write_compressed_bundle(mesh_root: &Path, bundle_name: &str, records: &[MeshRecord], level: i32) -> Result<PathBuf, String> {
     let bytes = compress_record_bundle(records, level)?;
     let dir = mesh_root.join("bundles");

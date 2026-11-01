@@ -1,11 +1,19 @@
 //! Post-ingest normalize subscriber (Layer 2 — ThalamicBus).
 //! Triggers `reconcile`-style normalization when ingest completes (AC4 pre-check).
 
-use crate::events::{MemorySubscriber, RecursionToken, SubscriberContext, SubscriberError, ThalamicPulse};
+// The subscriber itself is not registered by the daemon yet (v1 intentionally
+// registers exactly three subscribers); its pulse handling stays test-exercised.
+#[cfg(test)]
 use async_trait::async_trait;
+#[cfg(test)]
+use crate::events::{MemorySubscriber, RecursionToken, SubscriberContext, SubscriberError, ThalamicPulse};
 
+// The subscriber itself is not registered by the daemon yet (v1 intentionally
+// registers exactly three subscribers); its pulse handling stays test-exercised.
+#[cfg(test)]
 pub struct PostIngestNormalize;
 
+#[cfg(test)]
 impl PostIngestNormalize {
     pub fn new() -> Self { Self }
 }
@@ -133,6 +141,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl MemorySubscriber for PostIngestNormalize {
     fn name(&self) -> &'static str { "post_ingest_normalize" }

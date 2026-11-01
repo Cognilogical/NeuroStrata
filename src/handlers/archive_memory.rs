@@ -139,6 +139,7 @@ pub async fn archive_memory(
         ));
     }
 
+    let now_ts = chrono::Utc::now().timestamp();
     payload
         .metadata
         .as_object_mut()
@@ -148,12 +149,36 @@ pub async fn archive_memory(
         .metadata
         .as_object_mut()
         .expect("object checked above")
-        .insert(
-            "archived_at".to_string(),
-            serde_json::json!(chrono::Utc::now().timestamp()),
-        );
+        .insert("archived_at".to_string(), serde_json::json!(now_ts));
+    if payload.metadata.get("facets_bitemporal").is_some() {
+        crate::domain::retract_inferred_facets(&mut payload.metadata, now_ts);
+    }
     if let Err(e) = store.upsert(&namespace, &id, vector, payload).await {
         return ArchiveOutcome::Failed(format!("Failed to archive memory {}: {}", id, e));
+    }
+    if std::env::var_os("NEUROSTRATA_LEARNING_DIR").is_some() {
+        match crate::learning::recorder::LearningRecorder::open(
+            crate::learning::control::default_learning_dir(),
+            None,
+        )
+        .await
+        {
+            Ok(recorder) => {
+                let outcome = crate::learning::observation::LearningOutcome {
+                    outcome_id: format!("archive-{}-{}", now_ts, id),
+                    occurred_at: now_ts,
+                    namespace: namespace.clone(),
+                    connection_id: None,
+                    task_id: None,
+                    target_ids: vec![id.clone()],
+                    kind: crate::learning::observation::LearningOutcomeKind::MemoryArchived,
+                };
+                if let Err(e) = recorder.record_outcome(&outcome).await {
+                    eprintln!("learning outcome record failed: {}", e);
+                }
+            }
+            Err(e) => eprintln!("learning recorder open failed: {}", e),
+        }
     }
 
     bus.emit(

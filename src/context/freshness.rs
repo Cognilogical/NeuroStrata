@@ -26,12 +26,6 @@ pub struct FreshnessInputs {
     pub has_governed_path: bool,
 }
 
-impl FreshnessInputs {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 /// Compute the four freshness dimensions from `inputs`.
 pub fn compute(inputs: &FreshnessInputs) -> Freshness {
     Freshness {
@@ -45,30 +39,6 @@ pub fn compute(inputs: &FreshnessInputs) -> Freshness {
 /// Alias for callers that prefer a verb-first name.
 pub fn compute_freshness(inputs: &FreshnessInputs) -> Freshness {
     compute(inputs)
-}
-
-/// Positional variant kept for callers that do not want to build the struct.
-#[allow(clippy::too_many_arguments)]
-pub fn compute_all(
-    stored_file_sha256: Option<&str>,
-    current_file_sha256: Option<&str>,
-    stored_span_sha256: Option<&str>,
-    current_span_sha256: Option<&str>,
-    verification_status: Option<&str>,
-    index_coverage: Option<Coverage>,
-    decision_status: Option<&str>,
-    has_governed_path: bool,
-) -> Freshness {
-    compute(&FreshnessInputs {
-        stored_file_sha256: stored_file_sha256.map(str::to_string),
-        current_file_sha256: current_file_sha256.map(str::to_string),
-        stored_span_sha256: stored_span_sha256.map(str::to_string),
-        current_span_sha256: current_span_sha256.map(str::to_string),
-        verification_status: verification_status.map(str::to_string),
-        index_coverage,
-        decision_status: decision_status.map(str::to_string),
-        has_governed_path,
-    })
 }
 
 /// Compute only the source-currency dimension from two hashes.

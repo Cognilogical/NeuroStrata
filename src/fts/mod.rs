@@ -1,5 +1,4 @@
 //! In-house multi-field lexical engine.
-#![allow(dead_code)]
 //!
 //! This module is deliberately `std`-only: the native store and the
 //! `crates/neurostrata-wasm` read-only engine compile it from this path, so it
@@ -336,23 +335,14 @@ impl LexicalIndex {
         self.namespaces.remove(namespace);
     }
 
-    pub fn clear(&mut self) {
-        self.namespaces.clear();
-    }
-
-    pub fn rebuild(&mut self, docs: Vec<LexicalDoc>) {
-        self.clear();
-        let mut docs = docs;
-        docs.sort_by(|a, b| a.namespace.cmp(&b.namespace).then_with(|| a.id.cmp(&b.id)));
-        for doc in docs {
-            self.add(doc);
-        }
-    }
-
+    /// Test-surface helpers (the `tests/fts` crate compiles this module via
+    /// `#[path]`): dataset size probes. Production flows never read them.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.namespaces.values().map(|ns| ns.len()).sum()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.namespaces.values().all(|ns| ns.is_empty())
     }
@@ -944,6 +934,15 @@ fn levenshtein_bounded(a: &str, b: &str, max: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_size_probes() {
+        let mut idx = LexicalIndex::new();
+        assert!(idx.is_empty());
+        idx.add(LexicalDoc::new("m1", "ns", "fact", "alpha needle"));
+        assert_eq!(idx.len(), 1);
+        assert!(!idx.is_empty());
+    }
 
     #[test]
     fn levenshtein_is_bounded() {

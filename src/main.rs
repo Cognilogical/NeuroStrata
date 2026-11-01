@@ -1,6 +1,5 @@
 // Increase recursion limit for large JSON literals in tools/list
 #![recursion_limit = "256"]
-#![allow(dead_code)]
 
 mod attempt;
 mod buffer;
@@ -377,6 +376,13 @@ enum Commands {
         action: MetricsCommands,
     },
 
+    /// Local deduplication learning loop: status/pause/resume/rollback/reset/train
+    #[command(name = "learn")]
+    Learn {
+        #[command(subcommand)]
+        action: LearnCommands,
+    },
+
     /// Curated read-only GraphQL query execution
     #[command(name = "graphql")]
     Graphql {
@@ -386,6 +392,30 @@ enum Commands {
         /// Target namespace
         #[arg(short, long, default_value = "NeuroStrata")]
         namespace: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq)]
+enum LearnCommands {
+    /// Show local deduplication learning status
+    Status,
+    /// Pause background candidate training
+    Pause,
+    /// Resume background candidate training
+    Resume,
+    /// Rollback active model to previous known-good version
+    Rollback,
+    /// Reset derived candidate datasets/models
+    Reset {
+        #[arg(long)]
+        purge_observations: bool,
+        #[arg(long)]
+        confirm_purge: bool,
+    },
+    /// Build deduplication dataset and train/evaluate a candidate version
+    Train {
+        #[arg(long, default_value = "v1.0.0-local")]
+        version: String,
     },
 }
 
@@ -1014,6 +1044,110 @@ impl ReadSource {
             }
         }
     }
+}
+
+fn print_learn_control(req: crate::learning::control::LearningControlRequest) {
+    match crate::learning::control::apply_control(&req) {
+        Ok(res) => match serde_json::to_string_pretty(&res) {
+            Ok(out) => println!("{}", out),
+            Err(e) => eprintln!("learn control result serialize failed: {}", e),
+        },
+        Err(e) => {
+            eprintln!("learn control failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build the dedup dataset, train a candidate, evaluate it fail-closed, and
+/// promote it when the real eval report carries numeric metrics.
+async fn run_learn_train(version: &str) -> anyhow::Result<()> {
+    let root = crate::learning::control::default_learning_dir();
+    let paths = crate::judgment::laya_onnx::LearningPaths::new(root.clone());
+    let mgr = crate::judgment::laya_onnx::LearningRuntimeManager::new(paths.clone());
+    let rt_state = mgr.ensure_ready().await;
+    let runtime = std::sync::Arc::new(mgr.runtime()?);
+    let model_cache = runtime.model_cache.clone();
+    let trainer = crate::learning::trainer::Trainer::new(runtime);
+
+    trainer.transition(
+        &crate::learning::trainer::TrainingJobState::WaitingForData,
+        crate::learning::trainer::TrainingJobState::Training,
+    )?;
+
+    let policy = crate::learning::dataset::DistancePolicy::load_from(&paths.root_dir());
+    policy.save_to(&paths.root_dir())?;
+    let dataset_report = crate::learning::dataset::build_dedup_dataset(
+        &paths.root_dir(),
+        &paths.root_dir().join("dataset"),
+    )
+    .await?;
+
+    trainer.train_candidate(&version.to_string()).await?;
+
+    // The builtin train path writes under runtime model_cache, not LearningPaths.
+    let candidate_dir = model_cache.join("candidates").join(version);
+    let eval_path = candidate_dir.join("eval_report.json");
+    let eval_raw = std::fs::read_to_string(&eval_path).map_err(|_| {
+        anyhow::anyhow!(
+            "no eval_report.json for candidate {} at {}; training did not produce a measurable artifact; evaluation refused (fail-closed)",
+            version,
+            eval_path.display()
+        )
+    })?;
+    let eval_report: crate::learning::trainer::EvaluationReport =
+        serde_json::from_str(&eval_raw).map_err(|e| {
+            anyhow::anyhow!("eval_report.json for {} is not parseable: {}", version, e)
+        })?;
+    let score = trainer.evaluate_candidate(&eval_report)?;
+
+    let bundle = crate::learning::model_bundle::ModelBundle::load(&candidate_dir, "laya")?;
+
+    // Promote in the active manifest and persist it.
+    let manifest_path = paths.root_dir().join("active_manifest.json");
+    let mut manifest: crate::learning::trainer::ActiveManifest = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    trainer.promote(&mut manifest, &version.to_string(), score)?;
+
+    std::fs::create_dir_all(paths.root_dir())?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    // Mirror promoted versions into status.json.
+    let mut status = crate::learning::control::load_status(&paths.root_dir());
+    status.active_version = manifest.active_version.clone();
+    status.previous_good_version = manifest.previous_good_version.clone();
+    status.candidate_version = None;
+    status.training_state = crate::learning::trainer::TrainingJobState::Promoted;
+    status.latest_evaluation = Some(eval_report);
+    std::fs::write(
+        paths.root_dir().join("status.json"),
+        serde_json::to_string_pretty(&status)?,
+    )?;
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "version": version,
+            "rt_state": format!("{:?}", rt_state),
+            "score": score,
+            "active_version": manifest.active_version,
+            "previous_good_version": manifest.previous_good_version,
+            "checkpoint_path": bundle.checkpoint_path(),
+            "manifest_path": bundle.manifest_path(),
+            "dataset_report": dataset_report,
+            "train_jsonl": paths.train_jsonl(),
+            "proxy_eval_jsonl": paths.proxy_eval_jsonl(),
+            "base_model_dir": paths.base_model_dir(),
+            "candidate_dir": paths.candidate_dir(&version.to_string()),
+        })
+    );
+    Ok(())
 }
 
 async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()> {
@@ -2685,6 +2819,47 @@ async fn run() -> anyhow::Result<()> {
                 crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(&model_id, &target_dir).await?;
                 println!("Laya model '{}' fetched and verified to '{}'", model_id, target_dir);
             }
+            Commands::Learn { action } => match action {
+                LearnCommands::Status => {
+                    let status = crate::learning::control::load_status(
+                        &crate::learning::control::default_learning_dir(),
+                    );
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                }
+                LearnCommands::Pause => {
+                    print_learn_control(crate::learning::control::LearningControlRequest {
+                        action: crate::learning::control::LearningControlAction::Pause,
+                        purge_observations: false,
+                    });
+                }
+                LearnCommands::Resume => {
+                    print_learn_control(crate::learning::control::LearningControlRequest {
+                        action: crate::learning::control::LearningControlAction::Resume,
+                        purge_observations: false,
+                    });
+                }
+                LearnCommands::Rollback => {
+                    print_learn_control(crate::learning::control::LearningControlRequest {
+                        action: crate::learning::control::LearningControlAction::Rollback,
+                        purge_observations: false,
+                    });
+                }
+                LearnCommands::Reset {
+                    purge_observations,
+                    confirm_purge,
+                } => {
+                    if purge_observations && !confirm_purge {
+                        anyhow::bail!("--purge-observations requires --confirm-purge");
+                    }
+                    print_learn_control(crate::learning::control::LearningControlRequest {
+                        action: crate::learning::control::LearningControlAction::Reset,
+                        purge_observations,
+                    });
+                }
+                LearnCommands::Train { version } => {
+                    run_learn_train(&version).await?;
+                }
+            },
             Commands::Run { program, args } => {
                 // Deliberate, named, and it never touches the database.
                 match std::process::Command::new(&program).args(&args).status() {
@@ -3330,6 +3505,7 @@ async fn run() -> anyhow::Result<()> {
                     Ok(report) => {
                         if report.verified {
                             println!("Setup complete. Daemon healthy.");
+                            println!("Backup timer installed: {}", report.backup_installed);
                         } else if report.daemon_installed {
                             println!("Setup complete. Daemon installed but did not become healthy — see notes above.");
                         } else {
@@ -3626,6 +3802,52 @@ async fn run() -> anyhow::Result<()> {
                             crate::server::handle_graphql_query(&args, vector_store.clone()).await;
                         println!("{}", out);
                     }
+                    Commands::Learn { action } => match action {
+                        LearnCommands::Status => {
+                            let status = crate::learning::control::load_status(
+                                &crate::learning::control::default_learning_dir(),
+                            );
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                        }
+                        LearnCommands::Pause => {
+                            print_learn_control(
+                                crate::learning::control::LearningControlRequest {
+                                    action: crate::learning::control::LearningControlAction::Pause,
+                                    purge_observations: false,
+                                },
+                            );
+                        }
+                        LearnCommands::Resume => {
+                            print_learn_control(
+                                crate::learning::control::LearningControlRequest {
+                                    action: crate::learning::control::LearningControlAction::Resume,
+                                    purge_observations: false,
+                                },
+                            );
+                        }
+                        LearnCommands::Rollback => {
+                            print_learn_control(
+                                crate::learning::control::LearningControlRequest {
+                                    action: crate::learning::control::LearningControlAction::Rollback,
+                                    purge_observations: false,
+                                },
+                            );
+                        }
+                        LearnCommands::Reset { purge_observations, confirm_purge } => {
+                            if purge_observations && !confirm_purge {
+                                anyhow::bail!("--purge-observations requires --confirm-purge");
+                            }
+                            print_learn_control(
+                                crate::learning::control::LearningControlRequest {
+                                    action: crate::learning::control::LearningControlAction::Reset,
+                                    purge_observations,
+                                },
+                            );
+                        }
+                        LearnCommands::Train { version } => {
+                            run_learn_train(&version).await?;
+                        }
+                    },
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
                     }

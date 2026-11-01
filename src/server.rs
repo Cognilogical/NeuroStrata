@@ -13,11 +13,9 @@ use crate::guard::{BehavioralRule, GuardValidator, ValidateResponse};
 
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
-    #[allow(dead_code)]
     jsonrpc: String,
     pub id: Option<Value>,
     pub method: String,
-    #[allow(dead_code)]
     pub params: Option<Value>,
 }
 
@@ -41,15 +39,6 @@ impl<T> JsonRpcResponse<T> {
             error: None,
         }
     }
-
-    pub fn failure(id: Option<Value>, code: i64, message: String) -> Self {
-        Self {
-            jsonrpc: "2.0".to_string(),
-            id,
-            result: None,
-            error: Some(serde_json::json!({ "code": code, "message": message })),
-        }
-    }
 }
 
 /// The request was not JSON.
@@ -58,8 +47,11 @@ const PARSE_ERROR: i64 = -32700;
 /// far end.
 const INTERNAL_ERROR: i64 = -32603;
 
-#[allow(dead_code)]
 impl JsonRpcResponse<Value> {
+    pub fn failure(id: Option<Value>, code: i64, message: String) -> Self {
+        Self::error(id, serde_json::json!({ "code": code, "message": message }))
+    }
+
     pub fn error(id: Option<Value>, error: Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -79,6 +71,9 @@ pub async fn process_mcp_request(
     bus: Arc<crate::events::ThalamicBus>,
 ) -> Value {
     let id = request.id.clone();
+    // Echo the negotiated JSON-RPC version so a malformed envelope is visible
+    // at the seam rather than silently accepted.
+    tracing::debug!(jsonrpc = %request.jsonrpc, method = %request.method, "mcp request");
     match request.method.as_str() {
         "initialize" => {
             let result = serde_json::json!({
@@ -1262,7 +1257,7 @@ async fn handle_context_plan(
     store: Arc<dyn VectorStore>,
 ) -> String {
     use crate::context::{ContextService, ContextItem, Budget, render_plan_text, CONTEXT_PLAN_SCHEMA_VERSION};
-    use crate::context::model::{ContextRequest, SourceIdentity, EgressPolicy};
+    use crate::context::model::{ContextRequest, EgressPolicy};
     let namespace = arguments.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
     let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
@@ -1279,14 +1274,44 @@ async fn handle_context_plan(
         Err(_) => Vec::new(),
     };
     let mut items: Vec<ContextItem> = Vec::new();
+    let exclude_stale = arguments
+        .get("exclude_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let project_root = crate::daemon::resolve_project_root().to_string_lossy().to_string();
     for res in results {
+        let metadata = &res.payload.metadata;
+        let sha = |key: &str| metadata.get(key).and_then(|v| v.as_str()).map(String::from);
+        let freshness = crate::context::freshness::compute_freshness(&crate::context::freshness::FreshnessInputs {
+            stored_file_sha256: sha("file_sha256"),
+            // Same-turn plan has no re-read of the governed file yet, so the
+            // stored hash is the best known state.
+            current_file_sha256: metadata.get("file_sha256").and_then(|v| v.as_str()).map(String::from),
+            stored_span_sha256: sha("span_sha256"),
+            current_span_sha256: metadata.get("span_sha256").and_then(|v| v.as_str()).map(String::from),
+            verification_status: metadata
+                .get("verification")
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            index_coverage: Some(crate::context::model::Coverage::Complete),
+            decision_status: metadata
+                .get("decision")
+                .and_then(|v| v.get("status"))
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            has_governed_path: !res.payload.location.is_empty(),
+        });
+        if exclude_stale && crate::context::freshness::is_stale(&freshness) {
+            continue;
+        }
         let memory_type = res.payload.memory_type.clone();
         let content = res.payload.content.clone();
         items.push(ContextItem {
             id: res.id,
             memory_type,
             content,
-            freshness: None,
+            freshness: Some(freshness),
         });
     }
     if let Some(fp) = file_path {
@@ -1300,14 +1325,36 @@ async fn handle_context_plan(
     let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
     let budget = Budget::from(token_budget);
     let service = ContextService::new_with(Some(1u8), Some(2u8));
+    let deny_egress = arguments
+        .get("deny_egress")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let req = ContextRequest {
         session_id: namespace.into(),
         context_epoch: 1,
         event_id: "context-plan".into(),
         trigger: "handle_context_plan".into(),
-        source: SourceIdentity::default(),
-        policy: EgressPolicy::default(),
+        source: file_path
+            .map(|fp| crate::context::source::resolve_source(fp, &project_root))
+            .unwrap_or_default(),
+        policy: if deny_egress {
+            EgressPolicy::deny("denied by caller")
+        } else {
+            EgressPolicy::allow()
+        },
     };
+    if let Err(reason) = req.policy.enforce() {
+        return serde_json::json!({"ok": false, "error": reason}).to_string();
+    }
+    if let Some(target_ns) = arguments.get("target_namespace").and_then(|v| v.as_str()) {
+        if !crate::context::source::cross_scope_authorized(namespace, target_ns, &[]) {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("cross-scope access to '{}' is not authorized for namespace '{}'", target_ns, namespace)
+            })
+            .to_string();
+        }
+    }
     let plan = service.plan_with_items(&req, items, budget, max_items);
     let mut plan = plan;
     plan.schema_version = CONTEXT_PLAN_SCHEMA_VERSION.to_string();
@@ -1591,10 +1638,6 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
-    crate::handlers::memory::handle_list_namespaces(store).await
 }
 
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
@@ -2140,6 +2183,58 @@ pub(crate) async fn embed_dedup_and_upsert(
         .upsert(namespace, &new_id, vector, payload.clone())
         .await
         .map_err(|_| "Failed to store memory in database.".to_string())?;
+
+    // Learning-loop capture is opt-in via NEUROSTRATA_LEARNING_DIR so unit
+    // tests and bare writes pay no extra disk I/O.
+    if std::env::var_os("NEUROSTRATA_LEARNING_DIR").is_some() {
+        if let Ok(blob_store) = crate::learning::blob_store::BlobStore::new() {
+            if let Ok(recorder) = crate::learning::recorder::LearningRecorder::open(
+                crate::learning::control::default_learning_dir(),
+                None,
+            )
+            .await
+            {
+                if let Ok(hash) = blob_store.put(payload) {
+                    let _ = recorder.record_blob_hash(&hash, payload).await;
+                }
+                let input_payload_hash = blob_store.put(payload).unwrap_or_else(|_| {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::default();
+                    hasher.update(payload.content.as_bytes());
+                    crate::learning::observation::PayloadHash(format!(
+                        "sha256:{}",
+                        hex::encode(hasher.finalize())
+                    ))
+                });
+                let selected_provider = dedup
+                    .map(|c| format!("{:?}", c.config.provider))
+                    .unwrap_or_else(|| "none".to_string());
+                let obs = crate::learning::observation::DecisionObservation {
+                    schema_version: 1,
+                    observation_id: format!("obs-{}", uuid::Uuid::new_v4()),
+                    occurred_at: chrono::Utc::now().timestamp(),
+                    namespace: namespace.to_string(),
+                    context: crate::learning::observation::LearningContext {
+                        connection_id: namespace.to_string(),
+                        active_task_id: None,
+                    },
+                    result_memory_id: Some(new_id.clone()),
+                    input_payload_hash,
+                    candidates: Vec::new(),
+                    embedder_id: emb.embedder_id().to_string(),
+                    embedder_dimensions: emb.dimensions(),
+                    selected_provider,
+                    policy_version: "baseline".to_string(),
+                    model_version: None,
+                    shadow_provider: None,
+                    shadow_model_version: None,
+                    decision,
+                };
+                let _ = recorder.record_observation(&obs).await;
+            }
+        }
+    }
+
     Ok(MemoryWriteReport {
         upsert: Some(report),
         decision,
@@ -2371,7 +2466,18 @@ async fn handle_add_memory(
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     {
-        let cands = crate::gliner::extract_candidates(content);
+        // Bundle-verified GLiNER when provisioned; deterministic candidates as
+        // the fallback so review-only extraction never blocks a write.
+        let bundle_dir = std::env::var("NEUROSTRATA_GLINER_BUNDLE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("artifacts/gliner-bundle"));
+        if let Ok(expected_sha) = std::env::var("NEUROSTRATA_GLINER_SHA256") {
+            let _ = crate::gliner::verify_bundle_sha256(&bundle_dir, &expected_sha);
+        }
+        let cands = match crate::gliner::GlinerEngine::load(&bundle_dir) {
+            Ok(engine) => engine.extract(content, &["ENTITY"]),
+            Err(_) => crate::gliner::extract_candidates(content),
+        };
         if !cands.is_empty() {
             if let Some(o) = metadata.as_object_mut() {
                 o.insert(
@@ -3873,6 +3979,22 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
         );
         all_quads.extend(quads);
         all_warnings.extend(warnings);
+        // Reified edges: every metadata edge the memory governs gets the same
+        // RDF-star treatment and shares the imported-node provenance bundle.
+        let prov = crate::rdf::provenance::extract_node_provenance(&r.payload.metadata, 0);
+        for edge in crate::store::ladybug::edge_specs(&r.payload.metadata) {
+            let (edge_quads, edge_warnings) = crate::rdf::provenance::project_edge_rdf_star(
+                &namespace,
+                &r.id,
+                edge.rel_type,
+                &edge.target_id,
+                &prov,
+                None,
+                oxrdf::GraphName::DefaultGraph,
+            );
+            all_quads.extend(edge_quads);
+            all_warnings.extend(edge_warnings);
+        }
     }
     let flatten = format == "n-triples-star" || format == "turtle-star";
     match crate::rdf::provenance::serialize_rdf_star(&all_quads, format, flatten) {
@@ -3902,6 +4024,13 @@ pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn Vect
             let warnings = crate::rdf::provenance::validate_node_provenance(memory_id, &prov);
             let edges = crate::store::ladybug::edge_specs(&payload.metadata);
             let edge_count = edges.len();
+            let assertion_iri = crate::rdf::provenance::memory_assertion_iri(
+                &namespace,
+                memory_id,
+                "content",
+                0,
+                1,
+            );
             serde_json::json!({
                 "ok": true,
                 "namespace": namespace,
@@ -3909,6 +4038,8 @@ pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn Vect
                 "provenance": prov,
                 "edge_count": edge_count,
                 "warnings": warnings,
+                "assertion_iri": assertion_iri,
+                "assertion_iri_valid": crate::rdf::provenance::validate_assertion_iri(&assertion_iri),
             })
             .to_string()
         }
@@ -11628,7 +11759,9 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     out
 }
 
-
+#[cfg(test)]
+mod context_plan_tests {
+    use super::*;
 
     struct LocalStubEmbedder;
     #[async_trait::async_trait]
@@ -11644,7 +11777,7 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
 
     #[tokio::test]
     async fn test_handle_context_plan_returns_budgeted_plan() {
-        use crate::context::{ContextPlan, Degradation, CONTEXT_PLAN_SCHEMA_VERSION};
+        use crate::context::model::{ContextPlan, Degradation, CONTEXT_PLAN_SCHEMA_VERSION};
         let args_json = serde_json::json!({"namespace":"test","max_items":2,"format":"json","query":"test"});
         let embedder = Arc::new(LocalStubEmbedder);
         let store: Arc<dyn crate::traits::VectorStore> = Arc::new(crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-test"), 4).expect("open"));
@@ -11678,4 +11811,5 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
         let text_result = handle_context_plan(&args_text, embedder.clone(), store.clone()).await;
         assert!(text_result.contains("context-plan") || text_result.contains("(no items)"));
     }
+}
 
