@@ -1046,7 +1046,10 @@ pub async fn handle_task_complete(
         ));
     }
 
-    let reason = arg_str(&args, "reason").unwrap_or("").to_string();
+    let reason = arg_str(&args, "reason")
+        .or_else(|| arg_str(&args, "close_reason"))
+        .unwrap_or("")
+        .to_string();
     let link_memory_id = arg_str(&args, "link_memory_id").map(|s| s.to_string());
     let memory = args.get("memory").cloned();
 
@@ -1432,7 +1435,14 @@ pub async fn handle_task_complete(
         actor,
         session: String::new(),
     };
-    let completed = apply(&task, Status::Done, &ctx).map_err(|e| format!("ERROR: {}", e))?;
+    let mut completed = apply(&task, Status::Done, &ctx).map_err(|e| format!("ERROR: {}", e))?;
+    if !reason.trim().is_empty() {
+        if let Some(meta) = completed.payload.metadata.as_object_mut() {
+            if let Some(t) = meta.get_mut("task").and_then(|v| v.as_object_mut()) {
+                t.insert("close_reason".to_string(), json!(reason.trim()));
+            }
+        }
+    }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
 
     // M3: spawn follow-up tasks now that the parent is done. Each inherits

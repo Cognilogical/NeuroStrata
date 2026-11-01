@@ -2176,7 +2176,7 @@ impl LadybugStore {
                     let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
                     let _ = conn.query(&q_meta);
                     if let Some(backfill_text) = content_backfill {
-                        let safe_back = backfill_text.replace("'", "\\'");
+                        let safe_back = crate::store::ladybug::escape_ladybug_string(&backfill_text);
                         let q_content = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), safe_back);
                         let _ = conn.query(&q_content);
                     }
