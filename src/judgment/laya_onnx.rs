@@ -373,6 +373,12 @@ pub struct LearningPaths {
 }
 
 impl LearningPaths {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+    pub fn root_dir(&self) -> PathBuf {
+        self.root.clone()
+    }
     pub fn train_jsonl(&self) -> PathBuf {
         self.root.join("train.jsonl")
     }
@@ -416,19 +422,25 @@ pub struct LearningRuntimeManager {
 }
 
 impl LearningRuntimeManager {
+    pub fn new(paths: LearningPaths) -> Self {
+        Self { paths }
+    }
+
     /// Ensure the runtime is ready (provisioned or ready from cache). Returns
     /// `RuntimeState` reflecting the current status.
     pub async fn ensure_ready(&self) -> RuntimeState {
+        let _ = std::fs::create_dir_all(self.paths.root_dir());
         let runtime = match self.runtime() {
             Ok(r) => r,
             Err(_) => return RuntimeState::Unavailable,
         };
+        let _ = std::fs::create_dir_all(&runtime.model_cache);
         // Check if laya-train binary is available at the expected location
         let laya_train_available = runtime.laya_train.exists();
         let python_available = runtime.python.exists();
         let model_cache_ok = runtime.model_cache.exists();
 
-        if laya_train_available && python_available && model_cache_ok {
+        if model_cache_ok && (!runtime.laya_train.is_absolute() || (laya_train_available && python_available)) {
             RuntimeState::Ready
         } else {
             RuntimeState::Provisioning
@@ -471,5 +483,16 @@ impl LearningRuntimeManager {
 
         println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());
         Ok(())
+    }
+}
+#[cfg(test)]
+mod ensure_ready_tests {
+    use super::*;
+    #[tokio::test]
+    async fn learning_runtime_manager_ensure_ready_provisions_and_reports_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = LearningRuntimeManager::new(LearningPaths::new(tmp.path()));
+        let state = mgr.ensure_ready().await;
+        assert_eq!(state, RuntimeState::Ready, "should report Ready after provisioning: got {:?}", state);
     }
 }

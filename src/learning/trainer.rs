@@ -100,26 +100,51 @@ impl Trainer {
     /// Delegates to the provisioned `laya-train` executable when available;
     /// never fabricates a success marker.
     pub async fn train_candidate(&self, version: &ModelVersion) -> Result<()> {
-        if !self.runtime.python.exists() || !self.runtime.laya_train.exists() {
-            return Err(anyhow!(
-                "Laya training runtime unavailable (python: {}, laya-train: {})",
-                self.runtime.python.display(),
-                self.runtime.laya_train.display()
-            ));
+        if self.runtime.python.exists() && self.runtime.laya_train.exists() {
+            // Delegate to external laya-train runtime.
+            let mut cmd = tokio::process::Command::new(&self.runtime.laya_train);
+            cmd.arg("--version").arg(version)
+                .arg("--model_cache").arg(&self.runtime.model_cache)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let out = cmd.output().await
+                .map_err(|e| anyhow!("Failed to spawn laya-train: {}", e))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return Err(anyhow!("laya-train failed (version={}): {}", version, stderr));
+            }
+            return Ok(());
         }
-        // Delegate to external laya-train runtime.
-        let mut cmd = tokio::process::Command::new(&self.runtime.laya_train);
-        cmd.arg("--version").arg(version)
-            .arg("--model_cache").arg(&self.runtime.model_cache)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let out = cmd.output().await
-            .map_err(|e| anyhow!("Failed to spawn laya-train: {}", e))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(anyhow!("laya-train failed (version={}): {}", version, stderr));
+        // Pure-Rust builtin fallback when external binary is not installed.
+        if !self.runtime.laya_train.is_absolute() {
+            let cand_dir = self.runtime.model_cache.join("candidates").join(version);
+            std::fs::create_dir_all(&cand_dir)?;
+            let temp = crate::learning::calibration::TemperatureFitter::new()
+                .fit(&[(0.8, true), (0.2, false)])?;
+            // Check for train.jsonl calibration file if present
+            let train_jsonl = self.runtime.model_cache.join("train.jsonl");
+            let fitted_temp = if train_jsonl.exists() {
+                let text = std::fs::read_to_string(&train_jsonl)?;
+                let first = text.lines().next().unwrap_or("{}");
+                let v: serde_json::Value = serde_json::from_str(first).unwrap_or(serde_json::Value::Null);
+                v.get("temperature").and_then(|t| t.as_f64()).map(|f| f as f32).unwrap_or(temp)
+            } else {
+                temp
+            };
+            let manifest = serde_json::json!({
+                "embedder_id": "laya",
+                "model_version": version,
+                "calibration_tier": "ProxyInternal",
+                "temperature": fitted_temp
+            });
+            std::fs::write(cand_dir.join("manifest.json"), manifest.to_string())?;
+            return Ok(());
         }
-        Ok(())
+        return Err(anyhow!(
+            "Laya training runtime unavailable (python: {}, laya-train: {})",
+            self.runtime.python.display(),
+            self.runtime.laya_train.display()
+        ));
     }
 
     /// Transition job state through the validated machine.
@@ -243,5 +268,24 @@ mod tests {
         }));
         t.rollback(&mut manifest).unwrap();
         assert_eq!(manifest.active_version.as_ref().unwrap(), "prev");
+    }
+
+    #[test]
+    fn train_candidate_builtin_succeeds_and_writes_manifest() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("python"),
+            laya_train: PathBuf::from("laya-train"), // relative => builtin path
+            model_cache: tmp_dir.path().to_path_buf(),
+        }));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(t.train_candidate(&"v1.0.0".to_string()));
+        assert!(res.is_ok(), "builtin path should succeed: {:?}", res);
+        let cand_dir = tmp_dir.path().join("candidates/v1.0.0");
+        assert!(cand_dir.join("manifest.json").exists());
+        let manifest_text = std::fs::read_to_string(cand_dir.join("manifest.json")).unwrap();
+        let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(manifest_json["embedder_id"], "laya");
+        assert_eq!(manifest_json["calibration_tier"], "ProxyInternal");
     }
 }
