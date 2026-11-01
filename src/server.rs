@@ -2422,11 +2422,10 @@ async fn handle_add_memory(
             }
         }
         let include_rdf_projection = arguments.get("include_rdf_projection").and_then(|v| v.as_bool()).unwrap_or(false);
-        let rdf_projection_info = if include_rdf_projection {
-            Some((crate::rdf::canonical::dual_write("pending", &payload).1, crate::rdf::shacl::infer_shape(&payload)))
-        } else {
-            None
-        };
+        // Projection over "pending" is wrong: the digest must be computed from
+        // the id the row actually persists under, which embed_dedup_and_upsert
+        // only knows after the call. Clone now, project in the Ok arm.
+        let payload_for_projection = include_rdf_projection.then(|| payload.clone());
 
         match embed_dedup_and_upsert(
             &store,
@@ -2442,6 +2441,31 @@ async fn handle_add_memory(
                 let upsert = report.upsert.clone();
                 let linked_id = report.linked_existing_id.clone();
                 let decision = report.decision;
+                // RDF projection must name the REAL persisted id, not
+                // "pending": the digest bytes are identity- and content-
+                // dependent, so it is computed from what the store actually
+                // holds after the upsert.
+                let rdf_projection_info = match payload_for_projection.as_ref() {
+                    Some(_) => match &upsert {
+                        Some(u) => match store.get(namespace, &u.id).await {
+                            Ok(Some((_, stored_payload))) => Some((
+                                crate::rdf::canonical::dual_write(&u.id, &stored_payload).1,
+                                crate::rdf::shacl::infer_shape(&stored_payload),
+                            )),
+                            // The store cannot yet answer for the row: fall
+                            // back to the payload as prepared, still under the
+                            // real id.
+                            _ => Some((
+                                crate::rdf::canonical::dual_write(&u.id, payload_for_projection.as_ref().unwrap()).1,
+                                crate::rdf::shacl::infer_shape(payload_for_projection.as_ref().unwrap()),
+                            )),
+                        },
+                        // Nothing fresh was upserted (dedup reuse) — a digest
+                        // for a row this call did not write would be a lie.
+                        None => None,
+                    },
+                    None => None,
+                };
 
                 // Exact reuse / blocked exact duplicate: no new row, no Created pulse.
                 if upsert.is_none() {
@@ -2508,7 +2532,7 @@ async fn handle_add_memory(
                     }
                 }
                 for w in &multimodal_warnings {
-                    msg.push_str(&format!("\\nMultimodal warning: {}", w));
+                    msg.push_str(&format!("\nMultimodal warning: {}", w));
                 }
                 // TASK NUDGE: advisory when a non-task/procedure memory's content
                 if let Some((rdf_digest, shape_fields)) = rdf_projection_info {
@@ -6158,12 +6182,13 @@ async fn handle_guard_validate(
                             })
                             .map(|m| m.id.as_str())
                     });
-                let (allowed, transition) = validator.guard_validate(
+                let (allowed, transition) = validator.guard_validate_with_mutations(
                     session_id,
                     active_task_id,
                     cwd,
                     action_type,
                     mutating,
+                    arguments.get("mutations_since_note").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                 );
                 if !allowed {
                     let reason = transition.unwrap_or_else(|| {
@@ -7804,6 +7829,41 @@ mod tests {
         .await;
         assert!(projected.contains("RDF Digest:"), "{}", projected);
         assert!(projected.contains("Inferred Shape Fields:"), "{}", projected);
+
+        // The digest must be computed from the REAL persisted id, not the
+        // "pending" placeholder: pull the memory id out of the reply, find the
+        // stored row (its canonical key may be qualified), and confirm the
+        // digest recomputed over the REAL stored identity matches.
+        let bare_id = projected
+            .lines()
+            .find(|l| l.starts_with("Memory ID: "))
+            .map(|l| l["Memory ID: ".len()..].trim().to_string())
+            .expect("reply must carry the persisted memory id");
+        let memories = store
+            .list("probe", None, None)
+            .await
+            .expect("probe rows");
+        let row = memories
+            .iter()
+            .find(|m| m.id == bare_id || m.id.ends_with(&bare_id))
+            .expect("projected row must be stored");
+        let expected_digest = crate::rdf::canonical::dual_write(&row.id, &row.payload).1;
+        assert!(
+            projected.contains(&format!("RDF Digest: {}", expected_digest)),
+            "digest must match dual_write over the real stored id {} (bare {}); reply: {}; expected: {}",
+            row.id,
+            bare_id,
+            projected,
+            expected_digest
+        );
+        assert!(
+            !projected.contains(&format!(
+                "RDF Digest: {}",
+                crate::rdf::canonical::dual_write("pending", &row.payload).1
+            )),
+            "digest must NOT be the 'pending' digest; reply: {}",
+            projected
+        );
     }
 
     /// The write path normalizes a string domain to its slug, so a stored

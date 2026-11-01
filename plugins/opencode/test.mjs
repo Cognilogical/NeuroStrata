@@ -9,6 +9,7 @@ import plugin, {
   adapterStatus,
   onTurnEnd,
   fetchContextPlan,
+  resetClientForTesting,
 } from "./dist/index.js";
 
 test("Plugin.define exports V2 setup and registers execute.before hook", async () => {
@@ -281,7 +282,10 @@ test("fetchContextPlan calls neurostrata_context_plan and returns text", async (
 });
 
 test("fetchContextPlan throws when MCP client not initialized", async () => {
-  // Force uninitialized by creating fresh module state? mcpClient persists; instead test error path via unreachable? 
-  // The function requires initialized client; if not initialized throws. We at least assert it is a function.
-  assert.equal(typeof fetchContextPlan, "function");
+  // Drop the cached client so the module is back to "not initialized".
+  resetClientForTesting();
+  await assert.rejects(
+    () => fetchContextPlan({ namespace: "ctx-ns" }),
+    /NeuroStrata MCP client not initialized/
+  );
 });

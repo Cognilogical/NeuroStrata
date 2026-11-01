@@ -476,6 +476,14 @@ let config: PluginConfig = DEFAULT_CONFIG;
 let mcpClient: NeuroStrataMCPClient;
 
 /**
+ * Test hook: drop the cached MCP client so un-initialized code paths (like
+ * `fetchContextPlan` before `initialize` ran) can be exercised.
+ */
+export function resetClientForTesting(): void {
+  mcpClient = undefined as any;
+}
+
+/**
  * The plugin context, captured on initialize.
  *
  * The handlers below are module-level functions, so they cannot close over

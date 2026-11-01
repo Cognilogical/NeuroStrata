@@ -293,14 +293,16 @@ fn macos_backup_plist(script: &Path) -> String {
   <key>ProgramArguments</key><array>
     <string>{}</string>
   </array>
-  <key>StartCalendarInterval</key><dict>
-    <key>Hour</key><integer>0</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
-  <key>StartCalendarInterval</key><dict>
-    <key>Hour</key><integer>12</integer>
-    <key>Minute</key><integer>0</integer>
-  </dict>
+  <key>StartCalendarInterval</key><array>
+    <dict>
+      <key>Hour</key><integer>0</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>12</integer>
+      <key>Minute</key><integer>0</integer>
+    </dict>
+  </array>
   <key>StandardErrorPath</key><string>/tmp/neurostrata-backup.log</string>
 </dict></plist>
 "#,

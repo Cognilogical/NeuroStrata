@@ -360,6 +360,22 @@ mod tests {
             );
         }
 
+        // The dispatcher_free metric write trails subscriber completion, and
+        // under a loaded test process a fixed wait can race it: poll until the
+        // handled count reaches the emitted count (deadline-bounded), exactly
+        // as await_flag does for the flags themselves.
+        let deadline = Instant::now() + FLAG_WAIT;
+        loop {
+            let m = bus.metrics().dispatcher_handled;
+            if m >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher did not handle all 3 pulses within {FLAG_WAIT:?} (handled {m})"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             bus.metrics().dispatcher_handled,
             3,
@@ -459,6 +475,16 @@ mod tests {
             "two flips in one namespace are one row, updated"
         );
 
+        // Same poll-until discipline as every flag assertion: the handled
+        // counter write can trail the flags themselves under load.
+        let deadline = Instant::now() + FLAG_WAIT;
+        while bus.metrics().dispatcher_handled < 4 {
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher did not handle all 4 pulses within {FLAG_WAIT:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             bus.metrics().dispatcher_handled,
             4,

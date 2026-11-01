@@ -161,18 +161,35 @@ impl GuardValidator {
         _action_type: &str,
         is_mutating: bool,
     ) -> (bool, Option<String>) {
-        // If action is non-mutating, always permit (reads free).
-        if !is_mutating {
-            return (true, None);
-        }
-        // If no active task claim, block with transition message.
-        if active_task_id.is_none() {
-            return (false, Some(format!(
-                "Unpreflighted: claim task (session={}, worktree={}) before mutating; next legal transition: claim -> ContextLoaded -> TaskClaimed",
-                session_id, worktree
-            )));
-        }
-        (true, None)
+        self.guard_validate_with_mutations(
+            session_id,
+            active_task_id,
+            worktree,
+            _action_type,
+            is_mutating,
+            0,
+        )
+    }
+
+    /// Same preflight, but the caller supplies how many mutations have run
+    /// since the last `task_update` note (the Breath counter).
+    pub fn guard_validate_with_mutations(
+        &self,
+        session_id: &str,
+        active_task_id: Option<&str>,
+        worktree: &str,
+        action_type: &str,
+        is_mutating: bool,
+        mutations_since_note: usize,
+    ) -> (bool, Option<String>) {
+        crate::guard::fsm::evaluate_fsm_guard(
+            session_id,
+            active_task_id,
+            worktree,
+            action_type,
+            is_mutating,
+            mutations_since_note,
+        )
     }
 
     /// Check if a rule's trigger pattern matches the action
