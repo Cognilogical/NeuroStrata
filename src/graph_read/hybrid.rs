@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 /// Normalized vector distance in [0.0, 1.0] (lower = better).
 /// Reuses existing capped usage + provenance + feedback gain.
 pub fn normalize_vec(distance: f32, feedback_gain: f32) -> f32 {

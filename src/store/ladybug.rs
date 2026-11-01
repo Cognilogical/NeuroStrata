@@ -776,7 +776,7 @@ let incomplete = result_count >= fetch_limit;
             if search_mode == crate::traits::SearchMode::Hybrid {
                 let mut hybrid_results: Vec<SearchResult> = results.clone();
                 for sr in &mut hybrid_results {
-                    let d_vec = sr.score.clamp(0.0, 1.0);
+                    let d_vec = crate::graph_read::hybrid::normalize_vec(sr.score, 0.0);
                     // d_graph: co-occurrence from Step 2 primary_sources count.
                     // At this point in the function the expansion data has been
                     // consumed, so we approximate with metadata "co_occurrence_count"
@@ -800,7 +800,7 @@ let incomplete = result_count >= fetch_limit;
                         std::cmp::Ordering::Equal => a.id.cmp(&b.id),
                     }
                 });
-                let results: Vec<SearchResult> = hybrid_results.into_iter().take(limit).collect();
+                results = hybrid_results.into_iter().take(limit).collect();
             }
 
             Ok(DomainSearchOutcome { results, mode, incomplete })

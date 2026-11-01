@@ -456,6 +456,8 @@ mod tests {
             allowed_external_dirs: Vec::new(),
             lexical_blend_inhouse: false,
             lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
+            hybrid_enabled: false,
+            hybrid_weights: default_hybrid_weights(),
             extra: HashMap::new(),
         };
 

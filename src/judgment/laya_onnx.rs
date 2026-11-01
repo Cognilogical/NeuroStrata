@@ -128,25 +128,11 @@ impl JudgmentProvider for LayaOnnxProvider {
         // is acquired first so concurrent requests are bounded.
         let _permit = self.inference_semaphore.acquire().await.unwrap();
 
-        let state = self.state();
-        // If inference session loaded and candidates present, run ONNX inference.
-        // The call runs through spawn_blocking (semaphore already acquired).
-        // Currently returns empty (fail-closed) — inference wiring is complete,
-        // real pairwise tokenization/scoring requires tokenizer (deferred to future work).
-        if state == crate::judgment::RuntimeState::Ready && !candidates.is_empty() {
-            if self.inference_session().is_some() {
-                // Real ONNX inference path wired (session available). Currently
-                // returns empty list: no duplicates without tokenized scores.
-                // When tokenizer is available: tokenize new_memory.content +
-                // candidate.payload.content pairs, run inference, apply
-                // calibration threshold from manifest, return judgments above it.
-                // Per Prime Directive: never fabricate scores; fail-closed.
-            }
-        }
-
-        // No inference available (gliner feature disabled or session not loaded)
-        // Return empty list as per fail-closed design - no duplicates without inference
-        Ok(Vec::new())
+        // Fail-closed: Laya stub remains retired (not a hidden stub). Per spec
+        // §5.6 / 6, inference requires tokenized pair scoring; without it the
+        // correct answer is an explicit error (not fabricated scores), never
+        // Ok(empty) that implies a judgment was made.
+        anyhow::bail!("Laya ONNX inference not implemented (stub retired per spec §5.6): tokenized pair scoring required; do not fabricate scores")
     }
 
     /// Health check - verify the provider is operational.
