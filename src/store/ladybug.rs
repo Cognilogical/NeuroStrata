@@ -2091,6 +2091,20 @@ impl LadybugStore {
                         changed = true;
                     }
                 }
+                // (a2) procedure trigger repair
+                if mtype == "procedure" {
+                    let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+                    let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
+                    if !is_valid {
+                        meta.as_object_mut().unwrap().insert("trigger".to_string(), serde_json::Value::String("session-start".to_string()));
+                        changed = true;
+                    }
+                    let remaining_missing = meta.get("remaining_fires").is_none() || meta.get("remaining_fires").and_then(|v| v.as_u64()).map_or(true, |n| n == 0);
+                    if remaining_missing {
+                        meta.as_object_mut().unwrap().insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
+                        changed = true;
+                    }
+                }
                 // (b) dangling refs in edge arrays
                 let keys = ["governs","relates_to","contained_by","extracted_from","depends_on"];
                 let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
@@ -2100,6 +2114,11 @@ impl LadybugStore {
                         let mut kept = Vec::new();
                         for item in &arr {
                             if let Some(t) = item.as_str() {
+                                // Remove residual unresolved string targets (samples/total) and check existence
+                                if t == "samples" || t == "total" || t.contains("samples") || t.contains("total") {
+                                    unresolvable.push(t.to_string());
+                                    continue;
+                                }
                                 let tid = if t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) { t.split(crate::parser::ingest::NAMESPACE_SEPARATOR).last().unwrap_or(t).to_string() } else { t.to_string() };
                                 let exists = known_ids.contains(&tid) || (tid.len() >= 7 && known_ids.iter().any(|k| k.starts_with(&tid)));
                                 if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
