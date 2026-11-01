@@ -87,6 +87,8 @@ pub struct TimeSeriesStore {
     pub series: RwLock<BTreeMap<SeriesKey, Series>>,
     pub config: SeriesConfig,
     pub anomaly_cb: Option<Arc<dyn Fn(&SeriesKey, &Sample) + Send + Sync>>,
+    pub detector: crate::telemetry::AnomalyDetector,
+    pub anomalies: RwLock<Vec<crate::telemetry::AnomalyEvent>>,
 }
 
 impl TimeSeriesStore {
@@ -95,6 +97,8 @@ impl TimeSeriesStore {
             series: RwLock::new(BTreeMap::new()),
             config,
             anomaly_cb: None,
+            detector: crate::telemetry::AnomalyDetector::default(),
+            anomalies: RwLock::new(Vec::new()),
         }
     }
 
@@ -163,6 +167,15 @@ impl TimeSeriesStore {
         series.samples.push_back(sample.clone());
         drop(guard);
 
+        if let Some(ev) = self.detector.observe(&key.0, key.1, &key.2, sample.value) {
+            if let Ok(mut a) = self.anomalies.write() {
+                if a.len() >= 128 {
+                    a.remove(0);
+                }
+                a.push(ev);
+            }
+        }
+
         if let Some(ref cb) = self.anomaly_cb {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 cb(&key, &sample);
@@ -171,6 +184,15 @@ impl TimeSeriesStore {
                 // Callbacks must never block push; swallow panic silently.
             }
         }
+    }
+
+    pub fn recent_anomalies(&self, namespace: &str) -> Vec<crate::telemetry::AnomalyEvent> {
+        let guard = self.anomalies.read().unwrap();
+        guard
+            .iter()
+            .filter(|ev| namespace.is_empty() || ev.namespace == namespace)
+            .cloned()
+            .collect()
     }
 
     pub fn record(&self, namespace: &str, metric: MetricKind, stage: &str, ts: i64, value: f64, labels: BTreeMap<String, String>) {
@@ -529,6 +551,38 @@ mod tests {
             },
         );
         assert_eq!(called.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn push_records_anomaly_event_in_recent_anomalies() {
+        let store = TimeSeriesStore::default();
+        let key = ("test".to_string(), MetricKind::MemoryCount, "s".to_string());
+        // Baseline samples
+        for _ in 0..11 {
+            store.push(
+                key.clone(),
+                Sample {
+                    id: String::new(),
+                    seq: 0,
+                    ts: 1,
+                    value: 10.0,
+                    labels: BTreeMap::new(),
+                },
+            );
+        }
+        // Spike
+        store.push(
+            key.clone(),
+            Sample {
+                id: String::new(),
+                seq: 0,
+                ts: 2,
+                value: 100.0,
+                labels: BTreeMap::new(),
+            },
+        );
+        let anomalies = store.recent_anomalies("test");
+        assert!(!anomalies.is_empty(), "expected at least one anomaly event");
     }
 
     #[test]

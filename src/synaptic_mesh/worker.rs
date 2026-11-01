@@ -355,6 +355,15 @@ fn build_record(
         rehearsal_script.as_deref(),
     );
 
+    let patch_op = if matches!(state, LifecycleState::Archived | LifecycleState::Tombstoned) {
+        crate::streaming::PatchOp::Delete
+    } else {
+        crate::streaming::PatchOp::Add
+    };
+    let patch = crate::streaming::Stream::from_nquads(&nquads_text, patch_op)
+        .ok()
+        .filter(|s| !s.is_empty());
+
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
         id,
@@ -385,7 +394,7 @@ fn build_record(
         signature: None,
         signer_did: None,
         public_key: None,
-        patch: None,
+        patch,
     }
 }
 
@@ -1358,5 +1367,8 @@ mod tests {
         let roundtrip = crate::synaptic_mesh::import::read_compressed_bundle(&bundle_path).unwrap();
         assert_eq!(roundtrip.len(), 1);
         assert_eq!(roundtrip[0], record);
+
+        let loaded = &roundtrip[0];
+        assert!(loaded.patch.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
     }
 }

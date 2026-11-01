@@ -442,6 +442,31 @@ impl Stream {
                         }
                         i += 1;
                     }
+                    // Consume optional datatype (^^<...>) or language tag (@lang) suffix.
+                    if i < chars.len() && chars[i] == '^' && i + 1 < chars.len() && chars[i + 1] == '^' {
+                        term_chars.push(chars[i]);
+                        term_chars.push(chars[i + 1]);
+                        i += 2;
+                        if i < chars.len() && chars[i] == '<' {
+                            term_chars.push(chars[i]);
+                            i += 1;
+                            while i < chars.len() && chars[i] != '>' {
+                                term_chars.push(chars[i]);
+                                i += 1;
+                            }
+                            if i < chars.len() && chars[i] == '>' {
+                                term_chars.push(chars[i]);
+                                i += 1;
+                            }
+                        }
+                    } else if i < chars.len() && chars[i] == '@' {
+                        term_chars.push(chars[i]);
+                        i += 1;
+                        while i < chars.len() && !chars[i].is_whitespace() {
+                            term_chars.push(chars[i]);
+                            i += 1;
+                        }
+                    }
                 } else if chars[i] == '<' {
                     // IRI
                     term_chars.push(chars[i]);
@@ -547,6 +572,31 @@ impl Stream {
                             }
                         }
                         i += 1;
+                    }
+                    // Consume optional datatype (^^<...>) or language tag (@lang) suffix.
+                    if i < chars.len() && chars[i] == '^' && i + 1 < chars.len() && chars[i + 1] == '^' {
+                        term_chars.push(chars[i]);
+                        term_chars.push(chars[i + 1]);
+                        i += 2;
+                        if i < chars.len() && chars[i] == '<' {
+                            term_chars.push(chars[i]);
+                            i += 1;
+                            while i < chars.len() && chars[i] != '>' {
+                                term_chars.push(chars[i]);
+                                i += 1;
+                            }
+                            if i < chars.len() && chars[i] == '>' {
+                                term_chars.push(chars[i]);
+                                i += 1;
+                            }
+                        }
+                    } else if i < chars.len() && chars[i] == '@' {
+                        term_chars.push(chars[i]);
+                        i += 1;
+                        while i < chars.len() && !chars[i].is_whitespace() {
+                            term_chars.push(chars[i]);
+                            i += 1;
+                        }
                     }
                 } else if chars[i] == '<' {
                     term_chars.push(chars[i]);

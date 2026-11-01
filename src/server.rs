@@ -3903,6 +3903,7 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
             "name": name,
             "samples": samples,
             "aggregate": agg,
+            "anomalies": ls.metrics().recent_anomalies(&namespace),
         })
         .to_string();
     }
