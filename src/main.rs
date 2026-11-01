@@ -96,6 +96,14 @@ enum Commands {
 
         /// Optional path to the parser schema JSON file
         schema_path: Option<String>,
+
+        /// Preview ingestion without writing to the store or downloading models
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Dry-run mode: "estimate" or "presort"
+        #[arg(long, default_value = "estimate")]
+        dry_run_mode: String,
     },
 
     /// Export the memory graph to a JSON file
@@ -3495,6 +3503,23 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
+                if let Commands::Ingest { dry_run: true, dir, namespace: _, schema_path, dry_run_mode } = &other {
+                    let dir_str = cli_ingest_root(dir);
+                    let dir_path_owned = std::path::PathBuf::from(&dir_str);
+                    let schema_str = if let Some(path) = schema_path {
+                        std::fs::read_to_string(path).unwrap_or_else(|e| {
+                            eprintln!("Failed to read schema from {}: {}", path, e);
+                            std::process::exit(1);
+                        })
+                    } else {
+                        include_str!("schema.json").to_string()
+                    };
+                    if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
+                        let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
+                        println!("{}", report);
+                    }
+                    return Ok(());
+                }
                 let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
@@ -3632,7 +3657,26 @@ async fn run() -> anyhow::Result<()> {
                         dir,
                         namespace,
                         schema_path,
+                        dry_run,
+                        dry_run_mode,
                     } => {
+                        if dry_run {
+                            let dir_owned = cli_ingest_root(&dir);
+                            let dir_path = std::path::Path::new(&dir_owned);
+                            let schema_str = if let Some(path) = schema_path {
+                                std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                                    eprintln!("Failed to read schema from {}: {}", path, e);
+                                    std::process::exit(1);
+                                })
+                            } else {
+                                include_str!("schema.json").to_string()
+                            };
+                            if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
+                                let report = crate::parser::ingest::dry_run_directory(dir_path, &schema, &dry_run_mode).await?;
+                                println!("{}", report);
+                            }
+                            return Ok(());
+                        }
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {

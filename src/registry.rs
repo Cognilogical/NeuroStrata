@@ -673,6 +673,186 @@ mod tests {
         assert!(!is_registry_row(&serde_json::json!({ "domain": "auth" })));
         assert!(!is_registry_row(&serde_json::json!({})));
     }
+
+    // --- F15 (neurostrata-hs23) Domain DAG and aliases ---
+    #[test]
+    fn test_f15_domain_dag_parent_aliases_and_cycle_rejection() {
+        // Valid parent/child DAG with normalized aliases
+        let valid = serde_json::json!([
+            {"slug":"parent","parent":null,"aliases":["par","parent-alias"],"concept_iri":null},
+            {"slug":"child","parent":"parent","aliases":["kid"],"concept_iri":null}
+        ]);
+        assert!(validate_domain_entries(&valid.as_array().unwrap()).is_ok());
+
+        // Alias dedup: duplicate alias within same entry -> collision
+        let dup_alias = serde_json::json!([
+            {"slug":"a","parent":null,"aliases":["z","z"],"concept_iri":null}
+        ]);
+        let err = validate_domain_entries(&dup_alias.as_array().unwrap()).unwrap_err();
+        assert!(err.contains("collides"), "duplicate alias: {}", err);
+
+        // Parent cycle a -> b -> a
+        let cycle = serde_json::json!([
+            {"slug":"a","parent":"b","aliases":[],"concept_iri":null},
+            {"slug":"b","parent":"a","aliases":[],"concept_iri":null}
+        ]);
+        let err = validate_domain_entries(&cycle.as_array().unwrap()).unwrap_err();
+        assert!(err.contains("cycle"), "expected cycle error, got: {}", err);
+
+        // Case-folded alias collision with slug across entries
+        let case_collision = serde_json::json!([
+            {"slug":"auth","parent":null,"aliases":["AUTH"],"concept_iri":null}
+        ]);
+        let err = validate_domain_entries(&case_collision.as_array().unwrap()).unwrap_err();
+        assert!(err.contains("collides"), "expected alias collision, got: {}", err);
+
+        // registry_metadata_v2 sorts and preserves v2 shape; write_registry preserves unrelated keys
+        let entries = serde_json::json!([
+            {"slug":"auth","parent":null,"aliases":["authentication"],"concept_iri":"http://example/auth"}
+        ]).as_array().unwrap().to_vec();
+        let v2_meta = registry_metadata_v2(&entries);
+        assert!(v2_meta.get("domain_registry").unwrap().get("version").unwrap().as_u64() == Some(2));
+        let slugs: Vec<String> = v2_meta.get("domain_registry").unwrap()["domains"].as_array().unwrap().iter()
+            .map(|v| v.get("slug").unwrap().as_str().unwrap().to_string()).collect();
+        assert_eq!(slugs, vec!["auth"]);
+    }
+
+    // F12 (neurostrata-o2m6) Watermarks
+    #[tokio::test]
+    async fn test_f12_enrichment_watermark_persistence_and_normalization() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        use std::sync::Arc;
+        use crate::traits::VectorStore;
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb_trait: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
+        let emb = Arc::new(StubEmbedder);
+        let namespace = "test-f12";
+        // Pre-populate registry row so enrichment_commit needs no emb
+        let payload = MemoryPayload {
+            content: registry_content(namespace),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "domain_registry": {"version":2,"domains":[{"slug":"x","parent":null,"aliases":[],"concept_iri":null}]},
+                "eligibility":"private"
+            }),
+        };
+        let _ = store.upsert(namespace, &registry_row_id(namespace), vec![0.0; 4], payload).await;
+
+        let wm = serde_json::json!({
+            "last_enriched_at":"2026-01-01T00:00:00Z",
+            "enriched_count":42,
+            "extractor_fingerprint":"fp-1",
+            "source_digest":"digest-abc"
+        });
+        enrichment_commit(&store, Some(&emb_trait), namespace, wm.clone(), serde_json::json!({"stages":[]})).await.unwrap();
+
+        let meta = store.get(namespace, &registry_row_id(namespace)).await.unwrap().unwrap().1.metadata;
+        let state = enrichment_state(&meta);
+        let stored_wm = state.get("watermark").cloned().unwrap();
+        assert_eq!(stored_wm["enriched_count"], 42);
+        assert_eq!(stored_wm["extractor_fingerprint"], "fp-1");
+        assert_eq!(stored_wm["source_digest"], "digest-abc");
+
+        // Normalization: number -> structured object, null -> zeroed
+        let norm = normalize_watermark(serde_json::json!(99));
+        assert_eq!(norm["enriched_count"], 99);
+        assert!(norm["last_enriched_at"].is_null());
+        assert_eq!(norm["extractor_fingerprint"], "");
+
+        // Read back via enrichment_state on payload metadata
+        assert_eq!(enrichment_state(&meta).get("state").unwrap(), "done");
+    }
+
+    // F14 (neurostrata-u6yl / neurostrata-bgik) Enrichment telemetry
+    #[test]
+    fn test_f14_enrichment_telemetry_shape_and_failure_recording() {
+        // normalize_telemetry sorting + totals
+        let telemetry = serde_json::json!({
+            "stages": [
+                {"name":"load","count":4,"failures":1,"latency_ms":200,"fingerprint":"f2","last_error":null},
+                {"name":"extract","count":1,"failures":0,"latency_ms":50,"fingerprint":"f1","last_error":null}
+            ]
+        });
+        let norm = normalize_telemetry(telemetry);
+        let stages = norm.get("stages").unwrap().as_array().unwrap();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0]["name"], "extract");
+        assert_eq!(stages[1]["name"], "load");
+        let totals = norm.get("totals").unwrap();
+        assert_eq!(totals["count"], 5);
+        assert_eq!(totals["failures"], 1);
+        assert_eq!(totals["latency_ms"], 250);
+
+        // enrichment_fail recording (simulated using direct metadata mutation + state construction)
+        let mut meta = serde_json::json!({
+            "enrichment_state": {
+                "state":"running",
+                "watermark":null,
+                "lock_holder":"worker-3",
+                "lock_acquired_at":"2026-01-01T00:00:00Z",
+                "rerun_passes":[],
+                "telemetry":{"stages":[{"name":"ingest","count":2,"failures":0,"latency_ms":30,"fingerprint":"","last_error":null}],"totals":{"count":2,"failures":0,"latency_ms":30}}
+            }
+        });
+        // Verify failure path sets state, increments failures, last_error, clears lock
+        let state_before = enrichment_state(&meta);
+        assert_eq!(state_before.get("state").unwrap(), "running");
+        assert_eq!(state_before.get("lock_holder").unwrap(), "worker-3");
+        // Direct construction of failed record (mirrors enrichment_fail)
+        let failed_state = enrichment_state_record("failed", serde_json::json!(null), None, None, vec![], serde_json::json!({
+            "stages":[{"name":"ingest","count":2,"failures":1,"latency_ms":30,"fingerprint":"","last_error":"bad file"}]
+        }));
+        assert_eq!(failed_state["state"], "failed");
+        assert!(failed_state.get("lock_holder").unwrap().is_null());
+        let t = failed_state.get("telemetry").unwrap();
+        let stage = t.get("stages").unwrap().as_array().unwrap()[0].clone();
+        assert_eq!(stage["failures"], 1);
+        assert_eq!(stage["last_error"], "bad file");
+    }
+
+    // F24 (neurostrata-mlle / neurostrata-cjb3) Enrichment locking
+    #[tokio::test]
+    async fn test_f24_enrichment_lock_acquire_conflict_and_release() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        use std::sync::Arc;
+        use crate::traits::VectorStore;
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb_trait: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
+        let emb = Arc::new(StubEmbedder);
+        let namespace = "test-f24";
+        let payload = MemoryPayload {
+            content: registry_content(namespace),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({
+                "domain_registry":{"version":2,"domains":[]},
+                "eligibility":"private"
+            }),
+        };
+        let _ = store.upsert(namespace, &registry_row_id(namespace), vec![0.0; 4], payload).await;
+
+        // Acquire for worker-1
+        let res = enrichment_start(&store, Some(&emb_trait), namespace, "worker-1").await.unwrap();
+        assert_eq!(res["acquired"], true);
+
+        // Conflict while locked
+        let res2 = enrichment_start(&store, Some(&emb_trait), namespace, "worker-2").await.unwrap();
+        assert_eq!(res2["acquired"], false);
+        assert_eq!(res2["lock_held"], true);
+        assert_eq!(res2["holder"], "worker-1");
+
+        // Commit clears lock; subsequent acquire succeeds
+        enrichment_commit(&store, Some(&emb_trait), namespace, serde_json::json!({}), serde_json::json!({})).await.unwrap();
+        let res3 = enrichment_start(&store, Some(&emb_trait), namespace, "worker-2").await.unwrap();
+        assert_eq!(res3["acquired"], true);
+    }
 }
 
 static ENRICHMENT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

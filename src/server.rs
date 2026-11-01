@@ -208,7 +208,8 @@ pub async fn process_mcp_request(
                                 "facets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter results by epistemic facet (e.g. failed-attempt, enforced-rule, architecture-decision)." },
                                 "domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by domain slug(s) (OR)." },
                                 "node_sets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by node_set tag(s)." },
-                                "node_set_mode": { "type": "string", "enum": ["all", "any"], "description": "AND/OR semantics for node_sets filter. Default any." }
+                                "node_set_mode": { "type": "string", "enum": ["all", "any"], "description": "AND/OR semantics for node_sets filter. Default any." },
+                                "domain_expansion": { "type": "boolean", "description": "Expand domain filter to include child domains in the ontology DAG. Default true." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -5020,6 +5021,7 @@ async fn handle_search_memory(
         })
         .unwrap_or_default();
     let node_set_mode = arguments.get("node_set_mode").and_then(|v| v.as_str()).unwrap_or("any").to_string();
+    let domain_expansion = arguments.get("domain_expansion").and_then(|v| v.as_bool()).unwrap_or(true);
     // domains filter (OR) - thread into search_with_domain? Store filters by domains already via `domain` param.
     // For now, merge domains into the existing `domains` variable handling below.
 
@@ -5197,6 +5199,18 @@ async fn handle_search_memory(
             {
                 let mode = outcome.mode;
                 let mut results = outcome.results;
+                if !domain_expansion && !slugs.is_empty() && mode == crate::traits::DomainMatchMode::Domain {
+                    let unexpanded: std::collections::HashSet<String> = if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+                        let ont = ls.get_ontology(namespace);
+                        slugs.iter().map(|s| ont.canonical_slug(s).unwrap_or_else(|| s.clone())).collect()
+                    } else {
+                        slugs.iter().cloned().collect()
+                    };
+                    results.retain(|r| {
+                        let row_keys = crate::domain::domain_keys(&r.payload.metadata);
+                        row_keys.iter().any(|k| unexpanded.contains(k))
+                    });
+                }
                 if !facets_filter.is_empty() {
                     results.retain(|r| {
                         let facets = crate::domain::compute_facets(&r.payload.memory_type, &r.payload.metadata);
@@ -10797,6 +10811,134 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(after, before + 1);
+    }
+
+    #[tokio::test]
+    async fn test_f9_multi_domain_node_sets_and_domain_expansion_false() {
+        let dir = std::env::temp_dir().join(format!("ns-f9-srv-{}", uuid::Uuid::new_v4()));
+        let lb = crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("store");
+        lb.init("probe-f9").await.unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(lb);
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let vec = emb.embed("auth rule").await.unwrap();
+
+        let entries = vec![
+            serde_json::json!({"slug":"auth","parent":null,"aliases":["authentication"],"concept_iri":null}),
+            serde_json::json!({"slug":"tls","parent":"auth","aliases":["ssl"],"concept_iri":null}),
+        ];
+        let reg_id = crate::registry::registry_row_id("probe-f9");
+        let mut reg_p = payload("Domain registry for probe-f9");
+        reg_p.memory_type = "fact".to_string();
+        reg_p.metadata = crate::registry::registry_metadata_v2(&entries);
+        store.upsert("probe-f9", &reg_id, vec.clone(), reg_p).await.unwrap();
+
+        let mut p1 = payload("Parent auth rule");
+        p1.metadata = serde_json::json!({"domain": ["auth", "security"], "node_set": ["core", "edge"]});
+        store.upsert("probe-f9", "m-parent", vec.clone(), p1).await.unwrap();
+
+        let mut p2 = payload("Child tls rule");
+        p2.metadata = serde_json::json!({"domain": "tls", "node_set": ["edge"]});
+        store.upsert("probe-f9", "m-child", vec.clone(), p2).await.unwrap();
+
+        // Default domain_expansion: true includes child domain "tls" when querying "auth"
+        let expanded_res = handle_search_memory(
+            serde_json::json!({"namespace": "probe-f9", "query": "auth rule", "domain": "auth"}),
+            emb.clone(),
+            store.clone(),
+        ).await;
+        assert!(expanded_res.contains("m-parent"), "expanded should contain parent: {expanded_res}");
+        assert!(expanded_res.contains("m-child"), "expanded should contain child: {expanded_res}");
+
+        // domain_expansion: false excludes child domain "tls" when querying "auth"
+        let unexpanded_res = handle_search_memory(
+            serde_json::json!({"namespace": "probe-f9", "query": "auth rule", "domain": "auth", "domain_expansion": false}),
+            emb.clone(),
+            store.clone(),
+        ).await;
+        assert!(unexpanded_res.contains("m-parent"), "unexpanded should contain parent: {unexpanded_res}");
+        assert!(!unexpanded_res.contains("m-child"), "unexpanded must exclude child: {unexpanded_res}");
+
+        // node_set_mode: "all" with ["core", "edge"] keeps only m-parent
+        let ns_all_res = handle_search_memory(
+            serde_json::json!({"namespace": "probe-f9", "query": "auth rule", "node_sets": ["core", "edge"], "node_set_mode": "all"}),
+            emb,
+            store,
+        ).await;
+        assert!(ns_all_res.contains("m-parent"));
+        assert!(!ns_all_res.contains("m-child"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_f22_handle_distill_extracts_and_dedups_candidates() {
+        let dir = std::env::temp_dir().join(format!("ns-f22-distill-{}", uuid::Uuid::new_v4()));
+        let lb = crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("store");
+        lb.init("probe-f22").await.unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(lb);
+
+        let rel_sess = format!("target/tmp-f22-sessions-{}", uuid::Uuid::new_v4());
+        let sess_path = std::env::current_dir().unwrap().join(&rel_sess);
+        std::fs::create_dir_all(&sess_path).unwrap();
+        std::fs::write(
+            sess_path.join("session-1.log"),
+            "We must always validate SHACL shapes before export.\nWe must always validate SHACL shapes before export.\nTODO: wire extra telemetry metric\nRandom chat noise line.\n",
+        ).unwrap();
+
+        let dry = handle_distill(
+            serde_json::json!({"namespace": "probe-f22", "session_dir": rel_sess, "dry_run": true}),
+            store.clone(),
+        ).await;
+        assert!(dry.contains("[rule_candidate] We must always validate SHACL shapes before export."), "dry={dry}");
+        assert!(dry.contains("[todo:] TODO: wire extra telemetry metric"), "dry={dry}");
+        assert_eq!(dry.matches("[rule_candidate]").count(), 1, "duplicate line must be deduped: {dry}");
+
+        let live = handle_distill(
+            serde_json::json!({"namespace": "probe-f22", "session_dir": rel_sess, "dry_run": false}),
+            store,
+        ).await;
+        assert!(live.contains("Proposed candidates (review-only): 2 created."), "live={live}");
+        let _ = std::fs::remove_dir_all(&sess_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_f23_handle_feedback_memory_persistence_validation_and_ranking() {
+        let dir = std::env::temp_dir().join(format!("ns-f23-feedback-{}", uuid::Uuid::new_v4()));
+        let lb = crate::store::ladybug::LadybugStore::for_testing(&dir, 4).expect("store");
+        lb.init("probe-f23").await.unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(lb);
+        let vec = vec![1.0, 0.0, 0.0, 0.0];
+
+        let p1 = payload("First candidate memory");
+        store.upsert("probe-f23", "cand-low", vec.clone(), p1).await.unwrap();
+        let p2 = payload("Second candidate memory");
+        store.upsert("probe-f23", "cand-high", vec.clone(), p2).await.unwrap();
+
+        // Out-of-range rating rejected without mutating
+        let bad = handle_feedback_memory(
+            serde_json::json!({"namespace": "probe-f23", "id": "cand-high", "rating": 2.5}),
+            store.clone(),
+        ).await;
+        assert!(bad.contains("ERROR: rating must be in [-1, 1]."), "bad={bad}");
+
+        // Valid positive feedback on cand-high and negative on cand-low
+        let ok_high = handle_feedback_memory(
+            serde_json::json!({"namespace": "probe-f23", "id": "cand-high", "rating": 1.0}),
+            store.clone(),
+        ).await;
+        assert!(ok_high.contains("\"ok\":true") && ok_high.contains("\"feedback_score\":1.0"), "ok_high={ok_high}");
+        let ok_low = handle_feedback_memory(
+            serde_json::json!({"namespace": "probe-f23", "id": "cand-low", "rating": -1.0}),
+            store.clone(),
+        ).await;
+        assert!(ok_low.contains("\"ok\":true") && ok_low.contains("\"feedback_score\":-1.0"), "ok_low={ok_low}");
+
+        // Verify ranking: cand-high must rank ahead of cand-low (lower distance score)
+        let results = store.search("probe-f23", vec, 5, false, false).await.unwrap();
+        let pos_high = results.iter().position(|r| r.id == "cand-high").expect("cand-high present");
+        let pos_low = results.iter().position(|r| r.id == "cand-low").expect("cand-low present");
+        assert!(pos_high < pos_low, "positive feedback memory must rank above negative feedback memory");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

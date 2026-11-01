@@ -187,3 +187,54 @@ impl JsonObjExt for Value {
         obj
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_f21_resolve_config_and_load_vocabulary() {
+        // resolve_config from registry metadata
+        let meta_annotate = serde_json::json!({"ontology_config":{"path":"/tmp/vocab.json","mode":"annotate"}});
+        let cfg = resolve_config(&meta_annotate).unwrap();
+        assert_eq!(cfg.path, "/tmp/vocab.json");
+        assert_eq!(cfg.mode, "annotate");
+
+        let meta_strict = serde_json::json!({"ontology_config":{"path":"/tmp/vocab.json","mode":"strict"}});
+        let cfg_strict = resolve_config(&meta_strict).unwrap();
+        assert_eq!(cfg_strict.mode, "strict");
+
+        // default mode when missing
+        let meta_default = serde_json::json!({"ontology_config":{"path":"/tmp/vocab.json"}});
+        let cfg_def = resolve_config(&meta_default).unwrap();
+        assert_eq!(cfg_def.mode, "annotate");
+
+        // Write temporary vocabulary file
+        let tmp = std::env::temp_dir().join("neurostrata_vocab_f21.json");
+        {
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            let vocab = serde_json::json!([
+                {"slug":"auth","concept_iri":"http://example/auth","aliases":["authentication","login"]},
+                {"slug":"database","concept_iri":"http://example/db","aliases":[]}
+            ]);
+            f.write_all(vocab.to_string().as_bytes()).unwrap();
+        }
+
+        let loaded = load_vocabulary(tmp.to_str().unwrap()).unwrap();
+        assert!(loaded.is_array());
+
+        // concept_iris_from_vocabulary matches canonical slug and alias
+        let iris_slugs = concept_iris_from_vocabulary(&loaded, &["auth".to_string()]);
+        assert!(iris_slugs.contains(&"http://example/auth".to_string()));
+        let iris_alias = concept_iris_from_vocabulary(&loaded, &["authentication".to_string()]);
+        assert!(iris_alias.contains(&"http://example/auth".to_string()));
+
+        // Missing vocabulary file returns Err
+        let missing = load_vocabulary("/tmp/nonexistent_neurostrata_vocab_12345.json");
+        assert!(missing.is_err());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&tmp);
+    }
+}

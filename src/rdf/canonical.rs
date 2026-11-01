@@ -87,6 +87,24 @@ mod tests {
     }
 
     #[test]
+    fn test_f17_canonicalize_topology_and_known_ids_aliases() {
+        let meta = serde_json::json!({
+            "domain_registry": {
+                "domains": [
+                    {"slug":"ladybugdb","aliases":["lbug","LadybugDB","ladybug-db"],"parent":null,"concept_iri":null}
+                ]
+            }
+        });
+        let index = OntologyIndex::from_registry_metadata(&meta);
+        let mut topo = serde_json::json!({"component":"lbug","target_system":"Ladybug-DB"});
+        canonicalize_topology(&mut topo, &index);
+        assert_eq!(topo.get("component").unwrap().as_str().unwrap(), "ladybugdb");
+        assert_eq!(topo.get("target_system").unwrap().as_str().unwrap(), "ladybugdb");
+        assert_eq!(canonicalize_known_ids_alias("lbug", &index), "ladybugdb");
+        assert_eq!(canonicalize_known_ids_alias("LadybugDB", &index), "ladybugdb");
+    }
+
+    #[test]
     fn dual_write_produces_digest() {
         let payload = MemoryPayload {
             content: "hello".to_string(),

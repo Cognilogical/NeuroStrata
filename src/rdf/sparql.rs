@@ -43,6 +43,20 @@ fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
 
+/// Create a SparqlParser with all 9 pre-registered prefixes from spec §6.
+pub fn parser_with_prefixes() -> SparqlParser {
+    SparqlParser::new()
+        .with_prefix("ns", "urn:neurostrata:ns#").unwrap()
+        .with_prefix("mem", "urn:neurostrata:memory:").unwrap()
+        .with_prefix("class", "urn:neurostrata:class:").unwrap()
+        .with_prefix("dom", "urn:neurostrata:domain:").unwrap()
+        .with_prefix("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#").unwrap()
+        .with_prefix("rdfs", "http://www.w3.org/2000/01/rdf-schema#").unwrap()
+        .with_prefix("owl", "http://www.w3.org/2002/07/owl#").unwrap()
+        .with_prefix("skos", "http://www.w3.org/2004/02/skos/core#").unwrap()
+        .with_prefix("xsd", "http://www.w3.org/2001/XMLSchema#").unwrap()
+}
+
 fn is_archived(metadata: &serde_json::Value) -> bool {
     metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -58,16 +72,28 @@ fn is_retired_at(metadata: &serde_json::Value, now: i64) -> bool {
     }
 }
 
-/// Async projection: queries live LadybugDB store and converts memories to RDF quads.
-pub async fn project_sparql_dataset_async(
+/// Compute memory salience score per spec §5.3 / custom function definition.
+pub fn compute_memory_salience(metadata: &serde_json::Value, now: i64) -> f64 {
+    if is_archived(metadata) || is_retired_at(metadata, now) || is_mesh_conflicting(metadata) {
+        return 0.0;
+    }
+    let access_count = metadata.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0) as f64;
+    let access_term = (1.0 + access_count).ln() * 0.1;
+    let feedback = metadata.get("feedback_score").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(-1.0, 1.0) * 0.05;
+    let neural_gain = metadata.get("neural_gain").and_then(|v| v.as_f64()).unwrap_or(1.0).clamp(0.0, 10.0);
+    ((1.0 + access_term + feedback) * neural_gain).max(0.0)
+}
+
+/// Async projection with metadata mapping (for custom functions).
+pub async fn project_sparql_dataset_with_meta_async(
     namespace: &str,
     include_retired: bool,
     include_archived: bool,
     store: &crate::store::ladybug::LadybugStore,
-) -> Dataset {
+) -> (Dataset, std::collections::HashMap<String, serde_json::Value>) {
     let mut dataset = Dataset::new();
+    let mut meta_map = std::collections::HashMap::new();
 
-    // Use public wrapper for list - now accessible via store.list_memories
     let mem_result = store.list_memories(namespace, None, None).await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -76,7 +102,6 @@ pub async fn project_sparql_dataset_async(
 
     if let Ok(ref memories) = mem_result {
         for m in memories {
-            // Visibility filters (spec §5.2)
             if !include_retired && is_retired_at(&m.payload.metadata, now) {
                 continue;
             }
@@ -91,6 +116,9 @@ pub async fn project_sparql_dataset_async(
             }
 
             let payload = m.payload.clone();
+            meta_map.insert(format!("urn:neurostrata:memory:{}", m.id), m.payload.metadata.clone());
+            meta_map.insert(m.id.clone(), m.payload.metadata.clone());
+
             let qs = crate::rdf::projection::memory_to_quads(
                 &m.id,
                 &payload,
@@ -100,11 +128,94 @@ pub async fn project_sparql_dataset_async(
             );
             for q in qs {
                 dataset.insert(&q);
+                // Union-default-graph semantics (§5.2): also insert default-graph copy
+                dataset.insert(&oxrdf::Quad::new(
+                    q.subject.clone(),
+                    q.predicate.clone(),
+                    q.object.clone(),
+                    oxrdf::GraphName::DefaultGraph,
+                ));
             }
         }
     }
 
-    dataset
+    (dataset, meta_map)
+}
+
+/// Async projection: queries live LadybugDB store and converts memories to RDF quads.
+pub async fn project_sparql_dataset_async(
+    namespace: &str,
+    include_retired: bool,
+    include_archived: bool,
+    store: &crate::store::ladybug::LadybugStore,
+) -> Dataset {
+    project_sparql_dataset_with_meta_async(namespace, include_retired, include_archived, store).await.0
+}
+
+/// Build a QueryEvaluator with the 3 NeuroStrata custom functions registered.
+pub fn evaluator_with_custom_functions(
+    meta_map: std::sync::Arc<std::collections::HashMap<String, serde_json::Value>>,
+    now: i64,
+) -> QueryEvaluator {
+    use oxrdf::{NamedNode, Term, Literal};
+    QueryEvaluator::new()
+        .with_custom_function(
+            NamedNode::new("urn:neurostrata:ns#salience").unwrap(),
+            {
+                let meta_map = meta_map.clone();
+                move |args: &[Term]| -> Option<Term> {
+                    let key = args.first()?;
+                    let key_str = match key {
+                        Term::NamedNode(n) => n.as_str().to_string(),
+                        Term::Literal(l) => l.value().to_string(),
+                        _ => return Some(Literal::from(0.0f64).into()),
+                    };
+                    let score = meta_map.get(&key_str).map(|m| compute_memory_salience(m, now)).unwrap_or(0.0);
+                    Some(Literal::from(score).into())
+                }
+            },
+        )
+        .with_custom_function(
+            NamedNode::new("urn:neurostrata:ns#validAt").unwrap(),
+            {
+                let meta_map = meta_map.clone();
+                move |args: &[Term]| -> Option<Term> {
+                    let mem_term = args.get(0)?;
+                    let ts_term = args.get(1)?;
+                    let key_str = match mem_term {
+                        Term::NamedNode(n) => n.as_str().to_string(),
+                        Term::Literal(l) => l.value().to_string(),
+                        _ => return Some(Literal::from(false).into()),
+                    };
+                    let ts: i64 = match ts_term {
+                        Term::Literal(l) => l.value().parse::<i64>().ok()?,
+                        _ => return Some(Literal::from(false).into()),
+                    };
+                    let meta = meta_map.get(&key_str)?;
+                    let valid_from = meta.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let valid_to = meta.get("valid_to").and_then(|v| v.as_i64()).filter(|v| *v != 0);
+                    let is_valid = valid_from <= ts && (valid_to.is_none() || ts < valid_to.unwrap());
+                    Some(Literal::from(is_valid).into())
+                }
+            },
+        )
+        .with_custom_function(
+            NamedNode::new("urn:neurostrata:ns#isRetired").unwrap(),
+            {
+                let meta_map = meta_map.clone();
+                move |args: &[Term]| -> Option<Term> {
+                    let mem_term = args.first()?;
+                    let key_str = match mem_term {
+                        Term::NamedNode(n) => n.as_str().to_string(),
+                        Term::Literal(l) => l.value().to_string(),
+                        _ => return Some(Literal::from(false).into()),
+                    };
+                    let meta = meta_map.get(&key_str)?;
+                    let retired = is_retired_at(meta, now);
+                    Some(Literal::from(retired).into())
+                }
+            },
+        )
 }
 
 /// Evaluate a SPARQL query over the projected namespace dataset.
@@ -118,8 +229,8 @@ pub async fn execute_sparql_query(
 ) -> Result<(String, usize, bool, bool), String> {
     let config = SparqlConfig::default();
 
-    // Parse the SPARQL query using spargebra
-    let query = SparqlParser::new()
+    // Parse the SPARQL query using spargebra with pre-registered prefixes
+    let query = parser_with_prefixes()
         .parse_query(query_str)
         .map_err(|e| format!("SPARQL parse error: {}", e))?;
 
@@ -132,8 +243,9 @@ pub async fn execute_sparql_query(
     // Reject UPDATE queries: spargebra separates UPDATE via parse_update; parse_query
     // handles SELECT/ASK/CONSTRUCT/DESCRIBE only, so an UPDATE input errors here.
 
-    // Build the dataset from namespace projection (live LadybugDB)
-    let dataset = project_sparql_dataset_async(namespace, include_retired, include_archived, store).await;
+    // Build the dataset from namespace projection (live LadybugDB) with meta mapping
+    let (dataset, meta_map) = project_sparql_dataset_with_meta_async(namespace, include_retired, include_archived, store).await;
+    let meta_arc = std::sync::Arc::new(meta_map);
 
     if dataset.len() > config.max_dataset_quads {
         return Err(format!(
@@ -143,8 +255,12 @@ pub async fn execute_sparql_query(
         ));
     }
 
-    // Prepare and evaluate with QueryEvaluator
-    let evaluator = QueryEvaluator::new();
+    // Prepare and evaluate with QueryEvaluator (custom functions registered)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let evaluator = evaluator_with_custom_functions(meta_arc, now);
     let prepared = evaluator.prepare(&query);
     let results = prepared
         .execute(&dataset)
@@ -287,38 +403,117 @@ mod tests {
         assert!(!is_archived(&missing));
     }
 
-    #[test]
-    #[ignore = "requires live LadybugDB; see: neurostrata-c0lw#integration-projection"]
-    fn test_execute_sparql_query_live_projection() {
-        // This integration test exercises the live LadybugDB projection path:
-        // project_sparql_dataset_async + execute_sparql_query async with LadybugStore.
-        // Requires a populated NeuroStrata DB at the configured path.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let db_path = crate::config::Config::from_default_path()
-            .map(|c| c.db_path.clone())
-            .unwrap_or_default();
-        let store = match crate::store::ladybug::LadybugStore::new(
-            db_path.to_string_lossy().to_string(),
-            1000,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                // No DB initialized; test is skipped, not failing.
-                return;
-            }
+    #[tokio::test]
+    async fn test_execute_sparql_query_live_projection() {
+        use crate::traits::{MemoryPayload, VectorStore};
+        let tmp = std::env::temp_dir().join(format!("ns-sparql-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("test-sparql").await.unwrap();
+        let payload = MemoryPayload {
+            content: "SPARQL live projection fact".to_string(),
+            user_id: "u1".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "src/rdf/sparql.rs".to_string(),
+            location_lines: "1".to_string(),
+            metadata: serde_json::json!({"domain": "retrieval"}),
         };
-        let result = rt.block_on(execute_sparql_query(
+        store
+            .upsert("test-sparql", "mem-1", vec![0.1, 0.2, 0.3, 0.4], payload)
+            .await
+            .unwrap();
+
+        let (serialized, count, truncated, timed_out) = execute_sparql_query(
             "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
-            "NeuroStrata",
+            "test-sparql",
             QueryResultsFormat::Json,
             false,
             false,
             &store,
-        ));
-        // Should succeed even with empty DB (returns formatted output).
-        assert!(result.is_ok());
-        let (serialized, count, truncated, timed_out) = result.unwrap();
-        assert!(count >= 0);
-        assert!(!serialized.is_empty());
+        )
+        .await
+        .expect("sparql query succeeds");
+        assert!(count > 0, "expected projected triples in default union graph");
+        assert!(!truncated);
+        assert!(!timed_out);
+        assert!(serialized.contains("urn:neurostrata:memory:mem-1"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_preregistered_prefixes_parse() {
+        let q = parser_with_prefixes().parse_query("SELECT ?s WHERE { ?s a class:Fact ; ns:domain dom:auth }");
+        assert!(q.is_ok(), "pre-registered prefixes should parse without explicit PREFIX");
+    }
+
+    #[test]
+    fn test_custom_functions_salience_valid_at_is_retired() {
+        use std::collections::HashMap;
+        use oxrdf::{Dataset, NamedNode};
+        use spargebra::SparqlParser;
+        use spareval::QueryEvaluator;
+
+        let mut meta_map = HashMap::new();
+        meta_map.insert("urn:neurostrata:memory:m1".into(), serde_json::json!({
+            "access_count": 10,
+            "feedback_score": 0.8,
+            "neural_gain": 1.5,
+            "valid_from": 100
+        }));
+        meta_map.insert("m1".into(), meta_map.get("urn:neurostrata:memory:m1").unwrap().clone());
+
+        meta_map.insert("urn:neurostrata:memory:m2".into(), serde_json::json!({
+            "valid_to": 500
+        }));
+        meta_map.insert("m2".into(), meta_map.get("urn:neurostrata:memory:m2").unwrap().clone());
+
+        let meta_arc = std::sync::Arc::new(meta_map);
+        let now = 600i64; // past m2's valid_to 500 so it is retired
+        let evaluator = evaluator_with_custom_functions(meta_arc, now);
+
+        let query_str = "SELECT (ns:salience(<urn:neurostrata:memory:m1>) AS ?s1) (ns:salience(<urn:neurostrata:memory:m2>) AS ?s2) (ns:validAt(<urn:neurostrata:memory:m1>, 200) AS ?v1) (ns:isRetired(<urn:neurostrata:memory:m2>) AS ?r2) WHERE {}";
+        let query = parser_with_prefixes().parse_query(query_str).expect("parse");
+        let dataset = Dataset::new();
+        let prepared = evaluator.prepare(&query);
+        let results = prepared.execute(&dataset).expect("execute");
+
+        if let spareval::QueryResults::Solutions(mut sol_iter) = results {
+            let sol = sol_iter.next().unwrap().expect("first solution");
+            let s1 = sol.get("s1").unwrap();
+            let s2 = sol.get("s2").unwrap();
+            let v1 = sol.get("v1").unwrap();
+            let r2 = sol.get("r2").unwrap();
+
+            // Assert s1 > 1.0
+            let s1_val = match s1 {
+                oxrdf::Term::Literal(l) => l.value().parse::<f64>().unwrap(),
+                _ => 0.0,
+            };
+            assert!(s1_val > 1.0, "salience of active memory should be > 1.0 (got {})", s1_val);
+
+            // Assert s2 == 0.0
+            let s2_val = match s2 {
+                oxrdf::Term::Literal(l) => l.value().parse::<f64>().unwrap(),
+                _ => -1.0,
+            };
+            assert_eq!(s2_val, 0.0, "retired memory salience should be 0.0");
+
+            // Assert v1 == true
+            let v1_str = match v1 {
+                oxrdf::Term::Literal(l) => l.value().to_string(),
+                _ => "false".into(),
+            };
+            assert_eq!(v1_str, "true", "validAt at 200 should be true");
+
+            // Assert r2 == true (m2 valid_to=500 <= now=600)
+            let r2_str = match r2 {
+                oxrdf::Term::Literal(l) => l.value().to_string(),
+                _ => "false".into(),
+            };
+            assert_eq!(r2_str, "true", "isRetired for m2 at now=600 should be true (valid_to 500 <= 600)");
+        } else {
+            panic!("expected solutions");
+        }
     }
 }

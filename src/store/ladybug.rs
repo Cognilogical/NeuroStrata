@@ -1974,20 +1974,17 @@ impl LadybugStore {
         self.with_conn(move |conn| {
             // Collect active memory ids + metadata.
             let query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.metadata, m.is_retired",
+                "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.metadata",
                 escape_ladybug_string(&namespace)
             );
             let mut res = conn.query(&query)?;
             let mut rows: Vec<(String, String)> = Vec::new();
+            let now = chrono::Utc::now().timestamp();
             while let Some(row) = res.next() {
                 let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let meta = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
-                // skip retired
-                let retired = match &row[2] {
-                    lbug::Value::Bool(b) => *b,
-                    _ => false,
-                };
-                if retired {
+                let parsed_meta: serde_json::Value = serde_json::from_str(&meta).unwrap_or(serde_json::json!({}));
+                if is_archived(&parsed_meta) || is_retired_at(&parsed_meta, now) {
                     continue;
                 }
                 rows.push((id, meta));
@@ -2829,22 +2826,8 @@ impl VectorStore for LadybugStore {
             }
         }
         if payload.metadata.is_object() {
-            let inferred = crate::domain::compute_facets(&payload.memory_type, &payload.metadata);
-            // Merge inferred facets with any manual facets (F16).
-            let mut merged: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            if let Some(existing) = payload.metadata.get("facets").and_then(|v| v.as_array()) {
-                for f in existing {
-                    if let Some(s) = f.as_str() {
-                        merged.insert(s.to_string());
-                    }
-                }
-            }
-            for f in inferred {
-                merged.insert(f);
-            }
-            if let Some(obj) = payload.metadata.as_object_mut() {
-                obj.insert("facets".to_string(), serde_json::json!(merged.into_iter().collect::<Vec<_>>()));
-            }
+            let now_ts = chrono::Utc::now().timestamp();
+            crate::domain::materialize_facets_bitemporal(&payload.memory_type, &mut payload.metadata, now_ts);
         }
 
         // Write-side concept_iri stamping (F20): if metadata.concept_iri absent
@@ -3155,13 +3138,26 @@ impl VectorStore for LadybugStore {
                         .metadata
                         .get("absolute_path")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            if payload.location.trim().is_empty() {
+                                None
+                            } else {
+                                Some(payload.location.clone())
+                            }
+                        });
                     let content_hash = payload
                         .metadata
                         .get("file_sha256")
                         .or_else(|| payload.metadata.get("span_sha256"))
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            use sha2::{Digest, Sha256};
+                            let mut hasher = Sha256::new();
+                            hasher.update(payload.content.as_bytes());
+                            Some(hex::encode(hasher.finalize()))
+                        });
                     let (line_start, line_end) = match (if payload.location_lines.trim().is_empty() { None } else { Some(payload.location_lines.as_str()) })
                         .or_else(|| payload.metadata.get("location_lines").and_then(|v| v.as_str()))
                     {
@@ -11346,6 +11342,185 @@ eurostrata\src\daemon.rs",
         let idx = store.get_ontology("probe");
         assert_eq!(idx.canonical_slug("authentication"), Some("auth".to_string()));
         assert!(idx.expand_domain("auth").contains(&"tls".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_f1_exact_name_recall_five_identifier_classes() {
+        let dir = std::env::temp_dir().join(format!("ns-f1-exact-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let zero = vec![0.1, 0.2, 0.3, 0.4];
+
+        // 1. Symbol
+        let mut p_sym = retired_test_payload("fact", "agent", json!({"symbol": "verify_bundle_sha256"}));
+        p_sym.content = "Bundle verification helper verify_bundle_sha256".to_string();
+        store.upsert("probe", "m-sym", zero.clone(), p_sym).await.unwrap();
+
+        // 2. File path
+        let mut p_file = retired_test_payload("fact", "agent", json!({}));
+        p_file.location = "src/judgment/laya_onnx.rs".to_string();
+        p_file.content = "Local ONNX duplicate judgment provider".to_string();
+        store.upsert("probe", "m-file", zero.clone(), p_file).await.unwrap();
+
+        // 3. Env var
+        let mut p_env = retired_test_payload("rule", "agent", json!({"env": "NEUROSTRATA_HYBRID_SEARCH", "source": "AGENTS.md"}));
+        p_env.content = "Set NEUROSTRATA_HYBRID_SEARCH in environment to enable hybrid scoring".to_string();
+        store.upsert("probe", "m-env", zero.clone(), p_env).await.unwrap();
+
+        // 4. Error string
+        let mut p_err = retired_test_payload("fact", "agent", json!({"error_code": "ERR_SHACL_CLOSED_WORLD"}));
+        p_err.content = "Validation error ERR_SHACL_CLOSED_WORLD when target missing".to_string();
+        store.upsert("probe", "m-err", zero.clone(), p_err).await.unwrap();
+
+        // 5. Quoted phrase
+        let mut p_phrase = retired_test_payload("rule", "agent", json!({"source": "AGENTS.md"}));
+        p_phrase.content = "Always enforce zero compile-time feature flags across workspace".to_string();
+        store.upsert("probe", "m-phrase", zero.clone(), p_phrase).await.unwrap();
+
+        for (query, expected_id) in [
+            ("verify_bundle_sha256", "m-sym"),
+            ("  SRC/JUDGMENT/LAYA_ONNX.RS  ", "m-file"),
+            ("NEUROSTRATA_HYBRID_SEARCH", "m-env"),
+            ("ERR_SHACL_CLOSED_WORLD", "m-err"),
+            ("Always enforce zero compile-time feature flags across workspace", "m-phrase"),
+        ] {
+            let outcome = store
+                .search_with_domain("probe", vec![0.9, 0.0, 0.0, 0.0], 5, false, false, &[], Some(query), true)
+                .await
+                .unwrap();
+            let hit = outcome.results.iter().find(|r| r.id == expected_id).expect("exact match found");
+            assert_eq!(hit.score, 0.0, "exact match should have score 0.0 for {}", query);
+            assert!(crate::traits::is_direct_match(&hit.evidence));
+
+            let lex = store
+                .search_lexical("probe", query.trim(), 5, false, false, &[], "admin", 1)
+                .await
+                .unwrap();
+            assert!(lex.results.iter().any(|r| r.id == expected_id), "lexical hit for {}", query);
+        }
+
+        // Negative probe: non-existent identifier should not get an exact-name 0.0 score
+        let neg = store
+            .search_with_domain("probe", vec![0.9, 0.0, 0.0, 0.0], 5, false, false, &[], Some("NON_EXISTENT_SYMBOL_XYZ_999"), true)
+            .await
+            .unwrap();
+        assert!(neg.results.iter().all(|r| r.score > 0.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_f6_edge_sources_provenance_round_trip() {
+        let dir = std::env::temp_dir().join(format!("ns-f6-edge-prov-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        let target = retired_test_payload("fact", "agent", json!({}));
+        store.upsert("probe", "target-node", v.clone(), target).await.unwrap();
+
+        let mut declarer = retired_test_payload("rule", "agent", json!({
+            "governs": ["target-node"],
+            "absolute_path": "src/domain.rs",
+            "file_sha256": "deadbeefcafe"
+        }));
+        declarer.location = "src/domain.rs".to_string();
+        declarer.location_lines = "10-25".to_string();
+        store.upsert("probe", "declaring-rule", v.clone(), declarer).await.unwrap();
+
+        let fetched = store.get("probe", "declaring-rule").await.unwrap().expect("declaring-rule exists");
+        let edge_sources = fetched.1.metadata.get("edge_sources").and_then(|v| v.as_array()).expect("edge_sources array");
+        assert_eq!(edge_sources.len(), 1);
+        let es = &edge_sources[0];
+        assert_eq!(es.get("declaring_id").and_then(|v| v.as_str()), Some("declaring-rule"));
+        assert_eq!(es.get("rel_type").and_then(|v| v.as_str()), Some("GOVERNS"));
+        assert_eq!(es.get("resolved_target").and_then(|v| v.as_str()), Some("target-node"));
+        assert_eq!(es.get("logical_target").and_then(|v| v.as_str()), Some("target-node"));
+        assert_eq!(es.get("file").and_then(|v| v.as_str()), Some("src/domain.rs"));
+        assert_eq!(es.get("content_hash").and_then(|v| v.as_str()), Some("deadbeefcafe"));
+        assert_eq!(es.get("line_start").and_then(|v| v.as_i64()), Some(10));
+        assert_eq!(es.get("line_end").and_then(|v| v.as_i64()), Some(25));
+        assert_eq!(es.get("extractor").and_then(|v| v.as_str()), Some("upsert"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_f13_dangling_edges_and_f18_shape_warnings() {
+        let dir = std::env::temp_dir().join(format!("ns-f13-f18-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        let valid_target = retired_test_payload("fact", "agent", json!({}));
+        store.upsert("probe", "valid-target", v.clone(), valid_target).await.unwrap();
+
+        // Row with one resolved target, one dangling target, missing rule source, and invalid endpoint role (fact contained_by fact)
+        let declarer = retired_test_payload("rule", "agent", json!({
+            "governs": ["valid-target", "missing-target-xyz"],
+            "contained_by": ["valid-target"]
+        }));
+        store.upsert("probe", "declarer-1", v.clone(), declarer).await.unwrap();
+
+        let dangling = store.dangling_edges("probe").await.unwrap();
+        assert!(
+            dangling.iter().any(|d| d.get("declared_target").and_then(|t| t.as_str()) == Some("missing-target-xyz") && d.get("reason").and_then(|r| r.as_str()) == Some("missing")),
+            "expected missing-target-xyz in dangling_edges: {:?}",
+            dangling
+        );
+        assert!(
+            !dangling.iter().any(|d| d.get("declared_target").and_then(|t| t.as_str()) == Some("valid-target")),
+            "resolved valid-target must not be in dangling_edges"
+        );
+
+        let warnings = store.shape_warnings("probe").await;
+        assert!(
+            warnings.iter().any(|w| w.get("why").and_then(|r| r.as_str()).map(|s| s.contains("endpoint role mismatch")).unwrap_or(false)),
+            "expected endpoint role mismatch in shape_warnings: {:?}",
+            warnings
+        );
+        assert!(
+            warnings.iter().any(|w| w.get("field").and_then(|f| f.as_str()) == Some("metadata.source")),
+            "expected metadata.source SHACL warning in shape_warnings: {:?}",
+            warnings
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_f20_concept_iri_stamping_on_write() {
+        let dir = std::env::temp_dir().join(format!("ns-f20-concept-iri-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        let entries = vec![
+            serde_json::json!({
+                "slug": "auth",
+                "parent": null,
+                "aliases": ["authentication"],
+                "concept_iri": "https://neurostrata.io/concepts/authentication"
+            }),
+        ];
+        let registry_id = crate::registry::registry_row_id("probe");
+        let reg_payload = MemoryPayload {
+            content: crate::registry::registry_content("probe"),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: crate::registry::registry_metadata_v2(&entries),
+        };
+        store.upsert("probe", &registry_id, v.clone(), reg_payload).await.unwrap();
+
+        let p = retired_test_payload("rule", "agent", json!({"domain": "auth"}));
+        store.upsert("probe", "auth-rule-1", v.clone(), p).await.unwrap();
+
+        let fetched = store.get("probe", "auth-rule-1").await.unwrap().expect("exists");
+        assert_eq!(
+            fetched.1.metadata.get("concept_iri").and_then(|v| v.as_str()),
+            Some("https://neurostrata.io/concepts/authentication")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

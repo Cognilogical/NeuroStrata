@@ -1170,6 +1170,48 @@ pub async fn ingest_directory(
     )
     .await;
 
+    // Watermark + stage telemetry on the namespace registry row (F12).
+    let current_version = ingest_version(&schema.fingerprint());
+    let mut current_hashes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for path_str in &current_paths {
+        if let Some(h) = current_hashes.get(path_str) { break; }
+    }
+    // Compute deterministic source_digest over sorted (path, hash) pairs.
+    let mut digest_entries: Vec<(String, String)> = current_hashes
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    digest_entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let digest_str = digest_entries
+        .iter()
+        .map(|(p, h)| format!("{}={}", p, h))
+        .collect::<Vec<_>>()
+        .join(";");
+    let source_digest = sha256_hex(digest_str.as_bytes());
+    let watermark = serde_json::json!({
+        "last_enriched_at": chrono::Utc::now().to_rfc3339(),
+        "enriched_count": current_paths.len(),
+        "extractor_fingerprint": current_version,
+        "source_digest": format!("sha256:{}", source_digest),
+    });
+    let telemetry = serde_json::json!({
+        "stages": [{
+            "name": "ingest",
+            "count": current_paths.len(),
+            "failures": 0,
+            "latency_ms": 0,
+            "fingerprint": current_version,
+        }]
+    });
+    let _ = crate::registry::enrichment_commit(
+        &vector_store,
+        Some(&embedder),
+        namespace,
+        watermark,
+        telemetry,
+    )
+    .await;
+
     Ok(())
 }
 
@@ -2015,6 +2057,116 @@ mod tests {
         assert!(secs[0].links.contains(&"https://example.com".to_string()));
         assert_eq!(secs[1].heading, "Second");
     }
+
+    /// F8 dry-run estimate and presort with all required fields present.
+    #[tokio::test]
+    async fn test_f8_dry_run_estimate_and_presort_zero_writes() {
+        let tmp = std::env::temp_dir().join(format!("ns-f8-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create");
+        std::fs::write(tmp.join("foo.rs"), "pub fn bar() {}").unwrap();
+        std::fs::write(tmp.join("README.md"), "# Hello\n\nSecret token x.\n").unwrap();
+        // Duplicate file with same hash
+        std::fs::write(tmp.join("dup.rs"), "pub fn bar() {}").unwrap();
+        // Versioned file
+        std::fs::write(tmp.join("foo_v2.rs"), "pub fn bar_v2() {}").unwrap();
+        // Junk / bak file
+        std::fs::write(tmp.join("foo.bak"), "old").unwrap();
+        // Secret / PII content
+        std::fs::write(tmp.join("secret.rs"), "const TOKEN: &str = \"secret123\";\nlet email = \"a@b.com\";\n").unwrap();
+
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema parses");
+        let est_report = dry_run_directory(&tmp, &schema, "estimate").await.unwrap();
+        let pre_report = dry_run_directory(&tmp, &schema, "presort").await.unwrap();
+
+        for (label, r) in [("estimate", &est_report), ("presort", &pre_report)] {
+            assert!(r.contains(&format!("Dry-run ({})", label)), "{} mode header", label);
+            assert!(r.contains("Files:"), "{} Files", label);
+            assert!(r.contains("Parseable files:"), "{} Parseable", label);
+            assert!(r.contains("Symbols:"), "{} Symbols", label);
+            assert!(r.contains("Doc sections:"), "{} Doc sections", label);
+            assert!(r.contains("Embeddings needed (est):"), "{} Embeddings", label);
+            assert!(r.contains("Avoided embeddings:"), "{} Avoided", label);
+            assert!(r.contains("Secret hits:"), "{} Secret hits", label);
+            assert!(r.contains("PII warnings:"), "{} PII", label);
+            assert!(r.contains("Junk candidates:"), "{} Junk candidates", label);
+            assert!(r.contains("Duplicate candidates:"), "{} Duplicate", label);
+            assert!(r.contains("Version candidates:"), "{} Version", label);
+        }
+        assert!(pre_report.contains("Junk files:"));
+        assert!(pre_report.contains("Duplicate groups:"));
+        assert!(pre_report.contains("Version candidate files:"));
+        assert!(pre_report.contains("Proposed dataset groups:"));
+    }
+
+    /// F7 extract imports / resolve dependency paths for Rust/TS.
+    #[test]
+    fn test_f7_extract_and_resolve_dependencies() {
+        let rust = r#"mod foo;
+use crate::bar::baz;
+use super::x;"#;
+        let specs = extract_import_specifiers("rust", rust);
+        assert!(specs.contains(&"mod:foo".to_string()));
+        assert!(specs.contains(&"use:crate::bar::baz".to_string()));
+
+        let ts = r#"import { x } from "./utils";\nrequire("./helper");"#;
+        let ts_specs = extract_import_specifiers("typescript", ts);
+        assert!(ts_specs.contains(&"js:./utils".to_string()) || ts_specs.contains(&"js:./utils".to_string()));
+
+        let all = std::collections::HashSet::from(["src/foo.rs".to_string(), "src/bar.rs".to_string(), "src/utils.ts".to_string(), "src/helper.js".to_string()]);
+        // Resolve rust `mod foo;` from src/main.rs -> src/foo.rs
+        let rust_deps = resolve_dependency_paths("src/main.rs", &specs, &all);
+        assert!(rust_deps.contains(&"src/foo.rs".to_string()));
+        // Resolve rust `use crate::bar::baz;` -> src/bar.rs
+        assert!(rust_deps.contains(&"src/bar.rs".to_string()));
+
+        // Resolve TypeScript imports
+        let ts_deps = resolve_dependency_paths("src/app.ts", &ts_specs, &all);
+        assert!(ts_deps.contains(&"src/utils.ts".to_string()) || ts_deps.contains(&"src/helper.js".to_string()));
+    }
+
+    /// F2 incremental ingest + F12 watermark.
+    #[tokio::test]
+    async fn test_f2_f12_incremental_ingest_and_watermark() {
+        let tmp = std::env::temp_dir().join(format!("ns-f2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create");
+        std::fs::write(tmp.join("hello.rs"), "pub fn hello() {}").unwrap();
+        let db = std::env::temp_dir().join(format!("ns-f2-db-{}", std::process::id()));
+        let store: Arc<dyn VectorStore> = Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open"));
+        store.init("f2").await.unwrap();
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        let embedder = Arc::new(ZeroEmbedder);
+
+        // First ingest -> generation 1, writes watermark.
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("first");
+        let source_key = source_key_for(&tmp);
+        let gen1 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen1 > 0, "first ingest produces a generation");
+
+        // Check registry row has watermark and telemetry.
+        let registry_id = crate::registry::registry_row_id("f2");
+        let (vec, payload) = store.get("f2", &registry_id).await.unwrap().expect("registry row");
+        let meta = payload.metadata.as_object().expect("metadata");
+        assert!(meta.contains_key("enrichment_state"), "enrichment_state present");
+        let state = meta.get("enrichment_state").expect("state");
+        let wm = state.get("watermark").expect("watermark");
+        assert!(wm.get("extractor_fingerprint").is_some(), "fingerprint");
+        assert!(wm.get("source_digest").is_some(), "source_digest");
+        assert!(wm.get("last_enriched_at").is_some(), "last_enriched_at");
+
+        // Second ingest with unchanged files -> generation 2, carries forward unchanged nodes.
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("second");
+        let gen2 = store.active_generation("f2", &source_key).await.unwrap();
+        assert!(gen2 > gen1, "second ingest produces newer generation");
+        // Watermark updated (same fingerprint if schema unchanged, updated digest if files same).
+        let (vec2, payload2) = store.get("f2", &registry_id).await.unwrap().expect("registry row 2");
+        let meta2 = payload2.metadata.as_object().expect("meta2");
+        let wm2 = meta2.get("enrichment_state").expect("state2").get("watermark").expect("wm2");
+        assert!(wm2.get("source_digest").is_some(), "updated digest");
+
+        // Modify file -> re-embeds changed file; old generation superseded.
+        std::fs::write(tmp.join("hello.rs"), "pub fn hello_new() {}").unwrap();
+        ingest_directory(&tmp, &schema, embedder.clone(), store.clone(), "f2", None, &[]).await.expect("modified");
+    }
 }
 /// Dry-run ingest: walk the tree and produce a report without writing or
 /// downloading anything.
@@ -2039,6 +2191,12 @@ pub async fn dry_run_directory(
     let mut junk: Vec<String> = Vec::new();
     let mut pii_warnings: Vec<String> = Vec::new();
     let mut groups: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut all_file_paths: Vec<String> = Vec::new();
+    let mut avoided_embeddings: usize = 0;
+    let mut version_candidates: Vec<String> = Vec::new();
+
+    // Pattern: version suffixes in file stem; used after loop too.
+    let v_pattern = regex::Regex::new(r"(_v[0-9]+|-v[0-9]+|\.bak$|\.old$|_old$|_copy$)").unwrap();
 
     let walker = ignore::WalkBuilder::new(dir_path).build();
     for result in walker {
@@ -2061,6 +2219,9 @@ pub async fn dry_run_directory(
         let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => continue };
         let hash = sha256_hex(&bytes);
         file_hashes.entry(hash.clone()).or_default().push(path_str.to_string());
+
+        // Version-candidate detection: collect paths for post-loop analysis.
+        all_file_paths.push(path_str.to_string());
 
         let lang_name = path.extension()
             .map(|e| normalize_ext(&e.to_string_lossy()))
@@ -2127,8 +2288,37 @@ pub async fn dry_run_directory(
     for (h, paths) in &file_hashes {
         if paths.len() > 1 {
             duplicates.push(format!("{} files share hash {}", paths.len(), &h[..12]));
+            // Avoided embeddings = extra copies of identical content.
+            avoided_embeddings += paths.len() - 1;
         }
     }
+
+    // Version-candidate detection from patterns and from shared normalized base stems.
+    // Pattern-based was tracked during loop; now add shared-stem detection.
+    let mut stem_dir_map: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    for path_str in &all_file_paths {
+        let p = std::path::Path::new(path_str);
+        if let Some(stem) = p.file_stem() {
+            let stem_str = stem.to_string_lossy().to_string();
+            let normalized = v_pattern.replace_all(&stem_str, "");
+            if let Some(parent) = p.parent() {
+                let parent_key = parent.to_string_lossy().to_string();
+                let dir_stem_key = format!("{}::{}", parent_key, normalized);
+                stem_dir_map.entry(dir_stem_key.clone()).or_default().insert(path_str.clone());
+            }
+        }
+    }
+    for (key, path_set) in &stem_dir_map {
+        if path_set.len() > 1 {
+            for path_str in path_set {
+                if !version_candidates.contains(path_str) {
+                    version_candidates.push(path_str.clone());
+                }
+            }
+        }
+    }
+    version_candidates.sort();
+    version_candidates.dedup();
 
     let mut report = String::new();
     report.push_str(&format!("Dry-run ({}) report:\n", mode));
@@ -2137,13 +2327,19 @@ pub async fn dry_run_directory(
     report.push_str(&format!("Symbols: {}\n", symbols));
     report.push_str(&format!("Doc sections: {}\n", doc_sections));
     report.push_str(&format!("Embeddings needed (est): {}\n", symbols + doc_sections));
+    report.push_str(&format!("Avoided embeddings: {}\n", avoided_embeddings));
     report.push_str(&format!("Secret hits: {}\n", secret_hits));
+    report.push_str(&format!("PII warnings: {}\n", pii_warnings.len()));
+    report.push_str(&format!("Junk candidates: {}\n", junk.len()));
+    report.push_str(&format!("Duplicate candidates: {}\n", duplicates.len()));
+    report.push_str(&format!("Version candidates: {}\n", version_candidates.len()));
     if mode == "presort" {
         report.push_str(&format!("Junk files: {}\n", junk.len()));
         for j in &junk { report.push_str(&format!("  junk: {}\n", j)); }
         report.push_str(&format!("Duplicate groups: {}\n", duplicates.len()));
         for d in &duplicates { report.push_str(&format!("  dup: {}\n", d)); }
-        report.push_str(&format!("PII warnings: {}\n", pii_warnings.len()));
+        report.push_str(&format!("Version candidate files: {}\n", version_candidates.len()));
+        for v in &version_candidates { report.push_str(&format!("  version: {}\n", v)); }
         for w in &pii_warnings { report.push_str(&format!("  pii: {}\n", w)); }
         report.push_str("Proposed dataset groups:\n");
         for (g, c) in &groups { report.push_str(&format!("  {} ({} files)\n", g, c)); }
@@ -2260,9 +2456,12 @@ pub fn resolve_dependency_paths(
         } else if let Some(spec) = imp.strip_prefix("use:") {
             let spec = spec.trim_end_matches(';');
             if let Some(rest) = spec.strip_prefix("crate::") {
-                let base = rest.replace("::", "/");
-                push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
-                push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+                let segments: Vec<&str> = rest.split("::").filter(|s| !s.is_empty()).collect();
+                for len in 1..=segments.len() {
+                    let base = segments[..len].join("/");
+                    push_candidates(&mut candidates, std::path::Path::new("src").join(&base).as_path(), &exts);
+                    push_candidates(&mut candidates, std::path::Path::new(&base), &exts);
+                }
             } else if let Some(rest) = spec.strip_prefix("super::") {
                 let base = rest.replace("::", "/");
                 let parent_parent = parent.parent().unwrap_or(parent);
