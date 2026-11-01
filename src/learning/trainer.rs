@@ -71,7 +71,9 @@ impl Trainer {
 
     /// Run a training job for candidate version.
     pub async fn train_candidate(&self, version: &ModelVersion) -> Result<()> {
-        Ok(())
+        // R10: Training is not implemented in this build.
+        let _ = version;
+        Err(anyhow::anyhow!("training is not available in this build (Laya trainer not provisioned)"))
     }
 
     /// Transition job state (no-ops in Phase-0 stub).
