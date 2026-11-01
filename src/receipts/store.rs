@@ -1,4 +1,5 @@
 //! Event-keyed receipt storage with idempotent replay.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 

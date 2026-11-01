@@ -12,5 +12,5 @@ pub mod validator;
 #[cfg(test)]
 pub(crate) mod testkit;
 
-pub use models::{BehavioralRule, ValidateRequest, ValidateResponse, ValidateVerdict};
+pub use models::{BehavioralRule, ValidateRequest, ValidateResponse};
 pub use validator::GuardValidator;

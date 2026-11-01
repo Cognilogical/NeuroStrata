@@ -88,7 +88,7 @@ pub struct FederationExecutionReport {
 
 fn contains_service(pattern: &GraphPattern) -> bool {
     match pattern {
-        GraphPattern::Service { inner, .. } => {
+        GraphPattern::Service { inner: _, .. } => {
             // The inner itself may contain a nested service — handled by
             // the caller that checks inner specifically.
             true
@@ -299,7 +299,7 @@ pub async fn handle_remote_sparql_request(
     query_str: &str,
     namespace: &str,
     host_header: Option<&str>,
-    auth_header: Option<&str>,
+    _auth_header: Option<&str>,
     config: &FederationConfig,
     store: &crate::store::ladybug::LadybugStore,
 ) -> Result<FederationExecutionReport, FederationError> {
@@ -352,9 +352,9 @@ pub async fn handle_remote_sparql_request(
         .map_err(|e| FederationError::Evaluation(format!("{}", e)))?;
 
     // Build JSON report body, respecting max_solutions
-    let mut body = String::new();
+    let body: String;
     let mut count = 0usize;
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
 
     match results {
         spareval::QueryResults::Solutions(mut sol_iter) => {

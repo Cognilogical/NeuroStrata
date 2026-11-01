@@ -153,7 +153,7 @@ impl OxRdfBridge {
 
     /// Convert an OxRdfQuad to NeuroStrata's hand-written Quad.
     pub fn oxrdf_quad_to_neurostrata(quad: &OxRdfQuad) -> crate::rdf::types::Quad {
-        use crate::rdf::types::{Quad as NSQuad, QuadObject, Tier};
+        use crate::rdf::types::{Quad as NSQuad, QuadObject};
 
         let subject = match &quad.inner.subject {
             NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),

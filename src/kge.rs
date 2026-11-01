@@ -23,7 +23,6 @@
 
 // Feature gate removed - kge is core
 use std::path::PathBuf;
-use rand::Rng;
 // Module exports + implementation of env var readers and artifact path helper.
 // These are required for the Argon review: env vars parsed (not just doc comments) and artifact layout helper (used by train task).
 

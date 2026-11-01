@@ -2,4 +2,3 @@
 
 pub mod store;
 
-pub use store::{Receipt, ReceiptStore};

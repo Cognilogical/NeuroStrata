@@ -273,7 +273,7 @@ fn tokenize_term(token: &str, line: usize) -> Result<(String, &str), ParseError>
             }
         }
         // Now rest may contain ^^<datatype> or @lang
-        let mut full_lit = format!("{}\"", literal);
+        let _full_lit = format!("{}\"", literal);
         // Wait - literal currently holds the inner content with escapes preserved
         // Actually let's rebuild properly
         // Reconstruct quoted string with escaped content preserved as original escapes
@@ -294,22 +294,19 @@ fn tokenize_term(token: &str, line: usize) -> Result<(String, &str), ParseError>
     // IRI <...>
     if token.starts_with('<') {
         let mut depth = 1;
-        let mut chars = token.chars().enumerate();
-        let mut pos = 1;
+        let chars = token.chars().enumerate();
         for (i, ch) in chars {
             if i == 0 {
                 continue;
             }
             if ch == '<' {
                 depth += 1;
-                pos = i + 1;
             } else if ch == '>' {
                 depth -= 1;
                 if depth == 0 {
                     let iri = token[..i + 1].to_string();
                     return Ok((iri, &token[i + 1..]));
                 }
-                pos = i + 1;
             }
         }
         return Err(ParseError::InvalidTerm {
@@ -407,8 +404,8 @@ impl Stream {
                     message: format!("expected 3 or 4 terms, got {}", term_count),
                 });
             }
-            let terms_slice = &parts[1..parts.len() - 1];
-            let mut terms: Vec<String> = Vec::new();
+            let _terms_slice = &parts[1..parts.len() - 1];
+            let _terms: Vec<String> = Vec::new();
             // Actually terms_slice is split by whitespace, but terms may contain spaces inside quotes
             // We need to parse more carefully
             // Re-tokenize respecting quotes

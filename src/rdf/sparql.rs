@@ -8,7 +8,6 @@
 //!
 //! See docs/superpowers/specs/2026-10-27-sparql-query-engine-design.md for detailed spec.
 
-use crate::traits::MemoryPayload;
 use oxrdf::{Dataset, Variable};
 use spargebra::SparqlParser;
 use spareval::QueryEvaluator;
@@ -268,7 +267,7 @@ pub async fn execute_sparql_query(
 
     // Serialize results
     let mut output = Vec::new();
-    let mut serializer = QueryResultsSerializer::from_format(format);
+    let serializer = QueryResultsSerializer::from_format(format);
 
     // Extract variables before take() (wrapper loses variables())
     let results_vars: Vec<Variable> = match &results {
@@ -284,7 +283,7 @@ pub async fn execute_sparql_query(
                 .serialize_boolean_to_writer(&mut output, b)
                 .map_err(|e| format!("serialize boolean: {}", e))?;
         }
-        spareval::QueryResults::Solutions(mut solutions) => {
+        spareval::QueryResults::Solutions(solutions) => {
             let solutions = solutions.take(config.max_solutions);
             let mut serializer_solutions =
                 serializer
@@ -300,7 +299,7 @@ pub async fn execute_sparql_query(
             let _ = serializer_solutions.finish()
                 .map_err(|e| format!("serialize finish: {}", e))?;
         }
-        spareval::QueryResults::Graph(mut triples) => {
+        spareval::QueryResults::Graph(triples) => {
             // CONSTRUCT/DESCRIBE: serialize triples as N-Triples.
             for triple in triples {
                 let t = triple.map_err(|e| format!("graph evaluation error: {}", e))?;
@@ -450,9 +449,9 @@ mod tests {
     #[test]
     fn test_custom_functions_salience_valid_at_is_retired() {
         use std::collections::HashMap;
-        use oxrdf::{Dataset, NamedNode};
-        use spargebra::SparqlParser;
-        use spareval::QueryEvaluator;
+        use oxrdf::Dataset;
+        
+        
 
         let mut meta_map = HashMap::new();
         meta_map.insert("urn:neurostrata:memory:m1".into(), serde_json::json!({

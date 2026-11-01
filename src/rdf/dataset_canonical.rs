@@ -102,7 +102,7 @@ pub fn build_mesh_canonical_nquads(
 /// metadata + lifecycle + relationships so the reconstructed payload is
 /// independent of any caller-side escaping or ordering.
 fn rebuild_canonical_nquads(record: &crate::synaptic_mesh::record::MeshRecord) -> String {
-    use crate::synaptic_mesh::record::LifecycleState;
+    
     let meta = record.metadata.as_object().cloned().unwrap_or_default();
     // Content: match worker.rs pattern — string directly, else JSON serialize
     let content_str = match &record.content {

@@ -13,7 +13,7 @@ mod event;
 mod subscriber;
 pub(crate) mod subscribers;
 
-pub use self::bus::{SubscriberId, ThalamicBus};
+pub use self::bus::ThalamicBus;
 pub use self::event::ThalamicPulse;
 pub use self::subscriber::{
     BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,

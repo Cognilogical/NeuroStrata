@@ -1,5 +1,5 @@
 use uuid::Uuid;
-use crate::synaptic_mesh::record::{MeshRecord, Relationship, Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
+use crate::synaptic_mesh::record::{Relationship, Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
 use crate::synaptic_mesh::manifest::Trust;
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
@@ -3086,7 +3086,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
             let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
-            let lifecycle_state_enum: LifecycleState = lifecycle_state.parse().unwrap_or(LifecycleState::Active);
+            let _lifecycle_state_enum: LifecycleState = lifecycle_state.parse().unwrap_or(LifecycleState::Active);
             // created_at is required for deterministic canonical RDF (fail closed).
             let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
                 Some(t) => t.to_string(),
@@ -3110,13 +3110,13 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
                 for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
             }
-            let update_id_raw = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str);
+            let _update_id_raw = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str);
             let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str).to_string();
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
 
             // Convert trust string to Trust enum
-            let trust_enum = match trust {
+            let _trust_enum = match trust {
                 "trusted" => Trust::Trusted,
                 "promoted" => Trust::Promoted,
                 _ => Trust::Untrusted,
@@ -3303,7 +3303,7 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
 
 pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
     use crate::rdf::sparql::{execute_sparql_query};
-    use sparesults::QueryResultsFormat;
+    
 
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
         Some(q) => q.to_string(),

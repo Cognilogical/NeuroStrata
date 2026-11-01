@@ -312,10 +312,9 @@ pub fn get_twin_state_from_rows(
     rows: &[(String, crate::traits::MemoryPayload)],
     twin_id: &str,
 ) -> Option<BTreeMap<String, f64>> {
-    let mut best_id: Option<String> = None;
     let mut best_version = 0u64;
     let mut best_payload: Option<&crate::traits::MemoryPayload> = None;
-    for (id, payload) in rows {
+    for (_id, payload) in rows {
         if payload.memory_type != "digital_twin" {
             continue;
         }
@@ -335,7 +334,6 @@ pub fn get_twin_state_from_rows(
             .unwrap_or(0);
         if version > best_version {
             best_version = version;
-            best_id = Some(id.clone());
             best_payload = Some(payload);
         }
     }
@@ -348,7 +346,7 @@ pub fn twin_history_from_rows(
     limit: usize,
 ) -> Vec<(u64, i64, BTreeMap<String, f64>)> {
     let mut matched: Vec<(u64, i64, BTreeMap<String, f64>)> = Vec::new();
-    for (id, payload) in rows {
+    for (_id, payload) in rows {
         if payload.memory_type != "digital_twin" {
             continue;
         }
@@ -389,7 +387,7 @@ pub fn twin_diff_from_rows(
 ) -> Result<Vec<TwinDelta>, TwinError> {
     let mut from_payload: Option<&crate::traits::MemoryPayload> = None;
     let mut to_payload: Option<&crate::traits::MemoryPayload> = None;
-    for (id, payload) in rows {
+    for (_id, payload) in rows {
         if payload.memory_type != "digital_twin" {
             continue;
         }

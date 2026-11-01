@@ -4,7 +4,7 @@
 //! Quad/QuadObject. The OxRdfBridge provides conversion to/from legacy types.
 
 use crate::traits::MemoryPayload;
-use super::namespace::{field_predicate, graph_iri, ns_predicate, relation_predicate};
+use super::namespace::{field_predicate, ns_predicate, relation_predicate};
 use super::types::{EdgeProvenance, Tier};
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Literal, GraphName, Quad};
 

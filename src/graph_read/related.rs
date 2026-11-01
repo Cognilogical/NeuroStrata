@@ -1,4 +1,5 @@
 //! Bounded 1–2 hop traversal primitives for the `related` graph-read tool.
+#![allow(dead_code)]
 //!
 //! Like `graph_read::memories_for_file`, this module is deliberately free of
 //! `crate::` dependencies (serde + std only) so
@@ -611,7 +612,7 @@ fn build_result(
     stage: String,
     visited: usize,
 ) -> ClosureResult<String> {
-    let mut truncated_final = truncated || hard_truncated;
+    let truncated_final = truncated || hard_truncated;
     let mut budget_exceeded: Option<BudgetExceeded> = None;
     if truncated_final {
         budget_exceeded = Some(BudgetExceeded {

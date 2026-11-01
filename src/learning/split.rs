@@ -59,7 +59,7 @@ struct UnionFind {
 impl UnionFind {
     fn new(n: usize) -> Self {
         let mut parent = vec![0; n];
-        let mut rank = vec![0; n];
+        let rank = vec![0; n];
         for i in 0..n {
             parent[i] = i;
         }

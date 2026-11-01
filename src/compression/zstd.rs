@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 pub const DEFAULT_MESH_MAX_DECOMPRESSED_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SNAPSHOT_MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
@@ -82,7 +82,7 @@ pub fn decompress_bounded(bytes: &[u8], max: usize) -> Result<Vec<u8>, Decompres
 }
 
 pub fn decompress_snapshot(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError> {
-    let mut decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
     let mut buf = Vec::new();
     decoder.take((max as u64) + 1).read_to_end(&mut buf)?;
     if buf.len() > max {
@@ -95,7 +95,7 @@ pub fn decompress_snapshot(bytes: &[u8], max: usize) -> Result<Vec<u8>, Decompre
 }
 
 pub fn decompress_mesh_bundle(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError> {
-    let mut decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
     let mut buf = Vec::new();
     decoder.take((max as u64) + 1).read_to_end(&mut buf)?;
     if buf.len() > max {

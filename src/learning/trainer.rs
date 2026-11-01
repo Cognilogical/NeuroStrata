@@ -1,5 +1,4 @@
 //! Local training loop for Laya-based deduplication candidates.
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -164,6 +163,7 @@ impl Trainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn state_machine_transitions_are_valid() {

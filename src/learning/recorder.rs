@@ -1,14 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs::OpenOptions;
-use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::path::Path;
 
-use futures::executor::block_on;
 
 use crate::learning::observation::{
-    DecisionObservation, LearningContext, LearningOutcome, LearningOutcomeKind, PayloadHash,
+    DecisionObservation, LearningOutcome, PayloadHash,
 };
 
 pub struct LearningRecorder {
@@ -62,8 +59,10 @@ impl LearningRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::learning::BlobStore;
+    use crate::learning::blob_store::BlobStore;
+    use crate::learning::observation::LearningContext;
     use crate::traits::MemoryPayload;
+    use futures::executor::block_on;
     use serde_json::json;
 
     #[test]

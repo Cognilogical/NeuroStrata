@@ -2201,7 +2201,7 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         if w.runs_in == wiring::RunsIn::ProjectPipeline && resolved.is_none() {
             uncovered.push(w.id);
         }
-        let mut entry = json!({
+        let entry = json!({
             "id": w.id,
             "runs_in": w.runs_in.as_str(),
             "blocks": w.blocks,
@@ -3880,6 +3880,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
     fn ns_key_lowercases_and_sanitizes() {
         assert_eq!(ns_key("MyProj"), "myproj");
         assert_eq!(ns_key("NeuroStrata"), "neurostrata");

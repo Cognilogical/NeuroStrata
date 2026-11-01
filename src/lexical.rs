@@ -2,12 +2,12 @@
 //! Unconditionally compiled; `tantivy = "0.27"` is present in Cargo.toml.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
+use tantivy::query::QueryParser;
 use tantivy::schema::{Field as TantivyField, Schema, STORED, STRING, TEXT, FAST, INDEXED, Value as TantivyValue};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 

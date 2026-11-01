@@ -7,12 +7,11 @@ pub mod laya_onnx;
 
 pub use policy::{CalibrationTier, DedupDecision};
 
-pub use laya_onnx::{ModelVersion, RuntimeState};
+pub use laya_onnx::RuntimeState;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -176,7 +175,7 @@ impl DeduplicationChecker {
         new_memory: &MemoryPayload,
         candidates: &[SearchResult],
     ) -> Option<Vec<DuplicateJudgment>> {
-        let active = self.provider_set.active.clone()?;
+        let _active = self.provider_set.active.clone()?;
         if let Some(provider) = &self.provider_set.active {
             if !self.circuit_breaker.allow_request() {
                 tracing::debug!(
@@ -201,7 +200,7 @@ impl DeduplicationChecker {
 
         match result {
             Ok(Ok(judgments)) => {
-                if let Some(provider) = &self.provider_set.active {
+                if let Some(_provider) = &self.provider_set.active {
                     self.circuit_breaker.record_success();
                 }
                 let duplicates: Vec<_> = judgments
@@ -221,7 +220,7 @@ impl DeduplicationChecker {
                     error = %e,
                     "Judgment provider error"
                 );
-                if let Some(provider) = &self.provider_set.active {
+                if let Some(_provider) = &self.provider_set.active {
                     self.circuit_breaker.record_failure();
                 }
                 None
@@ -232,7 +231,7 @@ impl DeduplicationChecker {
                     timeout_seconds = self.config.timeout_seconds,
                     "Judgment call timed out"
                 );
-                if let Some(provider) = &self.provider_set.active {
+                if let Some(_provider) = &self.provider_set.active {
                     self.circuit_breaker.record_failure();
                 }
                 None

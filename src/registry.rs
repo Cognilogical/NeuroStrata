@@ -450,7 +450,7 @@ pub async fn write_registry(
                 let sb = b.get("slug").and_then(|v| v.as_str()).unwrap_or("");
                 sa.cmp(sb)
             });
-            let mut v2meta = registry_metadata_v2(&entries);
+            let v2meta = registry_metadata_v2(&entries);
             // merge v2meta.domain_registry into meta, preserving other keys
             if let Some(dr) = v2meta.get("domain_registry").cloned() {
                 obj.insert("domain_registry".to_string(), dr);
@@ -725,7 +725,7 @@ mod tests {
         use crate::traits::VectorStore;
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let emb_trait: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
-        let emb = Arc::new(StubEmbedder);
+        let _emb = Arc::new(StubEmbedder);
         let namespace = "test-f12";
         // Pre-populate registry row so enrichment_commit needs no emb
         let payload = MemoryPayload {
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(totals["latency_ms"], 250);
 
         // enrichment_fail recording (simulated using direct metadata mutation + state construction)
-        let mut meta = serde_json::json!({
+        let meta = serde_json::json!({
             "enrichment_state": {
                 "state":"running",
                 "watermark":null,
@@ -822,7 +822,7 @@ mod tests {
         use crate::traits::VectorStore;
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let emb_trait: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
-        let emb = Arc::new(StubEmbedder);
+        let _emb = Arc::new(StubEmbedder);
         let namespace = "test-f24";
         let payload = MemoryPayload {
             content: registry_content(namespace),

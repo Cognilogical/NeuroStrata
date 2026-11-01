@@ -935,7 +935,7 @@ pub async fn ingest_directory(
         if let Ok(rows) = vector_store.list(namespace, None, None).await {
             for r in rows {
                 let id = r.id.clone();
-                let (ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
                     Some(x) => x,
                     None => continue,
                 };
@@ -1059,7 +1059,7 @@ pub async fn ingest_directory(
         if let Ok(rows) = vector_store.list(namespace, None, None).await {
             for r in rows {
                 let id = r.id.clone();
-                let (ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
                     Some(x) => x,
                     None => continue,
                 };
@@ -1172,9 +1172,9 @@ pub async fn ingest_directory(
 
     // Watermark + stage telemetry on the namespace registry row (F12).
     let current_version = ingest_version(&schema.fingerprint());
-    let mut current_hashes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let current_hashes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for path_str in &current_paths {
-        if let Some(h) = current_hashes.get(path_str) { break; }
+        if let Some(_h) = current_hashes.get(path_str) { break; }
     }
     // Compute deterministic source_digest over sorted (path, hash) pairs.
     let mut digest_entries: Vec<(String, String)> = current_hashes
@@ -2144,7 +2144,7 @@ use super::x;"#;
 
         // Check registry row has watermark and telemetry.
         let registry_id = crate::registry::registry_row_id("f2");
-        let (vec, payload) = store.get("f2", &registry_id).await.unwrap().expect("registry row");
+        let (_vec, payload) = store.get("f2", &registry_id).await.unwrap().expect("registry row");
         let meta = payload.metadata.as_object().expect("metadata");
         assert!(meta.contains_key("enrichment_state"), "enrichment_state present");
         let state = meta.get("enrichment_state").expect("state");
@@ -2158,7 +2158,7 @@ use super::x;"#;
         let gen2 = store.active_generation("f2", &source_key).await.unwrap();
         assert!(gen2 > gen1, "second ingest produces newer generation");
         // Watermark updated (same fingerprint if schema unchanged, updated digest if files same).
-        let (vec2, payload2) = store.get("f2", &registry_id).await.unwrap().expect("registry row 2");
+        let (_vec2, payload2) = store.get("f2", &registry_id).await.unwrap().expect("registry row 2");
         let meta2 = payload2.metadata.as_object().expect("meta2");
         let wm2 = meta2.get("enrichment_state").expect("state2").get("watermark").expect("wm2");
         assert!(wm2.get("source_digest").is_some(), "updated digest");
@@ -2308,7 +2308,7 @@ pub async fn dry_run_directory(
             }
         }
     }
-    for (key, path_set) in &stem_dir_map {
+    for (_key, path_set) in &stem_dir_map {
         if path_set.len() > 1 {
             for path_str in path_set {
                 if !version_candidates.contains(path_str) {

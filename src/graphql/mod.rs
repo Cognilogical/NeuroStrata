@@ -136,7 +136,7 @@ fn build_memory_node(
     edges_by_source: &HashMap<String, Vec<(String, String, Option<String>)>>,
     principal: &str,
     variable_first: Option<i32>,
-    variable_after: Option<&str>,
+    _variable_after: Option<&str>,
     include_archived: bool,
     include_retired: bool,
 ) -> Option<Value> {
@@ -252,9 +252,9 @@ pub fn execute_on_records(
         "location", "locationLines", "validFrom", "validTo", "feedbackScore",
         "metadata", "mentions", "edges", "__typename",
     ].iter().cloned().collect();
-    let allowed_edge_fields: HashSet<&str> = ["targetId", "relation", "extractor", "__typename"].iter().cloned().collect();
+    let _allowed_edge_fields: HashSet<&str> = ["targetId", "relation", "extractor", "__typename"].iter().cloned().collect();
     let allowed_connection_fields: HashSet<&str> = ["edges", "pageInfo", "__typename"].iter().cloned().collect();
-    let allowed_pageinfo_fields: HashSet<&str> = ["hasNextPage", "endCursor", "__typename"].iter().cloned().collect();
+    let _allowed_pageinfo_fields: HashSet<&str> = ["hasNextPage", "endCursor", "__typename"].iter().cloned().collect();
 
     // Basic field validation by scanning selection set names (simplified heuristics)
     // For the unit tests, we mainly need to detect unknown root and unknown selection on Memory/Edge/MemoryConnection/PageInfo

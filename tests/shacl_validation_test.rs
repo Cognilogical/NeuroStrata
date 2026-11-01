@@ -38,7 +38,7 @@ pub mod multimodal;
 mod shacl;
 
 use serde_json::Value;
-use shacl::{validate_memory, ShaclViolation};
+use shacl::validate_memory;
 
 // Replicate MemoryPayload inline (same as src/traits.rs definition)
 struct TestMemoryPayload {

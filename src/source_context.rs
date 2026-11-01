@@ -4,7 +4,7 @@ use std::sync::Once;
 
 /// A legacy, process-provided project root scoped to one source identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScopedAnchorOverride {
+pub struct ScopedAnchorOverride {
     pub(crate) source_id: String,
     pub(crate) project_root: PathBuf,
 }

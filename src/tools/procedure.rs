@@ -195,7 +195,7 @@ pub(crate) fn procedures_due_strap_filtered(
     if needle.is_empty() {
         return procedures_due_strap(memories, now);
     }
-    let mut filtered: Vec<Value> = all
+    let filtered: Vec<Value> = all
         .into_iter()
         .filter(|row| {
             let trigger = row.get("trigger").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();

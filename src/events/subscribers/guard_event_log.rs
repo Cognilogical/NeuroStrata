@@ -25,7 +25,7 @@
 use crate::events::{
     MemorySubscriber, RecursionToken, SubscriberContext, SubscriberError, ThalamicPulse,
 };
-use crate::traits::{MemoryPayload, VectorStore};
+use crate::traits::MemoryPayload;
 use async_trait::async_trait;
 use serde_json::json;
 
@@ -189,6 +189,7 @@ mod tests {
     use super::*;
     use crate::events::{ThalamicBus, ThalamicPulse};
     use crate::store::LadybugStore;
+    use crate::traits::VectorStore;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};

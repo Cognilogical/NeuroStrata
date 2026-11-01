@@ -309,7 +309,7 @@ impl TimeSeriesStore {
                 if key.0 == namespace && key.1 == metric {
                     for s in series.samples.iter() {
                         if from.map_or(true, |f| s.ts >= f) && to.map_or(true, |t| s.ts <= t) {
-                            let mut samp = s.clone();
+                            let samp = s.clone();
                             // Ensure stage field reflects stage from series key
                             // (already embedded via id, but keep as-is)
                             all_samples.push(samp);

@@ -1,5 +1,6 @@
 // Increase recursion limit for large JSON literals in tools/list
 #![recursion_limit = "256"]
+#![allow(dead_code)]
 
 mod attempt;
 mod buffer;
@@ -56,7 +57,7 @@ mod tools;
 mod traits;
 
 use crate::traits::SearchResult;
-use crate::traits::{Embedder, VectorStore};
+use crate::traits::VectorStore;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use config::Config;

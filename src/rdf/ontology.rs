@@ -1,13 +1,12 @@
 use crate::domain;
 use crate::registry;
-use crate::rdf::shacl::{ShaclViolation, validate_memory};
+use crate::rdf::shacl::ShaclViolation;
 use oxrdf::NamedOrBlankNode;
 use oxrdf::Term;
 use crate::traits::MemoryPayload;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct QueryBudget {

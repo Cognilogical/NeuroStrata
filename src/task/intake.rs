@@ -9,10 +9,8 @@
 //! - No mesh travel, no task status expansion, no extraction exemption
 
 use crate::task::intent::detect_task_intents;
-use crate::traits::VectorStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Source kind for an intake receipt.

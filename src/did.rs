@@ -1,4 +1,4 @@
-use openssl::pkey::{PKey, Id, Private, Public};
+use openssl::pkey::{PKey, Id, Private};
 use openssl::sign::{Signer, Verifier};
 use serde_json;
 use std::fs;
@@ -102,7 +102,7 @@ pub fn encode_base58btc(bytes: &[u8]) -> String {
     // Reverse the digits produced (they come out LSB first)
     let chars: Vec<char> = out.chars().collect();
     let prefix_len = zeros;
-    let mut reversed = chars[prefix_len..].iter().rev().cloned().collect::<String>();
+    let reversed = chars[prefix_len..].iter().rev().cloned().collect::<String>();
     out = chars[..prefix_len].iter().cloned().collect();
     out.push_str(&reversed);
     out
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn signer_did_and_public_key_from_did_roundtrip() {
-        let (pkey, did, pubkey) = generate_keypair().unwrap();
+        let (_pkey, did, pubkey) = generate_keypair().unwrap();
         assert!(did.starts_with("did:key:z6Mk"));
         assert_eq!(pubkey.len(), 32);
         let recovered = public_key_from_did(&did).unwrap();
@@ -360,12 +360,12 @@ mod tests {
         assert!(!did.is_empty());
         assert_eq!(pubkey.len(), 32);
         // Load back
-        let (pkey2, did2, pubkey2) = load_or_generate_keypair(&tmp).unwrap();
+        let (_pkey2, did2, pubkey2) = load_or_generate_keypair(&tmp).unwrap();
         assert_eq!(did, did2);
         assert_eq!(pubkey, pubkey2);
         // Keypair to PEM and back
         let pem = keypair_to_private_pem(&pkey).unwrap();
-        let (pkey3, did3, pubkey3) = keypair_from_private_pem(&pem).unwrap();
+        let (_pkey3, did3, pubkey3) = keypair_from_private_pem(&pem).unwrap();
         assert_eq!(did, did3);
         assert_eq!(pubkey, pubkey3);
         // Clean up

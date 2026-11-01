@@ -116,7 +116,7 @@ impl GuardValidator {
             match sandbox_result {
                 Ok(verdict) => {
                     // Extract constraints from rules for context
-                    let constraints: Vec<String> = matching_rules
+                    let _constraints: Vec<String> = matching_rules
                         .iter()
                         .filter(|r| r.status != "deprecated")
                         .map(|r| r.constraint_text.clone())
@@ -158,7 +158,7 @@ impl GuardValidator {
         session_id: &str,
         active_task_id: Option<&str>,
         worktree: &str,
-        action_type: &str,
+        _action_type: &str,
         is_mutating: bool,
     ) -> (bool, Option<String>) {
         // If action is non-mutating, always permit (reads free).

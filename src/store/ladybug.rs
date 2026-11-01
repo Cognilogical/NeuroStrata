@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use lbug::{Connection, Database, SystemConfig};
 
-use crate::domain::domain_key;
 use crate::traits::{
     DomainMatchMode, DomainSearchOutcome, GraphMatchKind, GraphRead, MemoryHit, MemoryPayload,
     RelocateOutcome, SearchResult, VectorStore,
@@ -164,7 +163,7 @@ async fn search_inner(
             //
             // ORDER BY dist ASC, id ASC gives deterministic tie-breaking so the
             // same query returns the same rows across runs.
-            let structural_types = STRUCTURAL_MEMORY_TYPES
+            let _structural_types = STRUCTURAL_MEMORY_TYPES
                 .iter()
                 .map(|t| format!("'{}'", t))
                 .collect::<Vec<_>>()
@@ -5596,11 +5595,11 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
                 let created_at: String = format!("{}", row[9]);
                 let updated_at: String = format!("{}", row[10]);
-                let candidate_kind: String = format!("{}", row[11]);
-                let payload_str: String = format!("{}", row[12]);
-                let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
-                let source_span_str: String = format!("{}", row[14]);
-                let extractor_fingerprint: Option<String> = {
+                let _candidate_kind: String = format!("{}", row[11]);
+                let _payload_str: String = format!("{}", row[12]);
+                let _confidence: Option<f64> = format!("{}", row[13]).parse().ok();
+                let _source_span_str: String = format!("{}", row[14]);
+                let _extractor_fingerprint: Option<String> = {
                     let s = format!("{}", row[15]);
                     if s.is_empty() { None } else { Some(s) }
                 };
@@ -9359,7 +9358,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let zero = vec![0.0f32; 4];
+        let _zero = vec![0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Primary: a fact that matches the query
@@ -9635,7 +9634,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let zero = vec![0.0f32; 4];
+        let _zero = vec![0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Two primaries that both connect to the same expansion candidate
@@ -9730,7 +9729,7 @@ eurostrata\src\daemon.rs",
         // Verify ordering by co-occurrence (descending)
         let mut prev_count = usize::MAX;
         for r in &gov_expansions {
-            let count = r
+            let _count = r
                 .evidence
                 .as_ref()
                 .unwrap()
@@ -10043,7 +10042,7 @@ eurostrata\src\daemon.rs",
     async fn family_independence_one_hop_does_not_crowd_out_siblings() {
         let store = episode_sibling_test_store().await;
         // Add many one-hop neighbors
-        let zero = vec![0.0f32; 4];
+        let _zero = vec![0.0f32; 4];
         for i in 0..5 {
             store
                 .upsert(

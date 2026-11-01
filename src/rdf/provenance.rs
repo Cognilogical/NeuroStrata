@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn project_memory_rdf_star_emits_base_and_assertion() {
-        let (qs, w) = project_memory_rdf_star("ns", "m1", &sample_payload(), crate::rdf::types::Tier::Domain, 1);
+        let (qs, _w) = project_memory_rdf_star("ns", "m1", &sample_payload(), crate::rdf::types::Tier::Domain, 1);
         assert!(!qs.is_empty());
         assert!(qs.iter().any(|q| q.predicate.as_str().contains("content")));
         assert!(qs.iter().any(|q| q.object.to_string().contains("Assertion") || q.predicate.as_str().contains("type") && q.object.to_string().contains("Assertion")));
@@ -649,7 +649,7 @@ mod tests {
             valid_to: 0,
             generation: 1,
         };
-        let (qs, w) = project_edge_rdf_star("ns", "a", "GOVERNS", "b", &prov, None, GraphName::DefaultGraph);
+        let (qs, _w) = project_edge_rdf_star("ns", "a", "GOVERNS", "b", &prov, None, GraphName::DefaultGraph);
         assert!(!qs.is_empty());
     }
 

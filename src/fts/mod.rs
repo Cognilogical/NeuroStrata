@@ -1,4 +1,5 @@
 //! In-house multi-field lexical engine.
+#![allow(dead_code)]
 //!
 //! This module is deliberately `std`-only: the native store and the
 //! `crates/neurostrata-wasm` read-only engine compile it from this path, so it

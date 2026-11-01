@@ -208,6 +208,12 @@ mod tests {
         let h = make("h1", "rule", "new rule", serde_json::json!({"location":"loc4","enforcement":"ENFORCED","valid_to":9999999999_i64}));
         let conflicts4 = detect_conflicts(&[g, h]);
         assert!(conflicts4.is_empty());
+        // (e) Unrelated rules sharing broad file location but no topic overlap -> no conflict
+        let mut r1 = make("r1", "rule", "Never use docker containers", serde_json::json!({"location":"AGENTS.md"}));
+        r1.payload.location = "AGENTS.md".to_string();
+        let mut r2 = make("r2", "rule", "Always use absolute file paths", serde_json::json!({"location":"AGENTS.md"}));
+        r2.payload.location = "AGENTS.md".to_string();
+        assert!(detect_conflicts(&[r1, r2]).is_empty());
     }
 
     #[test]
@@ -418,7 +424,11 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
             let b = active[j];
             if b.payload.memory_type != "rule" && b.payload.memory_type != "fact" { continue; }
             // same location or topology
-            let same_loc = !a.payload.location.is_empty() && a.payload.location == b.payload.location;
+            let loc_a = a.payload.location.trim();
+            let loc_b = b.payload.location.trim();
+            let valid_loc = !loc_a.is_empty()
+                && !matches!(loc_a.to_ascii_lowercase().as_str(), "n/a" | "none" | "unknown" | "global");
+            let same_loc = valid_loc && loc_a == loc_b;
             let topo_a = a.payload.metadata.get("topology");
             let topo_b = b.payload.metadata.get("topology");
             // Topology conflict (K2): same (component, target_system) anchor but
@@ -488,8 +498,8 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
                     flag = true;
                 }
             }
-            // Opposite polarity for rules governing same target (topology or location).
-            if (same_loc || same_topo_anchor) && neg_opposition {
+            // Opposite polarity for rules governing same target (topology or location with topic overlap).
+            if (same_topo_anchor || (same_loc && sim >= 0.35)) && neg_opposition {
                 // only flag if at least one is a rule
                 if a.payload.memory_type == "rule" || b.payload.memory_type == "rule" {
                     flag = true;

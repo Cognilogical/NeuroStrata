@@ -60,7 +60,7 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
 
     let mut out = Vec::new();
 
-    if payload.content.trim().is_empty() {
+    if payload.content.trim().is_empty() && !is_structural(payload.memory_type.as_str()) {
         out.push(ShaclViolation {
             field: "content".to_string(),
             why: "content must be non-empty".to_string(),
@@ -372,7 +372,8 @@ fn is_structural(t: &str) -> bool {
 pub fn endpoint_role_allowed(rel_type: &str, source_type: &str, target_type: &str) -> bool {
     match rel_type {
         "GOVERNS" => source_type == "rule" || source_type == "fact",
-        "CONTAINS" => CONTAINED_TYPES.contains(&source_type) && CONTAINER_TYPES.contains(&target_type),
+        "CONTAINS" => (CONTAINED_TYPES.contains(&source_type) && CONTAINER_TYPES.contains(&target_type))
+            || (source_type == "task" && target_type == "task"),
         "EXTRACTED_FROM" => !is_structural(source_type) && target_type == "task",
         _ => true,
     }
@@ -400,5 +401,26 @@ mod tests {
     #[test]
     fn parse_embedded_shapes_returns_count() {
         assert!(parse_embedded_shapes() > 0, "embedded SHACL .ttl shapes must parse");
+    }
+
+    #[test]
+    fn endpoint_contains_task_task_and_rejects_invalid() {
+        assert!(endpoint_role_allowed("CONTAINS", "task", "task"), "task contains task should be valid");
+        assert!(!endpoint_role_allowed("CONTAINS", "rule", "fact"), "rule contains fact should be invalid");
+    }
+
+    #[test]
+    fn validate_memory_file_empty_content_no_content_violation() {
+        let payload = MemoryPayload {
+            content: "".to_string(),
+            user_id: "u1".to_string(),
+            memory_type: "file".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        };
+        let v = validate_memory(&payload);
+        assert!(v.iter().all(|vi| vi.field != "content"), "structural file with empty content must not emit content violation: got {:?}", v);
     }
 }

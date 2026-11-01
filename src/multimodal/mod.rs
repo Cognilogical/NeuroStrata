@@ -234,8 +234,8 @@ fn parse_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         // SOF markers
         if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
             if i + 7 < bytes.len() {
-                let height = ((bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32));
-                let width = ((bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32));
+                let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32) ;
+                let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32) ;
                 if height > 0 && width > 0 {
                     return Some((width, height));
                 }
@@ -287,8 +287,8 @@ fn parse_vp8_lossy(bytes: &[u8]) -> Option<(u32, u32)> {
     let b27 = bytes.get(27)?;
     let b28 = bytes.get(28)?;
     let b29 = bytes.get(29)?;
-    let width = (((*b26 as u16) | ((*b27 as u16) << 8)) & 0x3FFF) as u32;
-    let height = (((*b28 as u16) | ((*b29 as u16) << 8)) & 0x3FFF) as u32;
+    let _width = (((*b26 as u16) | ((*b27 as u16) << 8)) & 0x3FFF) as u32;
+    let _height = (((*b28 as u16) | ((*b29 as u16) << 8)) & 0x3FFF) as u32;
     // Actually width/height are packed differently. Let's use simple approach:
     // Per spec: width at 26..28 (little-endian 14 bits), height at 28..30.
     let width_raw = u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF;

@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! The context read-planning boundary.
 //!
 //! `context/` owns read planning and rendering only. It does not own

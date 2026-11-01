@@ -8,7 +8,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use crate::learning::labels::{derive_labels, LabelRule, LabelTier};
-use crate::learning::split::DatasetSplits;
 use crate::learning::observation::{DecisionObservation, LearningOutcome, LearningOutcomeKind};
 
 /// Measured raw-distance bands per embedder for the dedup policy.
@@ -254,17 +253,10 @@ pub async fn build_dedup_dataset(
         .filter_map(|r| r.id.strip_prefix("rule-").map(|s| s.to_string()))
         .collect();
 
-    let mut train_ids: Vec<String> = observations.iter()
+    let _train_ids: Vec<String> = observations.iter()
         .filter(|o| !weak_obs_ids.contains(&o.observation_id))
         .map(|o| o.observation_id.clone()).collect();
     // Actually split assigns all; we just filter weak out of calib/eval
-    // Recompute based on split assignments
-    let mut train_rows = 0usize;
-    let mut proxy_calib_rows = 0usize;
-    let mut proxy_eval_rows = 0usize;
-    let mut gold_calib_rows = 0usize;
-    let mut gold_eval_rows = 0usize;
-
     // Helper to write JSONL for a subset
     fn write_jsonl(path: &Path, items: &[DecisionObservation]) -> Result<()> {
         let mut f = std::fs::File::create(path)?;
@@ -281,7 +273,7 @@ pub async fn build_dedup_dataset(
         .filter(|o| splits.train.contains(&o.observation_id))
         .collect();
     write_jsonl(&out_dir.join("train.jsonl"), &train_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
-    train_rows = train_obs.len();
+    let train_rows = train_obs.len();
 
     // Calibration / eval only from non-weak, assigned to those splits
     let calib_obs: Vec<&DecisionObservation> = observations.iter()
@@ -328,10 +320,10 @@ pub async fn build_dedup_dataset(
     write_jsonl(&out_dir.join("gold_calibration.jsonl"), &gold_calib_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
     write_jsonl(&out_dir.join("gold_eval.jsonl"), &gold_eval_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
 
-    proxy_calib_rows = proxy_calib_obs.len();
-    proxy_eval_rows = proxy_eval_obs.len();
-    gold_calib_rows = gold_calib_obs.len();
-    gold_eval_rows = gold_eval_obs.len();
+    let proxy_calib_rows = proxy_calib_obs.len();
+    let proxy_eval_rows = proxy_eval_obs.len();
+    let gold_calib_rows = gold_calib_obs.len();
+    let gold_eval_rows = gold_eval_obs.len();
 
     // 7. Manifest
     let manifest = DatasetManifest {
@@ -354,7 +346,7 @@ pub async fn build_dedup_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    
 
     #[test]
     fn failing_build_dedup_dataset_empty_root() {

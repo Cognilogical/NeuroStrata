@@ -1,5 +1,4 @@
 //! Evaluation suite for candidate models.
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Report for a single evaluation suite.

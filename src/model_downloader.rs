@@ -349,7 +349,7 @@ mod tests {
     fn extract_tar_gz_writes_member() {
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        use std::io::Write;
+        
         use tar::Builder;
 
         let tmp = std::env::temp_dir().join("ns-tar-test");

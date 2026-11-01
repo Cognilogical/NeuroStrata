@@ -14,6 +14,7 @@ pub enum MetricKind {
     IngestLatencyMs,
 }
 
+#[allow(non_upper_case_globals)]
 pub const Latency: MetricKind = MetricKind::EnrichmentLatencyMs;
 
 impl MetricKind {

@@ -19,7 +19,7 @@ impl BlobStore {
     }
 
     pub fn put(&self, payload: &MemoryPayload) -> Result<PayloadHash> {
-        use std::io::Write;
+        
         // SHA-256 of the content string
         let mut hasher = sha2::Sha256::default();
         hasher.update(payload.content.as_bytes());

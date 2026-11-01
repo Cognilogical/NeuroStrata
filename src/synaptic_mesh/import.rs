@@ -2702,7 +2702,7 @@ mod tests {
             "trust": "untrusted"
         });
         let body = serde_json::to_string(&proc_json).unwrap();
-        let rel = commit_record_json(&mesh, "probe", "procedures", &id.to_string(), &body);
+        let _rel = commit_record_json(&mesh, "probe", "procedures", &id.to_string(), &body);
         // The ASSERT: the shared file itself carries no counters.
         for counter in RUNTIME_COUNTER_KEYS {
             assert!(
