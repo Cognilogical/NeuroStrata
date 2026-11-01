@@ -156,7 +156,7 @@ pub const COMMUNITY_STRUCTURAL_TYPES: [&str; 6] = [
 #[cfg(feature = "community")]
 pub use inner::*;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "community"))]
 mod tests {
     use super::*;
 
