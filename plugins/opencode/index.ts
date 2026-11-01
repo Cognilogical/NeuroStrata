@@ -752,7 +752,7 @@ async function wrapMutatingTool(
 // Turn Hook: intent detection + nudge
 // ──────────────────────────────────────────────────────────────────────
 
-async function onTurnEnd(turn: {
+export async function onTurnEnd(turn: {
   role: "user" | "assistant";
   content: string;
 }): Promise<void> {
@@ -779,6 +779,18 @@ async function onTurnEnd(turn: {
 // resolver, the wire helpers, the verdict parser and the adapter status are
 // the contract the adapter tests exercise.
 // ──────────────────────────────────────────────────────────────────────
+
+export async function fetchContextPlan(opts: {
+  namespace: string;
+  query?: string;
+  file_path?: string;
+  max_items?: number;
+  max_bytes?: number;
+  format?: "json" | "text";
+}): Promise<string> {
+  if (!mcpClient) throw new Error("NeuroStrata MCP client not initialized");
+  return await mcpClient.callTool("neurostrata_context_plan", opts);
+}
 
 export default Plugin.define({
   id: "neurostrata",

@@ -5176,6 +5176,26 @@ async fn handle_search_memory(
         .unwrap_or_default();
     let node_set_mode = arguments.get("node_set_mode").and_then(|v| v.as_str()).unwrap_or("any").to_string();
     let domain_expansion = arguments.get("domain_expansion").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
+    // existing search behavior (include_code_ast defaults to true so searches
+    // that match code_ast rows keep working unless explicitly disabled).
+    let search_filters = crate::search::SearchFilters {
+        memory_types: arguments
+            .get("memory_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        fact_shape: arguments.get("fact_shape").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        path_prefix: arguments.get("path_prefix").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        exclude_stale: arguments.get("exclude_stale").and_then(|v| v.as_bool()).unwrap_or(false),
+        include_code_ast: arguments.get("include_code_ast").and_then(|v| v.as_bool()).unwrap_or(true),
+    };
+    let has_upgraded_filters = !search_filters.memory_types.is_empty()
+        || search_filters.fact_shape.is_some()
+        || search_filters.path_prefix.is_some()
+        || search_filters.exclude_stale
+        || !search_filters.include_code_ast;
     // domains filter (OR) - thread into search_with_domain? Store filters by domains already via `domain` param.
     // For now, merge domains into the existing `domains` variable handling below.
 
@@ -5292,6 +5312,9 @@ async fn handle_search_memory(
                 }
             });
         }
+        if has_upgraded_filters {
+            results.retain(|r| crate::search::passes_filters(&r.payload.memory_type, &r.payload.metadata, &r.payload.location, &search_filters));
+        }
         results.truncate(DEFAULT_LIMIT);
 
         if results.is_empty() {
@@ -5387,6 +5410,9 @@ async fn handle_search_memory(
                         }
                     });
                 }
+                if has_upgraded_filters {
+                    results.retain(|r| crate::search::passes_filters(&r.payload.memory_type, &r.payload.metadata, &r.payload.location, &search_filters));
+                }
                 // Optional in-house lexical blend (config-gated, off by default).
                 // Merge the lexical candidate set into the vector result set and
                 // re-score with the documented single rule. Vector-only rows
@@ -5452,6 +5478,9 @@ async fn handle_search_memory(
                                 if !keep {
                                     continue;
                                 }
+                            }
+                            if has_upgraded_filters && !crate::search::passes_filters(&lex.payload.memory_type, &lex.payload.metadata, &lex.payload.location, &search_filters) {
+                                continue;
                             }
                             let blended = 0.7 + 0.3 * lex.score;
                             let mut lex = lex;
@@ -11147,7 +11176,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+#[tokio::test]
+async fn test_handle_search_memory_applies_search_filters() {
+    let dir = std::env::temp_dir().join(format!("ns-sf-{}", uuid::Uuid::new_v4()));
+    let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+        crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp database"),
+    );
+    store.init("probe").await.expect("init namespace");
+
+    let id_rule = uuid::Uuid::new_v4().to_string();
+    let mut p_rule = payload("always use podman");
+    p_rule.location = "src/a.rs".to_string();
+    p_rule.memory_type = "rule".to_string();
+    store
+        .upsert("probe", &id_rule, StubEmbedder.embed("always use podman").await.unwrap(), p_rule)
+        .await
+        .expect("seed rule");
+
+    let id_fact = uuid::Uuid::new_v4().to_string();
+    let mut p_fact = payload("podman database access");
+    p_fact.location = "src/b.rs".to_string();
+    p_fact.memory_type = "fact".to_string();
+    p_fact.metadata = serde_json::json!({"source_currency":"changed","verification":{"status":"unverified"}});
+    store
+        .upsert("probe", &id_fact, StubEmbedder.embed("podman database access").await.unwrap(), p_fact)
+        .await
+        .expect("seed fact");
+
+    let id_code = uuid::Uuid::new_v4().to_string();
+    let mut p_code = payload("podman code ast");
+    p_code.location = "src/c.rs".to_string();
+    p_code.memory_type = "code_ast".to_string();
+    store
+        .upsert("probe", &id_code, StubEmbedder.embed("podman code ast").await.unwrap(), p_code)
+        .await
+        .expect("seed code_ast");
+
+    // memory_types filter
+    let text = handle_search_memory(
+        serde_json::json!({"namespace":"probe","query":"podman","memory_types":["rule"],"mode":"lexical-inhouse"}),
+        Arc::new(StubEmbedder),
+        store.clone(),
+    )
+    .await;
+    assert!(text.contains(&id_rule), "rule should survive memory_types filter: {text}");
+    assert!(!text.contains(&id_fact), "fact should be filtered out: {text}");
+    assert!(!text.contains(&id_code), "code_ast should be filtered out: {text}");
+
+    // path_prefix filter
+    let text = handle_search_memory(
+        serde_json::json!({"namespace":"probe","query":"podman","path_prefix":"src/b.rs","mode":"lexical-inhouse"}),
+        Arc::new(StubEmbedder),
+        store.clone(),
+    )
+    .await;
+    assert!(text.contains(&id_fact), "fact should survive path_prefix filter: {text}");
+    assert!(!text.contains(&id_rule), "rule should be filtered out by path_prefix: {text}");
+
+    // exclude_stale filter
+    let text = handle_search_memory(
+        serde_json::json!({"namespace":"probe","query":"podman","exclude_stale":true,"mode":"lexical-inhouse"}),
+        Arc::new(StubEmbedder),
+        store.clone(),
+    )
+    .await;
+    assert!(!text.contains(&id_fact), "stale fact should be excluded: {text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
+
+}
+
 
 async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String {
     // Parse namespace.

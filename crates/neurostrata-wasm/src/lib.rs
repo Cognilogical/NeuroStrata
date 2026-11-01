@@ -528,4 +528,33 @@ mod tests {
         let res = engine.list("ns", r#"{"badfield":"x"}"#);
         assert!(res.contains("error"));
     }
+
+    #[test]
+    fn wasm_engine_load_snapshot_and_namespaces_and_get_memory() {
+        let mut engine = WasmEngine::new(0.0);
+        let json = r#"{"version":1,"records":[{"id":"m1","namespace":"ns","payload":{"content":"hello world","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[1.0,2.0],"embedding_id":"e1"},{"id":"m2","namespace":"ns2","payload":{"content":"another","user_id":"u","memory_type":"fact","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":null}],"edges":[]}"#;
+        let report = engine.load_snapshot(json);
+        assert!(report.contains("\"ok\":true"), "load report: {report}");
+        let ns = engine.namespaces();
+        assert!(ns.contains("ns"), "namespaces: {ns}");
+        assert!(ns.contains("ns2"), "namespaces: {ns}");
+        let mem = engine.get_memory("ns", "m1", false, false);
+        assert!(mem.contains("m1"), "get_memory: {mem}");
+        let missing = engine.get_memory("ns", "nope", false, false);
+        assert_eq!(missing, "null");
+    }
+
+    #[test]
+    fn wasm_engine_search_and_vector_search_and_neighbors() {
+        let mut engine = WasmEngine::new(0.0);
+        let json = r#"{"version":1,"records":[{"id":"m1","namespace":"ns","payload":{"content":"podman container","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[1.0,0.0],"embedding_id":"e1"},{"id":"m2","namespace":"ns","payload":{"content":"docker container","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[0.0,1.0],"embedding_id":"e1"}],"edges":[{"source":"m1","relation":"RELATES_TO","target":"m2"}]}"#;
+        engine.load_snapshot(json);
+        let search = engine.search("ns", "podman", 10, false, false);
+        assert!(search.contains("m1"), "search: {search}");
+        let vs = engine.vector_search("ns", &[1.0, 0.0], "e1", 10, false, false);
+        assert!(vs.contains("m1"), "vector_search: {vs}");
+        let nb = engine.neighbors("ns", "m1", "", "out", 1, 10);
+        assert!(nb.contains("m2"), "neighbors: {nb}");
+    }
+
 }
