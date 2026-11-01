@@ -457,9 +457,14 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
     let mut edges: Vec<(String, EdgeType, String)> = Vec::new();
 
     // Load `.NeuroStrata/graph/graph.json` from current working directory.
-    let graph_path = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
-        .join(".NeuroStrata/graph/graph.json");
+    // NEUROSTRATA_KGE_GRAPH_DIR overrides the graph source dir; without it the
+    // default stays cwd-relative, exactly as the README documents.
+    let graph_path = match std::env::var("NEUROSTRATA_KGE_GRAPH_DIR") {
+        Ok(dir) => std::path::PathBuf::from(dir).join("graph.json"),
+        Err(_) => std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join(".NeuroStrata/graph/graph.json"),
+    };
     if graph_path.exists() {
         let content = std::fs::read_to_string(&graph_path)?;
         let json: serde_json::Value = serde_json::from_str(&content)?;
@@ -676,11 +681,16 @@ mod tests {
             ]
         });
         std::fs::write(graph_dir.join("graph.json"), graph_json.to_string()).unwrap();
-        std::env::set_current_dir(tmp_dir.path()).unwrap();
+        // The graph source is overridable by env, so this test never needs to
+        // chdir the whole test process into a self-deleting TempDir — that
+        // used to orphan every other test thread's working directory.
+        std::env::set_var("NEUROSTRATA_KGE_GRAPH_DIR", graph_dir.to_string_lossy().to_string());
+        std::env::set_var("NEUROSTRATA_KGE_DIR", tmp_dir.path().join(".NeuroStrata/kge").to_string_lossy().to_string());
         cli_train(Some("NeuroStrata"), false, Some(2), Some(8), None).unwrap();
         let scope_dir = tmp_dir.path().join(".NeuroStrata/kge/NeuroStrata");
         assert!(scope_dir.join("model.bin").exists(), "model.bin should exist");
         assert!(scope_dir.join("meta.json").exists(), "meta.json should exist");
         std::env::remove_var("NEUROSTRATA_KGE_DIR");
+        std::env::remove_var("NEUROSTRATA_KGE_GRAPH_DIR");
     }
 }

@@ -1,6 +1,30 @@
 //! AC4 task_complete pre-check — dirty-target normalization (Task 4).
 //! Before gating task to Done (Lock 2), verify 0 resolvable targets remain.
 
+/// Full AC4 pass over one namespace before completion: normalize declared
+/// targets in place, then re-classify and enforce the gate (orphaned targets
+/// warn and pass; resolvable declared targets block).
+pub async fn normalize_and_precheck_namespace(
+    store: &dyn crate::traits::VectorStore,
+    namespace: &str,
+) -> Result<(), String> {
+    let _ = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
+        store, namespace,
+    )
+    .await?;
+    let memories = store
+        .list(namespace, None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let summary = crate::diagnostic::classify::classify_namespace_targets(&memories);
+    let _ = crate::diagnostic::classify::classify_unmatched(
+        summary.materialized,
+        summary.declared,
+        summary.orphaned,
+    )?;
+    task_complete_precheck(&summary.declared_targets)
+}
+
 pub fn task_complete_precheck(dirty_target_ids: &[String]) -> Result<(), String> {
     if dirty_target_ids.is_empty() {
         Ok(()) // AC4 passes: doctor reports 0 resolvable targets

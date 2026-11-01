@@ -3,18 +3,30 @@
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Receipt {
     pub session_id: String,
     pub task_id: String,
     pub event_id: String,
     pub outcome: String,
     pub exposed_ids: Vec<String>,
+    /// Worktree binding captured at receipt time (`task::receipt::capture`):
+    /// where the work happened and what state the tree was in. An empty
+    /// `worktree` means "not bound" — the receipt is verified on presence only.
+    pub worktree: String,
+    pub head_sha: String,
+    pub dirty_tree_hash: String,
 }
 
 impl Receipt {
     pub fn key(&self) -> String {
         format!("{}:{}:{}", self.session_id, self.task_id, self.event_id)
+    }
+
+    /// Same contract as `task::receipt::Receipt::is_current`: true when the
+    /// stored worktree binding still matches the worktree's observed state.
+    pub fn is_current(&self, head_sha: &str, dirty_tree_hash: &str) -> bool {
+        self.head_sha == head_sha && self.dirty_tree_hash == dirty_tree_hash
     }
 }
 
@@ -66,6 +78,9 @@ mod tests {
             event_id: "e".into(),
             outcome: "ok".into(),
             exposed_ids: vec!["m1".into()],
+            worktree: "/tmp/w".into(),
+            head_sha: "sha".into(),
+            dirty_tree_hash: "hash".into(),
         };
         assert!(store.record(r.clone()));
         assert!(!store.record(r));

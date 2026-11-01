@@ -3151,17 +3151,26 @@ async fn handle_ingest_directory(
     // neurostrata-7ej). Ingestion upserts thousands of rows, and checkpointing
     // each one would dominate the run, so that happens once at the end.
     match ingests.run(namespace, dir_path, schema, emb.clone(), store.clone()).await {
-        Ok(progress) => format!(
-            "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols, {} declared edges relinked.",
-            dir_path,
-            namespace,
-            progress.files_ingested,
-            progress.symbols_ingested,
-            progress
-                .relinked_edges
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "no".to_string())
-        ),
+        Ok(progress) => {
+            // AC4: normalize resolvable declared targets so every ingest run
+            // leaves the namespace edge-canonical, not just bus subscribers.
+            let _ = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
+                &*store,
+                namespace,
+            )
+            .await;
+            format!(
+                "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols, {} declared edges relinked.",
+                dir_path,
+                namespace,
+                progress.files_ingested,
+                progress.symbols_ingested,
+                progress
+                    .relinked_edges
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "no".to_string())
+            )
+        }
         Err(e) => format!("Failed to ingest directory {}: {}", dir_path, e),
     }
 }
@@ -6109,6 +6118,67 @@ async fn handle_guard_validate(
                         "verdict": {
                             "bucket": "DeterministicReject",
                             "reasons": ["Zero-Action Start: no claimed (in_progress) task in this namespace. Claim or create a task before editing."],
+                            "constraints": []
+                        },
+                        "rule_ids_triggered": []
+                    });
+                    return format!(
+                        "namespace: {}\ntrace_id: {}\n{}",
+                        namespace,
+                        trace_id,
+                        serde_json::to_string_pretty(&body).unwrap_or_default()
+                    );
+                }
+                // AC2: a claimed task exists, so the mutating action must pass
+                // the session/worktree preflight before rule validation runs.
+                // Caller-named active task wins when it is InProgress; else any
+                // InProgress row in the namespace.
+                let session_id = arguments
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let active_task_id = arguments
+                    .get("active_task_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|tid| {
+                        memories.iter().any(|m| {
+                            m.id == *tid
+                                && crate::task::gate::is_task(m)
+                                && crate::task::gate::task_status(m)
+                                    == crate::task::machine::Status::InProgress
+                        })
+                    })
+                    .or_else(|| {
+                        memories
+                            .iter()
+                            .find(|m| {
+                                crate::task::gate::is_task(m)
+                                    && crate::task::gate::task_status(m)
+                                        == crate::task::machine::Status::InProgress
+                            })
+                            .map(|m| m.id.as_str())
+                    });
+                let (allowed, transition) = validator.guard_validate(
+                    session_id,
+                    active_task_id,
+                    cwd,
+                    action_type,
+                    mutating,
+                );
+                if !allowed {
+                    let reason = transition.unwrap_or_else(|| {
+                        "Unpreflighted: AC2 preflight rejected this mutating action.".to_string()
+                    });
+                    let trace_id = format!(
+                        "guard-validate-{}-{}",
+                        std::process::id(),
+                        chrono::Utc::now().timestamp_millis()
+                    );
+                    let body = serde_json::json!({
+                        "trace_id": trace_id,
+                        "verdict": {
+                            "bucket": "DeterministicReject",
+                            "reasons": [reason],
                             "constraints": []
                         },
                         "rule_ids_triggered": []

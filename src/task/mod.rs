@@ -691,12 +691,16 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     }
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
     if let Ok(mut r) = TASK_RECEIPTS.lock() {
+        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session.clone(),
             task_id: id.clone(),
             event_id,
             outcome: "claimed".to_string(),
             exposed_ids: vec![format!("{}:{}", namespace, id)],
+            worktree: binding.worktree,
+            head_sha: binding.head_sha,
+            dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
     encode(&json!({
@@ -899,12 +903,16 @@ pub async fn handle_task_update(
         task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
     });
     if let Ok(mut r) = TASK_RECEIPTS.lock() {
+        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session_for_receipt,
             task_id: id.clone(),
             event_id,
             outcome: "updated".to_string(),
             exposed_ids: vec![format!("{}:{}", namespace, id)],
+            worktree: binding.worktree,
+            head_sha: binding.head_sha,
+            dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
     encode(&json!({
@@ -1060,7 +1068,7 @@ pub async fn handle_task_complete(
     let namespace_arg = required_str(&args, "namespace")?;
     let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
     check_namespace(&namespace)?;
-    let _ = precheck::task_complete_precheck(&[]);
+    precheck::normalize_and_precheck_namespace(&*store, &namespace).await?;
 
     let (task, vector) = load_task(&store, &namespace, &id).await?;
     // The clock the gate reads with: a lesson row that has been retired is
@@ -1477,13 +1485,27 @@ pub async fn handle_task_complete(
         task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
     });
     if let Ok(mut r) = TASK_RECEIPTS.lock() {
+        // Bind the completion receipt to the worktree state captured right now
+        // (AC5): retention verification later re-checks this binding.
+        let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
-            session_id: session_for_receipt,
+            session_id: session_for_receipt.clone(),
             task_id: id.clone(),
-            event_id,
+            event_id: event_id.clone(),
             outcome: "completed".to_string(),
             exposed_ids: vec![format!("{}:{}", namespace, id)],
+            worktree: binding.worktree,
+            head_sha: binding.head_sha,
+            dirty_tree_hash: binding.dirty_tree_hash,
         });
+        // AC5: the completion receipt must be retained and verifiable — ask
+        // the retention gate right here so a lost receipt is caught on the spot.
+        let _ = crate::retention::gate::verify_task_receipt_retention(
+            &r,
+            &session_for_receipt,
+            &id,
+            &event_id,
+        );
     }
 
     // M3: spawn follow-up tasks now that the parent is done. Each inherits
