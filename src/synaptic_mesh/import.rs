@@ -1881,6 +1881,12 @@ pub fn decompress_record_bundle(bytes: &[u8]) -> Result<Vec<MeshRecord>, String>
     serde_json::from_slice(&raw).map_err(|e| e.to_string())
 }
 
+/// Read a compressed bundle from disk and decompress it.
+pub fn read_compressed_bundle(bundle_path: &Path) -> Result<Vec<MeshRecord>, String> {
+    let bytes = std::fs::read(bundle_path).map_err(|e| e.to_string())?;
+    decompress_record_bundle(&bytes)
+}
+
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
 
 /// The checkout's dirty porcelain paths (`git status --porcelain`, run like

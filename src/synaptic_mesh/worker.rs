@@ -208,6 +208,17 @@ fn apply_one(
 
     // ---- build + write ----
     let mut record = build_record(entry, id, superseded_by, node_id, epoch);
+
+    // Auto-sign if a local Ed25519 signing key exists.
+    let signing_key_path = std::env::var("NEUROSTRATA_MESH_SIGNING_KEY")
+        .ok()
+        .filter(|p| std::path::Path::new(p).exists())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| mesh.root().join(".neurostrata-mesh").join("signing.key"));
+    if signing_key_path.exists() {
+        let _ = sign_record(&mut record, &signing_key_path);
+    }
+
     let path = record_path(mesh, &record);
 
     if let Some(existing) = load_existing(&path)? {
@@ -403,6 +414,16 @@ pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), Strin
 pub fn compress_record_bundle(records: &[MeshRecord], level: i32) -> Result<Vec<u8>, String> {
     let json_bytes = serde_json::to_vec(records).map_err(|e| e.to_string())?;
     crate::compression::zstd::compress(&json_bytes, level).map_err(|e| e.to_string())
+}
+
+/// Write a compressed bundle to `<mesh_root>/bundles/<bundle_name>.bundle.zst`.
+pub fn write_compressed_bundle(mesh_root: &Path, bundle_name: &str, records: &[MeshRecord], level: i32) -> Result<PathBuf, String> {
+    let bytes = compress_record_bundle(records, level)?;
+    let dir = mesh_root.join("bundles");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.bundle.zst", bundle_name));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 /// Rebuild the canonical RDF block from a MeshRecord after lifecycle mutation.
@@ -1296,5 +1317,46 @@ mod tests {
             "the published metadata is the curated envelope: {}",
             record.metadata
         );
+    }
+
+    #[test]
+    fn apply_one_signs_record_when_signing_key_exists_and_bundle_roundtrip() {
+        let (mesh, outbox) = fixture("sign-bundle", None);
+        let id = Uuid::now_v7();
+        // Pre-create a valid Ed25519 signing key inside the mesh.
+        let key_dir = mesh.root().join(".neurostrata-mesh");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("signing.key");
+        let _ = crate::did::load_or_generate_keypair(&key_path).unwrap();
+
+        let entry = created(&id.to_string(), shareable_metadata());
+        outbox.append(&entry).unwrap();
+        drain_once(&outbox, &mesh, "node-author").unwrap();
+
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let text = std::fs::read_to_string(&path).expect("record exists");
+        let record: MeshRecord = serde_json::from_str(&text).unwrap();
+
+        // (a) DID-signed when local signing key exists.
+        assert!(
+            record.signature.as_ref().map_or(false, |s| !s.is_empty()),
+            "record must carry a non-empty signature"
+        );
+        let did = record.signer_did.as_ref().expect("signer_did must be set");
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "signer_did should start with did:key:z6Mk, got: {}",
+            did
+        );
+
+        // (b) Compressed bundle round-trips losslessly.
+        let bundle_path = write_compressed_bundle(mesh.root(), "test-bundle", &[record.clone()], 3).unwrap();
+        let roundtrip = crate::synaptic_mesh::import::read_compressed_bundle(&bundle_path).unwrap();
+        assert_eq!(roundtrip.len(), 1);
+        assert_eq!(roundtrip[0], record);
     }
 }

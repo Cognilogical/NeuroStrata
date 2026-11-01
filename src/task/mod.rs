@@ -19,6 +19,8 @@ use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
+static TASK_RECEIPTS: std::sync::LazyLock<std::sync::Mutex<crate::receipts::store::ReceiptStore>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(crate::receipts::store::ReceiptStore::new()));
+
 // ── small helpers shared by every handler ──────────────────────────────────
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -685,6 +687,16 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
+    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
+    if let Ok(mut r) = TASK_RECEIPTS.lock() {
+        r.record(crate::receipts::store::Receipt {
+            session_id: session.clone(),
+            task_id: id.clone(),
+            event_id,
+            outcome: "claimed".to_string(),
+            exposed_ids: vec![format!("{}:{}", namespace, id)],
+        });
+    }
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -879,6 +891,19 @@ pub async fn handle_task_update(
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
+    }
+    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("update-{}", id)).to_string();
+    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
+        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
+    });
+    if let Ok(mut r) = TASK_RECEIPTS.lock() {
+        r.record(crate::receipts::store::Receipt {
+            session_id: session_for_receipt,
+            task_id: id.clone(),
+            event_id,
+            outcome: "updated".to_string(),
+            exposed_ids: vec![format!("{}:{}", namespace, id)],
+        });
     }
     encode(&json!({
         "id": id,
@@ -1444,6 +1469,19 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+    let event_id = arg_str(&args, "event_id").unwrap_or(&format!("complete-{}", id)).to_string();
+    let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
+        task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
+    });
+    if let Ok(mut r) = TASK_RECEIPTS.lock() {
+        r.record(crate::receipts::store::Receipt {
+            session_id: session_for_receipt,
+            task_id: id.clone(),
+            event_id,
+            outcome: "completed".to_string(),
+            exposed_ids: vec![format!("{}:{}", namespace, id)],
+        });
+    }
 
     // M3: spawn follow-up tasks now that the parent is done. Each inherits
     // the caller's user/agent defaults and carries spawned_from + related_to.

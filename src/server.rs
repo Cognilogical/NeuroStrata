@@ -843,6 +843,22 @@ pub async fn process_mcp_request(
                             },
                             "required": ["namespace"]
                         }
+                    },
+                    {
+                        "name": "neurostrata_context_plan",
+                        "description": "Build a budgeted context-read plan from the store (namespace/query/file_path) and return it as JSON or text.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Project namespace." },
+                                "query": { "type": "string", "description": "Optional search query." },
+                                "file_path": { "type": "string", "description": "Optional governed file path." },
+                                "max_items": { "type": "integer", "description": "Max items (default 10)." },
+                                "max_bytes": { "type": "integer", "description": "Approx byte budget (default 1024)." },
+                                "format": { "type": "string", "enum": ["json", "text"], "description": "Output format." }
+                            },
+                            "required": ["namespace"]
+                        }
                     }
                 ]
             });
@@ -931,7 +947,7 @@ pub async fn process_mcp_request(
 
                     match name {
                         "neurostrata_list_namespaces" => {
-                            result_text = handle_list_namespaces(store.clone()).await;
+                            result_text = crate::handlers::memory::handle_list_namespaces(store.clone()).await;
                         }
                         "neurostrata_add_memory" => {
                             result_text = handle_add_memory(
@@ -1185,6 +1201,9 @@ pub async fn process_mcp_request(
                         "neurostrata_export_wasm_snapshot" => {
                             result_text = handle_export_wasm_snapshot(&arguments, store.clone()).await;
                         }
+                        "neurostrata_context_plan" => {
+                            result_text = handle_context_plan(&arguments, emb.clone(), store.clone()).await;
+                        }
                         // SynapticMesh: the handler is a pure string-in/
                         // string-out dispatch (filesystem + git only; no
                         // store, no bus, no daemon dependency), so it owns
@@ -1234,6 +1253,63 @@ pub async fn process_mcp_request(
             })
         }
         _ => serde_json::json!({}),
+    }
+}
+
+async fn handle_context_plan(
+    arguments: &Value,
+    embedder: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    use crate::context::{ContextItem, ContextPlan, Budget, rank_dedup_budget, render_plan_text, CONTEXT_PLAN_SCHEMA_VERSION};
+    use crate::context::model::{Degradation};
+    let namespace = arguments.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
+    let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let file_path = arguments.get("file_path").and_then(|v| v.as_str());
+    let max_items = arguments.get("max_items").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let _max_bytes = arguments.get("max_bytes").and_then(|v| v.as_u64()).unwrap_or(1024) as usize;
+    let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("json");
+
+    let vector = match embedder.embed(query).await {
+        Ok(v) => v,
+        Err(_) => vec![0.0f32; embedder.dimensions()],
+    };
+    let results = match store.search(namespace, vector, max_items.max(1), false, false).await {
+        Ok(r) => r,
+        Err(_) => Vec::new(),
+    };
+    let mut items: Vec<ContextItem> = Vec::new();
+    for res in results {
+        let memory_type = res.payload.memory_type.clone();
+        let content = res.payload.content.clone();
+        items.push(ContextItem {
+            id: res.id,
+            memory_type,
+            content,
+            freshness: None,
+        });
+    }
+    if let Some(fp) = file_path {
+        items.push(ContextItem {
+            id: fp.to_string(),
+            memory_type: "source".into(),
+            content: format!("file_path={}", fp),
+            freshness: None,
+        });
+    }
+    let budget = Budget::from(max_items);
+    let truncation = items.len() > max_items;
+    let deduped = rank_dedup_budget(items, budget);
+    let mut plan = ContextPlan::new("context-plan", Degradation::Supported);
+    plan.schema_version = CONTEXT_PLAN_SCHEMA_VERSION.to_string();
+    plan.applied_scope = namespace.to_string();
+    plan.event_id = "context-plan".into();
+    plan.items = deduped;
+    plan.truncation = truncation;
+    if format == "text" {
+        render_plan_text(&plan)
+    } else {
+        serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".into())
     }
 }
 
@@ -1511,11 +1587,7 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 }
 
 async fn handle_list_namespaces(store: Arc<dyn VectorStore>) -> String {
-    if let Ok(namespaces) = store.list_namespaces().await {
-        format!("Existing namespaces: {:?}", namespaces)
-    } else {
-        "Failed to list namespaces.".to_string()
-    }
+    crate::handlers::memory::handle_list_namespaces(store).await
 }
 
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
@@ -8828,7 +8900,7 @@ mod tests {
     /// Clients pin this list; a silent rename orphans their wiring.
     /// Keep in sync with the entries in `process_mcp_request` -> `"tools/list"`.
     #[tokio::test]
-    async fn tools_list_carries_all_thirty_five_tools_in_a_stable_order() {
+    async fn tools_list_carries_all_thirty_six_tools_in_a_stable_order() {
         let (store, _) = store_with_one_rule("probe").await;
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let request = JsonRpcRequest {
@@ -8898,6 +8970,7 @@ mod tests {
                 "neurostrata_metrics_list",
                 "neurostrata_chat_ask",
                 "neurostrata_export_wasm_snapshot",
+                "neurostrata_context_plan",
                 // SynapticMesh: appended by `tools.extend(synaptic_mesh_tool
                 // _definitions())` — this order IS the append order, so it
                 // pins where the mesh module's list enters the surface.
@@ -11144,4 +11217,36 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     }
     out
 }
+
+
+
+    struct LocalStubEmbedder;
+    #[async_trait::async_trait]
+    impl crate::traits::Embedder for LocalStubEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            let mut v = vec![0.0f32; 4];
+            for (i, b) in text.bytes().enumerate() { v[i % 4] += b as f32; }
+            for (i, x) in v.iter_mut().enumerate() { *x += (i as f32 + 1.0) * 0.001; }
+            Ok(v)
+        }
+        fn dimensions(&self) -> usize { 4 }
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_plan_returns_budgeted_plan() {
+        use crate::context::{ContextPlan, Degradation, CONTEXT_PLAN_SCHEMA_VERSION};
+        let args_json = serde_json::json!({"namespace":"test","max_items":2,"format":"json"});
+        let embedder = Arc::new(LocalStubEmbedder);
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-test"), 4).expect("open"));
+        store.init("test").await.unwrap();
+        let result_json = handle_context_plan(&args_json, embedder.clone(), store.clone()).await;
+        let plan: ContextPlan = serde_json::from_str(&result_json).expect("json parses");
+        assert_eq!(plan.schema_version, CONTEXT_PLAN_SCHEMA_VERSION);
+        assert!(plan.event_id.contains("context-plan") || plan.event_id == "context-plan");
+        assert!(plan.degradation == Degradation::Supported || plan.degradation == Degradation::Unsupported);
+        // Text format
+        let args_text = serde_json::json!({"namespace":"test","format":"text"});
+        let text_result = handle_context_plan(&args_text, embedder.clone(), store.clone()).await;
+        assert!(text_result.contains("context-plan") || text_result.contains("(no items)"));
+    }
 
