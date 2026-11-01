@@ -2067,7 +2067,7 @@ impl LadybugStore {
         let namespace = namespace.to_string();
         self.with_conn(move |conn| {
             let safe = crate::store::ladybug::escape_ladybug_string(&namespace);
-            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.memory_type, m.location, m.metadata", safe);
+            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata", safe);
             let mut res = conn.query(&query)?;
             let mut known_ids = std::collections::HashSet::new();
             let mut rows = Vec::new();
@@ -2075,14 +2075,15 @@ impl LadybugStore {
                 let id = format!("{}", row[0]);
                 let mtype = format!("{}", row[1]);
                 let loc = format!("{}", row[2]);
-                let meta_str = format!("{}", row[3]);
+                let content_str = format!("{}", row[3]);
+                let meta_str = format!("{}", row[4]);
                 let meta: serde_json::Value = serde_json::from_str(&meta_str).unwrap_or(serde_json::json!({}));
                 if meta.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) { continue; }
                 known_ids.insert(id.clone());
-                rows.push((id, mtype, loc, meta_str));
+                rows.push((id, mtype, loc, content_str, meta_str));
             }
             let mut updates = 0usize;
-            for (id, mtype, loc, meta_str) in &rows {
+            for (id, mtype, loc, content_str, meta_str) in &rows {
                 let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
                 let mut changed = false;
                 // (a) rule source
@@ -2107,6 +2108,42 @@ impl LadybugStore {
                         meta.as_object_mut().unwrap().insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
                         changed = true;
                     }
+                }
+                // (a3) task memory repair: backfill metadata.task defaults
+                if mtype == "task" {
+                    let task_meta = meta.get("task").cloned();
+                    let mut task_obj = if let Some(Value::Object(obj)) = task_meta { obj.clone() } else { serde_json::Map::new() };
+                    let mut task_changed = false;
+                    if !task_obj.contains_key("status") || task_obj.get("status").and_then(|v| v.as_str()).map_or(true, |s| !(s == "open" || s == "in_progress" || s == "blocked" || s == "done")) {
+                        task_obj.insert("status".to_string(), serde_json::Value::String("open".to_string()));
+                        task_changed = true;
+                    }
+                    if task_obj.get("priority").is_none() || !task_obj.get("priority").map_or(false, |v| v.as_u64().map_or(false, |_| true)) {
+                        task_obj.insert("priority".to_string(), serde_json::Value::Number(serde_json::Number::from(2)));
+                        task_changed = true;
+                    }
+                    if !task_obj.contains_key("task_type") {
+                        task_obj.insert("task_type".to_string(), serde_json::Value::String("task".to_string()));
+                        task_changed = true;
+                    }
+                    if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
+                        meta.as_object_mut().unwrap().insert("task".to_string(), serde_json::Value::Object(task_obj));
+                        changed = true;
+                    }
+                }
+                // (a4) content / fact and generic repair: backfill blank content and missing required fields from title/location/legacy
+                let content_empty = content_str.trim().is_empty();
+                let mut content_backfill: Option<String> = None;
+                let structural = matches!(mtype.as_str(), "file" | "directory" | "markdown" | "symbol" | "code_ast" | "doc_section" | "freshness_flag" | "guard_event");
+                if content_empty && !structural {
+                    content_backfill = Some(meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
+                        .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
+                        .unwrap_or_else(|| "legacy".to_string()));
+                }
+                if mtype == "fact" || (content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
+                    content_backfill = Some(meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
+                        .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
+                        .unwrap_or_else(|| "legacy".to_string()));
                 }
                 // (b) dangling refs in edge arrays
                 let keys = ["governs","relates_to","contained_by","extracted_from","depends_on"];
@@ -2135,9 +2172,14 @@ impl LadybugStore {
                     meta.as_object_mut().unwrap().insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
                     changed = true;
                 }
-                if changed {
-                    let q = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
-                    let _ = conn.query(&q);
+                if changed || content_backfill.is_some() {
+                    let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
+                    let _ = conn.query(&q_meta);
+                    if let Some(backfill_text) = content_backfill {
+                        let safe_back = backfill_text.replace("'", "\\'");
+                        let q_content = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), safe_back);
+                        let _ = conn.query(&q_content);
+                    }
                     updates += 1;
                 }
             }
