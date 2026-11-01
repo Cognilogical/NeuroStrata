@@ -17,6 +17,8 @@ mod fts;
 mod gliner;
 #[cfg(feature = "kge")]
 pub mod kge;
+#[cfg(feature = "community")]
+pub mod community;
 mod events;
 mod graph_read;
 mod guard;
