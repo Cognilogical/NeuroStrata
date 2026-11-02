@@ -12,6 +12,20 @@ use crate::traits::{
     RelocateOutcome, SearchResult, VectorStore,
 };
 
+/// Parse metadata JSON string with error handling and logging
+fn parse_metadata_or_warn(raw: &str, context: &str) -> Value {
+    if raw.trim().is_empty() {
+        return Value::Null;
+    }
+    match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("failed to parse {} JSON: {}", context, e);
+            Value::Null
+        }
+    }
+}
+
 /// Read a boolean column out of a query row.
 ///
 /// The value has to be read as a typed boolean, never as its rendered form:
@@ -191,65 +205,60 @@ async fn search_inner(
                         "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
                         safe_ns
                     );
-                    if let Ok(rows) = conn.query(&exact_q) {
-                        for row in rows {
-                            let id: String = format!("{}", row[0]);
-                            let content: String = format!("{}", row[1]);
-                            let user_id: String = format!("{}", row[2]);
-                            let memory_type: String = format!("{}", row[3]);
-                            let agent_name: String = format!("{}", row[4]);
-                            let location: String = format!("{}", row[5]);
-                            let location_lines: String = format!("{}", row[6]);
-                            let metadata_str: String = format!("{}", row[7]);
-                            let metadata_val: Value = match serde_json::from_str(&metadata_str) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if !metadata_str.trim().is_empty() {
-                                        tracing::warn!("corrupt metadata JSON in store row: {e}");
+                    match conn.query(&exact_q) {
+                        Ok(rows) => {
+                            for row in rows {
+                                let id: String = format!("{}", row[0]);
+                                let content: String = format!("{}", row[1]);
+                                let user_id: String = format!("{}", row[2]);
+                                let memory_type: String = format!("{}", row[3]);
+                                let agent_name: String = format!("{}", row[4]);
+                                let location: String = format!("{}", row[5]);
+                                let location_lines: String = format!("{}", row[6]);
+                                let metadata_str: String = format!("{}", row[7]);
+                                let metadata_val: Value = parse_metadata_or_warn(&metadata_str, "metadata");
+                                if is_retired_at(&metadata_val, now) { continue; }
+                                if !include_archived && is_archived(&metadata_val) { continue; }
+                                if is_mesh_conflicting(&metadata_val) { continue; }
+                                if crate::registry::is_registry_row(&metadata_val) { continue; }
+                                if !domain_keys.is_empty() && !crate::domain::domain_keys(&metadata_val).iter().any(|k| domain_keys.contains(k)) { continue; }
+                                if !include_tasks && memory_type == "task" { continue; }
+                                if STRUCTURAL_MEMORY_TYPES.contains(&memory_type.as_str()) { continue; }
+                                let symbol = metadata_val.get("symbol").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+                                let location_l = location.to_lowercase();
+                                let content_l = content.to_lowercase();
+                                let mut matched = false;
+                                for t in &targets {
+                                    let tl = t.to_lowercase();
+                                    if location_l == tl || content_l == tl { matched = true; break; }
+                                    if let Some(sym) = &symbol { if *sym == tl { matched = true; break; } }
+                                    if let Some(obj) = metadata_val.as_object() {
+                                        for (_k, v) in obj.iter() {
+                                            if let Some(s) = v.as_str() { if s.to_lowercase() == tl { matched = true; break; } }
+                                        }
+                                        if matched { break; }
                                     }
-                                    Value::Null
                                 }
-                            };
-                            if is_retired_at(&metadata_val, now) { continue; }
-                            if !include_archived && is_archived(&metadata_val) { continue; }
-                            if is_mesh_conflicting(&metadata_val) { continue; }
-                            if crate::registry::is_registry_row(&metadata_val) { continue; }
-                            if !domain_keys.is_empty() && !crate::domain::domain_keys(&metadata_val).iter().any(|k| domain_keys.contains(k)) { continue; }
-                            if !include_tasks && memory_type == "task" { continue; }
-                            if STRUCTURAL_MEMORY_TYPES.contains(&memory_type.as_str()) { continue; }
-                            let symbol = metadata_val.get("symbol").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
-                            let location_l = location.to_lowercase();
-                            let content_l = content.to_lowercase();
-                            let mut matched = false;
-                            for t in &targets {
-                                let tl = t.to_lowercase();
-                                if location_l == tl || content_l == tl { matched = true; break; }
-                                if let Some(sym) = &symbol { if *sym == tl { matched = true; break; } }
-                                if let Some(obj) = metadata_val.as_object() {
-                                    for (_k, v) in obj.iter() {
-                                        if let Some(s) = v.as_str() { if s.to_lowercase() == tl { matched = true; break; } }
-                                    }
-                                    if matched { break; }
-                                }
+                                if !matched { continue; }
+                                if exact_matches.iter().any(|r| r.id == id) { continue; }
+                                exact_matches.push(SearchResult {
+                                    id: id.clone(),
+                                    score: 0.0,
+                                    payload: MemoryPayload {
+                                        content, user_id, memory_type,
+                                        agent_name: Some(agent_name),
+                                        location, location_lines, metadata: metadata_val,
+                                    },
+                                    evidence: Some(vec![crate::traits::SearchEvidence {
+                                        kind: crate::traits::EvidenceKind::DirectMatch,
+                                        path: vec![],
+                                        explanation: "Exact name match.".to_string(),
+                                        derivation: vec!["exact-name".to_string()],
+                                    }]),
+                                });
                             }
-                            if !matched { continue; }
-                            if exact_matches.iter().any(|r| r.id == id) { continue; }
-                            exact_matches.push(SearchResult {
-                                id: id.clone(),
-                                score: 0.0,
-                                payload: MemoryPayload {
-                                    content, user_id, memory_type,
-                                    agent_name: Some(agent_name),
-                                    location, location_lines, metadata: metadata_val,
-                                },
-                                evidence: Some(vec![crate::traits::SearchEvidence {
-                                    kind: crate::traits::EvidenceKind::DirectMatch,
-                                    path: vec![],
-                                    explanation: "Exact name match.".to_string(),
-                                    derivation: vec!["exact-name".to_string()],
-                                }]),
-                            });
                         }
+                        Err(e) => { tracing::warn!("query failed: {e}"); }
                     }
                 }
             }
@@ -305,7 +314,7 @@ async fn search_inner(
                 let location_lines: String = format!("{}", row[7]);
                 let metadata_str: String = format!("{}", row[8]);
 
-                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                let metadata_val: Value = parse_metadata_or_warn(&metadata_str, "metadata");
 
                 // Skip retired rows -- they do not count toward the limit.
                 if is_retired_at(&metadata_val, now) {
@@ -505,7 +514,8 @@ async fn search_inner(
 
                 // Process one-hop neighbor queries (4 directed branches total).
                 for q in [&neighbor_out_q, &neighbor_in_q] {
-                    if let Ok(rows) = conn.query(q) {
+                    match conn.query(q) {
+                        Ok(rows) => {
                         for row in rows {
                             let result_id: String = format!("{}", row[0]);
                             let content: String = format!("{}", row[1]);
@@ -516,7 +526,7 @@ async fn search_inner(
                             let location_lines: String = format!("{}", row[6]);
                             let metadata_str: String = format!("{}", row[7]);
                             let metadata_val: Value =
-                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                                parse_metadata_or_warn(&metadata_str, "metadata");
                             if is_retired_at(&metadata_val, now) { continue; }
                             if primary_set.contains(result_id.as_str()) { continue; }
 
@@ -568,18 +578,21 @@ async fn search_inner(
                             }
                         }
                     }
+                    Err(e) => { tracing::warn!("query failed: {e}"); }
+                }
                 }
 
                 // Process two-hop governing queries
                 for q in [&govern_out_q, &govern_in_q] {
-                    if let Ok(rows) = conn.query(q) {
+                    match conn.query(q) {
+                        Ok(rows) => {
                         for row in rows {
                             let result_id: String = format!("{}", row[0]);
                             // memory_type is at row[3] (r.memory_type) - use column directly for task filter
                             let memory_type: String = format!("{}", row[3]);
                             let metadata_str: String = format!("{}", row[7]);
                             let metadata_val: Value =
-                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                                parse_metadata_or_warn(&metadata_str, "metadata");
                             if is_retired_at(&metadata_val, now) { continue; }
                             if primary_set.contains(result_id.as_str()) { continue; }
 
@@ -595,7 +608,7 @@ async fn search_inner(
                             let f_id: String = format!("{}", row[10]);
                             let f_metadata_str: String = format!("{}", row[11]);
                             let f_metadata: Value =
-                                serde_json::from_str(&f_metadata_str).unwrap_or(Value::Null);
+                                parse_metadata_or_warn(&f_metadata_str, "f_metadata");
                             let outgoing: bool = row_flag_true(&row[12]);
 
                             // Retired intermediate invalidates only that path
@@ -645,17 +658,20 @@ async fn search_inner(
                             }
                         }
                     }
+                    Err(e) => { tracing::warn!("query failed: {e}"); }
+                }
                 }
 
                 // Process 3-hop transitive governing queries (CONTAINS hops).
                 for q in [&govern_out_cont_q, &govern_in_cont_q] {
-                    if let Ok(rows) = conn.query(q) {
+                    match conn.query(q) {
+                        Ok(rows) => {
                         for row in rows {
                             let result_id: String = format!("{}", row[0]);
                             let memory_type: String = format!("{}", row[3]);
                             let metadata_str: String = format!("{}", row[7]);
                             let metadata_val: Value =
-                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                                parse_metadata_or_warn(&metadata_str, "metadata");
                             if is_retired_at(&metadata_val, now) { continue; }
                             if primary_set.contains(result_id.as_str()) { continue; }
                             if !include_tasks && memory_type == "task" { continue; }
@@ -667,11 +683,11 @@ async fn search_inner(
                             let f_id: String = format!("{}", row[10]);
                             let f_metadata_str: String = format!("{}", row[11]);
                             let f_metadata: Value =
-                                serde_json::from_str(&f_metadata_str).unwrap_or(Value::Null);
+                                parse_metadata_or_warn(&f_metadata_str, "f_metadata");
                             let f1_id: String = format!("{}", row[12]);
                             let f1_metadata_str: String = format!("{}", row[13]);
                             let f1_metadata: Value =
-                                serde_json::from_str(&f1_metadata_str).unwrap_or(Value::Null);
+                                parse_metadata_or_warn(&f1_metadata_str, "f1_metadata");
                             let outgoing: bool = row_flag_true(&row[14]);
 
                             if is_retired_at(&f_metadata, now) { continue; }
@@ -724,11 +740,14 @@ async fn search_inner(
                             }
                         }
                     }
+                    Err(e) => { tracing::warn!("query failed: {e}"); }
+                }
                 }
 
                 // Process episode-sibling query
                 // Row layout: s.id, s.content, s.user_id, s.memory_type, s.agent_name, s.location, s.location_lines, s.metadata, m.id, t.id, t.metadata
-                if let Ok(rows) = conn.query(&episode_sibling_q) {
+                match conn.query(&episode_sibling_q) {
+                    Ok(rows) => {
                     for row in rows {
                         let result_id: String = format!("{}", row[0]);
                         let content: String = format!("{}", row[1]);
@@ -739,7 +758,7 @@ async fn search_inner(
                         let location_lines: String = format!("{}", row[6]);
                         let metadata_str: String = format!("{}", row[7]);
                         let metadata_val: Value =
-                            serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                            parse_metadata_or_warn(&metadata_str, "metadata");
                         if is_retired_at(&metadata_val, now) { continue; }
                         if primary_set.contains(result_id.as_str()) { continue; }
 
@@ -753,7 +772,7 @@ async fn search_inner(
                         let t_id: String = format!("{}", row[9]);     // t.id (intermediate task)
                         let t_metadata_str: String = format!("{}", row[10]);
                         let t_metadata: Value =
-                            serde_json::from_str(&t_metadata_str).unwrap_or(Value::Null);
+                            parse_metadata_or_warn(&t_metadata_str, "t_metadata");
 
                         // Retired intermediate task invalidates only that path (matching two-hop rule)
                         if is_retired_at(&t_metadata, now) { continue; }
@@ -794,6 +813,8 @@ async fn search_inner(
                         }
                     }
                 }
+                Err(e) => { tracing::warn!("query failed: {e}"); }
+            }
 
                 // Phase 2: Admit DISTINCT result IDs in family order — one-hop
                 // family first, then episode-sibling, then governing-only — capped at `limit` per family.
@@ -1278,9 +1299,14 @@ impl LadybugStore {
                         // Checkpoint them into the main DB files right away, so
                         // a later crash does not put the same marginal WAL back
                         // in front of the strict verifier.
-                        if let Ok(conn) = Connection::new(&db) {
-                            if let Err(e) = conn.query("CHECKPOINT;") {
-                                tracing::warn!("WAL recovery CHECKPOINT failed: {e}");
+                        match Connection::new(&db) {
+                            Ok(conn) => {
+                                if let Err(e) = conn.query("CHECKPOINT;") {
+                                    tracing::warn!("WAL recovery CHECKPOINT failed: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("failed to open connection for post-recovery CHECKPOINT: {e}");
                             }
                         }
                         db
@@ -1382,7 +1408,7 @@ impl LadybugStore {
         let mut registry = self
             .embedding_registry
             .lock()
-            .expect("embedding registry poisoned");
+            .unwrap_or_else(|e| { tracing::warn!("embedding registry lock poisoned: {e}"); e.into_inner() });
         if let Some(existing) = registry.get(namespace) {
             if !existing.compatible(desc) {
                 anyhow::bail!(
@@ -1812,14 +1838,17 @@ fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections
         escape_ladybug_string(namespace)
     );
     let mut gens = std::collections::HashSet::new();
-    if let Ok(rows) = conn.query(&query) {
-        for row in rows {
-            if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
-                if g > 0 {
-                    gens.insert(g as u64);
+    match conn.query(&query) {
+        Ok(rows) => {
+            for row in rows {
+                if let Ok(g) = format!("{}", row[0]).parse::<i64>() {
+                    if g > 0 {
+                        gens.insert(g as u64);
+                    }
                 }
             }
         }
+        Err(e) => { tracing::warn!("active_generations_of query failed: {e}"); }
     }
     gens
 }
@@ -1830,15 +1859,18 @@ fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections
 fn all_active_generations(conn: &Connection) -> std::collections::HashSet<(String, u64)> {
     let query = "MATCH (g:IngestGeneration) WHERE g.active_generation > 0 RETURN g.namespace, g.active_generation";
     let mut pairs = std::collections::HashSet::new();
-    if let Ok(rows) = conn.query(query) {
-        for row in rows {
-            let ns = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
-            if let Ok(g) = format!("{}", row[1]).parse::<i64>() {
-                if g > 0 {
-                    pairs.insert((ns, g as u64));
+    match conn.query(query) {
+        Ok(rows) => {
+            for row in rows {
+                let ns = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
+                if let Ok(g) = format!("{}", row[1]).parse::<i64>() {
+                    if g > 0 {
+                        pairs.insert((ns, g as u64));
+                    }
                 }
             }
         }
+        Err(e) => { tracing::warn!("all_active_generations query failed: {e}"); }
     }
     pairs
 }
@@ -2272,14 +2304,7 @@ impl LadybugStore {
     }
 
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
-        for ns in ["NeuroStrata", "global", "dogfood-app", "Praxis", "allele", "Nibble.Fish", "ImportProbeA", "NeuroStrata-mmd"] {
-            if namespace == ns {
-                if let Err(e) = self.repair_namespace_hygiene(namespace).await {
-                    tracing::warn!("repair_namespace_hygiene failed for '{namespace}': {e}");
-                }
-                break;
-            }
-        }
+        // Diagnostic read-only query - no namespace hygiene repair
 
         let namespace = namespace.to_string();
         self.with_conn(move |conn| {
@@ -2388,32 +2413,34 @@ impl LadybugStore {
                 known_ids.insert(id.clone());
                 rows.push((id, mtype, loc, content_str, meta_str));
             }
-            let mut updates = 0usize;
+            let mut shape_updates = 0usize;
+            let mut dangling_updates = 0usize;
             for (id, mtype, loc, content_str, meta_str) in &rows {
                 let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
                 if !meta.is_object() { meta = serde_json::json!({}); }
-                let mut changed = false;
+                let mut shape_changed = false;
+                let mut dangling_changed = false;
                 // (a) rule source
                 if mtype == "rule" {
                     let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
                     if src.is_empty() || src.trim().is_empty() || src == "N/A" {
                         let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
                         meta.as_object_mut().unwrap().insert("source".to_string(), serde_json::Value::String(val));
-                        changed = true;
+                        shape_changed = true;
                     }
                 }
                 // (a2) procedure trigger repair
                 if mtype == "procedure" {
                     let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
-                    let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
+                    let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger == "before-edit" || trigger == "after-mutation" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
                     if !is_valid {
                         meta.as_object_mut().unwrap().insert("trigger".to_string(), serde_json::Value::String("session-start".to_string()));
-                        changed = true;
+                        shape_changed = true;
                     }
                     let remaining_missing = meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none();
                     if remaining_missing {
                         meta.as_object_mut().unwrap().insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
-                        changed = true;
+                        shape_changed = true;
                     }
                 }
                 // (a3) task memory repair: backfill metadata.task defaults
@@ -2435,7 +2462,7 @@ impl LadybugStore {
                     }
                     if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
                         meta.as_object_mut().unwrap().insert("task".to_string(), serde_json::Value::Object(task_obj));
-                        changed = true;
+                        shape_changed = true;
                     }
                 }
                 // (a4) content / fact and generic repair: backfill blank content and missing required fields from title/location/legacy
@@ -2471,15 +2498,16 @@ impl LadybugStore {
                                 if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
                             } else { kept.push(item.clone()); }
                         }
-                        if kept.len() != arr.len() { meta.as_object_mut().unwrap().insert(k.to_string(), serde_json::Value::Array(kept)); changed = true; }
+                        if kept.len() != arr.len() { meta.as_object_mut().unwrap().insert(k.to_string(), serde_json::Value::Array(kept)); dangling_changed = true; }
                     }
                 }
                 if !unresolvable.is_empty() {
                     archived_refs.extend(unresolvable);
                     meta.as_object_mut().unwrap().insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
-                    changed = true;
+                    dangling_changed = true;
                 }
-                if changed || content_backfill.is_some() {
+                if shape_changed || content_backfill.is_some() {
+                    let has_backfill = content_backfill.is_some();
                     let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
                     if let Err(e) = conn.query(&q_meta) {
                         tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
@@ -2491,24 +2519,17 @@ impl LadybugStore {
                                 tracing::warn!("hygiene repair: content write failed for {id}: {e}");
                             }
                         }
-                        updates += 1;
+                        if shape_changed || has_backfill { shape_updates += 1; }
+                        if dangling_changed { dangling_updates += 1; }
                     }
                 }
             }
-            Ok((updates, updates))
+            Ok((shape_updates, dangling_updates))
         }).await
     }
 
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
     pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
-        for ns in ["NeuroStrata", "global", "dogfood-app", "Praxis", "allele", "Nibble.Fish", "ImportProbeA", "NeuroStrata-mmd"] {
-            if namespace == ns {
-                if let Err(e) = self.repair_namespace_hygiene(namespace).await {
-                    tracing::warn!("repair_namespace_hygiene failed for '{namespace}': {e}");
-                }
-                break;
-            }
-        }
         let rows = match self.list(namespace, None, None).await {
             Ok(rows) => rows,
             Err(e) => {
@@ -2723,7 +2744,7 @@ impl LadybugStore {
                     let location: String = format!("{}", row[4]);
                     let metadata_str: String = format!("{}", row[5]);
                     let metadata: Value =
-                        serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                        parse_metadata_or_warn(&metadata_str, "metadata");
                     let payload = MemoryPayload {
                         content,
                         user_id,
@@ -2815,7 +2836,7 @@ impl LadybugStore {
                     let location_lines: String = format!("{}", row[7]);
                     let metadata_str: String = format!("{}", row[8]);
                     let metadata: Value =
-                        serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                        parse_metadata_or_warn(&metadata_str, "metadata");
                     let payload = MemoryPayload {
                         content,
                         user_id,
@@ -3019,7 +3040,7 @@ impl LadybugStore {
                 Ok(out)
             })
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| { tracing::warn!("query_db_metrics failed: {e}"); Vec::new() });
 
         let key = (namespace.to_string(), kind, name.to_string());
         let mut samples = self.metrics.range(
@@ -3064,7 +3085,7 @@ impl LadybugStore {
                 let location = format!("{}", row[4]);
                 let metadata_str = format!("{}", row[5]);
                 let metadata: Value =
-                    serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                    parse_metadata_or_warn(&metadata_str, "metadata");
                 let payload = MemoryPayload {
                     content,
                     user_id,
@@ -3100,35 +3121,38 @@ impl LadybugStore {
                     "MATCH (a:Memory)-[r:{}]->(b:Memory) WHERE a.namespace = '{}' AND b.namespace = '{}' RETURN a.id, b.id, r.source, r.valid_from, r.valid_to",
                     table, safe_ns, safe_ns
                 );
-                if let Ok(erows) = conn.query(&eq) {
-                    for erow in erows {
-                        let from = format!("{}", erow[0]);
-                        let to = format!("{}", erow[1]);
-                        let src_str = format!("{}", erow[2]);
-                        let vf = format!("{}", erow[3]).parse::<i64>().ok().filter(|v| *v > 0);
-                        let vt = format!("{}", erow[4]).parse::<i64>().ok().filter(|v| *v > 0);
-                        if !include_retired {
-                            if let Some(vt_val) = vt {
-                                if vt_val <= now_ts {
-                                    continue;
+                match conn.query(&eq) {
+                    Ok(erows) => {
+                        for erow in erows {
+                            let from = format!("{}", erow[0]);
+                            let to = format!("{}", erow[1]);
+                            let src_str = format!("{}", erow[2]);
+                            let vf = format!("{}", erow[3]).parse::<i64>().ok().filter(|v| *v > 0);
+                            let vt = format!("{}", erow[4]).parse::<i64>().ok().filter(|v| *v > 0);
+                            if !include_retired {
+                                if let Some(vt_val) = vt {
+                                    if vt_val <= now_ts {
+                                        continue;
+                                    }
                                 }
                             }
+                            if !src_str.is_empty() && src_str != *warn_ns {
+                                tracing::debug!(
+                                    "edge in '{}' carries origin source '{}'",
+                                    warn_ns,
+                                    src_str
+                                );
+                            }
+                            edges.push(crate::graph_read::related::EdgeSpec {
+                                source: from,
+                                relation: rel_name.to_string(),
+                                target: to,
+                                valid_from: vf.unwrap_or(0),
+                                valid_to: vt.unwrap_or(0),
+                            });
                         }
-                        if !src_str.is_empty() && src_str != *warn_ns {
-                            tracing::debug!(
-                                "edge in '{}' carries origin source '{}'",
-                                warn_ns,
-                                src_str
-                            );
-                        }
-                        edges.push(crate::graph_read::related::EdgeSpec {
-                            source: from,
-                            relation: rel_name.to_string(),
-                            target: to,
-                            valid_from: vf.unwrap_or(0),
-                            valid_to: vt.unwrap_or(0),
-                        });
                     }
+                    Err(e) => { tracing::warn!("export_wasm_snapshot edge query failed: {e}"); }
                 }
             }
 
@@ -4181,7 +4205,7 @@ impl VectorStore for LadybugStore {
                 let location_lines: String = format!("{}", row[7]);
                 let metadata_str: String = format!("{}", row[8]);
                 let metadata_val: Value =
-                    serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                    parse_metadata_or_warn(&metadata_str, "metadata");
 
                 // Lifecycle filters (Rust side).
                 if is_retired_at(&metadata_val, now) {
@@ -4299,7 +4323,7 @@ impl VectorStore for LadybugStore {
                 let location_lines: String = format!("{}", row[6]);
                 let metadata_str: String = format!("{}", row[7]);
                 let metadata_val: Value =
-                    serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                    parse_metadata_or_warn(&metadata_str, "metadata");
 
                 if is_retired_at(&metadata_val, now) {
                     continue;

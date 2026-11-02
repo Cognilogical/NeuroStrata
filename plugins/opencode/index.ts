@@ -666,7 +666,7 @@ export async function prefetchMemoriesForFile(
 // ──────────────────────────────────────────────────────────────────────
 
 let config: PluginConfig = DEFAULT_CONFIG;
-let mcpClient: NeuroStrataMCPClient;
+let mcpClient: NeuroStrataMCPClient | undefined;
 
 /**
  * Test hook: drop the cached MCP client so un-initialized code paths (like
@@ -901,78 +901,6 @@ async function negotiateCapabilities(): Promise<void> {
   }
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// Tool Wrapper: guard_validate before write/edit
-// ──────────────────────────────────────────────────────────────────────
-
-async function wrapWriteEdit(
-  call: any,
-  next: (call: any) => Promise<any>,
-): Promise<any> {
-  if (!config.strictMode) {
-    const result_ = await next(call);
-    // Executed without validation: it is still a mutation.
-    mutationsSinceNote++;
-    return result_;
-  }
-
-  const actionType = call.name; // "write" or "edit"
-  const payload = JSON.stringify(call.args);
-  const cwd = process.cwd();
-  const { session_id, active_task_id, worktree } = callState(call);
-
-  try {
-    const text = await mcpClient.callTool("neurostrata_guard_validate", {
-      namespace: config.namespace,
-      session_id,
-      active_task_id,
-      worktree,
-      action_type: actionType,
-      payload,
-      cwd,
-      is_mutating: true,
-      use_sandbox: false, // semantic-only for speed; sandbox opt-in
-      mutations_since_note: mutationsSinceNote,
-    });
-
-    const result = parseGuardValidate(text);
-    if (result.verdict === "reject") {
-      const reason =
-        result.reasons.join("; ") ||
-        result.constraints.join("; ") ||
-        result.bucket;
-      console.warn("Guard rejected write/edit", {
-        actionType,
-        session_id,
-        active_task_id,
-        worktree,
-        reason,
-        rule_ids: result.rule_ids,
-      });
-      return {
-        success: false,
-        error: `Zero-Action Start violation: ${reason}`,
-        data: { guard_verdict: result, degraded: false },
-      };
-    }
-  } catch (err) {
-    const message = String(err);
-    setStatus({ state: "unavailable", lastError: message });
-    console.error("Guard validation failed", { error: message });
-    // Fail closed: a guard that cannot answer is not a guard that passed.
-    return {
-      success: false,
-      error: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
-      data: { degraded: true, state: status.state },
-    };
-  }
-
-  const result_ = await next(call);
-  // Executed: count the mutation after the call goes through.
-  mutationsSinceNote++;
-  return result_;
-}
-
 /**
  * AC2 State-check wrapper: blocks mutating tools when session/task/worktree
  * state shows Unpreflighted/BreathRequired (no active task claim or note
@@ -995,70 +923,6 @@ function callState(call: any): {
     active_task_id: asString(args.active_task_id) ?? activeTaskId,
     worktree: asString(args.worktree) ?? process.cwd(),
   };
-}
-
-async function wrapMutatingTool(
-  call: any,
-  next: (call: any) => Promise<any>,
-): Promise<any> {
-  if (!config.strictMode) {
-    const result_ = await next(call);
-    // Executed without validation: it is still a mutation.
-    mutationsSinceNote++;
-    return result_;
-  }
-
-  const actionType = call.name;
-  const payload = JSON.stringify(call.args);
-  const cwd = process.cwd();
-  const { session_id, active_task_id, worktree } = callState(call);
-
-  try {
-    const text = await mcpClient.callTool("neurostrata_guard_validate", {
-      namespace: config.namespace,
-      session_id,
-      active_task_id,
-      worktree,
-      action_type: actionType,
-      payload,
-      cwd,
-      is_mutating: true,
-      use_sandbox: false,
-      mutations_since_note: mutationsSinceNote,
-    });
-
-    const result = parseGuardValidate(text);
-    if (result.verdict === "reject") {
-      const reason =
-        result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
-      console.warn("Guard rejected mutating tool", {
-        actionType,
-        session_id,
-        active_task_id,
-        worktree,
-        reason,
-        rule_ids: result.rule_ids,
-      });
-      return {
-        success: false,
-        error: `Zero-Action Start violation: ${reason}`,
-        data: { guard_verdict: result, degraded: false },
-      };
-    }
-  } catch (err) {
-    const message = String(err);
-    setStatus({ state: "unavailable", lastError: message });
-    console.error("Guard validation failed", { error: message });
-    return {
-      success: false,
-      error: `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
-      data: { degraded: true, state: status.state },
-    };
-  }
-  const result_ = await next(call);
-  // Executed: count the mutation after the call goes through.
-  mutationsSinceNote++;
-  return result_;
 }
 
 // ──────────────────────────────────────────────────────────────────────

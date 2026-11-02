@@ -759,7 +759,7 @@ export async function prefetchMemoriesForFile(
 // ──────────────────────────────────────────────────────────────────────
 
 let config: PluginConfig = DEFAULT_CONFIG;
-let mcpClient: NeuroStrataMCPClient;
+let mcpClient: NeuroStrataMCPClient | undefined;
 
 /**
  * The plugin context, captured on initialize.
