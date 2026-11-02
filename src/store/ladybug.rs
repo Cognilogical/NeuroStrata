@@ -5768,13 +5768,25 @@ impl crate::traits::IntakeStore for LadybugStore {
                 .and_then(|row| format!("{}", row[0]).parse().ok())
                 .unwrap_or(0);
 
+            if limit == 0 {
+                return Ok(crate::task::intake::IntakeListResponse {
+                    namespace: namespace.clone(),
+                    count: 0,
+                    total: total as usize,
+                    offset,
+                    limit,
+                    items: Vec::new(),
+                });
+            }
+
             // Get paginated results
             let query = format!(
-                "MATCH (r:IntakeReceipt) WHERE r.namespace = '{}' RETURN r.id, r.namespace, r.source_kind, r.source_revision, r.source_digest, r.detected_intents, r.raw_text, r.created_at ORDER BY r.created_at DESC LIMIT {} OFFSET {}",
-                safe_ns, limit, offset
+                "MATCH (r:IntakeReceipt) WHERE r.namespace = '{}' RETURN r.id, r.namespace, r.source_kind, r.source_revision, r.source_digest, r.detected_intents, r.raw_text, r.created_at ORDER BY r.created_at DESC LIMIT {}",
+                safe_ns,
+                offset.saturating_add(limit)
             );
             let mut results = Vec::new();
-            for row in conn.query(&query)? {
+            for row in conn.query(&query)?.skip(offset).take(limit) {
                 let id: String = format!("{}", row[0]);
                 let ns: String = format!("{}", row[1]);
                 let source_kind_str: String = format!("{}", row[2]);
@@ -5854,13 +5866,25 @@ impl crate::traits::IntakeStore for LadybugStore {
                 .and_then(|row| format!("{}", row[0]).parse().ok())
                 .unwrap_or(0);
 
+            if limit == 0 {
+                return Ok(crate::task::intake::IntakeListResponse {
+                    namespace: namespace.clone(),
+                    count: 0,
+                    total: total as usize,
+                    offset,
+                    limit,
+                    items: Vec::new(),
+                });
+            }
+
             // Get paginated results
             let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint ORDER BY c.created_at DESC LIMIT {} OFFSET {}",
-                where_clause, limit, offset
+                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint ORDER BY c.created_at DESC LIMIT {}",
+                where_clause,
+                offset.saturating_add(limit)
             );
             let mut results = Vec::new();
-            for row in conn.query(&query)? {
+            for row in conn.query(&query)?.skip(offset).take(limit) {
                 let id: String = format!("{}", row[0]);
                 let ns: String = format!("{}", row[1]);
                 let receipt_id: String = format!("{}", row[2]);
@@ -5872,14 +5896,6 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let cas_version: i64 = format!("{}", row[8]).parse().unwrap_or(1);
                 let created_at: String = format!("{}", row[9]);
                 let updated_at: String = format!("{}", row[10]);
-                let _candidate_kind: String = format!("{}", row[11]);
-                let _payload_str: String = format!("{}", row[12]);
-                let _confidence: Option<f64> = format!("{}", row[13]).parse().ok();
-                let _source_span_str: String = format!("{}", row[14]);
-                let _extractor_fingerprint: Option<String> = {
-                    let s = format!("{}", row[15]);
-                    if s.is_empty() { None } else { Some(s) }
-                };
                 let candidate_kind: String = format!("{}", row[11]);
                 let payload_str: String = format!("{}", row[12]);
                 let confidence: Option<f64> = format!("{}", row[13]).parse().ok();

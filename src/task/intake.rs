@@ -419,6 +419,180 @@ mod tests {
         let candidates = create_candidates_from_intents("test", "rcpt-1", &request, intents);
         assert_eq!(candidates.len(), 2);
     }
+
+    /// End-to-end probe of the IntakeStore handlers against a real temp
+    /// `LadybugStore`: intake twice, then list receipts and candidates both
+    /// unpaged and paged (`limit: 1, offset: 1`), then resolve a candidate.
+    /// Guards the LIMIT syntax: `OFFSET` is not Ladybug Cypher, so any output
+    /// containing "parser exception" (or an ERROR from the underlying query)
+    /// fails here.
+    #[tokio::test]
+    async fn handle_intake_round_trips_receipts_candidates_and_pagination() {
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(
+                dir.path().join("intake.lbug").to_string_lossy().to_string(),
+                4,
+            )
+            .expect("open temp database"),
+        );
+        store.init("intake-list-test").await.expect("create schema");
+
+        let ns = "intake-list-test";
+        let text = "TODO: fix the offset pagination bug";
+
+        // Intake twice, separated enough that `created_at` (second
+        // resolution) orders the two receipts deterministically.
+        for (rev, digest) in [("rev-1", "digest-1"), ("rev-2", "digest-2")] {
+            let out = handle_intake(
+                json!({
+                    "namespace": ns,
+                    "source_revision": rev,
+                    "source_digest": digest,
+                    "text": text,
+                }),
+                store.clone(),
+            )
+            .await;
+            assert!(!out.contains("ERROR"), "intake {} failed: {}", rev, out);
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+        }
+
+        // Receipts: unpaged
+        let out = handle_intake_list(
+            json!({"namespace": ns, "mode": "receipts"}),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "unpaged receipts list broke: {}",
+            out
+        );
+        let receipts: Value = serde_json::from_str(&out).expect("parse receipts");
+        assert_eq!(receipts["count"], json!(2));
+        assert_eq!(receipts["total"], json!(2));
+        let all_receipt_ids: Vec<String> = receipts["receipts"]
+            .as_array()
+            .expect("receipts array")
+            .iter()
+            .map(|r| r["id"].as_str().expect("receipt id").to_string())
+            .collect();
+
+        // Receipts: paged pages reassemble the full listing
+        let pages: [Vec<String>; 2] = [
+            page_of(handle_intake_list(
+                json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 0}),
+                store.clone(),
+            ).await, "receipts"),
+            page_of(handle_intake_list(
+                json!({"namespace": ns, "mode": "receipts", "limit": 1, "offset": 1}),
+                store.clone(),
+            ).await, "receipts"),
+        ];
+        assert_eq!(pages[0].len(), 1, "receipt page at offset 0: {:?}", pages);
+        assert_eq!(pages[1].len(), 1, "receipt page at offset 1: {:?}", pages);
+        assert_ne!(pages[0][0], pages[1][0], "offset must move to the next row");
+        let mut combined = pages.concat();
+        combined.sort();
+        let mut sorted_all = all_receipt_ids.clone();
+        sorted_all.sort();
+        assert_eq!(combined, sorted_all, "paged pages must cover every receipt");
+
+        // Candidates: unpaged (one intent per receipt → one candidate each)
+        let out = handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates"}),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "unpaged candidates list broke: {}",
+            out
+        );
+        let candidates: Value = serde_json::from_str(&out).expect("parse candidates");
+        assert_eq!(candidates["count"], json!(2));
+        assert_eq!(candidates["total"], json!(2));
+        let all_candidate_ids: Vec<String> = candidates["candidates"]
+            .as_array()
+            .expect("candidates array")
+            .iter()
+            .map(|c| c["id"].as_str().expect("candidate id").to_string())
+            .collect();
+
+        // Candidates: paged pages reassemble the full listing
+        let page0 = page_of(handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 0}),
+            store.clone(),
+        ).await, "candidates");
+        let page1 = page_of(handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates", "limit": 1, "offset": 1}),
+            store.clone(),
+        ).await, "candidates");
+        assert_eq!(page0.len(), 1, "candidate page at offset 0");
+        assert_eq!(page1.len(), 1, "candidate page at offset 1");
+        assert_ne!(page0[0], page1[0], "offset must move to the next candidate");
+        let mut combined = [page0.clone(), page1.clone()].concat();
+        combined.sort();
+        let mut sorted_all = all_candidate_ids.clone();
+        sorted_all.sort();
+        assert_eq!(combined, sorted_all, "paged pages must cover every candidate");
+
+        // Resolve one candidate (dismissed keeps the resolve path free of
+        // task creation side effects).
+        let out = handle_intake_resolve(
+            json!({
+                "namespace": ns,
+                "candidate_id": page1[0],
+                "disposition": "dismissed",
+                "cas_version": 1,
+            }),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "resolve broke: {}",
+            out
+        );
+        let resolved: Value = serde_json::from_str(&out).expect("parse resolve");
+        assert_eq!(resolved["candidate"]["disposition"], json!("dismissed"));
+
+        // The remaining pending candidate is still listable, filtered.
+        let out = handle_intake_list(
+            json!({"namespace": ns, "mode": "candidates", "review_state": "pending"}),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !out.contains("ERROR") && !out.contains("parser exception"),
+            "filtered candidates list broke: {}",
+            out
+        );
+        let pending: Value = serde_json::from_str(&out).expect("parse pending");
+        assert_eq!(pending["count"], json!(1));
+        assert_eq!(pending["total"], json!(1));
+    }
+
+    /// Pull the ids off one listing page, after checking the page answered.
+    fn page_of(raw: String, key: &str) -> Vec<String> {
+        assert!(
+            !raw.contains("ERROR") && !raw.contains("parser exception"),
+            "listing page ({} items) broke: {}",
+            key,
+            raw
+        );
+        let value: Value =
+            serde_json::from_str(&raw).expect("page must be valid JSON");
+        value[key]
+            .as_array()
+            .expect("page array")
+            .iter()
+            .map(|row| row["id"].as_str().expect("id").to_string())
+            .collect()
+    }
 }
 
 /// Handler for neurostrata_task_intake tool.
@@ -460,7 +634,9 @@ pub async fn handle_intake(
     let description = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     // Downcast to IntakeStore
-    let intake_store = match store.as_any().downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -505,7 +681,9 @@ pub async fn handle_intake_list(
 
     let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("candidates");
 
-    let intake_store = match store.as_any().downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -619,7 +797,9 @@ pub async fn handle_intake_resolve(
         None => return "ERROR: 'cas_version' is required (u64).".to_string(),
     };
 
-    let intake_store = match store.as_any().downcast_ref::<crate::store::ladybug::LadybugStore>() {
+    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::ladybug::LadybugStore>()
+    {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -642,16 +822,5 @@ pub async fn handle_intake_resolve(
             serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
         }
         Err(e) => e,
-    }
-}
-
-// Add AsAny trait for downcasting
-trait AsAny {
-    fn as_any(&self) -> &dyn std::any::Any;
-}
-
-impl<T: 'static> AsAny for T {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
