@@ -431,13 +431,32 @@ mod tests {
     #[test]
     fn gold_fixtures_disjoint() {
         // Step 4: separately adjudicated gold fixtures with disjoint
-        // gold_calib and gold_eval partitions; tests reject overlap or weak labels.
-        let calib_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::from(["obs-gold-1".into(), "obs-gold-2".into()]);
-        let eval_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::from(["obs-gold-eval-1".into(), "obs-gold-eval-2".into()]);
-        let overlap: std::collections::HashSet<&String> = calib_ids.intersection(&eval_ids).collect();
-        assert!(overlap.is_empty(), "gold calib and eval must not overlap");
+        // gold_calib and gold_eval partitions; exercises the real shipped
+        // fixture files and rejects overlap or weak labels.
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read_ids = |relative: &str| -> std::collections::HashSet<String> {
+            let path = manifest_dir.join(relative);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    let row: serde_json::Value = serde_json::from_str(line)
+                        .unwrap_or_else(|e| panic!("invalid JSONL in {}: {e}", path.display()));
+                    row["observation_id"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("missing observation_id in {}: {line}", path.display()))
+                        .to_string()
+                })
+                .collect()
+        };
+        let calib_ids = read_ids("tests/fixtures/learning/dedup_gold_calib.jsonl");
+        let eval_ids = read_ids("tests/fixtures/learning/dedup_gold_eval.jsonl");
+        assert!(!calib_ids.is_empty(), "gold calib fixture must not be empty");
+        assert!(!eval_ids.is_empty(), "gold eval fixture must not be empty");
+        assert!(calib_ids.is_disjoint(&eval_ids),
+            "gold calib and eval must not overlap: {:?}",
+            calib_ids.intersection(&eval_ids).collect::<Vec<_>>());
     }
 
     #[test]

@@ -383,6 +383,11 @@ struct GraphQuery {
     /// Optional, source-scoped compatibility override from the CLI.
     anchor_root: Option<String>,
     source_id: Option<String>,
+    /// CLI `--clear`: flip export-freshness dirty flags to clean before
+    /// exporting, so an operator-confirmed export is not refused by the
+    /// freshness gate.
+    #[serde(default)]
+    pub clear: bool,
 }
 
 pub async fn start_daemon(
@@ -1041,6 +1046,12 @@ async fn handle_get_graph(
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, query.source_id.as_deref());
 
+    if query.clear {
+        if let Err(e) = crate::events::clear_export_freshness(state.vector_store.as_ref()).await {
+            eprintln!("Warning: failed to clear export freshness: {e}");
+        }
+    }
+
     // VectorStore exposes no namespaced graph read, so this serves
     // `export_graph()` (the whole graph) and filters by namespace. Adding a
     // `get_graph_by_namespace` to VectorStore would drop the filter step.
@@ -1162,6 +1173,9 @@ struct ExportGraphReq {
     include_archived: Option<bool>,
     anchor_root: Option<String>,
     source_id: Option<String>,
+    /// CLI `--clear`: clean the export-freshness flags before exporting.
+    #[serde(default)]
+    clear: bool,
 }
 
 async fn handle_export_graph(
@@ -1173,6 +1187,12 @@ async fn handle_export_graph(
     let anchor_root = req.anchor_root.as_deref().map(Path::new);
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, req.source_id.as_deref());
+
+    if req.clear {
+        if let Err(e) = crate::events::clear_export_freshness(state.vector_store.as_ref()).await {
+            eprintln!("Warning: failed to clear export freshness: {e}");
+        }
+    }
 
     let data = state
         .vector_store

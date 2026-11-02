@@ -26,40 +26,6 @@ impl OxRdfQuad {
             inner: Quad::new(subject, predicate, object, graph_name),
         }
     }
-
-    /// Get the underlying oxrdf Quad reference.
-    pub fn as_quad(&self) -> &Quad {
-        &self.inner
-    }
-
-    /// Convert to N-Quads string representation.
-    pub fn to_nquads(&self) -> String {
-        self.inner.to_string()
-    }
-
-    /// Create a quad from strings for use in projection logic.
-    pub fn from_strings(
-        subject: &str,
-        predicate: &str,
-        object_type: &str,
-        object_value: &str,
-        graph: Option<&str>,
-    ) -> Result<Self, oxrdf::IriParseError> {
-        let subject_nn = NamedNode::new_unchecked(subject.to_string());
-        let predicate_nn = NamedNode::new_unchecked(predicate.to_string());
-        let object = match object_type {
-            "iri" => oxrdf::Term::NamedNode(NamedNode::new_unchecked(object_value.to_string())),
-            _ => {
-                let datatype = NamedNode::new("http://www.w3.org/2001/XMLSchema#string")?;
-                oxrdf::Term::Literal(Literal::new_typed_literal(object_value.to_string(), datatype))
-            }
-        };
-        let graph_name = match graph {
-            Some(g) => GraphName::NamedNode(NamedNode::new_unchecked(g.to_string())),
-            None => GraphName::DefaultGraph,
-        };
-        Ok(Self::new(subject_nn, predicate_nn, object, graph_name))
-    }
 }
 
 impl From<OxRdfQuad> for Quad {
@@ -120,7 +86,19 @@ impl OxRdfBridge {
                         Some(lang) => {
                             match Literal::new_language_tagged_literal(value.clone(), lang) {
                                 Ok(lit) => oxrdf::Term::Literal(lit),
-                                Err(_) => Literal::new_simple_literal(value.clone()).into(),
+                                Err(e) => {
+                                    // RFC 5646 language tags are validated at
+                                    // conversion; an invalid tag downgrades the
+                                    // literal to a plain string (lossy).
+                                    tracing::warn!(
+                                        "invalid language tag '{}' on literal '{}'; \
+                                         falling back to simple literal: {}",
+                                        lang,
+                                        value,
+                                        e
+                                    );
+                                    Literal::new_simple_literal(value.clone()).into()
+                                }
                             }
                         }
                         None => Literal::new_typed_literal(value.clone(), datatype_nn).into(),
@@ -153,8 +131,26 @@ impl OxRdfBridge {
                 datatype: Some(lit.datatype().as_str().to_string()),
                 language: lit.language().map(|lang| lang.to_string()),
             },
-            oxrdf::Term::BlankNode(bn) => QuadObject::Iri(format!("_:{}", bn)),
-            oxrdf::Term::Triple(_) => {
+            oxrdf::Term::BlankNode(bn) => {
+                // Blank-node objects cannot round-trip through the legacy
+                // QuadObject (which has no blank-node variant), so they are
+                // coerced into an opaque IRI — flag the information loss.
+                tracing::warn!(
+                    "RDF quad object is a BlankNode (_:{}); coerced to legacy IRI '_:{}'",
+                    bn,
+                    bn
+                );
+                QuadObject::Iri(format!("_:{}", bn))
+            }
+            oxrdf::Term::Triple(t) => {
+                // RDF-star quoted triples have no legacy representation; the
+                // placeholder IRI discards the embedded statement.
+                tracing::warn!(
+                    "RDF-star quoted triple object coerced to legacy placeholder IRI \
+                     'urn:neurostrata:triple' (subject: {}, predicate: {})",
+                    t.subject,
+                    t.predicate
+                );
                 QuadObject::Iri("urn:neurostrata:triple".to_string())
             },
         };
@@ -205,18 +201,17 @@ mod tests {
     #[test]
     fn oxrdf_dataset_insert_and_len() {
         let mut ds = OxRdfDataset::new();
-        let graph = OxRdfBridge::tier_to_graph_name(
-            &crate::rdf::types::Tier::Domain,
-            "ns",
-            0,
-        );
-        let q = OxRdfQuad::from_strings(
-            "urn:neurostrata:memory:m1",
-            "urn:neurostrata:ns#content",
-            "literal",
-            "hello",
-            Some(&graph.to_string()),
-        ).unwrap();
+        let ns_quad = crate::rdf::types::Quad {
+            subject: "urn:neurostrata:memory:m1".to_string(),
+            predicate: "urn:neurostrata:ns#content".to_string(),
+            object: crate::rdf::types::QuadObject::Literal {
+                value: "hello".to_string(),
+                datatype: Some("http://www.w3.org/2001/XMLSchema#string".to_string()),
+                language: None,
+            },
+            graph: Some("urn:neurostrata:graph:ns:domain:gen:0".to_string()),
+        };
+        let q = OxRdfBridge::neurostrata_quad_to_oxrdf(&ns_quad).unwrap();
         assert!(ds.insert(q));
         assert_eq!(ds.len(), 1);
         assert!(!ds.is_empty());

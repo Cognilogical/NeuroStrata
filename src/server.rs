@@ -211,7 +211,8 @@ pub async fn process_mcp_request(
                                 "fact_shape": { "type": "string", "enum": ["atomic", "composite", "any"], "description": "Filter fact memories by shape ('atomic', 'composite', or 'any')." },
                                 "path_prefix": { "type": "string", "description": "Optional file/location path prefix filter." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
-                                "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." }
+                                "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
+                                "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -524,7 +525,10 @@ pub async fn process_mcp_request(
                                 "action_type": { "type": "string", "description": "Type of action: 'bash', 'write_file', etc." },
                                 "payload": { "type": "string", "description": "The actual command or file content to validate." },
                                 "cwd": { "type": "string", "description": "Current working directory for sandbox execution. Defaults to empty." },
-                                "use_sandbox": { "type": "boolean", "description": "Whether to execute the action in a sandbox after the semantic check. Defaults to false." }
+                                "use_sandbox": { "type": "boolean", "description": "Whether to execute the action in a sandbox after the semantic check. Defaults to false." },
+                                "session_id": { "type": "string", "description": "Active session ID for Zero-Action-Start preflight." },
+                                "active_task_id": { "type": "string", "description": "Claimed task ID for this session." },
+                                "mutations_since_note": { "type": "integer", "description": "Number of mutations since the last task note (Breath gate)." }
                             },
                             "required": ["action_type", "payload"]
                         }
@@ -591,7 +595,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_distill",
-                        "description": "Scan session logs and propose candidate rules/tasks (review-only). Returns proposed candidates; applies nothing.",
+                        "description": "Scan session logs for candidate rules/tasks and record intake candidates (unless dry_run is true).",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -772,7 +776,8 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name." },
-                                "memory_id": { "type": "string", "description": "Optional single memory ID to export." }
+                                "memory_id": { "type": "string", "description": "Optional single memory ID to export." },
+                                "format": { "type": "string", "enum": ["n-triples-star", "n-quads-star", "turtle-star", "trig-star"], "description": "RDF-star serialization format (default 'n-triples-star')." }
                             },
                             "required": ["namespace"]
                         }
@@ -805,7 +810,8 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "query": { "type": "string", "description": "GraphQL query document." },
                                 "variables": { "type": "object", "description": "Optional GraphQL variables object." },
-                                "principal": { "type": "string", "description": "Optional ReBAC principal (defaults to 'admin')." }
+                                "principal": { "type": "string", "description": "Optional ReBAC principal (defaults to 'admin')." },
+                                "namespace": { "type": "string", "description": "The project namespace to query against." }
                             },
                             "required": ["query"]
                         }
@@ -819,7 +825,7 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "kind": { "type": "string", "description": "Metric kind (e.g. retrieval_latency_ms, recall_hit_rate)." },
                                 "name": { "type": "string", "description": "Metric series name." },
-                                "metric": { "type": "string", "description": "Spec alias for 'name' (or 'kind'). Ignored when 'name' is present." },
+                                "metric": { "type": "string", "description": "Spec alias feeding both 'kind' and 'name'. Used as 'kind' when 'kind' is absent and as 'name' when 'name' is absent; a single value serving both slots is classified as a metric kind when it resolves, otherwise as a name swept across every kind. 'name' wins over 'metric' for the name slot." },
                                 "stage": { "type": "string", "description": "Optional stage filter (e.g. 'search', 'upsert'); acts as 'kind' or 'name' alias." },
                                 "since_ts": { "type": "integer", "description": "Optional lower timestamp bound." },
                                 "until_ts": { "type": "integer", "description": "Optional upper timestamp bound." },
@@ -2223,6 +2229,29 @@ pub(crate) fn first_location(locations: &[Value]) -> (String, String) {
     }
 }
 
+/// The `governs` array a `locations` argument derives: every non-empty path,
+/// normalized (see stamp_locations) and deduplicated -- several locations
+/// often sit in one file, so one edge is enough. Split out of stamp_locations
+/// so supersede can assert the same derivation it promises in its reply.
+pub(crate) fn derive_governs_from_locations(locations: &[Value]) -> Vec<serde_json::Value> {
+    locations
+        .iter()
+        .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
+        .filter(|p| !p.is_empty())
+        // Same normalisation the ingester applies to its node ids, so a
+        // path written by hand lands on the file node it names.
+        .map(crate::parser::ingest::normalize_node_path)
+        .fold(Vec::new(), |mut acc: Vec<String>, path| {
+            if !acc.contains(&path) {
+                acc.push(path);
+            }
+            acc
+        })
+        .into_iter()
+        .map(|p| serde_json::json!(p))
+        .collect()
+}
+
 /// Adds the `refs` anchors and the GOVERNS declarations a `locations` argument
 /// carries. Split out of handle_add_memory so task_complete's inline
 /// extraction lands on the exact same anchoring path (section 3.2).
@@ -2258,23 +2287,7 @@ pub(crate) fn stamp_locations(metadata: &mut Value, locations: &[Value]) {
     // A rule that names files governs them. This is the edge that makes an
     // architectural memory reachable from the code it constrains, rather
     // than only from a similar-sounding query.
-    let governed: Vec<serde_json::Value> = locations
-        .iter()
-        .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
-        .filter(|p| !p.is_empty())
-        // Same normalisation the ingester applies to its node ids, so a
-        // path written by hand lands on the file node it names.
-        .map(crate::parser::ingest::normalize_node_path)
-        .fold(Vec::new(), |mut acc: Vec<String>, path| {
-            // Several locations often sit in one file; one edge is enough.
-            if !acc.contains(&path) {
-                acc.push(path);
-            }
-            acc
-        })
-        .into_iter()
-        .map(|p| serde_json::json!(p))
-        .collect();
+    let governed = derive_governs_from_locations(locations);
     if !governed.is_empty() {
         obj.insert("governs".to_string(), serde_json::Value::Array(governed));
     }
@@ -4599,9 +4612,21 @@ pub(crate) async fn handle_twin_set(
     let eff_schema_id = schema_id.or_else(|| prev.and_then(|p| p.schema_id));
     let mut violations = Vec::new();
     if let Some(ref sid) = eff_schema_id {
-        if let Ok(Some((_, schema_payload))) = store.get(&namespace, sid).await {
-            let schema = crate::digital_twin::TwinSchema::from_metadata(&schema_payload.metadata);
-            violations = crate::digital_twin::validate_state(&state_after, schema.as_ref());
+        match store.get(&namespace, sid).await {
+            Ok(Some((_, schema_payload))) => {
+                let schema = crate::digital_twin::TwinSchema::from_metadata(&schema_payload.metadata);
+                violations = crate::digital_twin::validate_state(&state_after, schema.as_ref());
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "twin schema {sid} not found in namespace {namespace}; state validated without a schema"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "twin schema {sid} read failed in namespace {namespace}: {e}; state validated without a schema"
+                );
+            }
         }
     }
 
@@ -4841,21 +4866,27 @@ pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn Vect
 }
 
 pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String {
-    let cfg = crate::config::Config::from_default_path()
-        .map(|c| c.storage_hygiene)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Config::from_default_path failed in storage_status, using defaults: {e}");
-            Default::default()
-        });
+    // One load backs both consumers (the hygiene config and the non-Ladybug
+    // db_path fallback); a failure is warned once instead of once per branch.
+    let cfg = crate::config::Config::from_default_path();
+    if let Err(e) = &cfg {
+        tracing::warn!("Config::from_default_path failed in storage_status, using defaults: {e}");
+    }
+    let cfg = cfg.ok();
+    let hygiene_cfg = cfg
+        .as_ref()
+        .map(|c| c.storage_hygiene.clone())
+        .unwrap_or_default();
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
-        let status = crate::storage::compute_storage_status(ls.local_path(), &cfg);
+        let status = crate::storage::compute_storage_status(ls.local_path(), &hygiene_cfg);
         return serde_json::to_string(&status)
             .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}).to_string());
     }
-    let db_path = crate::config::Config::from_default_path()
-        .map(|c| std::path::PathBuf::from(c.db_path))
-        .unwrap_or_else(|_| std::path::PathBuf::from(".NeuroStrata/db"));
-    let status = crate::storage::compute_storage_status(&db_path, &cfg);
+    let db_path = cfg
+        .as_ref()
+        .map(|c| std::path::PathBuf::from(c.db_path.clone()))
+        .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
+    let status = crate::storage::compute_storage_status(&db_path, &hygiene_cfg);
     serde_json::to_string(&status)
         .unwrap_or_else(|e| serde_json::json!({"ok":false,"error":e.to_string()}).to_string())
 }
@@ -4951,7 +4982,7 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
     let kind_parse = kind_str.and_then(|s| crate::time_series::MetricKind::from_str(s).ok());
     let target = match (kind_str, name_str) {
         (None, None) => {
-            return serde_json::json!({"ok":false,"error":"kind and name (or spec aliases metric/stage/from/to) required"}).to_string()
+            return serde_json::json!({"ok":false,"error":"kind and name (or spec aliases metric/stage) required"}).to_string()
         }
         // A single string serving both slots: classify it as a kind when it
         // resolves, otherwise treat it as a stage name swept across kinds.
@@ -5188,7 +5219,10 @@ pub(crate) async fn handle_chat_ask(
     let system = arguments.get("system").and_then(|v| v.as_str());
     let cfg = crate::config::Config::from_default_path()
         .map(|c| c.rag_chat)
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!("Config::from_default_path failed in chat_ask, using defaults: {e}");
+            Default::default()
+        });
     let principal = arguments
         .get("principal")
         .and_then(|v| v.as_str())
@@ -5290,7 +5324,11 @@ async fn handle_domain_registry(arguments: Value, emb: Arc<dyn crate::traits::Em
     let read_registry = || async {
         match store.get(namespace, &crate::registry::registry_row_id(namespace)).await {
             Ok(Some((_, payload))) => payload.metadata.clone(),
-            _ => serde_json::json!({}),
+            Ok(None) => serde_json::json!({}),
+            Err(e) => {
+                tracing::warn!("registry read failed for '{namespace}': {e}");
+                serde_json::json!({})
+            }
         }
     };
 
@@ -5527,13 +5565,20 @@ async fn handle_supersede_memory(
         return rejection.to_string();
     }
     // The reason and the source land in stored metadata; a secret in either is
-    // as permanent as one in the content.
-    for extra in [reason, source.as_ref().and_then(|s| s.as_str())]
+    // as permanent as one in the content. An object-valued source is scanned
+    // too -- serialized, so every field it carries is examined rather than the
+    // object slipping past the string-only check.
+    let source_scan_str: Option<String> = source.as_ref().map(|s| {
+        s.as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| s.to_string())
+    });
+    for extra in [reason.map(str::to_string), source_scan_str]
         .into_iter()
         .flatten()
     {
         if let Some(rejection) =
-            crate::secrets::scan_entry_point(extra, &serde_json::json!({}), "supersede_memory")
+            crate::secrets::scan_entry_point(&extra, &serde_json::json!({}), "supersede_memory")
         {
             return rejection.to_string();
         }
@@ -5633,6 +5678,20 @@ async fn handle_supersede_memory(
             .filter_map(|loc| loc.get("path").and_then(|p| p.as_str()))
             .any(|p| !p.is_empty());
         stamp_locations(&mut new_payload.metadata, locations);
+        // Promised by the schema and the reply ("the governing pointer is now
+        // set from the locations parameter"): the paths replace the inherited
+        // governs outright. Honest about the source rather than trusting that
+        // stamp_locations did the replacement: assert the derivation here, so
+        // a drift in stamp_locations' semantics cannot leave a stale pointer.
+        if locations_wrote_governs && arguments.get("governs").is_none() {
+            let derived_governs = derive_governs_from_locations(locations);
+            if let Some(obj) = new_payload.metadata.as_object_mut() {
+                obj.insert(
+                    "governs".to_string(),
+                    serde_json::Value::Array(derived_governs),
+                );
+            }
+        }
         if let Some(metadata) = new_payload.metadata.as_object_mut() {
             metadata.remove("absolute_path");
         }
@@ -5740,12 +5799,14 @@ async fn handle_supersede_memory(
                 .map(|vt| vt <= now)
                 .unwrap_or(false);
             if was_retired {
-                // Another supersede raced us. Roll back the successor we just wrote.
-                // Best-effort: the successor is orphaned but the old row is already
-                // retired by the winner, so the namespace is consistent.
+                // Another supersede raced us. We do NOT roll back: by the time
+                // this check runs the winner's successor is already active, and
+                // a third repair write cannot tell which side is stale -- so
+                // the successor written here is left in place, orphaned and
+                // named, for the caller to retire deliberately.
                 return format!(
-                    "Memory {} was modified concurrently by another supersede. Retry if needed.",
-                    id
+                    "Memory {} was modified concurrently by another supersede (orphaned successor: {}). Retry if needed.",
+                    id, new_id
                 );
             }
             // Also verify the metadata object shape hasn't changed under us.
@@ -5947,7 +6008,7 @@ async fn handle_rebuild_communities(
     store: Arc<dyn VectorStore>,
 ) -> String {
     use crate::community::{
-        assign_hubs_by_access_count, detect_communities_with_resolution,
+        detect_communities_with_resolution,
         filter_structural_with_access_counts, COMMUNITY_STRUCTURAL_TYPES,
     };
     use crate::store::ladybug::edge_specs;
@@ -6069,8 +6130,7 @@ async fn handle_rebuild_communities(
         .filter(|(_, t)| COMMUNITY_STRUCTURAL_TYPES.contains(&t.as_str()))
         .map(|(id, _)| id.clone())
         .collect();
-    let mut raw_communities = detection.communities;
-    assign_hubs_by_access_count(&mut raw_communities, &access_counts);
+    let raw_communities = detection.communities;
     let mut filtered_communities: Vec<_> =
         filter_structural_with_access_counts(raw_communities, &structural_ids, &access_counts)
             .into_iter()
@@ -6599,10 +6659,19 @@ async fn handle_search_memory(
         return format!("{}\n\n{}", mode_line, report);
     }
 
-    if let Ok(_) = store.init(namespace).await {
-        if let Ok(vec) = emb.embed(&query).await {
-            if let Ok(outcome) = store
-                .search_with_domain(
+    if let Err(e) = store.init(namespace).await {
+        tracing::warn!("search_memory init failed for '{namespace}': {e}");
+        return format!("Failed to initialize namespace table.: {e}");
+    }
+    let vec = match emb.embed(&query).await {
+        Ok(vec) => vec,
+        Err(e) => {
+            tracing::warn!("search_memory embedding failed for '{namespace}': {e}");
+            return format!("Failed to generate embedding for search.: {e}");
+        }
+    };
+    if let Ok(outcome) = store
+        .search_with_domain(
                     namespace,
                     vec,
                     FETCH_LIMIT,
@@ -6669,6 +6738,9 @@ async fn handle_search_memory(
                         fuzzy_max_distance,
                     )
                     .await;
+                if let Err(e) = &lexical_outcome {
+                    tracing::warn!("search_lexical blend failed for '{namespace}': {e}");
+                }
                 if let Ok(lexical_outcome) = lexical_outcome {
                     let lexical_by_id: std::collections::HashMap<String, f32> =
                         lexical_outcome.results.iter().map(|r| (r.id.clone(), r.score)).collect();
@@ -6807,12 +6879,6 @@ async fn handle_search_memory(
             } else {
                 "Failed to search database.".to_string()
             }
-        } else {
-            "Failed to generate embedding for search.".to_string()
-        }
-    } else {
-        "Failed to initialize namespace table.".to_string()
-    }
 }
 
 /// Resolves a namespace against the ones that already exist, ignoring case.
@@ -8846,6 +8912,49 @@ mod tests {
             .expect("replacement exists");
         assert_eq!(replacement.location, "docs/new-source.md");
         assert!(replacement.metadata.get("absolute_path").is_none());
+    }
+
+    /// Supersede's schema promises that `locations` replaces the rule's
+    /// governs pointer, and the reply claims "the governing pointer is now
+    /// set from the locations parameter". A stale inherited governs list
+    /// left behind under those words would contradict the record: the
+    /// correction must genuinely write the paths the locations named.
+    #[tokio::test]
+    async fn superseding_with_locations_replaces_the_governs_pointer() {
+        let (store, old_id) = store_with_one_rule("probe").await;
+        let (vector, mut old) = store.get("probe", &old_id).await.unwrap().unwrap();
+        old.metadata["governs"] = serde_json::json!(["src/stale-file.rs"]);
+        store.upsert("probe", &old_id, vector, old).await.unwrap();
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": old_id,
+                "namespace": "probe",
+                "content": "replacement source rule",
+                "locations": [{ "path": "src/new_file.rs" }]
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("Superseded"), "got {}", reply);
+        assert!(
+            reply.contains("the locations parameter"),
+            "the reply must say where the pointer came from: {}",
+            reply
+        );
+
+        let (_, replacement) = store
+            .get("probe", &new_id_from(&reply))
+            .await
+            .unwrap()
+            .expect("replacement exists");
+        assert_eq!(
+            replacement.metadata.get("governs"),
+            Some(&serde_json::json!(["src/new_file.rs"])),
+            "governs must be derived from locations, not the stale pointer"
+        );
     }
 
     /// The defect that made editing useless: the row kept the vector of text it

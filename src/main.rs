@@ -245,7 +245,9 @@ enum Commands {
     ///
     /// Exit 0: a healthy daemon is serving. Exit 1: no daemon and the lock is
     /// free -- safe to start one. Exit 2: the lock is held but nothing answers;
-    /// a daemon is busy or finishing, so do not start another.
+    /// a daemon is busy or finishing, so do not start another. Exit 3: the
+    /// daemon is running an older/stale build (its probe handshake did not
+    /// match), so it should be shut down and restarted.
     Status,
 
     /// Rebuild a database from a backup, into a file that does not exist yet
@@ -667,9 +669,15 @@ async fn fetch_daemon_info() -> Option<serde_json::Value> {
 /// Used by the proxy mode to locate the lock file before deciding whether
 /// to spawn a competing daemon.
 fn config_db_path() -> Option<String> {
-    Config::from_default_path()
-        .ok()
-        .map(|c| c.db_path.to_string_lossy().to_string())
+    match Config::load() {
+        // Config::load() is read-only: it never materializes a config file,
+        // which a congested-proxy probe has no business doing.
+        Ok(c) => Some(c.db_path.to_string_lossy().to_string()),
+        Err(e) => {
+            tracing::warn!("config_db_path failed to load config: {e}");
+            None
+        }
+    }
 }
 
 /// Where crash breadcrumbs go: a `crash` directory beside the database.
@@ -681,7 +689,7 @@ fn config_db_path() -> Option<String> {
 /// directory itself.
 fn crash_dir() -> std::path::PathBuf {
     if let Ok(config) = Config::from_default_path() {
-        if let Some(parent) = config.db_path.parent().and_then(|p| p.parent()) {
+        if let Some(parent) = config.db_path.parent() {
             return parent.join("crash");
         }
     }
@@ -813,9 +821,18 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
 
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
+    // Read-only status probes must not create the lock file: open_daemon_lock
+    // opens with .create(true), so an absent-but-unheld lock would be
+    // materialized just by asking about it.
+    if !daemon_lock_path(db_path).exists() {
+        return false;
+    }
     match open_daemon_lock(db_path) {
         Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-        Err(_) => false,
+        Err(e) => {
+            tracing::warn!("daemon_holds_lock probe failed for {}: {e}", db_path.display());
+            false
+        }
     }
 }
 
@@ -996,7 +1013,12 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
     if target.exists() {
         let existing = std::fs::read_to_string(&target)?;
         if !crate::task::is_ours_hook(&existing) {
-            std::fs::copy(&target, hooks_dir.join("pre-commit.bak"))?;
+            let backup = hooks_dir.join("pre-commit.bak");
+            std::fs::copy(&target, &backup)?;
+            eprintln!(
+                "Backed up an existing (foreign) pre-commit hook to {}",
+                backup.display()
+            );
         }
     }
     std::fs::write(&target, crate::task::SCAFFOLDED_PRE_COMMIT_HOOK)?;
@@ -1043,6 +1065,9 @@ impl ReadSource {
                     .json(&serde_json::json!({ "op": "namespaces" }))
                     .send()
                     .await?;
+                if !res.status().is_success() {
+                    anyhow::bail!("daemon /cli/read returned HTTP {}", res.status());
+                }
                 let v: serde_json::Value = res.json().await?;
                 Ok(serde_json::from_value(v["namespaces"].clone())?)
             }
@@ -1058,6 +1083,9 @@ impl ReadSource {
                     .json(&serde_json::json!({ "op": "list", "namespace": namespace }))
                     .send()
                     .await?;
+                if !res.status().is_success() {
+                    anyhow::bail!("daemon /cli/read returned HTTP {}", res.status());
+                }
                 let v: serde_json::Value = res.json().await?;
                 Ok(serde_json::from_value(v["rows"].clone())?)
             }
@@ -3109,7 +3137,7 @@ async fn run() -> anyhow::Result<()> {
                 match probe {
                     DaemonProbe::Responsive => {
                         println!("daemon: listening on 127.0.0.1:34343, answering");
-                        println!("lock: held");
+                        println!("lock: {}", if held { "held" } else { "free" });
                         // Runtime skew (round 3): the answering daemon may be
                         // running an OLDER build than the binary on disk -- the
                         // guinea pig re-verified a shipped fix through a
@@ -3673,6 +3701,31 @@ async fn run() -> anyhow::Result<()> {
                     None
                 };
 
+                // AW-C4: `--dry-run` is read-only — it never opens the store —
+                // so it runs even while the daemon holds the lock.
+                if let Commands::Ingest { dry_run: true, dir, namespace: _, schema_path, dry_run_mode } = &other {
+                    let dir_str = cli_ingest_root(dir);
+                    let dir_path_owned = std::path::PathBuf::from(&dir_str);
+                    let schema_str = if let Some(path) = schema_path {
+                        std::fs::read_to_string(path).unwrap_or_else(|e| {
+                            eprintln!("Failed to read schema from {}: {}", path, e);
+                            std::process::exit(1);
+                        })
+                    } else {
+                        include_str!("schema.json").to_string()
+                    };
+                    let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Failed to load schema: {}", e);
+                            return Err(e.into());
+                        }
+                    };
+                    let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
+                    println!("{}", report);
+                    return Ok(());
+                }
+
                 if daemon_running {
                     // Read-only graph export is not a store mutation: it rides
                     // the daemon like backup does, instead of demanding a
@@ -3680,6 +3733,8 @@ async fn run() -> anyhow::Result<()> {
                     if let Commands::ExportGraph {
                         exclude_superseded,
                         include_archived,
+                        clear,
+                        source_id: cli_source_id,
                         ..
                     } = &other
                     {
@@ -3688,7 +3743,11 @@ async fn run() -> anyhow::Result<()> {
                             .expect("export graph target resolved before daemon dispatch");
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
+                        // AW-A2: `--source-id <id>` on the CLI scopes the
+                        // export just like the env var it falls back to.
+                        let source_id = cli_source_id
+                            .clone()
+                            .or_else(|| std::env::var("NEUROSTRATA_SOURCE_ID").ok());
                         let anchor_override = crate::source_context::scoped_anchor_override(
                             anchor_root.as_deref(),
                             source_id.as_deref(),
@@ -3702,7 +3761,8 @@ async fn run() -> anyhow::Result<()> {
                                     &(!exclude_superseded).to_string(),
                                 )
                                 .append_pair("include_archived", &include_archived.to_string())
-                                .append_pair("all", "true");
+                                .append_pair("all", "true")
+                                .append_pair("clear", &clear.to_string());
                             if let Some(anchor) = anchor_override.as_ref() {
                                 query
                                     .append_pair(
@@ -3760,28 +3820,6 @@ async fn run() -> anyhow::Result<()> {
                 if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
-                }
-                if let Commands::Ingest { dry_run: true, dir, namespace: _, schema_path, dry_run_mode } = &other {
-                    let dir_str = cli_ingest_root(dir);
-                    let dir_path_owned = std::path::PathBuf::from(&dir_str);
-                    let schema_str = if let Some(path) = schema_path {
-                        std::fs::read_to_string(path).unwrap_or_else(|e| {
-                            eprintln!("Failed to read schema from {}: {}", path, e);
-                            std::process::exit(1);
-                        })
-                    } else {
-                        include_str!("schema.json").to_string()
-                    };
-                    let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("Failed to load schema: {}", e);
-                            return Err(e.into());
-                        }
-                    };
-                    let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
-                    println!("{}", report);
-                    return Ok(());
                 }
                 let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
@@ -3882,14 +3920,8 @@ async fn run() -> anyhow::Result<()> {
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
                     }
-                    Commands::Laya { model, out_dir } => {
-                        let model_id = model.unwrap_or_else(|| "v1.11.1".to_string());
-                        let target_dir = out_dir.unwrap_or_else(|| "artifacts/laya-bundle".to_string());
-                        crate::judgment::laya_onnx::LayaOnnxProvider::fetch_model(
-                            &model_id,
-                            &target_dir,
-                        )
-                        .await?;
+                    Commands::Laya { .. } => {
+                        unreachable!("handled before store open")
                     }
                     Commands::Namespaces => {
                         run_namespaces(&read).await?;
@@ -3898,24 +3930,8 @@ async fn run() -> anyhow::Result<()> {
                         run_list(&read, &namespace).await?;
                     }
                     // Reached only through the fallback; the dedicated Status
-                    // arm exits before the store opens. Reported faithfully
-                    // anyway: the daemon is provably not running in this arm.
-                    Commands::Status => {
-                        println!("store: {:?}", config.db_path);
-                        println!("daemon: not running");
-                        println!(
-                            "lock: {}",
-                            if daemon_holds_lock(&config.db_path) {
-                                "held"
-                            } else {
-                                "free"
-                            }
-                        );
-                        println!(
-                            "status: down -- safe to start exactly one: neurostrata-mcp daemon"
-                        );
-                        std::process::exit(1);
-                    }
+                    // arm exits before the store opens.
+                    Commands::Status => unreachable!("handled before store open"),
                     Commands::Ingest {
                         dir,
                         namespace,
@@ -3989,6 +4005,7 @@ async fn run() -> anyhow::Result<()> {
                         exclude_superseded,
                         include_archived,
                         clear,
+                        source_id: cli_source_id,
                         ..
                     } => {
                         let target_path = graph_target
@@ -4028,7 +4045,11 @@ async fn run() -> anyhow::Result<()> {
                         // the search and snapshot read surfaces use.
                         let anchor_root = std::env::var_os("NEUROSTRATA_ANCHOR_ROOT")
                             .map(std::path::PathBuf::from);
-                        let source_id = std::env::var("NEUROSTRATA_SOURCE_ID").ok();
+                        // AW-A2: `--source-id <id>` on the CLI scopes the
+                        // export just like the env var it falls back to.
+                        let source_id = cli_source_id
+                            .clone()
+                            .or_else(|| std::env::var("NEUROSTRATA_SOURCE_ID").ok());
                         let anchor_override = crate::source_context::scoped_anchor_override(
                             anchor_root.as_deref(),
                             source_id.as_deref(),

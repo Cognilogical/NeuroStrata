@@ -399,13 +399,10 @@ pub fn rows_to_quads(
         let qs = memory_to_quads(id, payload, namespace, tier, generation);
         out.extend(quads_to_legacy(&qs));
     }
-    let graph_iri = format!("urn:neurostrata:graph:{}:{}:gen:{}",
-        namespace, tier.as_str(), generation);
-    let graph = GraphName::NamedNode(
-        NamedNode::new_unchecked(graph_iri)
-    );
+    let graph = super::types_oxrdf::OxRdfBridge::tier_to_graph_name(&tier, namespace, generation);
+    let graph = Some(graph);
     let ox_quads: Vec<Quad> = edges.iter().flat_map(|(from, rel, to, prov)| {
-        edge_to_quads(from, rel, to, prov.clone(), Some(graph.clone()))
+        edge_to_quads(from, rel, to, prov.clone(), graph.clone())
     }).collect();
     out.extend(quads_to_legacy(&ox_quads));
     out
@@ -448,37 +445,58 @@ pub fn project_rows_legacy(
             &tier_edges,
         ));
     }
+    // Bridge round-trip check: every legacy quad must convert back through
+    // `OxRdfBridge::neurostrata_quad_to_oxrdf` without a parse error; a
+    // failure means the legacy and oxrdf projections have drifted apart.
+    // Logged (never failed) so the export still returns its full legacy set.
+    for q in &out {
+        if let Err(e) = super::types_oxrdf::OxRdfBridge::neurostrata_quad_to_oxrdf(q) {
+            tracing::warn!(
+                "project_rows_legacy: legacy quad failed oxrdf round-trip ({} {}): {}",
+                q.subject,
+                q.predicate,
+                e
+            );
+        }
+    }
     out
 }
 
 /// Convert a slice of oxrdf Quads to NeuroStrata legacy Quad type.
+///
+/// Every conversion routes through `OxRdfBridge::oxrdf_quad_to_neurostrata`
+/// (single source of truth for the oxrdf→legacy mapping). Each OxRdfQuad is
+/// also inserted into an `OxRdfDataset`: an insert that reports a duplicate
+/// means the projection emitted the exact same quad twice, which is logged
+/// but the legacy output order is untouched.
 pub fn quads_to_legacy(quads: &[Quad]) -> Vec<super::types::Quad> {
-    use super::types::{Quad as LegacyQuad, QuadObject};
-    
-    quads.iter().map(|q| {
-        let subject = match &q.subject {
-            NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
-            NamedOrBlankNode::BlankNode(bn) => format!("_:{}", bn),
-        };
-        let predicate = q.predicate.as_str().to_string();
-        let object = match &q.object {
-            Term::NamedNode(nn) => QuadObject::Iri(nn.as_str().to_string()),
-            Term::Literal(lit) => QuadObject::Literal {
-                value: lit.value().to_string(),
-                datatype: Some(lit.datatype().as_str().to_string()),
-                language: lit.language().map(|lang| lang.to_string()),
-            },
-            Term::BlankNode(bn) => QuadObject::Iri(format!("_:{}", bn)),
-            Term::Triple(_) => QuadObject::Iri("urn:neurostrata:triple".to_string()),
-        };
-        let graph = match &q.graph_name {
-            GraphName::NamedNode(gn) => Some(gn.as_str().to_string()),
-            GraphName::BlankNode(bg) => Some(format!("_:{}", bg)),
-            GraphName::DefaultGraph => None,
-        };
-        
-        LegacyQuad { subject, predicate, object, graph }
-    }).collect()
+    use super::types_oxrdf::{OxRdfBridge, OxRdfDataset, OxRdfQuad};
+
+    let mut dataset = OxRdfDataset::new();
+    let legacy: Vec<super::types::Quad> = quads
+        .iter()
+        .map(|q| {
+            let wrap = OxRdfQuad::new(
+                q.subject.clone(),
+                q.predicate.clone(),
+                q.object.clone(),
+                q.graph_name.clone(),
+            );
+            let legacy = OxRdfBridge::oxrdf_quad_to_neurostrata(&wrap);
+            if !dataset.insert(wrap) {
+                tracing::warn!("duplicate RDF quad projected: {}", q);
+            }
+            legacy
+        })
+        .collect();
+    if !dataset.is_empty() {
+        tracing::debug!(
+            "quads_to_legacy: {} unique of {} projected quads",
+            dataset.len(),
+            quads.len()
+        );
+    }
+    legacy
 }
 
 #[cfg(test)]

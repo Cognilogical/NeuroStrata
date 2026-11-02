@@ -208,18 +208,6 @@ pub fn build_prompt_with_citations(
     (prompt, citations)
 }
 
-/// Plain prompt wrapper: same builder as [`build_prompt_with_citations`],
-/// discarding the citation list. Test-only convenience wrapper.
-#[cfg(test)]
-pub fn build_prompt(
-    ctx: &RagContext,
-    question: &str,
-    system: Option<&str>,
-    max_context_chars: usize,
-) -> String {
-    build_prompt_with_citations(ctx, question, system, max_context_chars).0
-}
-
 pub async fn retrieve_context(
     store: Arc<dyn crate::traits::VectorStore>,
     emb: Arc<dyn crate::traits::Embedder>,
@@ -459,6 +447,17 @@ pub async fn ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plain prompt wrapper: same builder as `build_prompt_with_citations`,
+    /// discarding the citation list.
+    fn build_prompt(
+        ctx: &RagContext,
+        question: &str,
+        system: Option<&str>,
+        max_context_chars: usize,
+    ) -> String {
+        build_prompt_with_citations(ctx, question, system, max_context_chars).0
+    }
 
     #[test]
     fn prompt_format_and_citations() {

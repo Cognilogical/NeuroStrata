@@ -163,29 +163,42 @@ impl WasmStore {
             let ns = rec.namespace.clone();
             let id = rec.id.clone();
             if let Some(vec) = &rec.vector {
-                if vec.len() == 0 {
+                if vec.is_empty() {
                     skipped += 1;
                     warnings.push(LoadWarning { id: id.clone(), reason: "DimensionMismatch".to_string() });
                     continue;
                 }
-                let ns_data = store.namespaces.entry(ns.clone()).or_insert_with(NamespaceData::new);
-                if ns_data.vector_dims.is_none() {
-                    ns_data.vector_dims = Some(vec.len());
-                    ns_data.embedding_id = rec.embedding_id.clone();
-                } else if Some(vec.len()) != ns_data.vector_dims {
-                    skipped += 1;
-                    warnings.push(LoadWarning { id: id.clone(), reason: "DimensionMismatch".to_string() });
-                    continue;
-                }
-                let expected_embed = ns_data.embedding_id.as_deref().unwrap_or("");
-                let rec_embed = rec.embedding_id.as_deref().unwrap_or("");
-                if !expected_embed.is_empty() && rec_embed != expected_embed {
-                    skipped += 1;
-                    warnings.push(LoadWarning { id: id.clone(), reason: "EmbeddingMismatch".to_string() });
-                    continue;
+                // Validate against existing namespace state BEFORE creating or
+                // mutating any entry: a namespace whose only records were all
+                // skipped (dimension/embedding mismatch) must never materialize
+                // in `namespaces()`.
+                if let Some(existing) = store.namespaces.get(&ns) {
+                    if existing.vector_dims.map_or(false, |dims| dims != vec.len()) {
+                        skipped += 1;
+                        warnings.push(LoadWarning { id: id.clone(), reason: "DimensionMismatch".to_string() });
+                        continue;
+                    }
+                    if let Some(expected) = &existing.embedding_id {
+                        if !expected.is_empty()
+                            && rec.embedding_id.as_deref().map_or(true, |e| e != expected) {
+                            skipped += 1;
+                            warnings.push(LoadWarning { id: id.clone(), reason: "EmbeddingMismatch".to_string() });
+                            continue;
+                        }
+                    }
                 }
             }
             let ns_data = store.namespaces.entry(ns.clone()).or_insert_with(NamespaceData::new);
+            if let Some(vec) = &rec.vector {
+                if ns_data.vector_dims.is_none() {
+                    ns_data.vector_dims = Some(vec.len());
+                }
+            }
+            // Backfill so a first record with `embedding_id: None` does not
+            // permanently block a later record from establishing it.
+            if ns_data.embedding_id.is_none() && rec.embedding_id.is_some() {
+                ns_data.embedding_id = rec.embedding_id.clone();
+            }
             let was_duplicate = ns_data.records.contains_key(&id);
             if was_duplicate {
                 warnings.push(LoadWarning { id: id.clone(), reason: "DuplicateId".to_string() });
@@ -206,7 +219,10 @@ impl WasmStore {
         }
         for edge in file.edges {
             for (_, ns_data) in store.namespaces.iter_mut() {
-                if ns_data.records.contains_key(&edge.source) {
+                // An edge is only meaningful inside a namespace that contains
+                // BOTH endpoints.
+                if ns_data.records.contains_key(&edge.source)
+                    && ns_data.records.contains_key(&edge.target) {
                     ns_data.edges.push(edge.clone());
                 }
             }
@@ -351,7 +367,14 @@ impl WasmEngine {
             }
             vec![relation.to_string()]
         };
-        let dir = related::parse_direction(Some(direction));
+        // Accept the common shorthand before delegating; unknown values still
+        // degrade to `Both` inside parse_direction.
+        let norm_dir = match direction.trim() {
+            "out" => "outgoing",
+            "in" => "incoming",
+            other => other,
+        };
+        let dir = related::parse_direction(Some(norm_dir));
         let ns = match self.store.namespaces.get(namespace) {
             Some(n) => n,
             None => return r#"{"error":"unknown namespace"}"#.to_string(),
@@ -549,7 +572,7 @@ mod tests {
     #[test]
     fn wasm_engine_search_and_vector_search_and_neighbors() {
         let mut engine = WasmEngine::new(0.0);
-        let json = r#"{"version":1,"records":[{"id":"m1","namespace":"ns","payload":{"content":"podman container","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[1.0,0.0],"embedding_id":"e1"},{"id":"m2","namespace":"ns","payload":{"content":"docker container","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[0.0,1.0],"embedding_id":"e1"}],"edges":[{"source":"m1","relation":"RELATES_TO","target":"m2"}]}"#;
+        let json = r#"{"version":1,"records":[{"id":"m1","namespace":"ns","payload":{"content":"podman container","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[1.0,0.0],"embedding_id":"e1"},{"id":"m2","namespace":"ns","payload":{"content":"docker container","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[0.0,1.0],"embedding_id":"e1"}],"edges":[{"source":"m1","relation":"GOVERNS","target":"m2"}]}"#;
         engine.load_snapshot(json);
         let search = engine.search("ns", "podman", 10, false, false);
         assert!(search.contains("m1"), "search: {search}");
@@ -557,6 +580,44 @@ mod tests {
         assert!(vs.contains("m1"), "vector_search: {vs}");
         let nb = engine.neighbors("ns", "m1", "", "out", 1, 10);
         assert!(nb.contains("m2"), "neighbors: {nb}");
+    }
+
+    #[test]
+    fn wasm_engine_neighbors_direction_shorthand_out_in() {
+        let mut engine = WasmEngine::new(0.0);
+        let json = r#"{"version":1,"records":[{"id":"m1","namespace":"ns","payload":{"content":"node a","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":null},{"id":"m2","namespace":"ns","payload":{"content":"node b","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":null}],"edges":[{"source":"m1","relation":"GOVERNS","target":"m2"}]}"#;
+        let report = engine.load_snapshot(json);
+        assert!(report.contains("\"ok\":true"), "load report: {report}");
+        // Directed edge m1 GOVERNS m2: "out" from m1 traverses to m2.
+        let nb_out = engine.neighbors("ns", "m1", "", "out", 1, 10);
+        assert!(nb_out.contains(r#""id":"m2""#), "neighbors(out): {nb_out}");
+        // RELATES_TO is the only undirected relation, so GOVERNS honors
+        // direction: "in" from m1 must reach nothing beyond the seed node.
+        let nb_in = engine.neighbors("ns", "m1", "", "in", 1, 10);
+        assert!(!nb_in.contains(r#""id":"m2""#), "neighbors(in) from m1 must not reach m2, got: {nb_in}");
+        // Symmetry check from the target side.
+        let nb_out_from_m2 = engine.neighbors("ns", "m2", "", "out", 1, 10);
+        assert!(!nb_out_from_m2.contains(r#""id":"m1""#), "neighbors(out) from m2 must not reach m1, got: {nb_out_from_m2}");
+        let nb_in_target = engine.neighbors("ns", "m2", "", "in", 1, 10);
+        assert!(nb_in_target.contains(r#""id":"m1""#), "neighbors(in) from m2: {nb_in_target}");
+    }
+
+    #[test]
+    fn fully_skipped_namespace_not_listed() {
+        // Every record in this namespace is skipped (empty vector =>
+        // DimensionMismatch), so the namespace must never appear.
+        let mut rec = sample_record("x", "skipped-ns", "hello", "rule");
+        rec.vector = Some(vec![]);
+        let file = SnapshotFile { version: 1, records: vec![rec], edges: vec![] };
+        let (store, report) = WasmStore::from_snapshot(file, 0).unwrap();
+        assert_eq!(report.skipped, 1);
+        assert!(!store.namespaces.contains_key("skipped-ns"),
+            "store namespaces: {:?}", store.namespaces.keys());
+        let mut engine = WasmEngine::new(0.0);
+        let json = r#"{"version":1,"records":[{"id":"x","namespace":"skipped-ns","payload":{"content":"hello","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[]}],"edges":[]}"#;
+        engine.load_snapshot(json);
+        let ns = engine.namespaces();
+        assert_eq!(ns, "[]", "namespaces: {ns}");
     }
 
 }

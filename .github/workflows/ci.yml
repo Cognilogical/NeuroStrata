@@ -133,3 +133,10 @@ jobs:
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1
+
+      # The wasm crate is path-locked to the same workspace but builds its own
+      # dep set (wasm-bindgen, tracing); run its unit tests explicitly so a
+      # broken --locked resolution or a wasm-only test regression fails CI.
+      - name: Test wasm crate
+        shell: bash
+        run: cargo test -p neurostrata-wasm --locked -- --test-threads=1

@@ -8,7 +8,6 @@ pub mod provenance;
 pub mod reasoning;
 pub mod shacl;
 pub mod sparql;
-#[cfg(test)]
 pub mod types_oxrdf;
 pub mod types;
 

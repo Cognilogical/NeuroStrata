@@ -194,34 +194,12 @@ pub mod community_inner {
         Ok((communities, quality))
     }
 
-    /// Filter out structural memory types from community members.
+    /// Filter out structural node ids from community members.
     /// Structural types do not count toward size / hub / min_member_id (§5.2a).
     /// The filter runs first, then `hub_id` is RECOMPUTED from the surviving
     /// members, so the hub of a filtered community is never an excluded
-    /// structural node.
-    // Production callers use `filter_structural_with_access_counts`; retained
-    // for the single-community contract its unit test pins down.
-    #[cfg(test)]
-    pub fn filter_structural(
-        community: &mut Community,
-        types: &HashMap<String, String>,
-        structural_types: &[&str],
-    ) {
-        community.member_ids.retain(|id| {
-            types
-                .get(id)
-                .map(|t| !structural_types.contains(&t.as_str()))
-                .unwrap_or(true)
-        });
-        // Empty access-count map → smallest surviving id becomes the hub.
-        community.hub_id = select_hub_id(&community.member_ids, &HashMap::new());
-        community.size = community.member_ids.len();
-    }
-
-    /// Vec-of-communities variant of `filter_structural` driven by a set of
-    /// structural node ids rather than a type map, with `hub_id` recomputed
-    /// from the surviving members via `select_hub_id` and the supplied access
-    /// counts (spec §5.2: hub = highest access_count, tie-break smallest id).
+    /// structural node. Hub selection delegates to `assign_hubs_by_access_count`
+    /// — the single canonical hub-assignment implementation.
     pub fn filter_structural_with_access_counts(
         mut communities: Vec<Community>,
         structural_ids: &std::collections::HashSet<String>,
@@ -229,9 +207,9 @@ pub mod community_inner {
     ) -> Vec<Community> {
         for c in communities.iter_mut() {
             c.member_ids.retain(|id| !structural_ids.contains(id));
-            c.hub_id = select_hub_id(&c.member_ids, access_counts);
             c.size = c.member_ids.len();
         }
+        assign_hubs_by_access_count(&mut communities, access_counts);
         communities
     }
 }
@@ -351,16 +329,12 @@ mod tests {
 
     #[test]
     fn filter_structural_recomputes_hub_from_survivors() {
-        let mut community = Community {
-            id: 0,
-            member_ids: vec![
-                "aaa_struct".to_string(),
-                "bbb_rule".to_string(),
-                "ccc_rule".to_string(),
-            ],
-            hub_id: "aaa_struct".to_string(),
-            size: 3,
-        };
+        use std::collections::HashSet;
+        let members = vec![
+            "aaa_struct".to_string(),
+            "bbb_rule".to_string(),
+            "ccc_rule".to_string(),
+        ];
         let types: HashMap<String, String> = [
             ("aaa_struct".to_string(), "symbol".to_string()),
             ("bbb_rule".to_string(), "rule".to_string()),
@@ -369,14 +343,33 @@ mod tests {
         .into_iter()
         .collect();
 
-        filter_structural(&mut community, &types, &COMMUNITY_STRUCTURAL_TYPES);
+        // Structural ids derived from the type map, mirroring server.rs.
+        let structural_ids: HashSet<String> = types
+            .iter()
+            .filter(|(_, t)| COMMUNITY_STRUCTURAL_TYPES.contains(&t.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
 
-        assert_eq!(community.member_ids, vec!["bbb_rule", "ccc_rule"]);
+        let community = Community {
+            id: 0,
+            member_ids: members,
+            hub_id: "aaa_struct".to_string(),
+            size: 3,
+        };
+
+        // Empty access-count map → tie breaks to the smallest surviving id.
+        let out = filter_structural_with_access_counts(
+            vec![community],
+            &structural_ids,
+            &HashMap::new(),
+        );
+
+        assert_eq!(out[0].member_ids, vec!["bbb_rule", "ccc_rule"]);
         assert_eq!(
-            community.hub_id, "bbb_rule",
+            out[0].hub_id, "bbb_rule",
             "hub must be recomputed after the structural filter, never a structural node"
         );
-        assert_eq!(community.size, 2);
+        assert_eq!(out[0].size, 2);
     }
 
     #[test]
