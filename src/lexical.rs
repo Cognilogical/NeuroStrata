@@ -123,18 +123,14 @@ impl TantivyLexicalIndex {
 
         // Try MmapDirectory; if corrupt wipe and recreate.
         let dir_result = tantivy::directory::MmapDirectory::open(&path_for_index);
-        let (index, _rebuilt) = match dir_result {
-            Ok(dir) => {
-                let index = Index::open_or_create(dir, Self::build_schema())?;
-                (index, false)
-            }
+        let index = match dir_result {
+            Ok(dir) => Index::open_or_create(dir, Self::build_schema())?,
             Err(_) => {
                 tracing::warn!("corrupt lexical index at {}; wiping and recreating", path_for_index.display());
                 std::fs::remove_dir_all(&path_for_index)?;
                 std::fs::create_dir_all(&path_for_index)?;
                 let dir = tantivy::directory::MmapDirectory::open(&path_for_index)?;
-                let index = Index::create(dir, Self::build_schema(), tantivy::IndexSettings::default())?;
-                (index, true)
+                Index::create(dir, Self::build_schema(), tantivy::IndexSettings::default())?
             }
         };
 
@@ -393,7 +389,7 @@ impl TantivyLexicalIndex {
             // Derive id (composite stripped to memory id) — we want the original memory id back.
             // The spec's TantivyHit.id is the memory id or composite? It says `id: String`; from spec §4 id is composite.
             // We return the composite or just id? Spec says `id: String` — we'll return the storage id (after "::").
-            let memory_id_part = comp_id.split("::").nth(1).unwrap_or(&comp_id).to_string();
+            let memory_id_part = comp_id.split_once("::").map(|(_, id)| id).unwrap_or(&comp_id).to_string();
             candidates.push(TantivyHit {
                 id: memory_id_part,
                 namespace: ns.clone(),
@@ -512,6 +508,23 @@ mod tests {
         assert!(idx.index_dir().is_none(), "fallback must be RAM-backed");
         assert!(idx.writer.lock().unwrap().is_some());
         std::fs::remove_file(&blocker).ok();
+    }
+
+    #[test]
+    fn test_search_returns_full_memory_id_with_colons() {
+        // Memory IDs may themselves contain "::" (e.g. "rule::arch::zero-flags");
+        // the composite key is "namespace::memory_id" and search must return the
+        // FULL memory id, not a fragment truncated at the first "::".
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("zero flags architectural rule", None);
+        idx.upsert_memory("NeuroStrata", "rule::arch::zero-flags", &p).unwrap();
+        let hits = idx.search("NeuroStrata", "zero flags", 10, true, true, None).unwrap();
+        assert!(!hits.is_empty(), "expected at least one hit");
+        assert!(
+            hits.iter().any(|h| h.id == "rule::arch::zero-flags"),
+            "expected full memory id, got ids: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]

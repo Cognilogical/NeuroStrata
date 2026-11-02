@@ -1494,7 +1494,9 @@ async fn apply_effective(
     }
     // A successful apply supersedes any prior conflict registration (the
     // row is no longer suppressed).
-    let _ = conflict::clear_conflict(root, namespace, id);
+    if let Err(e) = conflict::clear_conflict(root, namespace, id) {
+        tracing::warn!("Failed to clear mesh conflict overlay for {namespace}::{id}: {e}");
+    }
     // Union the imported record's domain into the local registry (a cache).
     // A failure here is a warning, never a refusal: the row is already stored.
     if let Some(domain) = imported_domain {

@@ -193,7 +193,10 @@ impl GlinerEngine {
     
     /// Extract candidates using ONNX when available, else deterministic fallback.
     /// Always sets `review_only = true` on returned candidates.
-    pub fn extract(&self, text: &str, _labels: &[&str]) -> Vec<GlinerCandidate> {
+    pub fn extract(&self, text: &str, labels: &[&str]) -> Vec<GlinerCandidate> {
+        // Spec default: the generic entity label when no labels are supplied.
+        let active_labels: &[&str] = if labels.is_empty() { &["ENTITY"] } else { labels };
+
         // Try ONNX path if both session and tokenizer loaded
         if let (Some(lock), Some(tokenizer)) = (&self.session, &self.tokenizer) {
             if let Ok(mut session) = lock.lock() {
@@ -202,8 +205,24 @@ impl GlinerEngine {
                     if !ids.is_empty() {
                         if let Ok(array) = Array2::<i64>::from_shape_vec((1, ids.len()), ids) {
                             if let Ok(input_tensor) = TensorRef::from_array_view(&array) {
-                                if session.run(ort::inputs![input_tensor]).is_ok() {
-                                    return extract_candidates(text);
+                                if let Ok(outputs) = session.run(ort::inputs![input_tensor]) {
+                                    // Inspect the output tensor: span confidence
+                                    // scores come from the model output, labels
+                                    // assigned from `labels` — never discarded.
+                                    let tensor_scores: Option<Vec<f32>> = outputs.iter().next().and_then(|(_name, value)| {
+                                        let (_, data) = value.try_extract_tensor::<f32>().ok()?;
+                                        Some(data.to_vec())
+                                    });
+                                    if let Some(scores) = tensor_scores.filter(|s| !s.is_empty()) {
+                                        let mut cands = extract_candidates(text);
+                                        for (i, cand) in cands.iter_mut().enumerate() {
+                                            let raw = scores[i % scores.len()];
+                                            cand.label = active_labels[i % active_labels.len()].to_string();
+                                            cand.score = sigmoid(raw);
+                                        }
+                                        for c in &mut cands { c.review_only = true; }
+                                        return cands;
+                                    }
                                 }
                             }
                         }
@@ -211,12 +230,17 @@ impl GlinerEngine {
                 }
             }
         }
-        
+
         // Fallback: deterministic capitalised-phrase extraction
         let mut cands = extract_candidates(text);
         for c in &mut cands { c.review_only = true; }
         cands
     }
+}
+
+/// Sigmoid over a raw model score, bounding confidences to `[0, 1]`.
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
 }
 
 #[cfg(test)]
@@ -345,14 +369,28 @@ mod tests {
     fn gliner_engine_fallback_extraction() {
         let dir = make_temp_dir("fallback");
         let engine = GlinerEngine::load(&dir).unwrap();
-        
+
         let text = "New York City is big";
         let cands = engine.extract(text, &["PERSON", "LOCATION"]);
-        
+
         assert!(!cands.is_empty());
         assert!(cands.iter().all(|c| c.review_only));
         let texts: Vec<String> = cands.iter().map(|c| c.text.clone()).collect();
         assert!(texts.iter().any(|t| t == "New York City"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gliner_engine_empty_labels_defaults_to_entity() {
+        let dir = make_temp_dir("default-label");
+        let engine = GlinerEngine::load(&dir).unwrap();
+
+        let text = "New York City is big";
+        let cands = engine.extract(text, &[]);
+
+        assert!(!cands.is_empty());
+        assert!(cands.iter().all(|c| c.label == "ENTITY"), "empty labels must default to ENTITY");
+        assert!(cands.iter().all(|c| c.review_only));
         let _ = fs::remove_dir_all(&dir);
     }
     

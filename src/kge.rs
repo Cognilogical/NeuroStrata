@@ -170,7 +170,21 @@ impl KgeModel {
             anyhow::bail!("Invalid KGE model magic header");
         }
 
-        let _version_u32 = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        let version_u32 = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        // The metadata carries a semantic version string ("1.0"); compare its
+        // major numeric against the binary header (save() writes 1u32).
+        let meta_version: u32 = version
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        if version_u32 != meta_version {
+            anyhow::bail!(
+                "KGE binary header version {} does not match metadata version {}",
+                version_u32,
+                meta_version
+            );
+        }
         let entity_count_stored =
             u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]) as usize;
         let relation_count_stored =
@@ -767,6 +781,36 @@ mod tests {
         assert_eq!(loaded.dim, 8);
         assert_eq!(loaded.entity_ids, entities);
         assert!((loaded.structural_distance("n1", "n2") - trained.structural_distance("n1", "n2")).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kge_load_bails_on_header_meta_version_mismatch() {
+        let dir = std::env::temp_dir().join(format!("neurostrata-kge-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_path = dir.join("model.bin");
+        let meta_path = dir.join("meta.json");
+
+        let entities = vec!["n1".to_string(), "n2".to_string()];
+        let edges = vec![("n1".to_string(), EdgeType::Governs, "n2".to_string())];
+        let trained = KgeModel::train(&edges, &entities, 8, 2, 0.01, 1.0, 42).unwrap();
+        trained.save(&model_path, &meta_path, 5, edges.len(), 0.25, Some(0.15)).unwrap();
+
+        // Overwrite the metadata version so it disagrees with the binary header.
+        let meta_buf = std::fs::read_to_string(&meta_path).unwrap();
+        let mut meta: serde_json::Value = serde_json::from_str(&meta_buf).unwrap();
+        meta["version"] = serde_json::Value::String("2.0".into());
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+        let err = KgeModel::load(&model_path, &meta_path)
+            .err()
+            .expect("version mismatch must bail");
+        assert!(
+            err.to_string().contains("does not match metadata version"),
+            "unexpected error: {}",
+            err
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

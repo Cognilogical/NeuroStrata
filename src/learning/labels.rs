@@ -43,7 +43,9 @@ pub struct LabelRule {
 }
 
 /// Derive labels from observations, applying versioned rules.
-/// Returns empty if no rules match (absence of follow-up = no DerivedLabel).
+/// A rule matches an observation only when the rule is the wildcard `"*"`,
+/// or the rule id equals / is contained in the observation id.
+/// Returns empty when no rule matches (absence of follow-up = no DerivedLabel).
 pub fn derive_labels(
     observation_ids: &[String],
     rules: &[LabelRule],
@@ -51,6 +53,13 @@ pub fn derive_labels(
     let mut labels = Vec::new();
     for obs_id in observation_ids {
         for rule in rules {
+            let rule_id = rule.id.as_str();
+            let matches_obs = rule_id == *obs_id
+                || rule_id == "*"
+                || obs_id.contains(rule_id);
+            if !matches_obs {
+                continue;
+            }
             labels.push(DerivedLabel {
                 observation_id: obs_id.clone(),
                 expected_duplicate_probability: rule.fixed_probability,
@@ -75,7 +84,7 @@ mod tests {
         // observation_ids regardless of which rules are applied.
         let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string()];
         let rules = vec![LabelRule {
-            id: "rule-v1".into(),
+            id: "obs".into(),
             version: 1,
             tier: LabelTier::ShippedAnchorGold,
             fixed_probability: Some(1.0),
@@ -88,6 +97,38 @@ mod tests {
             .map(|l| l.observation_id.as_str())
             .collect();
         assert_eq!(labels_changed, obs_ids);
+    }
+
+    #[test]
+    fn wildcard_rule_matches_all_observations() {
+        let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string()];
+        let rules = vec![LabelRule {
+            id: "*".into(),
+            version: 1,
+            tier: LabelTier::DeterministicInvariant,
+            fixed_probability: Some(1.0),
+        }];
+        let labels = derive_labels(&obs_ids, &rules).expect("derive labels");
+        assert_eq!(labels.len(), obs_ids.len(), "wildcard matches every observation");
+    }
+
+    #[test]
+    fn non_matching_rules_yield_no_derived_label() {
+        // A rule whose id neither equals nor is contained in the observation
+        // id must not match it (documented: empty Vec for non-matching rules).
+        let rules = vec![LabelRule {
+            id: "rule-v1".into(),
+            version: 1,
+            tier: LabelTier::DeterministicInvariant,
+            fixed_probability: Some(1.0),
+        }];
+        let labels = derive_labels(&["obs-1".to_string(), "obs-2".to_string()], &rules)
+            .expect("derive labels");
+        assert!(
+            labels.is_empty(),
+            "non-matching rule must yield no DerivedLabel, got {:?}",
+            labels
+        );
     }
 
     #[test]

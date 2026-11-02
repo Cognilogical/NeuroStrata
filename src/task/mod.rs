@@ -1500,12 +1500,15 @@ pub async fn handle_task_complete(
         });
         // AC5: the completion receipt must be retained and verifiable — ask
         // the retention gate right here so a lost receipt is caught on the spot.
-        let _ = crate::retention::gate::verify_task_receipt_retention(
+        let retention_ok = crate::retention::gate::verify_task_receipt_retention(
             &r,
             &session_for_receipt,
             &id,
             &event_id,
         );
+        if !retention_ok {
+            tracing::warn!("AC5 receipt retention check failed for task {}", id);
+        }
     }
 
     // M3: spawn follow-up tasks now that the parent is done. Each inherits

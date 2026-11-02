@@ -138,6 +138,32 @@ impl Trainer {
                 "pair_count": effective_pairs.len(),
             });
             std::fs::write(cand_dir.join("manifest.json"), manifest.to_string())?;
+
+            // Real evaluation with temperature-scaled metrics; written
+            // alongside manifest.json so `learn train` (src/main.rs) reads a
+            // measurable eval_report.json and promotes fail-closed.
+            let eval_report = crate::learning::evaluator::evaluate_pairs(&effective_pairs, fitted_temp);
+            let evaluation = EvaluationReport {
+                candidate: version.clone(),
+                suites: vec![SuiteReport {
+                    name: if from_dataset { "dataset" } else { "proxy_internal" }.to_string(),
+                    metrics: serde_json::json!({
+                        "score": eval_report.accuracy,
+                        "accuracy": eval_report.accuracy,
+                        "precision": eval_report.precision,
+                        "recall": eval_report.recall,
+                        "f1": eval_report.f1,
+                        "brier_score": eval_report.brier_score,
+                        "nll": eval_report.nll,
+                        "temperature": eval_report.temperature,
+                        "pair_count": eval_report.pair_count,
+                    }),
+                }],
+            };
+            std::fs::write(
+                cand_dir.join("eval_report.json"),
+                serde_json::to_string_pretty(&evaluation)?,
+            )?;
             return Ok(());
         }
         return Err(anyhow!(
@@ -163,11 +189,18 @@ impl Trainer {
             .ok_or_else(|| anyhow!("Candidate {} has no measurable metrics; evaluation refused (fail-closed)", report.candidate))
     }
 
+    /// Minimum evaluation score required to promote a candidate.
+    pub const PROMOTION_MIN_SCORE: f64 = 0.5;
+
     /// Promote a gold-shadow candidate to active (with previous-good preservation).
-    /// Only promotes when evaluation metrics exceed the threshold.
+    /// Only promotes when the evaluation score reaches the quality threshold.
     pub fn promote(&self, manifest: &mut ActiveManifest, version: &ModelVersion, score: f64) -> Result<()> {
-        if score < 0.0 {
-            return Err(anyhow!("Promotion refused: score {} below threshold", score));
+        if score < Self::PROMOTION_MIN_SCORE {
+            return Err(anyhow!(
+                "Promotion refused: score {} below quality threshold {}",
+                score,
+                Self::PROMOTION_MIN_SCORE
+            ));
         }
         manifest.previous_good_version = manifest.active_version.clone();
         manifest.active_version = Some(version.clone());
@@ -300,8 +333,9 @@ mod tests {
         ).unwrap()).unwrap();
         assert_eq!(manifest["calibration_tier"], "DatasetCalibrated");
         assert_eq!(manifest["pair_count"], 2);
-        // Fitted temperature = mean of real pair logits = (0.9 + 0.1) / 2 = 0.5.
-        assert!((manifest["temperature"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        // Real fit: both pairs are well-separated from 0.5, so the optimizer
+        // sharpens to the lower bound of the search range.
+        assert!((manifest["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-6);
     }
 
     #[test]
@@ -318,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_requires_positive_score() {
+    fn promote_requires_real_quality_score() {
         let mut manifest = ActiveManifest::default();
         let t = Trainer::new(Arc::new(LocalTrainingRuntime {
             python: PathBuf::from("python"),
@@ -327,7 +361,10 @@ mod tests {
         }));
         assert!(t.promote(&mut manifest, &"v1".to_string(), 0.8).is_ok());
         assert_eq!(manifest.active_version.as_ref().unwrap(), "v1");
+        // Below the 0.5 quality threshold: refused, including negative scores.
         assert!(t.promote(&mut manifest, &"v2".to_string(), -0.1).is_err());
+        assert!(t.promote(&mut manifest, &"v3".to_string(), 0.4).is_err());
+        assert_eq!(manifest.active_version.as_ref().unwrap(), "v1");
     }
 
     #[test]
@@ -357,9 +394,19 @@ mod tests {
         assert!(res.is_ok(), "builtin path should succeed: {:?}", res);
         let cand_dir = tmp_dir.path().join("candidates/v1.0.0");
         assert!(cand_dir.join("manifest.json").exists());
+        assert!(
+            cand_dir.join("eval_report.json").exists(),
+            "builtin path must write eval_report.json for learn train end-to-end"
+        );
         let manifest_text = std::fs::read_to_string(cand_dir.join("manifest.json")).unwrap();
         let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
         assert_eq!(manifest_json["embedder_id"], "laya");
         assert_eq!(manifest_json["calibration_tier"], "ProxyInternal");
+        // eval_report.json must be measurable and parseable by learn train.
+        let eval: EvaluationReport = serde_json::from_str(
+            &std::fs::read_to_string(cand_dir.join("eval_report.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(eval.candidate, "v1.0.0");
+        assert_eq!(eval.gold_metrics(), Some(1.0), "fallback pairs are perfectly separable");
     }
 }

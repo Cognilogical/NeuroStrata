@@ -32,7 +32,10 @@ fn plan_is_supported() {
     let plan = service.plan(&request);
     assert!(plan.items.is_empty());
     assert!(!plan.truncation);
-    assert_eq!(plan.degradation, Degradation::Supported);
+    // An empty plan is never implicitly `Supported`: `plan()` has no items,
+    // so it degrades to `Partial` (model.rs guarantees the empty outcome is
+    // observable). Only `plan_with_items` with real items returns `Supported`.
+    assert_eq!(plan.degradation, Degradation::Partial);
 }
 
 #[test]

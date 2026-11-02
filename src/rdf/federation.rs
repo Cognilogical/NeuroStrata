@@ -292,12 +292,31 @@ pub async fn project_federated_sparql_dataset_async(
 // Remote /sparql handler
 // ------------------------------------------------------------------
 
+/// Serialize an `oxrdf::Term` as a W3C SPARQL-results JSON term object.
+fn term_to_json(term: &oxrdf::Term) -> serde_json::Value {
+    use oxrdf::Term;
+    match term {
+        Term::NamedNode(nn) => serde_json::json!({ "type": "uri", "value": nn.as_str() }),
+        Term::BlankNode(bn) => serde_json::json!({ "type": "bnode", "value": bn.as_str() }),
+        Term::Literal(lit) => {
+            let mut obj = serde_json::json!({ "type": "literal", "value": lit.value() });
+            if let Some(lang) = lit.language() {
+                obj["xml:lang"] = serde_json::json!(lang);
+            } else if lit.datatype().as_str() != "http://www.w3.org/2001/XMLSchema#string" {
+                obj["datatype"] = serde_json::json!(lit.datatype().as_str());
+            }
+            obj
+        }
+        Term::Triple(_) => serde_json::json!({ "type": "literal", "value": "<RDF-star triple>" }),
+    }
+}
+
 /// Handles an inbound remote `/sparql` SPARQL request.
 pub async fn handle_remote_sparql_request(
     query_str: &str,
     namespace: &str,
     host_header: Option<&str>,
-    _auth_header: Option<&str>,
+    auth_header: Option<&str>,
     config: &FederationConfig,
     store: &crate::store::ladybug::LadybugStore,
 ) -> Result<FederationExecutionReport, FederationError> {
@@ -320,6 +339,34 @@ pub async fn handle_remote_sparql_request(
             "namespace {} not served",
             namespace
         )));
+    }
+
+    // Bearer auth (inbound peer credential): a peer row shipping a
+    // bearer_token_env marks this endpoint as bearer-gated, and any supplied
+    // Authorization header must be a well-formed non-empty Bearer token.
+    let requires_bearer = config
+        .service_peers
+        .iter()
+        .any(|p| !p.bearer_token_env.is_empty());
+    match auth_header {
+        Some(hdr) => {
+            let token = hdr
+                .strip_prefix("Bearer ")
+                .or_else(|| hdr.strip_prefix("bearer "))
+                .map(|rest| rest.trim())
+                .unwrap_or("");
+            if token.is_empty() {
+                return Err(FederationError::Denied(
+                    "malformed or empty Bearer Authorization header".into(),
+                ));
+            }
+        }
+        None if requires_bearer => {
+            return Err(FederationError::Denied(
+                "peer federation requires bearer auth".into(),
+            ));
+        }
+        None => {}
     }
 
     // Custom NeuroStrata functions rejected remotely
@@ -364,24 +411,35 @@ pub async fn handle_remote_sparql_request(
                 truncated = true;
             }
 
-            let vars = collected.first().and_then(|r| r.as_ref().ok()).map(|s| {
-                s.variables().iter().map(|v| format!("\"{}\"", v.as_str())).collect::<Vec<_>>().join(",")
-            }).unwrap_or_default();
-
-            let mut bindings = Vec::new();
+            // Serialize in standard W3C application/sparql-results+json form:
+            // {"head":{"vars":[...]},"results":{"bindings":[{"<var>":{"type":"uri"|"literal","value":"..."}}]}}
+            let mut var_names: Vec<String> = Vec::new();
             for item in &collected {
                 if let Ok(sol) = item {
-                    let vals: Vec<String> = sol.variables().iter().map(|v| {
-                        sol.get(v.as_str()).map(|t| format!("\"{}\"", t)).unwrap_or("null".into())
-                    }).collect();
-                    bindings.push(format!("{{{}}}", vals.join(",")));
+                    for v in sol.variables() {
+                        let name = v.as_str().to_string();
+                        if !var_names.contains(&name) {
+                            var_names.push(name);
+                        }
+                    }
                 }
             }
-            body = format!(
-                "{{\"head\":{{\"vars\":[{}]}},\"results\":{{\"bindings\":[{}]}}}}",
-                vars,
-                bindings.join(",")
-            );
+            let mut bindings: Vec<serde_json::Value> = Vec::new();
+            for item in &collected {
+                if let Ok(sol) = item {
+                    let mut binding = serde_json::Map::new();
+                    for v in sol.variables() {
+                        if let Some(term) = sol.get(v.as_str()) {
+                            binding.insert(v.as_str().to_string(), term_to_json(term));
+                        }
+                    }
+                    bindings.push(serde_json::Value::Object(binding));
+                }
+            }
+            body = serde_json::json!({
+                "head": { "vars": var_names },
+                "results": { "bindings": bindings }
+            }).to_string();
         }
         spareval::QueryResults::Boolean(b) => {
             body = format!(r#"{{"head":{{"vars":[]}},"boolean":{}}}"#, b);
@@ -391,10 +449,9 @@ pub async fn handle_remote_sparql_request(
         }
     }
 
-    // Given the complexity of fully re-serializing spent iterators without
-    // buffering all results, we provide a best-effort JSON body for SELECT
-    // that reflects the solution count and truncation state.
-    // The actual parent orchestration may wire deeper serialization.
+    // SELECT queries above are serialized in the standard W3C
+    // application/sparql-results+json format; Boolean and Graph bodies are
+    // handled by the same contract (head/boolean, empty bindings).
     let mut report = FederationExecutionReport {
         body,
         solution_count: count,
@@ -453,7 +510,7 @@ impl HttpServiceHandler {
             .config
             .service_peers
             .iter()
-            .find(|p| p.endpoint_url == endpoint_str || endpoint_str.contains(&p.endpoint_url));
+            .find(|p| p.endpoint_url.trim_end_matches('/') == endpoint_str.trim_end_matches('/'));
         let peer = match peer {
             Some(p) => p,
             None => {
@@ -469,7 +526,8 @@ impl HttpServiceHandler {
             .map_err(|_| FederationError::Denied("bearer token env missing".into()))?;
 
         // Format inner query: SELECT * WHERE { <pattern> }
-        let inner_str = format!("SELECT * WHERE {{ {:?} }}", pattern);
+        // GraphPattern implements Display and prints valid SPARQL syntax.
+        let inner_str = format!("SELECT * WHERE {{ {} }}", pattern);
         let url = format!(
             "{}?namespace={}",
             peer.endpoint_url.trim_end_matches('/'),

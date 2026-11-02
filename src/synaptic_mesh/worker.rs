@@ -253,7 +253,9 @@ fn apply_one(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| mesh.root().join(".neurostrata-mesh").join("signing.key"));
     if signing_key_path.exists() {
-        let _ = sign_record(&mut record, &signing_key_path);
+        if let Err(e) = sign_record(&mut record, &signing_key_path) {
+            tracing::warn!("SynapticMesh record signing failed: {e}");
+        }
     }
 
     let path = record_path(mesh, &record);

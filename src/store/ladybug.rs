@@ -100,11 +100,7 @@ async fn search_inner(
             }
         }
         if let Some(ref q) = query_text {
-            let _ids = adapter.expand_identifiers(&ont_idx, q);
-            let _rels = adapter.expand_relations_for_search(&ont_idx, "GOVERNS");
-            let _rel_list = adapter.expand_relation(&ont_idx, "GOVERNS");
-            let _closure = adapter.closure_governs(&ont_idx, &namespace, &[]);
-            // Hydrate reasoning payloads from in-namespace rows so the
+        // Hydrate reasoning payloads from in-namespace rows so the
             // reasoning-backed SearchResult rows carry real MemoryPayloads
             // (content, user_id, memory_type, metadata) instead of empty stubs.
             let hydrate_q = format!(
@@ -259,12 +255,6 @@ async fn search_inner(
             //
             // ORDER BY dist ASC, id ASC gives deterministic tie-breaking so the
             // same query returns the same rows across runs.
-            let _structural_types = STRUCTURAL_MEMORY_TYPES
-                .iter()
-                .map(|t| format!("'{}'", t))
-                .collect::<Vec<_>>()
-                .join(", ");
-
             // Build the row-class filter for the base query.
             // We exclude tasks, archived, and mesh-conflicting rows HERE so they
             // never consume the candidate budget. The server escape hatches
@@ -3336,7 +3326,15 @@ impl VectorStore for LadybugStore {
         // failed write.
         let shacl_adapter = crate::rdf::reasoning::ReasoningAdapter::new();
         if let Some(ont_idx) = self.ontology.load().get(namespace.as_str()) {
-            let _violations = shacl_adapter.validate_payload(ont_idx, &payload);
+            // SHACL violations land in the warning list instead of being
+            // discarded: every finding surfaces to the writer, never blocks.
+            for v in shacl_adapter.validate_payload(ont_idx, &payload) {
+                shape_warnings.push(WriteShapeWarning {
+                    field: v.field,
+                    why: v.why,
+                    skipped: "SHACL (advisory)".to_string(),
+                });
+            }
         }
         for v in crate::rdf::validate_memory(&payload) {
             shape_warnings.push(WriteShapeWarning {
@@ -4241,15 +4239,23 @@ impl VectorStore for LadybugStore {
     async fn export_database(&self, dir: &str) -> Result<()> {
         let dir = std::path::PathBuf::from(dir);
         let source = self.local_path.clone();
-        self.with_conn(move |conn| {
-            // Checkpoint first so the snapshot cannot miss writes still in the
-            // WAL. The engine's EXPORT DATABASE is not used: it SIGSEGVs in
-            // lbug 0.20.4's planner on every store (planExportTableData ->
-            // std::__format on a dangling string_view).
-            conn.query("CHECKPOINT")?;
-            Ok(())
-        })
-        .await?;
+        // Checkpoint first so the snapshot cannot miss writes still in the
+        // WAL. The engine's EXPORT DATABASE is not used: it SIGSEGVs in
+        // lbug 0.20.4's planner on every store (planExportTableData ->
+        // std::__format on a dangling string_view).
+        let started = std::time::Instant::now();
+        let checkpoint_result: Result<()> = self
+            .with_conn(move |conn| {
+                conn.query("CHECKPOINT")?;
+                Ok(())
+            })
+            .await;
+        crate::storage::snapshot::record_checkpoint_outcome(
+            started.elapsed().as_millis() as u64,
+            checkpoint_result.is_ok(),
+        );
+        checkpoint_result?;
+
         std::fs::create_dir_all(&dir)?;
         let target = dir.join("ladybug.store");
         std::fs::copy(&source, &target)
@@ -4284,7 +4290,12 @@ impl VectorStore for LadybugStore {
         // Snapshot hygiene: report which snapshots past the retention window
         // have expired, and prune them when the operator asks for it.
         if let Some(parent) = dir.parent() {
-            let _expired = crate::storage::snapshot::select_expired_snapshots(parent, 10);
+            let expired = crate::storage::snapshot::select_expired_snapshots(parent, 10);
+            if let Ok(expired) = expired {
+                if !expired.is_empty() {
+                    tracing::debug!("{} expired snapshots eligible for pruning", expired.len());
+                }
+            }
             if std::env::var("NEUROSTRATA_PRUNE_SNAPSHOTS").is_ok() {
                 let _ = crate::storage::snapshot::prune_expired_snapshots(parent, 10);
             }
@@ -4297,12 +4308,19 @@ impl VectorStore for LadybugStore {
         // survive, and clearing afterwards would drop its mark.
         let had_writes = self.dirty.take();
 
+        // The duration and success of every real checkpoint is recorded so
+        // `compute_storage_status` reports actual hygiene, not constants.
+        let started = std::time::Instant::now();
         let outcome = self
             .with_conn(move |conn| {
                 conn.query("CHECKPOINT")?;
                 Ok(())
             })
             .await;
+        crate::storage::snapshot::record_checkpoint_outcome(
+            started.elapsed().as_millis() as u64,
+            outcome.is_ok(),
+        );
 
         if outcome.is_err() && had_writes {
             self.dirty.mark();
@@ -5533,7 +5551,29 @@ impl GraphRead for LadybugStore {
     ) -> Result<crate::graph_read::related::RelatedResult> {
         let namespace = namespace.to_string();
         let seed = seed.to_string();
-        let relations = relations.to_vec();
+        // Spec §6: `related` consumes the ontology's relation expansion — each
+        // caller-named relation is widened through the subPropertyOf* chain,
+        // direct subproperties, and inverses before the subgraph fetch, so
+        // variant relations (e.g. a strict-governs subproperty) are present in
+        // the fetched edges. No ontology loaded → caller relations pass
+        // through unchanged.
+        let relations: Vec<String> = if relations.is_empty() {
+            relations.to_vec()
+        } else {
+            match self.ontology.load().get(namespace.as_str()).cloned() {
+                Some(index) => {
+                    let adapter = crate::rdf::reasoning::ReasoningAdapter::new();
+                    let mut expanded: Vec<String> = Vec::new();
+                    for rel in relations {
+                        for r in adapter.expand_relations_for_search(&index, &rel) {
+                            expanded.push(r);
+                        }
+                    }
+                    expanded
+                }
+                None => relations.to_vec(),
+            }
+        };
         let memory_types = memory_types.to_vec();
         let max_hops = crate::graph_read::related::clamp_max_hops(max_hops);
         let limit = crate::graph_read::related::clamp_limit(limit);

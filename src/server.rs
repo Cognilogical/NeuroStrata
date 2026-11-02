@@ -1,6 +1,5 @@
 use uuid::Uuid;
 use crate::synaptic_mesh::record::{Relationship, Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
-use crate::synaptic_mesh::manifest::Trust;
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
@@ -2064,7 +2063,11 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     );
                     obj.insert(
                         "closure_governs".to_string(),
-                        serde_json::json!({ "nodes": closure.items, "truncated": closure.truncated }),
+                        serde_json::json!({
+                            "nodes": closure.items,
+                            "truncated": closure.truncated,
+                            "budget_exceeded": closure.budget_exceeded
+                        }),
                     );
                 }
             }
@@ -2218,6 +2221,20 @@ pub(crate) fn stamp_new_memory(metadata: &mut Value) {
     }
 }
 
+/// Deterministic SHA-256 payload hash used when the blob store cannot hash
+/// (offline/temp-dir failures): identical scheme to `BlobStore::put`.
+fn payload_fallback_hash(
+    payload: &crate::traits::MemoryPayload,
+) -> crate::learning::observation::PayloadHash {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::default();
+    hasher.update(payload.content.as_bytes());
+    crate::learning::observation::PayloadHash(format!(
+        "sha256:{}",
+        hex::encode(hasher.finalize())
+    ))
+}
+
 /// The write half of add_memory: init, embed, dedup check, upsert.
 /// task_complete's inline extraction runs this same pipeline (section 3.2,
 /// path 3) and the error strings stay identical across both callers.
@@ -2262,6 +2279,10 @@ pub(crate) async fn embed_dedup_and_upsert(
     let mut decision = DedupDecision::Allowed;
     let mut dedup_hint = None;
     let mut linked_existing_id = None;
+    // Observed candidates for the learning loop: raw-distance candidates with
+    // their active-provider and shadow prediction values, so dataset labeling
+    // sees what each provider actually judged (not just what gated the write).
+    let mut observed_candidates: Vec<crate::learning::observation::ObservedCandidate> = Vec::new();
 
     // Exact-content candidates (independent of vector rank).
     if let Ok(exact_candidates) = store
@@ -2392,6 +2413,41 @@ pub(crate) async fn embed_dedup_and_upsert(
                             confidence: Some(dup.confidence),
                         });
                     }
+                    // Shadow verdicts are recorded (never discarded) by the
+                    // checker: pair each candidate with the prediction the
+                    // shadow provider gave it alongside the active one.
+                    let shadow_predictions: std::collections::HashMap<String, f32> = checker
+                        .last_shadow_verdict()
+                        .map(|(_, verdict)| {
+                            verdict
+                                .iter()
+                                .map(|d| (d.existing_memory_id.clone(), d.confidence))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let provider_predictions: std::collections::HashMap<&str, f32> = duplicates
+                        .iter()
+                        .map(|d| (d.existing_memory_id.as_str(), d.confidence))
+                        .collect();
+                    let blob_store =
+                        crate::learning::blob_store::BlobStore::new().ok();
+                    for c in &filtered {
+                        observed_candidates.push(crate::learning::observation::ObservedCandidate {
+                            candidate_id: c.id.clone(),
+                            payload_hash: blob_store
+                                .as_ref()
+                                .and_then(|bs| bs.put(&c.payload).ok())
+                                .unwrap_or_else(|| payload_fallback_hash(&c.payload)),
+                            source: crate::learning::observation::CandidateSource::RawDistance,
+                            raw_distance: Some(c.raw_distance),
+                            provider_confidence: provider_predictions
+                                .get(c.id.as_str())
+                                .copied(),
+                            shadow_prediction: shadow_predictions
+                                .get(c.id.as_str())
+                                .copied(),
+                        });
+                    }
                 }
             }
         }
@@ -2426,6 +2482,8 @@ pub(crate) async fn embed_dedup_and_upsert(
                 if let Ok(hash) = blob_store.put(payload) {
                     let _ = recorder.record_blob_hash(&hash, payload).await;
                 }
+                let last_shadow_verdict =
+                    dedup.and_then(|d| d.last_shadow_verdict());
                 let input_payload_hash = blob_store.put(payload).unwrap_or_else(|_| {
                     use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::default();
@@ -2449,13 +2507,15 @@ pub(crate) async fn embed_dedup_and_upsert(
                     },
                     result_memory_id: Some(new_id.clone()),
                     input_payload_hash,
-                    candidates: Vec::new(),
+                    candidates: std::mem::take(&mut observed_candidates),
                     embedder_id: emb.embedder_id().to_string(),
                     embedder_dimensions: emb.dimensions(),
                     selected_provider,
                     policy_version: "baseline".to_string(),
                     model_version: None,
-                    shadow_provider: None,
+                    shadow_provider: last_shadow_verdict
+                        .as_ref()
+                        .map(|(name, _)| name.clone()),
                     shadow_model_version: None,
                     decision,
                 };
@@ -2696,16 +2756,40 @@ async fn handle_add_memory(
             .unwrap_or(false)
     {
         // Bundle-verified GLiNER when provisioned; deterministic candidates as
-        // the fallback so review-only extraction never blocks a write.
+        // the fallback so review-only extraction never blocks a write. When a
+        // SHA-256 is provisioned, an unverified bundle is never loaded.
         let bundle_dir = std::env::var("NEUROSTRATA_GLINER_BUNDLE_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("artifacts/gliner-bundle"));
-        if let Ok(expected_sha) = std::env::var("NEUROSTRATA_GLINER_SHA256") {
-            let _ = crate::gliner::verify_bundle_sha256(&bundle_dir, &expected_sha);
-        }
-        let cands = match crate::gliner::GlinerEngine::load(&bundle_dir) {
-            Ok(engine) => engine.extract(content, &["ENTITY"]),
-            Err(_) => crate::gliner::extract_candidates(content),
+        let verified = match std::env::var("NEUROSTRATA_GLINER_SHA256") {
+            Ok(expected_sha) => match crate::gliner::verify_bundle_sha256(&bundle_dir, &expected_sha) {
+                Ok(true) => true,
+                Ok(false) => {
+                    tracing::warn!(
+                        bundle_dir = %bundle_dir.display(),
+                        "GLiNER bundle fails its provisioned SHA-256; skipping load"
+                    );
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        bundle_dir = %bundle_dir.display(),
+                        "GLiNER bundle SHA-256 verification failed; skipping load"
+                    );
+                    false
+                }
+            },
+            // No expected hash provisioned: nothing to verify against.
+            Err(_) => true,
+        };
+        let cands = if verified {
+            match crate::gliner::GlinerEngine::load(&bundle_dir) {
+                Ok(engine) => engine.extract(content, &["ENTITY"]),
+                Err(_) => crate::gliner::extract_candidates(content),
+            }
+        } else {
+            crate::gliner::extract_candidates(content)
         };
         if !cands.is_empty() {
             if let Some(o) = metadata.as_object_mut() {
@@ -3513,11 +3597,15 @@ async fn handle_ingest_directory(
         Ok(progress) => {
             // AC4: normalize resolvable declared targets so every ingest run
             // leaves the namespace edge-canonical, not just bus subscribers.
-            let _ = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
+            // A normalization failure is logged, never silently swallowed.
+            if let Err(e) = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
                 &*store,
                 namespace,
             )
-            .await;
+            .await
+            {
+                tracing::warn!("post-ingest normalize failed: {e}");
+            }
             format!(
                 "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols, {} declared edges relinked.",
                 dir_path,
@@ -3618,31 +3706,45 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
     let namespace_str = namespace.as_str();
     let profile = arguments.get("profile").and_then(|v| v.as_str()).unwrap_or("mesh");
     let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("n-quads");
-    // N-Quads is the canonical serialization (spec §5.2d). Trig not yet supported.
-    if format != "n-quads" {
+    // N-Quads is the canonical serialization (spec §5.2d); TriG is a lossless
+    // re-grouping of the same canonical quads into named graphs.
+    if format != "n-quads" && format != "trig" {
         return serde_json::json!({"ok":false,"error":format!("unsupported format: {format}")}).to_string();
     }
     let memory_id_opt: Option<String> = arguments.get("memory_id").and_then(|v| v.as_str()).map(String::from);
 
-    // memory_id is required for canonical N-Quads export (§5.2g).
-    let id_str = match &memory_id_opt {
-        Some(id) => match Uuid::parse_str(id) {
+    // Canonical export targets: an explicit memory_id exports exactly that
+    // memory; a namespace without memory_id exports every memory in the
+    // namespace (the MCP tool schema declares memory_id optional).
+    let id_targets: Vec<String> = match &memory_id_opt {
+        Some(id) => vec![match Uuid::parse_str(id) {
             Ok(u) => u.to_string(),
             Err(e) => return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")}).to_string(),
+        }],
+        None => match store.list(namespace_str, None, None).await {
+            Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
+            Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
         },
-        None => return serde_json::json!({"ok":false,"error":"memory_id required for canonical RDF export"}).to_string(),
     };
 
-    match store.get(namespace_str, &id_str).await {
+    let mut exports: Vec<serde_json::Value> = Vec::new();
+    let mut export_errors: Vec<serde_json::Value> = Vec::new();
+    for id_str in &id_targets {
+    match store.get(namespace_str, id_str).await {
         Ok(Some((_, payload))) => {
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
             let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
-            let _lifecycle_state_enum: LifecycleState = lifecycle_state.parse().unwrap_or(LifecycleState::Active);
             // created_at is required for deterministic canonical RDF (fail closed).
             let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
                 Some(t) => t.to_string(),
-                None => return serde_json::json!({"ok":false,"error":"created_at missing from memory metadata"}).to_string(),
+                None => {
+                    export_errors.push(serde_json::json!({
+                        "memory_id": id_str,
+                        "error": "created_at missing from memory metadata"
+                    }));
+                    continue;
+                }
             };
             let created_by = &payload.user_id;
             let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
@@ -3662,17 +3764,9 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             if let Some(refs) = meta.get("references").and_then(|v| v.as_array()) {
                 for r in refs { if let Some(s) = r.as_str() { rels.push(("references".to_string(), s.to_string())); } }
             }
-            let _update_id_raw = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str);
             let update_id = meta.get("update_id").and_then(|v| v.as_str()).unwrap_or(&id_str).to_string();
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
-
-            // Convert trust string to Trust enum
-            let _trust_enum = match trust {
-                "trusted" => Trust::Trusted,
-                "promoted" => Trust::Promoted,
-                _ => Trust::Untrusted,
-            };
 
             // Convert rels (String,Uuid) to Vec<Relationship>
             let mut rels_converted: Vec<Relationship> = Vec::new();
@@ -3690,7 +3784,7 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             let rehearsal_script = proc_meta.get("rehearsal_script").and_then(|v| v.as_str());
 
             let (nquads_text, digest_str) = build_mesh_canonical_nquads(
-                &id_str, namespace_str, memory_type, lifecycle_state,
+                id_str, namespace_str, memory_type, lifecycle_state,
                 &created_at, created_by,
                 superseded_by,
                 archived_at.as_deref(),
@@ -3700,28 +3794,158 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                 trigger, initial_fires, valid_to, rehearsal_script,
             );
             // Honor profile parameter: mesh = canonical N-Quads wire format; local = full MemoryPayload JSON.
-            match profile {
-                "mesh" => serde_json::json!({
-                    "ok":true,
-                    "namespace":namespace_str,
-                    "memory_id":id_str,
-                    "format":format,
-                    "canonical_hash":digest_str,
-                    "quads":nquads_text,
-                }).to_string(),
+            let result_obj: serde_json::Value = match profile {
+                "mesh" => {
+                    let mut obj = serde_json::json!({
+                        "ok":true,
+                        "namespace":namespace_str,
+                        "memory_id":id_str,
+                        "format":format,
+                        "canonical_hash":digest_str,
+                        "quads":nquads_text,
+                    });
+                    if format == "trig" {
+                        // Group the canonical quads into named-graph TriG
+                        // blocks; every quad already carries its own graph
+                        // term, but a triple would fall back to the
+                        // namespace-scoped graph label.
+                        let fallback = format!("urn:neurostrata:graph:{namespace_str}");
+                        obj["trig"] = serde_json::Value::String(nquads_to_trig(&nquads_text, &fallback));
+                    }
+                    obj
+                }
                 "local" => serde_json::json!({
                     "ok":true,
                     "namespace":namespace_str,
                     "memory_id":id_str,
                     "payload":payload,
                     "canonical_hash":digest_str,
-                }).to_string(),
-                other => serde_json::json!({"ok":false,"error":format!("unsupported profile: {other}")}).to_string(),
-            }
+                }),
+                other => serde_json::json!({"ok":false,"error":format!("unsupported profile: {other}")}),
+            };
+            exports.push(result_obj);
         }
-        Ok(None) => serde_json::json!({"ok":false,"error":"memory not found"}).to_string(),
-        Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+        Ok(None) => export_errors.push(serde_json::json!({
+            "memory_id": id_str,
+            "error": "memory not found"
+        })),
+        Err(e) => export_errors.push(serde_json::json!({
+            "memory_id": id_str,
+            "error": e.to_string()
+        })),
     }
+    }
+
+    // Single-memory export keeps the exact original response shape.
+    if exports.is_empty() {
+        return serde_json::json!({
+            "ok":false,
+            "namespace":namespace_str,
+            "format":format,
+            "memory_count":0,
+            "errors":export_errors,
+        })
+        .to_string();
+    }
+    if id_targets.len() == 1 {
+        if let Some(err) = export_errors.first() {
+            let mut failed = serde_json::json!({"ok":false});
+            if let (Some(mid), Some(e)) = (err.get("memory_id"), err.get("error")) {
+                failed["error"] = e.clone();
+                failed["memory_id"] = mid.clone();
+            }
+            return failed.to_string();
+        }
+        return exports[0].to_string();
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "namespace": namespace_str,
+        "format": format,
+        "memory_count": exports.len(),
+        "memories": exports,
+        "errors": export_errors,
+    })
+    .to_string()
+}
+
+/// Convert canonical N-Quads text into TriG: quads sharing a graph term are
+/// grouped into one `GRAPH <g> { ... }` block. A quad without a graph (a
+/// triple) falls into `fallback_graph`. Literal objects (with spaces and
+/// escapes) are parsed term-aware so a literal never splits mid-token.
+fn nquads_to_trig(nquads: &str, fallback_graph: &str) -> String {
+    // A fallback graph label is a bare IRI (no `<...>` framing); TriG named
+    // graphs are IRIs, so add the framing when the caller passed a bare one.
+    let fallback_graph = if fallback_graph.starts_with('<') {
+        fallback_graph.to_string()
+    } else {
+        format!("<{fallback_graph}>")
+    };
+    let mut graphs: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for line in nquads.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let body = line.strip_suffix('.').unwrap_or(line).trim();
+        let terms = split_nquad_terms(body);
+        if terms.len() < 3 {
+            continue;
+        }
+        let (s, p, o) = (terms[0], terms[1], terms[2]);
+        let g = terms.get(3).copied().unwrap_or(fallback_graph.as_str());
+        graphs
+            .entry(g.to_string())
+            .or_default()
+            .push(format!("  {s} {p} {o} ."));
+    }
+    let mut out = String::new();
+    for (graph, triples) in graphs {
+        out.push_str(&format!("GRAPH {graph} {{\n"));
+        for triple in triples {
+            out.push_str(&triple);
+            out.push('\n');
+        }
+        out.push_str("}\n");
+    }
+    out
+}
+
+/// Split an N-Quads line body into 3-4 terms, honoring `"` literals (a literal
+/// may contain spaces and `\"`-escaped quotes; `^^<datatype>` and `@lang`
+/// suffixes ride with the literal term).
+fn split_nquad_terms(line: &str) -> Vec<&str> {
+    let mut terms: Vec<&str> = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_literal = false;
+    let mut escaped = false;
+    for (i, &b) in line.as_bytes().iter().enumerate() {
+        if in_literal {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_literal = false;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_literal = true;
+            start.get_or_insert(i);
+        } else if b == b' ' {
+            if let Some(s) = start.take() {
+                terms.push(&line[s..i]);
+            }
+        } else {
+            start.get_or_insert(i);
+        }
+    }
+    if let Some(s) = start {
+        terms.push(&line[s..]);
+    }
+    terms
 }
 
 async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
@@ -5438,7 +5662,7 @@ async fn handle_rebuild_communities(
     arguments: Value,
     store: Arc<dyn VectorStore>,
 ) -> String {
-    use crate::community::{detect_communities_with_quality, filter_structural, COMMUNITY_STRUCTURAL_TYPES};
+    use crate::community::{detect_communities_with_resolution, filter_structural, COMMUNITY_STRUCTURAL_TYPES};
     use crate::store::ladybug::edge_specs;
 
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
@@ -5452,7 +5676,7 @@ async fn handle_rebuild_communities(
         .get("min_community_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(3) as usize;
-    let _resolution = arguments
+    let resolution = arguments
         .get("resolution")
         .and_then(|v| v.as_f64())
         .unwrap_or(1.0);
@@ -5479,7 +5703,7 @@ async fn handle_rebuild_communities(
     // Filter eligible nodes (spec §5.2): active-generation, not retired, not archived, not mesh-conflicting, not registry.
     let mut node_ids: Vec<String> = Vec::new();
     let mut node_type_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut edges: Vec<(String, String, f32)> = Vec::new();
+    let mut edges: Vec<(String, String, f64)> = Vec::new();
 
     for r in &all_memories {
         let metadata = &r.payload.metadata;
@@ -5524,21 +5748,25 @@ async fn handle_rebuild_communities(
     }
 
     // Run community detection (deterministic Leiden), with the quality value
-    // the Leiden run converged to reported alongside the partition.
-    let (communities, modularity) = match detect_communities_with_quality(&node_ids, &edges) {
-        Ok(pair) => pair,
+    // the Leiden run converged to reported alongside the partition. The
+    // `resolution` argument flows into LeidenConfig instead of being
+    // discarded.
+    let detection = match detect_communities_with_resolution(&edges, resolution) {
+        Ok(result) => result,
         Err(e) => return format!("Community detection failed: {e}"),
     };
+    let modularity = detection.quality;
 
     // Filter communities by min_community_size (using non-structural members only)
-    let mut filtered_communities: Vec<_> = communities
+    let mut filtered_communities: Vec<_> = detection
+        .communities
         .into_iter()
-        .filter_map(|c| {
-            let non_structural: Vec<String> =
-                filter_structural(&c.member_ids, &node_type_map, &COMMUNITY_STRUCTURAL_TYPES);
-            let size = non_structural.len();
-            if size >= min_community_size {
-                Some((c.id, non_structural, c.hub_id, size))
+        .filter_map(|mut c| {
+            filter_structural(&mut c, &node_type_map, &COMMUNITY_STRUCTURAL_TYPES);
+            // c.size and c.hub_id are recomputed by filter_structural from the
+            // surviving (non-structural) members.
+            if c.size >= min_community_size {
+                Some((c.id, c.member_ids, c.hub_id, c.size))
             } else {
                 None
             }
@@ -7118,6 +7346,34 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    /// The TriG converter groups canonical N-Quads by graph term, keeps
+    /// literal objects (spaces, escapes) intact, and routes quadruples
+    /// missing a graph into the fallback namespace graph.
+    #[test]
+    fn nquads_to_trig_groups_by_graph_and_preserves_literals() {
+        let nquads = concat!(
+            "<urn:s1> <urn:p> \"a b \\\"c\\\" d\" <urn:neurostrata:graph:ns:domain:gen:0> .\n",
+            "<urn:s2> <urn:p> <urn:o> <urn:neurostrata:graph:ns:domain:gen:0> .\n",
+            "<urn:s3> <urn:p> <urn:o> <urn:other:graph> .\n",
+        );
+        let trig = nquads_to_trig(nquads, "urn:neurostrata:graph:ns");
+        assert!(
+            trig.contains("GRAPH <urn:neurostrata:graph:ns:domain:gen:0> {\n  <urn:s1> <urn:p> \"a b \\\"c\\\" d\" .\n  <urn:s2> <urn:p> <urn:o> .\n}"),
+            "quads sharing a graph land in one block, literal intact: {trig}"
+        );
+        assert!(
+            trig.contains("GRAPH <urn:other:graph>"),
+            "a distinct graph term forms its own block: {trig}"
+        );
+        // No graph term → the namespace fallback graph.
+        let triple_only = "<urn:s> <urn:p> <urn:o> .";
+        let fallback = nquads_to_trig(triple_only, "urn:neurostrata:graph:ns");
+        assert_eq!(
+            fallback,
+            "GRAPH <urn:neurostrata:graph:ns> {\n  <urn:s> <urn:p> <urn:o> .\n}\n"
+        );
+    }
 
     /// Task 1 (F1/FM-2 regression): the stdio proxy's client must carry
     /// the daemon bearer token, or every proxied MCP session is a 401

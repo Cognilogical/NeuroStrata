@@ -247,5 +247,17 @@ fn field_weights_are_the_documented_defaults() {
     let index = LexicalIndex::new();
     assert_eq!(index.namespaces.len(), 0);
     assert_eq!(fts::DEFAULT_FIELD_WEIGHTS, [1.0, 2.0, 1.5, 3.0, 0.5]);
-    assert_eq!(Field::Content, Field::Content);
+    // Field identity: the variants are distinct, Content is not Symbol.
+    assert_ne!(Field::Content, Field::Symbol);
+    assert_ne!(Field::Content, Field::MemoryType);
+    assert!(Field::Content < Field::Symbol);
+    // Weight slots are positional: ALL_FIELDS[i] owns DEFAULT_FIELD_WEIGHTS[i]
+    // (the same mapping `weight_index()` bakes into scoring), so Content
+    // carries the 1.0 default and Symbol is boosted ×2.
+    let slot =
+        |field: Field| fts::ALL_FIELDS.iter().position(|f| *f == field).unwrap();
+    assert_eq!(slot(Field::Content), 0);
+    assert_eq!(slot(Field::Symbol), 1);
+    assert_eq!(fts::DEFAULT_FIELD_WEIGHTS[slot(Field::Content)], 1.0);
+    assert_eq!(fts::DEFAULT_FIELD_WEIGHTS[slot(Field::Symbol)], 2.0);
 }

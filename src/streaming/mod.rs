@@ -82,17 +82,6 @@ pub fn format_iri(iri: &str) -> Result<String, ParseError> {
     } else {
         iri
     };
-    for ch in inner.chars() {
-        let c = ch as u32;
-        if c == 0x20 || c == 0x3C || c == 0x3E || c == 0x22 || c == 0x7B || c == 0x7D
-            || c == 0x7C || c == 0x5E || c == 0x5C || c == 0x60
-        {
-            if ch != '<' && ch != '>' {
-                // These specific chars are rejected outright
-                // Control chars (U+0000 to U+0020) are escaped or rejected
-            }
-        }
-    }
     // Reject chars: < > " { } | ^ \ ` and control chars U+0000..=U+0020
     for ch in inner.chars() {
         let c = ch as u32;
@@ -115,19 +104,10 @@ pub fn format_iri(iri: &str) -> Result<String, ParseError> {
             _ => {}
         }
     }
-    for ch in inner.chars() {
-        let c = ch as u32;
-        if c > 0x007F {
-            // Non-ASCII: escape as \uXXXX
-        }
-    }
     // Actually build the escaped version
     let mut escaped = String::new();
     for ch in inner.chars() {
         let c = ch as u32;
-        if c == 0x5C || c == 0x22 || c == 0x0A || c == 0x0D || c == 0x09 {
-            // These don't apply to IRI inner directly; only control/non-ASCII
-        }
         if (c > 0x0020 && c < 0x007F)
             && ch != '<'
             && ch != '>'
@@ -298,10 +278,6 @@ impl Stream {
                     message: format!("expected 3 or 4 terms, got {}", term_count),
                 });
             }
-            let _terms_slice = &parts[1..parts.len() - 1];
-            let _terms: Vec<String> = Vec::new();
-            // Actually terms_slice is split by whitespace, but terms may contain spaces inside quotes
-            // We need to parse more carefully
             // Re-tokenize respecting quotes
             let content = trimmed.trim_start_matches(op_token).trim();
             // Remove trailing .

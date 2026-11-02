@@ -44,6 +44,25 @@ pub struct StorageStatus {
     pub snapshot_export_dir: String,
 }
 
+/// Duration of the most recent checkpoint, in milliseconds. Cross-task record
+/// because checkpoints are driven by whichever task lands the write.
+static LAST_CHECKPOINT_DURATION_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of failed checkpoints since process start (monotonic, never reset).
+static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record a finished checkpoint. Called from the store's checkpoint path so
+/// `compute_storage_status` reports real hygiene data instead of constants.
+pub fn record_checkpoint_outcome(duration_ms: u64, ok: bool) {
+    use std::sync::atomic::Ordering;
+    LAST_CHECKPOINT_DURATION_MS.store(duration_ms, Ordering::Relaxed);
+    if !ok {
+        CHECKPOINT_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn compute_storage_status(
     store_path: &Path,
     config: &StorageHygieneConfig,
@@ -96,8 +115,10 @@ pub fn compute_storage_status(
         dirty: wal_bytes > 0,
         checkpoint_interval_secs: config.checkpoint_interval_secs,
         last_checkpoint_at,
-        last_checkpoint_duration_ms: Some(0),
-        checkpoint_failures: 0,
+        last_checkpoint_duration_ms: Some(
+            LAST_CHECKPOINT_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        checkpoint_failures: CHECKPOINT_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
         snapshot_export_dir: snapshot_dir.display().to_string(),
     }
 }

@@ -55,10 +55,21 @@ const TOPOLOGY_KEYS: [&str; 5] = [
 ];
 
 pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
-    // Ensure embedded .ttl SHACL schemas are parsed once and active.
-    let _ = parse_embedded_shapes();
-
+    // Embedded .ttl SHACL schemas must parse cleanly. A decode error here
+    // means the shipped schemas drifted — surface it as a violation instead
+    // of silently validating against nothing.
+    let loaded = parse_embedded_shapes();
     let mut out = Vec::new();
+    if loaded < embedded_ttl_shapes().len() {
+        out.push(ShaclViolation {
+            field: "shacl.embedded_shapes".to_string(),
+            why: format!(
+                "only {}/{} embedded SHACL shapes parsed cleanly",
+                loaded,
+                embedded_ttl_shapes().len()
+            ),
+        });
+    }
 
     if payload.content.trim().is_empty() && !is_structural(payload.memory_type.as_str()) {
         out.push(ShaclViolation {

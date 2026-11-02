@@ -76,6 +76,9 @@ pub struct DatasetManifest {
     pub split_seed: u64,
     pub observation_ids: Vec<String>,
     pub label_rule_versions: Vec<(String, u32)>,
+    /// Number of labels derived by the versioned rule set (\>0 signals the
+    /// dataset actually passed through `derive_labels`; never discarded).
+    pub derived_label_count: usize,
 }
 
 /// Versioned dataset build report.
@@ -213,8 +216,10 @@ pub async fn build_dedup_dataset(
         }
     }
 
-    // Call derive_labels to exercise the contract
-    let _derived = derive_labels(&observation_ids, &rules)?;
+    // Derive labels against the versioned rule set; keep the count in the
+    // dataset stats/manifest instead of discarding the derivation.
+    let derived = derive_labels(&observation_ids, &rules)?;
+    let derived_label_count = derived.len();
 
     // 5. Component-disjoint split
     let memory_ids: Vec<std::collections::HashSet<String>> = observations.iter().map(|o| {
@@ -331,6 +336,7 @@ pub async fn build_dedup_dataset(
         split_seed: 42,
         observation_ids: observation_ids.clone(),
         label_rule_versions: rules.iter().map(|r| (r.id.clone(), r.version)).collect(),
+        derived_label_count,
     };
     std::fs::write(out_dir.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
 
@@ -371,11 +377,13 @@ mod tests {
             split_seed: 42,
             observation_ids: vec!["obs-1".into(), "obs-2".into()],
             label_rule_versions: vec![("rule-v1".into(), 1)],
+            derived_label_count: 2,
         };
         let serialized = serde_json::to_string(&manifest).unwrap();
         let deserialized: DatasetManifest = serde_json::from_str(&serialized).unwrap();
         assert_eq!(manifest.dataset_version, deserialized.dataset_version);
         assert_eq!(manifest.split_seed, deserialized.split_seed);
+        assert_eq!(manifest.derived_label_count, deserialized.derived_label_count);
     }
 
     #[test]

@@ -126,7 +126,17 @@ fn is_archived(metadata: &Value) -> bool {
 }
 
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
-    metadata.get("retired_at").and_then(|v| v.as_i64()).map(|t| t <= now).unwrap_or(false)
+    // Matches src/rdf/sparql.rs: a record is retired when `retired_at` OR
+    // `valid_to` is present and non-null (a present-but-non-numeric value is
+    // treated as epoch 0, i.e. already retired).
+    for key in ["retired_at", "valid_to"] {
+        if let Some(v) = metadata.get(key) {
+            if !v.is_null() && v.as_i64().unwrap_or(0) <= now {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn build_memory_node(
@@ -262,9 +272,9 @@ pub fn execute_on_records(
         "location", "locationLines", "validFrom", "validTo", "feedbackScore",
         "metadata", "mentions", "edges", "__typename",
     ].iter().cloned().collect();
-    let _allowed_edge_fields: HashSet<&str> = ["targetId", "relation", "extractor", "__typename"].iter().cloned().collect();
+    let allowed_edge_fields: HashSet<&str> = ["targetId", "relation", "extractor", "cursor", "node", "__typename"].iter().cloned().collect();
     let allowed_connection_fields: HashSet<&str> = ["edges", "pageInfo", "__typename"].iter().cloned().collect();
-    let _allowed_pageinfo_fields: HashSet<&str> = ["hasNextPage", "endCursor", "__typename"].iter().cloned().collect();
+    let allowed_pageinfo_fields: HashSet<&str> = ["hasNextPage", "endCursor", "__typename"].iter().cloned().collect();
 
     // Basic field validation by scanning selection set names (simplified heuristics)
     // For the unit tests, we mainly need to detect unknown root and unknown selection on Memory/Edge/MemoryConnection/PageInfo
@@ -293,6 +303,24 @@ pub fn execute_on_records(
                                     if !allowed_connection_fields.contains(sname) {
                                         has_unknown_root = true;
                                         unknown_selection_errors.push(format!("unknown field {}", sname));
+                                    } else if sname == "edges" {
+                                        for inner in &sf.selection_set.items {
+                                            if let graphql_parser::query::Selection::Field(inf) = inner {
+                                                if !allowed_edge_fields.contains(inf.name) {
+                                                    has_unknown_root = true;
+                                                    unknown_selection_errors.push(format!("unknown field {}", inf.name));
+                                                }
+                                            }
+                                        }
+                                    } else if sname == "pageInfo" {
+                                        for inner in &sf.selection_set.items {
+                                            if let graphql_parser::query::Selection::Field(inf) = inner {
+                                                if !allowed_pageinfo_fields.contains(inf.name) {
+                                                    has_unknown_root = true;
+                                                    unknown_selection_errors.push(format!("unknown field {}", inf.name));
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -326,6 +354,7 @@ pub fn execute_on_records(
     let mut var_memory_type = vars.get("memoryType").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mut var_include_archived = vars.get("includeArchived").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut var_include_retired = vars.get("includeRetired").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut var_text = vars.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
     // Build result from query type: determine operation
     let mut data = json!({});
@@ -372,6 +401,17 @@ pub fn execute_on_records(
                                         var_include_retired = *b;
                                     }
                                 }
+                                "text" => {
+                                    match v {
+                                        graphql_parser::query::Value::String(s) => var_text = s.clone(),
+                                        graphql_parser::query::Value::Variable(name) => {
+                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
+                                                var_text = s.to_string();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -393,8 +433,12 @@ pub fn execute_on_records(
                                     }
                                 }
                             }
-                            if ns_arg != namespace {
-                                // namespace isolation enforced
+                            if !ns_arg.is_empty() && ns_arg != namespace {
+                                errors.push(GraphQLError { message: format!(
+                                    "namespace isolation violation: query requested '{}' on bound namespace '{}'",
+                                    ns_arg, namespace
+                                ) });
+                                return GraphQLResponse { data: None, errors };
                             }
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && payload.memory_type != "" {
@@ -448,20 +492,56 @@ pub fn execute_on_records(
                                 }
                                 filtered.push((id_str.clone(), payload.clone()));
                             }
+                            // Search query matching: when `text` is non-empty, score each
+                            // candidate by case-insensitive token/substring hits against
+                            // content and metadata, combined with metadata.score. Records
+                            // with no matching token/substring are dropped.
+                            let mut match_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+                            if root_name == "search" && !var_text.trim().is_empty() {
+                                let tokens: Vec<String> = var_text.to_lowercase()
+                                    .split_whitespace()
+                                    .filter(|t| !t.is_empty())
+                                    .map(|t| t.to_string())
+                                    .collect();
+                                let text_lc = var_text.to_lowercase();
+                                filtered.retain_mut(|(id_str, payload)| {
+                                    let content_lc = payload.content.to_lowercase();
+                                    let meta_lc = serde_json::to_string(&payload.metadata)
+                                        .map(|s| s.to_lowercase())
+                                        .unwrap_or_default();
+                                    let mut hits = 0.0f64;
+                                    for tok in &tokens {
+                                        // Occurrence-counted so richer matches outrank single hits.
+                                        hits += 2.0 * content_lc.matches(tok.as_str()).count() as f64;
+                                        hits += 1.0 * meta_lc.matches(tok.as_str()).count() as f64;
+                                    }
+                                    // Full-text bonus when the whole query is a substring.
+                                    if !text_lc.is_empty() && (content_lc.contains(&text_lc) || meta_lc.contains(&text_lc)) {
+                                        hits += 1.0;
+                                    }
+                                    if hits <= 0.0 {
+                                        return false;
+                                    }
+                                    let meta_score = payload.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    match_scores.insert(id_str.clone(), hits + meta_score);
+                                    true
+                                });
+                            }
                             // Sort
                             if root_name == "memories" {
                                 filtered.sort_by(|a, b| {
-                                    let _vf_a = a.1.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
-                                    let _vf_b = b.1.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0);
                                     b.1.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0).cmp(&a.1.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0))
                                         .then_with(|| a.0.cmp(&b.0))
                                 });
                             } else {
-                                // search: sort by score ASC, id ASC
+                                // search: match score DESC (match hits combined with
+                                // metadata.score), id ASC as tie-break
                                 filtered.sort_by(|a, b| {
-                                    let s_a = a.1.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                    let s_b = b.1.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                    s_a.partial_cmp(&s_b).unwrap().then(a.0.cmp(&b.0))
+                                    let s_a = match_scores.get(&a.0).copied()
+                                        .unwrap_or_else(|| a.1.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0));
+                                    let s_b = match_scores.get(&b.0).copied()
+                                        .unwrap_or_else(|| b.1.metadata.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0));
+                                    s_b.partial_cmp(&s_a).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
                                 });
                             }
                             // Cursor pagination via after
@@ -653,6 +733,97 @@ mod tests {
         assert_eq!(node_edges[0]["targetId"], target);
         assert_eq!(node_edges[0]["relation"], rel);
         assert_eq!(node_edges[0]["extractor"], "metadata");
+    }
+
+    #[test]
+    fn search_text_filters_and_scores_matches() {
+        let mk = |content: &str, meta: serde_json::Value| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: meta,
+        };
+        let records = vec![
+            ("hit1".into(), mk("database writes are batched", serde_json::json!({}))),
+            ("hitmeta".into(), mk("", serde_json::json!({"content": "database lifecycle"}))),
+            ("miss".into(), mk("unrelated memory", serde_json::json!({}))),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ search(text: \"Database\") { edges { node { id content } } } }", None);
+        let data = resp.data.as_ref().unwrap();
+        let rows = data["search"]["edges"].as_array().unwrap();
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert!(ids.contains(&&serde_json::json!("hit1")), "content match included");
+        assert!(ids.contains(&&serde_json::json!("hitmeta")), "metadata match included");
+        assert!(!ids.contains(&&serde_json::json!("miss")), "non-matching record excluded");
+    }
+
+    #[test]
+    fn search_text_single_token_orders_by_match_score_desc() {
+        let mk = |content: &str, score: f64| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({ "score": score }),
+        };
+        // b hits "rule" twice in content (+4), a once (+2): match score desc puts b first
+        let records = vec![
+            ("a".into(), mk("rule", 0.0)),
+            ("b".into(), mk("rule rule", 0.0)),
+        ];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ search(text: \"rule\") { edges { node { id } } } }", None);
+        let rows = resp.data.as_ref().unwrap()["search"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["node"]["id"], "b");
+        assert_eq!(rows[1]["node"]["id"], "a");
+    }
+
+    #[test]
+    fn namespace_isolation_violation_rejects_cross_ns_queries() {
+        let records = vec![("m1".into(), crate::traits::MemoryPayload {
+            content: "x".into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        })];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memory(id: \"m1\", namespace: \"other\") { id } }", None);
+        assert!(resp.data.is_none(), "cross-namespace query must be rejected");
+        assert!(resp.errors.iter().any(|e| e.message.contains("namespace isolation violation")
+            && e.message.contains("'other'") && e.message.contains("'ns'")));
+    }
+
+    #[test]
+    fn valid_to_treated_as_retired() {
+        let now = chrono::Utc::now().timestamp();
+        let records = vec![("expired".into(), crate::traits::MemoryPayload {
+            content: "x".into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({ "valid_to": now - 10 }),
+        })];
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories { edges { node { id } } } }", None);
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        assert!(rows.is_empty(), "expired valid_to record must be treated as retired");
+        // includeRetired restores it
+        let resp2 = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories(includeRetired: true) { edges { node { id } } } }", None);
+        let rows2 = resp2.data.as_ref().unwrap()["memories"]["edges"].as_array().unwrap();
+        assert_eq!(rows2.len(), 1);
     }
 
     #[test]

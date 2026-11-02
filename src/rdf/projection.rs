@@ -287,6 +287,9 @@ pub fn memory_to_quads(
 }
 
 /// Project one LadybugDB edge into an oxrdf Quad.
+///
+/// Single-quad core; provenance quads are emitted by [`edge_to_quads`] because
+/// a single-Quad return cannot carry the extra provenance rows.
 pub fn edge_to_quad(
     from: &str,
     rel_type: &str,
@@ -297,13 +300,72 @@ pub fn edge_to_quad(
     let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", from)));
     let object = Term::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", to)));
     let graph = graph.unwrap_or(GraphName::DefaultGraph);
-    
+
     Quad {
         subject,
         predicate: NamedNode::new_unchecked(relation_predicate(rel_type)),
         object,
         graph_name: graph,
     }
+}
+
+/// Project one LadybugDB edge into oxrdf Quads, emitting provenance quads
+/// (`ns:provenanceSource`, `ns:provenanceValidFrom/To`, `ns:provenanceGeneration`,
+/// `ns:provenanceExtractor`) beside the relation quad when provenance is Some.
+pub fn edge_to_quads(
+    from: &str,
+    rel_type: &str,
+    to: &str,
+    provenance: Option<EdgeProvenance>,
+    graph: Option<GraphName>,
+) -> Vec<Quad> {
+    let mut quads = vec![edge_to_quad(from, rel_type, to, None, graph.clone())];
+    if let Some(prov) = provenance {
+        let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("urn:neurostrata:memory:{}", from)));
+        let graph = graph.unwrap_or(GraphName::DefaultGraph);
+        let xsd_string = NamedNode::new_unchecked(XSD_STRING.to_string());
+        let xsd_integer = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer".to_string());
+        let mut provenance_quals: Vec<(&'static str, Term)> = Vec::new();
+        if let Some(src) = prov.source {
+            provenance_quals.push((
+                "provenanceSource",
+                Term::Literal(Literal::new_typed_literal(src, xsd_string.clone())),
+            ));
+        }
+        if let Some(vf) = prov.valid_from {
+            provenance_quals.push((
+                "provenanceValidFrom",
+                Term::Literal(Literal::new_typed_literal(vf.to_string(), xsd_integer.clone())),
+            ));
+        }
+        if let Some(vt) = prov.valid_to {
+            provenance_quals.push((
+                "provenanceValidTo",
+                Term::Literal(Literal::new_typed_literal(vt.to_string(), xsd_integer.clone())),
+            ));
+        }
+        if let Some(gen) = prov.generation {
+            provenance_quals.push((
+                "provenanceGeneration",
+                Term::Literal(Literal::new_typed_literal(gen.to_string(), xsd_integer.clone())),
+            ));
+        }
+        if let Some(ex) = prov.extractor {
+            provenance_quals.push((
+                "provenanceExtractor",
+                Term::Literal(Literal::new_typed_literal(ex, xsd_string.clone())),
+            ));
+        }
+        for (name, term) in provenance_quals {
+            quads.push(Quad {
+                subject: subject.clone(),
+                predicate: NamedNode::new_unchecked(ns_predicate(name)),
+                object: term,
+                graph_name: graph.clone(),
+            });
+        }
+    }
+    quads
 }
 
 /// Combine node + edge quads for a namespace snapshot.
@@ -325,8 +387,8 @@ pub fn rows_to_quads(
     let graph = GraphName::NamedNode(
         NamedNode::new_unchecked(graph_iri)
     );
-    let ox_quads: Vec<Quad> = edges.iter().map(|(from, rel, to, prov)| {
-        edge_to_quad(from, rel, to, prov.clone(), Some(graph.clone()))
+    let ox_quads: Vec<Quad> = edges.iter().flat_map(|(from, rel, to, prov)| {
+        edge_to_quads(from, rel, to, prov.clone(), Some(graph.clone()))
     }).collect();
     out.extend(quads_to_legacy(&ox_quads));
     out
@@ -483,6 +545,37 @@ mod tests {
         let q = edge_to_quad("a", "GOVERNS", "b", None, Some(GraphName::DefaultGraph));
         assert_eq!(q.predicate, NamedNode::new_unchecked("urn:neurostrata:ns#governs"));
         assert!(matches!(&q.object, Term::NamedNode(nn) if nn.as_str() == "urn:neurostrata:memory:b"));
+    }
+
+    #[test]
+    fn edge_provenance_quads_emitted_when_some() {
+        let prov = EdgeProvenance {
+            source: Some("owner".to_string()),
+            valid_from: Some(1730000000),
+            valid_to: None,
+            generation: Some(1),
+            extractor: Some("metadata".to_string()),
+        };
+        let none = edge_to_quads("a", "GOVERNS", "b", None, Some(GraphName::DefaultGraph));
+        assert_eq!(none.len(), 1, "no provenance -> only the relation quad");
+
+        let qs = edge_to_quads("a", "GOVERNS", "b", Some(prov), Some(GraphName::DefaultGraph));
+        let preds: Vec<&str> = qs
+            .iter()
+            .skip(1)
+            .map(|q| q.predicate.as_str().rsplit('#').next().unwrap())
+            .collect();
+        assert_eq!(
+            preds,
+            vec![
+                "provenanceSource",
+                "provenanceValidFrom",
+                "provenanceGeneration",
+                "provenanceExtractor"
+            ]
+        );
+        assert!(qs.iter().any(|q| q.predicate.as_str().ends_with("#provenanceSource")
+            && matches!(&q.object, Term::Literal(l) if l.value() == "owner")));
     }
 
     #[test]

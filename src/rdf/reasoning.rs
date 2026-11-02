@@ -101,7 +101,13 @@ impl ReasoningAdapter {
 
     /// Bounded transitive GOVERNS closure (default 2 hops, §5.5).
     pub fn closure_governs(&self, ontology: &OntologyIndex, root: &str, edges: &[String]) -> ClosureResult {
-        let _ = ontology;
+        // GOVERNS closure expands over subPropertyOf*: an edge carrying any
+        // sub-relation of GOVERNS (e.g. a strict-governs variant) participates.
+        let governed_rels: Vec<String> = self
+            .expand_relation(ontology, "GOVERNS")
+            .into_iter()
+            .map(|r| r.to_lowercase())
+            .collect();
         let mut result = ClosureResult::default();
         let max_hops = self.config.governs_max_hops as usize;
         let budget = self.config.closure_budget;
@@ -113,24 +119,32 @@ impl ReasoningAdapter {
         // Hop 0: direct outgoing edges from root
         for edge in edges {
             let parts: Vec<String> = edge.split("::").map(|s| s.to_string()).collect();
-            if parts.len() == 2 && parts[0] == root {
-                let target = &parts[1];
-                if !visited.contains(target) {
-                    visited.insert(target.clone());
-                    result.results.push(target.clone());
-                    result.evidence.push(SearchEvidence {
-                        kind: EvidenceKind::Governs2hop,
-                        path: vec![EvidenceEdge {
-                            source: root.to_string(),
-                            relation: "governs".to_string(),
-                            target: target.clone(),
-                        }],
-                        explanation: format!("GOVERNS {}::{}", root, target),
-                        derivation: vec!["reasoning".to_string()],
-                    });
-                }
-                frontier.push_back(target.clone());
+            if parts.len() < 2 || parts[0] != root {
+                continue;
             }
+            // 2-part edges carry no explicit relation; 3-part "src::tgt::rel" must be a
+            // GOVERNS sub-relation (lowercase compare) to participate.
+            let relates = parts.len() == 2
+                || governed_rels.iter().any(|r| *r == parts[2].to_lowercase());
+            if !relates {
+                continue;
+            }
+            let target = &parts[1];
+            if !visited.contains(target) {
+                visited.insert(target.clone());
+                result.results.push(target.clone());
+                result.evidence.push(SearchEvidence {
+                    kind: EvidenceKind::Governs2hop,
+                    path: vec![EvidenceEdge {
+                        source: root.to_string(),
+                        relation: "governs".to_string(),
+                        target: target.clone(),
+                    }],
+                    explanation: format!("GOVERNS {}::{}", root, target),
+                    derivation: vec!["reasoning".to_string()],
+                });
+            }
+            frontier.push_back(target.clone());
         }
 
         // BFS for further bounded transitive hops
@@ -145,23 +159,29 @@ impl ReasoningAdapter {
                 node_count += 1;
                 for edge in edges {
                     let parts: Vec<String> = edge.split("::").map(|s| s.to_string()).collect();
-                    if parts.len() == 2 && parts[0] == node {
-                        let target = &parts[1];
-                        if !visited.contains(target) {
-                            visited.insert(target.clone());
-                            result.results.push(target.clone());
-                            frontier.push_back(target.clone());
-                            result.evidence.push(SearchEvidence {
-                                kind: EvidenceKind::Governs2hop,
-                                path: vec![EvidenceEdge {
-                                    source: node.clone(),
-                                    relation: "governs".to_string(),
-                                    target: target.clone(),
-                                }],
-                                explanation: format!("GOVERNS {}::{}", node, target),
-                                derivation: vec!["reasoning".to_string()],
-                            });
-                        }
+                    if parts.len() < 2 || parts[0] != node {
+                        continue;
+                    }
+                    let relates = parts.len() == 2
+                        || governed_rels.iter().any(|r| *r == parts[2].to_lowercase());
+                    if !relates {
+                        continue;
+                    }
+                    let target = &parts[1];
+                    if !visited.contains(target) {
+                        visited.insert(target.clone());
+                        result.results.push(target.clone());
+                        frontier.push_back(target.clone());
+                        result.evidence.push(SearchEvidence {
+                            kind: EvidenceKind::Governs2hop,
+                            path: vec![EvidenceEdge {
+                                source: node.clone(),
+                                relation: "governs".to_string(),
+                                target: target.clone(),
+                            }],
+                            explanation: format!("GOVERNS {}::{}", node, target),
+                            derivation: vec!["reasoning".to_string()],
+                        });
                     }
                 }
             }
@@ -186,10 +206,17 @@ impl ReasoningAdapter {
         let expanded_domains = self.expand_domain(ontology, domain);
         let expanded_query = self.expand_identifiers(ontology, query);
 
-        // Bounded GOVERNS closure over expanded domains
+        // Bounded GOVERNS closure over expanded domains; closure evidence is
+        // attached to the SearchResult rows it discovered.
         let mut all_results: Vec<String> = Vec::new();
+        let mut closure_evidence: HashMap<String, Vec<SearchEvidence>> = HashMap::new();
         for d in &expanded_domains {
             let closure = self.closure_governs(ontology, d, edges);
+            for ev in closure.evidence {
+                if let Some(target) = ev.path.first().map(|e| e.target.clone()) {
+                    closure_evidence.entry(target).or_default().push(ev);
+                }
+            }
             for r in closure.results {
                 all_results.push(r);
             }
@@ -214,7 +241,7 @@ impl ReasoningAdapter {
                     id: r.clone(),
                     score: 0.8,
                     payload: self.payload_for(r),
-                    evidence: None,
+                    evidence: closure_evidence.get(r).cloned(),
                 });
             }
         }

@@ -114,13 +114,27 @@ impl GuardValidator {
             let sandbox_result = self.sandbox.evaluate(action_type, payload, cwd).await;
 
             match sandbox_result {
-                Ok(verdict) => {
+                Ok(mut verdict) => {
                     // Extract constraints from rules for context
-                    let _constraints: Vec<String> = matching_rules
+                    let constraints: Vec<String> = matching_rules
                         .iter()
                         .filter(|r| r.status != "deprecated")
                         .map(|r| r.constraint_text.clone())
                         .collect();
+
+                    match &mut verdict {
+                        ValidateVerdict::SandboxReject { constraints: ref mut c, .. } => {
+                            if c.is_empty() {
+                                *c = constraints;
+                            }
+                        }
+                        ValidateVerdict::DeterministicReject { constraints: ref mut c, .. } => {
+                            if c.is_empty() {
+                                *c = constraints;
+                            }
+                        }
+                        _ => {}
+                    }
 
                     return (verdict, rule_ids);
                 }

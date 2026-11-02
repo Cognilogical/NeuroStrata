@@ -75,6 +75,9 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// The verdict of a shadow (non-gating) provider: the full judged list.
+pub type DuplicateVerdict = Vec<DuplicateJudgment>;
+
 /// A set of judgment providers selected for dedup checking.
 /// Each mode (Auto, Heuristic, LayaLocal, Jev, None) selects one or two
 /// providers — the "active" one and an optional "shadow" provider.
@@ -127,6 +130,9 @@ pub struct DeduplicationChecker {
     pub config: DeduplicationConfig,
     provider_set: ProviderSet,
     circuit_breaker: circuit_breaker::CircuitBreaker,
+    /// Last shadow provider verdict: (provider name, judgments). Kept, never
+    /// discarded — the shadow records alongside without gating the write.
+    last_shadow: std::sync::Arc<std::sync::Mutex<Option<(String, DuplicateVerdict)>>>,
 }
 
 impl DeduplicationChecker {
@@ -164,6 +170,7 @@ impl DeduplicationChecker {
             config,
             provider_set,
             circuit_breaker: circuit_breaker::CircuitBreaker::new(cb_config),
+            last_shadow: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -187,9 +194,23 @@ impl DeduplicationChecker {
                 return None;
             }
         }
-        // The shadow provider records alongside without gating the write.
+        // The shadow provider records its verdict alongside without gating
+        // the write: store (provider name, verdict) for inspection, and
+        // never fabricate one when it errors.
         if let Some(shadow) = &self.provider_set.shadow {
-            let _ = shadow.judge_duplicates(new_memory, candidates).await;
+            match shadow.judge_duplicates(new_memory, candidates).await {
+                Ok(verdict) => {
+                    *self.last_shadow.lock().expect("last_shadow lock") =
+                        Some((shadow.name().to_string(), verdict));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        provider = shadow.name(),
+                        error = %e,
+                        "Shadow judgment failed; verdict not recorded"
+                    );
+                }
+            }
         }
 
         // Apply timeout to judgment call
@@ -276,6 +297,131 @@ impl DeduplicationChecker {
             config,
             provider_set,
             circuit_breaker: circuit_breaker::CircuitBreaker::new(cb_config),
+            last_shadow: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// The last recorded shadow provider verdict, if any: (provider name, judgments).
+    pub fn last_shadow_verdict(&self) -> Option<(String, DuplicateVerdict)> {
+        self.last_shadow.lock().expect("last_shadow lock").clone()
+    }
+
+    /// Test-only constructor injecting both an active and a shadow provider.
+    #[cfg(test)]
+    pub fn new_with_active_and_shadow(
+        config: DeduplicationConfig,
+        active: Arc<dyn JudgmentProvider>,
+        shadow: Arc<dyn JudgmentProvider>,
+    ) -> Self {
+        let provider_set = ProviderSet {
+            active: Some(active),
+            shadow: Some(shadow),
+        };
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: config.cb_failure_threshold,
+            initial_backoff_ms: config.cb_backoff_initial_seconds * 1000,
+            max_backoff_ms: config.cb_backoff_max_seconds * 1000,
+            backoff_multiplier: 2.0,
+        };
+        Self {
+            config,
+            provider_set,
+            circuit_breaker: circuit_breaker::CircuitBreaker::new(cb_config),
+            last_shadow: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{MemoryPayload, SearchResult};
+
+    struct FakeJudgmentProvider {
+        name: &'static str,
+        confidence: f32,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl JudgmentProvider for FakeJudgmentProvider {
+        async fn judge_duplicates(
+            &self,
+            _new_memory: &MemoryPayload,
+            candidates: &[SearchResult],
+        ) -> Result<Vec<DuplicateJudgment>> {
+            if self.fail {
+                anyhow::bail!("fake shadow failure");
+            }
+            Ok(candidates
+                .iter()
+                .map(|c| DuplicateJudgment {
+                    existing_memory_id: c.id.clone(),
+                    confidence: self.confidence,
+                    reason: Some(self.name.to_string()),
+                })
+                .collect())
+        }
+
+        async fn health_check(&self) -> Result<bool> {
+            Ok(!self.fail)
+        }
+
+        fn name(&self) -> &str {
+            self.name
+        }
+    }
+
+    fn dummy_memory() -> MemoryPayload {
+        MemoryPayload {
+            content: "hello".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "loc".to_string(),
+            location_lines: "1".to_string(),
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn dummy_candidate(id: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            score: 0.9,
+            payload: dummy_memory(),
+            evidence: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn shadow_verdict_is_recorded_not_discarded() {
+        let config = DeduplicationConfig::default();
+        let checker = DeduplicationChecker::new_with_active_and_shadow(
+            config,
+            Arc::new(FakeJudgmentProvider { name: "active", confidence: 0.9, fail: false }),
+            Arc::new(FakeJudgmentProvider { name: "shadow-test", confidence: 0.95, fail: false }),
+        );
+        let mem = dummy_memory();
+        let cands = vec![dummy_candidate("c1")];
+        checker.check_duplicates(&mem, &cands).await;
+        let verdict = checker.last_shadow_verdict().expect("shadow verdict must be stored");
+        assert_eq!(verdict.0, "shadow-test");
+        assert_eq!(verdict.1.len(), 1);
+        assert_eq!(verdict.1[0].existing_memory_id, "c1");
+        assert!((verdict.1[0].confidence - 0.95).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn shadow_error_records_no_verdict() {
+        let config = DeduplicationConfig::default();
+        let checker = DeduplicationChecker::new_with_active_and_shadow(
+            config,
+            Arc::new(FakeJudgmentProvider { name: "active", confidence: 0.9, fail: false }),
+            Arc::new(FakeJudgmentProvider { name: "shadow-test", confidence: 0.95, fail: true }),
+        );
+        let mem = dummy_memory();
+        let cands = vec![dummy_candidate("c1")];
+        checker.check_duplicates(&mem, &cands).await;
+        assert!(checker.last_shadow_verdict().is_none(), "failed shadow must not fabricate a verdict");
     }
 }

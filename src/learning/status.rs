@@ -20,6 +20,10 @@ pub struct LearnStatus {
     pub unlabeled_observations: usize,
     pub counts_by_label_tier: BTreeMap<String, usize>,
     pub latest_evaluation: Option<EvaluationReport>,
+    /// The last recorded control request (`control.json`), read at load time
+    /// so status reporting names what the operator asked the loop to do.
+    #[serde(default)]
+    pub last_control: Option<crate::learning::control::LearningControlRequest>,
 }
 
 impl Default for LearnStatus {
@@ -36,6 +40,7 @@ impl Default for LearnStatus {
             unlabeled_observations: 0,
             counts_by_label_tier: BTreeMap::new(),
             latest_evaluation: None,
+            last_control: None,
         }
     }
 }

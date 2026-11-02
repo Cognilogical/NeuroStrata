@@ -40,6 +40,18 @@ impl DatasetSplits {
             || self.calibration.contains(observation_id)
             || self.eval.contains(observation_id)
     }
+    /// The split an observation is assigned to, if any.
+    pub fn split_of(&self, observation_id: &str) -> Option<Split> {
+        if self.train.contains(observation_id) {
+            Some(Split::Train)
+        } else if self.calibration.contains(observation_id) {
+            Some(Split::Calibration)
+        } else if self.eval.contains(observation_id) {
+            Some(Split::Eval)
+        } else {
+            None
+        }
+    }
 }
 
 /// Which dataset split an observation belongs to.
@@ -221,55 +233,53 @@ pub fn split_observations(
         assigned.extend(component);
     }
     
-    // Validate no component crosses split boundaries
+    // Validate no connected group (canonical union-find component) spans
+    // multiple splits.
+    let group_roots: Vec<usize> = (0..n).map(|i| uf.find(i)).collect();
+    verify_no_group_leakage(observation_ids, &group_roots, &splits)?;
+
+    Ok(splits)
+}
+
+/// Verify that every group of observations grouped by their canonical
+/// union-find component root was assigned the exact same `Split`. Bails if any
+/// group spans multiple splits (or if an observation has no split at all).
+pub fn verify_no_group_leakage(
+    observation_ids: &[String],
+    group_roots: &[usize],
+    splits: &DatasetSplits,
+) -> Result<()> {
+    use std::collections::hash_map::Entry;
     let mut violations: Vec<String> = Vec::new();
-    let mut split_for_component: HashMap<usize, Split> = HashMap::new();
-    
-    for component in component_list.iter() {
-        if let Some(&obs_idx) = component.first() {
-            let root = uf.find(obs_idx);
-            let component_split = match root {
-                _ => { // Find split by checking first observation
-                    let first_obs = &observation_ids[component[0]];
-                    if splits.train.contains(first_obs) {
-                        Split::Train
-                    } else if splits.calibration.contains(first_obs) {
-                        Split::Calibration
-                    } else {
-                        Split::Eval
-                    }
-                }
-            };
-            split_for_component.insert(root, component_split);
-        }
-    }
-    
-    // Check each component for boundary crossing
-    for (root, expected_split) in split_for_component.iter() {
-        let component = components.get(root).unwrap();
-        for &obs_idx in component {
-            let obs_id = &observation_ids[obs_idx];
-            let mut actual_split = Split::Train; // default
-            if splits.train.contains(obs_id) {
-                actual_split = Split::Train;
-            } else if splits.calibration.contains(obs_id) {
-                actual_split = Split::Calibration;
-            } else if splits.eval.contains(obs_id) {
-                actual_split = Split::Eval;
+    let mut group_split: HashMap<usize, Split> = HashMap::new();
+    for (obs_id, root) in observation_ids.iter().zip(group_roots.iter()) {
+        let Some(split) = splits.split_of(obs_id) else {
+            violations.push(format!(
+                "observation {} (group {}) has no split assignment",
+                obs_id, root
+            ));
+            continue;
+        };
+        match group_split.entry(*root) {
+            Entry::Occupied(e) if *e.get() != split => {
+                violations.push(format!(
+                    "group {} spans {:?} and {:?} (observation {})",
+                    root,
+                    e.get(),
+                    split,
+                    obs_id
+                ));
             }
-            
-            if actual_split != *expected_split {
-                violations.push(format!("Component root {} (expected {:?}): observation {} in {:?}", 
-                    root, expected_split, obs_id, actual_split));
+            Entry::Occupied(_) => {}
+            Entry::Vacant(e) => {
+                e.insert(split);
             }
         }
     }
-    
     if !violations.is_empty() {
         anyhow::bail!("Component-disjoint constraint violations: {:?}", violations);
     }
-    
-    Ok(splits)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -373,5 +383,64 @@ mod tests {
         let obs1_in_train = splits.train.contains("obs-1");
         let obs2_in_train = splits.train.contains("obs-2");
         assert_eq!(obs1_in_train, obs2_in_train, "shared governance target must not cross split boundaries");
+    }
+
+    #[test]
+    fn time_window_groups_share_split() {
+        // Observations within the same hour bucket are unioned into one group,
+        // so they must land in the exact same split.
+        let obs_ids = vec!["obs-a".to_string(), "obs-b".to_string(), "obs-c".to_string()];
+        let empty = || HashSet::new();
+        let result = split_observations(
+            &obs_ids,
+            &[empty(), empty(), empty()],
+            &[empty(), empty(), empty()],
+            &[None, None, None],
+            &[None, None, None],
+            &[1000, 2000, 1500], // all in the same 1-hour bucket
+        );
+        let splits = result.expect("splits");
+        let assigned: Vec<Split> = obs_ids.iter().map(|id| splits.split_of(id).expect("assigned")).collect();
+        assert!(
+            assigned.iter().all(|s| *s == assigned[0]),
+            "same time-window group must share one split, got {:?}",
+            assigned
+        );
+    }
+
+    #[test]
+    fn verify_no_group_leakage_bails_on_split_group() {
+        let obs_ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut splits = DatasetSplits::new();
+        splits.insert("a", Split::Train);
+        splits.insert("b", Split::Train);
+        splits.insert("c", Split::Eval);
+        // a, b, c all belong to group 7.
+        let err = verify_no_group_leakage(&obs_ids, &[7, 7, 7], &splits)
+            .err()
+            .expect("group spanning multiple splits must bail");
+        assert!(err.to_string().contains("Component-disjoint constraint violations"), "err={}", err);
+    }
+
+    #[test]
+    fn verify_no_group_leakage_passes_consistent_groups() {
+        let obs_ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut splits = DatasetSplits::new();
+        splits.insert("a", Split::Train);
+        splits.insert("b", Split::Train);
+        splits.insert("c", Split::Eval);
+        // Groups are consistent: {a, b} -> Train, {c} -> Eval.
+        assert!(verify_no_group_leakage(&obs_ids, &[0, 0, 1], &splits).is_ok());
+    }
+
+    #[test]
+    fn verify_no_group_leakage_bails_on_unassigned_observation() {
+        let obs_ids = vec!["a".to_string(), "unassigned".to_string()];
+        let mut splits = DatasetSplits::new();
+        splits.insert("a", Split::Train);
+        let err = verify_no_group_leakage(&obs_ids, &[0, 1], &splits)
+            .err()
+            .expect("unassigned observation must bail");
+        assert!(err.to_string().contains("unassigned"), "err={}", err);
     }
 }

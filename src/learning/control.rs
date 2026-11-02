@@ -43,11 +43,18 @@ const CONTROL_FILE: &str = "control.json";
 
 /// Read the current status snapshot from `root/status.json`, defaulting to a
 /// fresh `LearnStatus` when the file is absent (the loop has never run).
+/// The last recorded control action reads in from `root/control.json` so
+/// status reporting reflects what the operator asked for, not just the
+/// effect it had.
 pub fn load_status(root: &Path) -> LearnStatus {
-    std::fs::read_to_string(root.join(STATUS_FILE))
+    let mut status = std::fs::read_to_string(root.join(STATUS_FILE))
         .ok()
         .and_then(|raw| serde_json::from_str::<LearnStatus>(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if let Ok(control) = read_control(root) {
+        status.last_control = control;
+    }
+    status
 }
 
 /// Read the active manifest from `root/active_manifest.json` if present.
@@ -99,6 +106,9 @@ pub fn apply_control_at(
             status.candidate_version = None;
             status.shadow_version = None;
             status.training_state = crate::learning::trainer::TrainingJobState::WaitingForData;
+            manifest.candidate_version = None;
+            manifest.shadow_version = None;
+            persist_manifest(root, &manifest)?;
         }
     }
 
@@ -134,15 +144,38 @@ pub fn apply_control(request: &LearningControlRequest) -> Result<LearningControl
     apply_control_at(&default_learning_dir(), request)
 }
 
+/// Promoted (active) model version from the default learning root's
+/// `active_manifest.json`. Production consumers (the Laya ONNX provider's
+/// gating decision) use it to check whether their verdicts may block a write.
+pub fn read_active_version() -> Option<String> {
+    load_manifest(&default_learning_dir()).active_version
+}
+
+/// Read the last recorded control request from `root/control.json`.
+/// Returns `Ok(None)` when no control action has been applied yet.
+pub fn read_control(root: &Path) -> Result<Option<LearningControlRequest>, String> {
+    let raw = match std::fs::read_to_string(root.join(CONTROL_FILE)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("control.json read: {}", e)),
+    };
+    serde_json::from_str::<LearningControlRequest>(&raw)
+        .map(Some)
+        .map_err(|e| format!("control.json parse: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn temp_root() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static SEQ: AtomicI64 = AtomicI64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ns-learning-control-{}-{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_millis()
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+                + SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
@@ -202,6 +235,37 @@ mod tests {
         );
         assert!(root.join("control.json").exists());
         assert!(root.join("status.json").exists());
+        // The persisted active manifest must also drop candidate/shadow refs.
+        let manifest_text = std::fs::read_to_string(root.join("active_manifest.json")).unwrap();
+        let manifest: ActiveManifest = serde_json::from_str(&manifest_text).unwrap();
+        assert!(manifest.candidate_version.is_none(), "reset must clear manifest.candidate_version");
+        assert!(manifest.shadow_version.is_none(), "reset must clear manifest.shadow_version");
+    }
+
+    #[test]
+    fn read_control_returns_recorded_request() {
+        let root = temp_root();
+        assert!(
+            read_control(&root).unwrap().is_none(),
+            "no control action yet => None"
+        );
+        let req = LearningControlRequest {
+            action: LearningControlAction::Pause,
+            purge_observations: false,
+        };
+        apply_control_at(&root, &req).unwrap();
+        let recorded = read_control(&root)
+            .expect("read_control must succeed on a written control.json")
+            .expect("control.json must contain the recorded request");
+        assert!(matches!(recorded.action, LearningControlAction::Pause));
+        assert!(!recorded.purge_observations);
+    }
+
+    #[test]
+    fn read_control_fails_on_corrupt_json() {
+        let root = temp_root();
+        std::fs::write(root.join("control.json"), b"not json").unwrap();
+        assert!(read_control(&root).is_err(), "corrupt control.json must error");
     }
 
     #[test]

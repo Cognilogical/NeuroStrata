@@ -256,8 +256,9 @@ pub fn validate_canonical_rdf(
         let line = line.trim();
         if line.is_empty() { continue; }
         let line_no_dot = line.strip_suffix('.').unwrap_or(line);
-        // Simplified parse: split by whitespace
-        let parts: Vec<&str> = line_no_dot.split_whitespace().collect();
+        // Quote-aware tokenize: literals may contain spaces/blanks inside
+        // `"..."`, so plain whitespace splitting would produce bogus terms.
+        let parts: Vec<&str> = split_nq_terms(line_no_dot);
         if parts.len() < 4 {
             violations.push(format!(
                 "line {}: malformed N-Quads (expected 4 terms, got {})",
@@ -327,9 +328,54 @@ pub fn validate_canonical_rdf(
     }
 }
 
+/// Quote-aware N-Quads tokenizer: splits a term line into terms while keeping
+/// quoted literals (which may contain spaces, tabs, and escaped `\"`) intact.
+fn split_nq_terms(line: &str) -> Vec<&str> {
+    let mut terms: Vec<&str> = Vec::new();
+    let bytes = line.as_bytes();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                in_quote = !in_quote;
+                i += 1;
+            }
+            b'\\' if in_quote => {
+                // Skip the escaped character (e.g. \" or \uXXXX start).
+                i += 2.min(bytes.len().saturating_sub(i));
+            }
+            b' ' | b'\t' if !in_quote => {
+                if start < i {
+                    terms.push(&line[start..i]);
+                }
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        let last = line[start..].trim();
+        if !last.is_empty() {
+            terms.push(last);
+        }
+    }
+    terms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn split_nq_terms_keeps_quoted_literals_with_spaces() {
+        let line = "<urn:neurostrata:memory:m1> <urn:neurostrata:ns#content> \"hello world with spaces\" <urn:neurostrata:graph:ns:domain:gen:0> .";
+        let no_dot = line.strip_suffix('.').unwrap_or(line);
+        let terms = split_nq_terms(no_dot.trim());
+        assert_eq!(terms.len(), 4, "terms: {:?}", terms);
+        assert_eq!(terms[2], "\"hello world with spaces\"");
+    }
     #[test]
     fn build_mesh_canonical_nquads_is_deterministic() {
         let tags: Vec<String> = vec!["a".to_string()];

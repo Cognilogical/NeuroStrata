@@ -30,6 +30,12 @@ pub struct LayaOnnxProvider {
     inference_session: Option<Arc<std::sync::Mutex<ort::session::Session>>>,
     /// Temperature for temperature-scaled confidence.
     temperature: f32,
+    /// Model version recorded in the bundle manifest.
+    model_version: String,
+    /// Calibration tier recorded in the bundle manifest.
+    calibration_tier: crate::judgment::CalibrationTier,
+    /// Embedder identity recorded in the bundle manifest.
+    embedder_id: String,
 }
 
 impl LayaOnnxProvider {
@@ -55,15 +61,14 @@ impl LayaOnnxProvider {
         let model_version = manifest.get("model_version")
             .or(manifest.get("version"))
             .and_then(|x| x.as_str())
-            .unwrap_or("v0.1.0-local");
-        let _ = model_version.to_string();
+            .unwrap_or("v0.1.0-local")
+            .to_string();
 
         let temperature = manifest.get("temperature")
             .and_then(|x| x.as_f64())
             .map(|v| v as f32)
             .unwrap_or(1.0f32);
         let temperature = if temperature > 0.0 { temperature } else { 1.0f32 };
-        let _ = temperature;
 
         let calibration_tier = if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
             match t {
@@ -74,7 +79,6 @@ impl LayaOnnxProvider {
         } else {
             crate::judgment::CalibrationTier::ProxyInternal
         };
-        let _ = calibration_tier;
 
         // SHA-256 verification if present
         if let Some(expected_sha) = manifest.get("model_sha256").and_then(|x| x.as_str()) {
@@ -90,8 +94,7 @@ impl LayaOnnxProvider {
 
         let embedder_id = manifest["embedder_id"].as_str().ok_or_else(|| {
             anyhow!("Manifest missing embedder_id")
-        })?;
-        let _embedder_id = embedder_id.to_string();
+        })?.to_string();
 
         // Build session directly from file (local-first; graceful on bad model).
         let inference_session = {
@@ -112,7 +115,41 @@ impl LayaOnnxProvider {
             state,
             inference_session,
             temperature,
+            model_version,
+            calibration_tier,
+            embedder_id,
         })
+    }
+
+    /// Model version recorded in the bundle manifest.
+    pub fn model_version(&self) -> &str {
+        &self.model_version
+    }
+
+    /// Temperature recorded in the bundle manifest (defaults 1.0).
+    pub fn temperature(&self) -> f32 {
+        self.temperature
+    }
+
+    /// Calibration tier recorded in the bundle manifest.
+    pub fn calibration_tier(&self) -> crate::judgment::CalibrationTier {
+        self.calibration_tier
+    }
+
+    /// Embedder identity recorded in the bundle manifest.
+    pub fn embedder_id(&self) -> &str {
+        &self.embedder_id
+    }
+
+    /// Whether this model may gate (block) a memory write, per the dedup
+    /// policy: Gold tier + currently-active version + bare standalone add.
+    pub fn may_block(&self, active_version: Option<&str>, is_bare_standalone_add: bool) -> bool {
+        crate::judgment::policy::model_may_block(
+            self.calibration_tier,
+            &self.model_version,
+            active_version,
+            is_bare_standalone_add,
+        )
     }
 
     /// Probe the provider's runtime state. Does not attempt inference.
@@ -174,6 +211,29 @@ impl JudgmentProvider for LayaOnnxProvider {
         }
         // Bound concurrent inference: one permit per judge_duplicates call.
         let _permit = self.inference_semaphore.acquire().await.ok();
+
+        // Gating comes from the dedup policy: a Gold-calibrated model may gate
+        // a bare standalone add only when it is the currently-promoted
+        // version. Shadow (non-promoted) verdicts record alongside without
+        // gating the write, and the reason string says which mode produced it.
+        let inline_extraction = new_memory
+            .metadata
+            .get("extracted_from")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        let active_version = crate::learning::control::read_active_version();
+        let gating = self.may_block(active_version.as_deref(), !inline_extraction);
+        let verdict_mode = if gating { "gating" } else { "shadow" };
+        // Model identity travels with every verdict reason so the judged
+        // duplicates are traceable to the exact bundle that produced them.
+        let model_meta = format!(
+            "; model_version={}; embedder_id={}; calibration_tier={:?}; mode={}",
+            self.model_version(),
+            self.embedder_id(),
+            self.calibration_tier(),
+            verdict_mode,
+        );
 
         // Obtain a tokenizer: bundled tokenizer.json if present, otherwise
         // fall back to subword/whitespace token IDs.
@@ -255,7 +315,7 @@ impl JudgmentProvider for LayaOnnxProvider {
             judgments.push(DuplicateJudgment {
                 existing_memory_id: cand.id.clone(),
                 confidence: similarity,
-                reason: Some(reason.to_string()),
+                reason: Some(format!("{}{}", reason, model_meta)),
             });
         }
 
@@ -268,6 +328,17 @@ impl JudgmentProvider for LayaOnnxProvider {
         {
             let is_healthy = self.inference_session().is_some() &&
                            self.state() == crate::judgment::RuntimeState::Ready;
+            // Model identity is part of the health record: a green health
+            // check for the wrong bundle is an operator-visible failure.
+            tracing::debug!(
+                provider = self.name(),
+                model_version = self.model_version(),
+                embedder_id = self.embedder_id(),
+                calibration_tier = ?self.calibration_tier(),
+                temperature = self.temperature(),
+                ready = is_healthy,
+                "laya-onnx provider health"
+            );
             Ok(is_healthy)
         }
     }
@@ -405,7 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn laya_ensure_ready_reports_ready() {
+    async fn laya_provider_state_unavailable_with_fake_model() {
         {
             let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
             let dir = std::env::temp_dir().join("ns-laya-ready");
@@ -416,8 +487,35 @@ mod tests {
             std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
             let p = LayaOnnxProvider::load(&dir, sem).expect("bundle with manifest and model loads");
             assert_eq!(p.state(), RuntimeState::Unavailable); // fake model fails session creation
+            // Manifest fields must be stored, not discarded.
+            assert_eq!(p.model_version(), "v1");
+            assert_eq!(p.embedder_id(), "laya");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[tokio::test]
+    async fn laya_may_block_follows_policy() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let dir = std::env::temp_dir().join("ns-laya-may-block");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "embedder_id": "laya",
+            "model_version": "v1",
+            "calibration_tier": "GoldShipped"
+        });
+        std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        let p = LayaOnnxProvider::load(&dir, sem).expect("bundle loads");
+        assert_eq!(p.calibration_tier(), crate::judgment::CalibrationTier::Gold);
+        // Gold + active + bare standalone add -> may block.
+        assert!(p.may_block(Some("v1"), true));
+        // Not the active version (shadow) -> may not block.
+        assert!(!p.may_block(Some("v0"), true));
+        // Inline task extraction -> never model-blocks.
+        assert!(!p.may_block(Some("v1"), false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -472,6 +570,16 @@ pub enum RuntimeState {
     Unavailable,
 }
 
+/// Local training runtime readiness with an explicit degraded reason.
+/// Unlike the blind "directory exists ⇒ Ready" probe, this reflects whether a
+/// real model artifact or trainer binary is present on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayaReadiness {
+    Ready,
+    Degraded { reason: String },
+}
+
 /// Manages the local Laya training/runtime environment: provisioning a pinned
 /// Python runtime, `laya-train`, and the selected base checkpoint; starting
 /// and querying the runtime in the background without blocking daemon startup.
@@ -484,24 +592,31 @@ impl LearningRuntimeManager {
         Self { paths }
     }
 
-    /// Ensure the runtime is ready (provisioned or ready from cache). Returns
-    /// `RuntimeState` reflecting the current status.
-    pub async fn ensure_ready(&self) -> RuntimeState {
-        let _ = std::fs::create_dir_all(self.paths.root_dir());
+    /// Ensure the runtime is ready. Fail-closed: returns `Ready` only when a
+    /// real artifact exists — `model.onnx` inside the model cache, or a
+    /// present `laya-train` binary. An empty cache directory is `Degraded`.
+    pub async fn ensure_ready(&self) -> LayaReadiness {
         let runtime = match self.runtime() {
             Ok(r) => r,
-            Err(_) => return RuntimeState::Unavailable,
+            Err(e) => {
+                return LayaReadiness::Degraded {
+                    reason: format!("runtime unavailable: {}", e),
+                }
+            }
         };
-        let _ = std::fs::create_dir_all(&runtime.model_cache);
-        // Check if laya-train binary is available at the expected location
-        let laya_train_available = runtime.laya_train.exists();
-        let python_available = runtime.python.exists();
-        let model_cache_ok = runtime.model_cache.exists();
-
-        if model_cache_ok && (!runtime.laya_train.is_absolute() || (laya_train_available && python_available)) {
-            RuntimeState::Ready
+        let model_artifact = runtime.model_cache.join("model.onnx");
+        if model_artifact.exists() {
+            LayaReadiness::Ready
+        } else if runtime.laya_train.exists() {
+            LayaReadiness::Ready
         } else {
-            RuntimeState::Provisioning
+            LayaReadiness::Degraded {
+                reason: format!(
+                    "no model artifact at {} and no laya-train binary at {}",
+                    model_artifact.display(),
+                    runtime.laya_train.display()
+                ),
+            }
         }
     }
 
@@ -511,10 +626,11 @@ impl LearningRuntimeManager {
             .ok()
             .and_then(|e| e.parent().map(|p| p.join("python")))
             .unwrap_or_else(|| PathBuf::from("python"));
+        let root = self.paths.root_dir();
         Ok(LocalTrainingRuntime {
             python,
-            laya_train: PathBuf::from("laya-train"),
-            model_cache: PathBuf::from(".cache/laya"),
+            laya_train: root.join("laya-train"),
+            model_cache: root.join(".cache").join("laya"),
         })
     }
 }
@@ -522,11 +638,50 @@ impl LearningRuntimeManager {
 #[cfg(test)]
 mod ensure_ready_tests {
     use super::*;
+    use LayaReadiness::{Degraded, Ready};
+
     #[tokio::test]
-    async fn learning_runtime_manager_ensure_ready_provisions_and_reports_ready() {
+    async fn learning_runtime_manager_ensure_ready_degrades_on_empty_cache_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = LearningRuntimeManager::new(LearningPaths::new(tmp.path()));
         let state = mgr.ensure_ready().await;
-        assert_eq!(state, RuntimeState::Ready, "should report Ready after provisioning: got {:?}", state);
+        assert!(
+            matches!(state, Degraded { .. }),
+            "empty cache dir must be Degraded, got {:?}",
+            state
+        );
+        if let Degraded { reason } = state {
+            assert!(!reason.is_empty(), "degraded must carry a reason");
+        }
+    }
+
+    #[tokio::test]
+    async fn learning_runtime_manager_ensure_ready_ready_when_model_onnx_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join(".cache").join("laya");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("model.onnx"), b"stub model artifact").unwrap();
+        let mgr = LearningRuntimeManager::new(LearningPaths::new(tmp.path()));
+        let state = mgr.ensure_ready().await;
+        assert_eq!(
+            state,
+            Ready,
+            "model.onnx present must report Ready, got {:?}",
+            state
+        );
+    }
+
+    #[tokio::test]
+    async fn learning_runtime_manager_ensure_ready_ready_when_trainer_binary_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("laya-train"), b"#!/bin/sh\n").unwrap();
+        let mgr = LearningRuntimeManager::new(LearningPaths::new(tmp.path()));
+        let state = mgr.ensure_ready().await;
+        assert_eq!(
+            state,
+            Ready,
+            "laya-train binary present must report Ready, got {:?}",
+            state
+        );
     }
 }

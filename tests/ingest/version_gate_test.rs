@@ -53,7 +53,12 @@ fn ingest_version_changes_with_logic_version_or_fingerprint() {
 #[test]
 fn fingerprint_is_stable_for_empty_and_one_language_schemas() {
     let empty = ParserSchema::load(r#"{"languages":{}}"#).expect("parses");
-    assert_eq!(empty.fingerprint(), empty.fingerprint());
+    // Stability is measured against a freshly loaded equal schema, not the
+    // same value re-read out of the same variable.
+    assert_eq!(
+        empty.fingerprint(),
+        ParserSchema::load(r#"{"languages":{}}"#).unwrap().fingerprint()
+    );
     let one = ParserSchema::load(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{"functions":"(function_item) @fn"}}}}"#).expect("parses");
     assert_eq!(one.fingerprint(), one.fingerprint());
     assert_ne!(empty.fingerprint(), one.fingerprint());

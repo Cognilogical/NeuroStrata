@@ -15,15 +15,16 @@ impl ContextService {
         Self
     }
 
-    /// Every plan is fully supported: the caller has already wired the
-    /// capabilities it needs, so there is nothing to degrade and no candidates
-    /// to fill in at this stage.
+    /// An empty plan degrades to [`Degradation::Partial`]: the model
+    /// guarantees an empty plan is never implicitly `Supported` (model.rs),
+    /// because "nothing was planned" is a degraded outcome the caller must
+    /// be able to observe.
     pub fn plan<R>(&self, request: R) -> ContextPlan
     where
         R: AsRef<ContextRequest>,
     {
         let req = request.as_ref();
-        let mut plan = ContextPlan::new(req.event_id.clone(), Degradation::Supported);
+        let mut plan = ContextPlan::new(req.event_id.clone(), Degradation::Partial);
         plan.applied_scope = String::new();
         plan.items = Vec::new();
         plan.truncation = false;
@@ -57,6 +58,13 @@ impl ContextService {
         }
         plan.truncation = total > deduped.len();
         plan.items = deduped;
+        // Empty selection with candidates available is a degraded plan; a
+        // non-empty selection is fully supported.
+        plan.degradation = if !plan.items.is_empty() {
+            Degradation::Supported
+        } else {
+            Degradation::Partial
+        };
         plan
     }
 }
@@ -88,10 +96,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_is_supported_and_empty() {
+    fn plan_degrades_partial_when_empty() {
         let service = ContextService::new();
         let plan = service.plan(&request());
-        assert_eq!(plan.degradation, Degradation::Supported);
+        assert_eq!(plan.degradation, Degradation::Partial);
         assert!(plan.items.is_empty());
         assert!(!plan.truncation);
     }

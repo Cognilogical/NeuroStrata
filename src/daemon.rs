@@ -388,7 +388,7 @@ pub async fn start_daemon(
 /// bus when no daemon is running to ask.
 pub(crate) const BUS_CAPACITY: usize = 10_000;
 
-/// Build the daemon's thalamic bus: the bounded queue and the three v1
+/// Build the daemon's thalamic bus: the bounded queue and the four production
 /// subscribers, wired to the store the daemon opened.
 ///
 /// The store is attached *before* any subscriber registers: a registered
@@ -411,6 +411,9 @@ pub(crate) fn build_thalamic_bus(
     bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
     bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
     bus.register(Box::new(GuardEventLog::new(dimensions)));
+    bus.register(Box::new(
+        crate::events::subscribers::PostIngestNormalize::new(),
+    ));
     bus
 }
 
@@ -461,8 +464,8 @@ const MESH_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// If the served project is joined to a mesh, register the mesh-outbox
 /// subscriber and spawn the drain loop plus the session-start/periodic pull
 /// triggers. No mesh → nothing is registered, so
-/// the bus stays at its three v1 subscribers (the daemon tests assert exactly
-/// three). The mesh is resolved through the project-side pointer — the same
+/// the bus stays at its four production subscribers (the daemon tests assert
+/// exactly four). The mesh is resolved through the project-side pointer — the same
 /// path `MeshService` uses — so "joined" means the same thing here as at the
 /// CLI. This is the *only* daemon-side touch the mesh publish path needs.
 fn wire_mesh_publish(
@@ -1091,9 +1094,13 @@ async fn handle_ingest(
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(serde_json::to_value(progress).unwrap_or_else(
-        |_| serde_json::json!({ "state": "finished" }),
-    )))
+    let progress_value = serde_json::to_value(&progress).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize ingest progress: {e}"),
+        )
+    })?;
+    Ok(Json(progress_value))
 }
 
 /// Backup and restore run here rather than in the CLI so they work against a
@@ -1172,7 +1179,13 @@ async fn handle_tasks_import(
     )
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(serde_json::to_string(&summary).unwrap_or_default())
+    let summary_json = serde_json::to_string(&summary).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize import summary: {e}"),
+        )
+    })?;
+    Ok(summary_json)
 }
 
 #[derive(serde::Deserialize)]
@@ -1979,16 +1992,17 @@ impl crate::traits::AsAny for RecordingStore {
     /// the subscribers would dispatch against the bus's inert stand-in and
     /// this store would record nothing at all.
     #[tokio::test]
-    async fn daemon_builds_a_bus_of_three_subscribers_wired_to_its_store() {
+    async fn daemon_builds_a_bus_of_four_subscribers_wired_to_its_store() {
         const DIMENSIONS: usize = 42;
         let store = Arc::new(RecordingStore::default());
         let bus = build_thalamic_bus(store.clone(), DIMENSIONS, scratch_root("wiring"));
 
-        // Step 1's subject: exactly the three v1 subscribers are registered.
+        // Step 1's subject: exactly the four production subscribers are
+        // registered (the v1 trio plus post_ingest_normalize).
         let m = bus.metrics();
         assert_eq!(
-            m.subscribers, 3,
-            "the daemon bus must carry the three v1 subscribers: {m:?}"
+            m.subscribers, 4,
+            "the daemon bus must carry the four production subscribers: {m:?}"
         );
 
         bus.emit(
@@ -2185,7 +2199,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// The init-order drill (Step 6): a request that lands immediately after
     /// the daemon starts serving must find the bus already registered -- the
     /// bus is built before the HTTP server binds, so the first
-    /// `POST /bus/metrics` of the process reports all three subscribers. If
+    /// `POST /bus/metrics` of the process reports all four subscribers. If
     /// startup served before finishing the bus, this is the request that
     /// would catch it, at the same endpoint Step 7 curls against the live
     /// daemon.
@@ -2263,7 +2277,7 @@ impl crate::traits::AsAny for RecordingStore {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = response.text().await.unwrap();
         assert!(
-            body.contains("\"subscribers\":3"),
+            body.contains("\"subscribers\":4"),
             "the first request after start must see the fully wired bus, got: {body}"
         );
 
@@ -2731,7 +2745,7 @@ impl crate::traits::AsAny for RecordingStore {
             "one shape, one source: the route and the CLI must report the same fields"
         );
         assert_eq!(
-            from_route["subscribers"], 3,
+            from_route["subscribers"], 4,
             "and the route still reads the daemon's own wired bus: {body}"
         );
 

@@ -7,10 +7,10 @@
 //! exact moment someone stops trusting it -- the opposite of what an audit
 //! trail should do.
 //!
-//! Scope in 1.8.0: **metadata-only, no retrieval change.** Writing the
-//! tombstone is the whole of it; no read path filters on `archived` yet, so an
-//! archived row still surfaces in `search_memory` exactly as before. The
-//! filter is a follow-up task.
+//! Scope in 1.8.0: archived rows ARE excluded from retrieval. Every read
+//! surface filters on the tombstone via `is_archived`, so an archived row no
+//! longer surfaces in `search_memory` by default; callers that need
+//! tombstoned rows back must pass `include_archived: true` on the search.
 
 use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 use crate::traits::{MemoryPayload, VectorStore};

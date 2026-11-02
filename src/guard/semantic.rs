@@ -197,8 +197,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_guard_rule_storage() {
-        // Integration test would go here
-        // Requires mock VectorStore and Embedder
+        use crate::guard::models::BehavioralRule;
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        use crate::traits::{Embedder, VectorStore};
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let matcher = SemanticEvaluator::new(store, embedder, "guard");
+
+        let rule = BehavioralRule {
+            id: "rule-podman".to_string(),
+            version: 1,
+            rule_class: "blocking".to_string(),
+            trigger_pattern: "docker".to_string(),
+            constraint_text: "always use podman, never docker".to_string(),
+            hit_count: 0,
+            status: "active".to_string(),
+        };
+        matcher
+            .add_constraint(rule)
+            .await
+            .expect("storing a guard rule must succeed");
+
+        let rules = matcher
+            .match_constraints("docker run attempted", 5)
+            .await
+            .expect("matching constraints must succeed");
+
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.id == "rule-podman"
+                    && r.constraint_text == "always use podman, never docker"),
+            "stored guard rule must be retrievable via match_constraints, got: {rules:?}"
+        );
     }
 
     /// Composite Rec #4: row conversion applies the similarity cutoff and the

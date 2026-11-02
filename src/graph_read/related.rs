@@ -562,6 +562,14 @@ pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> 
     let mut edge_crossed = 0usize;
 
     while let Some((current, depth)) = queue.pop_front() {
+        // Enforce the wall-clock deadline inside the loop: an expired
+        // deadline halts traversal immediately instead of only being
+        // reported after the whole graph has been walked.
+        if Instant::now() >= budget.deadline {
+            truncated = true;
+            let len = items.len();
+            return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+        }
         // Gather outgoing GOVERNS neighbors sorted lexicographically.
         let mut neighbors: Vec<String> = Vec::new();
         for edge in edges {

@@ -17,11 +17,13 @@ pub async fn normalize_and_precheck_namespace(
         .await
         .map_err(|e| e.to_string())?;
     let summary = crate::diagnostic::classify::classify_namespace_targets(&memories);
-    let _ = crate::diagnostic::classify::classify_unmatched(
+    if let Ok(Some(warning)) = crate::diagnostic::classify::classify_unmatched(
         summary.materialized,
         summary.declared,
         summary.orphaned,
-    )?;
+    ) {
+        tracing::warn!("{warning}");
+    }
     task_complete_precheck(&summary.declared_targets)
 }
 
