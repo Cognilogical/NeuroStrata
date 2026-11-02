@@ -131,8 +131,8 @@ impl TantivyLexicalIndex {
         let dir_result = tantivy::directory::MmapDirectory::open(&path_for_index);
         let index = match dir_result {
             Ok(dir) => Index::open_or_create(dir, Self::build_schema())?,
-            Err(_) => {
-                tracing::warn!("corrupt lexical index at {}; wiping and recreating", path_for_index.display());
+            Err(e) => {
+                tracing::warn!("corrupt lexical index at {}; wiping and recreating: {e}", path_for_index.display());
                 std::fs::remove_dir_all(&path_for_index)?;
                 std::fs::create_dir_all(&path_for_index)?;
                 let dir = tantivy::directory::MmapDirectory::open(&path_for_index)?;
@@ -147,8 +147,8 @@ impl TantivyLexicalIndex {
             Ok(w) => {
                 writer_opt = Some(w);
             }
-            Err(_) => {
-                tracing::warn!("lexical index writer locked by another process (read-only mode)");
+            Err(e) => {
+                tracing::warn!("lexical index writer locked by another process (read-only mode): {e}");
             }
         }
         // If writer acquired and version missing / rebuilt, write version.

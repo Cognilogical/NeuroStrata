@@ -37,11 +37,11 @@ pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
 
     #[cfg(target_os = "linux")]
     {
-        run_setup_linux(&bin_path, &script_path, repo_path)
+        run_setup_linux(&bin_path, &script_path)
     }
     #[cfg(target_os = "macos")]
     {
-        run_setup_macos(&bin_path, &script_path, repo_path)
+        run_setup_macos(&bin_path, &script_path)
     }
     #[cfg(target_os = "windows")]
     {
@@ -56,7 +56,7 @@ pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
 // ═══ Linux (systemd, user-level) ═══════════════════════════════════════════
 
 #[cfg(target_os = "linux")]
-fn run_setup_linux(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupReport> {
+fn run_setup_linux(bin: &Path, script: &Path) -> Result<SetupReport> {
     let unit_dir = unit_dir_linux()?;
     fs::create_dir_all(&unit_dir).with_context(|| format!("create {}", unit_dir.display()))?;
 
@@ -195,7 +195,7 @@ fn backup_timer_template() -> String {
 // ═══ macOS (launchd agent + timer) ═══════════════════════════════════════
 
 #[cfg(target_os = "macos")]
-fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupReport> {
+fn run_setup_macos(bin: &Path, script: &Path) -> Result<SetupReport> {
     use std::fs;
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     let launchd_dir = PathBuf::from(home).join("Library").join("LaunchAgents");

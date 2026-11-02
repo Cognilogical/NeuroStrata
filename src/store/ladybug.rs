@@ -1810,7 +1810,7 @@ fn active_generation_of_source(conn: &Connection, namespace: &str, source_key: &
             Some(row) => format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64,
             None => 0,
         },
-        Err(_) => 0,
+        Err(e) => { tracing::warn!("active_generation_of_source query failed for ({namespace}, {source_key}): {e}"); 0 },
     }
 }
 
@@ -1836,7 +1836,7 @@ fn active_generation_of(conn: &Connection, namespace: &str) -> u64 {
             }
             latest
         }
-        Err(_) => 0,
+        Err(e) => { tracing::warn!("active_generation_of query failed for {namespace}: {e}"); 0 },
     }
 }
 
@@ -3796,7 +3796,13 @@ impl VectorStore for LadybugStore {
                 // F18 endpoint role matrix: check source/target memory types.
                 let target_type = {
                     let q = format!("MATCH (m:Memory {{id: '{}'}}) RETURN m.memory_type", escape_ladybug_string(&target));
-                    conn.query(&q).ok().and_then(|mut r| r.next()).map(|row| format!("{}", row[0])).unwrap_or_default()
+                    match conn.query(&q) {
+                        Ok(mut r) => r.next().map(|row| format!("{}", row[0])).unwrap_or_default(),
+                        Err(e) => {
+                            tracing::warn!("upsert target_type lookup failed for {target}: {e}");
+                            String::new()
+                        }
+                    }
                 };
                 if !crate::rdf::shacl::endpoint_role_allowed(&edge.rel_type, &payload.memory_type, &target_type) {
                     emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
@@ -6316,7 +6322,7 @@ impl crate::traits::IntakeStore for LadybugStore {
         let safe_raw_text = escape_ladybug_string(&text);
         let safe_receipt_id = escape_ladybug_string(&receipt_id);
         let safe_ns = escape_ladybug_string(&namespace);
-        let safe_source_kind = format!("{:?}", source_kind).to_lowercase();
+        let safe_source_kind = escape_ladybug_string(&format!("{:?}", source_kind).to_lowercase());
         let safe_source_revision = escape_ladybug_string(&source_revision);
         let safe_source_digest = escape_ladybug_string(&source_digest);
         let safe_created_at = escape_ladybug_string(&now);
@@ -6340,8 +6346,8 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let safe_receipt_id = escape_ladybug_string(&cand.receipt_id);
                 let safe_title = escape_ladybug_string(&cand.title);
                 let safe_desc = cand.description.as_ref().map(|d| escape_ladybug_string(d)).unwrap_or_default();
-                let safe_review_state = format!("{:?}", cand.review_state).to_lowercase();
-                let safe_disposition = format!("{:?}", cand.disposition).to_lowercase();
+                let safe_review_state = escape_ladybug_string(&format!("{:?}", cand.review_state).to_lowercase());
+                let safe_disposition = escape_ladybug_string(&format!("{:?}", cand.disposition).to_lowercase());
                 let safe_task_id = cand.task_id.as_ref().map(|t| escape_ladybug_string(t)).unwrap_or_default();
                 let safe_created = escape_ladybug_string(&cand.created_at);
                 let safe_updated = escape_ladybug_string(&cand.updated_at);
@@ -6488,10 +6494,10 @@ impl crate::traits::IntakeStore for LadybugStore {
             // Build WHERE clause for filters
             let mut where_clauses = vec![format!("c.namespace = '{}'", safe_ns)];
             if let Some(rs) = review_state_filter {
-                where_clauses.push(format!("c.review_state = '{}'", format!("{:?}", rs).to_lowercase()));
+                where_clauses.push(format!("c.review_state = '{}'", escape_ladybug_string(&format!("{:?}", rs).to_lowercase())));
             }
             if let Some(d) = disposition_filter {
-                where_clauses.push(format!("c.disposition = '{}'", format!("{:?}", d).to_lowercase()));
+                where_clauses.push(format!("c.disposition = '{}'", escape_ladybug_string(&format!("{:?}", d).to_lowercase())));
             }
             let where_clause = where_clauses.join(" AND ");
 
@@ -6608,7 +6614,7 @@ impl crate::traits::IntakeStore for LadybugStore {
         self.write_with_deadline("resolving intake candidate", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_cand_id = escape_ladybug_string(&candidate_id);
-            let safe_disposition = format!("{:?}", disposition).to_lowercase();
+            let safe_disposition = escape_ladybug_string(&format!("{:?}", disposition).to_lowercase());
             let safe_task_id = task_id_for_closure.as_ref().map(|t| escape_ladybug_string(t)).unwrap_or_default();
             let new_version = cas_version + 1;
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();

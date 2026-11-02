@@ -275,12 +275,11 @@ impl TimeSeriesStore {
         drop(guard);
 
         if let Some(ev) = self.detector.observe(&key.0, key.1, &key.2, sample.value) {
-            if let Ok(mut a) = self.anomalies.write() {
-                if a.len() >= 128 {
-                    a.remove(0);
-                }
-                a.push(ev);
+            let mut a = self.anomalies.write().unwrap_or_else(|e| e.into_inner());
+            if a.len() >= 128 {
+                a.remove(0);
             }
+            a.push(ev);
         }
 
         if let Some(ref cb) = self.anomaly_cb {

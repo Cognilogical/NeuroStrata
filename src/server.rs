@@ -338,7 +338,8 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "id": { "type": "string", "description": "Memory id of the procedure." },
                                 "note": { "type": "string", "description": "Optional free-text note for the Episodic Buffer entry." },
-                                "project_root": { "type": "string", "description": "Absolute path to the project root; the Episodic Buffer lives at <project_root>/.NeuroStrata/sessions/. Defaults to the working directory." }
+                                "project_root": { "type": "string", "description": "Absolute path to the project root; the Episodic Buffer lives at <project_root>/.NeuroStrata/sessions/. Defaults to the working directory." },
+                                "namespace": { "type": "string", "description": "Optional namespace of the procedure; when omitted, the store scans all namespaces by id." }
                             },
                             "required": ["id"]
                         },
