@@ -41,8 +41,16 @@ pub fn classify_namespace_targets(memories: &[crate::traits::SearchResult]) -> T
         for edge in edge_specs(&m.payload.metadata) {
             match classify_target(&known, &edge.target_id) {
                 TargetClass::Materialized => summary.materialized += 1,
-                TargetClass::Declared(_) => {
+                TargetClass::Declared(resolved_id) => {
                     summary.declared += 1;
+                    if !resolved_id.is_empty() && resolved_id != edge.target_id {
+                        tracing::debug!(
+                            "edge '{}' -> '{}' resolved to declared target '{}'",
+                            m.id,
+                            edge.target_id,
+                            resolved_id
+                        );
+                    }
                     summary.declared_targets.push(edge.target_id);
                 }
                 TargetClass::Orphaned => {

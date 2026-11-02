@@ -177,7 +177,7 @@ pub async fn archive_memory(
                     tracing::warn!("learning outcome record failed: {e}");
                 }
             }
-            Err(e) => eprintln!("learning recorder open failed: {}", e),
+            Err(e) => tracing::warn!("learning recorder open failed: {e}"),
         }
     }
 

@@ -54,27 +54,11 @@ async fn search_inner(
     let namespace = namespace.to_string();
     let mut domain_keys = domain_keys;
 
-    // Time-series metrics for this search (flushed periodically into the
-    // MemoryMetric table; anomalies pass through the detector + callback).
-    store
-        .metrics
-        .record(
-            &namespace,
-            crate::telemetry::anomaly::MetricKind::RetrievalDistance,
-            "search",
-            chrono::Utc::now().timestamp(),
-            0.0,
-            std::collections::BTreeMap::new(),
-        );
-    store.metrics.record(
-        &namespace,
-        crate::telemetry::anomaly::Latency,
-        "search",
-        chrono::Utc::now().timestamp(),
-        1.0,
-        std::collections::BTreeMap::new(),
-    );
-
+    // Time-series metrics for this search are recorded at the END of the
+    // routine, once real measurements exist: the top result's retrieval
+    // distance and the search's measured latency (previously hardcoded
+    // placeholders hid actual retrieval behaviour from the detector).
+    let started = std::time::Instant::now();
     // KGE secondary distance adjustment: when a trained model exists for this
     // namespace's scope, structural proximity pulls close entities together
     // (bounded so it can never override the semantic order).
@@ -144,7 +128,8 @@ async fn search_inner(
         }
     }
 
-    store
+    let metric_ns = namespace.clone();
+    let outcome = store
         .with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let vec_str = format!(
@@ -873,11 +858,12 @@ async fn search_inner(
             }
 
             // Decision-shape gain: a `decision`-shaped fact earns a small
-            // additive boost so decisions surface above similarly-scored
-            // unshaped facts (applied before the final sort so the order
-            // reflects it).
+            // bonus. Scores here are DISTANCES (lower = better, primary sort
+            // is ascending), so the gain is SUBTRACTED to genuinely pull
+            // decisions above equivalently-distant unshaped facts (applied
+            // before the final sort so the order reflects it).
             for r in results.iter_mut() {
-                r.score += crate::search::decision_shape_boost(&r.payload.metadata);
+                r.score = (r.score - crate::search::decision_shape_boost(&r.payload.metadata)).max(0.0);
             }
 
             // Final sort: primaries (DirectMatch, real boosted_distance) first,
@@ -992,7 +978,41 @@ let incomplete = result_count >= fetch_limit;
 
             Ok(DomainSearchOutcome { results, mode, incomplete })
         })
-        .await
+        .await;
+    let outcome = outcome?;
+    // Time-series metrics for this search: REAL measurements rather than the
+    // old hardcoded placeholders (0.0 distance / 1.0 latency). The best
+    // (lowest) retrieval distance across the final result set and the
+    // search's measured wall-clock latency in ms. Flushed periodically into
+    // the MemoryMetric table; anomalies pass through the detector + callback.
+    let top_distance = outcome
+        .results
+        .iter()
+        .map(|r| r.score as f64)
+        .fold(f64::INFINITY, f64::min);
+    let top_distance = if top_distance.is_finite() {
+        top_distance
+    } else {
+        0.0
+    };
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    store.metrics.record(
+        &metric_ns,
+        crate::telemetry::anomaly::MetricKind::RetrievalDistance,
+        "search",
+        chrono::Utc::now().timestamp(),
+        top_distance,
+        std::collections::BTreeMap::new(),
+    );
+    store.metrics.record(
+        &metric_ns,
+        crate::telemetry::anomaly::Latency,
+        "search",
+        chrono::Utc::now().timestamp(),
+        latency_ms,
+        std::collections::BTreeMap::new(),
+    );
+    Ok(outcome)
 }
 
 pub struct LadybugStore {
@@ -4404,16 +4424,22 @@ impl VectorStore for LadybugStore {
             .map_err(|e| anyhow::anyhow!("could not write snapshot checksums: {}", e))?;
 
         // Snapshot hygiene: report which snapshots past the retention window
-        // have expired, and prune them when the operator asks for it.
+        // have expired, and prune them when the operator asks for it. The
+        // retention budget comes from the storage-hygiene config (not a
+        // hardcoded constant) so the operator-facing limit and the prune
+        // behaviour cannot drift apart.
         if let Some(parent) = dir.parent() {
-            let expired = crate::storage::snapshot::select_expired_snapshots(parent, 10);
+            let keep = crate::storage::snapshot::StorageHygieneConfig::default()
+                .snapshot_retention_count
+                .max(5);
+            let expired = crate::storage::snapshot::select_expired_snapshots(parent, keep);
             if let Ok(expired) = expired {
                 if !expired.is_empty() {
                     tracing::debug!("{} expired snapshots eligible for pruning", expired.len());
                 }
             }
             if std::env::var("NEUROSTRATA_PRUNE_SNAPSHOTS").is_ok() {
-                if let Err(e) = crate::storage::snapshot::prune_expired_snapshots(parent, 10) {
+                if let Err(e) = crate::storage::snapshot::prune_expired_snapshots(parent, keep) {
                     tracing::warn!("prune_expired_snapshots failed: {e}");
                 }
             }

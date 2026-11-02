@@ -112,10 +112,11 @@ impl TypeSafeJevProvider {
         for (i, candidate) in candidates.iter().enumerate() {
             let question_key = format!("is_duplicate_{}", i);
             if let Some(answer) = answers.get(&question_key) {
-                let confidence = answer
-                    .get("probability")
-                    .and_then(|p| p.as_f64())
-                    .unwrap_or(0.0) as f32;
+                let confidence = answer.get("probability").and_then(|p| p.as_f64());
+                if confidence.is_none() {
+                    tracing::warn!("TypeSafe Jev response missing numeric 'probability' field");
+                }
+                let confidence = confidence.unwrap_or(0.0) as f32;
 
                 let reason = answer
                     .get("reasoning")

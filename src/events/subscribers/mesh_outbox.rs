@@ -173,8 +173,20 @@ impl MeshOutbox {
             return None;
         }
         // Derived artifacts (KGE vectors, community labels, inferred edges)
-        // stay local/versioned derived data and never cross the mesh.
-        if payload.metadata.get("derived").and_then(|v| v.as_bool()).unwrap_or(false) {
+        // stay local/versioned derived data and never cross the mesh. The
+        // marker is accepted in every shape it is written in: boolean `true`,
+        // integer `1`, or the strings `"true"`/`"1"` (case-insensitive).
+        let is_derived = payload
+            .metadata
+            .get("derived")
+            .map(|v| {
+                v.as_bool().unwrap_or(false)
+                    || v.as_i64() == Some(1)
+                    || v.as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("true") || s.trim() == "1")
+            })
+            .unwrap_or(false);
+        if is_derived {
             return None;
         }
         Some(OutboxEntry {
@@ -542,6 +554,47 @@ mod tests {
         let pending = outbox.pending().unwrap();
         assert_eq!(pending.len(), 1, "a procedure definition is shareable");
         assert_eq!(pending[0].memory_type, "procedure");
+    }
+
+    /// Derived rows (`metadata.derived` in any documented shape -- boolean
+    /// `true`, integer `1`, or the strings `"true"`/`"1"`) never enter the
+    /// outbox: KGE vectors, community labels, and inferred edges stay local -
+    /// and versioned-derived data (F4).
+    #[tokio::test]
+    async fn a_derived_row_is_not_captured_in_any_marker_shape() {
+        for derived in [serde_json::json!("true"), serde_json::json!(1), serde_json::json!(true)] {
+            let dir = scratch("derived");
+            let outbox_dir = dir.join("mesh");
+            let wake = Arc::new(Notify::new());
+            let (bus, store) = wired("derived-db", outbox_dir.clone(), wake).await;
+
+            let id = uuid::Uuid::now_v7().to_string();
+            store
+                .upsert(
+                    "ns",
+                    &id,
+                    vec![0.0; TEST_DIMENSIONS],
+                    payload("rule", serde_json::json!({ "eligibility": "shareable", "derived": derived })),
+                )
+                .await
+                .unwrap();
+
+            bus.emit(
+                ThalamicPulse::Created {
+                    id,
+                    namespace: "ns".to_string(),
+                    kind: "rule".to_string(),
+                },
+                &RecursionToken::root(),
+            );
+            tokio::time::sleep(DISPATCH_WAIT).await;
+
+            let outbox = Outbox::open(&outbox_dir).unwrap();
+            assert!(
+                outbox.pending().unwrap().is_empty(),
+                "a derived row must not cross the mesh, marker shape: {derived}"
+            );
+        }
     }
 
     /// The subscriber's outbox directory is a sibling of the mesh checkout, so

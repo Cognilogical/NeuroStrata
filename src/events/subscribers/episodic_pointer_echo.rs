@@ -160,7 +160,19 @@ fn resolve_anchor_for_namespace(namespace: &str, construction_root: &Path) -> Op
     }
     let parent = construction_root.parent()?;
     let candidate = parent.join(namespace);
-    candidate.join(".NeuroStrata").is_dir().then_some(candidate)
+    if candidate.join(".NeuroStrata").is_dir() {
+        return Some(candidate);
+    }
+    // The construction root itself: the workspace layout also names it for
+    // the namespace (the doc comment's second candidate), so a pulse for
+    // `NeuroStrata` resolves to *this* checkout before the caller famously
+    // falls back to it anyway.
+    if construction_root.file_name().and_then(|n| n.to_str()) == Some(namespace)
+        && construction_root.exists()
+    {
+        return Some(construction_root.to_path_buf());
+    }
+    None
 }
 
 #[async_trait]

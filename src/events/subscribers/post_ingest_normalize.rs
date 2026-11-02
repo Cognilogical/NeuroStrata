@@ -74,11 +74,7 @@ pub async fn normalize_namespace_targets(
         .list(namespace, None, None)
         .await
         .map_err(|e| e.to_string())?;
-    let known = crate::store::ladybug::KnownIds::new(
-        all.iter()
-            .filter(|m| m.payload.user_id == "auto-ingestor")
-            .map(|m| m.id.as_str()),
-    );
+    let known = crate::store::ladybug::KnownIds::new(all.iter().map(|m| m.id.as_str()));
     let mut updated = 0usize;
 
     for mem in &all {

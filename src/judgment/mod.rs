@@ -137,25 +137,46 @@ pub struct DeduplicationChecker {
 
 impl DeduplicationChecker {
     pub fn new(config: DeduplicationConfig) -> Result<Self> {
-        // Attempt to create a real Laya ONNX provider from the bundled model.
-        // If the bundle exists, use it; otherwise fall back to Mock for baseline behavior.
-        // Load Laya ONNX provider from bundle if present. Wrap in Arc<dyn JudgmentProvider>
-        // for the provider selection function.
+        // Load a real Laya ONNX provider from the bundle when it exists and
+        // parses; otherwise log WHY it is absent (at warn, so misconfiguration
+        // is visible) and continue without a laya provider.
         let laya_bundle_path = if config.laya_bundle_path.trim().is_empty() { std::path::PathBuf::from("artifacts/laya-bundle") } else { std::path::PathBuf::from(&config.laya_bundle_path) };
-        let laya_provider = crate::judgment::laya_onnx::LayaOnnxProvider::load(
+        let laya_provider = match crate::judgment::laya_onnx::LayaOnnxProvider::load(
             &laya_bundle_path,
             Arc::new(Semaphore::new(4)),
-        )
-        .ok()
-        .map(|p| Arc::new(p) as Arc<dyn JudgmentProvider>);
+        ) {
+            Ok(p) => Some(Arc::new(p) as Arc<dyn JudgmentProvider>),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load Laya ONNX bundle at {}: {e}",
+                    laya_bundle_path.display()
+                );
+                None
+            }
+        };
 
         // Determine the provider set based on explicit provider mode.
         // `none` alone disables dedup learning (baseline write path is allowed).
+        // The Jev API key resolves from the explicit config value first and,
+        // when absent/blank, from the env var named by `judgment_api_key_env`
+        // so the env-var indirection in the config is genuinely wired.
+        let jev_api_key = config
+            .judgment_api_key
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| {
+                config
+                    .judgment_api_key_env
+                    .as_ref()
+                    .and_then(|env| std::env::var(env).ok())
+                    .filter(|k| !k.trim().is_empty())
+            })
+            .unwrap_or_default();
         let provider_set = select_dedup_providers(
             &config,
             laya_provider,
             Some(Arc::new(typesafe_jev::TypeSafeJevProvider::new(
-                config.judgment_api_key.clone().unwrap_or_default(),
+                jev_api_key,
             )?)),
         )?;
 
@@ -196,25 +217,44 @@ impl DeduplicationChecker {
         }
         // The shadow provider records its verdict alongside without gating
         // the write: store (provider name, verdict) for inspection, and
-        // never fabricate one when it errors.
+        // never fabricate one when it errors, times out, or is skipped.
+        let timeout = Duration::from_secs(self.config.timeout_seconds);
         if let Some(shadow) = &self.provider_set.shadow {
-            match shadow.judge_duplicates(new_memory, candidates).await {
-                Ok(verdict) => {
-                    *self.last_shadow.lock().expect("last_shadow lock") =
+            // Clear any verdict from a prior call FIRST: a stale shadow
+            // verdict from an earlier request must never leak into a later
+            // one when the shadow fails, times out, or is not invoked.
+            *self.last_shadow.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let shadow_result = tokio::time::timeout(
+                timeout,
+                shadow.judge_duplicates(new_memory, candidates),
+            )
+            .await;
+            match shadow_result {
+                Ok(Ok(verdict)) => {
+                    *self
+                        .last_shadow
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) =
                         Some((shadow.name().to_string(), verdict));
                 }
-                Err(e) => {
-                    tracing::debug!(
+                Ok(Err(e)) => {
+                    tracing::warn!(
                         provider = shadow.name(),
                         error = %e,
                         "Shadow judgment failed; verdict not recorded"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider = shadow.name(),
+                        timeout_secs = timeout.as_secs(),
+                        "Shadow judgment timed out; verdict not recorded"
                     );
                 }
             }
         }
 
         // Apply timeout to judgment call
-        let timeout = Duration::from_secs(self.config.timeout_seconds);
         let result = tokio::time::timeout(timeout, async {
             active.judge_duplicates(new_memory, candidates).await
         })

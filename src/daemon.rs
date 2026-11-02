@@ -961,7 +961,9 @@ pub(crate) async fn start_daemon_on(
     }
 
     let _ = stop_periodic.send(true);
-    let _ = periodic.await;
+    if let Err(e) = periodic.await {
+        tracing::warn!("periodic checkpoint task join error: {e}");
+    }
 
     // The whole point of stopping gracefully: get everything on disk before exit.
     // A checkpoint needs every transaction to drain, and detached work such as
@@ -1447,7 +1449,9 @@ async fn handle_mcp(
 /// follows has to be quick.
 async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
     let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("ctrl_c signal listener failed: {e}");
+        }
         eprintln!("Received Ctrl-C, shutting down.");
     };
 
@@ -1536,7 +1540,9 @@ async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
         .and_then(|mut guard| guard.take());
     match sender {
         Some(tx) => {
-            let _ = tx.send(());
+            if tx.send(()).is_err() {
+                tracing::debug!("shutdown oneshot receiver already dropped");
+            }
             "Shutting down"
         }
         None => "Already shutting down",

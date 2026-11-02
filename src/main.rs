@@ -958,7 +958,12 @@ fn install_pre_push_hook(
     // Back up any existing hook before overwriting (best-effort).
     if target.exists() {
         let backup = hooks_dir.join("pre-push.bak");
-        let _ = std::fs::copy(&target, &backup);
+        if let Err(e) = std::fs::copy(&target, &backup) {
+            eprintln!(
+                "Warning: failed to back up existing hook to {}: {e}",
+                backup.display()
+            );
+        }
     }
     std::fs::write(&target, crate::task::SCAFFOLDED_PRE_PUSH_HOOK)?;
     set_hook_executable(&target)?;
@@ -1007,9 +1012,15 @@ fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
             Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
             Err(e) => format!("error: {}", e),
         };
-        let _ = file.set_len(0);
-        let _ = (&*file).write_all(report.as_bytes());
-        let _ = file.sync_all();
+        if let Err(e) = file.set_len(0) {
+            tracing::warn!("final checkpoint report truncate failed: {e}");
+        }
+        if let Err(e) = (&*file).write_all(report.as_bytes()) {
+            tracing::warn!("final checkpoint report write failed: {e}");
+        }
+        if let Err(e) = file.sync_all() {
+            tracing::warn!("final checkpoint report sync failed: {e}");
+        }
     }
 }
 
@@ -2663,7 +2674,9 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .on_thread_start(|| {
-            let _ = crash::install_alt_stack();
+            if let Err(e) = crash::install_alt_stack() {
+                tracing::warn!("install_alt_stack failed: {e}");
+            }
         })
         .build()?)
 }
@@ -2805,7 +2818,9 @@ async fn run() -> anyhow::Result<()> {
                 let config = Config::from_default_path()?;
                 // Taken before the database opens. `shutdown` waits for this lock
                 // to be released rather than for the port to close.
-                let _ = DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?);
+                if DAEMON_LOCK.set(take_daemon_lock(&config.db_path)?).is_err() {
+                    tracing::debug!("DAEMON_LOCK was already initialized");
+                }
                 let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
@@ -3900,7 +3915,9 @@ async fn run() -> anyhow::Result<()> {
                         // bookkeeping query alongside it.
                         if std::env::var("NEUROSTRATA_CLEAR_BEFORE_INGEST").is_ok() {
                             vector_store.clear_ingested(&namespace).await?;
-                            let _ = vector_store.generation_nodes(&namespace, 0).await;
+                            if let Err(e) = vector_store.generation_nodes(&namespace, 0).await {
+                                tracing::debug!("generation_nodes(0) probe note: {e}");
+                            }
                         }
                         println!(
                             "Ingesting AST from {:?} into namespace '{}'",
@@ -3945,7 +3962,10 @@ async fn run() -> anyhow::Result<()> {
                         // can flip the flag's `dirty` field to false; the
                         // gate trusts the flag, not its own clock.
                         if clear {
-                            let _ = crate::events::clear_export_freshness(&*vector_store).await;
+                            if let Err(e) = crate::events::clear_export_freshness(&*vector_store).await
+                            {
+                                eprintln!("Warning: failed to clear export freshness: {e}");
+                            }
                         }
                         if let Err(why) =
                             crate::events::check_export_freshness(&*vector_store).await
@@ -3975,7 +3995,9 @@ async fn run() -> anyhow::Result<()> {
                             .await?;
                         std::fs::write(target_path, serde_json::to_string_pretty(&graph_data)?)?;
                         println!("Graph exported successfully.");
-                        let _ = crate::events::clear_export_freshness(&*vector_store).await;
+                        if let Err(e) = crate::events::clear_export_freshness(&*vector_store).await {
+                            eprintln!("Warning: failed to clear export freshness: {e}");
+                        }
                     }
                     Commands::NormalizeMetadata { namespace } => {
                         use crate::store::ladybug::KnownIds;

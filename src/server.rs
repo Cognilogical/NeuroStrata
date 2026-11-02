@@ -208,7 +208,7 @@ pub async fn process_mcp_request(
                                 "fact_shape": { "type": "string", "enum": ["atomic", "composite", "any"], "description": "Filter fact memories by shape ('atomic', 'composite', or 'any')." },
                                 "path_prefix": { "type": "string", "description": "Optional file/location path prefix filter." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
-                                "include_code_ast": { "type": "boolean", "default": false, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." }
+                                "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -867,7 +867,8 @@ pub async fn process_mcp_request(
                                 "file_path": { "type": "string", "description": "Optional governed file path." },
                                 "files": { "type": "array", "items": { "type": "string" }, "description": "Optional governed file paths." },
                                 "max_items": { "type": "integer", "description": "Max items (default 10)." },
-                                "max_bytes": { "type": "integer", "description": "Approx byte budget (default 1024)." },
+                                "max_bytes": { "type": "integer", "description": "Approx byte budget (converted to tokens at ~4 bytes/token; defaults to max_items * 1024 bytes)." },
+                                "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale from the context plan." },
                                 "format": { "type": "string", "enum": ["json", "text"], "description": "Output format." }
                             },
                             "required": ["namespace"]
@@ -2430,9 +2431,15 @@ pub(crate) async fn embed_dedup_and_upsert(
                                 }
                             }
                             // Also carry other metadata? Keep existing; idempotent.
-                            let _ = store
+                            if let Err(e) = store
                                 .upsert(namespace, &ec.id, existing_vec, existing_payload)
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(
+                                    "dedup idempotent upsert failed for '{namespace}:{}': {e}",
+                                    ec.id
+                                );
+                            }
                         }
                     } else {
                         decision = DedupDecision::BlockedExact;
@@ -2458,6 +2465,16 @@ pub(crate) async fn embed_dedup_and_upsert(
     // Raw-distance candidates (model judgment path).
     if let Some(checker) = dedup {
         let limit = checker.config.max_candidates.max(1);
+        // A "gating" verdict only comes from the promoted Gold-calibrated
+        // active model on a bare standalone add (see laya_onnx's may_block).
+        // task_complete's inline extraction is exempt: a blocked model verdict
+        // must never strand a Lock-2 lesson.
+        let inline_extraction = payload
+            .metadata
+            .get("extracted_from")
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
         if let Ok(raw_candidates) = store
             .nearest_by_raw_distance(
                 namespace,
@@ -2497,7 +2514,19 @@ pub(crate) async fn embed_dedup_and_upsert(
                             .find(|c| c.id == dup.existing_memory_id)
                             .map(|c| c.raw_distance)
                             .unwrap_or(0.0);
-                        decision = DedupDecision::AllowedWithHint;
+                        decision = if !inline_extraction
+                            && dup
+                                .reason
+                                .as_deref()
+                                .map(|r| r.contains("mode=gating"))
+                                .unwrap_or(false)
+                        {
+                            // Gating Gold model on a standalone non-inline add:
+                            // the verdict blocks the write, not a hint.
+                            DedupDecision::BlockedModel
+                        } else {
+                            DedupDecision::AllowedWithHint
+                        };
                         dedup_hint = Some(DedupHint {
                             candidate_id: dup.existing_memory_id.clone(),
                             raw_distance: raw_dist,
@@ -2571,7 +2600,9 @@ pub(crate) async fn embed_dedup_and_upsert(
             .await
             {
                 if let Ok(hash) = blob_store.put(payload) {
-                    let _ = recorder.record_blob_hash(&hash, payload).await;
+                    if let Err(e) = recorder.record_blob_hash(&hash, payload).await {
+                        tracing::warn!("learning record_blob_hash failed: {e}");
+                    }
                 }
                 let last_shadow_verdict =
                     dedup.and_then(|d| d.last_shadow_verdict());
@@ -2610,7 +2641,9 @@ pub(crate) async fn embed_dedup_and_upsert(
                     shadow_model_version: None,
                     decision,
                 };
-                let _ = recorder.record_observation(&obs).await;
+                if let Err(e) = recorder.record_observation(&obs).await {
+                    tracing::warn!("learning record_observation failed: {e}");
+                }
             }
         }
     }
@@ -4629,7 +4662,12 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
             .filter(|r| memory_id_filter.is_none() || memory_id_filter == Some(r.id.as_str()))
             .map(|r| (r.id.clone(), r.payload.clone()))
             .collect();
+    let graph_name = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(format!(
+        "urn:neurostrata:graph:{}:{}:gen:{}",
+        namespace, "domain", 0
+    )));
     let mut edge_tuples: Vec<(String, String, String, Option<crate::rdf::types::EdgeProvenance>)> = Vec::new();
+    let mut edge_ox_quads: Vec<oxrdf::Quad> = Vec::new();
     for r in &row_pairs {
         let prov = crate::rdf::types::EdgeProvenance {
             source: Some(r.1.user_id.clone()),
@@ -4639,20 +4677,21 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
             extractor: None,
         };
         for edge in crate::store::ladybug::edge_specs(&r.1.metadata) {
-            let _ = crate::rdf::projection::edge_to_quad(&r.0, edge.rel_type, &edge.target_id, Some(prov.clone()), None);
+            // edge_to_quad is infallible (returns Quad directly): the quad
+            // feeds the legacy projection via edge_ox_quads, while edge_tuples
+            // keeps the raw shape for the rows-based path.
+            edge_ox_quads.push(crate::rdf::projection::edge_to_quad(
+                &r.0,
+                edge.rel_type,
+                &edge.target_id,
+                Some(prov.clone()),
+                Some(graph_name.clone()),
+            ));
             edge_tuples.push((r.0.clone(), edge.rel_type.to_string(), edge.target_id.clone(), Some(prov.clone())));
         }
     }
-    let graph_name = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(format!(
-        "urn:neurostrata:graph:{}:{}:gen:{}",
-        namespace, "domain", 0
-    )));
     let mut legacy_quads = crate::rdf::projection::project_rows_legacy(&row_pairs, &edge_tuples, &namespace, crate::rdf::types::Tier::Domain, 0);
-    legacy_quads.extend(crate::rdf::projection::quads_to_legacy(
-        &edge_tuples.iter().map(|(from, rel, to, prov)| {
-            crate::rdf::projection::edge_to_quad(from, rel, to, prov.clone(), Some(graph_name.clone()))
-        }).collect::<Vec<_>>(),
-    ));
+    legacy_quads.extend(crate::rdf::projection::quads_to_legacy(&edge_ox_quads));
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
         if let Ok(ox_quads) = ls.project_namespace_rdf(&namespace, crate::rdf::types::Tier::Domain, 0).await {
             legacy_quads = ox_quads;
@@ -6426,9 +6465,14 @@ async fn handle_search_memory(
                 let ns_clone = namespace.to_string();
                 let id_clone = res.id.clone();
                 tokio::spawn(async move {
-                    let _ = store_clone
+                    if let Err(e) = store_clone
                         .increment_access_count(&ns_clone, &id_clone)
-                        .await;
+                        .await
+                    {
+                        tracing::debug!(
+                            "increment_access_count failed for '{ns_clone}:{id_clone}': {e}"
+                        );
+                    }
                 });
             }
         }
@@ -6620,9 +6664,14 @@ async fn handle_search_memory(
                             let ns_clone = namespace.to_string();
                             let id_clone = res.id.clone();
                             tokio::spawn(async move {
-                                let _ = store_clone
+                                if let Err(e) = store_clone
                                     .increment_access_count(&ns_clone, &id_clone)
-                                    .await;
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        "increment_access_count failed for '{ns_clone}:{id_clone}': {e}"
+                                    );
+                                }
                             });
                         }
                     }

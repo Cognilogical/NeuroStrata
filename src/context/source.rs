@@ -74,9 +74,19 @@ pub fn resolve(path: impl AsRef<str>, project_root: impl AsRef<str>) -> SourceId
         .unwrap_or_else(|| root_canonical.clone());
     // Linked worktrees share one common checkout: `--git-common-dir` points
     // every worktree at the main repository's git dir, so they agree on
-    // `checkout_id` while `worktree_id` keeps them distinct.
+    // `checkout_id` while `worktree_id` keeps them distinct. The path git
+    // reports may be relative to `root` (e.g. `".git"`), so resolve it
+    // against `root` before canonicalizing.
     let checkout_id = git_output(root, &["rev-parse", "--git-common-dir"])
-        .map(|p| canonical(Path::new(&p).to_str().unwrap_or(&p)))
+        .map(|p| {
+            let p_path = Path::new(&p);
+            let full = if p_path.is_absolute() {
+                p_path.to_path_buf()
+            } else {
+                root_path.join(p_path)
+            };
+            canonical(full.to_str().unwrap_or(&p))
+        })
         .unwrap_or_else(|| root_canonical.clone());
     let worktree_id = root_canonical;
     let revision = git_output(root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
@@ -99,6 +109,18 @@ pub fn resolve_source(path: impl AsRef<str>, project_root: impl AsRef<str>) -> S
     resolve(path, project_root)
 }
 
+/// Cross-scope authorization helpers.
+pub fn same_namespace(current: &str, target: &str) -> bool {
+    current == target
+}
+
+pub fn cross_scope_authorized(current: &str, target: &str, authorized: &[String]) -> bool {
+    if same_namespace(current, target) {
+        return true;
+    }
+    authorized.iter().any(|a| a == target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,17 +140,4 @@ mod tests {
         let id = resolve(r"src\lib.rs", &root_str);
         assert_eq!(id.relative_path, "src/lib.rs");
     }
-}
-
-
-/// Cross-scope authorization helpers.
-pub fn same_namespace(current: &str, target: &str) -> bool {
-    current == target
-}
-
-pub fn cross_scope_authorized(current: &str, target: &str, authorized: &[String]) -> bool {
-    if same_namespace(current, target) {
-        return true;
-    }
-    authorized.iter().any(|a| a == target)
 }

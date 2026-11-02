@@ -19,7 +19,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
 
@@ -42,6 +42,7 @@ struct AtomicMetrics {
     subscriber_panics: AtomicU64,
     subscriber_timeouts: AtomicU64,
     recursion_blocks: AtomicU64,
+    subscriber_failures: AtomicU64,
 }
 
 /// The daemon's store, once attached. Until then the dispatcher substitutes an
@@ -53,6 +54,13 @@ struct AtomicMetrics {
 /// a subscriber that *does* read the store gets an explicit error naming the
 /// missing attachment instead of a panic or a write to nowhere.
 struct StoreNotAttached;
+
+/// The single static stand-in handed to every subscriber whose pulse runs
+/// before a store is attached: one allocation for the process, cloned per
+/// pulse, instead of a fresh `StoreNotAttached` allocated under the dispatcher
+/// on every such pulse (F9).
+static STORE_NOT_ATTACHED: LazyLock<Arc<dyn VectorStore>> =
+    LazyLock::new(|| Arc::new(StoreNotAttached));
 
 impl StoreNotAttached {
     fn err() -> anyhow::Error {
@@ -334,6 +342,7 @@ impl ThalamicBus {
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
             subscriber_timeouts: self.metrics.subscriber_timeouts.load(Ordering::Relaxed),
             recursion_blocks: self.metrics.recursion_blocks.load(Ordering::Relaxed),
+            subscriber_failures: self.metrics.subscriber_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -417,7 +426,7 @@ async fn dispatch(
         let store: Arc<dyn VectorStore> = store
             .get()
             .cloned()
-            .unwrap_or_else(|| Arc::new(StoreNotAttached));
+            .unwrap_or_else(|| STORE_NOT_ATTACHED.clone());
         let ctx = SubscriberContext {
             store: store.as_ref(),
             namespace,
@@ -443,6 +452,7 @@ async fn dispatch(
             match outcome {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(err))) => {
+                    metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(subscriber = sub.name(), "subscriber failed: {err:#}");
                 }
                 Ok(Err(payload)) => {
@@ -1086,6 +1096,57 @@ impl crate::traits::AsAny for RecordingStore {
         let m = bus.metrics();
         assert_eq!(m.events_emitted, 1);
         assert_eq!(m.dispatcher_handled, 1);
+    }
+
+    /// Returns `Err` on every pulse, on purpose: the dispatcher must log it,
+    /// count it on `BusMetrics::subscriber_failures`, and move on -- the same
+    /// disposition a panic gets, minus the watch-channel event (F2).
+    struct FailingSubscriber;
+
+    #[async_trait]
+    impl MemorySubscriber for FailingSubscriber {
+        fn name(&self) -> &'static str {
+            "failer"
+        }
+
+        async fn handle(
+            &self,
+            _event: &ThalamicPulse,
+            _token: &RecursionToken,
+            _ctx: &SubscriberContext<'_>,
+        ) -> Result<(), SubscriberError> {
+            Err(anyhow!("boom"))
+        }
+    }
+
+    #[tokio::test]
+    async fn subscriber_error_counts_a_failure() {
+        let bus = ThalamicBus::new(16);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran2 = ran.clone();
+        bus.register(Box::new(FailingSubscriber));
+        bus.register(Box::new(CountingSubscriber { counter: ran2 }));
+        bus.emit(
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            bus.metrics().subscriber_failures,
+            1,
+            "an Err from a subscriber is one recorded failure: {:?}",
+            bus.metrics()
+        );
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            1,
+            "the dispatcher reaches the next subscriber after a failure"
+        );
     }
 
     /// The spec's degenerate bus: capacity 0 accepts nothing -- every pulse

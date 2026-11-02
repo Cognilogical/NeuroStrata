@@ -75,13 +75,25 @@ impl ContextService {
         }
         plan.truncation = total > deduped.len();
         plan.items = deduped;
-        // Empty selection with candidates available is a degraded plan; a
-        // non-empty selection is fully supported.
+        // A non-empty selection is fully supported even when `truncation` is
+        // set: the plan delivered the items it planned, while `truncation`
+        // records (and the debug log below surfaces) that the request was cut
+        // short by dedup, budget or `max_items`. An empty selection is a
+        // degraded plan — nothing survived to deliver.
         plan.degradation = if !plan.items.is_empty() {
             Degradation::Supported
         } else {
             Degradation::Partial
         };
+        if plan.truncation {
+            tracing::debug!(
+                planned = total,
+                delivered = plan.items.len(),
+                "context plan truncated: {} of {} candidates delivered",
+                plan.items.len(),
+                total
+            );
+        }
         plan
     }
 }

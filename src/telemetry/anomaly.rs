@@ -51,8 +51,12 @@ pub type AnomalyKey = (String, MetricKind, String);
 pub struct AnomalyEvent {
     pub metric: MetricKind,
     pub value: f64,
+    /// The Welford running mean over all samples seen for this metric/stage
+    /// (not the EWMA, which is exponentially weighted toward recent samples).
     pub mean: f64,
     pub std_dev: f64,
+    /// Deviation of `value` from the EWMA, normalized by the Welford sample
+    /// `std_dev` (floored at 1e-6 to keep zero-variance streams finite).
     pub z_score: f64,
     pub namespace: String,
     pub stage: String,
@@ -215,7 +219,10 @@ impl AnomalyDetector {
 
     pub fn observe(&self, namespace: &str, metric: MetricKind, stage: &str, sample: f64) -> Option<AnomalyEvent> {
         let key = (namespace.to_string(), metric, stage.to_string());
-        let mut map = self.stats.write().expect("stats lock poisoned");
+        let mut map = self
+            .stats
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let stats = map.entry(key).or_insert_with(|| RollingStats::new(self.alpha, self.z_threshold, self.cooldown));
         stats.record(namespace, metric, stage, sample, Instant::now())
     }

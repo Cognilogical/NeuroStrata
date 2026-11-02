@@ -49,6 +49,12 @@ pub struct StorageStatus {
 static LAST_CHECKPOINT_DURATION_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Unix-seconds timestamp of the most recent checkpoint recorded in this
+/// process (0 = none recorded yet). The directory mtime is only a proxy;
+/// this records the real event the moment it happens.
+static LAST_CHECKPOINT_AT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Count of failed checkpoints since process start (monotonic, never reset).
 static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
@@ -58,6 +64,10 @@ static CHECKPOINT_FAILURES: std::sync::atomic::AtomicU32 =
 pub fn record_checkpoint_outcome(duration_ms: u64, ok: bool) {
     use std::sync::atomic::Ordering;
     LAST_CHECKPOINT_DURATION_MS.store(duration_ms, Ordering::Relaxed);
+    LAST_CHECKPOINT_AT_SECS.store(
+        chrono::Utc::now().timestamp().max(0) as u64,
+        Ordering::Relaxed,
+    );
     if !ok {
         CHECKPOINT_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
@@ -92,19 +102,39 @@ pub fn compute_storage_status(
                 .count()
         })
         .unwrap_or(0);
-    // The store directory's mtime is the best available proxy for the last
-    // checkpoint: snapshots (and the WAL) share that directory and every
-    // checkpoint refreshes one of them.
-    let last_checkpoint_at = fs::metadata(&snapshot_dir)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| {
-            let dt = chrono::DateTime::<chrono::Utc>::from(
-                std::time::UNIX_EPOCH + d,
-            );
-            dt.to_rfc3339()
-        });
+    // Prefer the real checkpoint timestamp recorded in this process; the
+    // store directory's mtime is only a proxy and falls back when no
+    // checkpoint happened yet in this process.
+    let last_checkpoint_at = {
+        let recorded_ts = LAST_CHECKPOINT_AT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+        if recorded_ts > 0 {
+            chrono::DateTime::from_timestamp(recorded_ts as i64, 0)
+                .map(|dt| dt.to_rfc3339())
+                .or_else(|| {
+                    fs::metadata(&snapshot_dir)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| {
+                            let dt = chrono::DateTime::<chrono::Utc>::from(
+                                std::time::UNIX_EPOCH + d,
+                            );
+                            dt.to_rfc3339()
+                        })
+                })
+        } else {
+            fs::metadata(&snapshot_dir)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| {
+                    let dt = chrono::DateTime::<chrono::Utc>::from(
+                        std::time::UNIX_EPOCH + d,
+                    );
+                    dt.to_rfc3339()
+                })
+        }
+    };
     StorageStatus {
         store_path: store_path.display().to_string(),
         store_bytes,
@@ -406,11 +436,23 @@ pub fn select_expired_snapshots(root: &Path, keep: usize) -> Result<Vec<PathBuf>
         }
         let manifest_str = match fs::read_to_string(&manifest_path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    "unreadable snapshot manifest at {}: {e}",
+                    manifest_path.display()
+                );
+                continue;
+            }
         };
         let manifest: serde_json::Value = match serde_json::from_str(&manifest_str) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    "invalid JSON in snapshot manifest at {}: {e}",
+                    manifest_path.display()
+                );
+                continue;
+            }
         };
         let format = manifest.get("format").and_then(|v| v.as_str()).unwrap_or("");
         let version = manifest.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;

@@ -140,6 +140,30 @@ mod tests {
         assert_eq!(decision_shape_boost(&json!(null)), 0.0);
     }
 
+    /// Scores are retrieval DISTANCES (lower = better). The decision-shape
+    /// gain must reduce the distance of a decision-shaped fact relative to an
+    /// identical unshaped fact; adding it would push decisions DOWN the
+    /// ascending ranking (Slice AD-5).
+    #[test]
+    fn decision_shape_gain_lowers_distance() {
+        let shaped = json!({"decision": "ship podman only"});
+        let unshaped = json!({});
+        let d: f32 = 0.42;
+        let shaped_score = (d - decision_shape_boost(&shaped)).max(0.0);
+        let unshaped_score = (d - decision_shape_boost(&unshaped)).max(0.0);
+        assert!(
+            shaped_score < unshaped_score,
+            "decision-shaped fact must score a lower distance than an identical unshaped fact (got {shaped_score} vs {unshaped_score})"
+        );
+        assert_eq!(unshaped_score, d);
+        assert_eq!(shaped_score, d - DECISION_SHAPE_GAIN);
+        // Near-zero distances clamp at 0.0 without ever going negative or
+        // flipping the ordering against a fully-boosted distance.
+        let near_zero_shaped = (0.01_f32 - decision_shape_boost(&shaped)).max(0.0);
+        assert_eq!(near_zero_shaped, 0.0);
+        assert!(near_zero_shaped <= (0.01_f32 - decision_shape_boost(&unshaped)).max(0.0));
+    }
+
     #[test]
     fn fact_shape_matches_variants() {
         let m = json!({"decision": "x"});

@@ -196,6 +196,9 @@ pub struct BusMetrics {
     pub subscriber_timeouts: u64,
     /// Emits refused because they were attempted under a held [`RecursionToken`].
     pub recursion_blocks: u64,
+    /// Subscriber invocations that returned `Err` to the dispatcher: logged,
+    /// counted, and never propagated to the caller of the storage write.
+    pub subscriber_failures: u64,
 }
 
 #[cfg(test)]

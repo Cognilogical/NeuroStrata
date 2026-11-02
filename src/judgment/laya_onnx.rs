@@ -184,6 +184,16 @@ impl LayaOnnxProvider {
             return Err(anyhow!("Downloaded Laya bundle is missing manifest.json"));
         }
 
+        // The bundle must contain the ONNX model itself: a download with a
+        // manifest but no model.onnx is unusable to the inference session,
+        // so fail loudly here instead of producing a half-usable bundle.
+        if !target_path.join("model.onnx").exists() {
+            return Err(anyhow!(
+                "Downloaded Laya bundle at {} is missing model.onnx",
+                target_path.display()
+            ));
+        }
+
         println!("Laya model '{}' fetched and verified to '{}'", model_id, target_path.display());
         Ok(())
     }
@@ -273,9 +283,18 @@ impl JudgmentProvider for LayaOnnxProvider {
                 // Try real ONNX execution with 2-float feature vector
                 let jaccard_sim = token_overlap;
                 let feature_vec = [jaccard_sim as f32, (1.0 - cand.score.clamp(0.0, 1.0)) as f32];
-                let feature_array = ort::value::Value::from_array(
-                    ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec()).unwrap()
-                ).ok();
+                // Build the ONNX input without panicking:
+                // from_shape_vec cannot fail for a literal (1, 2) from a
+                // 2-element vec, but a failure falls back to the
+                // token-overlap path instead of aborting the search.
+                let feature_array = match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec())
+                {
+                    Ok(arr) => ort::value::Value::from_array(arr).ok(),
+                    Err(_) => {
+                        tracing::warn!("Laya ONNX feature vector could not be shaped (1,2); using token-overlap fallback");
+                        None
+                    }
+                };
                 match feature_array {
                     Some(arr) => match session.run(ort::inputs! {"input" => arr}) {
                         Ok(outputs) => {
@@ -296,10 +315,15 @@ impl JudgmentProvider for LayaOnnxProvider {
                                 ),
                             }
                         }
-                        Err(_) => (
-                            temperature_scaled_sigmoid(fallback_logit, self.temperature),
-                            "laya-onnx-token-overlap-fallback",
-                        ),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Laya ONNX session.run failed, using token-overlap fallback: {e}"
+                            );
+                            (
+                                temperature_scaled_sigmoid(fallback_logit, self.temperature),
+                                "laya-onnx-token-overlap-fallback",
+                            )
+                        }
                     },
                     None => (
                         temperature_scaled_sigmoid(fallback_logit, self.temperature),
@@ -383,12 +407,16 @@ fn tokenize_content(content: &str, tokenizer: Option<&tokenizers::Tokenizer>) ->
         }
         // If encode fails, fall through to empty set (no tokens added)
     } else {
-        // Subword/whitespace fallback: split on whitespace and use simple hash IDs.
+        // Subword/whitespace fallback: split on whitespace and hash each word
+        // with FNV-1a 32-bit so anagrams ("ab" vs "ba") — which a byte-sum
+        // hash collides — get distinct token IDs.
         for word in content.split_whitespace() {
             if !word.is_empty() {
-                let hash_id = (word.len() as u32).wrapping_add(
-                    word.bytes().map(|b| b as u32).sum::<u32>() % 10000,
-                );
+                let mut hash_id: u32 = 2_166_136_261;
+                for &b in word.as_bytes() {
+                    hash_id ^= b as u32;
+                    hash_id = hash_id.wrapping_mul(16_777_619);
+                }
                 ids.insert(hash_id);
             }
         }

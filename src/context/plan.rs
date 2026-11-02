@@ -5,7 +5,9 @@ use std::borrow::Borrow;
 use std::collections::HashSet;
 
 /// Cumulative budgets applied while building a plan. All three must be
-/// respected: the plan stops as soon as any one of them is exhausted.
+/// respected: an item whose cost would exhaust any one of them is skipped,
+/// and iteration continues through the remaining candidates so a fitting
+/// later item can still make the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     pub per_call: usize,
@@ -67,7 +69,7 @@ impl Budget {
 
 /// Estimate the token cost of one item (chars/4 + a small per-item overhead).
 pub fn estimate_tokens(item: &ContextItem) -> usize {
-    item.content.len() / 4 + 8
+    item.content.chars().count() / 4 + 8
 }
 
 /// Deduplicate `items` by id and content, then keep as many as fit in `budget`,
