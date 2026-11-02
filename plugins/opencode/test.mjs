@@ -4,12 +4,17 @@ import http from "node:http";
 import plugin, {
   detectTaskIntentsLocal,
   parseGuardValidate,
+  parseFileMemoryHits,
   resolveConfig,
   NeuroStrataMCPClient,
   adapterStatus,
   onTurnEnd,
   fetchContextPlan,
   resetClientForTesting,
+  prefetchMemoriesForFile,
+  prefetchedPaths,
+  injectedMemoryIds,
+  PREFETCH_LRU_CAP,
 } from "./dist/index.js";
 
 test("Plugin.define exports V2 setup and registers execute.before hook", async () => {
@@ -82,6 +87,9 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer(port = 0) {
+  // Cross-test call counter, surfaced so tests can assert a deduped touch
+  // did not re-query the daemon.
+  const counters = { memoriesForFile: 0 };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -104,6 +112,7 @@ function createMockDaemonServer(port = 0) {
                 { name: "neurostrata_append_log" },
                 { name: "neurostrata_search_memory" },
                 { name: "neurostrata_context_plan" },
+                { name: "neurostrata_memories_for_file" },
               ],
             }));
             return;
@@ -111,6 +120,32 @@ function createMockDaemonServer(port = 0) {
           if (method === "tools/call") {
             const params = payload.params ?? {};
             const name = params.name ?? params.arguments?.name;
+            if (name === "neurostrata_memories_for_file") {
+              counters.memoriesForFile++;
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(makeMockRpcResponse(id, {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({
+                    hits: [
+                      {
+                        id: "mem-rule-1",
+                        valid_from: "2026-01-01T00:00:00Z",
+                        memory_type: "rule",
+                        content: "Always claim a task before editing files.",
+                      },
+                      {
+                        id: "mem-fact-2",
+                        valid_from: "2026-01-02T00:00:00Z",
+                        memory_type: "fact",
+                        content: "The daemon serves MCP on 127.0.0.1:34343.",
+                      },
+                    ],
+                  }),
+                }],
+              }));
+              return;
+            }
             // Healthy pass for guard; snapshot / log / search return ready + unlocked
             if (name === "neurostrata_get_snapshot") {
               res.writeHead(200, { "Content-Type": "application/json" });
@@ -162,7 +197,7 @@ function createMockDaemonServer(port = 0) {
     });
     server.listen(port, () => {
       const addr = server.address();
-      resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp` });
+      resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, counters });
     });
   });
 }
@@ -288,4 +323,83 @@ test("fetchContextPlan throws when MCP client not initialized", async () => {
     () => fetchContextPlan({ namespace: "ctx-ns" }),
     /NeuroStrata MCP client not initialized/
   );
+});
+
+// ─── (d) File-touch prefetch (design §4.5) ───
+
+test("parseFileMemoryHits reads hits and memories arrays", () => {
+  const asHits = parseFileMemoryHits(
+    JSON.stringify({ hits: [{ id: "m1", valid_from: "t0", memory_type: "rule", content: "x" }] })
+  );
+  assert.equal(asHits.length, 1);
+  assert.equal(asHits[0].id, "m1");
+
+  const asMemories = parseFileMemoryHits(
+    JSON.stringify({ memories: [{ id: "m2", valid_from: "t1", memory_type: "fact", content: "y" }] })
+  );
+  assert.equal(asMemories.length, 1);
+  assert.equal(asMemories[0].id, "m2");
+
+  // A hit without an id can never be deduped, so it is never surfaced.
+  const noId = parseFileMemoryHits(
+    JSON.stringify({ hits: [{ valid_from: "t2", content: "z" }, { id: "m3", content: "w" }] })
+  );
+  assert.equal(noId.length, 1);
+  assert.equal(noId[0].id, "m3");
+});
+
+test("prefetchMemoriesForFile: LRU path dedup and injectedMemoryIds dedup", async () => {
+  const { server, url, counters } = await createMockDaemonServer();
+  try {
+    const ctx = {
+      config: {
+        namespace: "prefetch-ns",
+        endpoint: url,
+        bearerToken: "mock-token",
+        strictMode: false,
+        requestTimeoutMs: 500,
+      },
+      tool: { hook: async () => {} },
+    };
+    await plugin.setup(ctx);
+
+    // Isolate from any earlier test's module-level state.
+    prefetchedPaths.clear();
+    injectedMemoryIds.clear();
+    counters.memoriesForFile = 0;
+
+    // First touch of a path: one daemon query, both governing memories returned.
+    const first = await prefetchMemoriesForFile("prefetch-ns", "src/foo.rs");
+    assert.equal(first.length, 2);
+    assert.ok(first[0].startsWith("[NeuroStrata rule mem-rule-1"));
+    assert.ok(first[1].startsWith("[NeuroStrata fact mem-fact-2"));
+    assert.equal(counters.memoriesForFile, 1);
+
+    // Second touch of the same path: LRU dedup — no re-query, empty answer.
+    const second = await prefetchMemoriesForFile("prefetch-ns", "src/foo.rs");
+    assert.deepEqual(second, []);
+    assert.equal(counters.memoriesForFile, 1, "LRU dedup must not re-query");
+
+    // A different file returning the same memories: injectedMemoryIds dedup
+    // — the query happens but yields no new snippets.
+    const third = await prefetchMemoriesForFile("prefetch-ns", "src/bar.rs");
+    assert.deepEqual(third, []);
+    assert.equal(counters.memoriesForFile, 2, "new path was queried once");
+    assert.equal(injectedMemoryIds.size, 2, "no duplicate memory keys injected");
+
+    // LRU cap: the prefetched-path map never grows past 128 entries.
+    for (let i = 0; i < PREFETCH_LRU_CAP * 2; i++) {
+      await prefetchMemoriesForFile("prefetch-ns", `file-${i}.rs`);
+    }
+    assert.equal(prefetchedPaths.size, PREFETCH_LRU_CAP);
+
+    // Empty path is a no-op that touches nothing.
+    const empty = await prefetchMemoriesForFile("prefetch-ns", "   ");
+    assert.deepEqual(empty, []);
+
+    prefetchedPaths.clear();
+    injectedMemoryIds.clear();
+  } finally {
+    server.close();
+  }
 });

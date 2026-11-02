@@ -469,6 +469,155 @@ export function detectTaskIntentsLocal(text: string): TaskIntentSignal[] {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// File-touch prefetch (design §4.5): LRU dedup + injected-memory dedup
+// ──────────────────────────────────────────────────────────────────────
+
+/** LRU cap: how many recently touched (`namespace:path`) keys are kept. */
+export const PREFETCH_LRU_CAP = 128;
+
+/** Output budget: one file-touch recall injects at most this many chars. */
+export const PREFETCH_MAX_CHARS = 2048;
+
+/**
+ * Recently touched file paths, keyed `namespace:path`, in LRU order
+ * (oldest first). Bounded so a long session cannot grow without bound.
+ */
+export const prefetchedPaths = new Map<string, number>();
+
+/** `(memory_id:valid_from)` keys already injected this session. */
+export const injectedMemoryIds = new Set<string>();
+
+function recordPrefetchedPath(key: string): void {
+  prefetchedPaths.set(key, Date.now());
+  if (prefetchedPaths.size > PREFETCH_LRU_CAP) {
+    const oldest = prefetchedPaths.keys().next().value;
+    if (oldest !== undefined) prefetchedPaths.delete(oldest);
+  }
+}
+
+function touchPrefetchedPath(key: string): void {
+  // Re-insertion moves the key to the newest end of the LRU order.
+  prefetchedPaths.delete(key);
+  recordPrefetchedPath(key);
+}
+
+/** One governing memory as `memories_for_file` returns it. */
+export interface FileMemoryHit {
+  id: string;
+  valid_from: string;
+  memory_type: string;
+  content: string;
+}
+
+/**
+ * Read the `memories_for_file` answer.
+ *
+ * The core wraps the body in a content-array answer like every other tool,
+ * and the array of governing memories arrives as `hits` or `memories`.
+ */
+export function parseFileMemoryHits(text: string): FileMemoryHit[] {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end <= start) {
+    throw new Error(
+      `memories_for_file returned no JSON body: ${text.slice(0, 200)}`,
+    );
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(
+      `memories_for_file returned an unreadable body: ${String(err)}`,
+    );
+  }
+
+  const raw = Array.isArray(body.hits)
+    ? body.hits
+    : Array.isArray(body.memories)
+      ? body.memories
+      : [];
+
+  const out: FileMemoryHit[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const hit = item as Record<string, unknown>;
+    const id = asString(hit.id) ?? asString(hit.memory_id);
+    const valid_from = asString(hit.valid_from) ?? "";
+    if (!id) continue; // a hit without an id cannot be deduped — never inject
+    out.push({
+      id,
+      valid_from,
+      memory_type: asString(hit.memory_type) ?? asString(hit.type) ?? "memory",
+      content:
+        asString(hit.content) ??
+        asString(hit.text) ??
+        asString(hit.summary) ??
+        "",
+    });
+  }
+  return out;
+}
+
+function formatFileMemorySnippet(hit: FileMemoryHit): string {
+  const where = hit.valid_from ? ` (valid_from ${hit.valid_from})` : "";
+  return `[NeuroStrata ${hit.memory_type} ${hit.id}${where}] ${hit.content}`;
+}
+
+/** Cap the recalled snippets so one file touch can never flood context. */
+function capSnippets(snippets: string[]): string[] {
+  let total = 0;
+  const out: string[] = [];
+  for (const snippet of snippets) {
+    if (total >= PREFETCH_MAX_CHARS) break;
+    const room = PREFETCH_MAX_CHARS - total;
+    out.push(snippet.length > room ? snippet.slice(0, room) : snippet);
+    total += Math.min(snippet.length, room) + 1; // + join newline
+  }
+  return out;
+}
+
+/**
+ * Recall governing memories when a file is touched (design §4.5).
+ *
+ * Each `namespace:path` key is prefetched at most once per LRU window;
+ * each memory is injected at most once per `(id, valid_from)` key. Never
+ * increments `access_count` — this is a read-only recall.
+ */
+export async function prefetchMemoriesForFile(
+  namespace: string,
+  filePath: string,
+): Promise<string[]> {
+  const path = filePath.trim();
+  if (path === "") return [];
+
+  const key = `${namespace}:${path}`;
+  if (prefetchedPaths.has(key)) {
+    touchPrefetchedPath(key);
+    return [];
+  }
+  recordPrefetchedPath(key);
+
+  if (!mcpClient) return [];
+
+  const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+    namespace,
+    path,
+    limit: 5,
+  });
+
+  const out: string[] = [];
+  for (const hit of parseFileMemoryHits(text)) {
+    const dedupKey = `${hit.id}:${hit.valid_from}`;
+    if (injectedMemoryIds.has(dedupKey)) continue;
+    injectedMemoryIds.add(dedupKey);
+    out.push(formatFileMemorySnippet(hit));
+  }
+  return capSnippets(out);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Plugin Entry Point
 // ──────────────────────────────────────────────────────────────────────
 
@@ -519,10 +668,44 @@ export async function initialize(ctx: any): Promise<void> {
     lastError: undefined,
   });
 
-  // Register guard validation before mutating tools (write, edit, bash).
+  // Register hooks before mutating tools (write, edit, bash).
   // V2 API: ctx.tool.hook("execute.before", ...) fires before each tool call.
   await ctx.tool.hook("execute.before", async (input: any) => {
     const toolName = input?.tool;
+
+    // File-touch recall (§4.5): on read/write/edit touching a file, prefetch
+    // the governing memories. Fail-soft: prefetch never blocks the tool, and
+    // `read` is never guard-validated.
+    if (toolName === "read" || toolName === "write" || toolName === "edit") {
+      const args = asRecord(input?.input);
+      const altArgs = asRecord(input?.args);
+      const filePath =
+        asString(args.filePath) ??
+        asString(args.path) ??
+        asString(altArgs.filePath) ??
+        asString(altArgs.path);
+      if (filePath) {
+        try {
+          const snippets = await prefetchMemoriesForFile(
+            config.namespace,
+            filePath,
+          );
+          if (snippets.length > 0) {
+            console.info(
+              `[NeuroStrata] File-touch recall for ${filePath}\n${snippets.join("\n")}`,
+            );
+          }
+        } catch (err) {
+          setStatus({ state: "degraded", lastError: String(err) });
+          console.warn("[NeuroStrata] File-touch prefetch failed", {
+            file: filePath,
+            error: String(err),
+          });
+        }
+      }
+    }
+
+    // Guard validation stays on the mutating tools only.
     if (toolName !== "write" && toolName !== "edit" && toolName !== "bash") return;
     const call: any = {
       name: toolName,

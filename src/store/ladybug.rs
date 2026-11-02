@@ -1017,6 +1017,12 @@ pub struct LadybugStore {
     pub metrics: Arc<crate::time_series::TimeSeriesStore>,
     /// Optional disk-backed Tantivy full-text index, opened lazily.
     pub tantivy_lexical: Arc<std::sync::RwLock<Option<crate::lexical::TantivyLexicalIndex>>>,
+    /// Embedding-space identity registry (Composite Recommendation #11):
+    /// the first `EmbeddingDescriptor` recorded per namespace in `init` is
+    /// authoritative for the store's lifetime; a later descriptor that fails
+    /// `compatible` is rejected so incompatible embedding spaces cannot be
+    /// mixed through this store.
+    embedding_registry: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::traits::EmbeddingDescriptor>>>,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1271,7 +1277,58 @@ impl LadybugStore {
                     .with_anomaly_callback(std::sync::Arc::new(|_key, _sample| {})),
             ),
             tantivy_lexical: Arc::new(std::sync::RwLock::new(None)),
+            embedding_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    /// The store's own embedding-space identity: it has only the configured
+    /// width plus the process's model selection, so the descriptor carries
+    /// those (the model's identity is what `EmbeddingDescriptor.compatible`
+    /// compares below). Model + width are the load-bearing fields of a space.
+    fn store_embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "store-registered".into(),
+            model: std::env::var("NEUROSTRATA_MODEL").unwrap_or_else(|_| "local-fastembed".into()),
+            revision: "store-lifetime".into(),
+            dims: self.dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
+
+    /// Composite Recommendation #11: verify or record the embedding-space
+    /// identity for a namespace. The first descriptor recorded in this
+    /// process is authoritative for the store's lifetime; a later descriptor
+    /// that is not `compatible` (different dimensions, model, or metric) is
+    /// rejected so incompatible embedding spaces are never mixed through
+    /// this store.
+    pub fn verify_or_record_embedding_descriptor(
+        &self,
+        namespace: &str,
+        desc: &crate::traits::EmbeddingDescriptor,
+    ) -> Result<()> {
+        let mut registry = self
+            .embedding_registry
+            .lock()
+            .expect("embedding registry poisoned");
+        if let Some(existing) = registry.get(namespace) {
+            if !existing.compatible(desc) {
+                anyhow::bail!(
+                    "embedding descriptor mismatch for namespace '{}': recorded provider='{}' model='{}' dims={} vs active provider='{}' model='{}' dims={}",
+                    namespace,
+                    existing.provider,
+                    existing.model,
+                    existing.dims,
+                    desc.provider,
+                    desc.model,
+                    desc.dims
+                );
+            }
+            return Ok(());
+        }
+        registry.insert(namespace.to_string(), desc.clone());
+        Ok(())
     }
 
     /// Runs a write with a deadline, so a caller is told the database is busy
@@ -2932,6 +2989,14 @@ impl LadybugStore {
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, _namespace: &str) -> Result<()> {
+        // Composite Recommendation #11: verify the embedding-space identity on
+        // every init (including the schema-ready fast path) so an incompatible
+        // descriptor is rejected before any vector lands.
+        self.verify_or_record_embedding_descriptor(
+            _namespace,
+            &self.store_embedding_descriptor(),
+        )?;
+
         if self.schema_ready.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
@@ -6703,6 +6768,56 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
         store
+    }
+
+    /// Composite Recommendation #11: the first embedding descriptor recorded
+    /// per namespace is authoritative; an incompatible descriptor (different
+    /// dimensions or model) follows with an Err, a compatible one with Ok.
+    #[test]
+    fn embedding_descriptor_registry_accepts_compatible_rejects_mismatch() {
+        let dir = std::env::temp_dir().join(format!("ns-embed-desc-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        let desc = crate::traits::EmbeddingDescriptor {
+            provider: "store-registered".into(),
+            model: "test-model".into(),
+            revision: "store-lifetime".into(),
+            dims: 4,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        };
+        store
+            .verify_or_record_embedding_descriptor("probe", &desc)
+            .expect("first record for a namespace");
+        store
+            .verify_or_record_embedding_descriptor("probe", &desc)
+            .expect("re-running with a compatible descriptor is idempotent");
+
+        let mut dims_mismatch = desc.clone();
+        dims_mismatch.dims = 8;
+        let dims_err = store
+            .verify_or_record_embedding_descriptor("probe", &dims_mismatch)
+            .expect_err("dimension mismatch must be rejected");
+        assert!(
+            dims_err.to_string().contains("embedding descriptor mismatch"),
+            "unexpected error: {dims_err}"
+        );
+
+        let mut model_mismatch = desc.clone();
+        model_mismatch.model = "other-model".into();
+        let model_err = store
+            .verify_or_record_embedding_descriptor("probe", &model_mismatch)
+            .expect_err("model change must be rejected");
+        assert!(
+            model_err.to_string().contains("embedding descriptor mismatch"),
+            "unexpected error: {model_err}"
+        );
+
+        // Other namespaces keep their own descriptor, so an incompatible
+        // descriptor is fine there until it, too, is recorded.
+        store
+            .verify_or_record_embedding_descriptor("other-ns", &dims_mismatch)
+            .expect("a distinct namespace records its own descriptor");
     }
 
     fn retired_test_payload(memory_type: &str, user_id: &str, metadata: Value) -> MemoryPayload {

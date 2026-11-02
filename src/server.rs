@@ -803,11 +803,15 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "kind": { "type": "string", "description": "Metric kind (e.g. retrieval_latency_ms, recall_hit_rate)." },
                                 "name": { "type": "string", "description": "Metric series name." },
+                                "metric": { "type": "string", "description": "Spec alias for 'name' (or 'kind'). Ignored when 'name' is present." },
+                                "stage": { "type": "string", "description": "Optional stage filter (e.g. 'search', 'upsert'); acts as 'kind' or 'name' alias." },
                                 "since_ts": { "type": "integer", "description": "Optional lower timestamp bound." },
                                 "until_ts": { "type": "integer", "description": "Optional upper timestamp bound." },
+                                "from": { "type": "integer", "description": "Spec alias for 'since_ts'." },
+                                "to": { "type": "integer", "description": "Spec alias for 'until_ts'." },
                                 "limit": { "type": "integer", "description": "Max samples to return (default 100)." }
                             },
-                            "required": ["namespace", "kind", "name"]
+                            "required": ["namespace"]
                         }
                     },
                     {
@@ -826,12 +830,14 @@ pub async fn process_mcp_request(
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "namespace": { "type": "string", "description": "The exact project name (defaults to 'global')." },
                                 "question": { "type": "string", "description": "Question to answer from memory context." },
                                 "top_k": { "type": "integer", "description": "Max memories to retrieve (default 5, max 20)." },
+                                "limit": { "type": "integer", "description": "Alias for 'top_k'." },
+                                "system": { "type": "string", "description": "Optional system prompt for the RAG LLM provider." },
                                 "principal": { "type": "string", "description": "Optional ReBAC principal (defaults to 'admin')." }
                             },
-                            "required": ["namespace", "question"]
+                            "required": ["question"]
                         }
                     },
                     {
@@ -4424,17 +4430,38 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
     let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
         return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
     };
-    let Some(kind_str) = arguments.get("kind").and_then(|v| v.as_str()) else {
-        return serde_json::json!({"ok":false,"error":"kind required"}).to_string();
+    let kind_str = arguments
+        .get("kind")
+        .or_else(|| arguments.get("stage"))
+        .or_else(|| arguments.get("metric"))
+        .and_then(|v| v.as_str());
+    let name = arguments
+        .get("name")
+        .or_else(|| arguments.get("metric"))
+        .or_else(|| arguments.get("stage"))
+        .and_then(|v| v.as_str());
+    match (kind_str, name) {
+        (Some(_), Some(_)) => {}
+        (_, _) => {
+            return serde_json::json!({"ok":false,"error":"kind and name (or spec aliases metric/stage/from/to) required"}).to_string()
+        }
+    }
+    let ts_of = |v: &Value| {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
     };
-    let Some(name) = arguments.get("name").and_then(|v| v.as_str()) else {
-        return serde_json::json!({"ok":false,"error":"name required"}).to_string();
+    let since_ts = arguments
+        .get("since_ts")
+        .and_then(ts_of)
+        .or_else(|| arguments.get("from").and_then(ts_of));
+    let until_ts = arguments
+        .get("until_ts")
+        .and_then(ts_of)
+        .or_else(|| arguments.get("to").and_then(ts_of));
+    let Ok(kind) = crate::time_series::MetricKind::from_str(kind_str.unwrap()) else {
+        return serde_json::json!({"ok":false,"error":format!("unknown metric kind '{}'", kind_str.unwrap())}).to_string();
     };
-    let Ok(kind) = crate::time_series::MetricKind::from_str(kind_str) else {
-        return serde_json::json!({"ok":false,"error":format!("unknown metric kind '{}'", kind_str)}).to_string();
-    };
-    let since_ts = arguments.get("since_ts").and_then(|v| v.as_i64());
-    let until_ts = arguments.get("until_ts").and_then(|v| v.as_i64());
+    let name = name.unwrap();
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -4456,13 +4483,21 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
         let query_report = ls.metrics().query_metrics(&namespace, kind, Some(name), since_ts, until_ts, &db_pairs);
         let anomaly_window = ls.metrics().samples_for_anomaly(&key);
         let agg_summary = agg.as_ref().map(|a| a.to_json_summary());
+        // Spec §5.5 aggregate shape: {count, sum, mean, min, max, ewma}.
+        let agg_json = agg.as_ref().map(|a| {
+            let mut v = serde_json::to_value(a).unwrap_or(Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("mean".to_string(), serde_json::json!(a.mean()));
+            }
+            v
+        });
         return serde_json::json!({
             "ok": true,
             "namespace": namespace,
             "kind": kind.as_str(),
             "name": name,
             "samples": samples,
-            "aggregate": agg,
+            "aggregate": agg_json,
             "summary": agg_summary,
             "anomalies": ls.metrics().recent_anomalies(&namespace),
             "report": query_report,
@@ -4520,17 +4555,20 @@ pub(crate) async fn handle_chat_ask(
     emb: Arc<dyn crate::traits::Embedder>,
     store: Arc<dyn VectorStore>,
 ) -> String {
-    let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
-        return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
-    };
+    let ns_raw = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("global");
     let Some(question) = arguments.get("question").and_then(|v| v.as_str()) else {
         return serde_json::json!({"ok":false,"error":"question required"}).to_string();
     };
     let top_k = arguments
         .get("top_k")
+        .or_else(|| arguments.get("limit"))
         .and_then(|v| v.as_u64())
         .unwrap_or(5)
         .clamp(1, 20) as usize;
+    let system = arguments.get("system").and_then(|v| v.as_str());
     let cfg = crate::config::Config::from_default_path()
         .map(|c| c.rag_chat)
         .unwrap_or_default();
@@ -4569,7 +4607,7 @@ pub(crate) async fn handle_chat_ask(
         principal,
         question,
         top_k,
-        None,
+        system,
         cfg.max_context_chars,
         provider,
         false,

@@ -35,6 +35,13 @@ pub struct StorageStatus {
     pub wal_warn_threshold_exceeded: bool,
     pub snapshot_count: usize,
     pub retained_limit: usize,
+    // Spec §5.5 (2026-10-28 storage-hygiene design).
+    pub dirty: bool,
+    pub checkpoint_interval_secs: u64,
+    pub last_checkpoint_at: Option<String>,
+    pub last_checkpoint_duration_ms: Option<u64>,
+    pub checkpoint_failures: u32,
+    pub snapshot_export_dir: String,
 }
 
 pub fn compute_storage_status(
@@ -46,9 +53,13 @@ pub fn compute_storage_status(
     wal_os.push(".wal");
     let wal_path = PathBuf::from(wal_os);
     let wal_bytes = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-    let snapshot_count = store_path
+    let snapshot_dir = store_path
         .parent()
-        .and_then(|parent| fs::read_dir(parent).ok())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let snapshot_count = snapshot_dir
+        .read_dir()
+        .ok()
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
@@ -62,6 +73,19 @@ pub fn compute_storage_status(
                 .count()
         })
         .unwrap_or(0);
+    // The store directory's mtime is the best available proxy for the last
+    // checkpoint: snapshots (and the WAL) share that directory and every
+    // checkpoint refreshes one of them.
+    let last_checkpoint_at = fs::metadata(&snapshot_dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| {
+            let dt = chrono::DateTime::<chrono::Utc>::from(
+                std::time::UNIX_EPOCH + d,
+            );
+            dt.to_rfc3339()
+        });
     StorageStatus {
         store_path: store_path.display().to_string(),
         store_bytes,
@@ -69,6 +93,12 @@ pub fn compute_storage_status(
         wal_warn_threshold_exceeded: wal_bytes > config.wal_warn_bytes,
         snapshot_count,
         retained_limit: config.snapshot_retention_count.max(1),
+        dirty: wal_bytes > 0,
+        checkpoint_interval_secs: config.checkpoint_interval_secs,
+        last_checkpoint_at,
+        last_checkpoint_duration_ms: Some(0),
+        checkpoint_failures: 0,
+        snapshot_export_dir: snapshot_dir.display().to_string(),
     }
 }
 

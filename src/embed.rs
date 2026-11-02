@@ -406,13 +406,34 @@ impl RemoteEmbedder {
         }
 
         let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
-        let embedding = json["data"][0]["embedding"]
+        // Embedding-space identity persistence: a malformed remote vector must
+        // be rejected outright. Substituting 0.0 for non-numeric or non-finite
+        // elements would silently poison cosine distances, and a length that
+        // disagrees with self.dimensions would be unmixable with every stored
+        // vector in the space. Fail-closed (Composite Recommendation #11).
+        let arr = json["data"][0]["embedding"]
             .as_array()
-            .context("Missing embedding in response")?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect();
-
+            .context("Missing embedding in response")?;
+        if arr.is_empty() {
+            anyhow::bail!("remote embedding was empty");
+        }
+        let mut embedding = Vec::with_capacity(arr.len());
+        for v in arr {
+            let val = v
+                .as_f64()
+                .ok_or_else(|| anyhow!("remote embedding contained non-finite or non-numeric value"))?;
+            if !val.is_finite() {
+                anyhow::bail!("remote embedding contained non-finite or non-numeric value");
+            }
+            embedding.push(val as f32);
+        }
+        if self.dimensions > 0 && embedding.len() != self.dimensions {
+            anyhow::bail!(
+                "remote embedding dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                embedding.len()
+            );
+        }
         Ok(embedding)
     }
 }
@@ -563,6 +584,51 @@ mod tests {
         let v = embedder.embed("hello").await.unwrap();
         assert_eq!(v, vec![0.25f32, 0.5, 0.75, 1.0]);
         server.await.unwrap();
+    }
+
+    /// Composite Recommendation #11: a remote response whose embedding is
+    /// non-numeric, non-finite, empty, or dimension-mismatched must fail the
+    /// embed call instead of silently surviving as 0.0 fills.
+    #[tokio::test]
+    async fn remote_embedder_rejects_non_numeric_and_mismatched_embeddings() {
+        let bad_embeddings: Vec<(&str, &str)> = vec![
+            ("non-numeric element", r#"[1.0, "not-a-number", 3.0, 4.0]"#),
+            ("dimension mismatch (expected 4)", r#"[1.0, 2.0, 3.0]"#),
+            ("empty", r#"[]"#),
+        ];
+        for (case, body_vec) in bad_embeddings {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let _ = read_http_request(&mut sock).await;
+                let body =
+                    format!(r#"{{"data":[{{"embedding":{}}}]}}"#, body_vec);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                use tokio::io::AsyncWriteExt;
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            });
+            let embedder = RemoteEmbedder::new(
+                format!("http://{}", addr),
+                "test-key".to_string(),
+                "test-model".to_string(),
+                4,
+            )
+            .unwrap();
+            let err = embedder.embed("hello").await.expect_err(case);
+            assert!(
+                err.to_string().contains("remote embedding"),
+                "case '{}' produced an unexpected error: {}",
+                case,
+                err
+            );
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
