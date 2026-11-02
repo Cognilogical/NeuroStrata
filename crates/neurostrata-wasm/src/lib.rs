@@ -376,6 +376,8 @@ impl WasmEngine {
                 source: edge.source.clone(),
                 relation: edge.relation.clone(),
                 target: edge.target.clone(),
+                valid_from: 0,
+                valid_to: 0,
             });
         }
         let result = related::graph_read_related(

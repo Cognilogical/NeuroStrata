@@ -84,7 +84,7 @@
 ## 🎯 NEXT STEPS
 
 1. Re-verify the full test suite + `git push` gate after the graph-read polish (warning cleanup is complete).
-2. Wire the remaining 2026-10-27 graph-read specs into any non-`related` read paths if the tracker asks for it. (tracked as ns-otuu / neurostrata-otuu)
+2. ✅ All 4 graph-read specs complete (2026-11-02): `src/graph_read/{temporal,prioritized,traversal,propagate}.rs` are implemented and wired into `neurostrata_related` (neurostrata-i3vi, neurostrata-otuu — complete).
 
 ## ⚠️ NOTES
 
