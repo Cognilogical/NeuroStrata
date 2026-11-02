@@ -41,7 +41,7 @@ impl CircuitBreaker {
     pub fn allow_request(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -93,7 +93,7 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         self.last_failure_time.store(now, Ordering::SeqCst);

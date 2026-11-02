@@ -305,7 +305,13 @@ impl JudgmentProvider for LayaOnnxProvider {
                 // token-overlap path instead of aborting the search.
                 let feature_array = match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec())
                 {
-                    Ok(arr) => ort::value::Value::from_array(arr).ok(),
+                    Ok(arr) => match ort::value::Value::from_array(arr) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::warn!("Laya ONNX Value::from_array failed: {e}; using token-overlap fallback");
+                            None
+                        }
+                    },
                     Err(_) => {
                         tracing::warn!("Laya ONNX feature vector could not be shaped (1,2); using token-overlap fallback");
                         None
@@ -421,25 +427,28 @@ fn tokenize_content(content: &str, tokenizer: Option<&tokenizers::Tokenizer>) ->
     if let Some(tok) = tokenizer {
         // When tokenizer.json exists: use tokenizer.encode to produce IDs.
         // We only need deterministic token IDs, so encode and collect token IDs.
-        if let Ok(encoded) = tok.encode(content, false) {
-            for token_id in encoded.get_ids() {
-                ids.insert(*token_id as u32);
+        match tok.encode(content, false) {
+            Ok(encoded) => {
+                for token_id in encoded.get_ids() {
+                    ids.insert(*token_id as u32);
+                }
+                return ids;
+            }
+            Err(e) => {
+                tracing::warn!("Laya tokenizer encode failed: {e}; falling back to whitespace hashing");
             }
         }
-        // If encode fails, fall through to empty set (no tokens added)
-    } else {
-        // Subword/whitespace fallback: split on whitespace and hash each word
-        // with FNV-1a 32-bit so anagrams ("ab" vs "ba") — which a byte-sum
-        // hash collides — get distinct token IDs.
-        for word in content.split_whitespace() {
-            if !word.is_empty() {
-                let mut hash_id: u32 = 2_166_136_261;
-                for &b in word.as_bytes() {
-                    hash_id ^= b as u32;
-                    hash_id = hash_id.wrapping_mul(16_777_619);
-                }
-                ids.insert(hash_id);
+    }
+    // FNV-1a whitespace hashing loop (used directly when no tokenizer,
+    // or as fallback when tokenizer encode fails): split on whitespace and hash.
+    for word in content.split_whitespace() {
+        if !word.is_empty() {
+            let mut hash_id: u32 = 2_166_136_261;
+            for &b in word.as_bytes() {
+                hash_id ^= b as u32;
+                hash_id = hash_id.wrapping_mul(16_777_619);
             }
+            ids.insert(hash_id);
         }
     }
     ids

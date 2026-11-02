@@ -2278,7 +2278,7 @@ pub async fn dry_run_directory(
 
     let walker = ignore::WalkBuilder::new(dir_path).build();
     for result in walker {
-        let entry = match result { Ok(e) => e, Err(_) => continue };
+        let entry = match result { Ok(e) => e, Err(e) => { tracing::warn!("dry_run walk entry error: {e}"); continue; } };
         let path = entry.path();
         let path_str = path.to_string_lossy();
         let mut should_skip = false;
@@ -2294,7 +2294,7 @@ pub async fn dry_run_directory(
         let is_file = entry.file_type().map_or(false, |ft| ft.is_file());
         if !is_file { continue; }
         files += 1;
-        let bytes = match std::fs::read(path) { Ok(b) => b, Err(_) => continue };
+        let bytes = match std::fs::read(path) { Ok(b) => b, Err(e) => { tracing::warn!("dry_run failed to read {}: {e}", path.display()); continue; } };
         let hash = sha256_hex(&bytes);
         file_hashes.entry(hash.clone()).or_default().push(path_str.to_string());
 

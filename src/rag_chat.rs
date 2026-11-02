@@ -333,11 +333,9 @@ impl OpenAiCompatibleProvider {
                 Ok(v) => {
                     if v.trim().is_empty() {
                         tracing::warn!(
-                            "RAG chat API key env var '{}' is set but empty",
+                            "RAG chat API key env var '{}' is set but empty (whitespace only); returning None",
                             env_name
                         );
-                    }
-                    if v.is_empty() {
                         None
                     } else {
                         Some(v)

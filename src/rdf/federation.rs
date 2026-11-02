@@ -455,8 +455,33 @@ pub async fn handle_remote_sparql_request(
         spareval::QueryResults::Boolean(b) => {
             body = format!(r#"{{"head":{{"vars":[]}},"boolean":{}}}"#, b);
         }
-        spareval::QueryResults::Graph(_) => {
-            body = "{\"head\":{\"vars\":[]},\"results\":{\"bindings\":[]}}".to_string();
+        spareval::QueryResults::Graph(mut triples) => {
+            let mut bindings: Vec<serde_json::Value> = Vec::new();
+            while let Some(item) = triples.next() {
+                if bindings.len() >= config.max_solutions {
+                    truncated = true;
+                    break;
+                }
+                if let Ok(triple) = item {
+                    let mut binding = serde_json::Map::new();
+                    binding.insert(
+                        "s".to_string(),
+                        term_to_json(&oxrdf::Term::from(triple.subject)),
+                    );
+                    binding.insert(
+                        "p".to_string(),
+                        term_to_json(&oxrdf::Term::from(triple.predicate)),
+                    );
+                    binding.insert("o".to_string(), term_to_json(&triple.object));
+                    bindings.push(serde_json::Value::Object(binding));
+                }
+            }
+            count = bindings.len();
+            body = serde_json::json!({
+                "head": { "vars": ["s", "p", "o"] },
+                "results": { "bindings": bindings }
+            })
+            .to_string();
         }
     }
 
@@ -501,9 +526,9 @@ impl spareval::DefaultServiceHandler for HttpServiceHandler {
         &self,
         service_name: &oxrdf::NamedNode,
         pattern: &GraphPattern,
-        _base_iri: Option<&oxiri::Iri<String>>,
+        base_iri: Option<&oxiri::Iri<String>>,
     ) -> Result<spareval::QuerySolutionIter<'static>, FederationError> {
-        self.execute(service_name, pattern)
+        self.execute(service_name, pattern, base_iri)
     }
 }
 
@@ -514,8 +539,8 @@ impl HttpServiceHandler {
         &self,
         service_name: &oxrdf::NamedNode,
         pattern: &GraphPattern,
+        base_iri: Option<&oxiri::Iri<String>>,
     ) -> Result<spareval::QuerySolutionIter<'static>, FederationError> {
-        // Look up peer by endpoint IRI.
         let endpoint_str = service_name.as_str();
         let peer = self
             .config
@@ -531,25 +556,21 @@ impl HttpServiceHandler {
                 )));
             }
         };
-
-        // Resolve bearer token from env.
         let token = std::env::var(&peer.bearer_token_env)
             .map_err(|_| FederationError::Denied("bearer token env missing".into()))?;
-
-        // Format inner query: SELECT * WHERE { <pattern> }
-        // GraphPattern implements Display and prints valid SPARQL syntax.
-        let inner_str = format!("SELECT * WHERE {{ {} }}", pattern);
+        let inner_str = match base_iri {
+            Some(iri) => format!("BASE <{}> SELECT * WHERE {{ {} }}", iri.as_str(), pattern),
+            None => format!("SELECT * WHERE {{ {} }}", pattern),
+        };
         let url = format!(
             "{}?namespace={}",
             peer.endpoint_url.trim_end_matches('/'),
             peer.remote_namespace
         );
-
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(self.config.timeout_ms))
             .build()
             .map_err(|e| FederationError::Network(format!("{}", e)))?;
-
         let send_result = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
@@ -567,7 +588,6 @@ impl HttpServiceHandler {
             }
             Err(e) => return Err(FederationError::Network(format!("{}", e))),
         };
-
         let status = resp.status();
         if !status.is_success() {
             return Err(FederationError::Network(format!(
@@ -575,16 +595,13 @@ impl HttpServiceHandler {
                 status
             )));
         }
-
         let body_bytes = resp
             .bytes()
             .map_err(|e| FederationError::Network(format!("{}", e)))?;
-
         let parser = sparesults::QueryResultsParser::from_format(sparesults::QueryResultsFormat::Json);
         let output = parser
             .for_slice(&body_bytes)
             .map_err(|e| FederationError::Parse(format!("{}", e)))?;
-
         match output {
             sparesults::SliceQueryResultsParserOutput::Solutions(sol_parser) => {
                 let variables: std::sync::Arc<[oxrdf::Variable]> =

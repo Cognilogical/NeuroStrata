@@ -717,8 +717,12 @@ pub fn execute(
             h.block_on(execute_async(store, namespace, principal, query, variables))
         })
     } else {
-        // Fallback: synchronous approximation (tests may not hit this path)
-        execute_on_records(&[], &std::collections::HashMap::new(), namespace, principal, query, variables)
+        // Fallback: build a current-thread runtime or use empty records.
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            rt.block_on(execute_async(store, namespace, principal, query, variables))
+        } else {
+            execute_on_records(&[], &std::collections::HashMap::new(), namespace, principal, query, variables)
+        }
     }
 }
 
