@@ -145,9 +145,17 @@ pub fn compute_storage_status(
         dirty: wal_bytes > 0,
         checkpoint_interval_secs: config.checkpoint_interval_secs,
         last_checkpoint_at,
-        last_checkpoint_duration_ms: Some(
-            LAST_CHECKPOINT_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed),
-        ),
+        // Only a checkpoint that actually happened in this process claims a
+        // duration: before the first checkpoint the atomic reads 0, and
+        // reporting `Some(0)` would be a fabricated metric. Mirrors the
+        // `last_checkpoint_at` guard above, which falls back to the
+        // directory mtime for the timestamp.
+        last_checkpoint_duration_ms: if LAST_CHECKPOINT_AT_SECS.load(std::sync::atomic::Ordering::Relaxed) > 0
+        {
+            Some(LAST_CHECKPOINT_DURATION_MS.load(std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        },
         checkpoint_failures: CHECKPOINT_FAILURES.load(std::sync::atomic::Ordering::Relaxed),
         snapshot_export_dir: snapshot_dir.display().to_string(),
     }

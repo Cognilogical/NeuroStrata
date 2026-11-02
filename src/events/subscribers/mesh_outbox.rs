@@ -22,9 +22,26 @@ use crate::synaptic_mesh::outbox::{
 };
 use crate::traits::MemoryPayload;
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
+
+/// Whether a memory is a derived artifact (KGE vectors, community labels,
+/// inferred edges) that must stay local/versioned derived data and never
+/// cross the mesh. The `derived` marker is accepted in every shape it is
+/// written in: boolean `true`, integer `1`, or the strings `"true"`/`"1"`
+/// (case-insensitive).
+fn is_derived_metadata(meta: &JsonValue) -> bool {
+    meta.get("derived")
+        .map(|v| {
+            v.as_bool().unwrap_or(false)
+                || v.as_i64() == Some(1)
+                || v.as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("true") || s.trim() == "1")
+        })
+        .unwrap_or(false)
+}
 
 /// Tees shareable mutations into the outbox and wakes the worker.
 pub struct MeshOutbox {
@@ -173,20 +190,8 @@ impl MeshOutbox {
             return None;
         }
         // Derived artifacts (KGE vectors, community labels, inferred edges)
-        // stay local/versioned derived data and never cross the mesh. The
-        // marker is accepted in every shape it is written in: boolean `true`,
-        // integer `1`, or the strings `"true"`/`"1"` (case-insensitive).
-        let is_derived = payload
-            .metadata
-            .get("derived")
-            .map(|v| {
-                v.as_bool().unwrap_or(false)
-                    || v.as_i64() == Some(1)
-                    || v.as_str()
-                        .is_some_and(|s| s.eq_ignore_ascii_case("true") || s.trim() == "1")
-            })
-            .unwrap_or(false);
-        if is_derived {
+        // stay local/versioned derived data and never cross the mesh.
+        if is_derived_metadata(&payload.metadata) {
             return None;
         }
         Some(OutboxEntry {
@@ -638,7 +643,7 @@ impl MeshOutbox {
                 }
                 // Derived artifacts (KGE vectors, community labels, inferred
                 // edges) stay local/versioned derived data, mirroring `entry()`.
-                if payload.metadata.get("derived").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if is_derived_metadata(&payload.metadata) {
                     continue;
                 }
                 // Eligibility gate (worker also re-checks, but skip early).

@@ -1,4 +1,8 @@
 //! Upgraded search filters and compact renderer helpers.
+//!
+//! Ranking here works on raw L2 distances (lower = better). Shape scoring
+//! SUBTRACTS a fixed gain from that distance, so a boosted fact simply lands
+//! closer to its query: `score = (distance - decision_shape_boost(...)).max(0.0)`.
 
 use serde_json::Value;
 
@@ -44,11 +48,14 @@ pub fn fact_shape_matches(metadata: &Value, shape: &str) -> bool {
     }
 }
 
-/// The additive score bonus a `decision`-shaped fact earns so decisions
-/// surface above equivalently-similar unshaped facts.
+/// The distance subtraction a `decision`-shaped fact earns: it is taken off
+/// the raw L2 distance (lower distance = better rank), so a decision-shaped
+/// fact surfaces above an equivalently-similar unshaped fact.
 pub const DECISION_SHAPE_GAIN: f32 = 0.03;
 
-/// Additive search boost for decision-shaped facts (spec: decision shape gain).
+/// Distance-reducing boost for decision-shaped facts (spec: decision shape
+/// gain). The caller subtracts the returned value from the raw L2 distance
+/// and clamps at zero; lower distance = better rank.
 pub fn decision_shape_boost(metadata: &Value) -> f32 {
     if fact_shape_matches(metadata, "decision") {
         DECISION_SHAPE_GAIN

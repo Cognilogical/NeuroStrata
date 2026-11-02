@@ -91,17 +91,23 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
     // Write default to file so user can edit it (only when the file is absent
     // or was an empty, valid list)
     if let Ok(json_content) = serde_json::to_string_pretty(&default_models) {
-        let _ = fs::write(&config_path, json_content);
+        if let Err(e) = fs::write(&config_path, json_content) {
+            tracing::warn!(
+                "Failed to write default embedder config to {}: {e}",
+                config_path.display()
+            );
+        }
     }
 
     Ok(default_models)
 }
 
-fn find_existing_cache_dir() -> PathBuf {
+fn find_existing_cache_dir() -> Result<PathBuf> {
     // Same reason as above: $HOME is absent on Windows, and an empty home turns
     // every candidate below into a relative path, which is how a 523 MB model
     // cache ends up inside the caller's working directory.
-    let home_path = dirs::home_dir().unwrap_or_default();
+    let home_path = dirs::home_dir()
+        .context("Could not find home directory ($HOME / USERPROFILE unset)")?;
 
     // Adopt the Neuro cache pattern: share models across all Neuro* tools
     let primary_neuro_cache = home_path.join(".cache/neuro/models/fastembed");
@@ -120,11 +126,11 @@ fn find_existing_cache_dir() -> PathBuf {
                 .map(|mut i| i.next().is_some())
                 .unwrap_or(false)
         {
-            return dir; // Return the first valid existing cache directory
+            return Ok(dir); // Return the first valid existing cache directory
         }
     }
 
-    primary_neuro_cache
+    Ok(primary_neuro_cache)
 }
 
 /// The model this process is configured to use: the one NEUROSTRATA_MODEL names
@@ -282,7 +288,7 @@ impl FastEmbedder {
                 }
             };
 
-        let cache_dir = find_existing_cache_dir();
+        let cache_dir = find_existing_cache_dir()?;
 
         if !cache_dir.exists() {
             fs::create_dir_all(&cache_dir)

@@ -1,6 +1,7 @@
 //! In-house multi-field lexical engine.
 //!
-//! This module is deliberately `std`-only: the native store and the
+//! This module is deliberately free of `crate::` dependencies (using only
+//! `std`, `serde`, and `tracing`): the native store and the
 //! `crates/neurostrata-wasm` read-only engine compile it from this path, so it
 //! must not grow a `crate::` dependency. The ranking rule is one auditable
 //! BM25-style formula (see `SearchOptions` and `bm25_term`), not a fusion of
@@ -257,8 +258,10 @@ impl LexicalIndex {
 
     pub fn add(&mut self, doc: LexicalDoc) {
         // Non-recall material never enters the index → keeps BM25 N/df/avgdl
-        // computed over visible recall rows only (§5.6 filtering at build time).
+        // computed over visible recall rows only (§5.6 filtering at build time);
+        // say so at debug level so a silent skip is diagnosable.
         if doc.structural || doc.registry || doc.conflicting {
+            tracing::debug!("skipping non-indexable doc {} in LexicalIndex::add", doc.id);
             return;
         }
         let namespace = doc.namespace.clone();

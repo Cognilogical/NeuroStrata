@@ -163,6 +163,15 @@ fn is_loopback_host(value: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost")
 }
 
+/// Whether an `Origin` header value names this machine. Only a loopback
+/// authority passes: an Origin without a scheme/authority separator (e.g.
+/// `null`) and any non-loopback authority are refused. The scheme itself is
+/// not checked -- the rebinding defense is the hostname, same as Host.
+fn is_allowed_origin(origin: &str) -> bool {
+    let authority = origin.split("://").nth(1).unwrap_or(origin);
+    is_loopback_host(authority)
+}
+
 fn forbidden(body: &'static str) -> axum::response::Response {
     axum::response::Response::builder()
         .status(axum::http::StatusCode::FORBIDDEN)
@@ -207,22 +216,26 @@ async fn auth_middleware(
     let headers = req.headers();
 
     // Rules 1-2 bind every route, /health included: a rebinding page is
-    // refused before any handler runs.
-    if let Some(host) = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-    {
-        if !is_loopback_host(host) {
-            return forbidden("forbidden -- Host must name loopback");
+    // refused before any handler runs. A header that is not valid UTF-8 is
+    // treated as a foreign host/origin, never silently skipped.
+    if let Some(raw_host) = headers.get(axum::http::header::HOST) {
+        match raw_host.to_str() {
+            Ok(host) => {
+                if !is_loopback_host(host) {
+                    return forbidden("forbidden -- Host must name loopback");
+                }
+            }
+            Err(_) => return forbidden("forbidden -- Host must name loopback"),
         }
     }
-    if let Some(origin) = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-    {
-        let authority = origin.split("://").nth(1).unwrap_or(origin);
-        if !is_loopback_host(authority) {
-            return forbidden("forbidden -- Origin must name loopback");
+    if let Some(raw_origin) = headers.get(axum::http::header::ORIGIN) {
+        match raw_origin.to_str() {
+            Ok(origin) => {
+                if !is_allowed_origin(origin) {
+                    return forbidden("forbidden -- Origin must name loopback");
+                }
+            }
+            Err(_) => return forbidden("forbidden -- Origin must name loopback"),
         }
     }
 
@@ -669,7 +682,14 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
 
     let mesh_dir = match MeshStorage::read_pointer(project_root) {
         Ok(Some((_mesh_id, dir, _remote))) => dir,
-        _ => return,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                "mesh pointer read failed for {}: {e}",
+                project_root.display()
+            );
+            return;
+        }
     };
     let node_id = resolve_node_id();
     let mesh = match MeshStorage::open(&mesh_dir) {
@@ -860,8 +880,8 @@ pub(crate) async fn start_daemon_on(
     // caller still waiting on the response (bead neurostrata-3fi.6.4). Out here
     // a failure costs a retry instead of a request, and the write is already in
     // the log either way.
-    // Snapshot/WAL hygiene knobs from config; defaults when unusable.
-    let hygiene: crate::storage::StorageHygieneConfig = crate::config::Config::from_default_path()
+    // Read-only hygiene knobs: load without materializing a config file.
+    let hygiene: crate::storage::StorageHygieneConfig = crate::config::Config::load()
         .map(|c| c.storage_hygiene)
         .unwrap_or_default();
 
@@ -1015,16 +1035,15 @@ async fn handle_get_graph(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let requested = query.namespace.unwrap_or_else(|| "global".to_string());
     let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
-    let config = crate::config::Config::from_default_path()
+    let config = crate::config::Config::load()
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let anchor_root = query.anchor_root.as_deref().map(Path::new);
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, query.source_id.as_deref());
 
-    // Using export_graph here temporarily or implement native LadybugDB querying here
-    // For now, let's just use export_graph (which gets everything) and filter by namespace
-    // In a real refactor, we would add get_graph_by_namespace to VectorStore.
-    // Wait! VectorStore has export_graph() returning the whole graph!
+    // VectorStore exposes no namespaced graph read, so this serves
+    // `export_graph()` (the whole graph) and filters by namespace. Adding a
+    // `get_graph_by_namespace` to VectorStore would drop the filter step.
     let data = state
         .vector_store
         .export_graph(
@@ -1149,7 +1168,7 @@ async fn handle_export_graph(
     State(state): State<AppState>,
     Json(req): Json<ExportGraphReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let config = crate::config::Config::from_default_path()
+    let config = crate::config::Config::load()
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let anchor_root = req.anchor_root.as_deref().map(Path::new);
     let anchor_override =
@@ -1532,12 +1551,13 @@ async fn handle_bus_metrics(State(state): State<AppState>) -> impl axum::respons
 }
 
 async fn handle_shutdown(State(state): State<AppState>) -> &'static str {
-    // A second caller finds None here; stopping twice is not an error.
+    // A second caller finds None here; stopping twice is not an error. The
+    // mutex is poison-tolerant so a panicked holder cannot wedge /shutdown.
     let sender = state
         .shutdown
         .lock()
-        .ok()
-        .and_then(|mut guard| guard.take());
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     match sender {
         Some(tx) => {
             if tx.send(()).is_err() {

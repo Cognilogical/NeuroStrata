@@ -6,7 +6,12 @@ pub fn ns_predicate(name: &str) -> String {
     format!("{}{}", NS, name)
 }
 
-pub fn memory_iri(id: &str, _concept_iri: Option<&str>) -> String {
+pub fn memory_iri(id: &str, concept_iri: Option<&str>) -> String {
+    if let Some(c) = concept_iri.map(str::trim).filter(|s| !s.is_empty()) {
+        if c.starts_with("urn:") || c.starts_with("http://") || c.starts_with("https://") {
+            return c.to_string();
+        }
+    }
     format!("urn:neurostrata:memory:{}", id)
 }
 

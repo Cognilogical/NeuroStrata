@@ -5416,8 +5416,16 @@ fn edge_hits_from_rows(
         let id = format!("{}", row[1]);
         let content = format!("{}", row[2]);
         let memory_type = format!("{}", row[3]);
-        let metadata: Value =
-            serde_json::from_str(&format!("{}", row[4])).unwrap_or(Value::Null);
+        let metadata_str = format!("{}", row[4]);
+        let metadata: Value = match serde_json::from_str(&metadata_str) {
+            Ok(v) => v,
+            Err(e) => {
+                if !metadata_str.trim().is_empty() {
+                    tracing::warn!("corrupt metadata JSON in store row: {e}");
+                }
+                Value::Null
+            }
+        };
 
         if !memory_types.is_empty() && !memory_types.iter().any(|t| t == &memory_type) {
             continue;
@@ -5647,8 +5655,16 @@ fn add_metadata_fallback_conn(
         let id = format!("{}", row[0]);
         let content = format!("{}", row[1]);
         let memory_type = format!("{}", row[2]);
-        let metadata: Value =
-            serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+        let metadata_str = format!("{}", row[3]);
+        let metadata: Value = match serde_json::from_str(&metadata_str) {
+            Ok(v) => v,
+            Err(e) => {
+                if !metadata_str.trim().is_empty() {
+                    tracing::warn!("corrupt metadata JSON in store row: {e}");
+                }
+                Value::Null
+            }
+        };
         if is_archived(&metadata)
             || is_retired_at(&metadata, now)
             || is_mesh_conflicting(&metadata)
@@ -5945,7 +5961,16 @@ fn fetch_related_subgraph(
         let id = format!("{}", row[0]);
         let memory_type = format!("{}", row[1]);
         let content = format!("{}", row[2]);
-        let metadata: Value = serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+        let metadata_str = format!("{}", row[3]);
+        let metadata: Value = match serde_json::from_str(&metadata_str) {
+            Ok(v) => v,
+            Err(e) => {
+                if !metadata_str.trim().is_empty() {
+                    tracing::warn!("corrupt metadata JSON in store row: {e}");
+                }
+                Value::Null
+            }
+        };
         seed_id = Some(id.clone());
         nodes.insert(
             id.clone(),
@@ -5967,8 +5992,16 @@ fn fetch_related_subgraph(
             let id = format!("{}", row[0]);
             let memory_type = format!("{}", row[1]);
             let content = format!("{}", row[2]);
-            let metadata: Value =
-                serde_json::from_str(&format!("{}", row[3])).unwrap_or(Value::Null);
+            let metadata_str = format!("{}", row[3]);
+            let metadata: Value = match serde_json::from_str(&metadata_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    if !metadata_str.trim().is_empty() {
+                        tracing::warn!("corrupt metadata JSON in store row: {e}");
+                    }
+                    Value::Null
+                }
+            };
             let prefer = match (candidate.as_ref().map(|c| c.1.as_str()), memory_type.as_str()) {
                 (_, "file") => true,
                 (Some("file"), _) => false,
@@ -6026,8 +6059,16 @@ fn fetch_related_subgraph(
                 let neighbor_ns = format!("{}", row[3]);
                 let neighbor_type = format!("{}", row[4]);
                 let neighbor_content = format!("{}", row[5]);
-                let neighbor_meta: Value =
-                    serde_json::from_str(&format!("{}", row[6])).unwrap_or(Value::Null);
+                let neighbor_meta_str = format!("{}", row[6]);
+                let neighbor_meta: Value = match serde_json::from_str(&neighbor_meta_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !neighbor_meta_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
                 let valid_from = format!("{}", row[7]).parse::<i64>().unwrap_or(0);
                 let valid_to = format!("{}", row[8]).parse::<i64>().unwrap_or(0);
                 if !allowed.contains(relation.as_str()) {
@@ -6076,8 +6117,16 @@ fn fetch_related_subgraph(
                 let neighbor_ns = format!("{}", row[3]);
                 let neighbor_type = format!("{}", row[4]);
                 let neighbor_content = format!("{}", row[5]);
-                let neighbor_meta: Value =
-                    serde_json::from_str(&format!("{}", row[6])).unwrap_or(Value::Null);
+                let neighbor_meta_str = format!("{}", row[6]);
+                let neighbor_meta: Value = match serde_json::from_str(&neighbor_meta_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !neighbor_meta_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
                 let valid_from = format!("{}", row[7]).parse::<i64>().unwrap_or(0);
                 let valid_to = format!("{}", row[8]).parse::<i64>().unwrap_or(0);
                 if !allowed.contains(relation.as_str()) {
@@ -6167,7 +6216,13 @@ impl crate::traits::IntakeStore for LadybugStore {
         };
 
         // Serialize detected intents for storage
-        let intents_json = serde_json::to_string(&detected_intents).unwrap_or_default();
+        let intents_json = match serde_json::to_string(&detected_intents) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to serialize detected_intents for storage: {e}");
+                String::new()
+            }
+        };
         let safe_intents = escape_ladybug_string(&intents_json);
         let safe_raw_text = escape_ladybug_string(&text);
         let safe_receipt_id = escape_ladybug_string(&receipt_id);
@@ -6202,8 +6257,21 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let safe_created = escape_ladybug_string(&cand.created_at);
                 let safe_updated = escape_ladybug_string(&cand.updated_at);
                 let safe_kind = escape_ladybug_string(&cand.candidate_kind);
-                let safe_payload = escape_ladybug_string(&serde_json::to_string(&cand.payload).unwrap_or_else(|_| "null".to_string()));
-                let safe_span = escape_ladybug_string(&cand.source_span.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()).unwrap_or_default());
+                let safe_payload = escape_ladybug_string(
+                    &serde_json::to_string(&cand.payload).unwrap_or_else(|e| {
+                        tracing::warn!("failed to serialize intake candidate payload: {e}");
+                        "null".to_string()
+                    }),
+                );
+                let safe_span = escape_ladybug_string(
+                    &cand.source_span
+                        .as_ref()
+                        .map(|v| serde_json::to_string(v).unwrap_or_else(|e| {
+                            tracing::warn!("failed to serialize intake candidate source_span: {e}");
+                            String::new()
+                        }))
+                        .unwrap_or_default(),
+                );
                 let safe_fp = escape_ladybug_string(&cand.extractor_fingerprint.clone().unwrap_or_default());
                 let safe_conf = cand.confidence.unwrap_or(0.0);
 
@@ -6467,7 +6535,9 @@ impl crate::traits::IntakeStore for LadybugStore {
                 crate::task::intake::Disposition::Created | crate::task::intake::Disposition::Linked
             ) {
                 if safe_task_id.is_empty() {
-                    return Err(anyhow::anyhow!("task_id is required for 'created' disposition"));
+                    return Err(anyhow::anyhow!(
+                        "task_id is required for 'created'/'linked' disposition"
+                    ));
                 }
                 let task_check = format!(
                     "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' AND m.memory_type = 'task' RETURN m.id",

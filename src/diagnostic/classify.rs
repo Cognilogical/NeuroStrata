@@ -51,7 +51,15 @@ pub fn classify_namespace_targets(memories: &[crate::traits::SearchResult]) -> T
                             resolved_id
                         );
                     }
-                    summary.declared_targets.push(edge.target_id);
+                    // The summary reports the id a normalization pass would
+                    // write — the resolved one when resolution produced it,
+                    // the raw target otherwise — so downstream consumers
+                    // (the AC4 precheck) name the canonical fixable id.
+                    if !resolved_id.is_empty() {
+                        summary.declared_targets.push(resolved_id);
+                    } else {
+                        summary.declared_targets.push(edge.target_id);
+                    }
                 }
                 TargetClass::Orphaned => {
                     summary.orphaned += 1;
@@ -176,7 +184,10 @@ mod tests {
         let s = classify_namespace_targets(&memories);
         assert_eq!(s.materialized, 1);
         assert_eq!(s.declared, 1);
-        assert_eq!(s.declared_targets, vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            s.declared_targets,
+            vec!["NeuroStrata::src/lib.rs".to_string()]
+        );
         assert_eq!(s.orphaned, 1);
         assert_eq!(s.orphaned_targets, vec!["docs/absent.md".to_string()]);
     }

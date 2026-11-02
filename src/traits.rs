@@ -48,9 +48,11 @@ pub struct MemoryPayload {
 /// A memory is an assertion until it names its origin, so `source` is the
 /// difference between a claim you can audit and one you can only take on
 /// faith. It is deliberately total over every shape the field legitimately
-/// takes: absent, JSON null, and a blank string all read as unsourced, while a
-/// non-empty string ("owner 2026-10-08") or a structured object
-/// ({kind, ref, captured_at}) read as sourced.
+/// takes: absent, JSON null, and a blank string all read as unsourced, while
+/// a non-empty string ("owner 2026-10-08") or a non-empty JSON object
+/// ({kind, ref, captured_at}) read as sourced. Numbers, booleans, and arrays
+/// carry no provenance semantics, so they read as unsourced too (`{"source":
+/// 42}` is not an origin).
 ///
 /// The task gate fails rules without one and the search ranker rewards them.
 /// They must agree on that line, so both call this rather than each carrying a
@@ -59,7 +61,10 @@ pub struct MemoryPayload {
 pub fn has_source(metadata: &Value) -> bool {
     metadata
         .get("source")
-        .map(|s| !s.is_null() && (s.as_str().map(|x| !x.trim().is_empty()).unwrap_or(true)))
+        .map(|s| {
+            s.as_str().is_some_and(|x| !x.trim().is_empty())
+                || s.as_object().is_some_and(|o| !o.is_empty())
+        })
         .unwrap_or(false)
 }
 
@@ -852,9 +857,10 @@ mod tests {
     }
 
     /// The provenance line the gate enforces and the ranker rewards. Every shape
-    /// the field legitimately takes has to land on the right side of it, and a
-    /// blank has to be indistinguishable from absent -- otherwise padding a rule
-    /// with `"source": ""` would satisfy neither.
+    /// the field legitimately takes has to land on the right side of it: a
+    /// blank has to be indistinguishable from absent (padding with
+    /// `"source": ""` must not satisfy the gate), and number/boolean/array
+    /// sources carry no provenance.
     #[test]
     fn has_source_covers_every_shape_the_field_takes() {
         for absent in [json!({}), json!({ "kind": "rule" })] {
@@ -868,17 +874,20 @@ mod tests {
             json!({ "source": null }),
             json!({ "source": "" }),
             json!({ "source": "  " }),
+            json!({ "source": 42 }),
+            json!({ "source": true }),
+            json!({ "source": [] }),
+            json!({ "source": ["a"] }),
         ] {
             assert!(
                 !has_source(&blank),
-                "blank source is not provenance: {}",
+                "shapeless source is not provenance: {}",
                 blank
             );
         }
         for real in [
             json!({ "source": "owner 2026-10-08" }),
             json!({ "source": { "kind": "derived", "ref": "task-wiot", "captured_at": "2026-10-09" } }),
-            json!({ "source": ["a"] }),
         ] {
             assert!(has_source(&real), "real source is provenance: {}", real);
         }

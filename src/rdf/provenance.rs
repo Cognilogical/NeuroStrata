@@ -91,16 +91,29 @@ pub fn extract_node_provenance(metadata: &serde_json::Value, default_generation:
         None
     };
     let source_fallback = if source.is_none() {
-        metadata.get("source").map(|v| {
+        metadata.get("source").and_then(|v| {
             if let Some(s) = v.as_str() {
-                String::from(s)
+                Some(String::from(s))
             } else if let Some(obj) = v.as_object() {
-                let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                let r = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-                let cap = obj.get("captured_at").and_then(|v| v.as_str()).unwrap_or("");
-                format!("{}:{}:{}", kind, r, cap)
+                if obj.is_empty() {
+                    // Nothing readable at all: leave `source` unset rather
+                    // than inventing a blank-but-present source string.
+                    None
+                } else {
+                    let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    let r = obj.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                    let cap = obj.get("captured_at").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(if kind.is_empty() && r.is_empty() && cap.is_empty() {
+                        // Structured source without the usual {kind, ref,
+                        // captured_at} shape: serialize the object instead of
+                        // emitting the meaningless "::" triple-empty form.
+                        serde_json::to_string(obj).unwrap_or_default()
+                    } else {
+                        format!("{}:{}:{}", kind, r, cap)
+                    })
+                }
             } else {
-                v.to_string()
+                Some(v.to_string())
             }
         })
     } else {
@@ -186,20 +199,27 @@ pub fn validate_node_provenance(target: &str, prov: &NodeProvenance) -> Vec<Prov
 }
 
 pub fn validate_assertion_iri(iri: &str) -> bool {
-    if !iri.starts_with("urn:neurostrata:assertion:") {
+    // Full shape: urn : neurostrata : assertion : ns : (memory|edge) : ...
+    // Anchor by position so a namespace or ID named "memory" or "edge"
+    // elsewhere in the IRI cannot confuse the validator.
+    let parts: Vec<&str> = iri.split(':').collect();
+    if parts.get(0) != Some(&"urn")
+        || parts.get(1) != Some(&"neurostrata")
+        || parts.get(2) != Some(&"assertion")
+    {
         return false;
     }
-    let rest = &iri["urn:neurostrata:assertion:".len()..];
-    let parts: Vec<&str> = rest.split(':').collect();
-    if parts.contains(&"memory") {
-        // Expected: ns, memory, id, slug, disc, version => 6 after prefix, spec allows 7 (tolerance)
-        return parts.len() >= 6;
+    let tail = &parts[3..];
+    let has_g = tail.iter().any(|p| p.starts_with('g') && p.len() > 1);
+    let has_v = tail.iter().any(|p| p.starts_with('v') && p.len() > 1);
+    if tail.get(1) == Some(&"memory") {
+        // Expected: ns, "memory", id, slug, disc, version => 6 after prefix,
+        // spec allows 7 (tolerance)
+        return tail.len() >= 6;
     }
-    if parts.contains(&"edge") {
-        // Expected: ns, edge, rel, from, to, g..., v... => 6+ after prefix
-        let has_g = parts.iter().any(|p| p.starts_with('g') && p.len() > 1);
-        let has_v = parts.iter().any(|p| p.starts_with('v') && p.len() > 1);
-        return parts.len() >= 6 && has_g && has_v;
+    if tail.get(1) == Some(&"edge") {
+        // Expected: ns, "edge", rel, from, to, g..., v... => 6+ after prefix
+        return tail.len() >= 6 && has_g && has_v;
     }
     false
 }
@@ -498,6 +518,13 @@ pub fn project_edge_rdf_star(
 }
 
 pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: bool) -> Result<String, String> {
+    if !matches!(
+        format,
+        "turtle-star" | "trig-star" | "n-triples-star" | "n-quads-star"
+    ) {
+        return Err(format!("unsupported RDF-star format: {format}"));
+    }
+
     let mut sorted: Vec<&oxrdf::Quad> = quads.iter().collect();
     sorted.sort_by(|a, b| {
         let a_g = a.graph_name.to_string();
@@ -552,7 +579,20 @@ pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: b
     // when graphs are preserved).
     let mut serializer = oxttl::NQuadsSerializer::new().for_writer(Vec::new());
     for q in sorted {
-        serializer.serialize_quad(q.as_ref()).map_err(|e| format!("serialize: {}", e))?;
+        // `flatten_graphs` also applies to n-quads-star: strip the graph name
+        // so every quad lands in the default graph.
+        let graph_name = if flatten_graphs {
+            GraphName::DefaultGraph
+        } else {
+            q.graph_name.clone()
+        };
+        let flattened = Quad {
+            subject: q.subject.clone(),
+            predicate: q.predicate.clone(),
+            object: q.object.clone(),
+            graph_name,
+        };
+        serializer.serialize_quad(flattened.as_ref()).map_err(|e| format!("serialize: {}", e))?;
     }
     let bytes = serializer.finish();
     String::from_utf8(bytes).map_err(|_| "utf8".to_string())

@@ -131,6 +131,9 @@ pub async fn process_mcp_request(
                                 "domain": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Optional category or domain(s) this rule belongs to. Stored normalized to lowercase-kebab slug(s)." },
                                 "register_domain": { "type": "boolean", "description": "Set to true ONLY if the domain is genuinely new for this namespace; the registry rejects any other unregistered domain." },
                                 "related_to": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory IDs this rule connects to, forming a knowledge graph edge." },
+                                "extract_entities": { "type": "boolean", "description": "Extract entity candidates via GLiNER when enabled." },
+                                "shacl_enforce": { "type": "boolean", "description": "Reject writes that violate SHACL shapes." },
+                                "include_rdf_projection": { "type": "boolean", "description": "Include projected RDF quad count in the response." },
                                 "metadata": { "type": "object", "description": "Optional dictionary with Bi-Directional Anchors" }
                             },
                             "required": ["content", "namespace", "project_root"]
@@ -300,14 +303,15 @@ pub async fn process_mcp_request(
                                 "prioritized": { "type": "boolean", "description": "Rank the page by canonical edge weights (GOVERNS > SUPERSEDES > EXTRACTED_FROM > RELATES_TO/CONTAINS > DEPENDS_ON)." },
                                 "cross_namespace": { "type": "boolean", "description": "Allow hops that leave the home namespace. Default false." },
                                 "namespace_allowlist": { "type": "array", "items": { "type": "string" }, "description": "Target namespaces permitted when cross_namespace is true. Empty means all." },
-                                "include_propagated_domains": { "type": "boolean", "description": "Attach bounded domain propagation from the returned seed nodes (GOVERNS/CONTAINS, default 3 hops)." }
+                                "include_propagated_domains": { "type": "boolean", "description": "Attach bounded domain propagation from the returned seed nodes (GOVERNS/CONTAINS, default 3 hops)." },
+                                "closure_governs": { "type": "boolean", "description": "When true, compute transitive GOVERNS closure over the seed." }
                             },
                             "required": ["namespace", "id"]
                         }
                     },
                     {
                         "name": "neurostrata_supersede_memory",
-                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced. This is the only tool on this surface that changes an existing memory.",
+                        "description": "Correct a memory that is wrong or out of date. Stores your new text as a new memory and retires the old one, which keeps its original wording as history and stops being returned by search. Re-embeds, so search matches the new wording and not the words you replaced.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -562,7 +566,7 @@ pub async fn process_mcp_request(
                     },
                     {
                         "name": "neurostrata_archive_memory",
-                        "description": "Mark a memory as archived by writing a tombstone beside it. The row keeps its content, id and metadata; archived is merged in rather than replacing what it was there. Metadata-only: no retrieval path filters on it yet, so an archived memory still appears in search_memory in 1.8.0.",
+                        "description": "Mark a memory as archived by writing a tombstone beside it. The row keeps its content, id and metadata; archived is merged in rather than replacing what it was there. Retrieval paths filter archived rows unless include_archived is true.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -646,7 +650,11 @@ pub async fn process_mcp_request(
                                 "format": { "type": "string", "enum": ["json", "csv", "tsv"], "description": "Serialization format for SELECT results. Defaults to json." },
                                 "namespace": { "type": "string", "description": "The namespace to query against. Defaults to the configured namespace." },
                                 "include_retired": { "type": "boolean", "description": "Include retired memories. Defaults to false." },
-                                "include_archived": { "type": "boolean", "description": "Include archived memories. Defaults to false." }
+                                "include_archived": { "type": "boolean", "description": "Include archived memories. Defaults to false." },
+                                "timeout_ms": { "type": "integer", "description": "Query timeout budget in milliseconds (default 250)." },
+                                "max_solutions": { "type": "integer", "description": "Maximum number of solutions to return (default 1000)." },
+                                "max_dataset_quads": { "type": "integer", "description": "Maximum dataset quads to load (default 250000)." },
+                                "max_algebra_nodes": { "type": "integer", "description": "Maximum SPARQL algebra nodes (default 1000)." }
                             },
                             "required": ["query"]
                         }
@@ -873,6 +881,10 @@ pub async fn process_mcp_request(
                                 "max_items": { "type": "integer", "description": "Max items (default 10)." },
                                 "max_bytes": { "type": "integer", "description": "Approx byte budget (converted to tokens at ~4 bytes/token; defaults to max_items * 1024 bytes)." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale from the context plan." },
+                                "file_paths": { "type": "array", "items": { "type": "string" }, "description": "Alias for files." },
+                                "target_namespace": { "type": "string", "description": "Optional cross-scope target namespace when authorized." },
+                                "turn_used": { "type": "integer", "description": "Bytes already used in the current turn budget." },
+                                "session_used": { "type": "integer", "description": "Bytes already used in the current session budget." },
                                 "format": { "type": "string", "enum": ["json", "text"], "description": "Output format." }
                             },
                             "required": ["namespace"]
@@ -1653,7 +1665,7 @@ fn proxy_client() -> reqwest::Client {
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(proxy_timeout())
         .build()
-        .unwrap()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// One forwarding attempt: POST the JSON-RPC request to the daemon's
@@ -1940,7 +1952,14 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         as usize;
     let cursor: Option<crate::graph_read::related::Cursor> = arguments
         .get("cursor")
-        .and_then(|c| serde_json::from_value(c.clone()).ok());
+        .filter(|c| !c.is_null())
+        .and_then(|c| match serde_json::from_value(c.clone()) {
+            Ok(cursor) => Some(cursor),
+            Err(e) => {
+                tracing::warn!("invalid cursor in neurostrata_related: {e}");
+                None
+            }
+        });
     let temporal = crate::graph_read::temporal::TemporalFilter {
         as_of: arguments.get("as_of").and_then(Value::as_i64),
         valid_from: arguments.get("valid_from").and_then(Value::as_i64),
@@ -2381,10 +2400,13 @@ pub(crate) async fn embed_dedup_and_upsert(
     let mut observed_candidates: Vec<crate::learning::observation::ObservedCandidate> = Vec::new();
 
     // Exact-content candidates (independent of vector rank).
-    if let Ok(exact_candidates) = store
+    let exact_lookup = store
         .find_active_exact_content(namespace, &payload.content, scope.clone())
-        .await
-    {
+        .await;
+    if let Err(e) = &exact_lookup {
+        tracing::warn!("find_active_exact_content failed for '{namespace}': {e}");
+    }
+    if let Ok(exact_candidates) = exact_lookup {
         for ec in exact_candidates {
             if let Ok(cand_key) = canonical_duplicate_key(namespace, &ec.payload) {
                 if cand_key == incoming_key {
@@ -2479,7 +2501,7 @@ pub(crate) async fn embed_dedup_and_upsert(
             .and_then(|v| v.as_array())
             .map(|a| !a.is_empty())
             .unwrap_or(false);
-        if let Ok(raw_candidates) = store
+        let raw_lookup = store
             .nearest_by_raw_distance(
                 namespace,
                 vector.clone(),
@@ -2488,8 +2510,11 @@ pub(crate) async fn embed_dedup_and_upsert(
                     scope: scope.clone(),
                 },
             )
-            .await
-        {
+            .await;
+        if let Err(e) = &raw_lookup {
+            tracing::warn!("nearest_by_raw_distance failed for '{namespace}': {e}");
+        }
+        if let Ok(raw_candidates) = raw_lookup {
             // Attempt partition + registry filter (registry already at store seam).
             let filtered: Vec<_> = raw_candidates
                 .into_iter()
@@ -2607,8 +2632,15 @@ pub(crate) async fn embed_dedup_and_upsert(
                     // Production-path read back: exercises BlobStore::get so
                     // the cached-bytes accessor is dead-code-free and the
                     // stored blob size is observable in the trace log.
-                    let _cached_len = blob_store.get(&hash).map(|b| b.len()).unwrap_or(0);
-                    tracing::trace!(bytes = _cached_len, "blob stored");
+                    match blob_store.get(&hash) {
+                        Some(b) => {
+                            let cached_len = b.len();
+                            tracing::trace!(bytes = cached_len, "blob stored");
+                        }
+                        None => {
+                            tracing::warn!("learning blob store missed hash '{}' on read-back", hash.0);
+                        }
+                    };
                     if let Err(e) = recorder.record_blob_hash(&hash, payload).await {
                         tracing::warn!("learning record_blob_hash failed: {e}");
                     }
@@ -2919,7 +2951,10 @@ async fn handle_add_memory(
         let cands = if verified {
             match crate::gliner::GlinerEngine::load(&bundle_dir) {
                 Ok(engine) => engine.extract(content, &["ENTITY"]),
-                Err(_) => crate::gliner::extract_candidates(content),
+                Err(e) => {
+                    tracing::warn!("GlinerEngine::load failed, using heuristic fallback: {e}");
+                    crate::gliner::extract_candidates(content)
+                }
             }
         } else {
             crate::gliner::extract_candidates(content)
@@ -3174,17 +3209,18 @@ async fn handle_get_snapshot(
         .map(|s| s.to_string());
     let cached_root = if project_root_arg.is_none() {
         let rid = crate::registry::registry_row_id(namespace);
-        store
-            .get(namespace, &rid)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|(_, p)| {
-                p.metadata
-                    .get("project_root")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
+        match store.get(namespace, &rid).await {
+            Ok(Some((_, p))) => p
+                .metadata
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("registry row read failed for '{namespace}': {e}");
+                None
+            }
+        }
     } else {
         None
     };
@@ -3454,7 +3490,13 @@ async fn handle_get_snapshot(
 
     // ── Doctor scheduling (in-memory, throttled) ──────────────────────────
     let rid = crate::registry::registry_row_id(namespace);
-    let reg_found = store.get(namespace, &rid).await.ok().flatten();
+    let reg_found = match store.get(namespace, &rid).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!("registry row read failed for '{namespace}': {e}");
+            None
+        }
+    };
     let (reg_vec_opt, reg_payload_opt) = match reg_found {
         Some((v, p)) => (Some(v), Some(p)),
         None => (None, None),
@@ -3582,7 +3624,10 @@ async fn handle_get_snapshot(
     // and render a section when communities exist.
     let communities_rows = match store.list(namespace, None, Some("community_summary")).await {
         Ok(rows) => rows,
-        Err(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("community_summary list failed for '{namespace}': {e}");
+            Vec::new()
+        }
     };
     // Remove community summaries from all_memories so they don't compete for top-5.
     all_memories.retain(|r| r.payload.memory_type != "community_summary");
@@ -3719,6 +3764,9 @@ async fn handle_ingest_directory(
     };
 
     if dry_run {
+        if !matches!(dry_run_mode.as_str(), "estimate" | "presort") {
+            return format!("ERROR: Invalid dry_run_mode '{}' (expected 'estimate' or 'presort').", dry_run_mode);
+        }
         match crate::parser::ingest::dry_run_directory(std::path::Path::new(dir_path), &schema, &dry_run_mode).await {
             Ok(report) => return report,
             Err(e) => return format!("Dry-run failed: {}", e),
@@ -3853,6 +3901,12 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace_str = namespace.as_str();
     let profile = arguments.get("profile").and_then(|v| v.as_str()).unwrap_or("mesh");
+    // Validate up-front: a namespace-wide export must fail fast with a single
+    // ok:false error instead of burning a per-memory project for every row
+    // before the unsupported profile is discovered at render time.
+    if profile != "mesh" && profile != "local" {
+        return serde_json::json!({"ok":false,"error":format!("unsupported profile: {profile}")}).to_string();
+    }
     let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("n-quads");
     // N-Quads is the canonical serialization (spec §5.2d); TriG is a lossless
     // re-grouping of the same canonical quads into named graphs.
@@ -4255,8 +4309,8 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
 }
 
 pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn VectorStore>) -> String {
-    use crate::rdf::sparql::{execute_sparql_query};
-    
+    use crate::rdf::sparql::execute_sparql_query_with_config;
+
 
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
         Some(q) => q.to_string(),
@@ -4279,13 +4333,33 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
     let include_retired = arguments.get("include_retired").and_then(|v| v.as_bool()).unwrap_or(false);
     let include_archived = arguments.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // AS-A6: apply caller-provided budget overrides directly on top of the
+    // env-resolved config and pass it explicitly to the executor — no env
+    // mutation, no redundant pre-checks; SparqlConfig carries all four caps.
+    let mut cfg = crate::rdf::sparql::get_sparql_config();
+    if let Some(v) = arguments.get("timeout_ms").and_then(|v| v.as_u64()) {
+        cfg.timeout_ms = v;
+    }
+    if let Some(v) = arguments.get("max_solutions").and_then(|v| v.as_u64()) {
+        cfg.max_solutions = v as usize;
+    }
+    if let Some(v) = arguments.get("max_dataset_quads").and_then(|v| v.as_u64()) {
+        cfg.max_dataset_quads = v as usize;
+    }
+    if let Some(v) = arguments.get("max_algebra_nodes").and_then(|v| v.as_u64()) {
+        cfg.max_algebra_nodes = v as usize;
+    }
+
     // Downcast to LadybugStore for SPARQL projection
     let ladybug_store = match crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::ladybug::LadybugStore>() {
         Some(ls) => ls,
-        None => return serde_json::json!({"ok":false,"error":"SPARQL requires LadybugStore backend"}).to_string(),
+        None => {
+            return serde_json::json!({"ok":false,"error":"SPARQL requires LadybugStore backend"}).to_string();
+        }
     };
 
-    match execute_sparql_query(&query, &namespace, format, include_retired, include_archived, ladybug_store).await {
+    let execution = execute_sparql_query_with_config(ladybug_store, &namespace, &query, format, include_retired, include_archived, cfg).await;
+    match execution {
         Ok((results, solution_count, truncated, timed_out)) => {
             let query_form = if query.trim().to_uppercase().starts_with("ASK") {
                 "ask"

@@ -82,11 +82,17 @@ pub fn propagate_domains(
         }
         // An inverted validity window can only be a data error (or an expired
         // row that was never retired); it is never a live relationship. An
-        // epoch-timestamped `valid_to` in the past is the same: expired.
+        // epoch-timestamped `valid_to` in the past is the same: expired. And
+        // an epoch-timestamped `valid_from` in the future is not yet active —
+        // matching the `valid_from`/`valid_to` overlap contract in
+        // `temporal.rs`, a window that has not opened yet is skipped.
         if edge.valid_to > 0
             && ((edge.valid_from > 0 && edge.valid_to < edge.valid_from)
                 || (edge.valid_to >= 1_000_000_000 && edge.valid_to < now_secs))
         {
+            continue;
+        }
+        if edge.valid_from >= 1_000_000_000 && edge.valid_from > now_secs {
             continue;
         }
         adjacency
@@ -275,6 +281,23 @@ mod tests {
         let ids: Vec<&str> = tags.iter().map(|t| t.node_id.as_str()).collect();
         assert_eq!(ids, vec!["live_file", "rule"]);
         assert!(!tags.iter().any(|t| t.node_id == "stale_file"));
+    }
+
+    #[test]
+    fn future_valid_epoch_edges_are_skipped() {
+        // `valid_from` about an hour ahead of the wall clock: the validity
+        // window has not opened yet, so the edge is not a live relationship.
+        let mut future = edge("rule", "GOVERNS", "future_file");
+        future.valid_from = chrono::Utc::now().timestamp() + 3600;
+        let live = edge("rule", "GOVERNS", "live_file");
+        let tags = propagate_domains(
+            &[seed("rule", "auth")],
+            &[live, future],
+            &PropagationConfig::default(),
+        );
+        let ids: Vec<&str> = tags.iter().map(|t| t.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["live_file", "rule"]);
+        assert!(!tags.iter().any(|t| t.node_id == "future_file"));
     }
 
     #[test]

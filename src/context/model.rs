@@ -226,13 +226,23 @@ pub struct SourceIdentity {
 /// once before rendering and once before host injection -- and both calls
 /// must see the same answer. A denial is not the same event as "not found",
 /// so the reason is part of the contract, not a debug field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// The default is [`EgressPolicy::allow`]: a request that never states a
+/// rule may plan normally, and denial is always an explicit, reasoned
+/// act ([`EgressPolicy::deny`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressPolicy {
     /// Whether egress is permitted.
     pub allowed: bool,
     /// Why egress was refused, when it was.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+impl Default for EgressPolicy {
+    fn default() -> Self {
+        Self::allow()
+    }
 }
 
 /// One planning request: what the host observed, and under which rules.
@@ -294,7 +304,12 @@ pub struct ContextPlan {
     pub event_id: String,
     /// The index generation the plan was built against.
     pub index_generation: u64,
-    /// The scope the plan was applied to (the namespace, in practice).
+    /// The scope the plan was applied to.
+    ///
+    /// The service stamps the request's authorized scope (its session id);
+    /// production hosts that own a namespace overwrite it with the effective
+    /// namespace after planning, which is why it is "the namespace" in
+    /// practice.
     pub applied_scope: String,
     /// The items to deliver.
     #[serde(default)]

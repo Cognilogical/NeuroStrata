@@ -182,25 +182,44 @@ pub async fn clear_export_freshness(store: &dyn VectorStore) -> Result<(), Strin
         .await
         .map_err(|e| format!("Failed to list namespaces: {e}"))?;
     for ns in &namespaces {
-        match store.get(ns, &flag_id(ns)).await {
-            Ok(Some((vector, mut payload))) => {
-                if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
-                    payload.metadata["dirty"] = serde_json::json!(false);
-                    store
-                        .upsert(ns, &flag_id(ns), vector, payload)
-                        .await
-                        .map_err(|e| {
-                            format!(
-                                "Failed to clear freshness flag for {ns}: {e}"
-                            )
-                        })?;
-                }
-            }
-            Ok(None) => continue,
-            Err(e) => return Err(format!("Failed to read freshness flag for {ns}: {e}")),
-        }
+        clear_export_freshness_for_namespace(store, ns)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
     }
     Ok(())
+}
+
+/// Clears the `dirty` freshness flag of a single namespace only.
+///
+/// A post-`ingest_done` pass just normalized the records of one namespace,
+/// so it must not mark every other namespace's flag as clean: a namespace
+/// whose mutations have not been exported yet would silently pass the
+/// export-freshness gate. Flips the flag row of `namespace` only — a
+/// missing flag row is a no-op, never an error.
+pub async fn clear_export_freshness_for_namespace(
+    store: &dyn VectorStore,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    match store.get(namespace, &flag_id(namespace)).await {
+        Ok(Some((vector, mut payload))) => {
+            if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
+                payload.metadata["dirty"] = serde_json::json!(false);
+                store
+                    .upsert(namespace, &flag_id(namespace), vector, payload)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to clear freshness flag for {namespace}: {e}"
+                        )
+                    })?;
+            }
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to read freshness flag for {namespace}: {e}"
+        )),
+    }
 }
 
 #[cfg(test)]

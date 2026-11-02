@@ -97,7 +97,7 @@ pub async fn project_sparql_dataset_with_meta_async(
         .map_err(|e| format!("Failed to load memories for SPARQL dataset: {e}"))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64;
 
     for m in &memories {
@@ -270,7 +270,9 @@ pub(crate) fn count_algebra_nodes(pattern: &spargebra::algebra::GraphPattern) ->
     }
 }
 
-/// Evaluate a SPARQL query over the projected namespace dataset.
+/// Test-only shim: evaluate with the env-resolved config. Production callers
+/// must use `execute_sparql_query_with_config` with an explicit SparqlConfig.
+#[cfg(test)]
 pub async fn execute_sparql_query(
     query_str: &str,
     namespace: &str,
@@ -280,7 +282,30 @@ pub async fn execute_sparql_query(
     store: &crate::store::ladybug::LadybugStore,
 ) -> Result<(String, usize, bool, bool), String> {
     let config = get_sparql_config();
+    execute_sparql_query_with_config(
+        store,
+        namespace,
+        query_str,
+        format,
+        include_retired,
+        include_archived,
+        config,
+    )
+    .await
+}
 
+/// Evaluate a SPARQL query over the projected namespace dataset with an
+/// explicit `SparqlConfig`, letting callers apply per-request budget
+/// overrides without resorting to environment mutation.
+pub async fn execute_sparql_query_with_config(
+    store: &crate::store::ladybug::LadybugStore,
+    namespace: &str,
+    query_str: &str,
+    format: QueryResultsFormat,
+    include_retired: bool,
+    include_archived: bool,
+    config: SparqlConfig,
+) -> Result<(String, usize, bool, bool), String> {
     // Parse the SPARQL query using spargebra with pre-registered prefixes
     let query = parser_with_prefixes()
         .parse_query(query_str)
@@ -321,7 +346,7 @@ pub async fn execute_sparql_query(
     // federation security model (allowlist + loopback/HTTPS validation).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64;
     let evaluator = if !service_endpoints.is_empty() {
         let handler = crate::rdf::federation::HttpServiceHandler {
@@ -346,7 +371,7 @@ pub async fn execute_sparql_query(
     let evaluator = evaluator.with_cancellation_token(cancel_token.clone());
     let timed_out_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let timeout_ms = config.timeout_ms;
-    tokio::spawn({
+    let timer_handle = tokio::spawn({
         let timed_out_flag = timed_out_flag.clone();
         async move {
             tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
@@ -355,9 +380,13 @@ pub async fn execute_sparql_query(
         }
     });
     let prepared = evaluator.prepare(&query);
-    let results = prepared
-        .execute(&dataset)
-        .map_err(|e| format!("SPARQL evaluation error: {}", e))?;
+    let results = match prepared.execute(&dataset) {
+        Ok(r) => r,
+        Err(e) => {
+            timer_handle.abort();
+            return Err(format!("SPARQL evaluation error: {}", e));
+        }
+    };
 
     // Serialize results
     let mut output = Vec::new();
@@ -429,6 +458,10 @@ pub async fn execute_sparql_query(
         }
     }
 
+    // Evaluation finished: stop the timer so a completed query neither leaks
+    // the sleep task nor races with the timed-out flag afterwards.
+    timer_handle.abort();
+
     let results_string = String::from_utf8(output)
         .map_err(|e| format!("UTF-8 error: {}", e))?;
     let timed_out = timed_out || timed_out_flag.load(std::sync::atomic::Ordering::SeqCst);
@@ -437,7 +470,8 @@ pub async fn execute_sparql_query(
 }
 
 /// Global configuration for SPARQL execution, honoring optional environment
-/// overrides (`NEUROSTRATA_SPARQL_TIMEOUT_MS`, `NEUROSTRATA_SPARQL_MAX_SOLUTIONS`).
+/// overrides (`NEUROSTRATA_SPARQL_TIMEOUT_MS`, `NEUROSTRATA_SPARQL_MAX_SOLUTIONS`,
+/// `NEUROSTRATA_SPARQL_MAX_DATASET_QUADS`, `NEUROSTRATA_SPARQL_MAX_ALGEBRA_NODES`).
 pub fn get_sparql_config() -> SparqlConfig {
     let mut config = SparqlConfig::default();
     if let Ok(v) = std::env::var("NEUROSTRATA_SPARQL_TIMEOUT_MS") {
@@ -448,6 +482,16 @@ pub fn get_sparql_config() -> SparqlConfig {
     if let Ok(v) = std::env::var("NEUROSTRATA_SPARQL_MAX_SOLUTIONS") {
         if let Ok(n) = v.trim().parse::<usize>() {
             config.max_solutions = n;
+        }
+    }
+    if let Ok(v) = std::env::var("NEUROSTRATA_SPARQL_MAX_DATASET_QUADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            config.max_dataset_quads = n;
+        }
+    }
+    if let Ok(v) = std::env::var("NEUROSTRATA_SPARQL_MAX_ALGEBRA_NODES") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            config.max_algebra_nodes = n;
         }
     }
     config

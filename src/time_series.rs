@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -54,7 +55,10 @@ pub fn default_series_config_from_app_config() -> SeriesConfig {
             flush_interval_secs: cfg.metrics_flush_interval_secs.max(1),
             ewma_alpha: cfg.metrics_ewma_alpha.clamp(0.01, 1.0),
         },
-        Err(_) => bad_app_config_fallback(),
+        Err(e) => {
+            tracing::warn!("time_series Config::from_default_path failed, using fallback: {e}");
+            bad_app_config_fallback()
+        }
     }
 }
 
@@ -64,6 +68,27 @@ fn bad_app_config_fallback() -> SeriesConfig {
         flush_interval_secs: 60,
         ewma_alpha: 0.2,
     }
+}
+
+/// Split a persisted metric sample id into its `(namespace, metric, stage)`
+/// segments. Canonical ids are `namespace::metric::stage::ts::seq`; legacy
+/// rows use the same layout with single colons (`ns:metric:stage:ts:seq`).
+/// An unprefixed legacy id starts with the metric segment itself
+/// (`metric::stage::ts::seq`), recognized by its first field parsing as a
+/// `MetricKind`; those return `None` for the namespace.
+fn split_metric_sample_id(id: &str) -> (Option<&str>, Option<&str>, Option<&str>) {
+    let sep = if id.contains("::") { "::" } else { ":" };
+    let mut fields = id.split(sep);
+    let first = fields.next();
+    let second = fields.next();
+    let third = fields.next();
+    if let (Some(f0), Some(f1)) = (first, second) {
+        if MetricKind::from_str(f0).is_ok() {
+            // Legacy unprefixed id: metric :: stage :: ts :: seq
+            return (None, Some(f0), Some(f1));
+        }
+    }
+    (first, second, third)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,7 +216,10 @@ impl TimeSeriesStore {
             return;
         }
 
-        let mut guard = self.series.write().unwrap();
+        let mut guard = self
+            .series
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let capacity = self.config.capacity.max(1);
 
         let series = guard.entry(key.clone()).or_insert_with(|| Series {
@@ -268,7 +296,10 @@ impl TimeSeriesStore {
     }
 
     pub fn recent_anomalies(&self, namespace: &str) -> Vec<crate::telemetry::AnomalyEvent> {
-        let guard = self.anomalies.read().unwrap();
+        let guard = self
+            .anomalies
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         guard
             .iter()
             .filter(|ev| namespace.is_empty() || ev.namespace == namespace)
@@ -288,7 +319,7 @@ impl TimeSeriesStore {
     }
 
     pub fn range(&self, key: &SeriesKey, from: i64, to: i64, db_samples: &[Sample]) -> Vec<Sample> {
-        let guard = self.series.read().unwrap();
+        let guard = self.series.read().unwrap_or_else(|e| e.into_inner());
         let in_mem: Vec<Sample> = guard
             .get(key)
             .map(|s| {
@@ -319,7 +350,7 @@ impl TimeSeriesStore {
     }
 
     pub fn aggregate(&self, key: &SeriesKey) -> Option<RollingAgg> {
-        let guard = self.series.read().unwrap();
+        let guard = self.series.read().unwrap_or_else(|e| e.into_inner());
         guard.get(key).map(|series| {
             let mut agg = series.agg.clone();
             if agg.count == 0 {
@@ -331,7 +362,7 @@ impl TimeSeriesStore {
     }
 
     pub fn list_keys(&self, namespace: &str) -> Vec<(SeriesKey, u64)> {
-        let guard = self.series.read().unwrap();
+        let guard = self.series.read().unwrap_or_else(|e| e.into_inner());
         let mut result: Vec<(SeriesKey, u64)> = guard
             .iter()
             .filter(|(k, _)| k.0 == namespace)
@@ -342,7 +373,7 @@ impl TimeSeriesStore {
     }
 
     pub fn samples_for_anomaly(&self, key: &SeriesKey) -> Vec<f64> {
-        let guard = self.series.read().unwrap();
+        let guard = self.series.read().unwrap_or_else(|e| e.into_inner());
         guard
             .get(key)
             .map(|s| s.samples.iter().map(|samp| samp.value).collect())
@@ -350,7 +381,7 @@ impl TimeSeriesStore {
     }
 
     pub fn take_unflushed(&self, namespace: Option<&str>) -> Vec<(SeriesKey, Vec<Sample>, u64)> {
-        let guard = self.series.read().unwrap();
+        let guard = self.series.read().unwrap_or_else(|e| e.into_inner());
         let mut result: Vec<(SeriesKey, Vec<Sample>, u64)> = Vec::new();
         for (key, series) in guard.iter() {
             if let Some(ns) = namespace {
@@ -375,7 +406,7 @@ impl TimeSeriesStore {
     }
 
     pub fn mark_flushed(&self, key: &SeriesKey, flushed_seq: u64) {
-        let mut guard = self.series.write().unwrap();
+        let mut guard = self.series.write().unwrap_or_else(|e| e.into_inner());
         if let Some(series) = guard.get_mut(key) {
             series.agg.flushed_seq = flushed_seq;
             series.last_flushed = Instant::now();
@@ -397,7 +428,7 @@ impl TimeSeriesStore {
             .collect();
         let mut all_samples: Vec<Sample> = Vec::new();
 
-        let guard = self.series.read().unwrap();
+        let guard = self.series.read().unwrap_or_else(|e| e.into_inner());
         if let Some(st) = stage {
             let key = (namespace.to_string(), metric, st.to_string());
             if let Some(series) = guard.get(&key) {
@@ -429,14 +460,23 @@ impl TimeSeriesStore {
             seen.insert(s.id.clone(), s);
         }
         for (_, samp) in db_map.iter() {
-            // Drop DB samples that belong to a different namespace; the id
-            // format is `namespace::metric::stage::ts::seq` so both the
-            // prefixed and the contains-check cover legacy unprefixed ids.
-            if !namespace.is_empty()
-                && !samp.id.starts_with(&format!("{namespace}:"))
-                && !samp.id.contains(namespace)
-            {
+            // DB sample ids embed their `namespace`, `metric` and `stage`
+            // segments (`namespace::metric::stage::ts::seq`; legacy rows use
+            // single colons). Every segment must match the query: a substring
+            // namespace hit (e.g. "a" inside "beta::memory_count::...") or a
+            // row persisted for a different metric or stage must not merge
+            // into this result.
+            let (id_ns, id_metric, id_stage) = split_metric_sample_id(&samp.id);
+            if !namespace.is_empty() && id_ns != Some(namespace) {
                 continue;
+            }
+            if id_metric != Some(metric.as_str()) {
+                continue;
+            }
+            if let Some(req_stage) = stage {
+                if id_stage != Some(req_stage) {
+                    continue;
+                }
             }
             // Include DB sample if it matches range
             if from.map_or(true, |f| samp.ts >= f) && to.map_or(true, |t| samp.ts <= t) {
@@ -822,5 +862,96 @@ mod tests {
         assert_eq!(samples.len(), 1, "foreign-namespace DB sample must be filtered out");
         assert_eq!(samples[0]["id"], "alpha::memory_count::s::50::2");
         assert!(out["aggregate"]["sum"].as_f64().unwrap() - 2.0 < 1e-6);
+    }
+
+    #[test]
+    fn query_metrics_drops_db_rows_for_other_metric_stage_and_ns_lookalikes() {
+        let store = TimeSeriesStore::new(SeriesConfig {
+            capacity: 8,
+            ..SeriesConfig::default()
+        });
+        let db = vec![
+            // Different metric, same namespace and stage.
+            (
+                "alpha::access_count::s::50::3".to_string(),
+                Sample {
+                    id: "alpha::access_count::s::50::3".to_string(),
+                    seq: 3,
+                    ts: 50,
+                    value: 11.0,
+                    labels: BTreeMap::new(),
+                },
+            ),
+            // Same metric and namespace, different stage.
+            (
+                "alpha::memory_count::embed::51::4".to_string(),
+                Sample {
+                    id: "alpha::memory_count::embed::51::4".to_string(),
+                    seq: 4,
+                    ts: 51,
+                    value: 12.0,
+                    labels: BTreeMap::new(),
+                },
+            ),
+            // Substring namespace look-alike: "a" matches inside "beta::...".
+            (
+                "beta::memory_count::s::52::5".to_string(),
+                Sample {
+                    id: "beta::memory_count::s::52::5".to_string(),
+                    seq: 5,
+                    ts: 52,
+                    value: 13.0,
+                    labels: BTreeMap::new(),
+                },
+            ),
+            // The matching row that must survive the filter.
+            (
+                "alpha::memory_count::s::53::6".to_string(),
+                Sample {
+                    id: "alpha::memory_count::s::53::6".to_string(),
+                    seq: 6,
+                    ts: 53,
+                    value: 2.0,
+                    labels: BTreeMap::new(),
+                },
+            ),
+        ];
+        // The matching row used by the exact-namespace assertions below.
+        // 1) Substring-namespace look-alike: querying "a" must not match
+        //    ids merely containing "a" ("alpha::...", "beta::...").
+        let out = store.query_metrics("a", MetricKind::MemoryCount, Some("s"), None, None, &db);
+        let samples = out["samples"].as_array().expect("samples array");
+        assert!(
+            samples.is_empty(),
+            "only rows whose namespace segment is exactly 'a' may survive; got {samples:?}"
+        );
+        assert_eq!(out["aggregate"]["sum"].as_f64().unwrap(), 0.0);
+
+        // 2) Exact namespace, explicit stage: the foreign metric, the
+        //    foreign stage and the "beta" look-alike are all dropped.
+        let out = store.query_metrics("alpha", MetricKind::MemoryCount, Some("s"), None, None, &db);
+        let samples = out["samples"].as_array().expect("samples array");
+        assert_eq!(
+            samples.len(),
+            1,
+            "foreign-metric, foreign-stage and namespace-lookalike DB rows must be filtered out"
+        );
+        assert_eq!(samples[0]["id"], "alpha::memory_count::s::53::6");
+
+        // 3) A cross-stage sweep (no stage filter) admits the same metric's
+        // other stage but still drops the foreign metric and the look-alike.
+        let sweep = store.query_metrics("alpha", MetricKind::MemoryCount, None, None, None, &db);
+        let swept = sweep["samples"].as_array().expect("samples array");
+        let swept_ids: Vec<&str> = swept
+            .iter()
+            .filter_map(|s| s["id"].as_str())
+            .collect();
+        assert_eq!(
+            swept_ids,
+            vec![
+                "alpha::memory_count::embed::51::4",
+                "alpha::memory_count::s::53::6"
+            ]
+        );
     }
 }

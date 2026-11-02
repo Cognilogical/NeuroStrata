@@ -7,10 +7,13 @@
 //! canonicalization converges without an agent remembering to do it. The
 //! pass itself is [`normalize_namespace_targets`].
 //!
-//! The same pulse then clears every namespace's export-freshness `dirty`
-//! flag via [`super::clear_export_freshness`]: a normalization pass unions
-//! the affected rows as they already stand, commits them, so the committed
-//! export is not behind the store an ingest just touched.
+//! The same pulse then clears the ingested namespace's export-freshness
+//! `dirty` flag via
+//! [`super::export_freshness_dirty::clear_export_freshness_for_namespace`]:
+//! a normalization pass unions the affected rows as they already stand,
+//! commits them, so the committed export is not behind the store an ingest
+//! just touched. Only that namespace's flag is cleared — other namespaces
+//! may still hold un-exported mutations and must not pass the gate.
 //!
 //! Both passes propagate their errors to the dispatcher — a failed
 //! normalization or flag clear is recorded as a subscriber failure on the
@@ -248,19 +251,24 @@ impl MemorySubscriber for PostIngestNormalize {
         &self,
         event: &ThalamicPulse,
         _token: &RecursionToken,
-        _ctx: &SubscriberContext<'_>,
+        ctx: &SubscriberContext<'_>,
     ) -> Result<(), SubscriberError> {
         match event {
             // Trigger normalize / reconcile on ingest-done pulse. Errors are
             // propagated, not discarded: a normalize or flag-clear failure is
-            // a subscriber error the bus counts, and callers see it.
+            // a subscriber error the bus counts, and callers see it. Only the
+            // ingested namespace's flag is cleared — other namespaces may
+            // still hold un-exported mutations and must not pass the gate.
             ThalamicPulse::Created { kind, namespace, .. } if kind == "ingest_done" => {
-                normalize_namespace_targets(_ctx.store, namespace)
+                normalize_namespace_targets(ctx.store, namespace)
                     .await
                     .map_err(|e| anyhow::anyhow!("post_ingest_normalize failed: {e}"))?;
-                super::clear_export_freshness(_ctx.store)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("clear_export_freshness failed: {e}"))?;
+                super::export_freshness_dirty::clear_export_freshness_for_namespace(
+                    ctx.store,
+                    namespace,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("clear_export_freshness failed: {e:#}"))?;
                 Ok(())
             }
             _ => Ok(()),

@@ -7,11 +7,13 @@
 //!
 //! Two construction paths, one honest outcome each:
 //!
-//! * [`ContextService::plan`] builds the empty shell of a plan for a request:
-//!   scope from the request, no items, never `Supported` (an empty plan is a
-//!   degraded outcome the caller must observe). It is the base both other
-//!   paths report through, and the shape a caller uses when it only needs the
-//!   degradation and scope semantics probed.
+//! * [`ContextService::plan`] builds the shell of a plan for a request:
+//!   scope from the request, no items, never `Supported`. An empty plan is
+//!   a degraded outcome (`Partial`) the caller must observe, and a request
+//!   whose [`EgressPolicy`] denies egress is refused up front (`Unavailable`
+//!   with no items). It is the base both other paths report through, and the
+//!   shape a caller uses when it only needs the degradation, policy and
+//!   scope semantics probed.
 //! * [`ContextService::plan_with_items`] takes ranked candidate items and a
 //!   [`Budget`], dedups and budgets them down (`plan::rank_dedup_budget`),
 //!   truncates to `max_items`, and reports `Supported` only when at least one
@@ -40,11 +42,31 @@ impl ContextService {
         R: AsRef<ContextRequest>,
     {
         let req = request.as_ref();
+        // The egress policy travels with the request: enforce it before any
+        // plan is shaped. A denied request produces an empty denial shell —
+        // `Degradation::Unavailable`, never implicitly `Supported` — rather
+        // than silently planning content that may not leave the process.
+        if let Err(reason) = req.policy.enforce() {
+            tracing::debug!(reason = %reason, "context plan denied by egress policy");
+            let mut plan = ContextPlan::new(req.event_id.clone(), Degradation::Unavailable);
+            plan.applied_scope = req.session_id.clone();
+            plan.items = Vec::new();
+            plan.truncation = false;
+            return plan;
+        }
         let mut plan = ContextPlan::new(req.event_id.clone(), Degradation::Partial);
-        // The scope the plan was applied to: the caller-authorized namespace.
+        // The request's authorized scope: the caller's session id (production
+        // hosts that own a namespace, as in server.rs, overwrite it with the
+        // effective namespace after planning).
         plan.applied_scope = req.session_id.clone();
         plan.items = Vec::new();
         plan.truncation = false;
+        tracing::trace!(
+            epoch = req.context_epoch,
+            trigger = %req.trigger,
+            repo = %req.source.repo_id,
+            "planned context"
+        );
         plan
     }
 
@@ -67,7 +89,13 @@ impl ContextService {
     where
         R: AsRef<ContextRequest>,
     {
-        let mut plan = self.plan(request);
+        let mut plan = self.plan(&request);
+        if request.as_ref().policy.enforce().is_err() {
+            // The egress policy denied this request; keep the denial shell
+            // (empty items, `Unavailable`) instead of upgrading it to
+            // `Supported` — no item may be delivered against refused egress.
+            return plan;
+        }
         let total = candidates.len();
         let mut deduped = super::plan::rank_dedup_budget(candidates, budget);
         if deduped.len() > max_items {
@@ -131,6 +159,29 @@ mod tests {
         assert_eq!(plan.degradation, Degradation::Partial);
         assert!(plan.items.is_empty());
         assert!(!plan.truncation);
+    }
+
+    /// A request whose egress policy denies never produces a deliverable
+    /// plan: `plan` refuses up front (`Unavailable`, no items), and
+    /// `plan_with_items` keeps that denial shell instead of upgrading it to
+    /// `Supported` even when candidates survived.
+    #[test]
+    fn denied_policy_never_yields_deliverable_plan() {
+        let service = ContextService::new();
+        let mut denied = request();
+        denied.policy = EgressPolicy::deny("egress refused");
+        let plan = service.plan(&denied);
+        assert_eq!(plan.degradation, Degradation::Unavailable);
+        assert!(plan.items.is_empty());
+
+        let with_items = service.plan_with_items(
+            &denied,
+            vec![item("i1", "c1")],
+            Budget::from(10_000usize),
+            10,
+        );
+        assert_eq!(with_items.degradation, Degradation::Unavailable);
+        assert!(with_items.items.is_empty());
     }
 
     #[test]
