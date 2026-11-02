@@ -1,6 +1,6 @@
 # Knowledge-Graph Embeddings (Structural Channel) Design
 
-> Status: **APPROVED** (2026-10-28).
+> Status: **APPROVED** (2026-10-28) & implemented (v1.14.3) — see src/kge.rs.
 > Task: `neurostrata-84k2` (KGE structural channel, OxiRS §1.6).
 > Companion: `docs/design-oxirs-concepts.md` §1.6, `docs/design-cognee-concepts.md`.
 

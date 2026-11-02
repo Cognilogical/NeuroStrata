@@ -163,6 +163,11 @@ pub struct TraversalEdge {
     pub target: String,
     pub role: EdgeRole,
     pub depth: usize,
+    /// INT64 validity columns of the stored edge (`0` = unbounded).
+    #[serde(default)]
+    pub valid_from: i64,
+    #[serde(default)]
+    pub valid_to: i64,
 }
 
 /// The chain of edges that led the traversal to one node. `kind` is `"direct"`
@@ -219,6 +224,11 @@ pub struct EdgeSpec {
     pub source: String,
     pub relation: String,
     pub target: String,
+    /// INT64 validity columns of the stored edge (`0` = unbounded).
+    #[serde(default)]
+    pub valid_from: i64,
+    #[serde(default)]
+    pub valid_to: i64,
 }
 
 /// The bounded BFS core. It takes an in-memory subgraph (already row-filtered
@@ -368,6 +378,8 @@ pub fn graph_read_related(
                         target: es.target.clone(),
                         role: edge_role(&es.relation),
                         depth,
+                        valid_from: es.valid_from,
+                        valid_to: es.valid_to,
                     });
                 }
             }
@@ -396,6 +408,8 @@ pub fn graph_read_related(
                 target: es.target.clone(),
                 role: edge_role(&es.relation),
                 depth: es_depth,
+                valid_from: es.valid_from,
+                valid_to: es.valid_to,
             });
             hops += 1;
             cur = prev;
@@ -632,8 +646,8 @@ mod closure_tests {
     #[test]
     fn chain_closure() {
         let edges = vec![
-            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string() },
-            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string() },
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string(), valid_from: 0, valid_to: 0 },
         ];
         let budget = QueryBudget::default();
         let result = closure_governs("A", &edges, &budget);
@@ -645,7 +659,7 @@ mod closure_tests {
     #[test]
     fn cycle_guard_self_loop() {
         let edges = vec![
-            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "A".to_string() },
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "A".to_string(), valid_from: 0, valid_to: 0 },
         ];
         let budget = QueryBudget::default();
         let result = closure_governs("A", &edges, &budget);
@@ -656,9 +670,9 @@ mod closure_tests {
     #[test]
     fn max_hops_truncation_and_budget_exceeded() {
         let edges = vec![
-            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string() },
-            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string() },
-            EdgeSpec { source: "C".to_string(), relation: "GOVERNS".to_string(), target: "D".to_string() },
+            EdgeSpec { source: "A".to_string(), relation: "GOVERNS".to_string(), target: "B".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec { source: "B".to_string(), relation: "GOVERNS".to_string(), target: "C".to_string(), valid_from: 0, valid_to: 0 },
+            EdgeSpec { source: "C".to_string(), relation: "GOVERNS".to_string(), target: "D".to_string(), valid_from: 0, valid_to: 0 },
         ];
         let mut budget = QueryBudget::default();
         budget.max_hops = 1;

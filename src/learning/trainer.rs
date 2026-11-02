@@ -115,27 +115,27 @@ impl Trainer {
             }
             return Ok(());
         }
-        // Pure-Rust builtin fallback when external binary is not installed.
-        if !self.runtime.laya_train.is_absolute() {
+        // Pure-Rust builtin fallback when the external binary is not installed
+        // or is not present on disk.
+        if !self.runtime.laya_train.is_absolute() || !self.runtime.laya_train.exists() {
             let cand_dir = self.runtime.model_cache.join("candidates").join(version);
             std::fs::create_dir_all(&cand_dir)?;
-            let temp = crate::learning::calibration::TemperatureFitter::new()
-                .fit(&[(0.8, true), (0.2, false)])?;
-            // Check for train.jsonl calibration file if present
+
+            // Prefer real labeled pairs from train.jsonl; fall back to proxy
+            // pairs only when no valid pairs exist there.
             let train_jsonl = self.runtime.model_cache.join("train.jsonl");
-            let fitted_temp = if train_jsonl.exists() {
-                let text = std::fs::read_to_string(&train_jsonl)?;
-                let first = text.lines().next().unwrap_or("{}");
-                let v: serde_json::Value = serde_json::from_str(first).unwrap_or(serde_json::Value::Null);
-                v.get("temperature").and_then(|t| t.as_f64()).map(|f| f as f32).unwrap_or(temp)
-            } else {
-                temp
-            };
+            let pairs = read_calibration_pairs(&train_jsonl);
+            let from_dataset = !pairs.is_empty();
+            let fallback_pairs: Vec<(f32, bool)> = vec![(0.8, true), (0.2, false)];
+            let effective_pairs = if from_dataset { pairs } else { fallback_pairs };
+            let fitted_temp = crate::learning::calibration::TemperatureFitter::new()
+                .fit(&effective_pairs)?;
             let manifest = serde_json::json!({
                 "embedder_id": "laya",
                 "model_version": version,
-                "calibration_tier": "ProxyInternal",
-                "temperature": fitted_temp
+                "calibration_tier": if from_dataset { "DatasetCalibrated" } else { "ProxyInternal" },
+                "temperature": fitted_temp,
+                "pair_count": effective_pairs.len(),
             });
             std::fs::write(cand_dir.join("manifest.json"), manifest.to_string())?;
             return Ok(());
@@ -185,6 +185,38 @@ impl Trainer {
     }
 }
 
+/// Reads labeled calibration pairs from a `train.jsonl` file. Accepts
+/// `"logit"`/`"score"` numeric keys and `"label"`/`"is_duplicate"` boolean
+/// keys; lines that fail to parse or lack a valid pair are skipped.
+fn read_calibration_pairs(path: &std::path::Path) -> Vec<(f32, bool)> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let logit = value
+            .get("logit")
+            .and_then(|x| x.as_f64())
+            .or_else(|| value.get("score").and_then(|x| x.as_f64()));
+        let label = value
+            .get("label")
+            .and_then(|x| x.as_bool())
+            .or_else(|| value.get("is_duplicate").and_then(|x| x.as_bool()));
+        if let (Some(logit), Some(label)) = (logit, label) {
+            pairs.push((logit as f32, label));
+        }
+    }
+    pairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,17 +249,59 @@ mod tests {
     }
 
     #[test]
-    fn train_candidate_fails_when_missing_bin() {
+    fn train_candidate_missing_absolute_bin_falls_back_to_builtin() {
+        let tmp_dir = tempfile::tempdir().unwrap();
         let t = Trainer::new(Arc::new(LocalTrainingRuntime {
             python: PathBuf::from("/nonexistent/python"),
             laya_train: PathBuf::from("/nonexistent/laya-train"),
-            model_cache: PathBuf::from(".cache/laya"),
+            model_cache: tmp_dir.path().to_path_buf(),
+        }));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(t.train_candidate(&"v0.0.0".to_string()));
+        assert!(res.is_ok(), "missing absolute laya-train should use builtin path: {:?}", res);
+        let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            tmp_dir.path().join("candidates/v0.0.0/manifest.json"),
+        ).unwrap()).unwrap();
+        assert_eq!(manifest["calibration_tier"], "ProxyInternal");
+    }
+
+    #[test]
+    fn train_candidate_fails_when_binary_exists_but_python_missing() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let laya_train = tmp_dir.path().join("laya-train");
+        std::fs::write(&laya_train, b"#!/bin/sh\n").unwrap();
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("/nonexistent/python"),
+            laya_train: laya_train.clone(),
+            model_cache: tmp_dir.path().to_path_buf(),
         }));
         let rt = tokio::runtime::Runtime::new().unwrap();
         let res = rt.block_on(t.train_candidate(&"v0.0.0".to_string()));
         assert!(res.is_err());
-        let msg = res.unwrap_err().to_string();
-        assert!(msg.contains("unavailable") || msg.contains("Failed"));
+    }
+
+    #[test]
+    fn train_candidate_uses_real_train_jsonl_pairs() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp_dir.path().join("train.jsonl"),
+            "{\"logit\": 0.9, \"label\": true}\n{\"score\": 0.1, \"is_duplicate\": false}\nnot-json\n",
+        ).unwrap();
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("python"),
+            laya_train: PathBuf::from("laya-train"), // relative => builtin path
+            model_cache: tmp_dir.path().to_path_buf(),
+        }));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(t.train_candidate(&"v2.0.0".to_string()))
+            .expect("builtin path with real train.jsonl pairs should succeed");
+        let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            tmp_dir.path().join("candidates/v2.0.0/manifest.json"),
+        ).unwrap()).unwrap();
+        assert_eq!(manifest["calibration_tier"], "DatasetCalibrated");
+        assert_eq!(manifest["pair_count"], 2);
+        // Fitted temperature = mean of real pair logits = (0.9 + 0.1) / 2 = 0.5.
+        assert!((manifest["temperature"].as_f64().unwrap() - 0.5).abs() < 1e-6);
     }
 
     #[test]

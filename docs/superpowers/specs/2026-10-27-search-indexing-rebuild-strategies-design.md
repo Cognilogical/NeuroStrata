@@ -1,6 +1,6 @@
 # Search Index — Rebuild Strategies and Incremental Updates Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/fts/mod.rs + src/parser/ingest.rs.
 > Task: `neurostrata-umk8` (Search Index — Rebuild Strategies and Incremental Updates Design).
 
 ## 1. Problem

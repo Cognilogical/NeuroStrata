@@ -1,6 +1,6 @@
 # SHACL Shape Validation Design
 
-> Status: **APPROVED** (2026-10-28).
+> Status: **APPROVED** (2026-10-28) & implemented (v1.14.3) — see src/rdf/shacl.rs.
 > Task: `neurostrata-7zvo` (SHACL shape validation + AI constraint inference, OxiRS §1.3).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-owl-rdfs-reasoning-design.md`.
 

@@ -1,6 +1,6 @@
 # Community Detection (Louvain/Leiden) Design
 
-> Status: **APPROVED** (2026-10-28).
+> Status: **APPROVED** (2026-10-28) & implemented (v1.14.3) — see src/community.rs.
 > Task: `neurostrata-vhx3` (Community detection, OxiRS §1.7).
 > Companion: `docs/design-oxirs-concepts.md` §1.7.
 

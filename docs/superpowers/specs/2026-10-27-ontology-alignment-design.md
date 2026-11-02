@@ -1,6 +1,6 @@
 # Ontology Alignment — Align Per-Namespace Ontologies Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/ontology_grounding.rs + src/rdf/ontology.rs.
 > Task: `neurostrata-ooa1` (Ontology alignment: align per-namespace ontologies, P3).
 
 ## 1. Problem

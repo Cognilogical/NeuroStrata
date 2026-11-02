@@ -1,6 +1,6 @@
 # Cross-Namespace Concept IRIs on SynapticMesh Share Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/rdf/projection.rs + src/rdf/namespace.rs.
 > Task: `neurostrata-pjoa` (Cross-namespace concept IRIs on SynapticMesh share, P2, ranked #20, M effort).
 
 ## 1. Problem

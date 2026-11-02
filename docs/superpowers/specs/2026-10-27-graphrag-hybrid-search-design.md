@@ -1,6 +1,6 @@
 # GraphRAG Hybrid Search Design
 
-> Status: **APPROVED** (2026-10-28).
+> Status: **APPROVED** (2026-10-28) & implemented (v1.14.3) — see src/graph_read/hybrid.rs + src/search.rs.
 > Task: `neurostrata-52dq` (GraphRAG hybrid search, vector × graph × keyword, P3).
 > Companion: `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md`, `docs/superpowers/specs/2026-10-27-community-detection-design.md`, `docs/superpowers/specs/2026-10-27-entity-mention-linking-design.md`, `docs/superpowers/specs/2026-10-27-closure-budget-zstd-anomaly-design.md`.
 

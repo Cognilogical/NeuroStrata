@@ -1,6 +1,6 @@
 # Entity Resolution — Merge Canonical MemoryId Across Namespaces Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/mention.rs + src/rdf/canonical.rs.
 > Task: `neurostrata-epzj` (Entity Resolution — Merge Canonical MemoryId Across Namespaces Design).
 
 ## 1. Problem

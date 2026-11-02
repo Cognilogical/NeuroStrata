@@ -1,6 +1,6 @@
 # Import / Module Dependency Extraction Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/rdf/namespace.rs + src/graph_read/related.rs.
 > Task: `neurostrata-6el3` (Dependency edges: extract imports/module dependencies into graph, P2, ranked #7, M-L effort).
 
 ## 1. Problem

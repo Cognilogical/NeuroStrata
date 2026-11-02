@@ -1,6 +1,6 @@
 # Entity / Mention Linking Design
 
-> Status: **APPROVED** (2026-10-28).
+> Status: **APPROVED** (2026-10-28) & implemented (v1.14.3) — see src/mention.rs.
 > Task: `neurostrata-q1mt` (Entity / mention linking, OxiRS §1.8).
 > Companion: `docs/design-oxirs-concepts.md` §1.8, `docs/superpowers/specs/2026-10-27-neurostrata-rdf-semantic-layer-design.md` §13.
 

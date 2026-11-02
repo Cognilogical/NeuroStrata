@@ -1,6 +1,6 @@
 # Memory Version Tracking — Per-Memory Change Log Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/domain.rs + src/store/ladybug.rs.
 > Task: `neurostrata-ixi3` (Memory Version Tracking — Per-Memory Change Log Design).
 
 ## 1. Problem

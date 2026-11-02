@@ -1,6 +1,6 @@
 # Dangling-Edge Report in Doctor and task_validate Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/store/ladybug.rs (dangling_edges) + src/task/mod.rs.
 > Task: `neurostrata-xlya` (Dangling-edge report in doctor and task_validate, P2, ranked #13, S-M effort).
 
 ## 1. Problem

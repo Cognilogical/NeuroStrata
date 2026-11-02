@@ -1,6 +1,6 @@
 # Retrieval Budget — Per-Query Cap and Timeout Across Hybrid Retrieval Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/context/plan.rs + src/context/service.rs.
 > Task: `neurostrata-jwoa` (Retrieval budget: per-query cap and timeout across hybrid retrieval, P3).
 
 ## 1. Problem

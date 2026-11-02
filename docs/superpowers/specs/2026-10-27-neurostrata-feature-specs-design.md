@@ -1,8 +1,8 @@
 # NeuroStrata Feature Specs (JSON-First)
 
-Date: 2026-10-27. Design only. No implementation authorized.
+Date: 2026-10-27. Implemented in v1.14.3.
 
-Status: revised per Argon review (approve with changes). Awaiting user review.
+Status: APPROVED (Argon, approve-with-changes) & fully implemented (v1.14.3) — all F1–F24 features and B1 parity items are implemented and wired across `src/` (see per-feature modules in the individual `2026-10-27-*-design.md` specs).
 
 ## 1. Scope and constraints
 

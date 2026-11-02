@@ -3,7 +3,7 @@ use crate::rdf::ontology::ClosureResult;
 use crate::rdf::ontology::OntologyIndex;
 use crate::rdf::ontology::QueryBudget;
 use serde_json::json;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// Configuration for deterministic reasoning.
 #[derive(Debug, Clone, Copy)]
@@ -30,15 +30,30 @@ impl Default for ReasoningConfig {
 /// Bounded BFS via QueryBudget, no tableau reasoner.
 pub struct ReasoningAdapter {
     pub config: ReasoningConfig,
+    /// Payload lookup keyed by memory id, populated by the call site from the
+    /// store so `execute` can hydrate inferred `SearchResult` rows with real
+    /// `MemoryPayload`s instead of empty stubs.
+    payloads: HashMap<String, MemoryPayload>,
 }
 
 impl ReasoningAdapter {
     pub fn new() -> Self {
-        Self { config: ReasoningConfig::default() }
+        Self { config: ReasoningConfig::default(), payloads: HashMap::new() }
     }
 
     pub fn new_with(config: ReasoningConfig) -> Self {
-        Self { config }
+        Self { config, payloads: HashMap::new() }
+    }
+
+    /// Builder: register a payload lookup map (id -> MemoryPayload).
+    pub fn with_payloads(mut self, payloads: HashMap<String, MemoryPayload>) -> Self {
+        self.payloads = payloads;
+        self
+    }
+
+    /// Hydrate a payload for `id`, falling back to the empty stub.
+    fn payload_for(&self, id: &str) -> MemoryPayload {
+        self.payloads.get(id).cloned().unwrap_or_else(Self::empty_payload)
     }
 
     fn empty_payload() -> MemoryPayload {
@@ -180,7 +195,7 @@ impl ReasoningAdapter {
             return vec![SearchResult {
                 id: query.to_string(),
                 score: 1.0,
-                payload: Self::empty_payload(),
+                payload: self.payload_for(query),
                 evidence: None,
             }];
         }
@@ -206,7 +221,7 @@ impl ReasoningAdapter {
                 out.push(SearchResult {
                     id: e.clone(),
                     score: 1.0,
-                    payload: Self::empty_payload(),
+                    payload: self.payload_for(e),
                     evidence: None,
                 });
             }
@@ -216,7 +231,7 @@ impl ReasoningAdapter {
                 out.push(SearchResult {
                     id: r.clone(),
                     score: 0.8,
-                    payload: Self::empty_payload(),
+                    payload: self.payload_for(r),
                     evidence: None,
                 });
             }
@@ -226,7 +241,7 @@ impl ReasoningAdapter {
             out.push(SearchResult {
                 id: query.to_string(),
                 score: 1.0,
-                payload: Self::empty_payload(),
+                payload: self.payload_for(query),
                 evidence: None,
             });
         }
@@ -342,5 +357,49 @@ mod tests {
         assert!(!adapter.expand_relation(&idx, "GOVERNS").is_empty());
         let results = adapter.execute(&idx, "auth", "ssl", &["tls::src/tls.rs".to_string()]);
         assert!(results.iter().any(|r| r.id == "src/tls.rs"));
+    }
+
+    #[test]
+    fn reasoning_adapter_hydrates_registered_payloads() {
+        let idx = OntologyIndex::from_registry_metadata(&json!({
+            "domain_registry": {
+                "domains": [
+                    {"slug": "auth", "aliases": ["authn"]},
+                    {"slug": "tls", "parent": "auth", "aliases": ["ssl"]}
+                ]
+            }
+        }));
+        let mut payloads: HashMap<String, MemoryPayload> = HashMap::new();
+        payloads.insert(
+            "src/tls.rs".to_string(),
+            MemoryPayload {
+                content: "TLS terminates at src/tls.rs".to_string(),
+                user_id: "agent:bosun".to_string(),
+                memory_type: "rule".to_string(),
+                agent_name: Some("bosun".to_string()),
+                location: "src/tls.rs".to_string(),
+                location_lines: "1-10".to_string(),
+                metadata: json!({"domain": "tls"}),
+            },
+        );
+        let adapter = ReasoningAdapter::new_with(ReasoningConfig::default())
+            .with_payloads(payloads);
+
+        let results = adapter.execute(&idx, "auth", "ssl", &["tls::src/tls.rs".to_string()]);
+        let hit = results
+            .iter()
+            .find(|r| r.id == "src/tls.rs")
+            .expect("governs closure result must be present");
+        assert_eq!(hit.payload.content, "TLS terminates at src/tls.rs");
+        assert_eq!(hit.payload.memory_type, "rule");
+        assert_eq!(hit.payload.user_id, "agent:bosun");
+
+        // Unregistered ids still fall back to the empty stub.
+        let miss = results
+            .iter()
+            .find(|r| r.id != "src/tls.rs")
+            .expect("expanded query result must be present");
+        assert_eq!(miss.payload.content, "");
+        assert_eq!(miss.payload.memory_type, "fact");
     }
 }

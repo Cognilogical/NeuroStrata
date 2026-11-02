@@ -1,6 +1,6 @@
 # Enrichment Locking Per Namespace Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/registry.rs.
 > Task: `neurostrata-bum5` (Enrichment locking per namespace, P2, ranked #24, S effort).
 
 ## 1. Problem

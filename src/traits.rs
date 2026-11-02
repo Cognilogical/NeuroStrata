@@ -555,7 +555,10 @@ pub trait GraphRead: Send + Sync {
     /// clamped to `[1, 2]`; `memory_types` empty means no type filter; `limit`
     /// is clamped to `[1, MAX_LIMIT]`. `cursor` resumes a page only when its
     /// fingerprint and generation still match the current query and store, so
-    /// retirement/privacy are rechecked on every page.
+    /// retirement/privacy are rechecked on every page. `cross_namespace` is
+    /// the boundary policy: same-namespace hops are always allowed, and a
+    /// cross-namespace hop requires an explicit opt-in (plus an optional
+    /// target allowlist).
     async fn related(
         &self,
         namespace: &str,
@@ -566,6 +569,7 @@ pub trait GraphRead: Send + Sync {
         memory_types: &[String],
         limit: usize,
         cursor: Option<&RelatedCursor>,
+        cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
     ) -> Result<RelatedResult>;
 }
 

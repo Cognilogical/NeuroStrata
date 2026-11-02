@@ -1,8 +1,8 @@
 # NeuroStrata RDF Semantic Layer (Approach 1: RDF Projection)
 
-Date: 2026-10-27. Design only. No implementation authorized.
+Date: 2026-10-27. Implemented in v1.14.3.
 
-Status: draft for user review.
+Status: APPROVED & implemented (v1.14.3) — see `src/rdf/` (types_oxrdf.rs, projection.rs, shacl.rs, reasoning.rs, sparql.rs, federation.rs, provenance.rs, canonical.rs, namespace.rs, ontology.rs, dataset_canonical.rs).
 
 ## 1. Purpose & scope
 

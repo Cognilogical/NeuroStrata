@@ -289,7 +289,14 @@ pub async fn process_mcp_request(
                                     "fingerprint": { "type": "string" },
                                     "generation": { "type": "integer" },
                                     "offset": { "type": "integer" }
-                                } }
+                                } },
+                                "as_of": { "type": "integer", "description": "Optional epoch second at which relationships must be active." },
+                                "valid_from": { "type": "integer", "description": "Optional start (epoch seconds) of the requested validity window." },
+                                "valid_to": { "type": "integer", "description": "Optional end (epoch seconds) of the requested validity window." },
+                                "prioritized": { "type": "boolean", "description": "Rank the page by canonical edge weights (GOVERNS > SUPERSEDES > EXTRACTED_FROM > RELATES_TO/CONTAINS > DEPENDS_ON)." },
+                                "cross_namespace": { "type": "boolean", "description": "Allow hops that leave the home namespace. Default false." },
+                                "namespace_allowlist": { "type": "array", "items": { "type": "string" }, "description": "Target namespaces permitted when cross_namespace is true. Empty means all." },
+                                "include_propagated_domains": { "type": "boolean", "description": "Attach bounded domain propagation from the returned seed nodes (GOVERNS/CONTAINS, default 3 hops)." }
                             },
                             "required": ["namespace", "id"]
                         }
@@ -1784,6 +1791,35 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
     let cursor: Option<crate::graph_read::related::Cursor> = arguments
         .get("cursor")
         .and_then(|c| serde_json::from_value(c.clone()).ok());
+    let temporal = crate::graph_read::temporal::TemporalFilter {
+        as_of: arguments.get("as_of").and_then(Value::as_i64),
+        valid_from: arguments.get("valid_from").and_then(Value::as_i64),
+        valid_to: arguments.get("valid_to").and_then(Value::as_i64),
+    };
+    let apply_temporal = !temporal.is_unbounded();
+    let prioritized = arguments
+        .get("prioritized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cross_namespace = crate::graph_read::traversal::CrossNamespacePolicy::new(
+        arguments
+            .get("cross_namespace")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        arguments
+            .get("namespace_allowlist")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
+    let include_propagated = arguments
+        .get("include_propagated_domains")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let Some(store) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
@@ -1810,14 +1846,133 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
             &memory_types,
             limit,
             cursor.as_ref(),
+            &cross_namespace,
         )
         .await
     {
-        Ok(result) => {
+        Ok(mut result) => {
+            // Temporal bounds apply to the validity windows of the edges on
+            // each node's evidence path. The seed is the explicit query target
+            // and is never dropped.
+            if apply_temporal {
+                let active = |e: &crate::graph_read::related::TraversalEdge| {
+                    crate::graph_read::temporal::is_temporally_active(
+                        e.valid_from,
+                        e.valid_to,
+                        None,
+                        None,
+                        &temporal,
+                    )
+                };
+                let mut paths: std::collections::HashMap<
+                    String,
+                    Vec<crate::graph_read::related::TraversalEdge>,
+                > = std::collections::HashMap::new();
+                for evidence in &result.evidence {
+                    if let Some(last) = evidence.path.last() {
+                        paths.insert(last.target.clone(), evidence.path.clone());
+                    }
+                }
+                result.nodes.retain(|node| {
+                    if node.id == seed {
+                        return true;
+                    }
+                    paths
+                        .get(&node.id)
+                        .map(|path| path.iter().all(active))
+                        .unwrap_or(true)
+                });
+                result.evidence.retain(|evidence| evidence.path.iter().all(active));
+                result.edges.retain(active);
+                result.total = result.nodes.len();
+            }
+
+            // Weighted ordering: rank the page by the canonical relation
+            // weights of the evidence path that reached each node.
+            if prioritized {
+                let mut relations: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for evidence in &result.evidence {
+                    if let Some(last) = evidence.path.last() {
+                        relations.insert(
+                            last.target.clone(),
+                            evidence.path.iter().map(|e| e.relation.clone()).collect(),
+                        );
+                    }
+                }
+                let items: Vec<crate::graph_read::prioritized::RelatedItem> = result
+                    .nodes
+                    .iter()
+                    .map(|node| {
+                        let rels = relations.get(&node.id).cloned().unwrap_or_default();
+                        crate::graph_read::prioritized::RelatedItem::with_relations(
+                            node.id.clone(),
+                            &rels,
+                        )
+                    })
+                    .collect();
+                let ordered = crate::graph_read::prioritized::prioritize_neighbors(items);
+                let rank: std::collections::HashMap<String, usize> = ordered
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| (item.id.clone(), index))
+                    .collect();
+                result
+                    .nodes
+                    .sort_by_key(|node| rank.get(&node.id).copied().unwrap_or(usize::MAX));
+            }
+
             let mut body = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("unsupported".to_string(), serde_json::json!(false));
                 obj.insert("seed".to_string(), serde_json::json!(seed));
+                if apply_temporal {
+                    obj.insert(
+                        "temporal_filter".to_string(),
+                        serde_json::to_value(temporal).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                if prioritized {
+                    obj.insert("prioritized".to_string(), serde_json::json!(true));
+                }
+                if cross_namespace.allow_cross_namespace {
+                    obj.insert(
+                        "cross_namespace".to_string(),
+                        serde_json::to_value(&cross_namespace)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                if include_propagated {
+                    let seeds: Vec<(String, String)> = result
+                        .nodes
+                        .iter()
+                        .filter_map(|node| {
+                            node.domain
+                                .clone()
+                                .map(|domain| (node.id.clone(), domain))
+                        })
+                        .collect();
+                    let edges: Vec<crate::graph_read::related::EdgeSpec> = result
+                        .edges
+                        .iter()
+                        .map(|e| crate::graph_read::related::EdgeSpec {
+                            source: e.source.clone(),
+                            relation: e.relation.clone(),
+                            target: e.target.clone(),
+                            valid_from: e.valid_from,
+                            valid_to: e.valid_to,
+                        })
+                        .collect();
+                    let tags = crate::graph_read::propagate::propagate_domains(
+                        &seeds,
+                        &edges,
+                        &crate::graph_read::propagate::PropagationConfig::default(),
+                    );
+                    obj.insert(
+                        "propagated_domains".to_string(),
+                        serde_json::to_value(tags).unwrap_or(serde_json::Value::Null),
+                    );
+                }
                 if arguments.get("closure_governs").and_then(|v| v.as_bool()).unwrap_or(false) {
                     let edges: Vec<crate::graph_read::related::EdgeSpec> = result
                         .edges
@@ -1826,6 +1981,8 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                             source: e.source.clone(),
                             relation: e.relation.clone(),
                             target: e.target.clone(),
+                            valid_from: e.valid_from,
+                            valid_to: e.valid_to,
                         })
                         .collect();
                     let closure = crate::graph_read::related::closure_governs(

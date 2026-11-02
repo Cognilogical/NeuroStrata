@@ -1,6 +1,6 @@
 # Tantivy Full-Text Search Design
 
-> Status: **APPROVED** (2026-10-28).
+> Status: **APPROVED** (2026-10-28) & implemented (v1.14.3) — see src/fts/mod.rs + src/lexical.rs.
 > Task: `neurostrata-n20x` (Tantivy full-text search, OxiRS §1.9).
 > Companion: `docs/design-oxirs-concepts.md` §1.9, `docs/superpowers/specs/2026-10-27-neurostrata-feature-specs-design.md` (F1 exact names).
 

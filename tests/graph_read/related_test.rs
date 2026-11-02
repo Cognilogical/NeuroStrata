@@ -36,6 +36,8 @@ fn edge(source: &str, relation: &str, target: &str) -> EdgeSpec {
         source: source.to_string(),
         relation: relation.to_string(),
         target: target.to_string(),
+        valid_from: 0,
+        valid_to: 0,
     }
 }
 

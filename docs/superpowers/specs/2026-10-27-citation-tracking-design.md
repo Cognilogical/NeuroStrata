@@ -1,6 +1,6 @@
 # Citation Tracking — Source Traceability Across Transformations Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/rag_chat.rs (+ src/server.rs).
 > Task: `neurostrata-z3zw` (Citation Tracking — Source Traceability Across Transformations Design).
 
 ## 1. Problem

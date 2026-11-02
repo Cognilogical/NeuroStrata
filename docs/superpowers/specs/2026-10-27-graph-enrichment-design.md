@@ -1,6 +1,6 @@
 # Graph Enrichment — Attribute Propagation from Seed Nodes Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/parser/ingest.rs.
 > Task: `neurostrata-grv3` (Graph enrichment: attribute propagation from seed nodes, P3).
 
 ## 1. Problem

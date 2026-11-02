@@ -1,6 +1,6 @@
 # Closed-World Shape Checks for Edges and Required Fields Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/rdf/shacl.rs (closed-world shape checks in src/store/ladybug.rs).
 > Task: `neurostrata-rzda` (Closed-world shape checks for edges and required fields, P2, ranked #18, S-M effort).
 
 ## 1. Problem

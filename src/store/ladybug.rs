@@ -87,6 +87,7 @@ async fn search_inner(
     // Ontology-backed query reasoning (RDFS/SHACL): expand the domain seeds
     // through the compiled index and exercise identifier/relation expansion
     // against the query text before the closure runs.
+    let mut inferred_results: Vec<SearchResult> = Vec::new();
     if let Some(ont_idx) = store.ontology.load().get(&namespace).cloned() {
         let adapter = crate::rdf::reasoning::ReasoningAdapter::new_with(
             crate::rdf::reasoning::ReasoningConfig::default(),
@@ -107,7 +108,47 @@ async fn search_inner(
             let _rels = adapter.expand_relations_for_search(&ont_idx, "GOVERNS");
             let _rel_list = adapter.expand_relation(&ont_idx, "GOVERNS");
             let _closure = adapter.closure_governs(&ont_idx, &namespace, &[]);
-            let _exec = adapter.execute(&ont_idx, &namespace, q, &[]);
+            // Hydrate reasoning payloads from in-namespace rows so the
+            // reasoning-backed SearchResult rows carry real MemoryPayloads
+            // (content, user_id, memory_type, metadata) instead of empty stubs.
+            let hydrate_q = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata LIMIT 512",
+                escape_ladybug_string(&namespace)
+            );
+            let hydrated = store
+                .with_conn(move |conn| {
+                    let mut out: std::collections::HashMap<String, MemoryPayload> =
+                        std::collections::HashMap::new();
+                    if let Ok(rows) = conn.query(&hydrate_q) {
+                        for row in rows {
+                            let id = format!("{}", row[0]);
+                            if id.is_empty() || out.contains_key(&id) {
+                                continue;
+                            }
+                            let metadata_str = format!("{}", row[7]);
+                            let metadata: Value =
+                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                            out.insert(
+                                id,
+                                MemoryPayload {
+                                    content: format!("{}", row[1]),
+                                    user_id: format!("{}", row[2]),
+                                    memory_type: format!("{}", row[3]),
+                                    agent_name: Some(format!("{}", row[4])),
+                                    location: format!("{}", row[5]),
+                                    location_lines: format!("{}", row[6]),
+                                    metadata,
+                                },
+                            );
+                        }
+                    }
+                    Ok(out)
+                })
+                .await
+                .unwrap_or_default();
+            let exec_adapter = crate::rdf::reasoning::ReasoningAdapter::new()
+                .with_payloads(hydrated);
+            inferred_results = exec_adapter.execute(&ont_idx, &namespace, q, &[]);
         }
     }
 
@@ -828,6 +869,21 @@ async fn search_inner(
                         evidence: if evidence.is_empty() { None } else { Some(evidence) },
                     });
                 }
+            }
+
+            // Merge reasoning-inferred rows: a row that the vector/graph pass
+            // did not surface but reasoning derived (and whose payload was
+            // hydrated to real content) joins the result set. Empty-stub rows
+            // carry no content and are never merged, so reasoning cannot
+            // invent a result.
+            for inferred in inferred_results {
+                if inferred.payload.content.is_empty() {
+                    continue;
+                }
+                if results.iter().any(|existing| existing.id == inferred.id) {
+                    continue;
+                }
+                results.push(inferred);
             }
 
             // Final sort: primaries (DirectMatch, real boosted_distance) first,
@@ -2853,6 +2909,8 @@ impl LadybugStore {
                             source: from,
                             relation: rel_name.to_string(),
                             target: to,
+                            valid_from: vf.unwrap_or(0),
+                            valid_to: vt.unwrap_or(0),
                         });
                     }
                 }
@@ -5367,6 +5425,7 @@ impl GraphRead for LadybugStore {
         memory_types: &[String],
         limit: usize,
         cursor: Option<&crate::graph_read::related::Cursor>,
+        cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
     ) -> Result<crate::graph_read::related::RelatedResult> {
         let namespace = namespace.to_string();
         let seed = seed.to_string();
@@ -5374,6 +5433,7 @@ impl GraphRead for LadybugStore {
         let memory_types = memory_types.to_vec();
         let max_hops = crate::graph_read::related::clamp_max_hops(max_hops);
         let limit = crate::graph_read::related::clamp_limit(limit);
+        let policy = cross_namespace.clone();
 
         let ns = namespace.clone();
         let seed_c = seed.clone();
@@ -5381,7 +5441,7 @@ impl GraphRead for LadybugStore {
 
         let (nodes, edges, generation) = self
             .with_conn(move |conn| {
-                fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops)
+                fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops, &policy)
             })
             .await?;
 
@@ -5415,6 +5475,7 @@ fn fetch_related_subgraph(
     seed: &str,
     relations: &[String],
     max_hops: usize,
+    cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
 ) -> Result<(
     Vec<crate::graph_read::related::NodeSpec>,
     Vec<crate::graph_read::related::EdgeSpec>,
@@ -5550,9 +5611,15 @@ fn fetch_related_subgraph(
 
         let mut next_frontier = Vec::new();
 
+        let ns_filter = if cross_namespace.allow_cross_namespace {
+            String::new()
+        } else {
+            format!(" AND b.namespace = '{}'", safe_ns)
+        };
+
         let out_q = format!(
-            "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' RETURN a.id, label(e), b.id, b.memory_type, b.content, b.metadata LIMIT {}",
-            id_list, safe_ns, RELATED_FETCH_LIMIT
+            "MATCH (a:Memory)-[e]->(b:Memory) WHERE a.id IN [{}]{} RETURN a.id, label(e), b.id, b.namespace, b.memory_type, b.content, b.metadata, e.valid_from, e.valid_to LIMIT {}",
+            id_list, ns_filter, RELATED_FETCH_LIMIT
         );
         {
             let mut rows = conn.query(&out_q)?;
@@ -5560,17 +5627,27 @@ fn fetch_related_subgraph(
                 let frontier_id = format!("{}", row[0]);
                 let relation = format!("{}", row[1]);
                 let neighbor_id = format!("{}", row[2]);
-                let neighbor_type = format!("{}", row[3]);
-                let neighbor_content = format!("{}", row[4]);
+                let neighbor_ns = format!("{}", row[3]);
+                let neighbor_type = format!("{}", row[4]);
+                let neighbor_content = format!("{}", row[5]);
                 let neighbor_meta: Value =
-                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
+                    serde_json::from_str(&format!("{}", row[6])).unwrap_or(Value::Null);
+                let valid_from = format!("{}", row[7]).parse::<i64>().unwrap_or(0);
+                let valid_to = format!("{}", row[8]).parse::<i64>().unwrap_or(0);
                 if !allowed.contains(relation.as_str()) {
+                    continue;
+                }
+                let target_ns = crate::graph_read::traversal::extract_namespace_prefix(&neighbor_id)
+                    .unwrap_or(neighbor_ns.as_str());
+                if !cross_namespace.is_allowed(namespace, target_ns) {
                     continue;
                 }
                 edges.push(EdgeSpec {
                     source: frontier_id.clone(),
                     relation: relation.clone(),
                     target: neighbor_id.clone(),
+                    valid_from,
+                    valid_to,
                 });
                 if !nodes.contains_key(&neighbor_id) {
                     nodes.insert(
@@ -5591,8 +5668,8 @@ fn fetch_related_subgraph(
         }
 
         let in_q = format!(
-            "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}] AND b.namespace = '{}' RETURN a.id, label(e), b.id, b.memory_type, b.content, b.metadata LIMIT {}",
-            id_list, safe_ns, RELATED_FETCH_LIMIT
+            "MATCH (a:Memory)<-[e]-(b:Memory) WHERE a.id IN [{}]{} RETURN a.id, label(e), b.id, b.namespace, b.memory_type, b.content, b.metadata, e.valid_from, e.valid_to LIMIT {}",
+            id_list, ns_filter, RELATED_FETCH_LIMIT
         );
         {
             let mut rows = conn.query(&in_q)?;
@@ -5600,17 +5677,27 @@ fn fetch_related_subgraph(
                 let frontier_id = format!("{}", row[0]);
                 let relation = format!("{}", row[1]);
                 let neighbor_id = format!("{}", row[2]);
-                let neighbor_type = format!("{}", row[3]);
-                let neighbor_content = format!("{}", row[4]);
+                let neighbor_ns = format!("{}", row[3]);
+                let neighbor_type = format!("{}", row[4]);
+                let neighbor_content = format!("{}", row[5]);
                 let neighbor_meta: Value =
-                    serde_json::from_str(&format!("{}", row[5])).unwrap_or(Value::Null);
+                    serde_json::from_str(&format!("{}", row[6])).unwrap_or(Value::Null);
+                let valid_from = format!("{}", row[7]).parse::<i64>().unwrap_or(0);
+                let valid_to = format!("{}", row[8]).parse::<i64>().unwrap_or(0);
                 if !allowed.contains(relation.as_str()) {
+                    continue;
+                }
+                let target_ns = crate::graph_read::traversal::extract_namespace_prefix(&neighbor_id)
+                    .unwrap_or(neighbor_ns.as_str());
+                if !cross_namespace.is_allowed(namespace, target_ns) {
                     continue;
                 }
                 edges.push(EdgeSpec {
                     source: neighbor_id.clone(),
                     relation: relation.clone(),
                     target: frontier_id.clone(),
+                    valid_from,
+                    valid_to,
                 });
                 if !nodes.contains_key(&neighbor_id) {
                     nodes.insert(
@@ -7327,6 +7414,7 @@ eurostrata\src\daemon.rs",
                 &[],
                 25,
                 None,
+                &crate::graph_read::traversal::CrossNamespacePolicy::default(),
             )
             .await
             .expect("related traversal succeeds");

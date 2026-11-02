@@ -1,6 +1,6 @@
 # Incremental Index — Add/Remove/Update Without Full Rebuild Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/parser/ingest.rs + src/domain.rs.
 > Task: `neurostrata-iwrn` (Incremental Index — Add/Remove/Update Without Full Rebuild Design).
 
 ## 1. Problem

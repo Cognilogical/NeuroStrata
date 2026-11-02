@@ -1,6 +1,6 @@
 # Ontology Grounding — Optional JSON Vocabulary Annotate/Strict Mode Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/ontology_grounding.rs.
 > Task: `neurostrata-3pqo` (Ontology grounding: optional JSON vocabulary annotate/strict mode, P3, ranked #21, effort M-L).
 
 ## 1. Problem

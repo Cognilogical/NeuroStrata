@@ -1,6 +1,6 @@
 # Watermarks — Record Last Ingested / Enriched With Fingerprints Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/registry.rs + src/parser/ingest.rs.
 > Task: `neurostrata-svr0` (Watermarks: record last ingested/enriched with fingerprints, P2, ranked #13, S effort).
 
 ## 1. Problem

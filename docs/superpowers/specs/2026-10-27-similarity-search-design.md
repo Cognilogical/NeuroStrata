@@ -1,6 +1,6 @@
 # Similarity Search — Vector Similarity Search Using Embeddings Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/embed.rs + src/search.rs.
 > Task: `neurostrata-wtnn` (Similarity search: vector similarity search using embeddings, P3).
 
 ## 1. Problem

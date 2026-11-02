@@ -1,6 +1,6 @@
 # Enrichment Telemetry — Per-Stage Counts, Failures, Latency, Fingerprints Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/telemetry/anomaly.rs + src/time_series.rs.
 > Task: `neurostrata-qylk` (Enrichment telemetry, P2, ranked #14, S-M effort).
 
 ## 1. Problem

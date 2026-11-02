@@ -1,6 +1,6 @@
 # Canonical Entity Slugs for Topology and KnownIds Aliases Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/rdf/canonical.rs.
 > Task: `neurostrata-u5o1` (Canonical entity slugs for topology and KnownIds aliases, P2, ranked #17, S-M effort).
 
 ## 1. Problem

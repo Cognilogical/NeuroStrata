@@ -1,6 +1,6 @@
 # Re-ingest Only What Changed — File-Level Content Hash Reuse Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/parser/ingest.rs.
 > Task: `neurostrata-emrz` (Re-ingest only what changed, P2, ranked #2, M-L effort).
 
 ## 1. Problem

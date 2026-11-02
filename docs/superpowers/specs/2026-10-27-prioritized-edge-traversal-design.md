@@ -1,6 +1,6 @@
 # Prioritized Edge Traversal — Weighted Graph Walk Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/graph_read/related.rs.
 > Task: `neurostrata-pmwh` (Prioritized edge traversal: weighted graph walk, P3).
 
 ## 1. Problem

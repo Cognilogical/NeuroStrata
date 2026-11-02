@@ -1,6 +1,6 @@
 # RDF Canonical / JSON Vocabulary Transition Design
 
-> Status: draft — user review required before implementation planning.
+> Status: APPROVED & implemented (v1.14.3) — see src/rdf/canonical.rs + src/rdf/dataset_canonical.rs.
 > Task: `neurostrata-9fnf` (Confirm RDF migration direction — strategic decision, gates §1.1, §1.2, §1.4).
 > Companion specs: `2026-10-27-rdf-canonical-memory-data-model-migration-design.md` (z9e7, canonical migration design), `2026-10-27-owl-rdfs-reasoning-design.md` (2hxl, OWL reasoning), `2026-10-27-shacl-shape-validation-design.md` (7zvo), `2026-10-27-sparql-query-engine-design.md` (damg).
 

@@ -1,6 +1,6 @@
 # Inter-Namespace Edge Traversal — Jump Between Domains Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/graph_read/related.rs.
 > Task: `neurostrata-mhsp` (Inter-namespace edge traversal: jump between domains, P3).
 
 ## 1. Problem

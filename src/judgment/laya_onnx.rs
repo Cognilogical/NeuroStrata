@@ -202,7 +202,9 @@ impl JudgmentProvider for LayaOnnxProvider {
 
             let token_overlap = if union == 0 { 0.0f32 } else { intersection as f32 / union as f32 };
 
-            let similarity = if let Some(lock) = self.inference_session() {
+            // Fallback logit when the ONNX tensor cannot be extracted.
+            let fallback_logit = (token_overlap - 0.5) * 4.0;
+            let (similarity, reason) = if let Some(lock) = self.inference_session() {
                 let mut session = lock.lock().unwrap();
                 // Try real ONNX execution with 2-float feature vector
                 let jaccard_sim = token_overlap;
@@ -210,25 +212,41 @@ impl JudgmentProvider for LayaOnnxProvider {
                 let feature_array = ort::value::Value::from_array(
                     ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec()).unwrap()
                 ).ok();
-                if let Some(arr) = feature_array {
-                    if session.run(ort::inputs! {"input" => arr}).is_ok() {
-                        // If ONNX succeeds, apply temperature scaling on token overlap
-                        let logit = token_overlap; // approximate logit from overlap
-                        1.0 / (1.0 + (-logit / self.temperature).exp())
-                    } else {
-                        // Fallback: temperature-scaled token overlap
-                        let logit = token_overlap;
-                        1.0 / (1.0 + (-logit / self.temperature).exp())
-                    }
-                } else {
-                    // Feature array creation failed; fallback
-                    let logit = token_overlap;
-                    1.0 / (1.0 + (-logit / self.temperature).exp())
+                match feature_array {
+                    Some(arr) => match session.run(ort::inputs! {"input" => arr}) {
+                        Ok(outputs) => {
+                            // Extract the first output tensor and derive the
+                            // model logit from real inference values.
+                            let model_logit = outputs.iter().next().and_then(|(_name, value)| {
+                                let (_, data) = value.try_extract_tensor::<f32>().ok()?;
+                                laya_logit_from_tensor(data)
+                            });
+                            match model_logit {
+                                Some(logit) => (
+                                    temperature_scaled_sigmoid(logit, self.temperature),
+                                    "laya-onnx-model-logit",
+                                ),
+                                None => (
+                                    temperature_scaled_sigmoid(fallback_logit, self.temperature),
+                                    "laya-onnx-token-overlap-fallback",
+                                ),
+                            }
+                        }
+                        Err(_) => (
+                            temperature_scaled_sigmoid(fallback_logit, self.temperature),
+                            "laya-onnx-token-overlap-fallback",
+                        ),
+                    },
+                    None => (
+                        temperature_scaled_sigmoid(fallback_logit, self.temperature),
+                        "laya-onnx-token-overlap-fallback",
+                    ),
                 }
             } else {
-                // No session; temperature-scaled fallback
-                let logit = token_overlap;
-                1.0 / (1.0 + (-logit / self.temperature).exp())
+                (
+                    temperature_scaled_sigmoid(fallback_logit, self.temperature),
+                    "laya-onnx-token-overlap-fallback",
+                )
             };
 
             // Ensure similarity stays bounded
@@ -237,7 +255,7 @@ impl JudgmentProvider for LayaOnnxProvider {
             judgments.push(DuplicateJudgment {
                 existing_memory_id: cand.id.clone(),
                 confidence: similarity,
-                reason: Some("laya-onnx-token-pair".to_string()),
+                reason: Some(reason.to_string()),
             });
         }
 
@@ -258,6 +276,22 @@ impl JudgmentProvider for LayaOnnxProvider {
     fn name(&self) -> &str {
         "laya-onnx"
     }
+}
+
+/// Computes the dedup logit from ONNX output tensor values:
+/// `[neg_logit, pos_logit]` => `pos - neg`; `[logit]` => logit;
+/// empty or unsupported shapes => `None` (caller must fall back).
+fn laya_logit_from_tensor(values: &[f32]) -> Option<f32> {
+    match values {
+        [neg, pos] => Some(pos - neg),
+        [logit] => Some(*logit),
+        _ => None,
+    }
+}
+
+/// Temperature-scaled sigmoid confidence derived from a model logit.
+fn temperature_scaled_sigmoid(logit: f32, temperature: f32) -> f32 {
+    1.0 / (1.0 + (-logit / temperature).exp())
 }
 
 /// Tokenizes text content, using the tokenizer file when available,
@@ -290,6 +324,26 @@ fn tokenize_content(content: &str, tokenizer: Option<&tokenizers::Tokenizer>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn laya_logit_extraction_computes_different_confidences_for_different_slices() {
+        let conf = |slice: &[f32]| {
+            laya_logit_from_tensor(slice)
+                .map(|logit| temperature_scaled_sigmoid(logit, 1.0))
+        };
+        // [neg, pos] => pos - neg = 5.0 => high confidence
+        let high = conf(&[-2.0, 3.0]);
+        // [neg, pos] flipped => pos - neg = -5.0 => low confidence
+        let low = conf(&[3.0, -2.0]);
+        assert_eq!(high, Some(1.0 / (1.0 + (-5.0_f32).exp())));
+        assert_eq!(low, Some(1.0 / (1.0 + 5.0_f32.exp())));
+        assert_ne!(high, low, "different tensor slices must yield different confidences");
+        // Single-element tensor: the logit is used directly.
+        assert_eq!(conf(&[0.0]), Some(0.5));
+        // Empty tensor or unsupported shape: extraction fails => caller falls back.
+        assert_eq!(conf(&[]), None);
+        assert_eq!(conf(&[1.0, 2.0, 3.0]), None);
+    }
 
     #[tokio::test]
     async fn laya_does_not_return_fake_confidence() {

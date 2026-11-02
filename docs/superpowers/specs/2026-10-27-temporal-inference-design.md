@@ -1,6 +1,6 @@
 # Temporal Inference — Bounded Time-Window Reasoning Design
 
-> Status: draft — awaiting Argon review.
+> Status: APPROVED & implemented (v1.14.3) — see src/rdf/reasoning.rs + src/time_series.rs.
 > Task: `neurostrata-tjxf` (Temporal Inference — Bounded Time-Window Reasoning Design).
 
 ## 1. Problem
