@@ -125,17 +125,10 @@ fn is_archived(metadata: &Value) -> bool {
 }
 
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
-    // Matches src/rdf/sparql.rs: a record is retired when `retired_at` OR
-    // `valid_to` is present and non-null (a present-but-non-numeric value is
-    // treated as epoch 0, i.e. already retired).
-    for key in ["retired_at", "valid_to"] {
-        if let Some(v) = metadata.get(key) {
-            if !v.is_null() && v.as_i64().unwrap_or(0) <= now {
-                return true;
-            }
-        }
+    match metadata.get("valid_to") {
+        Some(valid_to) if !valid_to.is_null() => valid_to.as_i64().unwrap_or(0) <= now,
+        _ => false,
     }
-    false
 }
 
 fn build_memory_node(

@@ -181,7 +181,7 @@ impl Queue {
     /// pulse just pushed is also the oldest, and goes. The caller counts an
     /// eviction as a drop.
     fn push(&self, event: ThalamicPulse, capacity: usize) -> bool {
-        let mut items = self.items.lock().expect("queue lock poisoned");
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         items.push_back(event);
         let evicted = if items.len() > capacity {
             items.pop_front();
@@ -197,11 +197,11 @@ impl Queue {
     }
 
     fn pop(&self) -> Option<ThalamicPulse> {
-        self.items.lock().expect("queue lock poisoned").pop_front()
+        self.items.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
     }
 
     fn len(&self) -> usize {
-        self.items.lock().expect("queue lock poisoned").len()
+        self.items.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -275,7 +275,7 @@ impl ThalamicBus {
     /// registry is append-only: ids are stable, and dispatch always sees the
     /// full list as of the pulse it is handling.
     pub fn register(&self, sub: Box<dyn MemorySubscriber>) -> SubscriberId {
-        let mut subs = self.subs.lock().expect("subscriber registry lock poisoned");
+        let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
         subs.push(Arc::from(sub));
         subs.len() - 1
     }
@@ -335,7 +335,7 @@ impl ThalamicBus {
             subscribers: self
                 .subs
                 .lock()
-                .expect("subscriber registry lock poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .len(),
             queue_depth: self.queue.len(),
             drops_oldest: self.metrics.drops_oldest.load(Ordering::Relaxed),
@@ -435,7 +435,7 @@ async fn dispatch(
 
         let registered: Vec<Arc<dyn MemorySubscriber>> = subs
             .lock()
-            .expect("subscriber registry lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         for sub in registered.iter() {
             // A fresh depth-1 token per subscriber: the token exists to refuse

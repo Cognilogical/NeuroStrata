@@ -441,7 +441,7 @@ pub async fn execute_sparql_query_with_config(
                     .map_err(|e| format!("serialize solution: {}", e))?;
             }
             solution_count = collected.len();
-            let _ = serializer_solutions.finish()
+            serializer_solutions.finish()
                 .map_err(|e| format!("serialize finish: {}", e))?;
         }
         spareval::QueryResults::Graph(triples) => {

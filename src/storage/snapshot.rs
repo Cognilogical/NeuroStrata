@@ -89,7 +89,13 @@ pub fn compute_storage_status(
     let snapshot_read = snapshot_dir.read_dir();
     let snapshot_count = match snapshot_read {
         Ok(entries) => entries
-            .filter_map(|e| e.ok())
+            .filter_map(|res| match res {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("snapshot directory entry read failed: {e}");
+                    None
+                }
+            })
             .filter(|e| {
                 e.path().is_dir()
                     && e.file_name()
@@ -239,7 +245,13 @@ pub fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
     let mut hasher = Sha256::new();
     if path.is_dir() {
         let mut entries: Vec<fs::DirEntry> = fs::read_dir(path)?
-            .filter_map(|e| e.ok())
+            .filter_map(|res| match res {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!("snapshot directory entry read failed: {e}");
+                    None
+                }
+            })
             .filter(|e| {
                 e.path().is_file() || e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
             })

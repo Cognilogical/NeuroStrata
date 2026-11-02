@@ -136,6 +136,12 @@ pub struct CreateReceiptRequest {
     /// Optional confidence score.
     #[serde(default)]
     pub confidence: Option<f64>,
+    /// Optional source span (e.g. `{"start": 0, "end": 42}`).
+    #[serde(default)]
+    pub source_span: Option<serde_json::Value>,
+    /// Optional extractor fingerprint identifying the extraction mechanism.
+    #[serde(default)]
+    pub extractor_fingerprint: Option<String>,
 }
 
 /// Request to list receipts.
@@ -262,8 +268,13 @@ pub fn create_candidates_from_intents(
             candidate_kind,
             payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
             confidence: request.confidence,
-            source_span: None,
-            extractor_fingerprint: None,
+            source_span: request.source_span.clone().or_else(|| {
+                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
+            }),
+            extractor_fingerprint: request
+                .extractor_fingerprint
+                .clone()
+                .or_else(|| Some("manual-override-v1".to_string())),
         }];
     }
 
@@ -295,14 +306,30 @@ pub fn create_candidates_from_intents(
             candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
             payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
             confidence: request.confidence,
-            source_span: None,
-            extractor_fingerprint: None,
+            source_span: request.source_span.clone().or_else(|| {
+                Some(serde_json::json!({"start": 0, "end": request.text.len()}))
+            }),
+            extractor_fingerprint: request
+                .extractor_fingerprint
+                .clone()
+                .or_else(|| Some("raw-text-fallback-v1".to_string())),
         });
     } else {
         // Create one candidate per distinct intent
         for (i, intent) in intents.into_iter().enumerate() {
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let title = format!("[{}] {}", intent.marker, intent.excerpt.chars().take(80).collect::<String>());
+            let span = request.source_span.clone().or_else(|| {
+                request
+                    .text
+                    .find(&intent.excerpt)
+                    .map(|start| serde_json::json!({"start": start, "end": start + intent.excerpt.len()}))
+                    .or_else(|| Some(serde_json::json!({"start": 0, "end": request.text.len()})))
+            });
+            let fp = request
+                .extractor_fingerprint
+                .clone()
+                .or_else(|| Some(format!("lexical-intent:{}", intent.marker)));
             candidates.push(IntakeCandidate {
                 id: generate_candidate_id(namespace, receipt_id, i),
                 namespace: namespace.to_string(),
@@ -318,8 +345,8 @@ pub fn create_candidates_from_intents(
                 candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
                 payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
                 confidence: request.confidence,
-                source_span: None,
-                extractor_fingerprint: None,
+                source_span: span,
+                extractor_fingerprint: fp,
             });
         }
     }
@@ -396,11 +423,15 @@ mod tests {
             candidate_kind: None,
             payload: None,
             confidence: None,
+            source_span: None,
+            extractor_fingerprint: None,
         };
         let candidates = create_candidates_from_intents("test", "rcpt-1", &request, vec![]);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].review_state, ReviewState::Pending);
         assert_eq!(candidates[0].disposition, Disposition::Pending);
+        assert!(candidates[0].source_span.is_some());
+        assert!(candidates[0].extractor_fingerprint.is_some());
     }
 
     #[test]
@@ -416,6 +447,8 @@ mod tests {
             candidate_kind: None,
             payload: None,
             confidence: None,
+            source_span: None,
+            extractor_fingerprint: None,
         };
         let intents = vec![
             DetectedIntent { marker: "todo:".to_string(), excerpt: "TODO: fix bug".to_string() },
@@ -642,6 +675,8 @@ pub async fn handle_intake(
         args.get("candidate_kind").and_then(|v| v.as_str()).map(|s| s.to_string());
     let payload = args.get("payload").cloned();
     let confidence = args.get("confidence").and_then(|v| v.as_f64());
+    let source_span = args.get("source_span").cloned();
+    let extractor_fingerprint = args.get("extractor_fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     // Downcast to IntakeStore
     let intake_store = store.as_intake_store();
@@ -661,6 +696,8 @@ pub async fn handle_intake(
         candidate_kind,
         payload,
         confidence,
+        source_span,
+        extractor_fingerprint,
     };
 
     match intake_store.create_receipt(request).await {

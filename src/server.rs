@@ -689,7 +689,9 @@ pub async fn process_mcp_request(
                                 "description": { "type": "string", "description": "Optional explicit description (for manual intake)." },
                                 "candidate_kind": { "type": "string", "description": "Optional candidate kind override (e.g. rule, task)." },
                                 "payload": { "type": "object", "description": "Optional payload attached to the generated candidate." },
-                                "confidence": { "type": "number", "description": "Optional confidence score for the generated candidate." }
+                                "confidence": { "type": "number", "description": "Optional confidence score for the generated candidate." },
+                                "source_span": { "type": "object", "description": "Optional source span override (e.g. {\"start\": 0, \"end\": 42})." },
+                                "extractor_fingerprint": { "type": "string", "description": "Optional extractor fingerprint override." }
                             },
                             "required": ["namespace", "source_revision", "source_digest", "text"]
                         }
@@ -13058,6 +13060,8 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
             candidate_kind: Some(ck.to_string()),
             payload: Some(serde_json::json!({"source":"distill","desc":desc})),
             confidence: Some(0.8),
+            source_span: Some(serde_json::json!({"start": 0, "end": desc.len()})),
+            extractor_fingerprint: Some("session-distill-v1".to_string()),
         };
         match intake_store.create_receipt(request).await {
             Ok(res) => {
