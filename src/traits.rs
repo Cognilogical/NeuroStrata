@@ -289,7 +289,12 @@ pub trait VectorStore: Send + Sync + AsAny {
     async fn init(&self, namespace: &str) -> Result<()>;
 
     /// Downcast support for store-specific capabilities (e.g., IntakeStore).
-    fn as_any(&self) -> &dyn std::any::Any;
+    ///
+    /// Delegates through `AsAny` so implementors declare the cast once; the
+    /// supertrait method is the single definition the calls resolve into.
+    fn as_any(&self) -> &dyn std::any::Any {
+        crate::traits::AsAny::as_any(self)
+    }
 
     /// Insert or update a memory with its associated vector and metadata.
     async fn upsert(

@@ -846,6 +846,11 @@ pub(crate) async fn start_daemon_on(
     // caller still waiting on the response (bead neurostrata-3fi.6.4). Out here
     // a failure costs a retry instead of a request, and the write is already in
     // the log either way.
+    // Snapshot/WAL hygiene knobs from config; defaults when unusable.
+    let hygiene: crate::storage::StorageHygieneConfig = crate::config::Config::from_default_path()
+        .map(|c| c.storage_hygiene)
+        .unwrap_or_default();
+
     let periodic_store = vector_store.clone();
     // Stopped before the final checkpoint, not aborted: a checkpoint it has
     // already started runs on a blocking thread that abort cannot reach, and the
@@ -854,6 +859,7 @@ pub(crate) async fn start_daemon_on(
     let periodic = tokio::spawn(async move {
         let mut wait = CHECKPOINT_INTERVAL;
         let mut failures: u32 = 0;
+        let mut wal_warned = false;
 
         loop {
             tokio::select! {
@@ -868,6 +874,27 @@ pub(crate) async fn start_daemon_on(
 
             match periodic_store.checkpoint().await {
                 Ok(()) => {
+                    // Post-checkpoint hygiene: flush buffered time-series
+                    // metrics into the MemoryMetric table and warn once per
+                    // WAL-growth excursion past the configured threshold.
+                    let ls = crate::traits::VectorStore::as_any(periodic_store.as_ref())
+                        .downcast_ref::<crate::store::LadybugStore>();
+                    if let Some(ls) = ls {
+                        let _ = ls.flush_metrics().await;
+                        match crate::storage::compute_storage_status(ls.local_path(), &hygiene)
+                        {
+                            status if status.wal_warn_threshold_exceeded => {
+                                if !wal_warned {
+                                    eprintln!(
+                                        "WARNING: the WAL has grown to {} bytes, beyond the configured warn threshold ({}). Checkpoints remove it; growth between checkpoints is what needs watching.",
+                                        status.wal_bytes, hygiene.wal_warn_bytes
+                                    );
+                                    wal_warned = true;
+                                }
+                            }
+                            _ => wal_warned = false,
+                        }
+                    }
                     if failures > 0 {
                         eprintln!(
                             "Checkpoint succeeded after {} failed attempts; those writes are on disk now.",

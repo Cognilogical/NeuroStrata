@@ -178,6 +178,29 @@ impl TantivyLexicalIndex {
         })
     }
 
+    /// Open with disk resilience: try the on-disk index first, and fall back
+    /// to a fresh in-RAM index when the directory cannot be opened (unreadable
+    /// or unusable path). Search still works; writes go to RAM and are lost on
+    /// exit — degraded, never fatal.
+    pub fn open(index_dir: &Path) -> Result<Self> {
+        match Self::open_or_create(index_dir) {
+            Ok(idx) => Ok(idx),
+            Err(e) => {
+                tracing::warn!(
+                    "lexical index at {} failed to open ({}); falling back to in-RAM index",
+                    index_dir.display(),
+                    e
+                );
+                Self::open_in_ram()
+            }
+        }
+    }
+
+    /// The directory backing this index, when it is disk-backed.
+    pub fn index_dir(&self) -> Option<&Path> {
+        self.index_dir.as_deref()
+    }
+
     /// Composite key for delete/replace.
     fn composite_key(namespace: &str, id: &str) -> String {
         format!("{}::{}", namespace, id)
@@ -473,5 +496,33 @@ mod tests {
         ];
         let count = idx.rebuild(&rows).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_open_falls_back_to_ram_when_dir_unusable() {
+        // A plain file where a directory is required: open_or_create cannot
+        // proceed, so open degrades to a RAM-backed index.
+        let blocker = std::env::temp_dir().join(format!(
+            "ns-lexical-blocker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let idx = TantivyLexicalIndex::open(&blocker).expect("fallback index");
+        assert!(idx.index_dir().is_none(), "fallback must be RAM-backed");
+        assert!(idx.writer.lock().unwrap().is_some());
+        std::fs::remove_file(&blocker).ok();
+    }
+
+    #[test]
+    fn test_search_hits_carry_their_namespace_and_index_reports_dir() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "m1", &dummy_payload("namespace carry test", None)).unwrap();
+        let hits = idx.search("ns", "namespace carry", 10, true, true, None).unwrap();
+        assert!(!hits.is_empty());
+        for h in &hits {
+            assert_eq!(h.namespace, "ns");
+        }
+        assert!(idx.index_dir().is_none());
     }
 }

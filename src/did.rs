@@ -263,7 +263,10 @@ pub fn canonical_signing_bytes(record_json: &serde_json::Value) -> Result<Vec<u8
     if let serde_json::Value::Object(ref mut map) = record {
         map.remove("signature");
     }
-    serde_json::to_vec(&record).map_err(|e| format!("serde_json::to_vec: {}", e))
+    // Normalize through the canonical value walker so signing bytes are
+    // produced from the canonicalized (not verbatim) document.
+    let normalized = canonicalize_json_value(&record);
+    serde_json::to_vec(&normalized).map_err(|e| format!("serde_json::to_vec: {}", e))
 }
 
 /// Canonical signing payload per `2026-10-28-did-signed-mesh-records-design.md` §5.2:

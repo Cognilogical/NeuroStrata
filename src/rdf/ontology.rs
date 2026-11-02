@@ -5,7 +5,6 @@ use oxrdf::NamedOrBlankNode;
 use oxrdf::Term;
 use crate::traits::MemoryPayload;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -131,40 +130,195 @@ impl OntologyIndex {
             d.parent = parent_map.get(&d.slug).cloned().flatten();
         }
 
-        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for d in &domains {
-            if let Some(parent) = &d.parent {
-                children.entry(parent.clone()).or_default().push(d.slug.clone());
-            }
-        }
+        Self::from_entries(domains)
+    }
 
+    /// Build an index from domain entries, registering each entry's parent,
+    /// concept IRI, and aliases as explicit ontology relations.
+    pub fn from_entries(entries: Vec<DomainEntry>) -> Self {
+        let mut index = if entries.is_empty() {
+            Self::empty()
+        } else {
+            OntologyIndex {
+                domains: entries,
+                children: BTreeMap::new(),
+                alias_map: BTreeMap::new(),
+                sub_properties: BTreeMap::new(),
+                sub_classes: BTreeMap::new(),
+                equivalent: BTreeMap::new(),
+                equivalent_class: BTreeMap::new(),
+                equivalent_property: BTreeMap::new(),
+                inverse_of: BTreeMap::new(),
+                transitive_properties: BTreeSet::new(),
+                symmetric_properties: BTreeSet::new(),
+                alt_labels: BTreeMap::new(),
+                exact_match: BTreeMap::new(),
+                broader: BTreeMap::new(),
+                narrower: BTreeMap::new(),
+                shacl_shapes: Vec::new(),
+            }
+        };
+
+        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut alias_map: BTreeMap<String, String> = BTreeMap::new();
-        for d in &domains {
+        for d in index.domains.clone() {
             for alias in &d.aliases {
                 alias_map.insert(alias.to_lowercase(), d.slug.clone());
+                index.add_alt_label(&d.slug, alias);
             }
             // slug itself maps to itself
             alias_map.insert(d.slug.to_lowercase(), d.slug.clone());
+            if let Some(parent) = &d.parent {
+                children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(d.slug.clone());
+                index.add_sub_class(&d.slug, parent);
+                index.add_broader(&d.slug, parent);
+            }
+            if let Some(iri) = &d.concept_iri {
+                index.add_equivalent(&d.slug, iri);
+                index.add_exact_match(&d.slug, iri);
+            }
         }
+        index.children = children;
+        index.alias_map = alias_map;
+        index
+    }
 
-        OntologyIndex {
-            domains,
-            children,
-            alias_map,
-            sub_properties: BTreeMap::new(),
-            sub_classes: BTreeMap::new(),
-            equivalent: BTreeMap::new(),
-            // New fields for 2xe9 spec
-            equivalent_class: BTreeMap::new(),
-            equivalent_property: BTreeMap::new(),
-            inverse_of: BTreeMap::new(),
-            transitive_properties: BTreeSet::new(),
-            symmetric_properties: BTreeSet::new(),
-            alt_labels: BTreeMap::new(),
-            exact_match: BTreeMap::new(),
-            broader: BTreeMap::new(),
-            narrower: BTreeMap::new(),
-            shacl_shapes: Vec::new(),
+    /// Register one more domain on an already-built index, keeping the alias,
+    /// sub-class, broader, children, and concept-IRI relations in sync. A slug
+    /// already present is a no-op, so repeated refreshes stay idempotent.
+    pub fn add_domain(&mut self, entry: DomainEntry) {
+        if self.domains.iter().any(|d| d.slug == entry.slug) {
+            return;
+        }
+        for alias in &entry.aliases {
+            self.alias_map.insert(alias.to_lowercase(), entry.slug.clone());
+            self.add_alt_label(&entry.slug, alias);
+        }
+        self.alias_map
+            .insert(entry.slug.to_lowercase(), entry.slug.clone());
+        if let Some(parent) = &entry.parent {
+            self.children
+                .entry(parent.clone())
+                .or_default()
+                .push(entry.slug.clone());
+            self.add_sub_class(&entry.slug, parent);
+            self.add_broader(&entry.slug, parent);
+        }
+        if let Some(iri) = &entry.concept_iri {
+            self.add_equivalent(&entry.slug, iri);
+            self.add_exact_match(&entry.slug, iri);
+        }
+        self.domains.push(entry);
+    }
+
+    /// The registered domain entries, in registration order.
+    pub fn domains(&self) -> &[DomainEntry] {
+        &self.domains
+    }
+
+    /// One registered domain by slug.
+    pub fn domain(&self, slug: &str) -> Option<&DomainEntry> {
+        self.domains.iter().find(|d| d.slug == slug)
+    }
+
+    /// Direct children of a registered domain (empty for unknown slugs; the
+    /// root domain is `"global"`).
+    pub fn children_of(&self, slug: &str) -> Vec<String> {
+        self.children.get(slug).cloned().unwrap_or_default()
+    }
+
+    /// Whether a property is declared symmetric (e.g. RELATES_TO).
+    pub fn is_symmetric(&self, prop: &str) -> bool {
+        self.symmetric_properties.contains(prop)
+    }
+
+    /// Populate the index from a vocabulary JSON object. Recognised optional
+    /// keys: `sub_classes`, `equivalents`, `sub_properties`,
+    /// `equivalent_properties`, `inverse_of`, `transitive_properties`,
+    /// `symmetric_properties`, `broader`, `exact_match`, `alt_labels`.
+    pub fn load_vocabulary_value(&mut self, vocab: &Value) {
+        if let Some(arr) = vocab.get("sub_classes").and_then(Value::as_array) {
+            for pair in arr {
+                if let Some((child, parent)) = vocabulary_pair(pair) {
+                    self.add_sub_class(child, parent);
+                }
+            }
+        }
+        if let Some(arr) = vocab.get("equivalents").and_then(Value::as_array) {
+            for pair in arr {
+                if let Some((a, b)) = vocabulary_pair(pair) {
+                    self.add_equivalent(a, b);
+                    self.add_equivalent_class(a, b);
+                }
+            }
+        }
+        if let Some(arr) = vocab.get("sub_properties").and_then(Value::as_array) {
+            for pair in arr {
+                if let Some((child, parent)) = vocabulary_pair(pair) {
+                    self.add_sub_property(child, parent);
+                }
+            }
+        }
+        if let Some(arr) = vocab
+            .get("equivalent_properties")
+            .and_then(Value::as_array)
+        {
+            for pair in arr {
+                if let Some((a, b)) = vocabulary_pair(pair) {
+                    self.add_equivalent_property(a, b);
+                }
+            }
+        }
+        if let Some(arr) = vocab.get("inverse_of").and_then(Value::as_array) {
+            for pair in arr {
+                if let Some((a, b)) = vocabulary_pair(pair) {
+                    self.add_inverse_of(a, b);
+                }
+            }
+        }
+        if let Some(arr) = vocab
+            .get("transitive_properties")
+            .and_then(Value::as_array)
+        {
+            for p in arr {
+                if let Some(s) = p.as_str() {
+                    self.add_transitive_property(s);
+                }
+            }
+        }
+        if let Some(arr) = vocab
+            .get("symmetric_properties")
+            .and_then(Value::as_array)
+        {
+            for p in arr {
+                if let Some(s) = p.as_str() {
+                    self.add_symmetric_property(s);
+                }
+            }
+        }
+        if let Some(arr) = vocab.get("broader").and_then(Value::as_array) {
+            for pair in arr {
+                if let Some((narrow, broad)) = vocabulary_pair(pair) {
+                    self.add_broader(narrow, broad);
+                }
+            }
+        }
+        if let Some(arr) = vocab.get("exact_match").and_then(Value::as_array) {
+            for pair in arr {
+                if let Some((a, b)) = vocabulary_pair(pair) {
+                    self.add_exact_match(a, b);
+                }
+            }
+        }
+        if let Some(arr) = vocab.get("alt_labels").and_then(Value::as_array) {
+            for pair in arr {
+                if let Some((symbol, label)) = vocabulary_pair(pair) {
+                    self.add_alt_label(symbol, label);
+                }
+            }
         }
     }
 
@@ -472,7 +626,7 @@ impl OntologyIndex {
         visited.insert(root.to_string());
 
         while let Some(cur) = queue.pop_front() {
-            if start.elapsed().as_millis() as u64 > budget.max_ms {
+            if budget.max_ms > 0 && start.elapsed().as_millis() as u64 > budget.max_ms {
                 break;
             }
             if result.results.len() >= budget.max_nodes {
@@ -514,7 +668,9 @@ impl OntologyIndex {
 
         // BFS for further bounded transitive hops (default 2 hops)
         let mut current_hops = 1usize;
-        while current_hops < max_hops && start.elapsed().as_millis() as u64 <= budget.max_ms {
+        while current_hops < max_hops
+            && (budget.max_ms == 0 || start.elapsed().as_millis() as u64 <= budget.max_ms)
+        {
             if result.results.len() >= budget.max_nodes {
                 break;
             }
@@ -542,128 +698,124 @@ impl OntologyIndex {
         result
     }
 
-pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize> {
-    let ttl_files: Vec<PathBuf> = std::fs::read_dir(schemas_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ttl"))
-        .map(|e| e.path())
-        .collect();
-
+pub fn load_shacl_shapes(&mut self, ttl: &str) -> anyhow::Result<usize> {
     let mut total = 0usize;
-    for path in ttl_files {
-        let content = std::fs::read_to_string(&path)?;
-        let parser = oxttl::TurtleParser::new();
-        let mut cur_shape: Option<ShaclShapeDef> = None;
+    let parser = oxttl::TurtleParser::new();
+    let mut cur_shape: Option<ShaclShapeDef> = None;
 
-        for q in parser.for_reader(content.as_bytes()) {
-            let q = q?;
-            let s = match q.subject {
-                NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
-                _ => q.subject.to_string(),
-            };
-            let p = q.predicate.as_str().to_string();
-            let o = match q.object {
-                Term::NamedNode(nn) => nn.as_str().to_string(),
-                Term::Literal(lit) => lit.value().to_string(),
-                _ => q.object.to_string(),
-            };
+    for q in parser.for_reader(ttl.as_bytes()) {
+        let q = q?;
+        let s = match q.subject {
+            NamedOrBlankNode::NamedNode(nn) => nn.as_str().to_string(),
+            _ => q.subject.to_string(),
+        };
+        let p = q.predicate.as_str().to_string();
+        let o = match q.object {
+            Term::NamedNode(nn) => nn.as_str().to_string(),
+            Term::Literal(lit) => lit.value().to_string(),
+            _ => q.object.to_string(),
+        };
 
-            // sh:NodeShape declaration
-            if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                && o == "http://www.w3.org/ns/shacl#NodeShape" {
-                if let Some(sh) = cur_shape.take() {
-                    self.shacl_shapes.push(sh);
-                    total += 1;
-                }
-                cur_shape = Some(ShaclShapeDef {
-                    shape_iri: s.clone(),
-                    ..Default::default()
-                });
+        // sh:NodeShape declaration
+        if p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+            && o == "http://www.w3.org/ns/shacl#NodeShape" {
+            if let Some(sh) = cur_shape.take() {
+                self.shacl_shapes.push(sh);
+                total += 1;
             }
+            cur_shape = Some(ShaclShapeDef {
+                shape_iri: s.clone(),
+                ..Default::default()
+            });
+        }
 
-            // sh:targetClass
-            if p == "http://www.w3.org/ns/shacl#targetClass" {
-                if let Some(sh) = cur_shape.as_mut() {
-                    sh.target_class = Some(o.clone());
-                }
+        // sh:targetClass
+        if p == "http://www.w3.org/ns/shacl#targetClass" {
+            if let Some(sh) = cur_shape.as_mut() {
+                sh.target_class = Some(o.clone());
             }
+        }
 
-            // sh:message
-            if p == "http://www.w3.org/ns/shacl#message" {
-                if let Some(sh) = cur_shape.as_mut() {
-                    sh.messages.insert(o.clone(), o.clone());
-                }
+        // sh:message
+        if p == "http://www.w3.org/ns/shacl#message" {
+            if let Some(sh) = cur_shape.as_mut() {
+                sh.messages.insert(o.clone(), o.clone());
             }
+        }
 
-            // sh:property
-            if p == "http://www.w3.org/ns/shacl#property" {
-                if let Some(sh) = cur_shape.as_mut() {
-                    sh.property_constraints.push((o.clone(), None));
-                }
+        // sh:property
+        if p == "http://www.w3.org/ns/shacl#property" {
+            if let Some(sh) = cur_shape.as_mut() {
+                sh.property_constraints.push((o.clone(), None));
             }
+        }
 
-            // sh:path
-            if p == "http://www.w3.org/ns/shacl#path" {
-                if let Some(last) = cur_shape.as_mut().and_then(|sh| sh.property_constraints.last_mut()) {
-                    last.0 = o.clone();
-                }
+        // sh:path
+        if p == "http://www.w3.org/ns/shacl#path" {
+            if let Some(last) = cur_shape.as_mut().and_then(|sh| sh.property_constraints.last_mut()) {
+                last.0 = o.clone();
             }
+        }
 
-            // sh:minCount
-            if p == "http://www.w3.org/ns/shacl#minCount" {
-                let val: u32 = o.parse().unwrap_or(0);
-                if let Some(shape_ref) = cur_shape.as_mut() {
-                    if let Some(last) = shape_ref.property_constraints.last_mut() {
-                        shape_ref.min_counts.insert(last.0.clone(), val);
-                    }
-                }
-            }
-
-            // sh:maxCount
-            if p == "http://www.w3.org/ns/shacl#maxCount" {
-                let val: u32 = o.parse().unwrap_or(u32::MAX);
-                if let Some(shape_ref) = cur_shape.as_mut() {
-                    if let Some(last) = shape_ref.property_constraints.last_mut() {
-                        shape_ref.max_counts.insert(last.0.clone(), val);
-                    }
-                }
-            }
-
-            // sh:datatype
-            if p == "http://www.w3.org/ns/shacl#datatype" {
-                if let Some(shape_ref) = cur_shape.as_mut() {
-                    if let Some(last) = shape_ref.property_constraints.last_mut() {
-                        shape_ref.datatypes.insert(last.0.clone(), o.clone());
-                    }
-                }
-            }
-
-            // sh:nodeKind
-            if p == "http://www.w3.org/ns/shacl#nodeKind" {
-                if let Some(shape_ref) = cur_shape.as_mut() {
-                    if let Some(last) = shape_ref.property_constraints.last_mut() {
-                        shape_ref.node_kinds.insert(last.0.clone(), o.clone());
-                    }
-                }
-            }
-
-            // sh:in
-            if p == "http://www.w3.org/ns/shacl#in" {
-                if let Some(shape_ref) = cur_shape.as_mut() {
-                    if let Some(last) = shape_ref.property_constraints.last_mut() {
-                        shape_ref.in_values.insert(last.0.clone(), Vec::new());
-                    }
+        // sh:minCount
+        if p == "http://www.w3.org/ns/shacl#minCount" {
+            let val: u32 = o.parse().unwrap_or(0);
+            if let Some(shape_ref) = cur_shape.as_mut() {
+                if let Some(last) = shape_ref.property_constraints.last_mut() {
+                    shape_ref.min_counts.insert(last.0.clone(), val);
                 }
             }
         }
 
-        if let Some(sh) = cur_shape.take() {
-            self.shacl_shapes.push(sh);
-            total += 1;
+        // sh:maxCount
+        if p == "http://www.w3.org/ns/shacl#maxCount" {
+            let val: u32 = o.parse().unwrap_or(u32::MAX);
+            if let Some(shape_ref) = cur_shape.as_mut() {
+                if let Some(last) = shape_ref.property_constraints.last_mut() {
+                    shape_ref.max_counts.insert(last.0.clone(), val);
+                }
+            }
+        }
+
+        // sh:datatype
+        if p == "http://www.w3.org/ns/shacl#datatype" {
+            if let Some(shape_ref) = cur_shape.as_mut() {
+                if let Some(last) = shape_ref.property_constraints.last_mut() {
+                    shape_ref.datatypes.insert(last.0.clone(), o.clone());
+                }
+            }
+        }
+
+        // sh:nodeKind
+        if p == "http://www.w3.org/ns/shacl#nodeKind" {
+            if let Some(shape_ref) = cur_shape.as_mut() {
+                if let Some(last) = shape_ref.property_constraints.last_mut() {
+                    shape_ref.node_kinds.insert(last.0.clone(), o.clone());
+                }
+            }
+        }
+
+        // sh:in
+        if p == "http://www.w3.org/ns/shacl#in" {
+            if let Some(shape_ref) = cur_shape.as_mut() {
+                if let Some(last) = shape_ref.property_constraints.last_mut() {
+                    shape_ref.in_values.insert(last.0.clone(), Vec::new());
+                }
+            }
         }
     }
 
+    if let Some(sh) = cur_shape.take() {
+        self.shacl_shapes.push(sh);
+        total += 1;
+    }
+
     Ok(total)
+}
+
+/// Drop loaded SHACL shapes (used when a registry row stops shipping shapes).
+pub fn clear_shacl_shapes(&mut self) {
+    self.shacl_shapes.clear();
 }
 
 /// Validate a memory payload against loaded SHACL shapes.
@@ -803,5 +955,29 @@ pub fn load_shacl_shapes(&mut self, schemas_dir: &Path) -> anyhow::Result<usize>
 
     pub fn shacl_shapes_loaded(&self) -> usize {
         self.shacl_shapes.len()
+    }
+}
+
+/// Extract an `(a, b)` pair from a vocabulary entry that is either a
+/// two-element `[a, b]` array or an object with `"child"`/`"parent"` (and
+/// `"a"`/`"b"`) keys.
+fn vocabulary_pair(pair: &Value) -> Option<(&str, &str)> {
+    match pair {
+        Value::Array(a) if a.len() == 2 => Some((a[0].as_str()?, a[1].as_str()?)),
+        Value::Object(o) => {
+            let a = o
+                .get("child")
+                .and_then(Value::as_str)
+                .or_else(|| o.get("a").and_then(Value::as_str));
+            let b = o
+                .get("parent")
+                .and_then(Value::as_str)
+                .or_else(|| o.get("b").and_then(Value::as_str));
+            match (a, b) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

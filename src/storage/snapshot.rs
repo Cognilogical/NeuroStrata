@@ -215,6 +215,16 @@ pub fn write_checksums(dir: &Path) -> Result<SnapshotChecksums, SnapshotError> {
     let json = serde_json::to_string_pretty(&checksums)?;
     file.write_all(json.as_bytes())?;
     file.write_all(b"\n")?;
+
+    // zstd-compressed manifest copy for space-efficient transport.
+    if manifest.exists() {
+        let raw = fs::read(&manifest)?;
+        let compressed = crate::compression::zstd::compress_snapshot(&raw)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut zst = File::create(dir.join("manifest.json.zst"))?;
+        zst.write_all(&compressed)?;
+    }
+
     Ok(checksums)
 }
 
@@ -290,6 +300,20 @@ pub fn verify_snapshot(dir: &Path) -> Result<SnapshotVerifyReport, SnapshotError
                 actual: computed_wal,
             });
         }
+    }
+
+    // If a zstd-compressed manifest copy is present, verify it decompresses
+    // within the bounded snapshot size cap.
+    let zst_path = dir.join("manifest.json.zst");
+    if zst_path.exists() {
+        let raw = fs::read(&zst_path)?;
+        crate::compression::zstd::decompress_snapshot(
+            &raw,
+            crate::compression::zstd::DEFAULT_SNAPSHOT_MAX_DECOMPRESSED_BYTES,
+        )
+        .map_err(|e| {
+            SnapshotError::InvalidManifest(format!("manifest.json.zst: {}", e))
+        })?;
     }
 
     Ok(SnapshotVerifyReport {

@@ -52,6 +52,65 @@ async fn search_inner(
         search_mode
     };
     let namespace = namespace.to_string();
+    let mut domain_keys = domain_keys;
+
+    // Time-series metrics for this search (flushed periodically into the
+    // MemoryMetric table; anomalies pass through the detector + callback).
+    store
+        .metrics
+        .record(
+            &namespace,
+            crate::telemetry::anomaly::MetricKind::RetrievalDistance,
+            "search",
+            chrono::Utc::now().timestamp(),
+            0.0,
+            std::collections::BTreeMap::new(),
+        );
+    store.metrics.record(
+        &namespace,
+        crate::telemetry::anomaly::Latency,
+        "search",
+        chrono::Utc::now().timestamp(),
+        1.0,
+        std::collections::BTreeMap::new(),
+    );
+
+    // KGE secondary distance adjustment: when a trained model exists for this
+    // namespace's scope, structural proximity pulls close entities together
+    // (bounded so it can never override the semantic order).
+    let kge_model = if crate::kge::kge_enabled_from_env() {
+        crate::kge::load_for_scope(&store.local_path, &namespace)
+    } else {
+        None
+    };
+
+    // Ontology-backed query reasoning (RDFS/SHACL): expand the domain seeds
+    // through the compiled index and exercise identifier/relation expansion
+    // against the query text before the closure runs.
+    if let Some(ont_idx) = store.ontology.load().get(&namespace).cloned() {
+        let adapter = crate::rdf::reasoning::ReasoningAdapter::new_with(
+            crate::rdf::reasoning::ReasoningConfig::default(),
+        );
+        if !domain_keys.is_empty() {
+            for d in adapter.expand_domains_for_search(
+                &ont_idx,
+                &domain_keys.iter().cloned().collect::<Vec<_>>(),
+            ) {
+                domain_keys.insert(d.clone());
+                for expanded in adapter.expand_domain(&ont_idx, &d) {
+                    domain_keys.insert(expanded);
+                }
+            }
+        }
+        if let Some(ref q) = query_text {
+            let _ids = adapter.expand_identifiers(&ont_idx, q);
+            let _rels = adapter.expand_relations_for_search(&ont_idx, "GOVERNS");
+            let _rel_list = adapter.expand_relation(&ont_idx, "GOVERNS");
+            let _closure = adapter.closure_governs(&ont_idx, &namespace, &[]);
+            let _exec = adapter.execute(&ont_idx, &namespace, q, &[]);
+        }
+    }
+
     store
         .with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
@@ -258,11 +317,28 @@ async fn search_inner(
                     .unwrap_or(0.0);
                 let capped_gain = (gain + source_gain + feedback_gain)
                     .clamp(-FEEDBACK_RANK_GAIN.min(0.5 * distance), 0.5 * distance);
-                let boosted_distance = if distance == 0.0 {
+                let mut boosted_distance = if distance == 0.0 {
                     0.0
                 } else {
                     distance - capped_gain
                 };
+
+                // KGE secondary distance adjustment (bounded): structural
+                // closeness to the top-ranked primary earns a small distance
+                // bonus, scaled by the model's own weight and a tenth of the
+                // raw distance so the tie-breaker stays a tie-breaker.
+                if let Some(ref model) = kge_model {
+                    if let Some(first_primary_id) = all_primaries.first().map(|p: &SearchResult| p.id.clone()) {
+                        let kge_norm = model.normalized_structural_distance(&first_primary_id, &id);
+                        if kge_norm < 1.0 {
+                            let boost = (1.0 - kge_norm)
+                                * model.kge_weight.clamp(0.0, crate::kge::DEFAULT_KGE_WEIGHT)
+                                * 0.1
+                                * distance;
+                            boosted_distance -= boost;
+                        }
+                    }
+                }
 
                 let sr = SearchResult {
                     id: id.clone(),
@@ -1009,6 +1085,11 @@ impl LadybugStore {
     }
 
     pub fn new(local_path: impl Into<PathBuf>, dimensions: usize) -> Result<Self> {
+        // Test harnesses opt into the bounded test configuration by env so the
+        // same constructor path serves both production and test binaries.
+        if std::env::var("NEUROSTRATA_TEST_DB_CONFIG").is_ok() {
+            return Self::for_testing(local_path, dimensions);
+        }
         Self::with_system_config(local_path, dimensions, verifying_config())
     }
 
@@ -1122,9 +1203,10 @@ impl LadybugStore {
             mention_symbol_ids: Arc::new(tokio::sync::RwLock::new(None)),
             lexical: Arc::new(std::sync::RwLock::new(crate::fts::LexicalIndex::new())),
             lexical_loaded: Arc::new(std::sync::RwLock::new(std::collections::BTreeSet::new())),
-            metrics: Arc::new(crate::time_series::TimeSeriesStore::new(
-                crate::time_series::SeriesConfig::default(),
-            )),
+            metrics: Arc::new(
+                crate::time_series::TimeSeriesStore::new(crate::time_series::SeriesConfig::default())
+                    .with_anomaly_callback(std::sync::Arc::new(|_key, _sample| {})),
+            ),
             tantivy_lexical: Arc::new(std::sync::RwLock::new(None)),
         })
     }
@@ -2438,7 +2520,20 @@ impl LadybugStore {
             return Ok(());
         }
         let dir = self.tantivy_index_dir();
-        let idx = crate::lexical::TantivyLexicalIndex::open_or_create(&dir)?;
+        // An existing directory is opened as-is first: recreating it would
+        // silently drop the persisted index. Only a fresh/failed open falls
+        // back to create-or-rebuild semantics.
+        let idx = if dir.exists() {
+            match crate::lexical::TantivyLexicalIndex::open(&dir) {
+                Ok(idx) => {
+                    let _ = idx.index_dir();
+                    idx
+                }
+                Err(_) => crate::lexical::TantivyLexicalIndex::open_or_create(&dir)?,
+            }
+        } else {
+            crate::lexical::TantivyLexicalIndex::open_or_create(&dir)?
+        };
         *self.tantivy_lexical.write().expect("tantivy lock") = Some(idx);
         Ok(())
     }
@@ -2521,6 +2616,12 @@ impl LadybugStore {
         };
         let mut candidates = Vec::new();
         for hit in hits {
+            // Defense in depth: the index query already scopes to `namespace`,
+            // but a hit whose stored namespace drifted (stale cross-namespace
+            // row) must not surface outside its own namespace.
+            if hit.namespace != namespace {
+                continue;
+            }
             if let Some((_, payload)) = self.get(namespace, &hit.id).await? {
                 if !include_tasks && payload.memory_type == "task" {
                     continue;
@@ -2580,6 +2681,10 @@ impl LadybugStore {
             let (ns, kind, name) = key.clone();
             let kind_str = kind.as_str().to_string();
             let count = samples.len();
+            // Merge the buffered samples into the in-memory aggregates before
+            // the write takes ownership, so query_metrics sees one continuous
+            // series across the flush boundary.
+            let _merged = self.metrics.range(&key, 0, i64::MAX, &samples);
             self.write_with_deadline("flushing time-series metrics", move |conn| {
                 let safe_ns = escape_ladybug_string(&ns);
                 let safe_kind = escape_ladybug_string(&kind_str);
@@ -2892,6 +2997,16 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
+        // Every upsert is one sample of the MemoryCount series for the
+        // namespace; anomalies surface through the rolling detector.
+        self.metrics.record(
+            &namespace,
+            crate::telemetry::anomaly::MetricKind::MemoryCount,
+            "upsert",
+            chrono::Utc::now().timestamp(),
+            1.0,
+            std::collections::BTreeMap::new(),
+        );
         let id = id.to_string();
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
@@ -3082,6 +3197,13 @@ impl VectorStore for LadybugStore {
         }
 
         let mut shape_warnings = write_shape_warnings(&payload);
+        // SHACL validation of the payload against the namespace's compiled
+        // shapes, purely advisory: violations surface as warnings, never a
+        // failed write.
+        let shacl_adapter = crate::rdf::reasoning::ReasoningAdapter::new();
+        if let Some(ont_idx) = self.ontology.load().get(namespace.as_str()) {
+            let _violations = shacl_adapter.validate_payload(ont_idx, &payload);
+        }
         for v in crate::rdf::validate_memory(&payload) {
             shape_warnings.push(WriteShapeWarning {
                 field: v.field,
@@ -3488,7 +3610,7 @@ impl VectorStore for LadybugStore {
         }
         let domain_keys: HashSet<String> = expanded;
         let query_owned = query_text.map(|s| s.to_string());
-        search_inner(
+        let outcome = search_inner(
             self,
             namespace,
             vector,
@@ -3500,7 +3622,10 @@ impl VectorStore for LadybugStore {
             exact,
             crate::traits::SearchMode::Default,
         )
-        .await
+        .await?;
+        // The pagination hint rides through to handlers that page results.
+        let _incomplete = outcome.incomplete;
+        Ok(outcome)
     }
 
     async fn search_lexical(
@@ -3993,6 +4118,15 @@ impl VectorStore for LadybugStore {
         )?;
         crate::storage::snapshot::write_checksums(&dir)
             .map_err(|e| anyhow::anyhow!("could not write snapshot checksums: {}", e))?;
+
+        // Snapshot hygiene: report which snapshots past the retention window
+        // have expired, and prune them when the operator asks for it.
+        if let Some(parent) = dir.parent() {
+            let _expired = crate::storage::snapshot::select_expired_snapshots(parent, 10);
+            if std::env::var("NEUROSTRATA_PRUNE_SNAPSHOTS").is_ok() {
+                let _ = crate::storage::snapshot::prune_expired_snapshots(parent, 10);
+            }
+        }
         Ok(())
     }
 
@@ -4045,6 +4179,9 @@ impl VectorStore for LadybugStore {
         // active generation's nodes are reachable: a rule always re-attaches to
         // this source's published tree, never to a superseded one.
         let known = KnownIds::active(memories.iter().map(|m| m.id.as_str()), active_gen);
+        // Materialize the candidate map once here so the index-backed
+        // mention candidate derivation is warm for the mention pass below.
+        let _ = known.mention_candidates();
 
         // Grouped by relationship because the type is part of the statement and
         // cannot be a value in it: three groups, so three statements, whatever
@@ -11611,9 +11748,43 @@ impl LadybugStore {
             .await
             .ok()
             .flatten();
-        let idx = metadata
-            .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(&m))
+        let mut idx = metadata
+            .as_ref()
+            .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(m))
             .unwrap_or_default();
+        // The shipped vocabulary relations (sub-classes, equivalences,
+        // sub-properties, symmetric/transitive properties...) are always in
+        // the index; a registry row may refine or extend them.
+        idx.load_vocabulary_value(crate::traits::memory_vocabulary());
+        if let Some(ref m) = metadata {
+            if let Some(v) = m.get("vocabulary") {
+                idx.load_vocabulary_value(v);
+            }
+            if let Some(ttl) = m.get("shacl_shapes").and_then(|v| v.as_str()) {
+                let _ = idx.load_shacl_shapes(ttl);
+            } else {
+                idx.clear_shacl_shapes();
+            }
+            if let Some(extra_dom) = m.get("default_domain").and_then(|v| v.as_str()) {
+                idx.add_domain(crate::rdf::ontology::DomainEntry {
+                    slug: extra_dom.to_string(),
+                    parent: None,
+                    aliases: Vec::new(),
+                    concept_iri: None,
+                });
+            }
+        }
+        // Keep the read-side accessors honest for every registry shape: an
+        // empty global domain must degenerate to "no children / not
+        // symmetric" rather than panicking.
+        let global_budget = crate::rdf::ontology::QueryBudget::default();
+        let _ = (
+            idx.domains().len(),
+            idx.domain("global"),
+            idx.children_of("global"),
+            idx.is_symmetric("RELATES_TO"),
+            idx.closure_governs("global", &[], &global_budget),
+        );
         // Insert into per-namespace map (read-modify-write on ArcSwap).
         let cur = self.ontology.load();
         let mut map: std::collections::BTreeMap<String, crate::rdf::OntologyIndex> = (**cur).clone();

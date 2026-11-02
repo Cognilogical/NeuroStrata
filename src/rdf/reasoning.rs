@@ -1,12 +1,8 @@
-#[cfg(test)]
 use crate::traits::{EvidenceEdge, EvidenceKind, MemoryPayload, SearchEvidence, SearchResult};
-#[cfg(test)]
 use crate::rdf::ontology::ClosureResult;
 use crate::rdf::ontology::OntologyIndex;
 use crate::rdf::ontology::QueryBudget;
-#[cfg(test)]
 use serde_json::json;
-#[cfg(test)]
 use std::collections::{BTreeSet, VecDeque};
 
 /// Configuration for deterministic reasoning.
@@ -41,12 +37,10 @@ impl ReasoningAdapter {
         Self { config: ReasoningConfig::default() }
     }
 
-    #[cfg(test)]
     pub fn new_with(config: ReasoningConfig) -> Self {
         Self { config }
     }
 
-    #[cfg(test)]
     fn empty_payload() -> MemoryPayload {
         MemoryPayload {
             content: String::new(),
@@ -71,7 +65,6 @@ impl ReasoningAdapter {
     }
 
     /// Expand identifiers via exactMatch / altLabels equivalence closure.
-    #[cfg(test)]
     pub fn expand_identifiers(&self, ontology: &OntologyIndex, query: &str) -> Vec<String> {
         if !self.config.reasoning_enabled {
             return vec![query.to_string()];
@@ -93,7 +86,6 @@ impl ReasoningAdapter {
     }
 
     /// Expand relation filters via subPropertyOf* closure.
-    #[cfg(test)]
     pub fn expand_relation(&self, ontology: &OntologyIndex, relation: &str) -> Vec<String> {
         if !self.config.reasoning_enabled {
             return vec![relation.to_string()];
@@ -102,7 +94,6 @@ impl ReasoningAdapter {
     }
 
     /// Bounded transitive GOVERNS closure (default 2 hops, §5.5).
-    #[cfg(test)]
     pub fn closure_governs(&self, ontology: &OntologyIndex, root: &str, edges: &[String]) -> ClosureResult {
         let _ = ontology;
         let mut result = ClosureResult::default();
@@ -178,7 +169,6 @@ impl ReasoningAdapter {
     }
 
     /// Execute reasoning-backed search expansion over domain, query, and edges.
-    #[cfg(test)]
     pub fn execute(
         &self,
         ontology: &OntologyIndex,
@@ -241,6 +231,94 @@ impl ReasoningAdapter {
             });
         }
         out
+    }
+
+    /// Production search-side domain expansion (§5.3): subclass-closure BFS,
+    /// class/superclass resolution, equivalence, and identifier expansion.
+    pub fn expand_domains_for_search(
+        &self,
+        index: &OntologyIndex,
+        seed_domains: &[String],
+    ) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for d in seed_domains {
+            if d.is_empty() || !out.insert(d.clone()) {
+                continue;
+            }
+            if !self.config.reasoning_enabled {
+                continue;
+            }
+            for r in index.closure_subclasses(d, &self.config.closure_budget).results {
+                out.insert(r);
+            }
+            for p in index.expand_class(d) {
+                out.insert(p);
+            }
+            for p in index.subclasses_of(d) {
+                out.insert(p);
+            }
+            for p in index.superclasses_of(d) {
+                out.insert(p);
+            }
+            for p in index.super_classes(d) {
+                out.insert(p);
+            }
+            if let Some(e) = index.equivalent_of(d) {
+                out.insert(e);
+            }
+            for e in index.equivalents_of(d) {
+                out.insert(e);
+            }
+            for a in index.aliases_for(d) {
+                out.insert(a);
+            }
+            for a in index.alt_labels_for(d) {
+                out.insert(a);
+            }
+        }
+        out
+    }
+
+    /// Production search-side relation expansion (§5.4): subPropertyOf* chain,
+    /// direct subproperties, and inverses.
+    pub fn expand_relations_for_search(
+        &self,
+        index: &OntologyIndex,
+        rel: &str,
+    ) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        out.insert(rel.to_string());
+        if !self.config.reasoning_enabled {
+            return out;
+        }
+        for r in index.expand_relation(rel) {
+            out.insert(r);
+        }
+        for r in index.subproperties_of(rel) {
+            out.insert(r);
+        }
+        for r in index.inverse_of(rel) {
+            out.insert(r);
+        }
+        // Transitive properties keep the seed relation across chains.
+        if index.is_transitive(rel) {
+            out.insert(rel.to_string());
+        }
+        out
+    }
+
+    /// SHACL validation of a payload against the index's loaded shapes.
+    /// Returns no violations when no shapes are loaded.
+    pub fn validate_payload(
+        &self,
+        index: &OntologyIndex,
+        payload: &crate::traits::MemoryPayload,
+    ) -> Vec<crate::rdf::shacl::ShaclViolation> {
+        if index.shacl_shapes_loaded() > 0 {
+            index.shacl_validate(payload)
+        } else {
+            Vec::new()
+        }
     }
 }
 

@@ -147,9 +147,9 @@ impl TimeSeriesStore {
         series.agg.next_seq += 1;
         sample.id = format!(
             "{}::{}::{}::{}::{}",
-            key.0,
-            key.1.as_str(),
-            key.2,
+            series.key.0,
+            series.key.1.as_str(),
+            series.key.2,
             sample.ts,
             sample.seq
         );

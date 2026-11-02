@@ -7,6 +7,7 @@ use crate::traits::MemoryPayload;
 use super::namespace::{field_predicate, ns_predicate, relation_predicate};
 use super::types::{EdgeProvenance, Tier};
 use oxrdf::{NamedNode, NamedOrBlankNode, Term, Literal, GraphName, Quad};
+use std::collections::BTreeMap;
 
 /// XSD string datatype IRI
 const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
@@ -328,6 +329,46 @@ pub fn rows_to_quads(
         edge_to_quad(from, rel, to, prov.clone(), Some(graph.clone()))
     }).collect();
     out.extend(quads_to_legacy(&ox_quads));
+    out
+}
+
+/// Legacy projection path that derives each row's tier from its `memory_type`
+/// via `Tier::from_memory_type`, projects rows group-by-group through
+/// `rows_to_quads` (which converts via `quads_to_legacy`), and concatenates.
+/// Edge quads are attached to the `default_tier` group's graph.
+/// Unsupported memory types resolve to `Tier::Domain`; the rows here use
+/// `default_tier` only to decide which tier group carries the edge graph.
+pub fn project_rows_legacy(
+    rows: &[(String, MemoryPayload)],
+    edges: &[(String, String, String, Option<EdgeProvenance>)],
+    namespace: &str,
+    default_tier: Tier,
+    generation: u64,
+) -> Vec<super::types::Quad> {
+    let mut by_tier: BTreeMap<Tier, Vec<(String, MemoryPayload)>> = BTreeMap::new();
+    for (id, payload) in rows {
+        by_tier
+            .entry(Tier::from_memory_type(&payload.memory_type))
+            .or_default()
+            .push((id.clone(), payload.clone()));
+    }
+
+    let mut out = Vec::new();
+    for (tier, tier_rows) in by_tier {
+        let tier_edges: Vec<(String, String, String, Option<EdgeProvenance>)> =
+            if tier == default_tier {
+                edges.to_vec()
+            } else {
+                Vec::new()
+            };
+        out.extend(rows_to_quads(
+            &tier_rows,
+            namespace,
+            tier,
+            generation,
+            &tier_edges,
+        ));
+    }
     out
 }
 

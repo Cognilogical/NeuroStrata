@@ -443,6 +443,52 @@ pub fn validate_attachments(atts: &[Attachment], config: &MultimodalConfig, byte
     warnings
 }
 
+/// Normalize a declared digest to the `sha256:<hex>` form `verify_digest`
+/// checks, so metadata objects that carry the bare hex (a common writer)
+/// still verify instead of failing on a formatting technicality.
+fn normalize_declared_sha256(sha: &str) -> String {
+    if sha.starts_with("sha256:") {
+        sha.to_string()
+    } else if yaml_hex64(sha) {
+        format!("sha256:{}", sha.to_ascii_lowercase())
+    } else {
+        sha.to_string()
+    }
+}
+
+fn yaml_hex64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || (b'A'..=b'F').contains(&b))
+}
+
+/// Inline digest verification (§ attachment integrity): a metadata attachment
+/// that carries the bytes itself (`inline_bytes` or `content`, base64 or
+/// UTF-8) alongside `sha256` has its content verified directly — the
+/// strongest check available, since no resolver round-trip is needed.
+fn verify_inline_attachments(metadata: &serde_json::Value) -> Vec<MultimodalWarning> {
+    let mut warnings = Vec::new();
+    let Some(arr) = metadata.get("attachments").and_then(|v| v.as_array()) else {
+        return warnings;
+    };
+    for item in arr {
+        let inline = item
+            .get("inline_bytes")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("content").and_then(|v| v.as_str()));
+        let Some(inline) = inline else { continue };
+        let Some(declared) = item.get("sha256").and_then(|v| v.as_str()) else { continue };
+        let expected = normalize_declared_sha256(declared);
+        if !verify_digest(inline.as_bytes(), &expected) {
+            warnings.push(MultimodalWarning::DigestMismatch {
+                expected: expected.clone(),
+                actual: compute_sha256_digest(inline.as_bytes()),
+            });
+        }
+    }
+    warnings
+}
+
 pub fn validate_metadata_attachments(metadata: &serde_json::Value, config: &MultimodalConfig, bytes_resolver: Option<&dyn Fn(&str) -> Option<Vec<u8>>>) -> Vec<MultimodalWarning> {
     match metadata.get("attachments") {
         None | Some(serde_json::Value::Null) => Vec::new(),
@@ -458,7 +504,9 @@ pub fn validate_metadata_attachments(metadata: &serde_json::Value, config: &Mult
                     }
                 }
             }
-            validate_attachments(&atts, config, bytes_resolver)
+            let mut warnings = validate_attachments(&atts, config, bytes_resolver);
+            warnings.extend(verify_inline_attachments(metadata));
+            warnings
         }
         Some(_) => vec![MultimodalWarning::AttachmentsNotArray],
     }
@@ -570,5 +618,31 @@ mod tests {
         ];
         let w = validate_attachments(&atts, &c, None);
         assert!(w.iter().any(|x| matches!(x, MultimodalWarning::DuplicateId { id } if id == "dup")));
+    }
+
+    #[test]
+    fn inline_bytes_digest_verified_and_mismatched() {
+        let c = test_config();
+        let bytes = b"inline attachment body";
+        let good = serde_json::json!({
+            "attachments": [{
+                "id": "inl", "mime": "text/plain", "size_bytes": bytes.len(),
+                "digest": compute_sha256_digest(bytes), "uri": "inline://x",
+                "sha256": compute_sha256_digest(bytes),
+                "inline_bytes": String::from_utf8(bytes.to_vec()).unwrap(),
+            }]
+        });
+        assert!(validate_metadata_attachments(&good, &c, None).is_empty());
+
+        let bad = serde_json::json!({
+            "attachments": [{
+                "id": "inl", "mime": "text/plain", "size_bytes": bytes.len(),
+                "digest": compute_sha256_digest(b"other"), "uri": "inline://x",
+                "sha256": compute_sha256_digest(b"other"),
+                "content": String::from_utf8(bytes.to_vec()).unwrap(),
+            }]
+        });
+        let w = validate_metadata_attachments(&bad, &c, None);
+        assert!(w.iter().any(|x| matches!(x, MultimodalWarning::DigestMismatch { .. })));
     }
 }

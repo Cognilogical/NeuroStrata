@@ -3702,16 +3702,21 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
     };
     let req_version = arguments.get("version").and_then(|v| v.as_u64());
     let namespace = resolve_namespace(&store, ns_raw).await;
-    let rows_raw = match store.list(&namespace, None, None).await {
-        Ok(r) => r,
-        Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-    };
-    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
-        .into_iter()
-        .map(|r| (r.id, r.payload))
-        .collect();
     if let Some(v) = req_version {
-        let hist = crate::digital_twin::twin_history_from_rows(&rows, twin_id, 0);
+        // Async history channel first; the rows fallback keeps a namespace
+        // whose typed listing misses the twin from silently reporting absence.
+        let mut hist = crate::digital_twin::twin_history(store.as_ref(), &namespace, twin_id, 0).await;
+        if hist.is_empty() {
+            let rows_raw = match store.list(&namespace, None, None).await {
+                Ok(r) => r,
+                Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+            };
+            let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
+                .into_iter()
+                .map(|r| (r.id, r.payload))
+                .collect();
+            hist = crate::digital_twin::twin_history_from_rows(&rows, twin_id, 0);
+        }
         if let Some((ver, ts, state)) = hist.into_iter().find(|(ver, _, _)| *ver == v) {
             return serde_json::json!({
                 "ok": true,
@@ -3729,9 +3734,9 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
         })
         .to_string();
     }
-    match crate::digital_twin::get_twin_state_from_rows(&rows, twin_id) {
+    match crate::digital_twin::get_twin_state(store.as_ref(), &namespace, twin_id).await {
         Some(state) => {
-            let summaries = crate::digital_twin::list_twins_from_rows(&rows);
+            let summaries = crate::digital_twin::list_twins(store.as_ref(), &namespace).await;
             let latest_version = summaries
                 .into_iter()
                 .find(|s| s.twin_id == twin_id)
@@ -3746,11 +3751,43 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
             })
             .to_string()
         }
-        None => serde_json::json!({
-            "ok": false,
-            "error": format!("digital twin '{}' not found", twin_id)
-        })
-        .to_string(),
+        None => {
+            // Fallback to the rows channel: `require_twin_state_from_rows`
+            // reports absence as `TwinError::NotFound` instead of an empty
+            // state, so a missed typed listing still degrades honestly.
+            let rows_raw = match store.list(&namespace, None, None).await {
+                Ok(r) => r,
+                Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
+            };
+            let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
+                .into_iter()
+                .map(|r| (r.id, r.payload))
+                .collect();
+            match crate::digital_twin::require_twin_state_from_rows(&rows, twin_id) {
+                Ok(state) => {
+                    let summaries = crate::digital_twin::list_twins_from_rows(&rows);
+                    let latest_version = summaries
+                        .into_iter()
+                        .find(|s| s.twin_id == twin_id)
+                        .map(|s| s.twin_version)
+                        .unwrap_or(1);
+                    serde_json::json!({
+                        "ok": true,
+                        "namespace": namespace,
+                        "twin_id": twin_id,
+                        "version": latest_version,
+                        "variables": state,
+                    })
+                    .to_string()
+                }
+                Err(crate::digital_twin::TwinError::NotFound(_)) => serde_json::json!({
+                    "ok": false,
+                    "error": format!("digital twin '{}' not found", twin_id)
+                })
+                .to_string(),
+                Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
+            }
+        }
     }
 }
 
@@ -3841,6 +3878,15 @@ pub(crate) async fn handle_twin_set(
     }
     let state_after = crate::digital_twin::get_state(&base_payload);
 
+    // ReBAC write gate: a caller that names a principal must actually be
+    // permitted to write memory of the target row's ownership/visibility.
+    if let Some(req_principal) = arguments.get("principal").and_then(|v| v.as_str()) {
+        let resolved = crate::rebac::resolve_principal(req_principal, Some(req_principal));
+        if !crate::rebac::can_write_memory(&resolved, &base_payload.user_id, &base_payload.metadata) {
+            return serde_json::json!({"ok":false,"error":"access denied by ReBAC policy"}).to_string();
+        }
+    }
+
     let eff_schema_id = schema_id.or_else(|| prev.and_then(|p| p.schema_id));
     let mut violations = Vec::new();
     if let Some(ref sid) = eff_schema_id {
@@ -3904,15 +3950,7 @@ pub(crate) async fn handle_twin_diff(arguments: &Value, store: Arc<dyn VectorSto
         return serde_json::json!({"ok":false,"error":"to_version required"}).to_string();
     };
     let namespace = resolve_namespace(&store, ns_raw).await;
-    let rows_raw = match store.list(&namespace, None, None).await {
-        Ok(r) => r,
-        Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-    };
-    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
-        .into_iter()
-        .map(|r| (r.id, r.payload))
-        .collect();
-    match crate::digital_twin::twin_diff_from_rows(&rows, twin_id, from_version, to_version) {
+    match crate::digital_twin::twin_diff(store.as_ref(), &namespace, twin_id, from_version, to_version).await {
         Ok(deltas) => serde_json::json!({
             "ok": true,
             "namespace": namespace,
@@ -3931,15 +3969,7 @@ pub(crate) async fn handle_twin_list(arguments: &Value, store: Arc<dyn VectorSto
         return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
     };
     let namespace = resolve_namespace(&store, ns_raw).await;
-    let rows_raw = match store.list(&namespace, None, None).await {
-        Ok(r) => r,
-        Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
-    };
-    let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
-        .into_iter()
-        .map(|r| (r.id, r.payload))
-        .collect();
-    let twins = crate::digital_twin::list_twins_from_rows(&rows);
+    let twins = crate::digital_twin::list_twins(store.as_ref(), &namespace).await;
     serde_json::json!({
         "ok": true,
         "namespace": namespace,
@@ -3964,7 +3994,7 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
     };
     let mut all_quads = Vec::new();
     let mut all_warnings = Vec::new();
-    for r in rows_raw {
+    for r in rows_raw.iter() {
         if let Some(mid) = memory_id_filter {
             if r.id != mid {
                 continue;
@@ -3996,12 +4026,55 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
             all_warnings.extend(edge_warnings);
         }
     }
+    // Legacy-graph projection: the rows and edges also get the
+    // graph IRI treatment so both shapes of the RDF surface are
+    // produced on every export call.
+    let row_pairs: Vec<(String, crate::traits::MemoryPayload)> =
+        rows_raw
+            .iter()
+            .filter(|r| memory_id_filter.is_none() || memory_id_filter == Some(r.id.as_str()))
+            .map(|r| (r.id.clone(), r.payload.clone()))
+            .collect();
+    let mut edge_tuples: Vec<(String, String, String, Option<crate::rdf::types::EdgeProvenance>)> = Vec::new();
+    for r in &row_pairs {
+        let prov = crate::rdf::types::EdgeProvenance {
+            source: Some(r.1.user_id.clone()),
+            valid_from: None,
+            valid_to: None,
+            generation: Some(0),
+            extractor: None,
+        };
+        for edge in crate::store::ladybug::edge_specs(&r.1.metadata) {
+            let _ = crate::rdf::projection::edge_to_quad(&r.0, edge.rel_type, &edge.target_id, Some(prov.clone()), None);
+            edge_tuples.push((r.0.clone(), edge.rel_type.to_string(), edge.target_id.clone(), Some(prov.clone())));
+        }
+    }
+    let graph_name = oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(format!(
+        "urn:neurostrata:graph:{}:{}:gen:{}",
+        namespace, "domain", 0
+    )));
+    let mut legacy_quads = crate::rdf::projection::project_rows_legacy(&row_pairs, &edge_tuples, &namespace, crate::rdf::types::Tier::Domain, 0);
+    legacy_quads.extend(crate::rdf::projection::quads_to_legacy(
+        &edge_tuples.iter().map(|(from, rel, to, prov)| {
+            crate::rdf::projection::edge_to_quad(from, rel, to, prov.clone(), Some(graph_name.clone()))
+        }).collect::<Vec<_>>(),
+    ));
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        if let Ok(ox_quads) = ls.project_namespace_rdf(&namespace, crate::rdf::types::Tier::Domain, 0).await {
+            legacy_quads = ox_quads;
+        }
+    }
+    let projected_quad_count = legacy_quads
+        .iter()
+        .filter(|q| matches!(q.object, crate::rdf::types::QuadObject::Iri(_) | crate::rdf::types::QuadObject::Literal { .. }))
+        .count();
     let flatten = format == "n-triples-star" || format == "turtle-star";
     match crate::rdf::provenance::serialize_rdf_star(&all_quads, format, flatten) {
         Ok(rdf_star) => serde_json::json!({
             "ok": true,
             "namespace": namespace,
             "quad_count": all_quads.len(),
+            "projected_quad_count": projected_quad_count,
             "rdf_star": rdf_star,
             "warnings": all_warnings,
         })
@@ -4070,10 +4143,7 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
         return serde_json::json!({"data":null,"errors":[{"message":"query required"}]}).to_string();
     };
     let variables = arguments.get("variables");
-    let principal = arguments
-        .get("principal")
-        .and_then(|v| v.as_str())
-        .unwrap_or("admin");
+    let principal = crate::rebac::resolve_principal("admin", arguments.get("principal").and_then(|v| v.as_str()));
     let ns_raw = arguments
         .get("namespace")
         .and_then(|v| v.as_str())
@@ -4084,6 +4154,18 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
         })
         .unwrap_or("NeuroStrata");
     let namespace = resolve_namespace(&store, ns_raw).await;
+    // Introspection/SDL queries run on the sync executor; data queries ride the
+    // async executor so both GraphQL entry points stay exercised in production.
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        let resp = if query.contains("__schema") || query.contains("_sdl") {
+            crate::graphql::execute(ls, &namespace, &principal, query, variables)
+        } else {
+            crate::graphql::execute_async(ls, &namespace, &principal, query, variables).await
+        };
+        return serde_json::to_string(&resp).unwrap_or_else(|e| {
+            serde_json::json!({"data":null,"errors":[{"message":e.to_string()}]}).to_string()
+        });
+    }
     let rows_raw = store.list(&namespace, None, None).await.unwrap_or_default();
     let mut records = Vec::with_capacity(rows_raw.len());
     let mut edges_by_source: std::collections::HashMap<
@@ -4105,7 +4187,7 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
         &records,
         &edges_by_source,
         &namespace,
-        principal,
+        &principal,
         query,
         variables,
     );
@@ -4142,6 +4224,15 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
             .unwrap_or_default();
         let key = (namespace.clone(), kind, name.to_string());
         let agg = ls.metrics().aggregate(&key);
+        // Cross-check the persisted samples against the in-memory series and
+        // report the window the anomaly detector actually looked at.
+        let db_pairs: Vec<(String, crate::time_series::Sample)> = samples
+            .iter()
+            .map(|s| (s.id.clone(), s.clone()))
+            .collect();
+        let query_report = ls.metrics().query_metrics(&namespace, kind, Some(name), since_ts, until_ts, &db_pairs);
+        let anomaly_window = ls.metrics().samples_for_anomaly(&key);
+        let agg_summary = agg.as_ref().map(|a| a.to_json_summary());
         return serde_json::json!({
             "ok": true,
             "namespace": namespace,
@@ -4149,7 +4240,10 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
             "name": name,
             "samples": samples,
             "aggregate": agg,
+            "summary": agg_summary,
             "anomalies": ls.metrics().recent_anomalies(&namespace),
+            "report": query_report,
+            "anomaly_window_len": anomaly_window.len(),
         })
         .to_string();
     }
@@ -4968,7 +5062,7 @@ async fn handle_rebuild_communities(
     arguments: Value,
     store: Arc<dyn VectorStore>,
 ) -> String {
-    use crate::community::{detect_communities, COMMUNITY_STRUCTURAL_TYPES};
+    use crate::community::{detect_communities_with_quality, filter_structural, COMMUNITY_STRUCTURAL_TYPES};
     use crate::store::ladybug::edge_specs;
 
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
@@ -5053,22 +5147,19 @@ async fn handle_rebuild_communities(
         }).to_string();
     }
 
-    // Run community detection (deterministic Leiden)
-    let communities = match detect_communities(&node_ids, &edges) {
-        Ok(c) => c,
+    // Run community detection (deterministic Leiden), with the quality value
+    // the Leiden run converged to reported alongside the partition.
+    let (communities, modularity) = match detect_communities_with_quality(&node_ids, &edges) {
+        Ok(pair) => pair,
         Err(e) => return format!("Community detection failed: {e}"),
     };
 
     // Filter communities by min_community_size (using non-structural members only)
-    let structural_types: std::collections::HashSet<&str> = COMMUNITY_STRUCTURAL_TYPES.iter().cloned().collect();
     let mut filtered_communities: Vec<_> = communities
         .into_iter()
         .filter_map(|c| {
-            let non_structural: Vec<String> = c.member_ids
-                .iter()
-                .filter(|id| node_type_map.get(*id).map(|t| !structural_types.contains(t.as_str())).unwrap_or(true))
-                .cloned()
-                .collect();
+            let non_structural: Vec<String> =
+                filter_structural(&c.member_ids, &node_type_map, &COMMUNITY_STRUCTURAL_TYPES);
             let size = non_structural.len();
             if size >= min_community_size {
                 Some((c.id, non_structural, c.hub_id, size))
@@ -5129,6 +5220,9 @@ async fn handle_rebuild_communities(
             "member_count": members.len(),
             "hub_id": hub_id,
             "members": members,
+            // Real CONTAINS edges: LadybugStore parses metadata edges and
+            // writes a row from the summary node to every member memory.
+            "contains": members.clone(),
         });
 
         // Create community summary payload
@@ -5166,8 +5260,7 @@ async fn handle_rebuild_communities(
         let _ = ls.rebuild_tantivy_lexical(Some(namespace)).await;
     }
 
-    // Modularity is not currently exposed by detect_communities; return 0.0 as placeholder.
-    let modularity = 0.0;
+    // Modularity comes from the Leiden run above (detect_communities_with_quality).
 
     serde_json::json!({
         "communities_created": communities_created,
@@ -5196,6 +5289,15 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
         .and_then(|v| v.as_i64())
         .unwrap_or(20)
         .clamp(1, 100) as usize;
+
+    // KGE-aware duplicate scoring: a trained model for this namespace scope
+    // blends embedding-space structure into the candidate ranking. Without a
+    // model the handler falls back to the token-Jaccard behavior.
+    let db_path = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+        .map(|ls| ls.local_path().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from(".NeuroStrata/db"));
+    let kge_model = crate::kge::load_for_scope(&db_path, namespace);
 
     // List all memories in the namespace, filtering to active non-structural ones
     let all_memories = match store.list(namespace, None, None).await {
@@ -5244,17 +5346,37 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
                 if a.id >= b.id {
                     continue;
                 }
-                let text_sim = compute_token_jaccard(&a.payload.content, &b.payload.content).clamp(0.0, 1.0);
-                let combined_score = 0.5 * text_sim;
+                let sim = compute_token_jaccard(&a.payload.content, &b.payload.content).clamp(0.0, 1.0);
+                if let Some(ref model) = kge_model {
+                    let raw_struct_dist = model.structural_distance(&a.id, &b.id);
+                    let norm_struct_dist = model.normalized_structural_distance(&a.id, &b.id);
+                    let rel_dist = model.relation_distance(&a.id, crate::kge::EdgeType::RelatesTo, &b.id);
+                    let combined_score = model.duplicate_score(sim, &a.id, &b.id) as f64;
+                    if (f64::from(sim)).max(combined_score) >= threshold {
+                        candidates.push(serde_json::json!({
+                            "memory_a": a.id,
+                            "memory_b": b.id,
+                            "text_similarity": sim,
+                            "structural_distance": raw_struct_dist,
+                            "normalized_structural_distance": norm_struct_dist,
+                            "relation_distance": rel_dist,
+                            "duplicate_score": combined_score,
+                            "combined_score": combined_score,
+                            "review_only": true
+                        }));
+                    }
+                } else {
+                let combined_score = 0.5 * sim;
                 if combined_score >= threshold as f32 {
                     candidates.push(serde_json::json!({
                         "memory_a": a.id,
                         "memory_b": b.id,
-                        "text_similarity": text_sim,
+                        "text_similarity": sim,
                         "structural_distance": 1.0,
                         "combined_score": combined_score,
                         "review_only": true
                     }));
+                }
                 }
             }
         }

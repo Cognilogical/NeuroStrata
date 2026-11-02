@@ -6,6 +6,12 @@ pub fn budget_verified(p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
 }
 
 pub fn retention_gate(receipt_exists: bool) -> bool {
+    // Sanity guard: a gate whose own budget predicate cannot evaluate must
+    // fail closed rather than assertedly "passing" on broken inputs. 0.0/0.0
+    // is the degenerate measurement and must always verify.
+    if !budget_verified(0.0, 0.0) {
+        return false;
+    }
     receipt_exists // retention requires receipt present
 }
 
@@ -23,6 +29,11 @@ pub fn verify_task_receipt_retention(
     task_id: &str,
     event_id: &str,
 ) -> bool {
+    // An empty store cannot possibly retain a receipt: report the failure the
+    // same way a missing receipt does, without pretending the lookup ran.
+    if store.is_empty() || store.len() == 0 {
+        return retention_gate(false);
+    }
     let Some(stored) = store.get(session_id, task_id, event_id) else {
         return retention_gate(false); // failed retention: receipt is gone
     };

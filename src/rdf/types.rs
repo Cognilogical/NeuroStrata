@@ -31,7 +31,7 @@ pub struct EdgeProvenance {
     pub extractor: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Global,
     Domain,
@@ -44,6 +44,15 @@ impl Tier {
             Tier::Global => "global",
             Tier::Domain => "domain",
             Tier::Task => "task",
+        }
+    }
+
+    /// Map a memory_type string to its projection tier.
+    pub fn from_memory_type(memory_type: &str) -> Tier {
+        match memory_type {
+            "rule" | "architecture" => Tier::Global,
+            "task" | "attempt" | "session" => Tier::Task,
+            _ => Tier::Domain,
         }
     }
 }

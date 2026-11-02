@@ -372,6 +372,11 @@ pub async fn apply_changed(
     let import_trust = mesh.manifest().policy.imported_procedures_trust;
     let head_signature = head_commit_signature_state(root);
 
+    // Bundle/RDF-patch artifacts are scanned before the candidate loop so a
+    // compressed drain bundle or an rdfpatch sidecar is accounted for on
+    // every replay pass (fail-soft; see `scan_bundles_and_patches`).
+    scan_bundles_and_patches(root);
+
     for rel in paths {
         let candidate = match classify_path(&rel, served) {
             Ok(Some(c)) => c,
@@ -1823,9 +1828,11 @@ pub fn verify_record_signature(
     if pub_bytes.len() != 32 {
         return SignatureDisposition::Invalid("public_key must be 32 bytes".to_string());
     }
-    if did.starts_with("did:key:z") {
-        let expected_did = crate::did::signer_did(&pub_bytes);
-        if &expected_did != did {
+    // The signer DID must resolve to exactly the record's public key: a
+    // DID that cannot be parsed (or names a different key) is a mismatch.
+    match crate::did::public_key_from_did(did) {
+        Ok(did_pub) if did_pub == pub_bytes => {}
+        _ => {
             return SignatureDisposition::Invalid(
                 "signer_did does not match public_key".to_string(),
             );
@@ -1872,10 +1879,10 @@ pub fn verify_record_signature(
 }
 
 /// Decompress a zstd-compressed mesh record bundle with bounded output size.
-/// Compiled with tests only — see `worker::compress_record_bundle`.
-#[cfg(test)]
+/// Used by [`read_compressed_bundle`]; additionally available for direct
+/// bundle decodes.
 pub fn decompress_record_bundle(bytes: &[u8]) -> Result<Vec<MeshRecord>, String> {
-    let raw = crate::compression::zstd::decompress_bounded(
+    let raw = crate::compression::zstd::decompress_mesh_bundle(
         bytes,
         crate::compression::zstd::DEFAULT_MESH_MAX_DECOMPRESSED_BYTES,
     )
@@ -1884,10 +1891,90 @@ pub fn decompress_record_bundle(bytes: &[u8]) -> Result<Vec<MeshRecord>, String>
 }
 
 /// Read a compressed bundle from disk and decompress it.
-#[cfg(test)]
 pub fn read_compressed_bundle(bundle_path: &Path) -> Result<Vec<MeshRecord>, String> {
     let bytes = std::fs::read(bundle_path).map_err(|e| e.to_string())?;
     decompress_record_bundle(&bytes)
+}
+
+/// Wire-up for the artifacts a mesh-worker may leave behind on the source
+/// node (spec: `NEUROSTRATA_MESH_BUNDLE_ZSTD` and
+/// `NEUROSTRATA_MESH_RDF_PATCH`). Called once per pulled checkout, before
+/// the replay pass. Fail-soft everywhere: a missing `bundles/` dir, an
+/// unreadable bundle, or an invalid patch is logged, never fatal.
+fn scan_bundles_and_patches(mesh_root: &Path) {
+    let bundles_dir = mesh_root.join("bundles");
+    if bundles_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+                    if path.to_string_lossy().ends_with(".bundle.zst") {
+                        match read_compressed_bundle(&path) {
+                            Ok(records) => {
+                                tracing::debug!(
+                                    "mesh bundle {} decoded: {} record(s)",
+                                    path.display(),
+                                    records.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // `.rdfpatch` sidecars written next to a `<id>.json` record file are
+    // validated with the streaming patch parser. A parse failure is a
+    // warning; the record itself is still gated by the ordinary replay
+    // validation.
+    if let Ok(nses) = std::fs::read_dir(mesh_root) {
+        for ns in nses.flatten() {
+            let ns_path = ns.path();
+            if !ns_path.is_dir() {
+                continue;
+            }
+            for subdir in ["memories", "procedures"] {
+                let dir = ns_path.join(subdir);
+                if !dir.is_dir() {
+                    continue;
+                }
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("rdfpatch") {
+                            continue;
+                        }
+                        // "Alongside a record": the sibling `.json` must exist.
+                        if !path.with_extension("json").exists() {
+                            continue;
+                        }
+                        match std::fs::read_to_string(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|text| {
+                                crate::streaming::Stream::parse_patch(&text)
+                                    .map(|deltas| deltas.len())
+                                    .map_err(|e| e.to_string())
+                            }) {
+                            Ok(n) => {
+                                tracing::debug!(
+                                    "mesh rdf patch {} valid: {} delta(s)",
+                                    path.display(),
+                                    n
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("mesh rdf patch {} invalid: {e}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------

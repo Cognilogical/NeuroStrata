@@ -165,7 +165,10 @@ impl RollingStats {
             return None;
         }
         let std_dev = self.welford.std_dev();
-        let z_score = if std_dev <= f64::EPSILON && (sample - self.welford.mean()).abs() <= f64::EPSILON {
+        let span = (self.welford.max() - self.welford.min()).abs();
+        let z_score = if (std_dev <= f64::EPSILON || span <= f64::EPSILON)
+            && (sample - self.welford.mean()).abs() <= f64::EPSILON
+        {
             0.0
         } else {
             (sample - self.ewma) / std_dev.max(1e-6)

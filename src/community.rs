@@ -1,8 +1,8 @@
 //! `community` — deterministic Leiden community detection.
 //! Spec: docs/superpowers/specs/2026-10-27-community-detection-design.md (APPROVED 2026-10-28).
 
-mod inner {
-    
+pub mod community_inner {
+
     use leiden_rs::{GraphDataBuilder, Leiden, LeidenConfig, QualityType};
     use std::collections::{BTreeMap, HashMap};
 
@@ -14,17 +14,21 @@ mod inner {
         pub size: usize,
     }
 
-    pub fn detect_communities(
+    /// Detect communities AND return the partition quality (modularity) the
+    /// Leiden run converged to (spec §5.2). `0.0` for empty input.
+    /// (The old `detect_communities` wrapper is superseded by this variant:
+    /// callers destructure `(communities, quality)`.)
+    pub fn detect_communities_with_quality(
         node_ids: &[String],
         edges: &[(String, String, f32)],
-    ) -> anyhow::Result<Vec<Community>> {
+    ) -> anyhow::Result<(Vec<Community>, f64)> {
         // Sort deterministically and dedup (spec §5.7: sorted node order)
         let mut sorted: Vec<String> = node_ids.to_vec();
         sorted.sort();
         sorted.dedup();
 
         if sorted.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0.0));
         }
 
         // Node id -> index (sorted order = deterministic CSR adjacency)
@@ -69,6 +73,7 @@ mod inner {
         };
         let leiden = Leiden::new(config);
         let result = leiden.run(&graph).map_err(|e| anyhow::anyhow!("leiden run: {e}"))?;
+        let quality = result.quality;
         let partition = result.partition;
 
         // Collect communities from nodes_in_community (sorted node indices).
@@ -118,7 +123,7 @@ mod inner {
             c.hub_id = c.member_ids.iter().min().cloned().unwrap_or_default();
         }
 
-        Ok(communities)
+        Ok((communities, quality))
     }
 
     /// Filter out structural memory types from community members.
@@ -151,7 +156,7 @@ pub const COMMUNITY_STRUCTURAL_TYPES: [&str; 6] = [
     "community_summary",
 ];
 
-pub use inner::*;
+pub use community_inner::*;
 
 #[cfg(test)]
 mod tests {
@@ -174,7 +179,7 @@ mod tests {
             ("c3".to_string(), "c4".to_string(), 0.5),
         ];
 
-        let communities = detect_communities(&nodes, &edges)?;
+        let (communities, _quality) = detect_communities_with_quality(&nodes, &edges)?;
         assert_eq!(
             communities.len(),
             2,
@@ -183,7 +188,7 @@ mod tests {
 
 
         // Determinism across runs with same input.
-        let second = detect_communities(&nodes, &edges)?;
+        let second = detect_communities_with_quality(&nodes, &edges).map(|(c, _)| c)?;
         assert_eq!(communities, second, "partition must be deterministic");
 
         // Determinism across shuffled input order (nodes + edges).
@@ -191,7 +196,7 @@ mod tests {
         shuffled_nodes.reverse();
         let mut shuffled_edges: Vec<(String, String, f32)> = edges.clone();
         shuffled_edges.reverse();
-        let third = detect_communities(&shuffled_nodes, &shuffled_edges)?;
+        let third = detect_communities_with_quality(&shuffled_nodes, &shuffled_edges).map(|(c, _)| c)?;
         assert_eq!(communities, third, "partition must be order-independent");
 
         Ok(())
@@ -201,14 +206,16 @@ mod tests {
     fn singleton_nodes_are_skipped() -> anyhow::Result<()> {
         let nodes = vec!["a".to_string(), "b".to_string()];
         let edges = vec![];
-        let communities = detect_communities(&nodes, &edges)?;
+        let (communities, _quality) = detect_communities_with_quality(&nodes, &edges)?;
         assert!(communities.is_empty(), "singletons produce no communities");
         Ok(())
     }
 
     #[test]
     fn empty_input_returns_empty() {
-        let communities = detect_communities(&[], &[]).expect("empty input must not error");
+        let (communities, quality) =
+            detect_communities_with_quality(&[], &[]).expect("empty input must not error");
         assert!(communities.is_empty());
+        assert_eq!(quality, 0.0);
     }
 }

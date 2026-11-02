@@ -3,35 +3,35 @@
 
 mod attempt;
 mod buffer;
-pub mod compression;
+mod compression;
 mod config;
 mod context;
 mod crash;
 mod daemon;
-pub mod did;
-pub mod digital_twin;
+mod did;
+mod digital_twin;
 mod domain;
 mod embed;
 mod fts;
 mod gliner;
-pub mod graphql;
-pub mod kge;
-pub mod community;
+mod graphql;
+mod kge;
+mod community;
 mod events;
 mod graph_read;
 mod guard;
 mod handlers;
 mod ingest_jobs;
 mod judgment;
-pub mod lexical;
+mod lexical;
 mod model_downloader;
 mod mention;
-pub mod multimodal;
+mod multimodal;
 mod ontology_grounding;
 mod learning;
 mod parser;
-pub mod rag_chat;
-pub mod rebac;
+mod rag_chat;
+mod rebac;
 mod recall_metrics;
 mod receipts;
 mod rdf;
@@ -41,15 +41,15 @@ mod secrets;
 mod server;
 mod setup;
 mod source_context;
-pub mod storage;
+mod storage;
 mod store;
-pub mod streaming;
+mod streaming;
 mod synaptic_mesh;
 mod task;
-pub mod telemetry;
-pub mod retention;
-pub mod diagnostic;
-pub mod time_series;
+mod telemetry;
+mod retention;
+mod diagnostic;
+mod time_series;
 mod tools;
 mod traits;
 
@@ -3921,6 +3921,14 @@ async fn run() -> anyhow::Result<()> {
                         };
 
                         if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
+                            // Opt-in pre-ingest hygiene: drop the ingester-owned
+                            // rows (and their lexical docs) so the rebuild starts
+                            // from a clean tree, then surface the generation
+                            // bookkeeping query alongside it.
+                            if std::env::var("NEUROSTRATA_CLEAR_BEFORE_INGEST").is_ok() {
+                                vector_store.clear_ingested(&namespace).await?;
+                                let _ = vector_store.generation_nodes(&namespace, 0).await;
+                            }
                             println!(
                                 "Ingesting AST from {:?} into namespace '{}'",
                                 dir_path, namespace

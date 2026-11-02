@@ -3,6 +3,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -285,6 +286,18 @@ impl Embedder for FastEmbedder {
     fn embedder_id(&self) -> &str {
         &self.model_name
     }
+
+    fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".into(),
+            model: self.model_name.clone(),
+            revision: "onnx".into(),
+            dims: self.dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
 }
 
 pub struct RemoteEmbedder {
@@ -295,6 +308,20 @@ pub struct RemoteEmbedder {
     dimensions: usize,
     model_name: String,
 }
+
+/// A typed carrier for the response status so the retry loop can downcast to
+/// it from the anyhow chain (reqwest::StatusCode does not implement
+/// std::error::Error itself).
+#[derive(Debug)]
+struct StatusError(reqwest::StatusCode);
+
+impl fmt::Display for StatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for StatusError {}
 
 impl RemoteEmbedder {
     pub fn new(
@@ -328,8 +355,10 @@ impl RemoteEmbedder {
                     if attempts >= 2 {
                         return Err(e);
                     }
-                    if let Some(status) = e.downcast_ref::<reqwest::StatusCode>() {
-                        if *status == 429 || status.is_server_error() {
+                    if let Some(s) = e.downcast_ref::<StatusError>() {
+                        if s.0 == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || s.0.is_server_error()
+                        {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -369,7 +398,11 @@ impl RemoteEmbedder {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("API error {}: {}", status, body));
+            // The status travels in the error chain so the retry loop in
+            // `embed_with_retry` can downcast and tell retryable server
+            // errors from fatal client ones.
+            return Err(anyhow::Error::new(StatusError(status))
+                .context(format!("API error {}: {}", status, body)));
         }
 
         let json: serde_json::Value = response.json().await.context("Failed to parse response")?;
@@ -397,12 +430,25 @@ impl Embedder for RemoteEmbedder {
     fn embedder_id(&self) -> &str {
         &self.model_name
     }
+
+    fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+        crate::traits::EmbeddingDescriptor {
+            provider: "openai-compatible".into(),
+            model: self.model_name.clone(),
+            revision: "unknown".into(),
+            dims: self.dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        }
+    }
 }
 
 pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
     let target_model = configured_model()?;
 
-    if let (Some(base_url), Some(api_key_env)) = (&target_model.base_url, &target_model.api_key_env)
+    let emb: Arc<dyn Embedder> = if let (Some(base_url), Some(api_key_env)) =
+        (&target_model.base_url, &target_model.api_key_env)
     {
         let api_key = std::env::var(api_key_env)
             .with_context(|| format!("API key env var {} not set", api_key_env))?;
@@ -415,20 +461,64 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
             "Initializing RemoteEmbedder with model: {} at {}",
             api_model, base_url
         );
-        Ok(Arc::new(RemoteEmbedder::new(
+        Arc::new(RemoteEmbedder::new(
             base_url.clone(),
             api_key,
             api_model,
             target_model.dimensions,
-        )?))
+        )?) as Arc<dyn Embedder>
     } else {
-        Ok(Arc::new(FastEmbedder::new()?))
+        Arc::new(FastEmbedder::new()?) as Arc<dyn Embedder>
+    };
+
+    // Embedding-space identity must resolve at startup: descriptors get
+    // persisted on namespace metadata and compared with `compatible`, so an
+    // embedder that reports the "unknown" descriptor would defeat that check.
+    let descriptor = emb.embedding_descriptor();
+    if descriptor.compatible(&crate::traits::EmbeddingDescriptor::unknown()) {
+        anyhow::bail!(
+            "embedder '{}' reports the unknown embedding descriptor",
+            emb.embedder_id()
+        );
     }
+    eprintln!(
+        "Embedding space: provider={} model={} dims={}",
+        descriptor.provider, descriptor.model, descriptor.dims
+    );
+    Ok(emb)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read one full HTTP request (headers + declared body) off the socket,
+    /// so responding cannot race the client still writing.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut acc: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            acc.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&acc).to_string();
+            if let Some(idx) = text.find("\r\n\r\n") {
+                let mut content_length = 0usize;
+                for line in text[..idx].lines() {
+                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = rest.trim().parse().unwrap_or(0);
+                    }
+                }
+                if acc.len() >= idx + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&acc).to_string()
+    }
 
     #[test]
     fn the_configured_width_is_known_without_loading_a_model() {
@@ -437,22 +527,86 @@ mod tests {
 
     #[tokio::test]
     async fn remote_embedder_happy_path() {
-        // Test with mock server would go here
-        // For now, test initialization
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let req = read_http_request(&mut sock).await;
+            assert!(
+                req.contains("POST /embeddings"),
+                "request: {}",
+                req
+            );
+            assert!(
+                req.to_ascii_lowercase()
+                    .contains("authorization: bearer test-key"),
+                "request: {}",
+                req
+            );
+            let body = r#"{"data":[{"embedding":[0.25,0.5,0.75,1.0]}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
         let embedder = RemoteEmbedder::new(
-            "http://localhost:1234".to_string(),
+            format!("http://{}", addr),
             "test-key".to_string(),
             "test-model".to_string(),
-            768,
-        );
-        assert!(embedder.is_ok());
+            4,
+        )
+        .unwrap();
+        let v = embedder.embed("hello").await.unwrap();
+        assert_eq!(v, vec![0.25f32, 0.5, 0.75, 1.0]);
+        server.await.unwrap();
     }
 
     #[tokio::test]
     async fn remote_embedder_retries_on_500() {
-        // Mock server returning 500 then 200
-        // This would require wiremock or similar
-        // Placeholder for integration test
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut handled = 0usize;
+            for attempt in 0..2 {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let req = read_http_request(&mut sock).await;
+                assert!(req.contains("POST /embeddings"), "request: {}", req);
+                let (status_line, body) = if attempt == 0 {
+                    ("HTTP/1.1 500 Internal Server Error", "server fail")
+                } else {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"data":[{"embedding":[1.0,2.0,3.0,4.0]}]}"#,
+                    )
+                };
+                let resp = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status_line,
+                    body.len(),
+                    body
+                );
+                use tokio::io::AsyncWriteExt;
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+                handled += 1;
+            }
+            handled
+        });
+        let embedder = RemoteEmbedder::new(
+            format!("http://{}", addr),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            4,
+        )
+        .unwrap();
+        let v = embedder.embed("retry me").await.unwrap();
+        assert_eq!(v, vec![1.0f32, 2.0, 3.0, 4.0]);
+        let handled = server.await.unwrap();
+        assert_eq!(handled, 2, "server must see both the failed and the retried attempt");
     }
 
     #[test]
@@ -465,6 +619,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(embedder.dimensions(), 768);
+    }
+
+    #[test]
+    fn remote_embedder_descriptor_is_resolved_not_unknown() {
+        let embedder = RemoteEmbedder::new(
+            "http://localhost:1234".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            768,
+        )
+        .unwrap();
+        let d = embedder.embedding_descriptor();
+        assert_eq!(d.provider, "openai-compatible");
+        assert_eq!(d.model, "test-model");
+        assert_eq!(d.dims, 768);
+        assert!(!d.compatible(&crate::traits::EmbeddingDescriptor::unknown()));
     }
 
     #[test]

@@ -8,8 +8,8 @@ pub fn allowed(user: &str, resource_owner: &str, relation: &str, acl: &[String])
     if user == "admin" {
         return true; // admin bypass
     }
-    if !resource_owner.is_empty() && user == resource_owner {
-        return true; // owner always allowed
+    if !resource_owner.is_empty() && check(resource_owner, user, "") {
+        return true; // owner always allowed, via §5.2 exact-equality check
     }
     match relation {
         "viewer" => acl.is_empty() || acl.iter().any(|e| e == "*" || e == user),
@@ -156,13 +156,10 @@ pub fn is_restricted(metadata: &Value) -> bool {
 
 /// §5.6 — publish allowed when unrestricted, wildcard, or peer intersection.
 pub fn can_publish_to_mesh(metadata: &Value, peer_principals: &[String]) -> bool {
+    if !is_restricted(metadata) {
+        return true; // empty ACL or wildcard: nothing restricted to carve back
+    }
     let acl = extract_visible_to(metadata);
-    if acl.is_empty() {
-        return true;
-    }
-    if acl.iter().any(|e| e == "*") {
-        return true;
-    }
     acl.iter().any(|e| peer_principals.iter().any(|p| p == e))
 }
 

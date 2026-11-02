@@ -124,6 +124,12 @@ pub fn set_state(
     merge: bool,
 ) -> Result<(), TwinError> {
     for (name, value) in vars {
+        if sanitize_var_name(name).is_empty() {
+            return Err(TwinError::InvalidPayload(format!(
+                "invalid variable name: {}",
+                name
+            )));
+        }
         if value.is_nan() || value.is_infinite() {
             return Err(TwinError::NonFinite {
                 name: name.clone(),
@@ -234,7 +240,9 @@ pub fn list_twins_from_rows(
 ) -> Vec<TwinSummary> {
     let mut best: BTreeMap<String, (String, u64, usize, i64, Option<String>, Option<String>)> = BTreeMap::new();
     for (id, payload) in rows {
-        if payload.memory_type != "digital_twin" {
+        let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
+            || payload.metadata.get("twin").is_some();
+        if !is_twin_row {
             continue;
         }
         let valid_to = payload.metadata.get("valid_to");
@@ -315,7 +323,7 @@ pub fn get_twin_state_from_rows(
     let mut best_version = 0u64;
     let mut best_payload: Option<&crate::traits::MemoryPayload> = None;
     for (_id, payload) in rows {
-        if payload.memory_type != "digital_twin" {
+        if !DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str()) {
             continue;
         }
         let payload_twin_id = payload
@@ -340,6 +348,17 @@ pub fn get_twin_state_from_rows(
     best_payload.map(get_state)
 }
 
+/// `get_twin_state_from_rows` for callers that need an error, not an absence:
+/// a twin id the rows do not carry is a lookup failure the caller must see
+/// (`TwinError::NotFound`), never an empty state that reads as "no variables".
+pub fn require_twin_state_from_rows(
+    rows: &[(String, crate::traits::MemoryPayload)],
+    twin_id: &str,
+) -> Result<BTreeMap<String, f64>, TwinError> {
+    get_twin_state_from_rows(rows, twin_id)
+        .ok_or_else(|| TwinError::NotFound(twin_id.to_string()))
+}
+
 pub fn twin_history_from_rows(
     rows: &[(String, crate::traits::MemoryPayload)],
     twin_id: &str,
@@ -347,7 +366,7 @@ pub fn twin_history_from_rows(
 ) -> Vec<(u64, i64, BTreeMap<String, f64>)> {
     let mut matched: Vec<(u64, i64, BTreeMap<String, f64>)> = Vec::new();
     for (_id, payload) in rows {
-        if payload.memory_type != "digital_twin" {
+        if !DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str()) {
             continue;
         }
         let payload_twin_id = payload
@@ -388,7 +407,7 @@ pub fn twin_diff_from_rows(
     let mut from_payload: Option<&crate::traits::MemoryPayload> = None;
     let mut to_payload: Option<&crate::traits::MemoryPayload> = None;
     for (_id, payload) in rows {
-        if payload.memory_type != "digital_twin" {
+        if !DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str()) {
             continue;
         }
         let payload_twin_id = payload
@@ -454,7 +473,14 @@ pub async fn get_twin_state(
                 .into_iter()
                 .map(|r| (r.id, r.payload))
                 .collect();
-            get_twin_state_from_rows(&rows, twin_id)
+            let state = get_twin_state_from_rows(&rows, twin_id);
+            if state.is_none() {
+                eprintln!(
+                    "[TWIN] state lookup missed for twin '{}' in namespace '{}'",
+                    twin_id, namespace
+                );
+            }
+            state
         }
         Err(_) => None,
     }
@@ -559,6 +585,31 @@ mod tests {
         assert!(matches!(
             set_state(&mut p, &vars, false),
             Err(TwinError::NonFinite { .. })
+        ));
+    }
+
+    #[test]
+    fn set_state_rejects_name_that_sanitizes_to_empty() {
+        let mut p = make_payload(json!({ "twin": {} }));
+        let mut vars = BTreeMap::new();
+        vars.insert(String::new(), 1.0);
+        assert!(matches!(
+            set_state(&mut p, &vars, false),
+            Err(TwinError::InvalidPayload(s)) if s.contains("invalid variable name")
+        ));
+    }
+
+    #[test]
+    fn require_twin_state_from_rows_maps_miss_to_not_found() {
+        let rows = vec![(
+            "id1".into(),
+            make_payload(json!({ "twin": { "id": "t1", "version": 1, "variables": { "a": 1.0 } } })),
+        )];
+        let state = require_twin_state_from_rows(&rows, "t1").unwrap();
+        assert_eq!(state.get("a"), Some(&1.0));
+        assert!(matches!(
+            require_twin_state_from_rows(&rows, "absent"),
+            Err(TwinError::NotFound(id)) if id == "absent"
         ));
     }
 

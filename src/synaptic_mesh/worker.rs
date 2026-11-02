@@ -93,12 +93,23 @@ pub fn drain_once(
     let policy = mesh.manifest().policy.clone();
     let epoch = mesh.manifest().epoch;
     let mut committed_ids: Vec<Uuid> = Vec::with_capacity(entries.len());
+    // The MeshRecords this drain actually wrote (Applied only) — the
+    // compressed-bundle opt-in (NEUROSTRATA_MESH_BUNDLE_ZSTD) serializes
+    // exactly these.
+    let mut committed_records: Vec<MeshRecord> = Vec::with_capacity(entries.len());
 
     for entry in &entries {
-        match apply_one(entry, mesh, node_id, &policy, epoch)? {
+        let (outcome, written) = match apply_one(entry, mesh, node_id, &policy, epoch) {
+            Ok(pair) => pair,
+            Err(e) => return Err(e),
+        };
+        match outcome {
             ApplyOutcome::Applied => {
                 report.applied += 1;
                 committed_ids.push(entry.stable_op_id);
+                if let Some(record) = written {
+                    committed_records.push(record);
+                }
             }
             ApplyOutcome::AlreadyApplied => {
                 report.already_applied += 1;
@@ -129,6 +140,26 @@ pub fn drain_once(
         }
     }
 
+    // Compressed-bundle opt-in (spec: NEUROSTRATA_MESH_BUNDLE_ZSTD): the
+    // drained records also land in `<root>/bundles/drain-<ts>.bundle.zst`.
+    // Best-effort — a bundle write failure never fails the drain.
+    if !committed_records.is_empty()
+        && std::env::var("NEUROSTRATA_MESH_BUNDLE_ZSTD")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    {
+        let _ = write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            &format!("drain-{}", Utc::now().timestamp_millis()),
+            &committed_records,
+        );
+    }
+
     // Mark committed AFTER the commit: a crash before this line leaves the
     // entries pending, and the worker's idempotent apply makes the retry a
     // no-op (AlreadyApplied), never a duplicate commit.
@@ -138,13 +169,16 @@ pub fn drain_once(
 }
 
 /// Apply one entry: classify (skip) or build + atomically write the record.
+/// On success returns the written record (only for `Applied` — a written
+/// file); the record is `None` for skip/already-applied/quarantine
+/// outcomes and is consumed by the caller's bundle tracking.
 fn apply_one(
     entry: &OutboxEntry,
     mesh: &MeshStorage,
     node_id: &str,
     policy: &super::manifest::MeshPolicy,
     epoch: u32,
-) -> Result<ApplyOutcome, String> {
+) -> Result<(ApplyOutcome, Option<MeshRecord>), String> {
     // ---- publish-side epoch quarantine (spec §"Deletion & erasure") ----
     // A record captured in an older epoch than the mesh's current one is from
     // a pre-purge outbox and must not be replayed into the new epoch. This is
@@ -153,31 +187,34 @@ fn apply_one(
     // inspect the old outbox. It is checked FIRST — an old-epoch entry is
     // quarantined whatever its other classifications would say.
     if entry.epoch < epoch {
-        return Ok(ApplyOutcome::Quarantined(format!(
-            "{}: old-epoch entry (epoch {} < manifest epoch {}); quarantined, not replayed",
-            entry.id, entry.epoch, epoch
-        )));
+        return Ok((
+            ApplyOutcome::Quarantined(format!(
+                "{}: old-epoch entry (epoch {} < manifest epoch {}); quarantined, not replayed",
+                entry.id, entry.epoch, epoch
+            )),
+            None,
+        ));
     }
     // ---- classification: a skip is a decision, never an error ----
     // Feedback guard: a row that already carries a `mesh` provenance marker was
     // imported FROM the mesh (slice 4 writes it) and must never be re-exported.
     if entry.metadata.get("mesh").is_some() {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     // Unknown op: defensive — an op this worker doesn't recognise is skipped,
     // never exported as if it were a fresh `created`.
     if !matches!(entry.op.as_str(), OP_CREATED | OP_SUPERSEDED | OP_ARCHIVED) {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     // Defensive re-check of the type filter the subscriber already applied.
     if !is_shareable_memory_type(&entry.memory_type) {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     // Sharing boundary: when the policy requires it (default), only
     // `eligibility: shareable` records are published. Absent or `private`
     // reads as private.
     if policy.require_record_eligibility && !is_eligible(&entry.metadata) {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     // ReBAC mesh boundary: restricted memories (`visible_to` without `*` or
     // matching mesh peer principal) stay local and are never published.
@@ -188,11 +225,11 @@ fn apply_one(
         .map(|s| s.did.clone())
         .collect();
     if !crate::rebac::can_publish_to_mesh(&entry.metadata, &peer_principals) {
-        return Ok(ApplyOutcome::Skipped);
+        return Ok((ApplyOutcome::Skipped, None));
     }
     let id = match Uuid::parse_str(&entry.id) {
         Ok(id) => id,
-        Err(_) => return Ok(ApplyOutcome::Skipped),
+        Err(_) => return Ok((ApplyOutcome::Skipped, None)),
     };
     let superseded_by = match entry.op.as_str() {
         OP_SUPERSEDED => match entry
@@ -201,7 +238,7 @@ fn apply_one(
             .and_then(|s| Uuid::parse_str(s).ok())
         {
             Some(target) => Some(target),
-            None => return Ok(ApplyOutcome::Skipped),
+            None => return Ok((ApplyOutcome::Skipped, None)),
         },
         _ => None,
     };
@@ -225,7 +262,7 @@ fn apply_one(
         if existing.update_id == record.update_id {
             // Byte-identical apply already landed (crash between rename and
             // mark-committed). Idempotent: nothing to write, nothing to commit.
-            return Ok(ApplyOutcome::AlreadyApplied);
+            return Ok((ApplyOutcome::AlreadyApplied, None));
         }
         // A lifecycle transition (superseded/archived) re-exports the SAME
         // record: preserve the origin fields that must not drift with each
@@ -251,7 +288,24 @@ fn apply_one(
         return Err(format!("mesh record exceeds 1 MiB size cap ({} bytes)", serialized.len()));
     }
     write_record(&path, &record)?;
-    Ok(ApplyOutcome::Applied)
+
+    // RDF patch sidecar (spec: NEUROSTRATA_MESH_RDF_PATCH opt-in): rebuild a
+    // Stream from the record's canonical N-Quads block and write its patch
+    // serialization next to the record file. Fail-soft.
+    if let Some(ref rdf_block) = record.rdf {
+        if std::env::var("NEUROSTRATA_MESH_RDF_PATCH").is_ok() {
+            if let Ok(stream) =
+                crate::streaming::Stream::from_nquads(&rdf_block.quads, crate::streaming::PatchOp::Add)
+            {
+                if !stream.is_empty() && stream.len() > 0 {
+                    let patch_path = path.with_extension("rdfpatch");
+                    let _ = std::fs::write(&patch_path, stream.to_patch());
+                }
+            }
+        }
+    }
+
+    Ok((ApplyOutcome::Applied, Some(record)))
 }
 
 /// The record's eligibility gate: only a literal `eligibility: "shareable"`.
@@ -420,22 +474,24 @@ pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), Strin
 }
 
 /// Compress a batch of mesh records with zstd for bundle transport.
-/// Compiled with tests only: no shipped mesh flow writes bundles yet (the
-/// spec's `NEUROSTRATA_MESH_BUNDLE_ZSTD` opt-in remains a follow-up), and
-/// the round-trip tests exercise the full path.
-#[cfg(test)]
-pub fn compress_record_bundle(records: &[MeshRecord], level: i32) -> Result<Vec<u8>, String> {
+/// Used by `write_compressed_bundle` under the drain-time
+/// `NEUROSTRATA_MESH_BUNDLE_ZSTD` opt-in and the bundle round-trip tests.
+pub fn compress_record_bundle(records: &[MeshRecord], _level: i32) -> Result<Vec<u8>, String> {
     let json_bytes = serde_json::to_vec(records).map_err(|e| e.to_string())?;
-    crate::compression::zstd::compress(&json_bytes, level).map_err(|e| e.to_string())
+    crate::compression::zstd::compress_mesh_bundle(&json_bytes).map_err(|e| e.to_string())
 }
 
-/// Write a compressed bundle to `<mesh_root>/bundles/<bundle_name>.bundle.zst`.
-#[cfg(test)]
-pub fn write_compressed_bundle(mesh_root: &Path, bundle_name: &str, records: &[MeshRecord], level: i32) -> Result<PathBuf, String> {
-    let bytes = compress_record_bundle(records, level)?;
-    let dir = mesh_root.join("bundles");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{}.bundle.zst", bundle_name));
+/// Write a compressed bundle to `<bundles_dir>/<bundle_name>.bundle.zst`.
+/// `bundles_dir` is the target directory directly (the mesh worker passes
+/// `<mesh_root>/bundles`).
+pub fn write_compressed_bundle(
+    bundles_dir: &Path,
+    bundle_name: &str,
+    records: &[MeshRecord],
+) -> Result<PathBuf, String> {
+    let bytes = compress_record_bundle(records, 3)?;
+    std::fs::create_dir_all(bundles_dir).map_err(|e| e.to_string())?;
+    let path = bundles_dir.join(format!("{}.bundle.zst", bundle_name));
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     Ok(path)
 }
@@ -1368,7 +1424,12 @@ mod tests {
         );
 
         // (b) Compressed bundle round-trips losslessly.
-        let bundle_path = write_compressed_bundle(mesh.root(), "test-bundle", &[record.clone()], 3).unwrap();
+        let bundle_path = write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "test-bundle",
+            &[record.clone()],
+        )
+        .unwrap();
         let roundtrip = crate::synaptic_mesh::import::read_compressed_bundle(&bundle_path).unwrap();
         assert_eq!(roundtrip.len(), 1);
         assert_eq!(roundtrip[0], record);

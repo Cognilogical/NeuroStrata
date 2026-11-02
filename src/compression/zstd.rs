@@ -78,33 +78,24 @@ pub fn compress_mesh_bundle(bytes: &[u8]) -> Result<Vec<u8>, CompressionError> {
 }
 
 pub fn decompress_bounded(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError> {
-    decompress_mesh_bundle(bytes, max)
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let mut buf = Vec::new();
+    decoder.take((max as u64) + 1).read_to_end(&mut buf)?;
+    if buf.len() > max {
+        return Err(DecompressionError::PayloadTooLarge {
+            max,
+            actual: buf.len(),
+        });
+    }
+    Ok(buf)
 }
 
 pub fn decompress_snapshot(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError> {
-    let decoder = zstd::stream::read::Decoder::new(bytes)?;
-    let mut buf = Vec::new();
-    decoder.take((max as u64) + 1).read_to_end(&mut buf)?;
-    if buf.len() > max {
-        return Err(DecompressionError::PayloadTooLarge {
-            max,
-            actual: buf.len(),
-        });
-    }
-    Ok(buf)
+    decompress_bounded(bytes, max)
 }
 
 pub fn decompress_mesh_bundle(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError> {
-    let decoder = zstd::stream::read::Decoder::new(bytes)?;
-    let mut buf = Vec::new();
-    decoder.take((max as u64) + 1).read_to_end(&mut buf)?;
-    if buf.len() > max {
-        return Err(DecompressionError::PayloadTooLarge {
-            max,
-            actual: buf.len(),
-        });
-    }
-    Ok(buf)
+    decompress_bounded(bytes, max)
 }
 
 #[cfg(test)]

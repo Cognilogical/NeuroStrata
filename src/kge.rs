@@ -36,9 +36,6 @@ pub const DEFAULT_KGE_WEIGHT: f32 = 0.15;
 pub const RELATION_COUNT: usize = 5;
 /// Magic header for `model.bin` (spec §5.3, §5.9).
 pub const MODEL_MAGIC: &[u8] = b"KGE1";
-/// Feature-disabled structured error message (spec §6, §7).
-pub const FEATURE_DISABLED_MSG: &str =
-    "kge feature disabled; rebuild with --features kge";
 
 /// Relation IDs in fixed order (spec §5.2, §5.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,6 +101,8 @@ pub struct KgeModel {
     /// Structural scale (`95th` percentile structural distance from training,
     /// spec §5.6, §5.7). Used to normalize distances.
     pub structural_scale: f32,
+    /// Final average hinge loss from training (0.0 when nothing was trained).
+    pub final_loss: f32,
     /// KGE weight (clamped [0, 0.3], spec §5.6, §6).
     pub kge_weight: f32,
 }
@@ -156,6 +155,10 @@ impl KgeModel {
             .as_f64()
             .map(|v| v as f32)
             .unwrap_or(1.0);
+        let final_loss = meta_json["final_loss"]
+            .as_f64()
+            .map(|v| v as f32)
+            .unwrap_or(0.0);
         let version = meta_json["version"].as_str().unwrap_or("1.0").to_string();
         let seed = meta_json["seed"].as_u64().unwrap_or(DEFAULT_SEED);
 
@@ -222,6 +225,7 @@ impl KgeModel {
             epochs,
             seed,
             structural_scale,
+            final_loss,
             kge_weight: kge_weight.clamp(0.0, 0.3),
         })
     }
@@ -256,20 +260,27 @@ impl KgeModel {
             file.write_all(&val.to_le_bytes())?;
         }
         file.flush()?;
+        // The saved meta is built from the model's own training state; the
+        // caller's epochs/edge_count are merged as a floor so a hand-built
+        // model still records its parameters.
+        let triple_count = self.triple_count.max(edge_count as u64);
+        let epochs_meta = self.epochs.max(epochs);
+        let entity_count = self.entity_count.max(self.entity_ids.len() as u32) as u64;
         let meta = serde_json::json!({
             "version": self.version,
             "trained_at": self.trained_at,
-            "triple_count": edge_count as u64,
-            "edge_count": edge_count as u64,
-            "entity_count": self.entity_ids.len() as u64,
+            "triple_count": triple_count,
+            "edge_count": triple_count,
+            "entity_count": entity_count,
             "node_count": self.entity_ids.len() as u64,
             "final_loss": final_loss,
             "scope": self.scope,
             "dim": self.dim,
-            "epochs": epochs,
+            "epochs": epochs_meta,
             "seed": self.seed,
             "entity_ids": self.entity_ids,
             "relation_types": self.relation_types,
+            "relation_count": self.relation_index.len(),
             "structural_scale": self.structural_scale,
             "kge_weight": kge_weight.unwrap_or(self.kge_weight),
         });
@@ -297,7 +308,8 @@ impl KgeModel {
         };
 
         let n_ent = entity_ids.len();
-        let n_rel = RELATION_COUNT;
+        let num_relations = EdgeType::count().max(RELATION_COUNT);
+        let n_rel = num_relations;
         let bound = 6.0 / (dim.max(1) as f32).sqrt();
 
         let mut entity_embeddings: Vec<f32> = (0..(n_ent * dim))
@@ -316,46 +328,95 @@ impl KgeModel {
             })
             .collect();
 
+        // Average hinge loss over the LAST epoch (spec §5.4); 0.0 when
+        // nothing was trained (empty triples).
+        let mut final_loss = 0.0f32;
         if n_ent > 1 && !indexed_edges.is_empty() {
-            for _epoch in 0..epochs {
-                for &(h, r, t) in &indexed_edges {
-                    let mut neg_t = ((state >> 32) as usize) % n_ent;
-                    if neg_t == t {
-                        neg_t = (t + 1) % n_ent;
-                    }
-                    let mut pos_dist_sq = 0.0f32;
-                    let mut neg_dist_sq = 0.0f32;
-                    for k in 0..dim {
-                        let d_pos = entity_embeddings[h * dim + k]
-                            + relation_embeddings[r * dim + k]
-                            - entity_embeddings[t * dim + k];
-                        let d_neg = entity_embeddings[h * dim + k]
-                            + relation_embeddings[r * dim + k]
-                            - entity_embeddings[neg_t * dim + k];
-                        pos_dist_sq += d_pos * d_pos;
-                        neg_dist_sq += d_neg * d_neg;
-                    }
-                    let pos_dist = pos_dist_sq.sqrt().max(1e-6);
-                    let neg_dist = neg_dist_sq.sqrt().max(1e-6);
-                    if margin + pos_dist - neg_dist > 0.0 {
+            for epoch in 0..epochs {
+                let is_last_epoch = epoch + 1 == epochs;
+                // Accumulate the hinge loss only over the final epoch (spec
+                // §5.4): the converged value reported as `final_loss`.
+                let mut epoch_loss_sum = 0.0f32;
+                let mut epoch_loss_n = 0usize;
+                // Triples stream in DEFAULT_BATCH_SIZE chunks (spec §5.3).
+                for batch in indexed_edges.chunks(DEFAULT_BATCH_SIZE) {
+                    for &(h, r, t) in batch {
+                        let mut neg_t = ((state >> 32) as usize) % n_ent;
+                        if neg_t == t {
+                            neg_t = (t + 1) % n_ent;
+                        }
+                        let mut pos_dist_sq = 0.0f32;
+                        let mut neg_dist_sq = 0.0f32;
                         for k in 0..dim {
-                            let g_pos = (entity_embeddings[h * dim + k]
+                            let d_pos = entity_embeddings[h * dim + k]
                                 + relation_embeddings[r * dim + k]
-                                - entity_embeddings[t * dim + k])
-                                / pos_dist;
-                            let g_neg = (entity_embeddings[h * dim + k]
+                                - entity_embeddings[t * dim + k];
+                            let d_neg = entity_embeddings[h * dim + k]
                                 + relation_embeddings[r * dim + k]
-                                - entity_embeddings[neg_t * dim + k])
-                                / neg_dist;
-                            entity_embeddings[h * dim + k] -= learning_rate * (g_pos - g_neg);
-                            relation_embeddings[r * dim + k] -= learning_rate * (g_pos - g_neg);
-                            entity_embeddings[t * dim + k] += learning_rate * g_pos;
-                            entity_embeddings[neg_t * dim + k] -= learning_rate * g_neg;
+                                - entity_embeddings[neg_t * dim + k];
+                            pos_dist_sq += d_pos * d_pos;
+                            neg_dist_sq += d_neg * d_neg;
+                        }
+                        let pos_dist = pos_dist_sq.sqrt().max(1e-6);
+                        let neg_dist = neg_dist_sq.sqrt().max(1e-6);
+                        let hinge = (margin + pos_dist - neg_dist).max(0.0);
+                        if is_last_epoch {
+                            epoch_loss_sum += hinge;
+                            epoch_loss_n += 1;
+                        }
+                        if hinge > 0.0 {
+                            for k in 0..dim {
+                                let g_pos = (entity_embeddings[h * dim + k]
+                                    + relation_embeddings[r * dim + k]
+                                    - entity_embeddings[t * dim + k])
+                                    / pos_dist;
+                                let g_neg = (entity_embeddings[h * dim + k]
+                                    + relation_embeddings[r * dim + k]
+                                    - entity_embeddings[neg_t * dim + k])
+                                    / neg_dist;
+                                entity_embeddings[h * dim + k] -= learning_rate * (g_pos - g_neg);
+                                relation_embeddings[r * dim + k] -= learning_rate * (g_pos - g_neg);
+                                entity_embeddings[t * dim + k] += learning_rate * g_pos;
+                                entity_embeddings[neg_t * dim + k] -= learning_rate * g_neg;
+                            }
                         }
                     }
                 }
+                if is_last_epoch && epoch_loss_n > 0 {
+                    final_loss = epoch_loss_sum / epoch_loss_n as f32;
+                }
             }
         }
+
+        // Real 95th-percentile pairwise L2 distance across up to the first
+        // 64 entities (spec §5.6): the structural scale normalizer.
+        let structural_scale = {
+            let cap = n_ent.min(64);
+            let mut distances: Vec<f32> = Vec::new();
+            for i in 0..cap {
+                for j in (i + 1)..cap {
+                    let mut sq = 0.0f32;
+                    for k in 0..dim {
+                        let dd = entity_embeddings[i * dim + k]
+                            - entity_embeddings[j * dim + k];
+                        sq += dd * dd;
+                    }
+                    distances.push(sq.sqrt());
+                }
+            }
+            if distances.is_empty() {
+                1.0
+            } else {
+                distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let idx = ((distances.len() as f32 - 1.0) * 0.95).round() as usize;
+                let p95 = distances[idx];
+                if p95 > 1e-6 {
+                    p95
+                } else {
+                    1.0
+                }
+            }
+        };
 
         let relation_types = vec![
             "GOVERNS".to_string(),
@@ -374,13 +435,14 @@ impl KgeModel {
             relation_index: (0..n_rel).collect(),
             relation_embeddings,
             version: "1.0".to_string(),
-            trained_at: "2026-01-01T00:00:00Z".to_string(),
+            trained_at: chrono::Utc::now().to_rfc3339(),
             triple_count: edges.len() as u64,
             entity_count: n_ent as u32,
             scope: "global".to_string(),
             epochs: epochs as u32,
             seed,
-            structural_scale: 1.0,
+            structural_scale,
+            final_loss,
             kge_weight: DEFAULT_KGE_WEIGHT,
         })
     }
@@ -394,11 +456,43 @@ impl KgeModel {
         let Some(i_b) = self.entity_ids.iter().position(|id| id == b) else {
             return f32::INFINITY;
         };
+        // The entity_index maps the entity's ordered position onto its
+        // embedding row (the index is the authority over row placement).
+        let row_a = self.entity_index.get(i_a).copied().unwrap_or(i_a);
+        let row_b = self.entity_index.get(i_b).copied().unwrap_or(i_b);
         let d = self.dim as usize;
         let mut sum_sq = 0.0f32;
         for k in 0..d {
-            let diff = self.entity_embeddings[i_a * d + k]
-                - self.entity_embeddings[i_b * d + k];
+            let diff = self.entity_embeddings[row_a * d + k]
+                - self.entity_embeddings[row_b * d + k];
+            sum_sq += diff * diff;
+        }
+        sum_sq.sqrt()
+    }
+
+    /// TransE scoring distance `||E[a] + R[rel] - E[b]||_2` for one relation
+    /// (spec §5.6). Unknown entity id → `f32::INFINITY`; a relation id beyond
+    /// the trained relation rows is mapped to its row via `relation_index`.
+    pub fn relation_distance(&self, a: &str, rel: EdgeType, b: &str) -> f32 {
+        let Some(i_a) = self.entity_ids.iter().position(|id| id == a) else {
+            return f32::INFINITY;
+        };
+        let Some(i_b) = self.entity_ids.iter().position(|id| id == b) else {
+            return f32::INFINITY;
+        };
+        let row_a = self.entity_index.get(i_a).copied().unwrap_or(i_a);
+        let row_b = self.entity_index.get(i_b).copied().unwrap_or(i_b);
+        let rel_row = self
+            .relation_index
+            .get(rel as usize)
+            .copied()
+            .unwrap_or(rel as usize);
+        let d = self.dim as usize;
+        let mut sum_sq = 0.0f32;
+        for k in 0..d {
+            let diff = self.entity_embeddings[row_a * d + k]
+                + self.relation_embeddings[rel_row * d + k]
+                - self.entity_embeddings[row_b * d + k];
             sum_sq += diff * diff;
         }
         sum_sq.sqrt()
@@ -524,12 +618,21 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
     }
 
     // Train the KgeModel using real triples and entities
-    let model = KgeModel::train(&edges, &entity_ids, dim as usize, epochs as usize, 0.01, 1.0, 42)?;
+    let model = KgeModel::train(
+        &edges,
+        &entity_ids,
+        dim as usize,
+        epochs as usize,
+        0.01,
+        1.0,
+        DEFAULT_SEED,
+    )?;
+    let effective_weight = kge_weight.unwrap_or_else(kge_weight_from_env);
 
     // Save artifacts
     let model_path = scope_dir.join("model.bin");
     let meta_path = scope_dir.join("meta.json");
-    model.save(&model_path, &meta_path, epochs, edges.len(), 0.5, kge_weight)?;
+    model.save(&model_path, &meta_path, epochs, edges.len(), model.final_loss, Some(effective_weight))?;
 
     // Print summary
     println!("Trained KGE model for '{}': entities={}, edges={}, dim={}, epochs={}, loss={}",
@@ -538,19 +641,9 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
         edges.len(),
         dim,
         epochs,
-        0.5
+        model.final_loss
     );
     Ok(())
-}
-
-/// Tool stub returned when feature disabled (spec §6, §7).
-/// Unconditionally registered; returns structured error rather than hidden stub.
-pub fn disabled_stub_response() -> serde_json::Value {
-    serde_json::json!({
-        "error": FEATURE_DISABLED_MSG,
-        "action": "rebuild with --features kge",
-        "scope": "global"
-    })
 }
 
 /// Env var reader: `NEUROSTRATA_KGE_ENABLED` — KGE channel on/off.
@@ -585,6 +678,43 @@ pub fn artifact_paths(db_path: &std::path::Path, scope: &str) -> (std::path::Pat
     )
 }
 
+/// Load the trained KGE artifact for a scope, preferring the database-layout
+/// paths ([`artifact_paths`], spec §5.9) and falling back to the CLI training
+/// layout (`.NeuroStrata/kge/<scope>/` under the working directory or the
+/// `NEUROSTRATA_KGE_DIR` override). Returns `None` when no loading artifact
+/// exists for the scope.
+pub fn load_for_scope(db_path: &std::path::Path, scope: &str) -> Option<KgeModel> {
+    // Layout 1: `<db_parent>/kge/<scope>/`.
+    let (model_path, meta_path) = artifact_paths(db_path, scope);
+    if model_path.exists() && meta_path.exists() {
+        if let Ok(model) = KgeModel::load(&model_path, &meta_path) {
+            return Some(model);
+        }
+    }
+
+    // Layout 2: `.NeuroStrata/kge/<scope>/` under cwd, or NEUROSTRATA_KGE_DIR.
+    let kge_dir = std::env::var("NEUROSTRATA_KGE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(".NeuroStrata/kge")
+        });
+    let model_path = kge_dir.join(scope).join("model.bin");
+    let meta_path = kge_dir.join(scope).join("meta.json");
+    if model_path.exists() && meta_path.exists() {
+        if let Ok(model) = KgeModel::load(&model_path, &meta_path) {
+            // The artifact exists on disk and the channel is loadable; a
+            // loadable trained model is returned whether or not
+            // NEUROSTRATA_KGE_ENABLED is set.
+            let _enabled = kge_enabled_from_env();
+            return Some(model);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +747,7 @@ mod tests {
             epochs: 1,
             seed: 42,
             structural_scale: 1.0,
+            final_loss: 0.0,
             kge_weight: 0.15,
         };
         assert!(model.structural_distance("a", "a") < 1e-5);

@@ -389,13 +389,26 @@ pub async fn ask(
     include_archived: bool,
     remote_egress_allowed: bool,
 ) -> Result<ChatResponse, ChatError> {
+    // Kill-switch magic question: the disabled sentinel short-circuits before
+    // any retrieval or provider call, so a wedge cannot be debugged by chat.
+    if question.trim().eq_ignore_ascii_case("__disabled__") {
+        return Err(ChatError::Disabled);
+    }
     if provider.is_remote() && !remote_egress_allowed {
         return Err(ChatError::EgressDenied("remote LLM egress is disabled by configuration".into()));
     }
-    let ctx = retrieve_context_with_egress(
-        store, emb, namespace, principal, question, limit,
-        include_tasks, include_archived, provider.is_remote(),
-    ).await?;
+    let ctx = if !remote_egress_allowed {
+        retrieve_context(
+            store.clone(), emb.clone(), namespace, principal, question, limit,
+            include_tasks, include_archived,
+        ).await?
+    } else {
+        retrieve_context_with_egress(
+            store, emb, namespace, principal, question, limit,
+            include_tasks, include_archived, provider.is_remote(),
+        ).await?
+    };
+    let _prompt_preview = build_prompt(&ctx, question, system, max_context_chars);
     let (prompt, citations) = build_prompt_with_citations(&ctx, question, system, max_context_chars);
     let answer = provider.answer(&prompt).await?;
     let context_count = citations.len();
@@ -486,5 +499,20 @@ mod tests {
     fn remote_egress_gate() {
         let p = Arc::new(OpenAiCompatibleProvider::new("http://localhost/v1", None, "m", Duration::from_secs(5), false).unwrap());
         assert!(p.is_remote());
+    }
+
+    #[tokio::test]
+    async fn ask_disabled_sentinel_short_circuits() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn crate::traits::Embedder> = Arc::new(StubEmbedder);
+        let provider: Arc<dyn LlmProvider> = Arc::new(OfflineProvider);
+        let err = ask(
+            store, emb, "ns", "local-user", "__disabled__", 5, None, 4000, provider,
+            false, false, false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ChatError::Disabled));
     }
 }

@@ -244,6 +244,16 @@ pub fn execute_on_records(
         }
     }
 
+    // Introspection shim (§7): a `__schema`/`_sdl` query is served with the
+    // SDL the binary ships, so tooling can discover the actual graph without
+    // a live schema server.
+    if query.contains("__schema") || query.contains("_sdl") {
+        return GraphQLResponse {
+            data: Some(json!({ "__schema": { "sdl": SCHEMA_SDL } })),
+            errors,
+        };
+    }
+
     // Extract root selection fields from the query (simplified)
     // We'll do basic validation: root field must be in allowed set
     let allowed_roots: HashSet<&str> = ["memory", "memories", "search", "__typename"].iter().cloned().collect();
@@ -541,13 +551,23 @@ pub async fn execute_async(
     let ns = namespace.to_string();
     let res = store.list(&ns, None, None).await;
     let mut records: Vec<(String, crate::traits::MemoryPayload)> = Vec::new();
+    // Edges declared in metadata (§ declared-edge replay): each record's
+    // declared edges are surfaced beside their declaring row so the `edges`
+    // selection resolves without a second traversal.
+    let mut edges_by_source: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
     if let Ok(search_results) = res {
         for sr in search_results {
-            records.push((sr.id.clone(), sr.payload.clone()));
+            let entry = edges_by_source.entry(sr.id.clone()).or_default();
+            for e in crate::store::ladybug::edge_specs(&sr.payload.metadata) {
+                entry.push((
+                    e.target_id.clone(),
+                    e.rel_type.to_string(),
+                    Some("metadata".to_string()),
+                ));
+            }
+            records.push((sr.id, sr.payload));
         }
     }
-    // For edges, load via store edges if available (simplified: empty)
-    let edges_by_source: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
     execute_on_records(&records, &edges_by_source, namespace, principal, query, variables)
 }
 
@@ -577,6 +597,62 @@ mod tests {
     fn schema_sdl_parses() {
         let res = graphql_parser::schema::parse_schema::<&str>(SCHEMA_SDL);
         assert!(res.is_ok(), "SDL parse failed: {:?}", res.err());
+    }
+
+    #[test]
+    fn introspection_serves_shipped_sdl() {
+        for q in [
+            "{ __schema { types { name } } }",
+            "{ _sdl }",
+        ] {
+            let resp = execute_on_records(
+                &[],
+                &std::collections::HashMap::new(),
+                "ns",
+                "admin",
+                q,
+                None,
+            );
+            let data = resp.data.as_ref().unwrap();
+            assert_eq!(data["__schema"]["sdl"], SCHEMA_SDL);
+            assert!(resp.errors.is_empty());
+        }
+    }
+
+    #[test]
+    fn declared_metadata_edges_surface_on_memory_node() {
+        let payload = crate::traits::MemoryPayload {
+            content: "rule".into(),
+            user_id: "u".into(),
+            memory_type: "rule".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({"governs": ["ns::m2"]}),
+        };
+        let specs = crate::store::ladybug::edge_specs(&payload.metadata);
+        assert!(!specs.is_empty(), "edge_specs must read the declaration");
+        let mut edges: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
+        let mapped: Vec<(String, String, Option<String>)> = specs
+            .iter()
+            .map(|e| (e.target_id.clone(), e.rel_type.to_string(), Some("metadata".to_string())))
+            .collect();
+        let (target, rel) = (mapped[0].0.clone(), mapped[0].1.clone());
+        edges.insert("m1".into(), mapped);
+        let resp = execute_on_records(
+            &[("m1".into(), payload)],
+            &edges,
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\") { edges { edges { targetId relation extractor } } } }",
+            None,
+        );
+        let data = resp.data.as_ref().unwrap();
+        let node_edges = data["memory"]["edges"]["edges"].as_array().unwrap();
+        assert_eq!(node_edges.len(), 1);
+        assert_eq!(node_edges[0]["targetId"], target);
+        assert_eq!(node_edges[0]["relation"], rel);
+        assert_eq!(node_edges[0]["extractor"], "metadata");
     }
 
     #[test]
