@@ -64,7 +64,10 @@ export const UIPanel: React.FC<Props> = ({
   };
 
   const handleOpenInEditor = () => {
-    if (!selectedNode || !selectedNode.absolute_path) return;
+    if (!selectedNode || !selectedNode.absolute_path) {
+      setOpenError("Selected node has no file path to open.");
+      return;
+    }
     const path = selectedNode.absolute_path;
 
     // Attempt to derive project root from absolute path and relative location
@@ -170,13 +173,7 @@ export const UIPanel: React.FC<Props> = ({
                               {ed === 'vscode' ? 'VS Code' : 'Cursor'}
                             </button>
                           ))}
-        <button
-          onClick={() => emit('open-project-dialog', "open")}
-          className="w-full mt-2 px-3 py-1.5 bg-blue-600/20 hover:bg-blue-600/40 border border-blue-500/30 rounded text-blue-300 font-medium transition-colors flex items-center justify-center gap-2 text-sm"
-        >
-          📂 Open Project Folder
-        </button>
-      </div>
+                        </div>
                         <button 
                           onClick={handleOpenInEditor}
                           className="w-full bg-blue-600/20 hover:bg-blue-600/40 text-blue-200 border border-blue-500/30 text-xs font-bold py-2 px-2 rounded transition-colors shadow-sm mt-1 flex items-center justify-center gap-2"

@@ -36,17 +36,51 @@ const MARKERS: &[(&str, &str)] = &[
 
 const NEGATION_PREFIXES: &[&str] = &["never ", "do not ", "don't ", "do not, "];
 
+/// Largest byte offset `i <= max_bytes.min(s.len())` such that
+/// `s.is_char_boundary(i)` — never slices a multi-byte UTF-8 codepoint.
+fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Case-insensitive substring search using ASCII case folding only, so the
+/// returned byte offset is always a char boundary of the ORIGINAL haystack
+/// (no `to_lowercase()` re-encoding that can shift byte offsets under
+/// multi-byte characters like "→", "İ", or emoji). All markers are ASCII,
+/// so ASCII folding matches everything a Unicode fold would for them.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    for start in 0..=hb.len().saturating_sub(nb.len()) {
+        if !haystack.is_char_boundary(start) {
+            continue;
+        }
+        if (0..nb.len()).all(|j| {
+            hb[start + j].to_ascii_lowercase() == nb[j].to_ascii_lowercase()
+        }) {
+            return Some(start);
+        }
+    }
+    None
+}
+
 /// Detect task-shaped statements in `text`. Case-insensitive substring match
 /// on clause boundaries. Returns one signal per distinct marker matched (in
 /// table order), with the trimmed clause (capped at 160 chars) as `excerpt`.
 pub fn detect_task_intents(text: &str) -> Vec<TaskIntentSignal> {
-    let lower = text.to_lowercase();
     let mut out: Vec<TaskIntentSignal> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for &(match_str, canonical) in MARKERS {
-        // find first occurrence (case-insensitive) of match_str
-        let idx = match lower.find(match_str) {
+        // find first occurrence (case-insensitive, char-boundary aligned) of
+        // match_str directly in the original text
+        let idx = match find_ascii_ci(text, match_str) {
             Some(i) => i,
             None => continue,
         };
@@ -81,7 +115,7 @@ pub fn detect_task_intents(text: &str) -> Vec<TaskIntentSignal> {
             .find('\n')
             .unwrap_or(rest.len())
             .min(160);
-        let mut excerpt: String = rest[..end].trim_end().to_string();
+        let mut excerpt: String = safe_prefix(rest, end).trim_end().to_string();
         if excerpt.chars().count() > 160 {
             excerpt = excerpt.chars().take(160).collect();
         }
@@ -126,5 +160,20 @@ mod tests {
     fn negated_rule_skipped() {
         let sigs = detect_task_intents("Never TODO: do this");
         assert!(sigs.is_empty());
+    }
+
+    #[test]
+    fn multibyte_excerpt_does_not_panic() {
+        // "TODO: " occupies 6 bytes; 85 x ("İ" + "→") pushes total length far
+        // past byte 160, and byte 160 lands mid-codepoint — previously this
+        // sliced `text[..160]` on a non-boundary and panicked.
+        let filler = "İ→".repeat(85);
+        assert!(filler.len() > 160);
+        let text = format!("TODO: {filler}");
+        let sigs = detect_task_intents(&text);
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].marker, "todo:");
+        assert!(sigs[0].excerpt.starts_with("TODO:"));
+        assert!(sigs[0].excerpt.chars().count() <= 160);
     }
 }

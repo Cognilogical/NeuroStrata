@@ -404,7 +404,6 @@ pub fn retract_inferred_facets(metadata: &mut serde_json::Value, valid_to: i64) 
 }
 
 /// Detect conflict candidates among active memories (F10). Returns (id, disputed_with_ids).
-/// Detect conflict candidates among active memories (F10). Returns (id, disputed_with_ids).
 pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String, Vec<String>)> {
     let now = chrono::Utc::now().timestamp();
     // Filter expired memories first (F10-6). Also skip archived/mesh-conflicting/registry
@@ -477,8 +476,6 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
             // opposing decision status
             let dec_a = a.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
             let dec_b = b.payload.metadata.get("decision").and_then(|d| d.get("status")).and_then(|v| v.as_str()).unwrap_or("");
-            let b_failed = a.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed")
-                || b.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
             // attempt outcome on the *other* row
             let a_attempt_failed = a.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
             let b_attempt_failed = b.payload.metadata.get("attempt").and_then(|x| x.get("outcome")).and_then(|v| v.as_str()) == Some("failed");
@@ -516,8 +513,6 @@ pub fn detect_conflicts(memories: &[crate::traits::SearchResult]) -> Vec<(String
             if high_cosine && neg_opposition {
                 flag = true;
             }
-            // avoid unused
-            let _ = b_failed;
             if flag {
                 disputed_with.push(b.id.clone());
             }

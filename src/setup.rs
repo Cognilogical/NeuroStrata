@@ -92,7 +92,7 @@ fn run_setup_linux(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
         println!("  NOTE: daemon did not become healthy; check journal above.");
     }
 
-    Ok(SetupReport { daemon_installed: true, backup_installed: true, verified })
+    Ok(SetupReport { daemon_installed: true, backup_installed: verified, verified })
 }
 
 #[cfg(target_os = "linux")]
@@ -342,30 +342,42 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
     }
 
     // Configure service properties
-    std::process::Command::new(&nssm_exe)
+    let app_dir_status = std::process::Command::new(&nssm_exe)
         .args([
             "set", service_name, "AppDirectory", &repo.display().to_string(),
         ])
         .status()
         .context("nssm set AppDirectory")?;
-    std::process::Command::new(&nssm_exe)
+    if !app_dir_status.success() {
+        anyhow::bail!("nssm set AppDirectory exited with {:?}", app_dir_status.code());
+    }
+    let start_flag_status = std::process::Command::new(&nssm_exe)
         .args([
             "set", service_name, "Start", "SERVICE_AUTO_START",
         ])
         .status()
         .context("nssm set Start")?;
-    std::process::Command::new(&nssm_exe)
+    if !start_flag_status.success() {
+        anyhow::bail!("nssm set Start exited with {:?}", start_flag_status.code());
+    }
+    let restart_status = std::process::Command::new(&nssm_exe)
         .args([
             "set", service_name, "Restart", "on-failure",
             "RestartSec", "5",
         ])
         .status()
         .context("nssm set Restart")?;
+    if !restart_status.success() {
+        anyhow::bail!("nssm set Restart exited with {:?}", restart_status.code());
+    }
 
-    std::process::Command::new(&nssm_exe)
+    let start_status = std::process::Command::new(&nssm_exe)
         .args(["start", service_name])
         .status()
         .context("nssm start NeuroStrata")?;
+    if !start_status.success() {
+        anyhow::bail!("nssm start NeuroStrata exited with {:?}", start_status.code());
+    }
 
     println!("NSSM service '{}' installed and started.", service_name);
     println!("Next: services.msc (look for NeuroStrata) or `sc query NeuroStrata`");

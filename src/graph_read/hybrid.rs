@@ -4,7 +4,7 @@ pub fn normalize_vec(distance: f32, feedback_gain: f32) -> f32 {
     // Clamp to [0, 1.0] and apply the same capped gain logic as in search_inner.
     let capped = distance.clamp(0.0, 1.0);
     let capped_gain = (capped * feedback_gain).clamp(-0.5, 0.5); // Simplified gain model
-    capped - capped_gain
+    (capped - capped_gain).clamp(0.0, 1.0)
 }
 
 /// Normalized graph distance in [0.0, 1.0].

@@ -546,21 +546,15 @@ pub fn serialize_rdf_star(quads: &[oxrdf::Quad], format: &str, flatten_graphs: b
         return String::from_utf8(bytes).map_err(|_| "utf8".to_string());
     }
 
-    if format == "n-quads-star" || format == "" && !flatten_graphs {
-        let mut serializer = oxttl::NQuadsSerializer::new().for_writer(Vec::new());
-        for q in sorted {
-            serializer.serialize_quad(q.as_ref()).map_err(|e| format!("serialize: {}", e))?;
-        }
-        let bytes = serializer.finish();
-        return String::from_utf8(bytes).map_err(|_| "utf8".to_string());
-    }
-
-    // default fallback to trig-star when !flatten_graphs
-    let mut serializer = oxttl::TriGSerializer::new().for_writer(Vec::new());
+    // Any remaining format must be `n-quads-star`: every other combination is
+    // handled by the branches above (n-triples-star/turtle-star via
+    // `is_triple_format` when flattening, every non-quad format via `is_trig`
+    // when graphs are preserved).
+    let mut serializer = oxttl::NQuadsSerializer::new().for_writer(Vec::new());
     for q in sorted {
         serializer.serialize_quad(q.as_ref()).map_err(|e| format!("serialize: {}", e))?;
     }
-    let bytes = serializer.finish().map_err(|e| format!("finish: {}", e))?;
+    let bytes = serializer.finish();
     String::from_utf8(bytes).map_err(|_| "utf8".to_string())
 }
 

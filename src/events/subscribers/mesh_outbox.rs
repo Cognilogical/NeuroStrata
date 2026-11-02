@@ -583,11 +583,15 @@ impl MeshOutbox {
                 if payload.user_id == "auto-ingestor" || sr.id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
                     continue;
                 }
+                // Derived artifacts (KGE vectors, community labels, inferred
+                // edges) stay local/versioned derived data, mirroring `entry()`.
+                if payload.metadata.get("derived").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    continue;
+                }
                 // Eligibility gate (worker also re-checks, but skip early).
+                // Default is private; only shareable records are published.
                 if payload.metadata.get("eligibility").and_then(|v| v.as_str()) != Some("shareable") {
-                    // Default is private; only shareable records are published.
-                    // But we don't know the mesh policy here, so only skip if
-                    // explicitly private/absent. The worker will filter anyway.
+                    continue;
                 }
 
                 // Check if mesh file exists.

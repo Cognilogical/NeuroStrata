@@ -87,56 +87,57 @@ pub async fn project_sparql_dataset_with_meta_async(
     include_retired: bool,
     include_archived: bool,
     store: &crate::store::ladybug::LadybugStore,
-) -> (Dataset, std::collections::HashMap<String, serde_json::Value>) {
+) -> Result<(Dataset, std::collections::HashMap<String, serde_json::Value>), String> {
     let mut dataset = Dataset::new();
     let mut meta_map = std::collections::HashMap::new();
 
-    let mem_result = store.list_memories(namespace, None, None).await;
+    let memories = store
+        .list_memories(namespace, None, None)
+        .await
+        .map_err(|e| format!("Failed to load memories for SPARQL dataset: {e}"))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
 
-    if let Ok(ref memories) = mem_result {
-        for m in memories {
-            if !include_retired && is_retired_at(&m.payload.metadata, now) {
-                continue;
-            }
-            if !include_archived && is_archived(&m.payload.metadata) {
-                continue;
-            }
-            if is_mesh_conflicting(&m.payload.metadata) {
-                continue;
-            }
-            if crate::registry::is_registry_row(&m.payload.metadata) {
-                continue;
-            }
+    for m in &memories {
+        if !include_retired && is_retired_at(&m.payload.metadata, now) {
+            continue;
+        }
+        if !include_archived && is_archived(&m.payload.metadata) {
+            continue;
+        }
+        if is_mesh_conflicting(&m.payload.metadata) {
+            continue;
+        }
+        if crate::registry::is_registry_row(&m.payload.metadata) {
+            continue;
+        }
 
-            let payload = m.payload.clone();
-            meta_map.insert(format!("urn:neurostrata:memory:{}", m.id), m.payload.metadata.clone());
-            meta_map.insert(m.id.clone(), m.payload.metadata.clone());
+        let payload = m.payload.clone();
+        meta_map.insert(format!("urn:neurostrata:memory:{}", m.id), m.payload.metadata.clone());
+        meta_map.insert(m.id.clone(), m.payload.metadata.clone());
 
-            let qs = crate::rdf::projection::memory_to_quads(
-                &m.id,
-                &payload,
-                namespace,
-                crate::rdf::types::Tier::Domain,
-                0,
-            );
-            for q in qs {
-                dataset.insert(&q);
-                // Union-default-graph semantics (§5.2): also insert default-graph copy
-                dataset.insert(&oxrdf::Quad::new(
-                    q.subject.clone(),
-                    q.predicate.clone(),
-                    q.object.clone(),
-                    oxrdf::GraphName::DefaultGraph,
-                ));
-            }
+        let qs = crate::rdf::projection::memory_to_quads(
+            &m.id,
+            &payload,
+            namespace,
+            crate::rdf::types::Tier::Domain,
+            0,
+        );
+        for q in qs {
+            dataset.insert(&q);
+            // Union-default-graph semantics (§5.2): also insert default-graph copy
+            dataset.insert(&oxrdf::Quad::new(
+                q.subject.clone(),
+                q.predicate.clone(),
+                q.object.clone(),
+                oxrdf::GraphName::DefaultGraph,
+            ));
         }
     }
 
-    (dataset, meta_map)
+    Ok((dataset, meta_map))
 }
 
 /// Build a QueryEvaluator with the 3 NeuroStrata custom functions registered.
@@ -302,7 +303,9 @@ pub async fn execute_sparql_query(
     // handles SELECT/ASK/CONSTRUCT/DESCRIBE only, so an UPDATE input errors here.
 
     // Build the dataset from namespace projection (live LadybugDB) with meta mapping
-    let (dataset, meta_map) = project_sparql_dataset_with_meta_async(namespace, include_retired, include_archived, store).await;
+    let (dataset, meta_map) =
+        project_sparql_dataset_with_meta_async(namespace, include_retired, include_archived, store)
+            .await?;
     let meta_arc = std::sync::Arc::new(meta_map);
 
     if dataset.len() > config.max_dataset_quads {
@@ -336,13 +339,20 @@ pub async fn execute_sparql_query(
 
     // Timeout budget: the engine's cancellation token preempts a query that
     // runs past `timeout_ms` (between evaluation steps) instead of merely
-    // reporting overrun afterwards.
+    // reporting overrun afterwards. The flag records whether the budget was
+    // actually consumed, so the caller can distinguish "timed out" from a
+    // query that finished within budget.
     let cancel_token = spareval::CancellationToken::new();
     let evaluator = evaluator.with_cancellation_token(cancel_token.clone());
+    let timed_out_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let timeout_ms = config.timeout_ms;
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
-        cancel_token.cancel();
+    tokio::spawn({
+        let timed_out_flag = timed_out_flag.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+            timed_out_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            cancel_token.cancel();
+        }
     });
     let prepared = evaluator.prepare(&query);
     let results = prepared
@@ -360,6 +370,8 @@ pub async fn execute_sparql_query(
     };
 
     let mut solution_count: usize = 0;
+    let mut timed_out = false;
+    let mut truncated = false;
 
     match results {
         spareval::QueryResults::Boolean(b) => {
@@ -368,24 +380,48 @@ pub async fn execute_sparql_query(
                 .map_err(|e| format!("serialize boolean: {}", e))?;
         }
         spareval::QueryResults::Solutions(solutions) => {
-            let solutions = solutions.take(config.max_solutions);
+            // Take one extra solution to detect truncation: a query returning
+            // exactly `max_solutions` rows must not be reported as truncated.
+            let mut collected: Vec<_> = Vec::new();
+            for item in solutions.take(config.max_solutions + 1) {
+                match item {
+                    Ok(sol) => collected.push(sol),
+                    Err(e) => {
+                        if timed_out_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            // Cancellation consumed the timeout budget mid-iteration.
+                            timed_out = true;
+                            break;
+                        }
+                        return Err(format!("evaluation error: {}", e));
+                    }
+                }
+            }
+
+            truncated = collected.len() > config.max_solutions;
+            if truncated {
+                collected.truncate(config.max_solutions);
+            }
+
             let mut serializer_solutions =
                 serializer
                     .serialize_solutions_to_writer(&mut output, results_vars)
                     .map_err(|e| format!("serialize solutions start: {}", e))?;
-            for solution in solutions {
-                let sol = solution.map_err(|e| format!("evaluation error: {}", e))?;
+            for sol in &collected {
                 serializer_solutions
-                    .serialize(&sol)
+                    .serialize(sol)
                     .map_err(|e| format!("serialize solution: {}", e))?;
-                solution_count += 1;
             }
+            solution_count = collected.len();
             let _ = serializer_solutions.finish()
                 .map_err(|e| format!("serialize finish: {}", e))?;
         }
         spareval::QueryResults::Graph(triples) => {
             // CONSTRUCT/DESCRIBE: serialize triples as N-Triples.
             for triple in triples {
+                if timed_out_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    timed_out = true;
+                    break;
+                }
                 let t = triple.map_err(|e| format!("graph evaluation error: {}", e))?;
                 output.extend_from_slice(format!("{} .\n", t).as_bytes());
                 solution_count += 1;
@@ -395,14 +431,26 @@ pub async fn execute_sparql_query(
 
     let results_string = String::from_utf8(output)
         .map_err(|e| format!("UTF-8 error: {}", e))?;
-    let truncated = solution_count >= config.max_solutions;
+    let timed_out = timed_out || timed_out_flag.load(std::sync::atomic::Ordering::SeqCst);
 
-    Ok((results_string, solution_count, truncated, false))
+    Ok((results_string, solution_count, truncated, timed_out))
 }
 
-/// Global configuration for SPARQL execution.
+/// Global configuration for SPARQL execution, honoring optional environment
+/// overrides (`NEUROSTRATA_SPARQL_TIMEOUT_MS`, `NEUROSTRATA_SPARQL_MAX_SOLUTIONS`).
 pub fn get_sparql_config() -> SparqlConfig {
-    SparqlConfig::default()
+    let mut config = SparqlConfig::default();
+    if let Ok(v) = std::env::var("NEUROSTRATA_SPARQL_TIMEOUT_MS") {
+        if let Ok(ms) = v.trim().parse::<u64>() {
+            config.timeout_ms = ms;
+        }
+    }
+    if let Ok(v) = std::env::var("NEUROSTRATA_SPARQL_MAX_SOLUTIONS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            config.max_solutions = n;
+        }
+    }
+    config
 }
 
 #[cfg(test)]

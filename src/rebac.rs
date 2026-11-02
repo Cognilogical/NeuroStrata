@@ -2,6 +2,22 @@ use serde_json::Value;
 
 /// §5.2 — allowed (exact per spec, no blanket grants, owner/admin bypass, viewer ACL).
 pub fn allowed(user: &str, resource_owner: &str, relation: &str, acl: &[String]) -> bool {
+    // Plain string entries have no role information: they grant "viewer" only.
+    let entries: Vec<(String, String)> = acl
+        .iter()
+        .map(|s| (s.clone(), "viewer".to_string()))
+        .collect();
+    allowed_with_roles(user, resource_owner, relation, &entries)
+}
+
+/// §5.2 — role-aware check over (principal, role) ACL entries. A `"*"` entry
+/// matches any user. Entry roles ladder: owner ⊃ editor ⊃ viewer.
+pub fn allowed_with_roles(
+    user: &str,
+    resource_owner: &str,
+    relation: &str,
+    acl: &[(String, String)],
+) -> bool {
     if user.is_empty() {
         return false; // no anonymous access
     }
@@ -11,11 +27,18 @@ pub fn allowed(user: &str, resource_owner: &str, relation: &str, acl: &[String])
     if !resource_owner.is_empty() && check(resource_owner, user, "") {
         return true; // owner always allowed, via §5.2 exact-equality check
     }
-    match relation {
-        "viewer" => acl.is_empty() || acl.iter().any(|e| e == "*" || e == user),
-        "editor" | "owner" => false,
-        _ => false,
+    if acl.is_empty() {
+        return relation == "viewer"; // unrestricted ACL grants read only
     }
+    acl.iter().any(|(principal, role)| {
+        (principal == "*" || principal == user)
+            && matches!(
+                (relation, role.as_str()),
+                ("viewer", "viewer" | "editor" | "owner")
+                    | ("editor", "editor" | "owner")
+                    | ("owner", "owner")
+            )
+    })
 }
 
 /// §5.2 — check (exact equality only, no substring spoofing).
@@ -50,6 +73,34 @@ pub fn extract_visible_to(metadata: &Value) -> Vec<String> {
                         Some(s.to_string())
                     } else if let Some(p) = v.get("principal").and_then(|p| p.as_str()) {
                         Some(p.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// §5.6 — extract visible_to as (principal, role) pairs. Plain string entries
+/// default to role "viewer"; {principal, role} objects carry their role
+/// (unknown/missing roles coerce to "viewer").
+pub fn extract_acl_with_roles(metadata: &Value) -> Vec<(String, String)> {
+    metadata
+        .get("visible_to")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    if let Some(s) = v.as_str() {
+                        Some((s.to_string(), "viewer".to_string()))
+                    } else if let Some(p) = v.get("principal").and_then(|p| p.as_str()) {
+                        let role = v
+                            .get("role")
+                            .and_then(|r| r.as_str())
+                            .filter(|r| matches!(*r, "viewer" | "editor" | "owner"))
+                            .unwrap_or("viewer");
+                        Some((p.to_string(), role.to_string()))
                     } else {
                         None
                     }
@@ -130,21 +181,21 @@ pub fn extract_resource_owner(user_id: &str, metadata: &Value) -> String {
 
 /// §5.4 / §5.6 — read permission via allowed (viewer).
 pub fn can_read_memory(principal: &str, user_id: &str, metadata: &Value) -> bool {
-    allowed(
+    allowed_with_roles(
         principal,
         &extract_resource_owner(user_id, metadata),
         "viewer",
-        &extract_visible_to(metadata),
+        &extract_acl_with_roles(metadata),
     )
 }
 
 /// §5.4 / §5.6 — write permission via allowed (editor).
 pub fn can_write_memory(principal: &str, user_id: &str, metadata: &Value) -> bool {
-    allowed(
+    allowed_with_roles(
         principal,
         &extract_resource_owner(user_id, metadata),
         "editor",
-        &extract_visible_to(metadata),
+        &extract_acl_with_roles(metadata),
     )
 }
 
@@ -272,6 +323,45 @@ mod tests {
     fn extract_visible_to_empty_and_array() {
         assert!(extract_visible_to(&serde_json::json!({})).is_empty());
         assert_eq!(extract_visible_to(&serde_json::json!({"visible_to":["a","b"]})), vec!["a","b"]);
+    }
+
+    // §5.6 role-aware ACLs — {principal, role} objects honor their role.
+    #[test]
+    fn extract_acl_with_roles_strings_default_viewer() {
+        let entries = extract_acl_with_roles(
+            &serde_json::json!({"visible_to":["bob", {"principal":"alice","role":"editor"}]}),
+        );
+        assert_eq!(
+            entries,
+            vec![
+                ("bob".to_string(), "viewer".to_string()),
+                ("alice".to_string(), "editor".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn role_editor_entry_grants_editor_and_viewer_not_owner() {
+        let meta = serde_json::json!({
+            "user_id": "alice",
+            "visible_to": [{ "principal": "bob", "role": "editor" }]
+        });
+        assert!(can_write_memory("bob", "alice", &meta), "editor entry grants editor");
+        assert!(can_read_memory("bob", "alice", &meta), "editor entry grants viewer");
+        assert!(
+            !allowed_with_roles("bob", "alice", "owner", &extract_acl_with_roles(&meta)),
+            "editor entry must NOT grant owner"
+        );
+    }
+
+    #[test]
+    fn wildcard_editor_entry_grants_editor_only() {
+        let meta = serde_json::json!({
+            "visible_to": [{ "principal": "*", "role": "editor" }]
+        });
+        assert!(allowed_with_roles("stranger", "alice", "editor", &extract_acl_with_roles(&meta)));
+        assert!(allowed_with_roles("stranger", "alice", "viewer", &extract_acl_with_roles(&meta)));
+        assert!(!allowed_with_roles("stranger", "alice", "owner", &extract_acl_with_roles(&meta)));
     }
 
     #[test]

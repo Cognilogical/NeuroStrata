@@ -40,14 +40,17 @@ pub fn memory_to_nquads(id: &str, payload: &crate::traits::MemoryPayload) -> Str
     }
     if let Some(obj) = payload.metadata.as_object() {
         for (k, v) in obj {
+            // Bare `null` is not valid N-Quads object syntax; skip null values.
             let val = match v {
+                serde_json::Value::Null => continue,
                 serde_json::Value::String(s) => format!("\"{}\"", escape_nq(s)),
                 serde_json::Value::Number(n) => n.to_string(),
                 serde_json::Value::Bool(b) => b.to_string(),
-                serde_json::Value::Null => "null".to_string(),
                 other => format!("\"{}\"", escape_nq(&other.to_string())),
             };
-            lines.push(format!("{} <urn:neurostrata:meta:{}> {} .", subj, escape_nq(k), val));
+            // Predicate keys must be IRI-safe (<, >, ", whitespace → _).
+            let key = sanitize_meta_key(k);
+            lines.push(format!("{} <urn:neurostrata:meta:{}> {} .", subj, key, val));
         }
     }
     lines.sort();
@@ -64,6 +67,14 @@ pub fn nquads_digest(nquads: &str) -> String {
 
 fn escape_nq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+}
+
+/// Replace IRI-unsafe characters (<, >, ", whitespace, etc.) in a metadata
+/// key so the generated `urn:neurostrata:meta:{}` predicate stays a valid IRI.
+fn sanitize_meta_key(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "-._~".contains(c) { c } else { '_' })
+        .collect()
 }
 
 #[cfg(test)]

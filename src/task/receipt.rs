@@ -30,16 +30,26 @@ impl Receipt {
 }
 
 /// Read one worktree's (HEAD sha, hash of `git status --porcelain`). A worktree
-/// that git cannot read at all reports `("none", "clean")` — a receipt bound to
-/// those values only ever matches itself, so it never blocks.
+/// that git cannot read at all reports a fallback derived from the hash of the
+/// worktree path itself (e.g. `("none-<pathh>", "clean-<pathh>")`) so two
+/// distinct unreadable worktrees never collide on a shared `("none", "clean")`
+/// identity — a receipt bound to those values only ever matches itself, so it
+/// never blocks.
 pub fn compute_worktree_state(worktree: &std::path::Path) -> (String, String) {
+    // Fallback identity: SHA-256 of the worktree path (not readable by git).
+    let path_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(worktree.to_string_lossy().as_bytes());
+        hex_encode(&hasher.finalize())
+    };
+
     let head_sha = std::process::Command::new("git")
         .args(["-C", &worktree.to_string_lossy(), "rev-parse", "HEAD"])
         .output()
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_else(|| "none".to_string());
+        .unwrap_or_else(|| format!("none-{path_hash}"));
 
     let dirty_tree_hash = std::process::Command::new("git")
         .args(["-C", &worktree.to_string_lossy(), "status", "--porcelain"])
@@ -51,7 +61,7 @@ pub fn compute_worktree_state(worktree: &std::path::Path) -> (String, String) {
             hasher.update(&out.stdout);
             hex_encode(&hasher.finalize())
         })
-        .unwrap_or_else(|| "clean".to_string());
+        .unwrap_or_else(|| format!("clean-{path_hash}"));
 
     (head_sha, dirty_tree_hash)
 }

@@ -118,6 +118,23 @@ pub fn build_candidates(index: &KnownIds) -> HashMap<String, String> {
     out
 }
 
+/// Whether `needle` occurs in `text` at a position whose immediate left and
+/// right neighbors (when present) are neither path/identifier separators
+/// (`/`, `\`, `:`, `-`, `_`, `.`) nor alphanumeric characters.
+fn has_unattached_occurrence(text: &str, needle: &str) -> bool {
+    for (pos, mat) in text.match_indices(needle) {
+        let left = text[..pos].chars().next_back();
+        let right = text[pos + mat.len()..].chars().next();
+        let glued = |c: char| {
+            matches!(c, '/' | '\\' | ':' | '-' | '_' | '.') || c.is_alphanumeric()
+        };
+        if !left.map_or(false, glued) && !right.map_or(false, glued) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Detect mention symbol ids in `content` and `location`.
 pub fn detect_mentions(content: &str, location: &str, index: &KnownIds) -> Vec<String> {
     if content.len() > 1_048_576 {
@@ -139,16 +156,13 @@ pub fn detect_mentions(content: &str, location: &str, index: &KnownIds) -> Vec<S
                 continue;
             }
             if let Some(id) = candidates.get(&stripped) {
-                // Short alias neighbor guard.
-                if is_short_alias(&stripped) {
-                    // Find token position in text to inspect neighbors.
-                    // We approximate by searching for the token substring.
-                    // Guard: neighboring chars (in original text around this token)
-                    // must not be path/identifier separators.
-                    // Since token came from split_whitespace, neighbors are whitespace
-                    // or string boundaries, which are safe. Additional guard inside token
-                    // is not applicable. Keep simple: allow.
-                    let _ = text;
+                // Short alias neighbor guard: only when at least one
+                // occurrence of the alias in `text` is NOT glued to a
+                // path/identifier separator on either side does it count as a
+                // real mention; occurrence inside `src/alias.rs` must not
+                // resolve via its short name.
+                if is_short_alias(&stripped) && !has_unattached_occurrence(text, &stripped) {
+                    continue;
                 }
                 if !resolved.contains(id) {
                     resolved.push(id.clone());
@@ -183,6 +197,18 @@ mod tests {
         let got = detect_mentions(content, "", &index);
         assert!(got.iter().any(|g| g.contains("src/foo.rs#functions:bar")));
         assert!(got.iter().any(|g| g.contains("src/baz.rs")));
+    }
+
+    #[test]
+    fn short_alias_glued_to_separator_not_mention() {
+        let ids = vec!["ns::1::src/bar.rs#functions:bar@abc".to_string()];
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let index = KnownIds::new(refs);
+        // "-bar-": token strips to the short alias "bar", but its only
+        // occurrence in text has separators on both sides → no mention.
+        assert!(detect_mentions("-bar-", "", &index).is_empty());
+        // Standalone short alias mention still resolves.
+        assert_eq!(detect_mentions("bar", "", &index).len(), 1);
     }
 
     #[test]

@@ -381,8 +381,18 @@ pub async fn write_registry(
 
     let _guard = REGISTRY_MUTEX.lock().await;
     let registry_id = registry_row_id(namespace);
-    // Read existing row (metadata + vector) for merge.
-    let existing = store.get(namespace, &registry_id).await.ok().flatten();
+    // Read existing row (metadata + vector) for merge. Fail the write on a
+    // read error: merging `wanted_slugs` into an empty "existing" would
+    // overwrite the registry and clobber existing domain slugs.
+    let existing = match store.get(namespace, &registry_id).await {
+        Ok(row) => row,
+        Err(e) => {
+            return Some(format!(
+                "ERROR [DOMAIN]: the registry row of namespace '{}' could not be read: {}. Nothing was written.",
+                namespace, e
+            ))
+        }
+    };
     let existing_meta = existing.as_ref().map(|(_, p)| p.metadata.clone()).unwrap_or(serde_json::json!({}));
     let existing_domains_slugs: Vec<String> = if existing_meta.get("domain_registry").is_some() {
         // v2 entries -> slugs; v1 -> strings

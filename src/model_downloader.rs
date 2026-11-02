@@ -194,7 +194,9 @@ pub fn fetch_from_registry(
         }
 
         let new_registry = registry;
-        let _ = new_registry.write(registry_dir);
+        if let Err(e) = new_registry.write(registry_dir) {
+            tracing::warn!("Failed to persist model registry: {e}");
+        }
         Ok(out_path)
     } else {
         let written = fetch_model(&entry.url, &entry.sha256, &out_path)?;
@@ -206,7 +208,9 @@ pub fn fetch_from_registry(
             }
         }
         let new_registry = registry;
-        let _ = new_registry.write(registry_dir);
+        if let Err(e) = new_registry.write(registry_dir) {
+            tracing::warn!("Failed to persist model registry: {e}");
+        }
         Ok(written)
     }
 }

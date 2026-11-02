@@ -910,16 +910,43 @@ let incomplete = result_count >= fetch_limit;
             if search_mode == crate::traits::SearchMode::Hybrid {
                 let mut hybrid_results: Vec<SearchResult> = results.clone();
                 for sr in &mut hybrid_results {
-                    let d_vec = crate::graph_read::hybrid::normalize_vec(sr.score, 0.0);
+                    // d_vec: feedback gain now sourced from the row's actual
+                    // feedback_score metadata instead of hardcoded 0.0.
+                    let fb_gain = sr.payload.metadata
+                        .get("feedback_score")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0) as f32;
+                    let d_vec = crate::graph_read::hybrid::normalize_vec(sr.score, fb_gain);
                     // d_graph: co-occurrence from Step 2 primary_sources count.
                     // At this point in the function the expansion data has been
                     // consumed, so we approximate with metadata "co_occurrence_count"
                     // (set during ingestion/search-expansion when available);
-                    // default to 0 → normalized graph distance of 1.0.
-                    let co_count = sr.payload.metadata
+                    // when absent/0, fall back to declared graph edges
+                    // (governs/relates_to/contained_by array lengths) plus
+                    // access_count so d_graph reflects real connectivity.
+                    let co_from_meta = sr.payload.metadata
                         .get("co_occurrence_count")
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
+                    let co_count = if co_from_meta > 0 {
+                        co_from_meta
+                    } else {
+                        let declared_edges: usize =
+                            ["governs", "relates_to", "contained_by"]
+                                .iter()
+                                .filter_map(|k| {
+                                    sr.payload.metadata
+                                        .get(*k)
+                                        .and_then(|v| v.as_array())
+                                        .map(|a| a.len())
+                                })
+                                .sum();
+                        let access = sr.payload.metadata
+                            .get("access_count")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        (declared_edges as i64 + access).max(0)
+                    };
                     let d_graph = crate::graph_read::hybrid::normalize_graph(co_count as u64);
                     // d_sym: compute symbol match grade from query and candidate symbols
                     let mut candidate_symbols: Vec<String> = Vec::new();

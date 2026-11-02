@@ -54,9 +54,7 @@ function App() {
 
       setGraphData(data);
       invoke('log_message', { msg: `Loaded graph: ${data.nodes.length} nodes, ${data.links.length} links` });
-      invoke('log_message', { msg: `Sample node: ${JSON.stringify(data.nodes[0])}` });
-      invoke('log_message', { msg: `Sample link: ${JSON.stringify(data.links[0])}` });
-      
+
       const uniqueNamespaces = Array.from(new Set(data.nodes.map(n => n.namespace).filter(Boolean))) as string[];
       setNamespaceFilters(prev => {
         const next: Record<string, boolean> = {};
@@ -158,7 +156,6 @@ function App() {
       nodeIds.has(typeof l.target === 'object' ? (l.target as { id: string }).id : (l.target as string))
     );
     
-    invoke('log_message', { msg: `Filtered data has ${nodes.length} nodes and ${links.length} links` });
     return { nodes, links };
   }, [graphData, typeFilters, namespaceFilters]);
 

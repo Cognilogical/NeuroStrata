@@ -1,5 +1,5 @@
 use uuid::Uuid;
-use crate::synaptic_mesh::record::{Relationship, Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
+use crate::synaptic_mesh::record::{Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
@@ -1010,7 +1010,9 @@ pub async fn process_mcp_request(
                             result_text = handle_rebuild_lexical_index(arguments, store.clone()).await;
                         }
                         "neurostrata_rebuild_communities" => {
-                            result_text = handle_rebuild_communities(arguments, store.clone()).await;
+                            result_text =
+                                handle_rebuild_communities(arguments, emb.clone(), store.clone())
+                                    .await;
                         }
                         "neurostrata_find_duplicate_candidates" => {
                             result_text = handle_find_duplicate_candidates(arguments, store.clone()).await;
@@ -1301,13 +1303,36 @@ async fn handle_context_plan(
     let max_bytes = arguments.get("max_bytes").and_then(|v| v.as_u64()).map(|b| b as usize);
     let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("json");
 
+    // Cross-scope authorization before any backend call: a caller may not even
+    // probe another namespace's memories through the plan unless authorized.
+    let target_ns = arguments.get("target_namespace").and_then(|v| v.as_str());
+    if let Some(target_ns) = target_ns {
+        if !crate::context::source::cross_scope_authorized(namespace, target_ns, &[]) {
+            return serde_json::json!({
+                "ok": false,
+                "error": format!("cross-scope access to '{}' is not authorized for namespace '{}'", target_ns, namespace)
+            })
+            .to_string();
+        }
+    }
+    let effective_ns = target_ns.unwrap_or(namespace);
+
+    let mut had_backend_error = false;
     let vector = match embedder.embed(query).await {
         Ok(v) => v,
-        Err(_) => vec![0.0f32; embedder.dimensions()],
+        Err(e) => {
+            had_backend_error = true;
+            tracing::warn!("context_plan backend error: {e}");
+            vec![0.0f32; embedder.dimensions()]
+        }
     };
-    let results = match store.search(namespace, vector, max_items.max(1), false, false).await {
+    let results = match store.search(effective_ns, vector, max_items.max(1), false, false).await {
         Ok(r) => r,
-        Err(_) => Vec::new(),
+        Err(e) => {
+            had_backend_error = true;
+            tracing::warn!("context_plan backend error: {e}");
+            Vec::new()
+        }
     };
     let mut items: Vec<ContextItem> = Vec::new();
     let exclude_stale = arguments
@@ -1361,7 +1386,7 @@ async fn handle_context_plan(
             for fp in &requested_files {
                 match ls
                     .memories_for_file(
-                        namespace,
+                        effective_ns,
                         None,
                         fp,
                         None,
@@ -1388,7 +1413,11 @@ async fn handle_context_plan(
                             });
                         }
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        had_backend_error = true;
+                        tracing::warn!("context_plan backend error: {e}");
+                        continue;
+                    }
                 }
             }
         }
@@ -1429,20 +1458,16 @@ async fn handle_context_plan(
     if let Err(reason) = req.policy.enforce() {
         return serde_json::json!({"ok": false, "error": reason}).to_string();
     }
-    if let Some(target_ns) = arguments.get("target_namespace").and_then(|v| v.as_str()) {
-        if !crate::context::source::cross_scope_authorized(namespace, target_ns, &[]) {
-            return serde_json::json!({
-                "ok": false,
-                "error": format!("cross-scope access to '{}' is not authorized for namespace '{}'", target_ns, namespace)
-            })
-            .to_string();
-        }
-    }
     let plan = service.plan_with_items(&req, items, budget, max_items);
     let mut plan = plan;
     plan.schema_version = CONTEXT_PLAN_SCHEMA_VERSION.to_string();
-    plan.applied_scope = namespace.to_string();
+    plan.applied_scope = effective_ns.to_string();
     plan.event_id = "context-plan".into();
+    // A backend failure anywhere in the pipeline is never honest as
+    // `Degradation::Supported`: the plan served only part of the request.
+    if had_backend_error {
+        plan.degradation = crate::context::model::Degradation::Partial;
+    }
     if format == "text" {
         render_plan_text(&plan)
     } else {
@@ -3775,15 +3800,6 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
             let origin_mesh_epoch = meta.get("origin_mesh_epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let trust = meta.get("trust").and_then(|v| v.as_str()).unwrap_or("untrusted");
 
-            // Convert rels (String,Uuid) to Vec<Relationship>
-            let mut rels_converted: Vec<Relationship> = Vec::new();
-            for (kind, target) in &rels {
-                if let Ok(target_uuid) = Uuid::parse_str(target) {
-                    let kind_str = if kind == "supersedes" { "supersedes" } else if kind == "references" { "references" } else { "references" };
-                    rels_converted.push(Relationship { kind: kind_str.to_string(), target: target_uuid });
-                }
-            }
-
             let proc_meta = meta.get("procedure_definition").and_then(|v| v.as_object()).cloned().unwrap_or_default();
             let trigger = proc_meta.get("trigger").and_then(|v| v.as_str());
             let initial_fires = proc_meta.get("remaining_fires_initial").and_then(|v| v.as_i64());
@@ -3821,13 +3837,27 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                     }
                     obj
                 }
-                "local" => serde_json::json!({
-                    "ok":true,
-                    "namespace":namespace_str,
-                    "memory_id":id_str,
-                    "payload":payload,
-                    "canonical_hash":digest_str,
-                }),
+                "local" => {
+                    // Honor `format == "trig"` here too: the mesh profile
+                    // regroups its canonical quads into TriG, so the local
+                    // profile re-renders the payload the same way instead of
+                    // silently ignoring the requested format.
+                    let rendered: serde_json::Value = if format == "trig" {
+                        let payload_str =
+                            serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+                        serde_json::Value::String(nquads_to_trig(&payload_str, &namespace_str))
+                    } else {
+                        serde_json::to_value(&payload).unwrap_or_default()
+                    };
+                    serde_json::json!({
+                        "ok":true,
+                        "namespace":namespace_str,
+                        "memory_id":id_str,
+                        "payload":rendered,
+                        "format":format,
+                        "canonical_hash":digest_str,
+                    })
+                }
                 other => serde_json::json!({"ok":false,"error":format!("unsupported profile: {other}")}),
             };
             exports.push(result_obj);
@@ -3982,11 +4012,36 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
             let meta = payload.metadata.as_object().cloned().unwrap_or_default();
             let memory_type = payload.memory_type.as_str();
             let lifecycle_state = meta.get("lifecycle_state").and_then(|v| v.as_str()).unwrap_or("active");
-            let lifecycle_state_enum: LifecycleState = lifecycle_state.parse().unwrap_or(LifecycleState::Active);
+            // Fail closed: an unparseable lifecycle_state is a finding, not a
+            // silent coercion to Active.
+            let lifecycle_state_enum: LifecycleState = match lifecycle_state.parse::<LifecycleState>() {
+                Ok(s) => s,
+                Err(_) => {
+                    return serde_json::json!({
+                        "ok":false,
+                        "valid":false,
+                        "violations":[format!("invalid lifecycle_state: {lifecycle_state}")]
+                    })
+                    .to_string()
+                }
+            };
             // created_at is required for deterministic canonical RDF (fail closed).
             let created_at = match meta.get("created_at").and_then(|v| v.as_str()) {
                 Some(t) => t.to_string(),
-                None => return serde_json::json!({"ok":false,"error":"created_at missing from memory metadata"}).to_string(),
+                None => return serde_json::json!({"ok":false,"valid":false,"violations":["created_at missing from memory metadata"]}).to_string(),
+            };
+            // Fail closed: a non-RFC3339 created_at breaks deterministic
+            // canonical ordering, so it is reported before any record is built.
+            let created_dt = match chrono::DateTime::parse_from_rfc3339(&created_at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(e) => {
+                    return serde_json::json!({
+                        "ok":false,
+                        "valid":false,
+                        "violations":[format!("invalid created_at (not RFC3339): {e}")]
+                    })
+                    .to_string()
+                }
             };
             let created_by = &payload.user_id;
             let superseded_by = meta.get("superseded_by").and_then(|v| v.as_str());
@@ -4049,7 +4104,7 @@ use crate::synaptic_mesh::record::{MeshRecord, Relationship};
             let tombstoned_dt = tombstoned_at.and_then(|t_str| chrono::DateTime::parse_from_rfc3339(t_str).ok().map(|dt| dt.with_timezone(&chrono::Utc)));
             let lifecycle = Lifecycle {
                 state: lifecycle_state_enum,
-                created_at: chrono::DateTime::parse_from_rfc3339(&created_at).ok().map(|d| d.with_timezone(&chrono::Utc)).unwrap_or_else(|| chrono::Utc::now()),
+                created_at: created_dt,
                 created_by: created_by_str,
                 superseded_by: superseded_uuid,
                 archived_at: archived_dt,
@@ -4100,8 +4155,10 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
     };
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => "NeuroStrata".to_string(),
+        Some(n) if !n.is_empty() => n.to_string(),
+        // No explicit namespace: resolve the project-root ("NeuroStrata")
+        // default the same way every other handler does.
+        _ => resolve_namespace(&store, "NeuroStrata").await,
     };
 
     let include_retired = arguments.get("include_retired").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -5648,7 +5705,7 @@ async fn handle_rebuild_lexical_index(
         }
         return match store.rebuild_lexical_index(namespace.as_deref()).await {
             Ok(documents) => format!(
-                "Rebuilt the Tantivy lexical index ({}): {} document(s) indexed{}.",
+                "Rebuilt the in-house lexical index ({}): {} document(s) indexed{}.",
                 crate::lexical::INDEX_VERSION,
                 documents,
                 namespace
@@ -5678,6 +5735,7 @@ async fn handle_rebuild_lexical_index(
 
 async fn handle_rebuild_communities(
     arguments: Value,
+    embedder: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
 ) -> String {
     use crate::community::{detect_communities_with_resolution, filter_structural, COMMUNITY_STRUCTURAL_TYPES};
@@ -5699,16 +5757,13 @@ async fn handle_rebuild_communities(
         .and_then(|v| v.as_f64())
         .unwrap_or(1.0);
 
-    // List existing community_summary rows to delete them.
+    // List existing community_summary rows; they are deleted only after
+    // detection succeeds, so a failed detection run never wipes the old
+    // summaries. They are also excluded from the graph below.
     let existing_communities = match store.list(namespace, None, Some("community_summary")).await {
         Ok(rows) => rows,
         Err(e) => return format!("Failed to list existing communities: {e}"),
     };
-    for row in &existing_communities {
-        if let Err(e) = store.delete(namespace, &row.id).await {
-            return format!("Failed to delete community summary {}: {e}", row.id);
-        }
-    }
 
     // List all memories in the namespace to build the graph.
     let all_memories = match store.list(namespace, None, None).await {
@@ -5724,6 +5779,12 @@ async fn handle_rebuild_communities(
     let mut edges: Vec<(String, String, f64)> = Vec::new();
 
     for r in &all_memories {
+        // Existing community summaries are not nodes of the memory graph:
+        // they are about to be replaced, and their CONTAINS edges would
+        // pollute the Leiden partition.
+        if r.payload.memory_type == "community_summary" {
+            continue;
+        }
         let metadata = &r.payload.metadata;
         // Exclude retired
         if let Some(v) = metadata.get("valid_to") {
@@ -5775,6 +5836,14 @@ async fn handle_rebuild_communities(
     };
     let modularity = detection.quality;
 
+    // Detection succeeded, so the old summaries can go now: delete after
+    // detect, before persist, or a partial failure leaves both generations.
+    for row in &existing_communities {
+        if let Err(e) = store.delete(namespace, &row.id).await {
+            return format!("Failed to delete community summary {}: {e}", row.id);
+        }
+    }
+
     // Filter communities by min_community_size (using non-structural members only)
     let mut filtered_communities: Vec<_> = detection
         .communities
@@ -5808,8 +5877,8 @@ async fn handle_rebuild_communities(
             .flatten()
             .map(|(v, _)| v.len())
             .filter(|&len| len > 0)
-            .unwrap_or(384),
-        None => 384,
+            .unwrap_or_else(|| embedder.dimensions().max(1)),
+        None => embedder.dimensions().max(1),
     };
 
     // Assign deterministic community IDs and persist summary rows.
@@ -6999,8 +7068,34 @@ async fn handle_guard_validate(
     );
     if mutating {
         // Determine whether this namespace is task-enabled.
-        if let Ok(memories) = store.list(&namespace, None, None).await {
-            let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
+        let memories = match store.list(&namespace, None, None).await {
+            Ok(memories) => memories,
+            Err(e) => {
+                // Fail closed: a store read error must never silently
+                // bypass Zero-Action Start for a mutating action.
+                let trace_id = format!(
+                    "guard-validate-{}-{}",
+                    std::process::id(),
+                    chrono::Utc::now().timestamp_millis()
+                );
+                let body = serde_json::json!({
+                    "trace_id": trace_id,
+                    "verdict": {
+                        "bucket": "DeterministicReject",
+                        "reasons": [format!("Zero-Action Start check failed: store error: {e}")],
+                        "constraints": []
+                    },
+                    "rule_ids_triggered": []
+                });
+                return format!(
+                    "namespace: {}\ntrace_id: {}\n{}",
+                    namespace,
+                    trace_id,
+                    serde_json::to_string_pretty(&body).unwrap_or_default()
+                );
+            }
+        };
+        let has_any_task = memories.iter().any(|m| crate::task::gate::is_task(m));
             if has_any_task {
                 let has_in_progress = memories
                     .iter()
@@ -7090,7 +7185,6 @@ async fn handle_guard_validate(
                     );
                 }
             }
-        }
     }
 
     let trace_id = format!(

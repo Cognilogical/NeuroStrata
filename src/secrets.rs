@@ -28,6 +28,7 @@ pub(crate) struct SecretScanner {
     provider_re: Regex,
     kv_re: Regex,
     jwt_re: Regex,
+    he_re: Regex,
 }
 
 /// Provider token prefixes and their expected shape (alphabet + min length
@@ -166,22 +167,35 @@ impl SecretScanner {
         // JWT: three base64url segments separated by dots.
         let jwt_re = Regex::new(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")?;
 
+        // High-entropy assignment check: secret-like keys (secret, password,
+        // passwd, api_key, apikey, access_key, client_secret, private_key)
+        // followed by '=' or ':' and a long opaque value (no whitespace, no
+        // path separators). Entropy/class-length validation happens in Rust.
+        let he_re = Regex::new(
+            r#"(?i)(?:secret|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|private[_-]?key)["']?\s*[=:]\s*["']?([^"'\s\\/]{24,})"#,
+        )?;
+
         Ok(Self {
             provider_re,
             kv_re,
             jwt_re,
+            he_re,
         })
     }
 
-    fn instance() -> Option<&'static SecretScanner> {
-        static SCANNER: OnceLock<Option<SecretScanner>> = OnceLock::new();
-        SCANNER.get_or_init(|| SecretScanner::build().ok()).as_ref()
+    fn instance() -> &'static SecretScanner {
+        static SCANNER: OnceLock<SecretScanner> = OnceLock::new();
+        // Fail closed: if a built-in regex fails to compile this must panic at
+        // first use, never silently disable the scanner.
+        SCANNER.get_or_init(|| {
+            SecretScanner::build().expect("built-in secret scanner regexes must compile")
+        })
     }
 
     /// Scan a string for secrets. Returns `None` if clean or the scanner is
     /// disabled, `Some(Rejection)` with category + location on detection.
     pub fn scan_str(text: &str, location: &str) -> Option<Rejection> {
-        let scanner = Self::instance()?;
+        let scanner = Self::instance();
         if text.len() > MAX_SCAN_BYTES {
             return Some(Rejection {
                 location: location.to_string(),
@@ -194,7 +208,7 @@ impl SecretScanner {
     /// Scan a JSON value recursively (metadata leaves), returning the first
     /// rejection found.
     pub fn scan_value(value: &Value, location: &str) -> Option<Rejection> {
-        let scanner = Self::instance()?;
+        let scanner = Self::instance();
         scanner.scan_value_inner(value, location, 0)
     }
 
@@ -238,6 +252,24 @@ impl SecretScanner {
             }
         }
 
+        // --- High-entropy assignment-style secrets ---
+        // Runs BEFORE the key=value phase so genuinely high-entropy opaque
+        // values next to secret-like keys get the precise
+        // `high_entropy_secret` detector; shorter/low-entropy values still
+        // fall through to the weak-password check below.
+        for cap in self.he_re.captures_iter(text) {
+            let token = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if is_placeholder(&token.to_ascii_lowercase()) {
+                continue;
+            }
+            if meets_high_entropy(token) {
+                return Some(Rejection {
+                    location: location.to_string(),
+                    category: "high_entropy_secret",
+                });
+            }
+        }
+
         // --- Key=value extraction ---
         for cap in self.kv_re.captures_iter(text) {
             let value = cap.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -271,7 +303,12 @@ impl SecretScanner {
 
     fn scan_value_inner(&self, value: &Value, location: &str, depth: usize) -> Option<Rejection> {
         if depth > MAX_DEPTH {
-            return None;
+            // Fail closed: a deep structure we cannot fully scan is rejected,
+            // not silently passed.
+            return Some(Rejection {
+                location: location.to_string(),
+                category: "max_depth_exceeded",
+            });
         }
         match value {
             Value::String(s) => self.scan_inner(s, location, depth),
@@ -374,6 +411,50 @@ impl SecretScanner {
         }
         None
     }
+}
+
+/// Whether a candidate value token looks like a real high-entropy secret:
+/// length >= 24 chars, mixed character classes (digits combined with
+/// uppercase/lowercase letters), and Shannon entropy >= 4.2 bits/char.
+fn meets_high_entropy(token: &str) -> bool {
+    if token.chars().count() < 24 {
+        return false;
+    }
+    let mut has_digit = false;
+    let mut has_letter = false;
+    for c in token.chars() {
+        if c.is_ascii_digit() {
+            has_digit = true;
+        } else if c.is_uppercase() || c.is_lowercase() {
+            has_letter = true;
+        }
+    }
+    if !(has_digit && has_letter) {
+        return false;
+    }
+    shannon_entropy_bits_per_char(token).map_or(false, |h| h >= 4.2)
+}
+
+/// Shannon entropy of `s` in bits per character.
+fn shannon_entropy_bits_per_char(s: &str) -> Option<f64> {
+    let len = s.chars().count();
+    if len == 0 {
+        return None;
+    }
+    let mut counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
+    for c in s.chars() {
+        *counts.entry(c).or_insert(0) += 1;
+    }
+    let len = len as f64;
+    Some(
+        counts
+            .values()
+            .map(|c| {
+                let p = *c as f64 / len;
+                -p * p.log2()
+            })
+            .sum(),
+    )
 }
 
 /// Whether the (lowercased) text matches known placeholder/documentation
@@ -728,6 +809,42 @@ mod tests {
         assert!(SecretScanner::scan_str(text, "content").is_none());
     }
 
+    // ── High-entropy assignment-style secrets ───────────────────────────
+
+    #[test]
+    fn high_entropy_assignment_detected() {
+        // 30 unique mixed-class chars: ~4.9 bits/char.
+        let token = "aB3xZ9kQ7wE2rT8uI1oP6pM4nC5vJ0";
+        let text = format!("api_key = {}", token);
+        let r = SecretScanner::scan_str(&text, "content").unwrap();
+        assert_eq!(r.category, "high_entropy_secret");
+    }
+
+    #[test]
+    fn high_entropy_low_entropy_value_falls_back_to_password() {
+        // >=24 chars but (almost) all the same character → entropy below 4.2.
+        let r = SecretScanner::scan_str("api_key = aaaaaaaaaaaaaaaaaaaaaaaaaab1", "content")
+            .unwrap();
+        assert_eq!(r.category, "password");
+    }
+
+    #[test]
+    fn short_value_not_high_entropy_detected() {
+        // 20 chars, below the 24-char threshold.
+        assert!(SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content").is_none()
+            || SecretScanner::scan_str("api_key = aB3xZ9kQ7wE2rT8uI1oP", "content")
+                .map(|r| r.category == "password")
+                .unwrap_or(false));
+    }
+
+    #[test]
+    fn quoted_high_entropy_value_detected() {
+        let token = "aB3xZ9kQ7wE2rT8uI1oP6pM4nC5vJ0";
+        let text = format!(r#"{{"client_secret": "{}"}}"#, token);
+        let r = SecretScanner::scan_str(&text, "content").unwrap();
+        assert_eq!(r.category, "high_entropy_secret");
+    }
+
     // ── Metadata scanning ───────────────────────────────────────────────
 
     #[test]
@@ -749,6 +866,16 @@ mod tests {
         });
         let r = SecretScanner::scan_value(&meta, "metadata").unwrap();
         assert_eq!(r.category, "password");
+    }
+
+    #[test]
+    fn overly_deep_metadata_rejected() {
+        let mut v = json!({ "leaf": "fine" });
+        for _ in 0..12 {
+            v = json!({ "nested": v });
+        }
+        let r = SecretScanner::scan_value(&v, "metadata");
+        assert_eq!(r.map(|r| r.category), Some("max_depth_exceeded"));
     }
 
     // ── Scan entry point integration ────────────────────────────────────

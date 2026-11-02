@@ -237,7 +237,12 @@ mod tests {
         // anything else is stale.
         assert!(!verify_task_receipt_retention(&store, "s", "t", "e"));
 
-        // An empty binding ("none", "clean") matches an unreadable worktree.
+        let (expected_sha, expected_dirty) =
+            crate::task::receipt::compute_worktree_state(std::path::Path::new(
+                "/tmp/opencode/definitely-not-a-worktree",
+            ));
+        // An empty binding matching the computed unreadable-worktree state
+        // verifies as current.
         store.record(crate::receipts::store::Receipt {
             session_id: "s".into(),
             task_id: "t".into(),
@@ -245,8 +250,8 @@ mod tests {
             outcome: "completed".into(),
             exposed_ids: vec![],
             worktree: "/tmp/opencode/definitely-not-a-worktree".into(),
-            head_sha: "none".into(),
-            dirty_tree_hash: "clean".into(),
+            head_sha: expected_sha,
+            dirty_tree_hash: expected_dirty,
         });
         assert!(verify_task_receipt_retention(&store, "s", "t", "e2"));
     }

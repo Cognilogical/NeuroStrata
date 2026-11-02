@@ -197,24 +197,29 @@ pub struct ResolveCandidateResult {
 
 
 /// Generate a deterministic ID for a receipt.
+/// Uses SHA-256 (not `DefaultHasher`, which is toolchain-unstable) so the
+/// persisted MERGE keys survive Rust version changes.
 pub fn generate_receipt_id(namespace: &str, source_digest: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    namespace.hash(&mut hasher);
-    source_digest.hash(&mut hasher);
-    format!("rcpt-{:x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(source_digest.as_bytes());
+    let digest = hasher.finalize();
+    format!("rcpt-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
 }
 
-/// Generate a deterministic ID for a candidate.
+/// Generate a deterministic ID for a candidate (SHA-256, toolchain-stable).
 fn generate_candidate_id(namespace: &str, receipt_id: &str, index: usize) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    namespace.hash(&mut hasher);
-    receipt_id.hash(&mut hasher);
-    index.hash(&mut hasher);
-    format!("cand-{:x}", hasher.finish())
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(receipt_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(index.to_le_bytes());
+    let digest = hasher.finalize();
+    format!("cand-{:016x}", u64::from_be_bytes(digest[..8].try_into().unwrap()))
 }
 
 /// Extract title from text using heuristics.
@@ -287,9 +292,9 @@ pub fn create_candidates_from_intents(
             cas_version: 1,
             created_at: now.clone(),
             updated_at: now,
-            candidate_kind: "task".to_string(),
-            payload: serde_json::Value::Null,
-            confidence: None,
+            candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+            payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
+            confidence: request.confidence,
             source_span: None,
             extractor_fingerprint: None,
         });
@@ -310,9 +315,9 @@ pub fn create_candidates_from_intents(
                 cas_version: 1,
                 created_at: now.clone(),
                 updated_at: now,
-                candidate_kind: "task".to_string(),
-                payload: serde_json::Value::Null,
-                confidence: None,
+                candidate_kind: request.candidate_kind.clone().unwrap_or_else(|| "task".to_string()),
+                payload: request.payload.clone().unwrap_or(serde_json::Value::Null),
+                confidence: request.confidence,
                 source_span: None,
                 extractor_fingerprint: None,
             });
@@ -660,7 +665,13 @@ pub async fn handle_intake(
             });
             serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
         }
-        Err(e) => e,
+        Err(e) => {
+            if e.starts_with("ERROR:") {
+                e
+            } else {
+                format!("ERROR: {e}")
+            }
+        }
     }
 }
 
@@ -705,28 +716,40 @@ pub async fn handle_intake_list(
                     });
                     serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
-                Err(e) => e,
+                Err(e) => {
+                    if e.starts_with("ERROR:") {
+                        e
+                    } else {
+                        format!("ERROR: {e}")
+                    }
+                }
             }
         }
         "candidates" => {
             let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
             let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
 
-            let review_state = args.get("review_state").and_then(|v| v.as_str()).and_then(|s| match s {
-                "pending" => Some(ReviewState::Pending),
-                "in_review" => Some(ReviewState::InReview),
-                "accepted" => Some(ReviewState::Accepted),
-                "dismissed" => Some(ReviewState::Dismissed),
+            let review_state = match args.get("review_state").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => match s {
+                    "pending" => Some(ReviewState::Pending),
+                    "in_review" => Some(ReviewState::InReview),
+                    "accepted" => Some(ReviewState::Accepted),
+                    "dismissed" => Some(ReviewState::Dismissed),
+                    _ => return format!("ERROR: Invalid review_state '{}'", s),
+                },
                 _ => None,
-            });
+            };
 
-            let disposition = args.get("disposition").and_then(|v| v.as_str()).and_then(|s| match s {
-                "pending" => Some(Disposition::Pending),
-                "created" => Some(Disposition::Created),
-                "linked" => Some(Disposition::Linked),
-                "dismissed" => Some(Disposition::Dismissed),
+            let disposition = match args.get("disposition").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => match s {
+                    "pending" => Some(Disposition::Pending),
+                    "created" => Some(Disposition::Created),
+                    "linked" => Some(Disposition::Linked),
+                    "dismissed" => Some(Disposition::Dismissed),
+                    _ => return format!("ERROR: Invalid disposition '{}'", s),
+                },
                 _ => None,
-            });
+            };
 
             let request = ListCandidatesRequest {
                 namespace: namespace.clone(),
@@ -748,7 +771,13 @@ pub async fn handle_intake_list(
                     });
                     serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
                 }
-                Err(e) => e,
+                Err(e) => {
+                    if e.starts_with("ERROR:") {
+                        e
+                    } else {
+                        format!("ERROR: {e}")
+                    }
+                }
             }
         }
         _ => "ERROR: 'mode' must be 'receipts' or 'candidates'.".to_string(),
@@ -812,6 +841,12 @@ pub async fn handle_intake_resolve(
             });
             serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
         }
-        Err(e) => e,
+        Err(e) => {
+            if e.starts_with("ERROR:") {
+                e
+            } else {
+                format!("ERROR: {e}")
+            }
+        }
     }
 }
