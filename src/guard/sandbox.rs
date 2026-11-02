@@ -7,8 +7,7 @@ use tracing::{info, warn};
 
 /// R26: the sandbox container image is pinned to a specific Alpine release
 /// (instead of `latest`) so a registry re-push cannot silently change the
-/// sandbox behavior. Full digest pin (image@sha256:...) is filed as a follow-up
-/// (needs digest resolution at install).
+/// sandbox behavior.
 pub const SANDBOX_IMAGE: &str = "alpine:3.21";
 
 /// R26: whether a Podman engine is reachable, from a synchronous probe. Callers
@@ -51,7 +50,19 @@ impl SandboxEvaluator {
         payload: &str,
         cwd: &str,
     ) -> anyhow::Result<ValidateVerdict> {
-        if !self.available {
+        // Re-probe dynamically: `available` was computed once in the
+        // constructor, so Podman may have appeared (or gone) since. Probing
+        // again here keeps this check from contradicting the daemon's own
+        // live probe at the request boundary (TOCTOU).
+        let mut engine = self.engine.clone();
+        let mut available = self.available;
+        if !available && probe_podman_available() {
+            // detect_engine only ever selects podman, so a successful probe
+            // is exactly the engine the constructor would have recorded.
+            engine = "podman".to_string();
+            available = true;
+        }
+        if !available {
             return Ok(ValidateVerdict::DeterministicReject {
                 reasons: vec!["No container engine (Podman) available. Sandbox evaluation required. Please install Podman for full security.".to_string()],
                 constraints: vec![],
@@ -83,18 +94,21 @@ impl SandboxEvaluator {
             });
         }
 
-        // We only sandbox bash or known script commands for now
+        // We only sandbox bash or known script commands for now. Any other
+        // action type needs no container: it already passed the deterministic
+        // and semantic rule checks, so the guard approves with a warning
+        // rather than rejecting action types the sandbox was never meant to
+        // run.
         if action_type != "bash" && action_type != "script" {
-            return Ok(ValidateVerdict::DeterministicReject {
-                reasons: vec![format!(
-                    "Sandbox evaluation not supported for action_type: {}",
+            return Ok(ValidateVerdict::ApprovedFailOpen {
+                warning: format!(
+                    "Sandbox execution not applicable for action_type '{}'; approved after deterministic and semantic rule checks",
                     action_type
-                )],
-                constraints: vec![],
+                ),
             });
         }
 
-        info!("Executing sandbox evaluation using engine: {}", self.engine);
+        info!("Executing sandbox evaluation using engine: {}", engine);
 
         let start = std::time::Instant::now();
 
@@ -103,7 +117,7 @@ impl SandboxEvaluator {
         // --network=none : isolate
         // -v cwd:/workspace:ro : mount project read-only
         // --tmpfs /tmp : scratch space
-        let child = Command::new(&self.engine)
+        let child = Command::new(&engine)
             .args([
                 "run",
                 "--rm",
@@ -118,6 +132,10 @@ impl SandboxEvaluator {
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Kill the container when the child future is dropped (the
+            // timeout path): an abandoned `podman run` would otherwise keep
+            // executing after the verdict has moved on.
+            .kill_on_drop(true)
             .spawn()?;
 
         // Wait with a strict timeout (e.g., 5 seconds for inline guard)

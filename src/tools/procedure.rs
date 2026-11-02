@@ -32,6 +32,9 @@ use std::sync::Arc;
 const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// Seconds in a day, for the `every-n-days:N` cadence.
 const DAY_SECONDS: i64 = 86_400;
+/// Estimated wall-clock length of one session, for the
+/// `every-n-sessions:N` cadence (a session carries no timestamp of its own).
+const SESSION_ESTIMATE_SECONDS: i64 = 3600;
 
 /// Composite Rec #20: process-wide per-procedure firing locks, keyed by
 /// `{namespace}::{id}`. Two concurrent perform calls on the same row would
@@ -67,10 +70,26 @@ pub(crate) fn is_lapsed(metadata: &Value, now: i64) -> bool {
     }
 }
 
-/// The iteration budget. `None` is unbounded — and so is a value that is not
-/// an integer, because an unreadable budget must not refuse every firing.
+/// The iteration budget. `None` is unbounded — and so is a value that cannot
+/// be parsed as an integer, because an unreadable budget must not refuse
+/// every firing. A JSON string holding an integer (`"3"`) counts: metadata
+/// round-trips through textual surfaces, so string-encoded integers are
+/// honored rather than silently read as unbounded.
 fn remaining_fires(metadata: &Value) -> Option<i64> {
-    metadata.get("remaining_fires").and_then(|v| v.as_i64())
+    let v = metadata.get("remaining_fires")?;
+    if v.is_null() {
+        return None;
+    }
+    match v
+        .as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+    {
+        Some(n) => Some(n),
+        None => {
+            tracing::warn!("procedure has malformed remaining_fires metadata: {}", v);
+            None
+        }
+    }
 }
 
 /// Lifetime rehearsal count.
@@ -143,19 +162,40 @@ pub(crate) fn stamp_local_trust(metadata: &mut Value) {
 /// When this procedure is next owed.
 ///
 /// v1 only gives the day-cadence trigger a real answer: everything else fires
-/// on the snapshot it rides on, so it is owed at `now`. A `every-n-days:N`
-/// procedure that has never been performed is owed at `now` too — otherwise a
-/// brand-new procedure would sit silent until its first rehearsal.
+/// on the snapshot it rides on, so it is owed at `now`. A `every-n-days:N` or
+/// `every-n-sessions:N` procedure that has never been performed is owed at
+/// `now` too — otherwise a brand-new procedure would sit silent until its
+/// first rehearsal.
+///
+/// `every-n-sessions:N` (Fired on snapshots just like `every-n-days:N`, but
+/// measured in sessions rather than days): a session has no wall-clock
+/// length, so one session is estimated as [`SESSION_ESTIMATE_SECONDS`] of
+/// elapsed time between rehearsals. When the row carries a
+/// `sessions_since_last_fire` counter it is authoritative instead of the
+/// estimate.
 fn next_due(metadata: &Value, now: i64) -> i64 {
-    let cadence = metadata
+    let trigger_str = metadata
         .get("trigger")
-        .and_then(|t| t.as_str())
+        .and_then(|t| t.as_str());
+    let day_cadence = trigger_str
         .and_then(|t| t.strip_prefix("every-n-days:"))
         .and_then(|n| n.parse::<i64>().ok());
-    match (cadence, last_performed_at(metadata)) {
-        (Some(days), Some(last)) => last + days * DAY_SECONDS,
-        _ => now,
+    if let (Some(days), Some(last)) = (day_cadence, last_performed_at(metadata)) {
+        return last + days * DAY_SECONDS;
     }
+    let session_cadence = trigger_str
+        .and_then(|t| t.strip_prefix("every-n-sessions:"))
+        .and_then(|n| n.parse::<i64>().ok());
+    if let (Some(n_sessions), Some(last)) = (session_cadence, last_performed_at(metadata)) {
+        if n_sessions > 1 {
+            let sessions_elapsed = metadata
+                .get("sessions_since_last_fire")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(n_sessions - 1);
+            return last + sessions_elapsed * SESSION_ESTIMATE_SECONDS;
+        }
+    }
+    now
 }
 
 // ── strap: procedures_due ───────────────────────────────────────────────────
@@ -402,7 +442,11 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
     // have already spent a fire between location and lock.
     let (vector, mut payload) = match store.get(&namespace, &id).await {
         Ok(Some(row)) => row,
-        _ => return reply(false, false, false, None, 0, None, "not found"),
+        Ok(None) => return reply(false, false, false, None, 0, None, "not found"),
+        Err(e) => {
+            let reason = format!("store error: {e}");
+            return reply(false, false, false, None, 0, None, &reason);
+        }
     };
 
     if payload.memory_type != "procedure" {

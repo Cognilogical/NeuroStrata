@@ -638,7 +638,9 @@ pub async fn cache_project_root(
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("project_root".to_string(), serde_json::Value::String(project_root.to_string()));
     }
-    let _ = store.upsert(namespace, &registry_id, vector, payload).await;
+    if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
+        tracing::warn!("registry upsert failed for '{namespace}:{registry_id}': {e}");
+    }
 }
 
 #[cfg(test)]

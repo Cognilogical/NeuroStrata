@@ -684,6 +684,10 @@ pub fn recover_report(project_root: &Path) -> String {
 }
 
 impl StorageApi for MeshService {
+    /// One mesh per project (tools.rs init contract): a project that
+    /// already carries a pointer refuses a second `init_mesh` — the first
+    /// mesh wins and its pointer is preserved. `leave` is the explicit way
+    /// to create a different one.
     fn init_mesh(
         &mut self,
         base_root: &Path,
@@ -692,7 +696,29 @@ impl StorageApi for MeshService {
         namespaces: &[String],
         remote: Option<&str>,
     ) -> Result<String, String> {
-        let storage = MeshStorage::init(base_root, node_id, mesh_name, namespaces, remote)
+        if let Ok(Some(existing)) = StorageApi::read_pointer(self, &self.project_root) {
+            let (mesh_id, mesh_dir, _) = existing;
+            return Err(format!(
+                "project already has a mesh pointer ({mesh_id} at {}); one mesh per project",
+                mesh_dir.display()
+            ));
+        }
+        // Omitted `namespace` = the current project namespace only (tools.rs
+        // init contract): the mesh is opt-in per namespace, and "share
+        // nothing" was never the intent — the first namespace a project owns
+        // is its own.
+        let default_ns: Vec<String> = if namespaces.is_empty() {
+            vec![self
+                .project_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default")
+                .to_string()]
+        } else {
+            namespaces.to_vec()
+        };
+        let storage = MeshStorage::init(base_root, node_id, mesh_name, &default_ns, remote)
             .map_err(|e| format!("{:#}", e))?;
         let mesh_id = storage.manifest().mesh_id.to_string();
         let root = storage.root().to_path_buf();
@@ -858,13 +884,20 @@ pub fn handle_mesh_tool_call_with_base(name: &str, arguments: &Value, base_root:
         "neurostrata_synaptic_mesh_init" => match arguments.get("name").and_then(|v| v.as_str()) {
             Some(mesh_name) => SynapticMeshCommands::Init {
                 name: mesh_name.to_string(),
+                // `namespace` accepts one string or an array of strings;
+                // omitted = the current project namespace (init_mesh's
+                // default), never "share nothing".
                 namespace: arguments
                     .get("namespace")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|s| s.as_str().map(String::from))
-                            .collect()
+                    .and_then(|v| match v {
+                        Value::Array(items) => Some(
+                            items
+                                .iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect::<Vec<String>>(),
+                        ),
+                        Value::String(s) => Some(vec![s.to_string()]),
+                        _ => None,
                     })
                     .unwrap_or_default(),
                 remote: arguments
@@ -922,6 +955,64 @@ mod tests {
         let report = svc.status().expect("status after init");
         assert!(report.contains("platform-team"), "report: {report}");
         assert!(report.contains(&id), "report: {report}");
+    }
+
+    #[test]
+    fn init_mesh_refuses_a_second_pointer_and_preserves_the_first() {
+        let base = scratch("idem-base");
+        let project = scratch("idem-proj");
+        let mut svc = MeshService::new(project.clone());
+        let first = svc
+            .init_mesh(&base, "node-idem", "first-team", &[], None)
+            .expect("first init");
+        let (p_id, p_dir, _) = svc
+            .read_pointer(&project)
+            .expect("pointer readable")
+            .expect("pointer written after first init");
+
+        let second = svc.init_mesh(&base, "node-idem", "second-team", &[], None);
+        let err = second.expect_err("second init MUST refuse — one mesh per project");
+        assert!(
+            err.contains("one mesh per project"),
+            "the refusal carries the contract: {err}"
+        );
+        assert!(
+            err.contains(&first),
+            "the refusal names the first mesh id: {err}"
+        );
+
+        // The refusal overwrote nothing: the first pointer survives verbatim.
+        let (id, dir, _) = svc
+            .read_pointer(&project)
+            .expect("pointer still readable")
+            .expect("pointer preserved");
+        assert_eq!(id, p_id, "first mesh id preserved");
+        assert_eq!(dir, p_dir, "first mesh dir preserved");
+        assert_eq!(id, first);
+    }
+
+    /// The other half of the init contract: omitted `namespace` defaults to
+    /// the current project's own namespace — the mesh is created sharing the
+    /// project's namespace, never nothing.
+    #[test]
+    fn init_mesh_with_no_namespaces_defaults_to_the_project_namespace() {
+        let base = scratch("nsdef-base");
+        let project = scratch("nsdef-proj");
+        let mut svc = MeshService::new(project.clone());
+        svc.init_mesh(&base, "node-nsdef", "nsdef-team", &[], None)
+            .expect("init");
+        let expected_ns = project
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("scratch dir name")
+            .to_string();
+        let storage = svc.joined().expect("mesh joined");
+        assert_eq!(
+            storage.manifest().namespaces,
+            &[expected_ns],
+            "omitted namespace = the current project namespace: {:?}",
+            storage.manifest().namespaces
+        );
     }
 
     #[test]

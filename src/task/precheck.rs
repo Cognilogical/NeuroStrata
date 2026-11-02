@@ -8,10 +8,13 @@ pub async fn normalize_and_precheck_namespace(
     store: &dyn crate::traits::VectorStore,
     namespace: &str,
 ) -> Result<(), String> {
-    let _ = crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
+    crate::events::subscribers::post_ingest_normalize::normalize_namespace_targets(
         store, namespace,
     )
-    .await?;
+    .await
+    .inspect_err(|e| {
+        tracing::warn!("precheck normalize_namespace_targets failed for '{namespace}': {e}");
+    })?;
     let memories = store
         .list(namespace, None, None)
         .await

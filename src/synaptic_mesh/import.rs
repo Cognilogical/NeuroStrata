@@ -381,10 +381,25 @@ pub async fn apply_changed(
     let import_trust = mesh.manifest().policy.imported_procedures_trust;
     let head_signature = head_commit_signature_state(root);
 
+    // The `(namespace, id)` pairs already presented as per-record `.json`
+    // candidates this pass. A record that arrived BOTH as a `.json` file
+    // and inside a `.bundle.zst` is applied exactly once — the `.json`
+    // candidate path is authoritative; the bundle copy is the duplicate.
+    // (`validate_record` enforces id == file stem, so the pair key aligns
+    // with the bundle comparison below.)
+    let json_candidate_ids: std::collections::HashSet<(String, String)> = paths
+        .iter()
+        .filter_map(|rel| classify_path(rel, served).ok().flatten())
+        .map(|c| (c.namespace, c.file_stem))
+        .collect();
+
     // Bundle/RDF-patch artifacts are scanned before the candidate loop so a
     // compressed drain bundle or an rdfpatch sidecar is accounted for on
-    // every replay pass (fail-soft; see `scan_bundles_and_patches`).
-    scan_bundles_and_patches(root);
+    // every replay pass (fail-soft; see `scan_bundles_and_patches`). The
+    // decoded bundle records are RETAINED: a record carried only inside a
+    // `.bundle.zst` is a replay candidate like any other, verified and
+    // applied below.
+    let bundled_records = scan_bundles_and_patches(root);
 
     for rel in paths {
         let candidate = match classify_path(&rel, served) {
@@ -473,6 +488,70 @@ pub async fn apply_changed(
         }
     }
 
+    // Bundle-only records: everything `scan_bundles_and_patches` decoded
+    // whose `(namespace, id)` did NOT arrive as a `.json` candidate this
+    // pass and whose namespace is served. Identical gates as the `.json`
+    // path — signature, then apply — so one decode, one apply, and the
+    // report counts the Disposition like any other candidate.
+    for (bundle_path, record) in bundled_records {
+        let id = record.id.to_string();
+        if !served.iter().any(|s| s == &record.namespace) {
+            continue;
+        }
+        if json_candidate_ids.contains(&(record.namespace.clone(), id.clone())) {
+            continue;
+        }
+        let rel = bundle_path.display().to_string();
+        match verify_record_signature(&record, &mesh.manifest().signers) {
+            SignatureDisposition::Verified => {
+                report.verified_signed += 1;
+            }
+            SignatureDisposition::Unsigned => {
+                report.unsigned_accepted += 1;
+            }
+            SignatureDisposition::Invalid(reason) => {
+                report.signature_rejected += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
+            SignatureDisposition::Unauthorized(reason) => {
+                report.unauthorized_signer += 1;
+                report.ignored.push(format!("{rel}: {reason}"));
+                continue;
+            }
+        }
+        match apply_one(
+            root,
+            &mesh_id,
+            record,
+            store.clone(),
+            emb.clone(),
+            concurrent,
+            import_trust,
+            head_signature,
+        )
+        .await
+        {
+            Disposition::Applied => {
+                report.applied += 1;
+                report.applied_ids.push(id);
+            }
+            Disposition::AppliedCombination(reason) => {
+                report.applied += 1;
+                report.applied_ids.push(id);
+                report.combinations.push(format!("{rel}: {reason}"));
+            }
+            Disposition::Skipped => report.skipped_update_id += 1,
+            Disposition::Ignored(reason) => {
+                report.ignored.push(format!("{rel}: {reason}"));
+            }
+            Disposition::Conflicted(conflict_id) => {
+                report.conflicted += 1;
+                report.conflicted_ids.push(conflict_id);
+            }
+        }
+    }
+
     // Accept HEAD only after the whole batch was walked AND no unresolved
     // conflict paused integration. A crash before this line leaves the old
     // cursor: the next pass replays the same files and the update_id skip
@@ -491,8 +570,35 @@ pub async fn apply_changed(
 /// Read the accepted-head cursor for this checkout, iff it is intact, names
 /// this mesh's schema, and belongs to this mesh.
 pub fn load_cursor(mesh_root: &Path, mesh_id: &str) -> Option<String> {
-    let text = std::fs::read_to_string(cursor_file(mesh_root)).ok()?;
-    let doc: Value = serde_json::from_str(&text).ok()?;
+    let path = cursor_file(mesh_root);
+    if !path.exists() {
+        return None;
+    }
+    // A cursor that exists but cannot be READ or PARSED is corrupt state,
+    // not absence: warn loudly (an operator must see it) and fall through
+    // to the full-tree reconciliation the None caller applies.
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::warn!(
+                "corrupt or unreadable mesh cursor at {}: {} — falling back to full-tree reconciliation",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    let doc: Value = match serde_json::from_str(&text) {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!(
+                "corrupt or unreadable mesh cursor at {}: {} — falling back to full-tree reconciliation",
+                path.display(),
+                e
+            );
+            return None;
+        }
+    };
     if doc["schema_version"].as_str() != Some(IMPORT_CURSOR_SCHEMA_VERSION) {
         return None;
     }
@@ -1977,7 +2083,13 @@ pub fn read_compressed_bundle(bundle_path: &Path) -> Result<Vec<MeshRecord>, Str
 /// `NEUROSTRATA_MESH_RDF_PATCH`). Called once per pulled checkout, before
 /// the replay pass. Fail-soft everywhere: a missing `bundles/` dir, an
 /// unreadable bundle, or an invalid patch is logged, never fatal.
-fn scan_bundles_and_patches(mesh_root: &Path) {
+///
+/// Returns every `MeshRecord` decoded from a `bundles/*.bundle.zst`
+/// artifact, paired with its bundle path so the replay pass can report the
+/// source. The caller deduplicates against the `.json` candidate tree — a
+/// bundle is a replay candidate, not a debug log.
+fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)> {
+    let mut bundled_records: Vec<(PathBuf, MeshRecord)> = Vec::new();
     let bundles_dir = mesh_root.join("bundles");
     if bundles_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
@@ -1992,6 +2104,9 @@ fn scan_bundles_and_patches(mesh_root: &Path) {
                                     path.display(),
                                     records.len()
                                 );
+                                for record in records {
+                                    bundled_records.push((path.clone(), record));
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!("mesh bundle {} undecodable: {e}", path.display());
@@ -2051,6 +2166,8 @@ fn scan_bundles_and_patches(mesh_root: &Path) {
             }
         }
     }
+
+    bundled_records
 }
 
 // --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
@@ -2356,6 +2473,66 @@ mod tests {
     async fn row_count(store: &std::sync::Arc<dyn VectorStore>, ns: &str) -> usize {
         store.init(ns).await.unwrap();
         store.list(ns, None, None).await.unwrap().len()
+    }
+
+    /// Slice T fix: a record that exists ONLY inside a `.bundle.zst`
+    /// artifact is a replay candidate — the bundle decode is no longer
+    /// dropped after a debug log. This record has no `.json` sibling in the
+    /// record tree; the bundle is its only carrier, and it must land in the
+    /// store exactly like a committed `.json` record would.
+    #[tokio::test]
+    async fn bundle_only_record_is_imported_and_applied_into_the_store() {
+        let (_base, mesh) = mesh_with_commit("bundle-only");
+        let id = Uuid::new_v4();
+        let value = simple_rule(id, "shares via bundle only");
+        let record: MeshRecord = serde_json::from_value(value).unwrap();
+        let written = crate::synaptic_mesh::worker::write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "test",
+            &[record],
+        )
+        .expect("bundle writes");
+        assert!(
+            written.to_string_lossy().ends_with("test.bundle.zst"),
+            "bundle artifact shape: {}",
+            written.display()
+        );
+        assert!(
+            !mesh
+                .root()
+                .join("probe")
+                .join("memories")
+                .join(format!("{id}.json"))
+                .exists(),
+            "fixture sanity: the record has NO `.json` sibling"
+        );
+        // The bundle artifact must be committed like any mesh content:
+        // an untracked file would trip the dirty-checkout guard.
+        mesh.commit_all("bundle artifact", "node-peer-1").unwrap();
+        let store = fresh_store("bundle-only").await;
+
+        let report =
+            apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+                .await
+                .expect("full-tree replay applies the bundle record");
+
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            1,
+            "the bundle-only record landed in the store"
+        );
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied from bundle");
+        assert_eq!(payload.content, "shares via bundle only");
     }
 
     // ---- contract tests ----------------------------------------------------

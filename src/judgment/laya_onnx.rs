@@ -210,7 +210,11 @@ impl JudgmentProvider for LayaOnnxProvider {
             anyhow::bail!("Laya ONNX inference session unavailable (model not loaded or invalid)");
         }
         // Bound concurrent inference: one permit per judge_duplicates call.
-        let _permit = self.inference_semaphore.acquire().await.ok();
+        let _permit = self
+            .inference_semaphore
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("Laya inference semaphore closed: {e}"))?;
 
         // Gating comes from the dedup policy: a Gold-calibrated model may gate
         // a bare standalone add only when it is the currently-promoted

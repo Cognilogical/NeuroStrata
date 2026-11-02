@@ -2,9 +2,10 @@
 //!
 //! Design: `docs/design-wiring-panel.md` (K3, 2026-10-08). Constraint in
 //! force: **git-first, never git-only**. Gates are the concept; git hooks are
-//! the default instance. `runs_in` is four values on purpose — the actual
-//! chokepoint of a non-software project (a CMS publish step, a render
-//! submission) is free text in `gate_point`, never an enum.
+//! the default instance. `Wire.runs_in` is the three-value `RunsIn` enum —
+//! a non-software project's actual chokepoint (a CMS publish step, a render
+//! submission) is the generic `ProjectPipeline` variant, never a new enum
+//! value.
 //!
 //! Rule: never hand a project a reminder where a machine will do.
 //!
@@ -47,6 +48,8 @@ pub struct Reminder {
     pub id: &'static str,
     /// Closed enum: mcp-call-failure | memory-added-or-superseded |
     /// memory-corrected | session-start | before-edit | during-work
+    /// (`VALID_FIRES_ON` is the machine-readable form of this list; new
+    /// triggers must join both).
     pub fires_on: &'static str,
     pub text: &'static str,
 }
@@ -185,9 +188,69 @@ pub fn is_automatic_wire(name: &str) -> bool {
     AUTOMATIC_WIRES.iter().any(|w| w.id == name)
 }
 
+/// Whether `name` is a reminder wire id whose trigger is a member of the
+/// closed `fires_on` enum. An ENFORCED rule citing one of these names a
+/// reminder where a machine belongs.
+pub fn is_reminder_wire(name: &str) -> bool {
+    REMINDER_WIRES
+        .iter()
+        .any(|r| r.id == name && is_valid_fires_on(r.fires_on))
+}
+
 /// Whether the automatic wire `name` hard-fails. An ENFORCED rule needs a
 /// machine that blocks: citing an advisory wire (`blocks == false`) as the
 /// sole guard is an enforcement claim no machine carries.
 pub fn is_blocking_automatic_wire(name: &str) -> bool {
     AUTOMATIC_WIRES.iter().any(|w| w.id == name && w.blocks)
+}
+
+/// The closed set of `fires_on` triggers a `Reminder` may name — the
+/// machine-readable form of the closed enum documented on the struct.
+pub const VALID_FIRES_ON: &[&str] = &[
+    "mcp-call-failure",
+    "memory-added-or-superseded",
+    "memory-corrected",
+    "session-start",
+    "before-edit",
+    "during-work",
+];
+
+/// Whether `s` is a legitimate `Reminder.fires_on` trigger.
+pub fn is_valid_fires_on(s: &str) -> bool {
+    VALID_FIRES_ON.contains(&s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every reminder wire must declare a trigger the closed enum knows:
+    /// a reminder that fires on nothing is dead text, and one that fires on
+    /// an unknown trigger is outside the contract.
+    #[test]
+    fn wiring_reminder_wires_declare_a_valid_fires_on_trigger() {
+        for r in REMINDER_WIRES {
+            assert!(
+                is_valid_fires_on(r.fires_on),
+                "reminder wire '{}' declares unknown fires_on '{}'",
+                r.id,
+                r.fires_on
+            );
+        }
+    }
+
+    /// The closed enum is exhaustive over the registry: every trigger
+    /// actually used by a reminder is a member of VALID_FIRES_ON, and the
+    /// known enum values validate.
+    #[test]
+    fn wiring_fires_on_members_and_non_members() {
+        assert!(is_valid_fires_on("mcp-call-failure"));
+        assert!(is_valid_fires_on("memory-added-or-superseded"));
+        assert!(is_valid_fires_on("memory-corrected"));
+        assert!(is_valid_fires_on("session-start"));
+        assert!(is_valid_fires_on("before-edit"));
+        assert!(is_valid_fires_on("during-work"));
+        assert!(!is_valid_fires_on("git-pre-push"));
+        assert!(!is_valid_fires_on(""));
+    }
 }

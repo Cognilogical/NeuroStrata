@@ -218,15 +218,39 @@ impl Stream {
                 PatchOp::Add => "A",
                 PatchOp::Delete => "D",
             };
-            let s = format_iri(&delta.subject).unwrap_or_else(|_| delta.subject.clone());
-            let p = format_iri(&delta.predicate).unwrap_or_else(|_| delta.predicate.clone());
+            let s = match format_iri(&delta.subject) {
+                Ok(formatted) => formatted,
+                Err(e) => {
+                    tracing::warn!("streaming to_patch: malformed subject IRI {:?}: {}", delta.subject, e);
+                    delta.subject.clone()
+                }
+            };
+            let p = match format_iri(&delta.predicate) {
+                Ok(formatted) => formatted,
+                Err(e) => {
+                    tracing::warn!("streaming to_patch: malformed predicate IRI {:?}: {}", delta.predicate, e);
+                    delta.predicate.clone()
+                }
+            };
             let o = if delta.object.starts_with('"') || delta.object.starts_with("_") || delta.object.starts_with('<') {
                 delta.object.clone()
             } else {
-                format_term(&delta.object).unwrap_or_else(|_| delta.object.clone())
+                match format_term(&delta.object) {
+                    Ok(formatted) => formatted,
+                    Err(e) => {
+                        tracing::warn!("streaming to_patch: malformed object term {:?}: {}", delta.object, e);
+                        delta.object.clone()
+                    }
+                }
             };
             if let Some(g) = &delta.graph {
-                let g_term = format_iri(g).unwrap_or_else(|_| g.clone());
+                let g_term = match format_iri(g) {
+                    Ok(formatted) => formatted,
+                    Err(e) => {
+                        tracing::warn!("streaming to_patch: malformed graph IRI {:?}: {}", g, e);
+                        g.clone()
+                    }
+                };
                 lines.push(format!("{} {} {} {} {} .", op_char, s, p, o, g_term));
             } else {
                 lines.push(format!("{} {} {} {} .", op_char, s, p, o));
@@ -499,10 +523,12 @@ impl Stream {
                 }
                 terms.push(term_chars.iter().collect::<String>());
             }
-            if terms.len() < 3 {
+            // A quad is `s p o g .` — fewer than 3 or more than 4 terms is a
+            // malformed line, not silently ignored or loosely accepted junk.
+            if terms.len() < 3 || terms.len() > 4 {
                 return Err(ParseError::MalformedLine {
                     line: line_num,
-                    message: format!("expected at least 3 terms, got {}", terms.len()),
+                    message: format!("expected 3 or 4 terms, got {}", terms.len()),
                 });
             }
             let subject_raw = terms[0].clone();

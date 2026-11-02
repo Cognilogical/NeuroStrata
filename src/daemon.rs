@@ -1547,6 +1547,14 @@ async fn handle_validate(
     State(state): State<AppState>,
     Json(request): Json<crate::guard::ValidateRequest>,
 ) -> Result<Json<crate::guard::ValidateResponse>, (axum::http::StatusCode, String)> {
+    // The caller's identity is genuinely consumed, not just carried: trace it
+    // so every verdict can be tied back to the requesting agent.
+    tracing::debug!(
+        orchestrator_id = %request.orchestrator_id,
+        action_type = %request.action_type,
+        "validating guard action"
+    );
+
     // Use sandbox if podman is available (R26: probe, never assume)
     let use_sandbox = crate::guard::sandbox::probe_podman_available();
 

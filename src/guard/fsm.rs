@@ -22,7 +22,8 @@ pub fn evaluate_fsm_guard(
     if !is_mutating
         || matches!(
             action_lower.as_str(),
-            "read" | "grep" | "glob" | "search"
+            "read" | "read_file" | "get" | "list" | "search" | "query" | "view" | "cat"
+                | "inspect" | "grep" | "glob"
         )
     {
         return (true, None);
@@ -47,6 +48,18 @@ pub fn evaluate_fsm_guard(
                 session_id,
                 active_task_id.unwrap_or(""),
                 worktree
+            )),
+        );
+    }
+    // A claimed task without a session or a worktree is a broken preflight,
+    // not a live claim: mutating work must say where and by whom it runs
+    // (the MCP caller passes session_id + cwd here).
+    if active_task_id.is_some() && (session_id.trim().is_empty() || worktree.trim().is_empty()) {
+        return (
+            false,
+            Some(format!(
+                "Unpreflighted: mutating action ({}) carries an empty session or worktree (session='{}', worktree='{}'); next legal transition: claim -> ContextLoaded -> TaskClaimed",
+                action_type, session_id, worktree
             )),
         );
     }

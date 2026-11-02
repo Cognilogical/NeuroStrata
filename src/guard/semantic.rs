@@ -141,28 +141,34 @@ pub(crate) fn rules_from_rows(
         .filter(|result| (result.score as f32) >= MIN_CONSTRAINT_SIMILARITY)
         .filter(|result| RULE_MEMORY_TYPES.contains(&result.payload.memory_type.as_str()))
         .filter_map(|result| {
-            let metadata = &result.payload.metadata;
-
-            // Extract rule fields from metadata
-            let id = metadata.get("id")?.as_str()?.to_string();
-            let version = metadata.get("version")?.as_u64()? as u32;
-            let rule_class = metadata.get("rule_class")?.as_str()?.to_string();
-            let trigger_pattern = metadata.get("trigger_pattern")?.as_str()?.to_string();
-            let hit_count = metadata.get("hit_count")?.as_u64()? as u32;
-            let status = metadata.get("status")?.as_str()?.to_string();
-            let constraint_text = result.payload.content;
-
-            Some(BehavioralRule {
-                id,
-                version,
-                rule_class,
-                trigger_pattern,
-                constraint_text,
-                hit_count,
-                status,
+            // A rule row whose metadata is incomplete is not a rule: it is
+            // dropped, and the drop is logged so a corrupt row is visible
+            // instead of silently ignored.
+            try_parse_rule_row(&result).or_else(|| {
+                tracing::warn!(
+                    "guard rule row {} missing required metadata field",
+                    result.id
+                );
+                None
             })
         })
         .collect()
+}
+
+/// Extract the rule fields from one search row's metadata. `None` means the
+/// row is missing at least one required field (`id`, `version`, `rule_class`,
+/// `trigger_pattern`, `hit_count`, `status`).
+fn try_parse_rule_row(result: &crate::traits::SearchResult) -> Option<BehavioralRule> {
+    let metadata = &result.payload.metadata;
+    Some(BehavioralRule {
+        id: metadata.get("id")?.as_str()?.to_string(),
+        version: metadata.get("version")?.as_u64()? as u32,
+        rule_class: metadata.get("rule_class")?.as_str()?.to_string(),
+        trigger_pattern: metadata.get("trigger_pattern")?.as_str()?.to_string(),
+        hit_count: metadata.get("hit_count")?.as_u64()? as u32,
+        status: metadata.get("status")?.as_str()?.to_string(),
+        constraint_text: result.payload.content.clone(),
+    })
 }
 
 #[cfg(test)]

@@ -270,6 +270,12 @@ impl LexicalIndex {
 
     /// Insert or replace a document, returning whether it replaced one.
     pub fn upsert(&mut self, doc: LexicalDoc) -> bool {
+        // Non-recall material never enters the index (§5.6 indexing filter);
+        // say so at debug level so a silent skip is diagnosable.
+        if doc.structural || doc.registry || doc.conflicting {
+            tracing::debug!("skipping non-indexable doc {} in LexicalIndex::upsert", doc.id);
+            return false;
+        }
         let key = doc.key();
         let existed = self
             .namespaces

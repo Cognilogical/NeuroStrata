@@ -1234,7 +1234,9 @@ impl LadybugStore {
                         // a later crash does not put the same marginal WAL back
                         // in front of the strict verifier.
                         if let Ok(conn) = Connection::new(&db) {
-                            let _ = conn.query("CHECKPOINT;");
+                            if let Err(e) = conn.query("CHECKPOINT;") {
+                                tracing::warn!("WAL recovery CHECKPOINT failed: {e}");
+                            }
                         }
                         db
                     }
@@ -1455,7 +1457,9 @@ impl LadybugStore {
             // standard library gives a thread, so this thread is given one
             // before it touches the engine. The call is idempotent, so the
             // pool reusing this thread does not leak another stack.
-            let _ = crate::crash::install_alt_stack();
+            if let Err(e) = crate::crash::install_alt_stack() {
+                tracing::warn!("install_alt_stack failed: {e}");
+            }
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
@@ -1498,7 +1502,9 @@ impl LadybugStore {
             let _turn = turn;
             // As in `with_locked_conn`: the engine runs on this thread, so
             // the crash handler's alternate signal stack is installed here.
-            let _ = crate::crash::install_alt_stack();
+            if let Err(e) = crate::crash::install_alt_stack() {
+                tracing::warn!("install_alt_stack failed: {e}");
+            }
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
@@ -2196,7 +2202,9 @@ impl LadybugStore {
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
         for ns in ["NeuroStrata", "global", "dogfood-app", "Praxis", "allele", "Nibble.Fish", "ImportProbeA", "NeuroStrata-mmd"] {
             if namespace == ns {
-                let _ = self.repair_namespace_hygiene(namespace).await;
+                if let Err(e) = self.repair_namespace_hygiene(namespace).await {
+                    tracing::warn!("repair_namespace_hygiene failed for '{namespace}': {e}");
+                }
                 break;
             }
         }
@@ -2423,7 +2431,9 @@ impl LadybugStore {
     pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
         for ns in ["NeuroStrata", "global", "dogfood-app", "Praxis", "allele", "Nibble.Fish", "ImportProbeA", "NeuroStrata-mmd"] {
             if namespace == ns {
-                let _ = self.repair_namespace_hygiene(namespace).await;
+                if let Err(e) = self.repair_namespace_hygiene(namespace).await {
+                    tracing::warn!("repair_namespace_hygiene failed for '{namespace}': {e}");
+                }
                 break;
             }
         }
@@ -2551,7 +2561,9 @@ impl LadybugStore {
                 location_lines: String::new(),
                 metadata: Value::Object(meta),
             };
-            let _ = idx.upsert_memory(&doc.namespace, &doc.id, &payload);
+            if let Err(e) = idx.upsert_memory(&doc.namespace, &doc.id, &payload) {
+                tracing::warn!("tantivy upsert_memory failed for {}:{}: {e}", doc.namespace, doc.id);
+            }
         }
         let loaded = self
             .lexical_loaded
@@ -2569,7 +2581,9 @@ impl LadybugStore {
 
     fn lexical_remove_doc(&self, namespace: &str, id: &str) {
         if let Some(ref idx) = *self.tantivy_lexical.read().expect("tantivy lock") {
-            let _ = idx.delete_memory(namespace, id);
+            if let Err(e) = idx.delete_memory(namespace, id) {
+                tracing::warn!("tantivy delete_memory failed for {namespace}:{id}: {e}");
+            }
         }
         let loaded = self
             .lexical_loaded
@@ -3040,7 +3054,6 @@ impl VectorStore for LadybugStore {
             return Ok(());
         }
 
-        let _namespace = _namespace.to_string();
         let dimensions = self.dimensions;
         // Use write_with_deadline so the write lock is held INSIDE the
         // spawn_blocking closure (see R5). Holding an async lock across
@@ -3103,11 +3116,15 @@ impl VectorStore for LadybugStore {
 
             // PQTH: Intake receipts table (operational, not memory rows)
             let create_receipts_table = "CREATE NODE TABLE IntakeReceipt (id STRING, namespace STRING, source_kind STRING, source_revision STRING, source_digest STRING, detected_intents STRING, raw_text STRING, created_at STRING, PRIMARY KEY (id))";
-            conn.query(create_receipts_table).ok();
+            if let Err(e) = conn.query(create_receipts_table) {
+                tracing::debug!("schema DDL query note: {e}");
+            }
 
             // PQTH: Intake candidates table (operational, not memory rows)
             let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, candidate_kind STRING, payload STRING, confidence DOUBLE, source_span STRING, extractor_fingerprint STRING, PRIMARY KEY (id))";
-            conn.query(create_candidates_table).ok();
+            if let Err(e) = conn.query(create_candidates_table) {
+                tracing::debug!("schema DDL query note: {e}");
+            }
             for stmt in [
                 "ALTER TABLE IntakeCandidate ADD candidate_kind STRING",
                 "ALTER TABLE IntakeCandidate ADD payload STRING",
@@ -3115,7 +3132,9 @@ impl VectorStore for LadybugStore {
                 "ALTER TABLE IntakeCandidate ADD source_span STRING",
                 "ALTER TABLE IntakeCandidate ADD extractor_fingerprint STRING",
             ] {
-                let _ = conn.query(stmt);
+                if let Err(e) = conn.query(stmt) {
+                    tracing::debug!("schema DDL query note: {e}");
+                }
             }
 
             // Source-scoped staged ingestion. Two row kinds live in this table:
@@ -3128,10 +3147,14 @@ impl VectorStore for LadybugStore {
             //     keying it by source is what keeps worktree B from overwriting
             //     worktree A's active generation.
             let create_generation_table = "CREATE NODE TABLE IngestGeneration (id STRING, namespace STRING, source_key STRING, active_generation INT64, counter INT64, PRIMARY KEY (id))";
-            conn.query(create_generation_table).ok();
+            if let Err(e) = conn.query(create_generation_table) {
+                tracing::debug!("schema DDL query note: {e}");
+            }
 
             let create_metric_table = "CREATE NODE TABLE MemoryMetric (id STRING, namespace STRING, kind STRING, name STRING, ts INT64, value DOUBLE, labels STRING, PRIMARY KEY (id))";
-            conn.query(create_metric_table).ok();
+            if let Err(e) = conn.query(create_metric_table) {
+                tracing::debug!("schema DDL query note: {e}");
+            }
 
             Ok(())
         })
@@ -3166,7 +3189,6 @@ impl VectorStore for LadybugStore {
         // Fetch known symbol ids for this namespace and rewrite unqualified edge
         // targets in payload.metadata to their qualified (resolved) form when
         // unambiguous. Qualified targets are left untouched.
-        // (Performed below once payload is mutable; placeholder marker removed.)
         let namespace = namespace.to_string();
         // R14: reject empty/whitespace namespaces before hitting the store.
         if namespace.trim().is_empty() {
@@ -4363,7 +4385,9 @@ impl VectorStore for LadybugStore {
                 }
             }
             if std::env::var("NEUROSTRATA_PRUNE_SNAPSHOTS").is_ok() {
-                let _ = crate::storage::snapshot::prune_expired_snapshots(parent, 10);
+                if let Err(e) = crate::storage::snapshot::prune_expired_snapshots(parent, 10) {
+                    tracing::warn!("prune_expired_snapshots failed: {e}");
+                }
             }
         }
         Ok(())

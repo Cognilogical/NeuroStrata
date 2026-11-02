@@ -140,7 +140,18 @@ impl GuardValidator {
                                 *c = constraints;
                             }
                         }
-                        _ => {}
+                        other => {
+                            // Pass verdicts carry no constraint field: the
+                            // triggered rules are logged, never silently
+                            // dropped.
+                            if !constraints.is_empty() {
+                                tracing::debug!(
+                                    rules = ?constraints,
+                                    "rules that fired alongside sandbox verdict {:?}",
+                                    other
+                                );
+                            }
+                        }
                     }
 
                     return (verdict, rule_ids);
@@ -173,10 +184,9 @@ impl GuardValidator {
     /// AC2 — Check session + active task + worktree state before permitting
     /// mutating actions (write/edit/bash-mutating). Returns the legal
     /// transition message when blocked (Unpreflighted, no task claim,
-    /// or BreathRequired state requires a note).
-    ///
-    /// Same preflight, but the caller supplies how many mutations have run
-    /// since the last `task_update` note (the Breath counter).
+    /// or BreathRequired state requires a note). The caller supplies how
+    /// many mutations have run since the last `task_update` note (the
+    /// Breath counter).
     pub fn guard_validate_with_mutations(
         &self,
         session_id: &str,
@@ -198,6 +208,13 @@ impl GuardValidator {
 
     /// Check if a rule's trigger pattern matches the action
     fn matches_trigger(trigger_pattern: &str, action_type: &str, payload: &str) -> bool {
+        // An empty (or whitespace-only) trigger matches everything by
+        // containment, so it would fire on every action the store returns:
+        // a rule with no trigger is not a rule.
+        if trigger_pattern.trim().is_empty() {
+            return false;
+        }
+
         // A rule fires when its trigger pattern matches the action type (the
         // action type contains the pattern, not the reverse) or appears in the
         // payload. The previous implementation used `pattern.contains(action)`,

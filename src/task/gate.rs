@@ -269,13 +269,20 @@ pub fn task_status(result: &SearchResult) -> Status {
 pub(crate) fn age_secs(meta: Option<&Value>, keys: &[&str], now: i64) -> Option<i64> {
     let meta = meta?;
     for key in keys {
-        if let Some(stamp) = meta
-            .get(key)
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|d| d.timestamp())
-        {
-            return Some(now - stamp);
+        let Some(s) = meta.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if s.is_empty() {
+            continue;
+        }
+        match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(stamp) => return Some(now - stamp.timestamp()),
+            // Silence is how a corrupt timestamp hides forever: a stamped
+            // clock that cannot be parsed is logged, then the next key is
+            // tried (a task with one bad and one good stamp still ages).
+            Err(_) => {
+                tracing::warn!("malformed RFC3339 timestamp '{}' in key '{}'", s, key);
+            }
         }
     }
     None
@@ -438,6 +445,21 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                         detail: format!(
                             "rule '{}' claims ENFORCED but names no real guard; set enforcement honestly (PARTIAL/NOT_ENFORCED) or name an existing wire id in metadata.guard.",
                             content_short(&row.payload.content)
+                        ),
+                    });
+                    continue;
+                }
+                // A reminder wire never blocks anything: it is advice that
+                // fires on a trigger, not a machine. Citing one behind an
+                // ENFORCED claim is the same overclaim as citing a
+                // non-blocking automatic wire.
+                if crate::task::wiring::is_reminder_wire(guard) {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "enforced_rule_advisory_guard",
+                        detail: format!(
+                            "rule '{}' claims ENFORCED but its guard '{}' is a REMINDER_WIRES reminder, which surfaces advice and never blocks. An ENFORCED rule must cite an AUTOMATIC_WIRES guard that hard-fails, or set enforcement honestly (PARTIAL/NOT_ENFORCED).",
+                            content_short(&row.payload.content), guard
                         ),
                     });
                     continue;
@@ -865,6 +887,50 @@ mod tests {
         assert!(report.violations.iter().any(|v| v.id == "rule-3"));
         assert!(!report.violations.iter().any(|v| v.id == "rule-2"));
         assert!(!report.violations.iter().any(|v| v.id == "rule-4"));
+    }
+
+    /// A reminder wire is advice, not a machine: an ENFORCED rule may not
+    /// cite one as its guard.
+    #[test]
+    fn an_enforced_rule_cannot_cite_a_reminder_wire_as_its_guard() {
+        let rows = vec![
+            row(
+                "rule-reminder-guard",
+                "rule",
+                "Always claim a task first",
+                json!({
+                    "enforcement": "ENFORCED",
+                    "guard": "task-first",
+                    "source": "owner 2026-10-08"
+                }),
+            ),
+            row(
+                "rule-automatic-guard",
+                "rule",
+                "Always use podman",
+                json!({
+                    "enforcement": "ENFORCED",
+                    "guard": "task-close-lock",
+                    "source": "owner 2026-10-08"
+                }),
+            ),
+        ];
+        let report = evaluate(&rows, NOW);
+        let bad: Vec<&str> = report
+            .violations
+            .iter()
+            .filter(|v| v.kind == "enforced_rule_advisory_guard")
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(
+            bad,
+            vec!["rule-reminder-guard"],
+            "an ENFORCED rule citing a REMINDER_WIRES reminder overclaims"
+        );
+        assert!(!report
+            .violations
+            .iter()
+            .any(|v| v.id == "rule-automatic-guard"));
     }
 
     const NOW: i64 = 1_760_000_000;

@@ -62,8 +62,8 @@ const fn t(from: Status, to: Status, guard: Guard) -> Transition {
     Transition { from, to, guard }
 }
 
-/// The whole machine: 4 states, 8 legal edges, one terminal state.
-/// `done` has exactly two entrances and both are ExtractionRequired.
+/// The whole machine: 4 states, 8 legal edges. `done` has two entrances
+/// (both ExtractionRequired) and can reopen to open with RequireReason.
 pub const TABLE: &[Transition] = &[
     t(Status::Open, Status::InProgress, Guard::None), // claim
     t(Status::Open, Status::Blocked, Guard::RequireReason),

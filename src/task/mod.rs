@@ -2372,8 +2372,13 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         automatic.push(entry);
     }
 
+    // The closed `fires_on` enum guards what this panel may surface as a
+    // reminder: a wire whose trigger is outside `VALID_FIRES_ON` is outside
+    // the contract (the catalog test asserts the same invariant), so it is
+    // filtered here rather than advertised as a reminder.
     let reminders: Vec<Value> = wiring::REMINDER_WIRES
         .iter()
+        .filter(|r| wiring::is_valid_fires_on(r.fires_on))
         .map(|r| json!({ "id": r.id, "fires_on": r.fires_on, "text": r.text }))
         .collect();
 

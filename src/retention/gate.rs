@@ -5,28 +5,95 @@ pub fn budget_verified(p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
     p95_plan_ms < 100.0 && p95_upsert_ms < 100.0
 }
 
+/// The 95th percentile of latency samples in milliseconds, computed the way
+/// the AC5 acceptance test computes it (ceil-index over a sorted slice).
+pub fn p95_ms(mut samples: Vec<f64>) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let idx = ((samples.len() as f64) * 0.95).ceil() as usize - 1;
+    samples[idx.min(samples.len() - 1)]
+}
+
 /// Last observed plan and upsert latency samples (milliseconds). Production
 /// call sites push real measurements here so the gate verifies its budget on
 /// evidence rather than on the degenerate 0.0/0.0 default.
 static LAST_PLAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_UPSERT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Record one latency sample pair (milliseconds). Stored as `f64::to_bits`.
+/// Rolling latency windows (milliseconds) the AC5 gate verifies over. Capped
+/// at [`SAMPLE_WINDOW_CAP`] so one pathological spike cannot fold into every
+/// future percentile the way a monotonically growing list would.
+static PLAN_SAMPLES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<f64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+static UPSERT_SAMPLES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<f64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+
+const SAMPLE_WINDOW_CAP: usize = 100;
+
+/// Push one sample into a rolling window, dropping the oldest entry past the
+/// cap. A poisoned std lock must not brick the gate, so it resumes.
+fn push_sample(window: &std::sync::Mutex<std::collections::VecDeque<f64>>, sample: f64) {
+    let mut guard = match window.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if guard.len() >= SAMPLE_WINDOW_CAP {
+        guard.pop_front();
+    }
+    guard.push_back(sample);
+}
+
+fn window_guard(
+    window: &std::sync::Mutex<std::collections::VecDeque<f64>>,
+) -> std::sync::MutexGuard<'_, std::collections::VecDeque<f64>> {
+    match window.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    }
+}
+
+/// Current AC5 p95 over the rolling plan-latency window (0.0 when empty,
+/// which must verify — the gate never fails on "no evidence yet").
+pub fn current_p95_plan_ms() -> f64 {
+    p95_ms(window_guard(&PLAN_SAMPLES).iter().copied().collect())
+}
+
+/// Current AC5 p95 over the rolling upsert-latency window.
+pub fn current_p95_upsert_ms() -> f64 {
+    p95_ms(
+        window_guard(&UPSERT_SAMPLES)
+            .iter()
+            .copied()
+            .collect(),
+    )
+}
+
+/// Record one latency sample pair (milliseconds). Stored as `f64::to_bits` in
+/// the last-observed slot and pushed into the rolling p95 windows.
+///
+/// A verify-only call passes `upsert_ms == 0.0` (no upsert leg ran); pushing
+/// that would drown the real measured upsert latencies with zeros, so a 0.0
+/// only primes the empty window and never replaces real samples.
 pub fn record_latency_sample(plan_ms: f64, upsert_ms: f64) {
     use std::sync::atomic::Ordering;
     LAST_PLAN_MS.store(plan_ms.to_bits(), Ordering::Relaxed);
     LAST_UPSERT_MS.store(upsert_ms.to_bits(), Ordering::Relaxed);
+    push_sample(&PLAN_SAMPLES, plan_ms);
+    let upsert_empty = window_guard(&UPSERT_SAMPLES).is_empty();
+    if upsert_ms > 0.0 || upsert_empty {
+        push_sample(&UPSERT_SAMPLES, upsert_ms);
+    }
 }
 
 pub fn retention_gate(receipt_exists: bool) -> bool {
-    use std::sync::atomic::Ordering;
-    // Sanity guard: a gate whose own budget predicate cannot evaluate must
-    // fail closed rather than assertedly "passing" on broken inputs. The
-    // unstored default decodes to 0.0/0.0 — the degenerate measurement, which
-    // must always verify.
-    let plan_ms = f64::from_bits(LAST_PLAN_MS.load(Ordering::Relaxed));
-    let upsert_ms = f64::from_bits(LAST_UPSERT_MS.load(Ordering::Relaxed));
-    if !budget_verified(plan_ms, upsert_ms) {
+    // Budget verified over the rolling evidence windows (the degenerate
+    // empty window reads as 0.0, which must always verify — the gate never
+    // fails on "no evidence yet"), not assertedly "passing" on broken inputs.
+    if !budget_verified(current_p95_plan_ms(), current_p95_upsert_ms()) {
         return false;
     }
     receipt_exists // retention requires receipt present
@@ -38,8 +105,9 @@ pub fn retention_gate(receipt_exists: bool) -> bool {
 /// a tree that moved or changed since the receipt was captured is stale.
 ///
 /// An unbound receipt (`worktree` empty — e.g. recorded where no project root
-/// is resolvable) verifies on presence, which is all `retention_gate` can
-/// honestly assert about it.
+/// is resolvable) still verifies through the gate rather than passing
+/// unconditionally: presence asserts "the receipt is retained", and the
+/// gate asserts the AC5 budget on recorded evidence.
 pub fn verify_task_receipt_retention(
     store: &crate::receipts::store::ReceiptStore,
     session_id: &str,
@@ -63,7 +131,10 @@ pub fn verify_task_receipt_retention(
     };
     if stored.worktree.is_empty() {
         record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
-        return true; // presence-only receipt: nothing further to verify
+        // Presence-only receipt: nothing further to verify against the
+        // worktree, but the gate still verifies the AC5 budget over the
+        // rolling evidence windows rather than passing unconditionally.
+        return retention_gate(true); // receipt present; gate re-checks AC5 budget
     }
     let upsert_start = std::time::Instant::now();
     let (head_sha, dirty_tree_hash) =
@@ -82,12 +153,6 @@ mod tests {
     use crate::traits::{MemoryPayload, VectorStore};
     use crate::store::ladybug::LadybugStore;
     use std::time::Instant;
-
-    fn p95_ms(mut samples_ms: Vec<f64>) -> f64 {
-        samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let idx = ((samples_ms.len() as f64) * 0.95).ceil() as usize - 1;
-        samples_ms[idx.min(samples_ms.len() - 1)]
-    }
 
     fn request() -> crate::context::ContextRequest {
         crate::context::ContextRequest {

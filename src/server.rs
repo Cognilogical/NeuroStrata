@@ -7122,6 +7122,7 @@ async fn handle_guard_validate(
     let mutating = !matches!(
         action_type.to_lowercase().as_str(),
         "read" | "read_file" | "get" | "list" | "search" | "query" | "view" | "cat" | "inspect"
+            | "grep" | "glob"
     );
     if mutating {
         // Determine whether this namespace is task-enabled.

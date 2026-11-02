@@ -300,12 +300,16 @@ fn slugify(s: &str) -> String {
 /// they must be cheap and must not block.
 pub trait IngestObserver: Send + Sync {
     fn file_ingested(&self, path: &str, symbols: usize);
-    fn file_skipped(&self, path: &str) { let _ = path; }
+    fn file_skipped(&self, path: &str) {
+        tracing::debug!("ingest skipped file: {path}");
+    }
     fn relinked(&self, edges: usize);
     /// Called once per run when the previous generation's `ingest_version`
     /// differs from the current one (or is absent). Implementors surface this
     /// as a warning; the ingest continues with a full re-parse.
-    fn version_gate_tripped(&self, _prev: &str, _current: &str) {}
+    fn version_gate_tripped(&self, prev: &str, current: &str) {
+        tracing::warn!("ingest version gate tripped: prev={prev} current={current}");
+    }
 }
 
 /// An owned item streamed from the blocking producer to the async consumer.
@@ -1241,14 +1245,17 @@ pub async fn ingest_directory(
             "fingerprint": current_version,
         }]
     });
-    let _ = crate::registry::enrichment_commit(
+    if let Err(e) = crate::registry::enrichment_commit(
         &vector_store,
         Some(&embedder),
         namespace,
         watermark,
         telemetry,
     )
-    .await;
+    .await
+    {
+        tracing::warn!("enrichment_commit failed for '{namespace}': {e}");
+    }
 
     Ok(())
 }
@@ -2064,7 +2071,7 @@ mod tests {
             }
             store.upsert("probe", &target, vec, payload).await.expect("upsert");
         }
-        let _ = current;
+        assert_ne!(current, "tampered");
 
         struct Rec(std::sync::Mutex<usize>);
         impl IngestObserver for Rec {
