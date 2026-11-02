@@ -629,10 +629,21 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
     )?;
     let effective_weight = kge_weight.unwrap_or_else(kge_weight_from_env);
 
-    // Save artifacts
+    // Save artifacts to scope_dir (.NeuroStrata/kge/<scope> or NEUROSTRATA_KGE_DIR)
     let model_path = scope_dir.join("model.bin");
     let meta_path = scope_dir.join("meta.json");
     model.save(&model_path, &meta_path, epochs, edges.len(), model.final_loss, Some(effective_weight))?;
+
+    // Also mirror to <db_path_parent>/kge/<scope>/ (spec §5.9) when NEUROSTRATA_KGE_DIR is not overridden,
+    // so the background daemon (whose cwd may differ from the project directory) loads the trained artifact.
+    if std::env::var("NEUROSTRATA_KGE_DIR").is_err() {
+        if let Ok(cfg) = crate::config::Config::from_default_path() {
+            let (db_model_path, db_meta_path) = artifact_paths(std::path::Path::new(&cfg.db_path), scope);
+            if db_model_path != model_path {
+                let _ = model.save(&db_model_path, &db_meta_path, epochs, edges.len(), model.final_loss, Some(effective_weight));
+            }
+        }
+    }
 
     // Print summary
     println!("Trained KGE model for '{}': entities={}, edges={}, dim={}, epochs={}, loss={}",
