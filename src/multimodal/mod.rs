@@ -238,7 +238,7 @@ fn parse_jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         let len = ((bytes[i + 2] as usize) << 8 | (bytes[i + 3] as usize)) + 2;
         // SOF markers
         if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
-            if i + 7 < bytes.len() {
+            if i + 8 < bytes.len() {
                 let height = (bytes[i + 5] as u32) << 8 | (bytes[i + 6] as u32) ;
                 let width = (bytes[i + 7] as u32) << 8 | (bytes[i + 8] as u32) ;
                 if height > 0 && width > 0 {
@@ -582,6 +582,21 @@ mod tests {
         png.extend_from_slice(&[0,0,0,0]);
         let dims = parse_dimensions("image/png", &png);
         assert_eq!(dims, Some((100, 200)));
+    }
+
+    /// A truncated JPEG whose slice ends exactly at an SOF0 marker's last
+    /// sensor byte (`bytes.len() == i + 8`) must return `None`, never panic
+    /// with an index-out-of-bounds on `bytes[i + 8]` (AO-24).
+    #[test]
+    fn jpeg_truncated_at_sof0_returns_none() {
+        let bytes: [u8; 10] = [
+            0xFF, 0xD8, // SOI at i=0
+            0xFF, 0xC0, // SOF0 marker at i=2
+            0x00, 0x12, // segment length
+            0x00, 0x00, 0x80, 0x00, // ends exactly at i + 8 == bytes.len()
+        ];
+        assert_eq!(bytes.len(), 2 + 8);
+        assert_eq!(parse_jpeg_dimensions(&bytes), None);
     }
 
     #[test]

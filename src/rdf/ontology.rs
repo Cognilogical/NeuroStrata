@@ -379,6 +379,16 @@ impl OntologyIndex {
     pub fn add_equivalent(&mut self, a: &str, b: &str) {
         self.equivalent.insert(a.to_string(), b.to_string());
         self.equivalent.insert(b.to_string(), a.to_string());
+        // Mirror into equivalent_class so equivalents_of() also sees concept
+        // IRIs registered via add_equivalent (not only via add_equivalent_class).
+        self.equivalent_class
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+        self.equivalent_class
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
     }
 
     pub fn equivalent_of(&self, class: &str) -> Option<String> {
@@ -409,6 +419,11 @@ impl OntologyIndex {
             .entry(a.to_string())
             .or_default()
             .insert(b.to_string());
+        // Symmetric reverse so equivalent_property(b) works too.
+        self.equivalent_property
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
     }
 
     pub fn add_inverse_of(&mut self, a: &str, b: &str) {
@@ -416,6 +431,11 @@ impl OntologyIndex {
             .entry(a.to_string())
             .or_default()
             .insert(b.to_string());
+        // Symmetric reverse so inverse_of(b) works too.
+        self.inverse_of
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
     }
 
     pub fn add_transitive_property(&mut self, prop: &str) {
@@ -638,7 +658,7 @@ impl OntologyIndex {
             if budget.max_ms > 0 && start.elapsed().as_millis() as u64 > budget.max_ms {
                 break;
             }
-            if result.results.len() >= budget.max_nodes {
+            if budget.max_nodes > 0 && result.results.len() >= budget.max_nodes {
                 break;
             }
             if let Some(kids) = self.children.get(&cur) {
@@ -680,7 +700,7 @@ impl OntologyIndex {
         while current_hops < max_hops
             && (budget.max_ms == 0 || start.elapsed().as_millis() as u64 <= budget.max_ms)
         {
-            if result.results.len() >= budget.max_nodes {
+            if budget.max_nodes > 0 && result.results.len() >= budget.max_nodes {
                 break;
             }
             let frontier_len = frontier.len();

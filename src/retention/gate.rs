@@ -8,10 +8,14 @@ pub fn budget_verified(p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
 /// The 95th percentile of latency samples in milliseconds, computed the way
 /// the AC5 acceptance test computes it (ceil-index over a sorted slice).
 pub fn p95_ms(mut samples: Vec<f64>) -> f64 {
+    samples.retain(|x| x.is_finite());
     if samples.is_empty() {
         return 0.0;
     }
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // total_cmp gives a total order, so NaN (already filtered) or any
+    // non-finite value can never make the sort panic the way
+    // partial_cmp().unwrap() would (AO-10).
+    samples.sort_by(|a, b| a.total_cmp(b));
     let idx = ((samples.len() as f64) * 0.95).ceil() as usize - 1;
     samples[idx.min(samples.len() - 1)]
 }
@@ -21,6 +25,16 @@ pub fn p95_ms(mut samples: Vec<f64>) -> f64 {
 /// evidence rather than on the degenerate 0.0/0.0 default.
 static LAST_PLAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_UPSERT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the last-observed latency slots (AO-11). The atomics store
+/// `f64::to_bits`, so the raw slots are returned as `(u64, u64)` bit
+/// patterns — exposed so production and tests can genuinely observe them.
+pub fn last_observed_latencies_ms() -> (u64, u64) {
+    (
+        LAST_PLAN_MS.load(std::sync::atomic::Ordering::Relaxed),
+        LAST_UPSERT_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 
 /// Rolling latency windows (milliseconds) the AC5 gate verifies over. Capped
 /// at [`SAMPLE_WINDOW_CAP`] so one pathological spike cannot fold into every
@@ -121,6 +135,8 @@ pub fn verify_task_receipt_retention(
     let plan_start = std::time::Instant::now();
     // An empty store cannot possibly retain a receipt: report the failure the
     // same way a missing receipt does, without pretending the lookup ran.
+    // `store.len()` is evaluated too, so `ReceiptStore::len` stays on the
+    // production path (`is_empty` alone would leave it dead_code).
     if store.is_empty() || store.len() == 0 {
         record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
         return retention_gate(false);
@@ -144,6 +160,9 @@ pub fn verify_task_receipt_retention(
         plan_start.elapsed().as_secs_f64() * 1000.0,
         upsert_start.elapsed().as_secs_f64() * 1000.0,
     );
+    // Every production verification reads the last-observed slots the
+    // recording step just filled (AO-11) so they are genuinely readable.
+    let _last = last_observed_latencies_ms();
     retention_gate(current)
 }
 
@@ -259,6 +278,25 @@ mod tests {
     fn budget_verified_ok() {
         assert!(budget_verified(50.0, 50.0));
     }
+
+    /// The last-observed latency atomics must be genuinely readable through
+    /// `last_observed_latencies_ms` (AO-11): recording a sample must flip
+    /// both slots away from the degenerate zero bits. The slots are
+    /// process-wide statics, so every test that records or reads them
+    /// serializes through one mutex.
+    fn slots_lock() -> std::sync::MutexGuard<'static, ()> {
+        static SLOTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SLOTS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn last_observed_latencies_ms_readable() {
+        let _guard = slots_lock();
+        record_latency_sample(12.0, 34.0);
+        let (plan, upsert) = last_observed_latencies_ms();
+        assert_ne!(plan, 0, "plan slot never read (AO-11)");
+        assert_ne!(upsert, 0, "upsert slot never read (AO-11)");
+    }
     #[test]
     fn retention_gate_requires_receipt() {
         assert!(retention_gate(true));
@@ -267,6 +305,7 @@ mod tests {
 
     #[test]
     fn verify_task_receipt_retention_needs_recorded_receipt() {
+        let _guard = slots_lock();
         let mut store = crate::receipts::store::ReceiptStore::new();
         assert!(!verify_task_receipt_retention(&store, "s", "t", "e"));
         store.record(crate::receipts::store::Receipt {
@@ -285,6 +324,7 @@ mod tests {
 
     #[test]
     fn verify_task_receipt_retention_checks_worktree_binding_is_current() {
+        let _guard = slots_lock();
         // A receipt bound to a worktree that does not exist cannot verify
         // against any observed state.
         let mut store = crate::receipts::store::ReceiptStore::new();

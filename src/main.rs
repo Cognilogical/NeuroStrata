@@ -1132,10 +1132,26 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
 
     // Promote in the active manifest and persist it.
     let manifest_path = paths.root_dir().join("active_manifest.json");
-    let mut manifest: crate::learning::trainer::ActiveManifest = std::fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    let mut manifest: crate::learning::trainer::ActiveManifest = if manifest_path.exists() {
+        match std::fs::read_to_string(&manifest_path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| {
+                serde_json::from_str::<crate::learning::trainer::ActiveManifest>(&raw)
+                    .map_err(|e| e.to_string())
+            })
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    "active manifest at {} unreadable or unparseable, using defaults: {e}",
+                    manifest_path.display()
+                );
+                crate::learning::trainer::ActiveManifest::default()
+            }
+        }
+    } else {
+        crate::learning::trainer::ActiveManifest::default()
+    };
     trainer.promote(&mut manifest, &version.to_string(), score)?;
     job_state = trainer.transition(
         &job_state,
@@ -1212,8 +1228,20 @@ async fn run_doctor(read: &ReadSource, scope: Option<&str>) -> anyhow::Result<()
         for b in namespaces.iter().skip(i + 1) {
             if a.eq_ignore_ascii_case(b) {
                 collisions += 1;
-                let a_len = read.list(a).await.map(|m| m.len()).unwrap_or(0);
-                let b_len = read.list(b).await.map(|m| m.len()).unwrap_or(0);
+                let a_len = match read.list(a).await {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        tracing::warn!("doctor list failed for '{a}': {e}");
+                        0
+                    }
+                };
+                let b_len = match read.list(b).await {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        tracing::warn!("doctor list failed for '{b}': {e}");
+                        0
+                    }
+                };
                 println!("Two spellings of one project:");
                 println!("  '{}' holds {} memories", a, a_len);
                 println!("  '{}' holds {} memories", b, b_len);
@@ -2956,8 +2984,7 @@ async fn run() -> anyhow::Result<()> {
                 if !(0.0..=0.3).contains(&kge_weight) {
                     anyhow::bail!("--kge-weight must be in [0, 0.3]");
                 }
-                // Scaffold: calls kge::cli_train (implements spec §5.4).
-                // Real implementation tracked in neurostrata-84k2; not a hidden stub.
+                // Run TransE KGE training over the namespace graph (spec §5.4).
                 crate::kge::cli_train(namespace.as_deref(), all, Some(epochs), Some(dim), Some(kge_weight))?;
             }
             Commands::Shutdown => {
@@ -3200,7 +3227,13 @@ async fn run() -> anyhow::Result<()> {
                     embed::configured_dimensions()?,
                 )?);
 
-                let namespaces = vector_store.list_namespaces().await.unwrap_or_default();
+                let namespaces = match vector_store.list_namespaces().await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!("restore list_namespaces check failed: {e}");
+                        Vec::new()
+                    }
+                };
                 println!("Restored {} into {:?}", dir, target);
                 if !namespaces.is_empty() {
                     println!(
@@ -3901,10 +3934,9 @@ async fn run() -> anyhow::Result<()> {
                             } else {
                                 include_str!("schema.json").to_string()
                             };
-                            if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
-                                let report = crate::parser::ingest::dry_run_directory(dir_path, &schema, &dry_run_mode).await?;
-                                println!("{}", report);
-                            }
+                            let schema = crate::parser::schema::ParserSchema::load(&schema_str)?;
+                            let report = crate::parser::ingest::dry_run_directory(dir_path, &schema, &dry_run_mode).await?;
+                            println!("{}", report);
                             return Ok(());
                         }
                         let dir = cli_ingest_root(&dir);
@@ -4041,6 +4073,7 @@ async fn run() -> anyhow::Result<()> {
                             };
                             let mut metadata = payload.metadata.clone();
                             if !metadata.is_object() {
+                                skipped += 1;
                                 continue;
                             }
                             let mut changed = false;
@@ -4078,11 +4111,12 @@ async fn run() -> anyhow::Result<()> {
                     }
                     Commands::RepairHygiene { namespace } => {
                         use crate::store::ladybug::LadybugStore;
-                        let db_path = std::env::var_os("NEUROSTRATA_DB")
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| config.db_path.clone());
-                        let dims = crate::embed::configured_dimensions()?;
-                        let direct = LadybugStore::new(db_path, dims)?;
+                        let direct =
+                            crate::traits::VectorStore::as_any(vector_store.as_ref())
+                                .downcast_ref::<LadybugStore>()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("repair-hygiene requires LadybugStore backend")
+                                })?;
                         let (fixed_shape, fixed_dangling) = direct.repair_namespace_hygiene(&namespace).await?;
                         println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
                     }

@@ -95,27 +95,41 @@ async fn search_inner(
                 .with_conn(move |conn| {
                     let mut out: std::collections::HashMap<String, MemoryPayload> =
                         std::collections::HashMap::new();
-                    if let Ok(rows) = conn.query(&hydrate_q) {
-                        for row in rows {
-                            let id = format!("{}", row[0]);
-                            if id.is_empty() || out.contains_key(&id) {
-                                continue;
+                    match conn.query(&hydrate_q) {
+                        Ok(rows) => {
+                            for row in rows {
+                                let id = format!("{}", row[0]);
+                                if id.is_empty() || out.contains_key(&id) {
+                                    continue;
+                                }
+                                let metadata_str = format!("{}", row[7]);
+                                let metadata: Value = match serde_json::from_str(&metadata_str) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        if !metadata_str.trim().is_empty() {
+                                            tracing::warn!(
+                                                "corrupt metadata JSON in store row: {e}"
+                                            );
+                                        }
+                                        Value::Null
+                                    }
+                                };
+                                out.insert(
+                                    id,
+                                    MemoryPayload {
+                                        content: format!("{}", row[1]),
+                                        user_id: format!("{}", row[2]),
+                                        memory_type: format!("{}", row[3]),
+                                        agent_name: Some(format!("{}", row[4])),
+                                        location: format!("{}", row[5]),
+                                        location_lines: format!("{}", row[6]),
+                                        metadata,
+                                    },
+                                );
                             }
-                            let metadata_str = format!("{}", row[7]);
-                            let metadata: Value =
-                                serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
-                            out.insert(
-                                id,
-                                MemoryPayload {
-                                    content: format!("{}", row[1]),
-                                    user_id: format!("{}", row[2]),
-                                    memory_type: format!("{}", row[3]),
-                                    agent_name: Some(format!("{}", row[4])),
-                                    location: format!("{}", row[5]),
-                                    location_lines: format!("{}", row[6]),
-                                    metadata,
-                                },
-                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("reasoning payload hydration query failed: {e}");
                         }
                     }
                     Ok(out)
@@ -184,7 +198,15 @@ async fn search_inner(
                             let location: String = format!("{}", row[5]);
                             let location_lines: String = format!("{}", row[6]);
                             let metadata_str: String = format!("{}", row[7]);
-                            let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                            let metadata_val: Value = match serde_json::from_str(&metadata_str) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    if !metadata_str.trim().is_empty() {
+                                        tracing::warn!("corrupt metadata JSON in store row: {e}");
+                                    }
+                                    Value::Null
+                                }
+                            };
                             if is_retired_at(&metadata_val, now) { continue; }
                             if !include_archived && is_archived(&metadata_val) { continue; }
                             if is_mesh_conflicting(&metadata_val) { continue; }
@@ -2188,15 +2210,25 @@ impl LadybugStore {
     }
 
     pub async fn active_generations_public(&self, namespace: &str) -> std::collections::HashSet<u64> {
+        let ns_label = namespace.to_string();
         let namespace = namespace.to_string();
         self.with_conn(move |conn| Ok(crate::store::ladybug::active_generations_of(conn, &namespace)))
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::warn!("active generations query failed for '{ns_label}': {e}");
+                Default::default()
+            })
     }
 
     pub async fn symbol_ids(&self, namespace: &str) -> Vec<String> {
         let gens = self.active_generations_public(namespace).await;
-        let memories = self.list(namespace, Some("auto-ingestor"), None).await.unwrap_or_default();
+        let memories = self
+            .list(namespace, Some("auto-ingestor"), None)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("symbol_ids memory list failed for '{namespace}': {e}");
+                Default::default()
+            });
         let mut out = Vec::new();
         for m in memories {
             let mt = m.payload.memory_type.as_str();
@@ -2756,10 +2788,10 @@ impl LadybugStore {
             .with_conn(move |conn| {
                 let query = match &ns_opt {
                     Some(ns) => format!(
-                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.namespace, m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata",
+                        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.namespace, m.id, m.content, m.user_id, m.memory_type, m.location, m.agent_name, m.location_lines, m.metadata",
                         escape_ladybug_string(ns)
                     ),
-                    None => "MATCH (m:Memory) RETURN m.namespace, m.id, m.content, m.user_id, m.memory_type, m.location, m.metadata".to_string(),
+                    None => "MATCH (m:Memory) RETURN m.namespace, m.id, m.content, m.user_id, m.memory_type, m.location, m.agent_name, m.location_lines, m.metadata".to_string(),
                 };
                 let rows = conn.query(&query)?;
                 let mut out = Vec::new();
@@ -2770,16 +2802,22 @@ impl LadybugStore {
                     let user_id: String = format!("{}", row[3]);
                     let memory_type: String = format!("{}", row[4]);
                     let location: String = format!("{}", row[5]);
-                    let metadata_str: String = format!("{}", row[6]);
+                    let agent_name: String = format!("{}", row[6]);
+                    let location_lines: String = format!("{}", row[7]);
+                    let metadata_str: String = format!("{}", row[8]);
                     let metadata: Value =
                         serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
                     let payload = MemoryPayload {
                         content,
                         user_id,
                         memory_type,
-                        agent_name: None,
+                        agent_name: if agent_name.is_empty() || agent_name == "unknown" {
+                            None
+                        } else {
+                            Some(agent_name)
+                        },
                         location,
-                        location_lines: String::new(),
+                        location_lines,
                         metadata,
                     };
                     out.push((ns, id, payload));
@@ -3160,13 +3198,21 @@ impl VectorStore for LadybugStore {
             // PQTH: Intake receipts table (operational, not memory rows)
             let create_receipts_table = "CREATE NODE TABLE IntakeReceipt (id STRING, namespace STRING, source_kind STRING, source_revision STRING, source_digest STRING, detected_intents STRING, raw_text STRING, created_at STRING, PRIMARY KEY (id))";
             if let Err(e) = conn.query(create_receipts_table) {
-                tracing::debug!("schema DDL query note: {e}");
+                if format!("{e}").to_lowercase().contains("already exists") {
+                    tracing::debug!("schema DDL query note: {e}");
+                } else {
+                    tracing::warn!("schema DDL table creation failed: {e}");
+                }
             }
 
             // PQTH: Intake candidates table (operational, not memory rows)
             let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, candidate_kind STRING, payload STRING, confidence DOUBLE, source_span STRING, extractor_fingerprint STRING, PRIMARY KEY (id))";
             if let Err(e) = conn.query(create_candidates_table) {
-                tracing::debug!("schema DDL query note: {e}");
+                if format!("{e}").to_lowercase().contains("already exists") {
+                    tracing::debug!("schema DDL query note: {e}");
+                } else {
+                    tracing::warn!("schema DDL table creation failed: {e}");
+                }
             }
             for stmt in [
                 "ALTER TABLE IntakeCandidate ADD candidate_kind STRING",
@@ -3191,12 +3237,20 @@ impl VectorStore for LadybugStore {
             //     worktree A's active generation.
             let create_generation_table = "CREATE NODE TABLE IngestGeneration (id STRING, namespace STRING, source_key STRING, active_generation INT64, counter INT64, PRIMARY KEY (id))";
             if let Err(e) = conn.query(create_generation_table) {
-                tracing::debug!("schema DDL query note: {e}");
+                if format!("{e}").to_lowercase().contains("already exists") {
+                    tracing::debug!("schema DDL query note: {e}");
+                } else {
+                    tracing::warn!("schema DDL table creation failed: {e}");
+                }
             }
 
             let create_metric_table = "CREATE NODE TABLE MemoryMetric (id STRING, namespace STRING, kind STRING, name STRING, ts INT64, value DOUBLE, labels STRING, PRIMARY KEY (id))";
             if let Err(e) = conn.query(create_metric_table) {
-                tracing::debug!("schema DDL query note: {e}");
+                if format!("{e}").to_lowercase().contains("already exists") {
+                    tracing::debug!("schema DDL query note: {e}");
+                } else {
+                    tracing::warn!("schema DDL table creation failed: {e}");
+                }
             }
 
             Ok(())
@@ -3340,7 +3394,13 @@ impl VectorStore for LadybugStore {
                 if !slugs.is_empty() {
                     // read registry (optional)
                     let rid = crate::registry::registry_row_id(&namespace);
-                    let reg_payload_opt = self.get(&namespace, &rid).await.ok().flatten();
+                    let reg_payload_opt = match self.get(&namespace, &rid).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("registry lookup failed for '{namespace}:{rid}': {e}");
+                            None
+                        }
+                    };
                     let mut iris: Vec<String> = Vec::new();
                     if let Some((_, reg_payload)) = &reg_payload_opt {
                         let entries = crate::registry::registry_domain_entries(&reg_payload.metadata);
@@ -3792,7 +3852,9 @@ impl VectorStore for LadybugStore {
                                         escape_ladybug_string(&id),
                                         safe_new_meta
                                     );
-                                    let _ = conn.query(&update_q);
+                                    if let Err(e) = conn.query(&update_q) {
+                                        tracing::warn!("edge_sources provenance update failed for '{namespace}:{id}': {e}");
+                                    }
                                 }
                             }
                         }
@@ -3808,7 +3870,9 @@ impl VectorStore for LadybugStore {
                 "MATCH (a:Memory {{id: '{}'}})-[r:RELATES_TO]->(b:Memory) WHERE r.extractor = 'mention-detector' DELETE r",
                 escape_ladybug_string(&id)
             );
-            let _ = conn.query(&del_q);
+            if let Err(e) = conn.query(&del_q) {
+                tracing::warn!("stale mention-edge cleanup failed for '{namespace}:{id}': {e}");
+            }
             for m in &mentions_for_write {
                 let m_safe = escape_ladybug_string(m);
                 let q = format!(
@@ -3818,7 +3882,9 @@ impl VectorStore for LadybugStore {
                     escape_ladybug_string(&namespace),
                     edge_now
                 );
-                let _ = conn.query(&q);
+                if let Err(e) = conn.query(&q) {
+                    tracing::warn!("mention-edge creation failed for '{namespace}:{id}': {e}");
+                }
             }
 
             Ok(crate::traits::UpsertReport {
@@ -4846,7 +4912,15 @@ impl VectorStore for LadybugStore {
                 let location_lines: String = format!("{}", row[6]);
                 let metadata_str: String = format!("{}", row[7]);
 
-                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !metadata_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
 
                 results.push(SearchResult {
                     id,
@@ -4906,7 +4980,15 @@ impl VectorStore for LadybugStore {
                 let location_lines: String = format!("{}", row[6]);
                 let metadata_str: String = format!("{}", row[7]);
 
-                let metadata_val: Value = serde_json::from_str(&metadata_str).unwrap_or(Value::Null);
+                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !metadata_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
 
 
 

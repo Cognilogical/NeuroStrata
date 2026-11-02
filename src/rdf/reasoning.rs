@@ -143,13 +143,18 @@ impl ReasoningAdapter {
                     explanation: format!("GOVERNS {}::{}", root, target),
                     derivation: vec!["reasoning".to_string()],
                 });
+                // Only unvisited targets seed the frontier; re-pushing an
+                // already-visited node wastes a BFS slot (AN-R3).
+                frontier.push_back(target.clone());
             }
-            frontier.push_back(target.clone());
         }
 
         // BFS for further bounded transitive hops
         let mut current_hops = 1usize;
-        while current_hops < max_hops && node_count < budget.max_nodes && start.elapsed().as_millis() as u64 <= budget.max_ms {
+        while current_hops < max_hops
+            && node_count < budget.max_nodes
+            && (budget.max_ms == 0 || start.elapsed().as_millis() as u64 <= budget.max_ms)
+        {
             let frontier_len = frontier.len();
             for _ in 0..frontier_len {
                 let node = match frontier.pop_front() {

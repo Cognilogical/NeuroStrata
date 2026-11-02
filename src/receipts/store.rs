@@ -17,9 +17,21 @@ pub struct Receipt {
     pub dirty_tree_hash: String,
 }
 
+/// Key components are joined with `:`. A `:` or `\` inside a component is
+/// escaped so distinct component tuples cannot collide on the same key
+/// (AO-30): plain alphanumeric IDs still format as `"s:t:e"`.
+fn key_component(component: &str) -> String {
+    component.replace('\\', "\\\\").replace(':', "\\:")
+}
+
 impl Receipt {
     pub fn key(&self) -> String {
-        format!("{}:{}:{}", self.session_id, self.task_id, self.event_id)
+        format!(
+            "{}:{}:{}",
+            key_component(&self.session_id),
+            key_component(&self.task_id),
+            key_component(&self.event_id)
+        )
     }
 
     /// Same contract as `task::receipt::Receipt::is_current`: true when the
@@ -51,7 +63,12 @@ impl ReceiptStore {
     }
 
     pub fn get(&self, session_id: &str, task_id: &str, event_id: &str) -> Option<&Receipt> {
-        let key = format!("{}:{}:{}", session_id, task_id, event_id);
+        let key = format!(
+            "{}:{}:{}",
+            key_component(session_id),
+            key_component(task_id),
+            key_component(event_id)
+        );
         self.inner.get(&key)
     }
 

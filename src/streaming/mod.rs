@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-pub const STRIPPED_PROCEDURE_COUNTERS: [&str; 4] = [
+pub const STRIPPED_PROCEDURE_COUNTERS: [&str; 5] = [
     "remaining_fires",
     "performance_count",
+    "previous_performance_count",
     "last_performed_at",
     "last_episodic_pointer",
 ];
@@ -129,9 +130,13 @@ pub fn format_iri(iri: &str) -> Result<String, ParseError> {
                     term: format!("<{}>", iri),
                 });
             }
-            // For control chars / non-ASCII, escape as \uXXXX in N-Triples IRI
-            // Per spec: escape control/non-ASCII via \uXXXX
-            escaped.push_str(&format!("\\u{:04X}", c));
+            // Per N-Triples spec: escape control/non-ASCII via \uXXXX, and
+            // codepoints beyond the BMP via \UXXXXXXXX (AO-5).
+            if c > 0xFFFF {
+                escaped.push_str(&format!("\\U{:08X}", c));
+            } else {
+                escaped.push_str(&format!("\\u{:04X}", c));
+            }
         } else {
             escaped.push(ch);
         }
@@ -294,14 +299,9 @@ impl Stream {
                     message: "missing trailing '.'".to_string(),
                 });
             }
-            // The rest between op and . are terms
-            let term_count = parts.len() - 2; // exclude op and .
-            if term_count != 3 && term_count != 4 {
-                return Err(ParseError::MalformedLine {
-                    line: line_num,
-                    message: format!("expected 3 or 4 terms, got {}", term_count),
-                });
-            }
+            // The rest between op and . are the terms. Count them only after
+            // quote-aware tokenization below — a whitespace split flags a
+            // quoted literal containing spaces as extra terms (AO-9).
             // Re-tokenize respecting quotes
             let content = trimmed.trim_start_matches(op_token).trim();
             // Remove trailing .
@@ -690,6 +690,16 @@ mod tests {
     fn test_stripped_counter_last_episodic_pointer() {
         let input = "A <s> <p> \"last_episodic_pointer\" .";
         assert!(Stream::parse_patch(input).is_err());
+    }
+
+    /// A quoted literal containing spaces is one term (AO-9): the whitespace
+    /// split must not be used to count terms before quote-aware tokenizing.
+    #[test]
+    fn parse_patch_accepts_quoted_literal_with_spaces() {
+        let patch = "A <urn:s> <urn:p> \"hello world\" .";
+        let parsed = Stream::parse_patch(patch).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].object, "\"hello world\"");
     }
 
     #[test]

@@ -465,8 +465,25 @@ fn is_placeholder(lower: &str) -> bool {
     if trimmed.is_empty() {
         return true;
     }
-    // Variable references and angle-bracket placeholders.
-    if trimmed.starts_with("${") || trimmed.starts_with('<') {
+    // Variable references and angle-bracket placeholders. Only single,
+    // short, one-line placeholder tokens are excluded: a document that
+    // merely begins with `<` (e.g. `<config>password = ...</config>`) or
+    // `${` must still reach the real detectors, not bypass the scanner.
+    if trimmed.starts_with('<')
+        && trimmed.ends_with('>')
+        && trimmed.len() <= 64
+        && !trimmed[1..trimmed.len() - 1].contains('<')
+        && !trimmed[1..trimmed.len() - 1].contains('>')
+        && !trimmed.contains('\n')
+    {
+        return true;
+    }
+    if trimmed.starts_with("${")
+        && trimmed.ends_with('}')
+        && trimmed.len() <= 64
+        && !trimmed[2..trimmed.len() - 1].contains('}')
+        && !trimmed.contains('\n')
+    {
         return true;
     }
     // Repeated asterisks or dots masking a value.
@@ -495,7 +512,7 @@ fn is_placeholder(lower: &str) -> bool {
 /// Split a JWT string into its three base64url segments.
 /// Returns `None` if there aren't exactly three segments.
 fn find_jwt_segments(s: &str) -> Option<(&str, &str, &str)> {
-    let mut parts = s.splitn(3, '.');
+    let mut parts = s.split('.');
     let a = parts.next()?;
     let b = parts.next()?;
     let c = parts.next()?;
@@ -918,6 +935,30 @@ mod tests {
                 entry
             );
         }
+    }
+
+    // ── Scanner bypass regression (AN-S1) ───────────────────────────────
+
+    #[test]
+    fn document_starting_with_angle_bracket_not_bypassing_scanner() {
+        // A full XML/HTML/Markdown document that happens to start with `<`
+        // must not disable the scanner; the embedded secret is rejected.
+        // A document that starts with `${` likewise.
+        let xml = r#"<config>api_key = "sk-live-1234567890abcdefghijklmnop"</config>"#;
+        let r = SecretScanner::scan_str(xml, "content");
+        assert!(r.is_some(), "secret inside <config> document must be rejected");
+        assert!(
+            matches!(
+                r.as_ref().map(|r| r.category),
+                Some("high_entropy_secret") | Some("password") | Some("openai_key")
+            ),
+            "unexpected category: {:?}",
+            r.map(|r| r.category)
+        );
+
+        // While single placeholder tokens are still allowed.
+        assert!(SecretScanner::scan_str("<your-api-key>", "content").is_none());
+        assert!(SecretScanner::scan_str("${API_KEY}", "content").is_none());
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────

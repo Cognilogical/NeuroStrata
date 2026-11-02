@@ -63,7 +63,10 @@ impl From<std::io::Error> for DecompressionError {
 }
 
 pub fn compress(bytes: &[u8], level: i32) -> Result<Vec<u8>, CompressionError> {
-    let mut encoder = zstd::stream::read::Encoder::new(bytes, level)?;
+    // Clamp to the same 1..=22 range `compress_mesh_bundle_with_level`
+    // accepts, so out-of-range levels never reach the encoder (AO-27).
+    let clamped = level.clamp(1, 22);
+    let mut encoder = zstd::stream::read::Encoder::new(bytes, clamped)?;
     let mut out = Vec::new();
     encoder.read_to_end(&mut out)?;
     Ok(out)

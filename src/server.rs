@@ -726,7 +726,8 @@ pub async fn process_mcp_request(
                                 "variables": { "type": "object", "description": "Map of variable names to finite numeric values." },
                                 "merge": { "type": "boolean", "description": "Merge into existing state (default true) or replace." },
                                 "schema_id": { "type": "string", "description": "Optional digital_twin_schema memory ID." },
-                                "source": { "type": "string", "description": "Optional telemetry source identifier." }
+                                "source": { "type": "string", "description": "Optional telemetry source identifier." },
+                                "principal": { "type": "string", "description": "Optional ReBAC principal for write authorization." }
                             },
                             "required": ["namespace", "twin_id", "variables"]
                         }
@@ -3958,9 +3959,8 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                     // profile re-renders the payload the same way instead of
                     // silently ignoring the requested format.
                     let rendered: serde_json::Value = if format == "trig" {
-                        let payload_str =
-                            serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-                        serde_json::Value::String(nquads_to_trig(&payload_str, &namespace_str))
+                        let fallback = format!("urn:neurostrata:graph:{namespace_str}");
+                        serde_json::Value::String(nquads_to_trig(&nquads_text, &fallback))
                     } else {
                         serde_json::to_value(&payload).unwrap_or_default()
                     };
@@ -4554,7 +4554,10 @@ pub(crate) async fn handle_twin_set(
     let vec = emb
         .embed(&base_payload.content)
         .await
-        .unwrap_or_else(|_| vec![0.0; emb.dimensions()]);
+        .unwrap_or_else(|e| {
+            tracing::warn!("handle_twin_set embed failed for '{namespace}:{twin_id}', using fallback vector: {e}");
+            vec![0.0; emb.dimensions()]
+        });
     if let Err(e) = store.upsert(&namespace, &id, vec, base_payload).await {
         return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
     }
@@ -4701,8 +4704,9 @@ pub(crate) async fn handle_export_rdf_star(arguments: &Value, store: Arc<dyn Vec
     let mut legacy_quads = crate::rdf::projection::project_rows_legacy(&row_pairs, &edge_tuples, &namespace, crate::rdf::types::Tier::Domain, 0);
     legacy_quads.extend(crate::rdf::projection::quads_to_legacy(&edge_ox_quads));
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
-        if let Ok(ox_quads) = ls.project_namespace_rdf(&namespace, crate::rdf::types::Tier::Domain, 0).await {
-            legacy_quads = ox_quads;
+        match ls.project_namespace_rdf(&namespace, crate::rdf::types::Tier::Domain, 0).await {
+            Ok(ox_quads) => legacy_quads = ox_quads,
+            Err(e) => tracing::warn!("project_namespace_rdf failed for '{namespace}': {e}"),
         }
     }
     let projected_quad_count = legacy_quads
@@ -4765,7 +4769,10 @@ pub(crate) async fn handle_provenance_for(arguments: &Value, store: Arc<dyn Vect
 pub(crate) async fn handle_storage_status(store: Arc<dyn VectorStore>) -> String {
     let cfg = crate::config::Config::from_default_path()
         .map(|c| c.storage_hygiene)
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!("Config::from_default_path failed in storage_status, using defaults: {e}");
+            Default::default()
+        });
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
         let status = crate::storage::compute_storage_status(ls.local_path(), &cfg);
         return serde_json::to_string(&status)
@@ -4924,10 +4931,16 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
         Vec<crate::time_series::Sample>,
         Option<crate::time_series::RollingAgg>,
     ) {
-        let sample_set = ls
+        let sample_set = match ls
             .query_db_metrics(namespace, kind, name, since_ts, until_ts, limit)
             .await
-            .unwrap_or_default();
+        {
+            Ok(samples) => samples,
+            Err(e) => {
+                tracing::warn!("query_db_metrics failed for '{namespace}': {e}");
+                Vec::new()
+            }
+        };
         let agg = ls
             .metrics()
             .aggregate(&(namespace.to_string(), kind, name.to_string()));
@@ -6001,14 +6014,16 @@ async fn handle_rebuild_communities(
     });
 
     let vec_dim = match node_ids.first() {
-        Some(first_id) => store
-            .get(namespace, first_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|(v, _)| v.len())
-            .filter(|&len| len > 0)
-            .unwrap_or_else(|| embedder.dimensions().max(1)),
+        Some(first_id) => match store.get(namespace, first_id).await {
+            Ok(Some((v, _))) if !v.is_empty() => v.len(),
+            Ok(_) => embedder.dimensions().max(1),
+            Err(e) => {
+                tracing::warn!(
+                    "rebuild_communities vector probe failed for '{namespace}:{first_id}': {e}"
+                );
+                embedder.dimensions().max(1)
+            }
+        },
         None => embedder.dimensions().max(1),
     };
 
@@ -12701,19 +12716,26 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
     let mut proposed: Vec<(String, String, String, usize)> = Vec::new(); // (title, description, file, line_no)
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
-        .ok()
-        .into_iter()
-        .flat_map(|rd| rd.flatten())
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
-        .collect();
+    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(path) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("handle_distill read_dir failed for {}: {e}", path.display());
+            Vec::new()
+        }
+    };
     files.sort();
 
     for file in files {
         let content = match std::fs::read_to_string(&file) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!("handle_distill failed to read {}: {e}", file.display());
+                continue;
+            }
         };
         for (line_no, line) in content.lines().enumerate() {
             let trimmed = line.trim();

@@ -253,7 +253,12 @@ pub(crate) fn procedures_due_strap_filtered(
     task_id: Option<&str>,
 ) -> String {
     let all = procedures_due(memories, now);
-    let needle = query.or(task_id).unwrap_or("").to_lowercase();
+    let needle = query
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| task_id.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("")
+        .to_lowercase();
     if needle.is_empty() {
         return procedures_due_strap(memories, now);
     }

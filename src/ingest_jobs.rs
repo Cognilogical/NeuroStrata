@@ -174,7 +174,7 @@ impl IngestJobs {
         };
 
         let mut rx = {
-            let mut jobs = self.jobs.lock().unwrap();
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
 
             if let Some(running) = attach_to_running(&jobs, namespace, &canonical_dir)? {
                 running
@@ -252,7 +252,7 @@ impl IngestJobs {
     /// cleared the namespace but before it had rebuilt or relinked it.
     pub async fn wait_idle(&self, limit: std::time::Duration) -> bool {
         let receivers: Vec<watch::Receiver<IngestProgress>> =
-            self.jobs.lock().unwrap().values().cloned().collect();
+            self.jobs.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
 
         let all_finished = async move {
             for mut rx in receivers {
