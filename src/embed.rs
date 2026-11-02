@@ -136,6 +136,7 @@ pub fn configured_dimensions() -> Result<usize> {
     Ok(configured_model()?.dimensions)
 }
 
+/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 const MAX_EMBED_TOKENS: usize = 2048;
 
 /// Verify a model file's SHA-256 checksum against a pinned value.
@@ -204,8 +205,7 @@ fn collect_onnx_files(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, max_d
     }
 }
 
-/// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
-
+/// Local fastembed-backed embedding provider.
 pub struct FastEmbedder {
     model: Arc<Mutex<TextEmbedding>>,
     model_name: String,
@@ -216,8 +216,23 @@ impl FastEmbedder {
     pub fn new() -> Result<Self> {
         let target_model = configured_model()?;
 
-        let model_enum = EmbeddingModel::from_str(&target_model.model_name)
-            .unwrap_or(EmbeddingModel::NomicEmbedTextV15);
+        // The descriptor must describe the model actually loaded: an unknown
+        // configured name silently falls back to NomicEmbedTextV15 (768 dims).
+        let (model_enum, loaded_model_name, loaded_dims) =
+            match EmbeddingModel::from_str(&target_model.model_name) {
+                Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
+                Err(_) => {
+                    tracing::warn!(
+                        "Unknown embedding model '{}', falling back to NomicEmbedTextV15 (768 dims)",
+                        target_model.model_name
+                    );
+                    (
+                        EmbeddingModel::NomicEmbedTextV15,
+                        "NomicEmbedTextV15".to_string(),
+                        768,
+                    )
+                }
+            };
 
         let cache_dir = find_existing_cache_dir();
 
@@ -253,8 +268,8 @@ impl FastEmbedder {
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
-            model_name: target_model.model_name.clone(),
-            dimensions: target_model.dimensions,
+            model_name: loaded_model_name,
+            dimensions: loaded_dims,
         })
     }
 }
@@ -276,7 +291,9 @@ impl Embedder for FastEmbedder {
         })
         .await
         .map_err(|e| anyhow::anyhow!("embed task panicked: {}", e))??;
-        Ok(embeddings.pop().unwrap_or_default())
+        embeddings
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("Embedding model returned an empty vector batch"))
     }
 
     fn dimensions(&self) -> usize {

@@ -202,8 +202,10 @@ pub(crate) fn procedures_due_strap(memories: &[SearchResult], now: i64) -> Strin
 }
 
 /// Filtered variant: only procedures whose trigger or content matches the
-/// query/task_id (substring, case-insensitive). Falls back to all due when
-/// no filter matches anything.
+/// query/task_id (substring, case-insensitive). When no due procedure matches
+/// the filter, returns `"No procedures match the given filter.\n"` — it does
+/// not fall back to the unfiltered list. An empty filter matches all due
+/// procedures (the unfiltered strap).
 pub(crate) fn procedures_due_strap_filtered(
     memories: &[SearchResult],
     now: i64,
@@ -310,30 +312,83 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
         }
     };
 
-    // No namespace parameter: the tool is addressed by memory id alone, so the
-    // row is found by scanning the namespace list. Ids are UUIDs, so the scan
-    // lands on one row; sorting first keeps the answer independent of database
-    // row order.
-    let mut namespaces = store.list_namespaces().await.unwrap_or_default();
-    namespaces.sort();
-    // Composite Rec #20, first pass: locate the row's namespace only, so the
-    // per-procedure fire lock can be keyed by `{namespace}::{id}` before the
-    // mutation path reads anything. Ids are UUIDs, so the scan lands on one
-    // row; sorting first keeps the answer independent of database row order.
+    // Optional explicit namespace: when given, address the row directly before
+    // paying for the UUID scan across every namespace.
+    let explicit_ns = arguments
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(std::string::ToString::to_string);
+
+    // Store errors must not masquerade as `not found`: every Err is kept here
+    // and, when the row fails to locate, answered truthfully as a store error.
+    let mut last_err: Option<anyhow::Error> = None;
+
     let mut holder: Option<String> = None;
-    for namespace in namespaces {
-        match store.get(&namespace, &id).await {
-            Ok(Some(_)) => {
-                holder = Some(namespace);
-                break;
+    if let Some(ns) = explicit_ns {
+        holder = match store.get(&ns, &id).await {
+            Ok(Some(_)) => Some(ns.clone()),
+            Ok(None) => None,
+            Err(e) => {
+                last_err.get_or_insert(e);
+                None
             }
-            Ok(None) => {}
-            Err(_) => continue,
+        };
+    }
+    if holder.is_none() {
+        // No namespace parameter (or the explicit one missed): the row is
+        // found by scanning the namespace list. Ids are UUIDs, so the scan
+        // lands on one row; sorting first keeps the answer independent of
+        // database row order.
+        let mut namespaces = match store.list_namespaces().await {
+            Ok(ns) => ns,
+            Err(e) => {
+                return reply(
+                    false,
+                    false,
+                    false,
+                    None,
+                    0,
+                    None,
+                    &format!("store error: {e}"),
+                )
+            }
+        };
+        namespaces.sort();
+        // Composite Rec #20, first pass: locate the row's namespace only, so the
+        // per-procedure fire lock can be keyed by `{namespace}::{id}` before the
+        // mutation path reads anything. Ids are UUIDs, so the scan lands on one
+        // row; sorting first keeps the answer independent of database row order.
+        for namespace in namespaces {
+            match store.get(&namespace, &id).await {
+                Ok(Some(_)) => {
+                    holder = Some(namespace);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    last_err.get_or_insert(e);
+                }
+            }
         }
     }
     let namespace = match holder {
         Some(ns) => ns,
-        None => return reply(false, false, false, None, 0, None, "not found"),
+        None => {
+            return match last_err {
+                Some(e) => reply(
+                    false,
+                    false,
+                    false,
+                    None,
+                    0,
+                    None,
+                    &format!("store error: {e}"),
+                ),
+                None => reply(false, false, false, None, 0, None, "not found"),
+            };
+        }
     };
 
     // Hold the per-procedure fire lock from before the authoritative read to

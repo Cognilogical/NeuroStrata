@@ -172,6 +172,9 @@ struct SymbolRow {
 struct DocSection {
     slug: String,
     heading: String,
+    /// Markdown heading depth (# = 1, ## = 2, ...); 0 for the implicit root.
+    /// Persisted as `heading_level` in the doc-section node metadata.
+    level: usize,
     text: String,
     sha256: String,
     backticked: Vec<String>,
@@ -185,7 +188,7 @@ fn parse_markdown_sections(content: &str) -> Vec<DocSection> {
     let mut current_level: usize = 0;
     let mut body: Vec<String> = Vec::new();
 
-    let flush = |heading: Option<String>, _level: usize, body: &Vec<String>, out: &mut Vec<DocSection>| {
+    let flush = |heading: Option<String>, level: usize, body: &Vec<String>, out: &mut Vec<DocSection>| {
         let heading = heading.unwrap_or_else(|| "root".to_string());
         let text = body.join("\n").trim().to_string();
         if text.is_empty() {
@@ -233,6 +236,7 @@ fn parse_markdown_sections(content: &str) -> Vec<DocSection> {
         out.push(DocSection {
             slug,
             heading,
+            level,
             text,
             sha256: sha,
             backticked,
@@ -265,6 +269,7 @@ fn parse_markdown_sections(content: &str) -> Vec<DocSection> {
             sections.push(DocSection {
                 slug: "root".to_string(),
                 heading: "root".to_string(),
+                level: 0,
                 text: text.clone(),
                 sha256: sha256_hex(text.as_bytes()),
                 backticked: vec![],
@@ -840,6 +845,7 @@ async fn run_consumer(
                 let mut metadata = serde_json::Map::new();
                 metadata.insert("domain".to_string(), serde_json::json!("docs"));
                 metadata.insert("heading".to_string(), serde_json::json!(section.heading));
+                metadata.insert("heading_level".to_string(), serde_json::json!(section.level));
                 metadata.insert("slug".to_string(), serde_json::json!(section.slug));
                 metadata.insert("backticked".to_string(), serde_json::json!(section.backticked));
                 metadata.insert("links".to_string(), serde_json::json!(section.links));
@@ -917,7 +923,9 @@ pub async fn ingest_directory(
     let worktree_id = source_key_for(dir_path);
     let source_key = worktree_id.clone();
     let ingest_start = std::time::Instant::now();
-    let _ = crate::registry::enrichment_start(&vector_store, Some(&embedder), namespace, &source_key).await;
+    if let Err(e) = crate::registry::enrichment_start(&vector_store, Some(&embedder), namespace, &source_key).await {
+        tracing::warn!("enrichment registry update failed: {e}");
+    }
     let source_identity = crate::context::model::SourceIdentity {
         worktree_id,
         ..Default::default()
@@ -1049,7 +1057,9 @@ pub async fn ingest_directory(
                 generation, namespace, abort
             );
         }
-        let _ = crate::registry::enrichment_fail(&vector_store, Some(&embedder), namespace, "ingest", &e.to_string()).await;
+        if let Err(e) = crate::registry::enrichment_fail(&vector_store, Some(&embedder), namespace, "ingest", &e.to_string()).await {
+            tracing::warn!("enrichment registry update failed: {e}");
+        }
         return Err(e);
     }
 
@@ -1059,52 +1069,65 @@ pub async fn ingest_directory(
     // no previous row is carried in that mode.
     if prev_gen > 0 && !force_reparse {
         let mut carried = 0usize;
-        if let Ok(rows) = vector_store.list(namespace, None, None).await {
-            for r in rows {
-                let id = r.id.clone();
-                let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
-                    Some(x) => x,
-                    None => continue,
-                };
-                if gen != prev_gen { continue; }
-                // The row's `location` is the file it came from (stamped at
-                // ingest time), which survives `#` in file names unlike
-                // splitting the symbol id.
-                let file_path = r.payload.location.clone();
-                let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
-                // Carry a previous row only when its file is still present with
-                // the same bytes, or (for no-hash rows) when the path is still
-                // visited. Deleted files and stale symbols drop out.
-                let carry = if current_paths.contains(&file_path) {
-                    match &hash {
-                        Some(h) => current_hashes.get(&file_path) == Some(h),
-                        None => true,
+        let rows = match vector_store.list(namespace, None, None).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "carry-forward: could not list previous-generation rows of namespace {}: {}",
+                    namespace, e
+                );
+                Vec::new()
+            }
+        };
+        for r in rows {
+            let id = r.id.clone();
+            let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                Some(x) => x,
+                None => continue,
+            };
+            if gen != prev_gen { continue; }
+            // The row's `location` is the file it came from (stamped at
+            // ingest time), which survives `#` in file names unlike
+            // splitting the symbol id.
+            let file_path = r.payload.location.clone();
+            let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+            // Carry a previous row only when its file is still present with
+            // the same bytes, or (for no-hash rows) when the path is still
+            // visited. Deleted files and stale symbols drop out.
+            let carry = if current_paths.contains(&file_path) {
+                match &hash {
+                    Some(h) => current_hashes.get(&file_path) == Some(h),
+                    None => true,
+                }
+            } else {
+                false
+            };
+            if !carry { continue; }
+            if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &id).await {
+                let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
+                let new_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, generation, crate::parser::generation::NAMESPACE_SEPARATOR);
+                payload.metadata.as_object_mut().map(|o| {
+                    o.insert("index_generation".to_string(), serde_json::json!(generation));
+                    o.insert("ingest_version".to_string(), serde_json::json!(current_version));
+                    // Fix contained_by generation prefixes (F2).
+                    if let Some(serde_json::Value::Array(arr)) = o.get("contained_by").cloned() {
+                        let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                        o.insert("contained_by".to_string(), serde_json::Value::Array(updated));
                     }
+                    // Fix depends_on generation prefixes (F2).
+                    if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
+                        let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                        o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
+                    }
+                });
+                let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
+                if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {
+                    tracing::warn!(
+                        "carry-forward: failed to re-stage node {} into generation {}: {}",
+                        new_id, generation, e
+                    );
                 } else {
-                    false
-                };
-                if !carry { continue; }
-                if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &id).await {
-                    let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
-                    let new_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, generation, crate::parser::generation::NAMESPACE_SEPARATOR);
-                    payload.metadata.as_object_mut().map(|o| {
-                        o.insert("index_generation".to_string(), serde_json::json!(generation));
-                        o.insert("ingest_version".to_string(), serde_json::json!(current_version));
-                        // Fix contained_by generation prefixes (F2).
-                        if let Some(serde_json::Value::Array(arr)) = o.get("contained_by").cloned() {
-                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
-                            o.insert("contained_by".to_string(), serde_json::Value::Array(updated));
-                        }
-                        // Fix depends_on generation prefixes (F2).
-                        if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
-                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
-                            o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
-                        }
-                    });
-                    let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
-                    if vector_store.upsert(namespace, &new_id, vec, payload).await.is_ok() {
-                        carried += 1;
-                    }
+                    carried += 1;
                 }
             }
         }
@@ -1122,23 +1145,39 @@ pub async fn ingest_directory(
             if let Some(obj) = payload.metadata.as_object_mut() {
                 obj.insert("depends_on".to_string(), serde_json::json!(target_ids));
             }
-            let _ = vector_store.upsert(namespace, &src_id, vec, payload).await;
+            if let Err(e) = vector_store.upsert(namespace, &src_id, vec, payload).await {
+                tracing::warn!(
+                    "depends_on stamping: failed to upsert file node {} for namespace {}: {}",
+                    src_id, namespace, e
+                );
+            }
         }
     }
 
     // Atomically flip the active pointer onto this generation. Only now are its
     // nodes reachable; the previous generation remains as history.
-    vector_store
+    if let Err(e) = vector_store
         .publish_generation(namespace, &source_key, generation)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "stored the nodes of namespace {} but could not make generation {} active: {}",
-                namespace,
-                generation,
-                e
-            )
-        })?;
+    {
+        // Publication failed: abort the staged generation so its rows do not
+        // leak as orphaned staging (same cleanup as the failure branch above).
+        if let Err(abort) = vector_store
+            .abort_generation(namespace, &source_key, generation)
+            .await
+        {
+            eprintln!(
+                "Failed to abort staging generation {} of namespace {}: {}",
+                generation, namespace, abort
+            );
+        }
+        return Err(anyhow::anyhow!(
+            "stored the nodes of namespace {} but could not make generation {} active: {}",
+            namespace,
+            generation,
+            e
+        ));
+    }
 
     // A rule is not rewritten just because its file came back, so replay what
     // the memories still declare now that the nodes they point at are the

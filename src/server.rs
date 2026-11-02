@@ -3445,7 +3445,9 @@ async fn handle_get_snapshot(
         if let Some(obj) = payload.metadata.as_object_mut() {
             obj.insert("doctor_state".to_string(), doctor_state);
         }
-        let _ = store.upsert(namespace, &rid, vec, payload).await;
+        if let Err(e) = store.upsert(namespace, &rid, vec, payload).await {
+            tracing::warn!("failed to persist doctor_state into {}::{}: {e}", namespace, rid);
+        }
     }
 
     // Communities (N) section (§5.6): partition community_summary out of all_memories,
@@ -4285,7 +4287,10 @@ pub(crate) async fn handle_twin_set(
     }
 
     let namespace = resolve_namespace(&store, ns_raw).await;
-    let rows_raw = store.list(&namespace, None, None).await.unwrap_or_default();
+    let rows_raw = match store.list(&namespace, None, None).await {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"ok": false, "error": format!("Failed to list namespace '{}': {}", namespace, e)}).to_string(),
+    };
     let rows: Vec<(String, crate::traits::MemoryPayload)> = rows_raw
         .into_iter()
         .map(|r| (r.id, r.payload))
@@ -4624,7 +4629,10 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
             serde_json::json!({"data":null,"errors":[{"message":e.to_string()}]}).to_string()
         });
     }
-    let rows_raw = store.list(&namespace, None, None).await.unwrap_or_default();
+    let rows_raw = match store.list(&namespace, None, None).await {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"data": serde_json::Value::Null, "errors": [{"message": format!("store list error: {}", e)}]}).to_string(),
+    };
     let mut records = Vec::with_capacity(rows_raw.len());
     let mut edges_by_source: std::collections::HashMap<
         String,
@@ -5156,7 +5164,10 @@ async fn handle_domain_registry(arguments: Value, emb: Arc<dyn crate::traits::Em
             if !entries.iter().any(|e| e.get("slug").and_then(|v|v.as_str())==Some(&slug)) {
                 return serde_json::json!({"ok":false,"error":{"code":"NOT_FOUND","message":format!("'{}' not found",slug)},"registry":{"version":2,"domains":entries},"warnings":[]}).to_string();
             }
-            let rows = store.list(namespace, None, None).await.unwrap_or_default();
+            let rows = match store.list(namespace, None, None).await {
+                Ok(r) => r,
+                Err(e) => return serde_json::json!({"ok":false,"error":{"code":"STORE_ERROR","message":e.to_string()},"warnings":[]}).to_string(),
+            };
             let orphaned = rows.iter().filter(|r| {
                 !crate::registry::is_registry_row(&r.payload.metadata) &&
                 crate::domain::domain_keys(&r.payload.metadata).iter().any(|k| k == &slug)
@@ -5181,7 +5192,9 @@ async fn handle_domain_registry(arguments: Value, emb: Arc<dyn crate::traits::Em
                 location_lines: String::new(),
                 metadata: meta2,
             };
-            let _ = store.upsert(namespace, &rid, vector, payload).await;
+            if let Err(e) = store.upsert(namespace, &rid, vector, payload).await {
+                return serde_json::json!({"ok":false,"error":{"code":"STORE_ERROR","message":e.to_string()},"warnings":[]}).to_string();
+            }
             if let Some(ls) = crate::traits::VectorStore::as_any(&*store).downcast_ref::<crate::store::ladybug::LadybugStore>() { ls.refresh_ontology(namespace).await; }
             let meta3 = read_registry().await;
             serde_json::json!({"ok":true,"registry":{"version":2,"domains":crate::registry::registry_domain_entries(&meta3)},"warnings":[],"removed":true,"orphaned_memories":orphaned}).to_string()
@@ -5866,7 +5879,9 @@ async fn handle_rebuild_communities(
 
     // Also rebuild the on-disk Tantivy BM25 lexical index for the namespace.
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
-        let _ = ls.rebuild_tantivy_lexical(Some(namespace)).await;
+        if let Err(e) = ls.rebuild_tantivy_lexical(Some(namespace)).await {
+            tracing::warn!("failed to rebuild Tantivy lexical index for {}: {e}", namespace);
+        }
     }
 
     // Modularity comes from the Leiden run above (detect_communities_with_quality).

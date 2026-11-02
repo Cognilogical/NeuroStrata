@@ -46,7 +46,10 @@ fn tighten_token_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(metadata) = std::fs::metadata(path) {
         if metadata.permissions().mode() & 0o077 != 0 {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .inspect_err(|e| {
+                    tracing::warn!("failed to tighten token file permissions on {}: {e}", path.display());
+                });
         }
     }
 }
@@ -62,7 +65,9 @@ fn load_or_create_token_file(path: &Path) -> String {
     }
     let token = generate_token();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("failed to create token file directory {}: {e}", dir.display());
+        }
     }
     #[cfg(unix)]
     {
@@ -78,13 +83,17 @@ fn load_or_create_token_file(path: &Path) -> String {
             .open(path)
             .and_then(|mut f| f.write_all(token.as_bytes()));
         if created.is_err() {
-            let _ = std::fs::write(path, &token);
+            if let Err(e) = std::fs::write(path, &token) {
+                tracing::warn!("failed to write token file {}: {e}", path.display());
+            }
             tighten_token_permissions(path);
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::write(path, &token);
+        if let Err(e) = std::fs::write(path, &token) {
+            tracing::warn!("failed to write token file {}: {e}", path.display());
+        }
     }
     token
 }
@@ -683,13 +692,15 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
     // R9: source-to-mesh reconciliation — re-emit any shareable memory in the
     // store that has no corresponding mesh record file. Closes the lossy-bus
     // loss window: dropped pulses are re-discovered on the next drain.
-    let _ = crate::events::subscribers::mesh_outbox::MeshOutbox::reconcile(
+    if let Err(e) = crate::events::subscribers::mesh_outbox::MeshOutbox::reconcile(
         store.as_ref(),
         &mesh_dir,
         &outbox,
         &namespaces,
         epoch,
-    ).await;
+    ).await {
+        tracing::warn!("mesh outbox reconcile failed: {e}");
+    }
     match drain_once(&outbox, &mesh, &node_id) {
         Ok(report) if report.pending_seen > 0 => {
             tracing::debug!(
@@ -883,7 +894,9 @@ pub(crate) async fn start_daemon_on(
                     let ls = crate::traits::VectorStore::as_any(periodic_store.as_ref())
                         .downcast_ref::<crate::store::LadybugStore>();
                     if let Some(ls) = ls {
-                        let _ = ls.flush_metrics().await;
+                        if let Err(e) = ls.flush_metrics().await {
+                            tracing::warn!("periodic flush_metrics failed: {e}");
+                        }
                         match crate::storage::compute_storage_status(ls.local_path(), &hygiene)
                         {
                             status if status.wal_warn_threshold_exceeded => {
@@ -1337,7 +1350,7 @@ async fn handle_memory_archive(
 async fn handle_edit(
     State(state): State<AppState>,
     Json(req): Json<EditReq>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<&'static str, (axum::http::StatusCode, String)> {
     // The operator's repair path: an in-place rewrite that keeps the id and
     // keeps no history. Agents get neurostrata_supersede_memory instead, which
     // is additive. Editing stays here, behind a human, because it destroys.
@@ -1356,14 +1369,20 @@ async fn handle_edit(
     )
     .await
     {
-        Ok(crate::server::EditOutcome::Edited) | Ok(crate::server::EditOutcome::NotFound) => {
-            Ok("OK")
+        Ok(crate::server::EditOutcome::Edited) => Ok("OK"),
+        Ok(crate::server::EditOutcome::NotFound) => {
+            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
         }
         // The next ingest of that namespace would overwrite the edit.
-        Ok(crate::server::EditOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
+        Ok(crate::server::EditOutcome::Ingested) => {
+            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the edit".to_string()))
+        }
         Err(e) => {
             eprintln!("edit of {} in {} failed: {}", req.id, old_namespace, e);
-            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("edit of {} in {} failed: {}", req.id, old_namespace, e),
+            ))
         }
     }
 }
@@ -1378,16 +1397,23 @@ struct SetMetadataReq {
 async fn handle_set_metadata(
     State(state): State<AppState>,
     Json(req): Json<SetMetadataReq>,
-) -> Result<&'static str, axum::http::StatusCode> {
+) -> Result<&'static str, (axum::http::StatusCode, String)> {
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
     match crate::server::set_metadata(&*state.vector_store, &namespace, &req.id, req.metadata).await
     {
-        Ok(crate::server::MetadataOutcome::Updated)
-        | Ok(crate::server::MetadataOutcome::NotFound) => Ok("OK"),
-        Ok(crate::server::MetadataOutcome::Ingested) => Err(axum::http::StatusCode::CONFLICT),
+        Ok(crate::server::MetadataOutcome::Updated) => Ok("OK"),
+        Ok(crate::server::MetadataOutcome::NotFound) => {
+            Err((axum::http::StatusCode::NOT_FOUND, "Memory not found".to_string()))
+        }
+        Ok(crate::server::MetadataOutcome::Ingested) => {
+            Err((axum::http::StatusCode::CONFLICT, "The next ingest of that namespace would overwrite the metadata".to_string()))
+        }
         Err(e) => {
             eprintln!("set-metadata of {} in {} failed: {}", req.id, namespace, e);
-            Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("set-metadata of {} in {} failed: {}", req.id, namespace, e),
+            ))
         }
     }
 }
@@ -1723,7 +1749,13 @@ async fn handle_http_learning_control(
     axum::Json(req): axum::Json<crate::learning::control::LearningControlRequest>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
     match crate::learning::control::apply_control(&req) {
-        Ok(res) => (axum::http::StatusCode::OK, axum::Json(serde_json::to_value(res).unwrap_or_default())),
+        Ok(res) => match serde_json::to_value(res) {
+            Ok(value) => (axum::http::StatusCode::OK, axum::Json(value)),
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+            ),
+        },
         Err(e) => (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({"ok": false, "error": e})),

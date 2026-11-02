@@ -89,6 +89,7 @@ pub async fn retrieve_context_with_egress(
     include_tasks: bool,
     include_archived: bool,
     require_shareable: bool,
+    snippet_max_chars: usize,
 ) -> Result<RagContext, ChatError> {
     let vector = emb.embed(query).await.map_err(|e| ChatError::Retrieval(format!("embed: {}", e)))?;
     let outcome = store
@@ -117,7 +118,7 @@ pub async fn retrieve_context_with_egress(
         .into_iter()
         .enumerate()
         .map(|(idx, r)| {
-            let snippet = truncate_snippet(&r.payload.content, 280);
+            let snippet = truncate_snippet(&r.payload.content, snippet_max_chars);
             let derivation = if let Some(ev) = &r.evidence {
                 let mut d = Vec::new();
                 for e in ev {
@@ -192,6 +193,9 @@ pub fn build_prompt_with_citations(
     (prompt, citations)
 }
 
+/// Plain prompt wrapper: same builder as [`build_prompt_with_citations`],
+/// discarding the citation list. Test-only convenience wrapper.
+#[cfg(test)]
 pub fn build_prompt(
     ctx: &RagContext,
     question: &str,
@@ -210,10 +214,11 @@ pub async fn retrieve_context(
     limit: usize,
     include_tasks: bool,
     include_archived: bool,
+    snippet_max_chars: usize,
 ) -> Result<RagContext, ChatError> {
     retrieve_context_with_egress(
         store, emb, namespace, principal, query, limit,
-        include_tasks, include_archived, false,
+        include_tasks, include_archived, false, snippet_max_chars,
     ).await
 }
 
@@ -399,14 +404,17 @@ pub async fn ask(
         retrieve_context(
             store.clone(), emb.clone(), namespace, principal, question, limit,
             include_tasks, include_archived,
+            // Snippets are the context budget's working unit: keep per-hit
+            // truncation proportional to the prompt ceiling.
+            (max_context_chars / 4).clamp(120, 1000),
         ).await?
     } else {
         retrieve_context_with_egress(
             store, emb, namespace, principal, question, limit,
             include_tasks, include_archived, provider.is_remote(),
+            (max_context_chars / 4).clamp(120, 1000),
         ).await?
     };
-    let _prompt_preview = build_prompt(&ctx, question, system, max_context_chars);
     let (prompt, citations) = build_prompt_with_citations(&ctx, question, system, max_context_chars);
     let answer = provider.answer(&prompt).await?;
     let context_count = citations.len();
@@ -433,6 +441,8 @@ mod tests {
             total: 2,
         };
         let (prompt, cit) = build_prompt_with_citations(&ctx, "test?", None, 4000);
+        // The plain wrapper must match the citable builder byte-for-byte.
+        assert_eq!(build_prompt(&ctx, "test?", None, 4000), prompt);
         assert!(prompt.contains("System:"));
         assert!(prompt.contains("Context:"));
         assert!(prompt.contains("[1] (id=mem-abc, score=0.12)"));

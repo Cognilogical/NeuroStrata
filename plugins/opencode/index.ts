@@ -70,6 +70,22 @@ function asRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
 }
 
+/**
+ * First argument-carrying object among the candidates.
+ *
+ * Hosts disagree on where payload args live (`input.input` vs `input.args`);
+ * `asRecord` folds a miss to `{}`, so the `??` chain must compare the raw
+ * values and skip misses outright.
+ */
+function firstRecord(...candidates: unknown[]): Record<string, unknown> {
+  for (const candidate of candidates) {
+    if (typeof candidate === "object" && candidate !== null) {
+      return candidate as Record<string, unknown>;
+    }
+  }
+  return {};
+}
+
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
 }
@@ -399,6 +415,22 @@ function initialStatus(): AdapterStatus {
 
 let status: AdapterStatus = initialStatus();
 
+/**
+ * Session/task tracking between host tool calls and guard validation.
+ *
+ * The guard needs `active_task_id`, but a host passes `write`/`edit` args
+ * that carry none of it. Task mutations (`claim`/`update`/`complete`) whose
+ * arguments carry `id` / `session_id` are the only reliable source.
+ */
+let activeSessionId: string | null = null;
+let activeTaskId: string | null = null;
+
+/** Reset the tracked session/task state (test hook). */
+export function resetState(): void {
+  activeSessionId = null;
+  activeTaskId = null;
+}
+
 /** The adapter's current state. A degraded core is visible here. */
 export function adapterStatus(): AdapterStatus {
   return { ...status, missingTools: [...status.missingTools] };
@@ -597,8 +629,10 @@ export async function prefetchMemoriesForFile(
     touchPrefetchedPath(key);
     return [];
   }
-  recordPrefetchedPath(key);
 
+  // Record the LRU entry only after the recall actually succeeded: a
+  // disconnected or failed call must never permanently suppress prefetch
+  // for this file within the LRU window.
   if (!mcpClient) return [];
 
   const text = await mcpClient.callTool("neurostrata_memories_for_file", {
@@ -606,6 +640,7 @@ export async function prefetchMemoriesForFile(
     path,
     limit: 5,
   });
+  recordPrefetchedPath(key);
 
   const out: string[] = [];
   for (const hit of parseFileMemoryHits(text)) {
@@ -630,6 +665,7 @@ let mcpClient: NeuroStrataMCPClient;
  */
 export function resetClientForTesting(): void {
   mcpClient = undefined as any;
+  resetState();
 }
 
 /**
@@ -705,12 +741,38 @@ export async function initialize(ctx: any): Promise<void> {
       }
     }
 
+    // Session/task tracking (F10): task mutations carry the `id` and
+    // `session_id` guard validation needs for the mutating write/edit calls
+    // that follow. Best-effort — a malformed payload never blocks the tool.
+    if (
+      toolName === "neurostrata_task_claim" ||
+      toolName === "neurostrata_task_update" ||
+      toolName === "neurostrata_task_complete"
+    ) {
+      const payloadArgs = firstRecord(input?.input, input?.args);
+      const sessionId =
+        asString(payloadArgs.session_id) ??
+        asString(input?.session_id) ??
+        asString(input?.sessionID);
+      if (sessionId) activeSessionId = sessionId;
+      const taskId = asString(payloadArgs.id);
+      if (toolName === "neurostrata_task_complete") {
+        activeTaskId = null;
+      } else if (taskId) {
+        activeTaskId = taskId;
+      }
+    }
+
     // Guard validation stays on the mutating tools only.
     if (toolName !== "write" && toolName !== "edit" && toolName !== "bash") return;
     const call: any = {
       name: toolName,
-      args: input?.input ?? {},
-      session_id: input?.sessionID ?? null,
+      args: firstRecord(input?.input, input?.args),
+      session_id:
+        asString(input?.session_id) ??
+        asString(input?.sessionID) ??
+        activeSessionId ??
+        undefined,
     };
     // Run guard validation (fail closed).
     if (!config.strictMode) return;
@@ -748,8 +810,15 @@ export async function initialize(ctx: any): Promise<void> {
       }
     } catch (err) {
       const message = String(err);
-      // Re-throw guard rejections as-is.
-      if (message.startsWith("Zero-Action Start violation:")) throw err;
+      // Re-throw guard rejections as-is: `String(new Error(...))` prepends
+      // "Error: ", so a startsWith check missed policy rejections and
+      // flipped the adapter to "unavailable" on a plain policy answer.
+      if (
+        message.includes("Zero-Action Start violation:") ||
+        message.includes("Guard rejected")
+      ) {
+        throw err;
+      }
       setStatus({ state: "unavailable", lastError: message });
       console.error("[NeuroStrata] Guard validation failed", { error: message });
       throw new Error(
@@ -822,13 +891,18 @@ async function wrapWriteEdit(
   const actionType = call.name; // "write" or "edit"
   const payload = JSON.stringify(call.args);
   const cwd = process.cwd();
+  const { session_id, active_task_id, worktree } = callState(call);
 
   try {
     const text = await mcpClient.callTool("neurostrata_guard_validate", {
       namespace: config.namespace,
+      session_id,
+      active_task_id,
+      worktree,
       action_type: actionType,
       payload,
       cwd,
+      is_mutating: true,
       use_sandbox: false, // semantic-only for speed; sandbox opt-in
     });
 
@@ -840,6 +914,9 @@ async function wrapWriteEdit(
         result.bucket;
       console.warn("Guard rejected write/edit", {
         actionType,
+        session_id,
+        active_task_id,
+        worktree,
         reason,
         rule_ids: result.rule_ids,
       });
@@ -876,8 +953,14 @@ function callState(call: any): {
 } {
   const args = asRecord(call.args);
   return {
-    session_id: asString(call.session_id) ?? asString(args.session_id) ?? "unknown",
-    active_task_id: asString(args.active_task_id) ?? null,
+    // Fall back to the session/task tracked from task mutations: a
+    // write/edit payload rarely carries either field itself.
+    session_id:
+      asString(call.session_id) ??
+      asString(args.session_id) ??
+      activeSessionId ??
+      "unknown",
+    active_task_id: asString(args.active_task_id) ?? activeTaskId,
     worktree: asString(args.worktree) ?? process.cwd(),
   };
 }

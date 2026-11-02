@@ -986,6 +986,14 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
     let hooks_dir = crate::task::git_hooks_dir(root);
     if !hooks_dir.is_dir() { std::fs::create_dir_all(&hooks_dir)?; }
     let target = hooks_dir.join("pre-commit");
+    // A pre-existing hook we did not scaffold is the user's; back it up
+    // rather than silently destroying it by overwriting.
+    if target.exists() {
+        let existing = std::fs::read_to_string(&target)?;
+        if !crate::task::is_ours_hook(&existing) {
+            std::fs::copy(&target, hooks_dir.join("pre-commit.bak"))?;
+        }
+    }
     std::fs::write(&target, crate::task::SCAFFOLDED_PRE_COMMIT_HOOK)?;
     set_hook_executable(&target)?;
     Ok(target)
@@ -3700,10 +3708,15 @@ async fn run() -> anyhow::Result<()> {
                     } else {
                         include_str!("schema.json").to_string()
                     };
-                    if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
-                        let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
-                        println!("{}", report);
-                    }
+                    let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Failed to load schema: {}", e);
+                            return Err(e.into());
+                        }
+                    };
+                    let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
+                    println!("{}", report);
                     return Ok(());
                 }
                 let embedder = build_embedder()?;
@@ -3874,33 +3887,38 @@ async fn run() -> anyhow::Result<()> {
                             include_str!("schema.json").to_string()
                         };
 
-                        if let Ok(schema) = crate::parser::schema::ParserSchema::load(&schema_str) {
-                            // Opt-in pre-ingest hygiene: drop the ingester-owned
-                            // rows (and their lexical docs) so the rebuild starts
-                            // from a clean tree, then surface the generation
-                            // bookkeeping query alongside it.
-                            if std::env::var("NEUROSTRATA_CLEAR_BEFORE_INGEST").is_ok() {
-                                vector_store.clear_ingested(&namespace).await?;
-                                let _ = vector_store.generation_nodes(&namespace, 0).await;
+                        let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("Failed to load schema: {}", e);
+                                return Err(e.into());
                             }
-                            println!(
-                                "Ingesting AST from {:?} into namespace '{}'",
-                                dir_path, namespace
-                            );
-                            crate::parser::ingest::ingest_directory(
-                                dir_path,
-                                &schema,
-                                embedder,
-                                vector_store,
-                                &namespace,
-                                // The CLI has nowhere to report progress to: it
-                                // is already printing each file as it goes.
-                                None,
-                                &[],
-                            )
-                            .await?;
-                            println!("Ingestion complete.");
+                        };
+                        // Opt-in pre-ingest hygiene: drop the ingester-owned
+                        // rows (and their lexical docs) so the rebuild starts
+                        // from a clean tree, then surface the generation
+                        // bookkeeping query alongside it.
+                        if std::env::var("NEUROSTRATA_CLEAR_BEFORE_INGEST").is_ok() {
+                            vector_store.clear_ingested(&namespace).await?;
+                            let _ = vector_store.generation_nodes(&namespace, 0).await;
                         }
+                        println!(
+                            "Ingesting AST from {:?} into namespace '{}'",
+                            dir_path, namespace
+                        );
+                        crate::parser::ingest::ingest_directory(
+                            dir_path,
+                            &schema,
+                            embedder,
+                            vector_store,
+                            &namespace,
+                            // The CLI has nowhere to report progress to: it
+                            // is already printing each file as it goes.
+                            None,
+                            &[],
+                        )
+                        .await?;
+                        println!("Ingestion complete.");
                     }
                     Commands::ExportGraph {
                         exclude_superseded,
@@ -4022,10 +4040,11 @@ async fn run() -> anyhow::Result<()> {
                     }
                     Commands::RepairHygiene { namespace } => {
                         use crate::store::ladybug::LadybugStore;
-                        let direct = LadybugStore::new(
-                            std::env::var_os("NEUROSTRATA_DB").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/home/kenton/.config/NeuroStrata/data/db")),
-                            512,
-                        )?;
+                        let db_path = std::env::var_os("NEUROSTRATA_DB")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| config.db_path.clone());
+                        let dims = crate::embed::configured_dimensions()?;
+                        let direct = LadybugStore::new(db_path, dims)?;
                         let (fixed_shape, fixed_dangling) = direct.repair_namespace_hygiene(&namespace).await?;
                         println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
                     }

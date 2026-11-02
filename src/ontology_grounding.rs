@@ -2,7 +2,6 @@ use crate::registry;
 use crate::store::ladybug::LadybugStore;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct OntologyConfig {
@@ -23,10 +22,18 @@ pub fn resolve_config(registry_metadata: &Value) -> Option<OntologyConfig> {
     Some(OntologyConfig { path, mode })
 }
 
+/// Read and parse a vocabulary file, keeping the failure kind distinct so
+/// callers can report `unreadable` (I/O) separately from `malformed` (JSON).
+fn load_vocabulary_classified(path: &str) -> Result<Value, (&'static str, String)> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| ("unreadable", e.to_string()))?;
+    serde_json::from_str(&content)
+        .map_err(|e| ("malformed", format!("invalid JSON: {e}")))
+}
+
 /// Read and parse a vocabulary file. Returns parsed JSON on success.
 pub fn load_vocabulary(path: &str) -> Result<Value, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&content).map_err(|e| e.to_string())
+    load_vocabulary_classified(path).map_err(|(_, msg)| msg)
 }
 
 /// Extract concept_iri values from a vocabulary for the given domain slugs.
@@ -52,7 +59,7 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
             if let Some(cobj) = concepts.as_object() {
                 for (k, v) in cobj {
                     if let Some(iri) = value_to_iri(v) {
-                        entries.push((k.clone(), iri, Vec::new()));
+                        entries.push((k.clone(), iri, aliases_of(v)));
                     }
                 }
             }
@@ -60,7 +67,7 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
             // top-level slug -> iri/object
             for (k, v) in obj {
                 if let Some(iri) = value_to_iri(v) {
-                    entries.push((k.clone(), iri, Vec::new()));
+                    entries.push((k.clone(), iri, aliases_of(v)));
                 }
             }
         }
@@ -81,28 +88,47 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
     out
 }
 
+/// Extract an `aliases` array from a vocabulary value when the value itself is
+/// an entry object (e.g. a concept object with its own alias list).
+fn aliases_of(v: &Value) -> Vec<String> {
+    v.get("aliases")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default()
+}
+
 fn collect_entries_from_array(arr: &[Value], out: &mut Vec<(String, String, Vec<String>)>) {
     for item in arr {
         if let Some(obj) = item.as_object() {
-            let slug = obj
-                .get("slug")
-                .or_else(|| obj.get("domain"))
-                .or_else(|| obj.get("name"))
-                .or_else(|| obj.get("@id"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            let at_id = obj.get("@id").and_then(|v| v.as_str());
+            // RDF/JSON-LD @graph nodes carry the concept IRI directly in @id;
+            // explicit concept fields win when present.
             let iri = obj
                 .get("concept_iri")
                 .or_else(|| obj.get("conceptIri"))
                 .or_else(|| obj.get("concept"))
                 .or_else(|| obj.get("iri"))
                 .or_else(|| obj.get("uri"))
-                .and_then(value_to_iri);
-            let aliases = obj
-                .get("aliases")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default();
+                .and_then(value_to_iri)
+                .or_else(|| at_id.map(|s| s.to_string()).filter(|s| !s.trim().is_empty()));
+            // The slug names the domain: label fields first, then the trailing
+            // IRI segment of @id (`http://x/onto#auth` -> "auth").
+            let slug = obj
+                .get("slug")
+                .or_else(|| obj.get("domain"))
+                .or_else(|| obj.get("name"))
+                .or_else(|| obj.get("rdfs:label"))
+                .or_else(|| obj.get("skos:prefLabel"))
+                .or_else(|| obj.get("label"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    at_id
+                        .and_then(|s| s.rsplit(['/', '#']).next())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                });
+            let aliases = aliases_of(item);
             if let (Some(s), Some(i)) = (slug, iri) {
                 out.push((s, i, aliases));
             }
@@ -140,19 +166,15 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
         }
     };
 
-    let path = Path::new(&cfg.path);
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            out.push(Value::json_obj(namespace, "unreadable", Some(cfg.path.clone()), e.to_string()));
-            return out;
-        }
-    };
-    // malformed check: must be JSON object
-    let vocab = match serde_json::from_str::<Value>(&content) {
-        Ok(v) => v,
-        Err(_) => {
-            out.push(Value::json_obj(namespace, "malformed", Some(cfg.path.clone()), "invalid JSON".to_string()));
+    let vocab = match load_vocabulary_classified(&cfg.path) {
+        Ok(vocab) => vocab,
+        Err((reason, msg)) => {
+            out.push(Value::json_obj(
+                namespace,
+                reason,
+                Some(cfg.path.clone()),
+                msg,
+            ));
             return out;
         }
     };

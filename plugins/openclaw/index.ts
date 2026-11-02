@@ -469,6 +469,56 @@ function initialStatus(): AdapterStatus {
 
 let status: AdapterStatus = initialStatus();
 
+/**
+ * Session/task tracking between turn content and guard validation.
+ *
+ * OpenClaw exposes no tool-call hook, so task mutations are observed
+ * best-effort from turn content mentioning `neurostrata_task_claim`,
+ * `neurostrata_task_update` or `neurostrata_task_complete`, with the
+ * `id` / `session_id` parameters the payload carries.
+ */
+let activeSessionId: string | null = null;
+let activeTaskId: string | null = null;
+
+/** Reset the tracked session/task state (test hook). */
+export function resetState(): void {
+  activeSessionId = null;
+  activeTaskId = null;
+}
+
+/**
+ * Read the `id` / `session_id` a task-mutation payload carries from turn
+ * content. Handles both JSON (`"id": "x"`) and call-ish (`id = "x"`)
+ * spellings; both `session_id` and camelCase `sessionID` are accepted.
+ */
+function extractTrackingFromText(text: string): {
+  taskId: string | undefined;
+  sessionId: string | undefined;
+} {
+  const id = /(?<![\w-])id["'\s]*[:=]\s*["']([^"']+)["']/.exec(text)?.[1];
+  const sessionId =
+    /session[_\s-]?id["'\s]*[:=]\s*["']([^"']+)["']/i.exec(text)?.[1] ?? undefined;
+  return { taskId: id, sessionId };
+}
+
+/** Update the tracked session/task state from a turn, best-effort. */
+function trackFromTurn(turn: ConversationTurn): void {
+  const lower = turn.content.toLowerCase();
+  const isClaimOrComplete =
+    lower.includes("neurostrata_task_claim") ||
+    lower.includes("neurostrata_task_update") ||
+    lower.includes("neurostrata_task_complete");
+  if (!isClaimOrComplete) return;
+
+  const { taskId, sessionId } = extractTrackingFromText(turn.content);
+  if (sessionId) activeSessionId = sessionId;
+  if (lower.includes("neurostrata_task_complete")) {
+    activeTaskId = null;
+  } else if (taskId) {
+    activeTaskId = taskId;
+  }
+}
+
 /** The adapter's current state. A degraded core is visible here. */
 export function adapterStatus(): AdapterStatus {
   return { ...status, missingTools: [...status.missingTools] };
@@ -662,8 +712,10 @@ export async function prefetchMemoriesForFile(
     touchPrefetchedPath(key);
     return [];
   }
-  recordPrefetchedPath(key);
 
+  // Record the LRU entry only after the recall actually succeeded: a
+  // disconnected or failed call must never permanently suppress prefetch
+  // for this file within the LRU window.
   if (!mcpClient) return [];
 
   const text = await mcpClient.callTool("neurostrata_memories_for_file", {
@@ -671,6 +723,7 @@ export async function prefetchMemoriesForFile(
     path,
     limit: 5,
   });
+  recordPrefetchedPath(key);
 
   const out: string[] = [];
   for (const hit of parseFileMemoryHits(text)) {
@@ -817,9 +870,13 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
   try {
     const text = await mcpClient.callTool("neurostrata_guard_validate", {
       namespace: config.namespace,
+      session_id: activeSessionId ?? "unknown",
+      active_task_id: activeTaskId,
+      worktree: cwd,
       action_type: actionType,
       payload,
       cwd,
+      is_mutating: true,
       use_sandbox: false,
     });
 
@@ -831,6 +888,9 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
         result.bucket;
       requireCtx().logger.warn("Guard rejected file operation", {
         actionType,
+        session_id: activeSessionId ?? "unknown",
+        active_task_id: activeTaskId,
+        worktree: cwd,
         reason,
         rule_ids: result.rule_ids,
       });
@@ -861,6 +921,10 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
 // ──────────────────────────────────────────────────────────────────────
 
 async function onTurnEnd(turn: ConversationTurn): Promise<void> {
+  // Session/task tracking for guard validation (F15): runs before intent
+  // detection so a rejected turn still updates the tracked state.
+  trackFromTurn(turn);
+
   if (!config.intentDetection.enabled) return;
   if (turn.role === "system") return; // don't re-process our own nudges
 

@@ -2268,6 +2268,7 @@ impl LadybugStore {
             let mut updates = 0usize;
             for (id, mtype, loc, content_str, meta_str) in &rows {
                 let mut meta: serde_json::Value = serde_json::from_str(meta_str).unwrap_or(serde_json::json!({}));
+                if !meta.is_object() { meta = serde_json::json!({}); }
                 let mut changed = false;
                 // (a) rule source
                 if mtype == "rule" {
@@ -2286,7 +2287,7 @@ impl LadybugStore {
                         meta.as_object_mut().unwrap().insert("trigger".to_string(), serde_json::Value::String("session-start".to_string()));
                         changed = true;
                     }
-                    let remaining_missing = meta.get("remaining_fires").is_none() || meta.get("remaining_fires").and_then(|v| v.as_u64()).map_or(true, |n| n == 0);
+                    let remaining_missing = meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none();
                     if remaining_missing {
                         meta.as_object_mut().unwrap().insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
                         changed = true;
@@ -2323,7 +2324,7 @@ impl LadybugStore {
                         .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
                         .unwrap_or_else(|| "legacy".to_string()));
                 }
-                if mtype == "fact" || (content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
+                if (content_empty && mtype == "fact") || (content_empty && !mtype.is_empty() && mtype != "rule" && mtype != "procedure" && mtype != "task") {
                     content_backfill = Some(meta.get("title").and_then(|v| v.as_str()).map(|s| s.to_string()).filter(|s| !s.trim().is_empty())
                         .or_else(|| meta.get("location").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s != "N/A"))
                         .unwrap_or_else(|| "legacy".to_string()));
@@ -2338,7 +2339,7 @@ impl LadybugStore {
                         for item in &arr {
                             if let Some(t) = item.as_str() {
                                 // Remove residual unresolved string targets (samples/total) and check existence
-                                if t == "samples" || t == "total" || t.contains("samples") || t.contains("total") {
+                                if t == "samples" || t == "total" {
                                     unresolvable.push(t.to_string());
                                     continue;
                                 }
@@ -2357,13 +2358,18 @@ impl LadybugStore {
                 }
                 if changed || content_backfill.is_some() {
                     let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
-                    let _ = conn.query(&q_meta);
-                    if let Some(backfill_text) = content_backfill {
-                        let safe_back = crate::store::ladybug::escape_ladybug_string(&backfill_text);
-                        let q_content = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), safe_back);
-                        let _ = conn.query(&q_content);
+                    if let Err(e) = conn.query(&q_meta) {
+                        tracing::warn!("hygiene repair: metadata write failed for {id}: {e}");
+                    } else {
+                        if let Some(backfill_text) = content_backfill {
+                            let safe_back = crate::store::ladybug::escape_ladybug_string(&backfill_text);
+                            let q_content = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.content = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), safe_back);
+                            if let Err(e) = conn.query(&q_content) {
+                                tracing::warn!("hygiene repair: content write failed for {id}: {e}");
+                            }
+                        }
+                        updates += 1;
                     }
-                    updates += 1;
                 }
             }
             Ok((updates, updates))
@@ -3009,21 +3015,23 @@ impl VectorStore for LadybugStore {
             }
 
             let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            conn.query(create_rel_table).ok();
 
             let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            conn.query(create_contains_table).ok();
 
             let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            conn.query(create_governs_table).ok();
 
             // Vocabulary v10: extraction edges (memory -> task) behind Lock 2.
             let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            conn.query(create_extracted_table).ok();
 
             // F7: dependency edges (directed).
             let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            conn.query(create_depends_table).ok();
+            for ddl in [create_rel_table, create_contains_table, create_governs_table, create_extracted_table, create_depends_table] {
+                if let Err(e) = conn.query(ddl) {
+                    if !e.to_string().contains("already exists") {
+                        return Err(e.into());
+                    }
+                }
+            }
 
             // RDF projection (Phase 1): idempotent migration for DBs created before
             // edge provenance columns existed. LadybugDB supports ALTER ... ADD.
@@ -4217,6 +4225,21 @@ impl VectorStore for LadybugStore {
         let outcome = self.write_with_deadline("moving a memory", move |conn| {
             // One statement, so there is no moment at which the memory exists in
             // neither namespace, and the row keeps its id, vector and edges.
+            // VERIFY the row actually sat in `from` before claiming the move:
+            // the SET clause matches-and-mutates silently, so without this the
+            // Tantivy index would be rewritten for a row that never moved.
+            let exists_query = format!(
+                "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' AND m.user_id <> 'auto-ingestor' RETURN m.user_id",
+                escape_ladybug_string(&id),
+                escape_ladybug_string(&from)
+            );
+            let present = {
+                let mut rows = conn.query(&exists_query)?;
+                rows.next().is_some()
+            };
+            if !present {
+                return Ok(RelocateOutcome::NotFound);
+            }
             let query = format!(
                 "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' AND m.user_id <> 'auto-ingestor' SET m.namespace = '{}'",
                 escape_ladybug_string(&id),
@@ -4447,7 +4470,7 @@ impl VectorStore for LadybugStore {
             }
         }
 
-        if wanted.is_empty() && active_paths.is_empty() && mention_pairs.is_empty() {
+        if wanted.is_empty() && active_paths.is_empty() && mention_pairs.is_empty() && mention_updates.is_empty() {
             return Ok(0);
         }
 
@@ -4468,7 +4491,9 @@ impl VectorStore for LadybugStore {
                     escape_ladybug_string(id),
                     escape_ladybug_string(meta)
                 );
-                let _ = conn.query(&q);
+                if let Err(e) = conn.query(&q) {
+                    tracing::warn!("relink: mentions metadata write failed for {id}: {e}");
+                }
             }
             // Retire stubs before replaying edges: the replayed declaration
             // then points at the real node, not the placeholder it replaced.
@@ -4483,7 +4508,9 @@ impl VectorStore for LadybugStore {
                 "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' DELETE r",
                 escape_ladybug_string(&namespace_owned)
             );
-            let _ = conn.query(&del_q);
+            if let Err(e) = conn.query(&del_q) {
+                tracing::warn!("relink: mention-detector edge cleanup failed: {e}");
+            }
             created += create_missing_edges(conn, "RELATES_TO", &mention_pairs, &namespace_owned, active_gen, relink_now, "mention-detector")?;
             Ok(created)
         })
@@ -4527,10 +4554,9 @@ impl VectorStore for LadybugStore {
                 safe_ns
             );
             let mut current: i64 = 0;
-            if let Ok(mut rows) = conn.query(&read) {
-                if let Some(row) = rows.next() {
-                    current = format!("{}", row[0]).parse::<i64>().unwrap_or(0);
-                }
+            let mut rows = conn.query(&read)?;
+            if let Some(row) = rows.next() {
+                current = format!("{}", row[0]).parse::<i64>().unwrap_or(0);
             }
             let next = (current.max(0) as u64).saturating_add(1);
 
@@ -4815,6 +4841,9 @@ impl VectorStore for LadybugStore {
             //    set read once below, matching `list`'s superseded filter.
             let mut nodes = Vec::new();
             let mut retired_ids = std::collections::HashSet::new();
+            // Every id actually pushed into `nodes`: edges must never dangle
+            // toward an unexported, superseded, archived or conflicting row.
+            let mut exported_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             let active_gens = all_active_generations(conn);
             let query_nodes = "MATCH (n:Memory) RETURN n.id, n.namespace, n.memory_type, n.content, n.location, n.metadata;";
             let mut result_nodes = conn.query(query_nodes)?;
@@ -4894,6 +4923,7 @@ impl VectorStore for LadybugStore {
                     continue;
                 }
 
+                exported_ids.insert(id.clone());
                 nodes.push(serde_json::json!({
                     "id": id,
                     "namespace": namespace,
@@ -4926,6 +4956,9 @@ impl VectorStore for LadybugStore {
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
                     continue;
                 }
+                if !exported_ids.contains(&source) || !exported_ids.contains(&target) {
+                    continue;
+                }
                 links.push(serde_json::json!({
                     "source": source,
                     "target": target,
@@ -4942,6 +4975,9 @@ impl VectorStore for LadybugStore {
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
                     continue;
                 }
+                if !exported_ids.contains(&source) || !exported_ids.contains(&target) {
+                    continue;
+                }
                 links.push(serde_json::json!({
                     "source": source,
                     "target": target,
@@ -4956,6 +4992,9 @@ impl VectorStore for LadybugStore {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
+                    continue;
+                }
+                if !exported_ids.contains(&source) || !exported_ids.contains(&target) {
                     continue;
                 }
                 links.push(serde_json::json!({
@@ -4976,6 +5015,9 @@ impl VectorStore for LadybugStore {
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
                     continue;
                 }
+                if !exported_ids.contains(&source) || !exported_ids.contains(&target) {
+                    continue;
+                }
                 links.push(serde_json::json!({
                     "source": source,
                     "target": target,
@@ -4990,6 +5032,9 @@ impl VectorStore for LadybugStore {
                 let source = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let target = if let lbug::Value::String(s) = &row[1] { s.clone() } else { continue };
                 if !include_retired && (retired_ids.contains(&source) || retired_ids.contains(&target)) {
+                    continue;
+                }
+                if !exported_ids.contains(&source) || !exported_ids.contains(&target) {
                     continue;
                 }
                 links.push(serde_json::json!({
@@ -5557,6 +5602,7 @@ impl GraphRead for LadybugStore {
         // variant relations (e.g. a strict-governs subproperty) are present in
         // the fetched edges. No ontology loaded → caller relations pass
         // through unchanged.
+        let mut expanded_set: std::collections::HashSet<String> = std::collections::HashSet::new();
         let relations: Vec<String> = if relations.is_empty() {
             relations.to_vec()
         } else {
@@ -5566,6 +5612,7 @@ impl GraphRead for LadybugStore {
                     let mut expanded: Vec<String> = Vec::new();
                     for rel in relations {
                         for r in adapter.expand_relations_for_search(&index, &rel) {
+                            expanded_set.insert(r.clone());
                             expanded.push(r);
                         }
                     }
@@ -5585,7 +5632,7 @@ impl GraphRead for LadybugStore {
 
         let (nodes, edges, generation) = self
             .with_conn(move |conn| {
-                fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops, &policy)
+                fetch_related_subgraph(conn, &ns, &seed_c, &rels, max_hops, &policy, &expanded_set)
             })
             .await?;
 
@@ -5620,6 +5667,7 @@ fn fetch_related_subgraph(
     relations: &[String],
     max_hops: usize,
     cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
+    expanded_set: &std::collections::HashSet<String>,
 ) -> Result<(
     Vec<crate::graph_read::related::NodeSpec>,
     Vec<crate::graph_read::related::EdgeSpec>,
@@ -5641,7 +5689,7 @@ fn fetch_related_subgraph(
         relations
             .iter()
             .map(String::as_str)
-            .filter(|r| crate::graph_read::related::is_allowed_relation(r))
+            .filter(|r| crate::graph_read::related::is_allowed_relation(r) || expanded_set.contains(*r))
             .collect()
     };
 

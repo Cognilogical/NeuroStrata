@@ -5,11 +5,28 @@ pub fn budget_verified(p95_plan_ms: f64, p95_upsert_ms: f64) -> bool {
     p95_plan_ms < 100.0 && p95_upsert_ms < 100.0
 }
 
+/// Last observed plan and upsert latency samples (milliseconds). Production
+/// call sites push real measurements here so the gate verifies its budget on
+/// evidence rather than on the degenerate 0.0/0.0 default.
+static LAST_PLAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_UPSERT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one latency sample pair (milliseconds). Stored as `f64::to_bits`.
+pub fn record_latency_sample(plan_ms: f64, upsert_ms: f64) {
+    use std::sync::atomic::Ordering;
+    LAST_PLAN_MS.store(plan_ms.to_bits(), Ordering::Relaxed);
+    LAST_UPSERT_MS.store(upsert_ms.to_bits(), Ordering::Relaxed);
+}
+
 pub fn retention_gate(receipt_exists: bool) -> bool {
+    use std::sync::atomic::Ordering;
     // Sanity guard: a gate whose own budget predicate cannot evaluate must
-    // fail closed rather than assertedly "passing" on broken inputs. 0.0/0.0
-    // is the degenerate measurement and must always verify.
-    if !budget_verified(0.0, 0.0) {
+    // fail closed rather than assertedly "passing" on broken inputs. The
+    // unstored default decodes to 0.0/0.0 — the degenerate measurement, which
+    // must always verify.
+    let plan_ms = f64::from_bits(LAST_PLAN_MS.load(Ordering::Relaxed));
+    let upsert_ms = f64::from_bits(LAST_UPSERT_MS.load(Ordering::Relaxed));
+    if !budget_verified(plan_ms, upsert_ms) {
         return false;
     }
     receipt_exists // retention requires receipt present
@@ -29,20 +46,34 @@ pub fn verify_task_receipt_retention(
     task_id: &str,
     event_id: &str,
 ) -> bool {
+    // The receipt lookup and the worktree re-verification are the
+    // store-state analogue of the plan and upsert legs: every production
+    // verification feeds a real sample into the gate's latency slots so the
+    // budget check runs on evidence, not the degenerate zeros.
+    let plan_start = std::time::Instant::now();
     // An empty store cannot possibly retain a receipt: report the failure the
     // same way a missing receipt does, without pretending the lookup ran.
     if store.is_empty() || store.len() == 0 {
+        record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
         return retention_gate(false);
     }
     let Some(stored) = store.get(session_id, task_id, event_id) else {
+        record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
         return retention_gate(false); // failed retention: receipt is gone
     };
     if stored.worktree.is_empty() {
+        record_latency_sample(plan_start.elapsed().as_secs_f64() * 1000.0, 0.0);
         return true; // presence-only receipt: nothing further to verify
     }
+    let upsert_start = std::time::Instant::now();
     let (head_sha, dirty_tree_hash) =
         crate::task::receipt::compute_worktree_state(std::path::Path::new(&stored.worktree));
-    retention_gate(stored.is_current(&head_sha, &dirty_tree_hash))
+    let current = stored.is_current(&head_sha, &dirty_tree_hash);
+    record_latency_sample(
+        plan_start.elapsed().as_secs_f64() * 1000.0,
+        upsert_start.elapsed().as_secs_f64() * 1000.0,
+    );
+    retention_gate(current)
 }
 
 #[cfg(test)]
