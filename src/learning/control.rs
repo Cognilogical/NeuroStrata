@@ -45,24 +45,56 @@ const CONTROL_FILE: &str = "control.json";
 /// fresh `LearnStatus` when the file is absent (the loop has never run).
 /// The last recorded control action reads in from `root/control.json` so
 /// status reporting reflects what the operator asked for, not just the
-/// effect it had.
+/// effect it had. A `status.json` / `active_manifest.json` that exists but
+/// cannot be read or parsed is logged and then falls back to the default
+/// rather than silently discarding operator state.
 pub fn load_status(root: &Path) -> LearnStatus {
-    let mut status = std::fs::read_to_string(root.join(STATUS_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<LearnStatus>(&raw).ok())
-        .unwrap_or_default();
+    let status_path = root.join(STATUS_FILE);
+    let mut status: LearnStatus = if status_path.exists() {
+        match std::fs::read_to_string(&status_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|raw| serde_json::from_str::<LearnStatus>(&raw).map_err(anyhow::Error::from))
+        {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to load {} ({}); defaulting to a fresh LearnStatus",
+                    status_path.display(),
+                    e
+                );
+                LearnStatus::default()
+            }
+        }
+    } else {
+        LearnStatus::default()
+    };
     if let Ok(control) = read_control(root) {
         status.last_control = control;
     }
     status
 }
 
-/// Read the active manifest from `root/active_manifest.json` if present.
+/// Read the active manifest from `root/active_manifest.json` if present,
+/// logging (but not failing on) a manifest that exists yet cannot be parsed.
 fn load_manifest(root: &Path) -> ActiveManifest {
-    std::fs::read_to_string(root.join(MANIFEST_FILE))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<ActiveManifest>(&raw).ok())
-        .unwrap_or_default()
+    let manifest_path = root.join(MANIFEST_FILE);
+    if !manifest_path.exists() {
+        return ActiveManifest::default();
+    }
+    match std::fs::read_to_string(&manifest_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|raw| serde_json::from_str::<ActiveManifest>(&raw).map_err(anyhow::Error::from))
+    {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            tracing::warn!(
+                "failed to load {} ({}); defaulting to a fresh ActiveManifest",
+                manifest_path.display(),
+                e
+            );
+            ActiveManifest::default()
+        }
+    }
 }
 
 /// Apply one control action against a concrete root directory and persist the

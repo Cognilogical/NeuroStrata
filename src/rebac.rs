@@ -67,7 +67,8 @@ pub fn extract_visible_to(metadata: &Value) -> Vec<String> {
         .get("visible_to")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter()
+            let parsed: Vec<String> = arr
+                .iter()
                 .filter_map(|v| {
                     if let Some(s) = v.as_str() {
                         Some(s.to_string())
@@ -77,7 +78,15 @@ pub fn extract_visible_to(metadata: &Value) -> Vec<String> {
                         None
                     }
                 })
-                .collect()
+                .collect();
+            // A non-empty array that parsed to nothing is malformed data, not
+            // an unrestricted ACL: the empty Vec means public viewer access in
+            // allowed_with_roles, so fail closed instead.
+            if !arr.is_empty() && parsed.is_empty() {
+                tracing::warn!("malformed non-empty visible_to ACL; failing closed");
+                return vec!["__invalid_acl__".to_string()];
+            }
+            parsed
         })
         .unwrap_or_default()
 }
@@ -90,7 +99,8 @@ pub fn extract_acl_with_roles(metadata: &Value) -> Vec<(String, String)> {
         .get("visible_to")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter()
+            let parsed: Vec<(String, String)> = arr
+                .iter()
                 .filter_map(|v| {
                     if let Some(s) = v.as_str() {
                         Some((s.to_string(), "viewer".to_string()))
@@ -105,7 +115,15 @@ pub fn extract_acl_with_roles(metadata: &Value) -> Vec<(String, String)> {
                         None
                     }
                 })
-                .collect()
+                .collect();
+            // Same fail-closed rule as extract_visible_to: every element of a
+            // non-empty array being malformed must not look like an
+            // unrestricted ACL.
+            if !arr.is_empty() && parsed.is_empty() {
+                tracing::warn!("malformed non-empty visible_to ACL; failing closed");
+                return vec![("__invalid_acl__".to_string(), "viewer".to_string())];
+            }
+            parsed
         })
         .unwrap_or_default()
 }
@@ -371,5 +389,24 @@ mod tests {
         assert!(!is_restricted(&serde_json::json!({"visible_to":["*"]})));
         assert!(can_publish_to_mesh(&serde_json::json!({"visible_to":["alice"]}), &["alice".into()]));
         assert!(can_publish_to_mesh(&serde_json::json!({"visible_to":["*"]}), &[]));
+    }
+
+    // §5.6 fail-closed — a non-empty visible_to array whose every element is
+    // malformed must NOT collapse to an unrestricted ACL (which
+    // allowed_with_roles treats as public viewer access).
+    #[test]
+    fn malformed_non_empty_visible_to_fails_closed() {
+        let meta = serde_json::json!({"user_id":"alice","visible_to":[42]});
+        assert_eq!(extract_visible_to(&meta), vec!["__invalid_acl__"]);
+        assert_eq!(
+            extract_acl_with_roles(&meta),
+            vec![("__invalid_acl__".to_string(), "viewer".to_string())]
+        );
+        assert!(!allowed("bob", "alice", "viewer", &extract_visible_to(&meta)));
+        assert!(!can_read_memory("bob", "alice", &meta));
+        // Malformed elements paired with a valid one still parse the valid one.
+        let mixed = serde_json::json!({"user_id":"alice","visible_to":[42,"bob"]});
+        assert!(can_read_memory("bob", "alice", &mixed));
+        assert!(!can_read_memory("carol", "alice", &mixed));
     }
 }

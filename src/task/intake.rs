@@ -615,7 +615,10 @@ pub async fn handle_intake(
         Some("manual") => SourceKind::Manual,
         Some("imported") => SourceKind::Imported,
         Some("tool") => SourceKind::Tool,
-        _ => SourceKind::Conversation, // default
+        Some("conversation") | Some("") | None => SourceKind::Conversation, // default
+        Some(s) => {
+            return serde_json::json!({ "error": format!("unknown source_kind '{s}' (expected conversation|manual|imported|tool)") }).to_string();
+        }
     };
 
     let source_revision = match args.get("source_revision").and_then(|v| v.as_str()) {
@@ -635,6 +638,10 @@ pub async fn handle_intake(
 
     let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
     let description = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let candidate_kind =
+        args.get("candidate_kind").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let payload = args.get("payload").cloned();
+    let confidence = args.get("confidence").and_then(|v| v.as_f64());
 
     // Downcast to IntakeStore
     let intake_store = store.as_intake_store();
@@ -651,9 +658,9 @@ pub async fn handle_intake(
         text,
         title,
         description,
-        candidate_kind: None,
-        payload: None,
-        confidence: None,
+        candidate_kind,
+        payload,
+        confidence,
     };
 
     match intake_store.create_receipt(request).await {

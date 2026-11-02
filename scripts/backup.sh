@@ -33,7 +33,7 @@ DAEMON_PORT="${NEUROSTRATA_DAEMON_PORT:-34343}"
 SERVICE="${NEUROSTRATA_SERVICE:-neurostrata.service}"
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
-die() { echo "ERROR: $*" >&2; exit "${2:-1}"; }
+die() { local msg="$1" code="${2:-1}"; echo "ERROR: $msg" >&2; exit "$code"; }
 
 # 0. Sanity: systemd-managed daemon (not ad-hoc)
 if ! systemctl --user cat "$SERVICE" >/dev/null 2>&1; then
@@ -56,11 +56,21 @@ if systemctl --user is-active --quiet "$SERVICE"; then
     systemctl --user stop "$SERVICE" || true
 fi
 
+# Never exit without the daemon back up, whatever killed us (die, set -e, signal).
+restore_daemon() {
+    if ${DAEMON_WAS_RUNNING:-false} && ! systemctl --user is-active --quiet "$SERVICE"; then
+        log "restoring $SERVICE after exit"
+        systemctl --user start "$SERVICE" || true
+    fi
+}
+trap restore_daemon EXIT
+
 # Wait for the db file to have no holders. Ground truth is lsof on the file,
 # not the process state — pgrep -f matches itself, and a "stopped" service
 # can still have a file mapping briefly.
 wait_for_file_free() {
     local path="$1" timeout="${2:-30}"
+    if ! command -v lsof >/dev/null 2>&1; then return 0; fi
     for _ in $(seq 1 "$timeout"); do
         if [ -z "$(lsof -t "$path" 2>/dev/null || true)" ]; then return 0; fi
         sleep 1
@@ -116,13 +126,18 @@ fi
 if $DAEMON_WAS_RUNNING; then
     log "systemctl start $SERVICE"
     systemctl --user start "$SERVICE"
+    HEALTHY=false
     for _ in $(seq 1 15); do
         if curl -s -f "http://127.0.0.1:$DAEMON_PORT/health" >/dev/null 2>&1; then
+            HEALTHY=true
             log "daemon healthy"
             break
         fi
         sleep 1
     done
+    if [ "$HEALTHY" != true ]; then
+        die "daemon did not become healthy within 15s after backup" 5
+    fi
 fi
 
 log "done"

@@ -225,10 +225,10 @@ mod unix_impl {
             libc::sigaddset(&mut set, sig);
             libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
 
-            libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
-            // Belt and braces: raise() with the default disposition and
-            // the signal unblocked does not return.
+            // Belt and braces: SA_RESETHAND on the installed sigaction means
+            // the disposition is already SIG_DFL by the time the handler
+            // runs, so the re-raise with the signal unblocked does not return.
             libc::_exit(128 + sig);
         }
     }
@@ -367,12 +367,20 @@ mod unix_impl {
     /// be broken, the unwinder may fail. None of that is allowed to stop
     /// the crash from happening.
     fn append_backtrace(path: &[u8], backtrace: &std::backtrace::Backtrace) {
-        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
-        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-            use std::io::Write;
-            let _ = writeln!(file, "\n--- backtrace ---");
-            let _ = writeln!(file, "{}", backtrace);
-            let _ = file.flush();
+        // Raw open/write like the rest of the handler: OpenOptions::open is
+        // not async-signal-safe and OpenOptions (Rust std) itself allocates.
+        let text = format!("\n--- backtrace ---\n{}\n", backtrace);
+        // SAFETY: `path` is a NUL-terminated path (see write_minimal_report).
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr() as *const libc::c_char,
+                libc::O_WRONLY | libc::O_APPEND | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            write_all(fd, text.as_bytes());
+            // SAFETY: `fd` was opened above and is now closed exactly once.
+            unsafe { libc::close(fd) };
         }
     }
 

@@ -97,8 +97,10 @@ fail() {
 }
 
 # Extracts the first x.y or x.y.z from a tool's --version output.
+# The `|| true` keeps set -o pipefail from aborting before the caller can
+# print its `fail` message when the tool is missing or errors out.
 version_of() {
-    "$@" 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1
+    "$@" 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1 || true
 }
 
 printf '\n%sneurostrata-mcp build (%s)%s\n' "$c_green" "$os" "$c_off"

@@ -37,8 +37,6 @@
 //! The overlay file remains the durable source of truth for [`status_lines`]
 //! and for [`Overlay`]-driven re-presentation; the metadata marker is its
 //! live reflection in the store.
-#[cfg(test)]
-use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -112,7 +110,7 @@ impl Overlay {
     /// the store read paths carry no `mesh_dir`. This remains the overlay's
     /// own query, exercised by the overlay round-trip tests.
     #[cfg(test)]
-    pub fn unresolved_ids(&self, namespace: &str) -> HashSet<String> {
+    pub fn unresolved_ids(&self, namespace: &str) -> std::collections::HashSet<String> {
         self.conflicts
             .iter()
             .filter(|e| e.namespace == namespace && e.kind == ConflictKind::Unresolved)
@@ -148,10 +146,10 @@ pub fn load_overlay(mesh_dir: &Path) -> Overlay {
     let overlay: Overlay = match serde_json::from_str(&text) {
         Ok(o) => o,
         Err(e) => {
-            tracing::warn!(
-                "corrupt or incompatible mesh conflict overlay at {}: parse failed ({e}) — treating as empty",
-                file.display()
-            );
+            tracing::warn!("corrupt mesh conflict overlay at {}: {e}", file.display());
+            // Preserve the corrupt bytes for diagnostics (never deleted);
+            // the overlay itself reads as empty (fail-soft).
+            let _ = std::fs::copy(&file, file.with_extension("json.corrupt"));
             return Overlay::empty();
         }
     };
@@ -499,6 +497,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_overlay(&mesh_dir).unresolved_count(), 0);
+        // AK-M6: corrupt bytes are preserved for diagnostics before the
+        // fail-soft empty read — never silently overwritten or deleted.
+        let backup = conflicts_dir_for(&mesh_dir)
+            .join(OVERLAY_FILE_NAME)
+            .with_extension("json.corrupt");
+        assert!(
+            backup.is_file(),
+            "a parse-safe backup of the corrupt overlay must exist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "{ not json",
+            "the backup carries the corrupt bytes byte-for-byte"
+        );
     }
 
     /// is_conflicting is true only for the typed `metadata.mesh.conflict:

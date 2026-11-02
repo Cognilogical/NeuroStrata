@@ -71,9 +71,22 @@ pub fn split_scoped_id(id: &str) -> Option<(String, u64, String)> {
 /// The logical path inside a physical id: namespace and generation stripped.
 ///
 /// This is the string a rule names (`src/lib.rs`), so edge resolution and
-/// `KnownIds` index on it. A bare id (a UUID, or a pre-namespace path) is
-/// returned unchanged; a generation is only stripped when the id carries three
-/// segments and the middle one is a number.
+/// `KnownIds` index on it. The stripping is deliberately lazier than
+/// [`split_scoped_id`]:
+///
+/// * [`split_scoped_id`] only recognises a *generation-scoped* id — all three
+///   segments (`<namespace>::<generation>::<logical path>`) with the middle
+///   one parsing as a `u64` generation — and returns `None` otherwise. That
+///   strictness is what makes it a safe inverse of [`generation_scoped_id`].
+/// * [`logical_path_of`] accepts unscoped ids and is total. A namespace-only
+///   id (`NeuroStrata::src/lib.rs`, no generation) still has its
+///   `<namespace>::` prefix stripped even though there is no `@g<gen>::`
+///   segment to peel, because a two-segment id's tail is the logical path a
+///   rule would name. The `<generation>::` middle segment is dropped only
+///   when it actually parses as a number; if it does not (or there is no
+///   second separator), the id was never generation-scoped, so the tail after
+///   the namespace is returned as the logical path. An id with no separator
+///   at all (a bare UUID or an already-logical path) is returned unchanged.
 pub fn logical_path_of(id: &str) -> &str {
     if let Some(first) = id.find(NAMESPACE_SEPARATOR) {
         let after_namespace = first + NAMESPACE_SEPARATOR.len();

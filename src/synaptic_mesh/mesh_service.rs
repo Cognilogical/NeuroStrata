@@ -309,17 +309,20 @@ impl MeshService {
                             // runtime (e.g. #[tokio::test]) has no multi-thread worker
                             // pool for block_in_place, so the probe runs on a scoped
                             // OS thread instead.
+                            let bearer =
+                                std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN")
+                                    .unwrap_or_default();
                             let probe = if handle.runtime_flavor()
                                 == tokio::runtime::RuntimeFlavor::MultiThread
                             {
                                 tokio::task::block_in_place(|| {
-                                    handle.block_on(self.federated_remote_list(&remote, &ns, ""))
+                                    handle.block_on(self.federated_remote_list(&remote, &ns, &bearer))
                                 })
                             } else {
                                 std::thread::scope(|s| {
                                     s.spawn(|| {
                                         handle.clone().block_on(self.federated_remote_list(
-                                            &remote, &ns, "",
+                                            &remote, &ns, &bearer,
                                         ))
                                     })
                                     .join()
@@ -401,7 +404,11 @@ pub fn dirty_paths(mesh_root: &Path) -> Vec<String> {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter(|l| {
-            !(l.starts_with("?? ") && l.trim_start_matches("?? ").trim() == MANIFEST_FILE_NAME)
+            !(l.starts_with("?? ")
+                && matches!(
+                    l.trim_start_matches("?? ").trim(),
+                    MANIFEST_FILE_NAME | ".gitignore"
+                ))
         })
         .map(|l| l.trim().to_string())
         .collect()

@@ -44,8 +44,11 @@ pub struct Counts {
     pub done: usize,
     pub total: usize,
     /// Task rows the gate did not judge because they are retired history.
-    /// Counted separately so the report never looks self-contradictory:
-    /// `in_progress` may exceed the number of `in_progress` violations.
+    /// Every retired row still carries its underlying status bucket, so it is
+    /// also counted in `open`/`in_progress`/`blocked`/`done`; `retired` exists
+    /// so the report can disclose how much of those buckets is dead history
+    /// (`in_progress` may exceed the number of `in_progress` violations
+    /// without being self-contradictory).
     pub retired: usize,
 }
 
@@ -504,7 +507,11 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                     });
                 }
             }
+            // Impossible at runtime (invalid values `continue` above) but the
+            // exhaustiveness checker cannot see that for `&str` literals.
             Some(_) => {}
+            // A rule that names a machine without claiming enforcement has
+            // a wire with its power unassigned: nothing runs the guard.
             None => {
                 // A rule that names a machine without claiming enforcement has
                 // a wire with its power unassigned: nothing runs the guard.

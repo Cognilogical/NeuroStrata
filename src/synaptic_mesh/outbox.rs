@@ -225,7 +225,10 @@ impl Outbox {
     /// Read the pending entries in stable (append) order. A trailing fragment
     /// — a line cut off before its newline by a crash mid-append — is dropped
     /// rather than read as a corrupt complete line, because it was never
-    /// durably committed to the WAL.
+    /// durably committed to the WAL. A corrupt complete line is likewise
+    /// never fatal: it is logged (warn) and skipped, so a single bad line
+    /// cannot wedge `drain_once`/`mark_committed`; the diagnostics stay on
+    /// disk untouched.
     pub fn pending(&self) -> Result<Vec<OutboxEntry>, String> {
         let wal = self.dir.join(OUTBOX_FILE_NAME);
         let bytes = match std::fs::read(&wal) {
@@ -249,8 +252,21 @@ impl Outbox {
             if line.is_empty() {
                 continue;
             }
-            let entry: OutboxEntry = serde_json::from_str(line)
-                .map_err(|e| format!("corrupt outbox WAL line ({}): {e}", self.dir.display()))?;
+            // Fail-soft: one corrupt line must not permanently wedge the
+            // drain loop (mark_committed re-reads pending(), so an Err here
+            // would block every retry). Diagnostics are preserved, never
+            // deleted, matching the status surface's contract — the line
+            // stays on disk and is skipped.
+            let entry: OutboxEntry = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping corrupt outbox WAL line in {}: {e}",
+                        self.dir.display()
+                    );
+                    continue;
+                }
+            };
             entries.push(entry);
         }
         Ok(entries)
@@ -416,6 +432,41 @@ mod tests {
             outbox.pending().unwrap(),
             vec![b],
             "a committed, b retained"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_complete_line_is_skipped_not_fatal() {
+        let dir = scratch("corrupt-line");
+        let outbox = Outbox::open(&dir).unwrap();
+        let a = entry(OP_CREATED, "mem-a");
+        outbox.append(&a).unwrap();
+
+        // A complete line (trailing newline — a durable append in git terms of
+        // the WAL format) whose payload is not valid JSON. Diagnostics are the
+        // WAL itself: they stay on disk, never deleted, and are skipped so a
+        // single bad line cannot wedge the drain loop.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join(OUTBOX_FILE_NAME))
+            .unwrap()
+            .write_all(b"this is not an outbox entry\n")
+            .unwrap();
+        let c = entry(OP_ARCHIVED, "mem-c");
+        outbox.append(&c).unwrap();
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(
+            pending,
+            vec![a.clone(), c.clone()],
+            "valid entries around the corrupt line survive, nothing wedges"
+        );
+        // mark_committed keeps working; the corrupt line is never rewritten in.
+        outbox.mark_committed(&[c.stable_op_id]).unwrap();
+        assert_eq!(
+            outbox.pending().unwrap(),
+            vec![a],
+            "commit still removes only the named ids"
         );
     }
 

@@ -150,17 +150,19 @@ impl SandboxEvaluator {
 
                 // Truncate logs to prevent LLM context overflow which causes death spirals and compaction errors
                 if stdout.len() > 500 {
+                    let suffix = safe_utf8_suffix(&stdout, 500);
                     stdout = format!(
-                        "...[TRUNCATED {} chars]...\n{}",
-                        stdout.len() - 500,
-                        &stdout[stdout.len() - 500..]
+                        "...[TRUNCATED {} bytes]...\n{}",
+                        stdout.len() - suffix.len(),
+                        suffix
                     );
                 }
                 if stderr.len() > 500 {
+                    let suffix = safe_utf8_suffix(&stderr, 500);
                     stderr = format!(
-                        "...[TRUNCATED {} chars]...\n{}",
-                        stderr.len() - 500,
-                        &stderr[stderr.len() - 500..]
+                        "...[TRUNCATED {} bytes]...\n{}",
+                        stderr.len() - suffix.len(),
+                        suffix
                     );
                 }
 
@@ -198,5 +200,57 @@ impl SandboxEvaluator {
                 })
             }
         }
+    }
+}
+
+/// UTF-8-safe tail slice: never splits a multi-byte codepoint, so indexing
+/// never panics (AJ-5).
+fn safe_utf8_suffix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut idx = s.len() - max_bytes;
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    &s[idx..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_suffix_no_panic_inside_multibyte_char() {
+        // `s.len() - 500` lands inside a multi-byte '🦀' codepoint: the naive
+        // byte slice would panic, the helper must split forward instead.
+        let crab = "🦀".repeat(300);
+        assert_eq!(crab.len(), 1200);
+        let suffix = safe_utf8_suffix(&crab, 500);
+        assert!(suffix.len() <= 500);
+        assert!(suffix.is_char_boundary(0));
+        assert!(std::str::from_utf8(suffix.as_bytes()).is_ok());
+
+        // Two-byte 'é' straddling the boundary.
+        let accents = "é".repeat(400);
+        assert_eq!(accents.len(), 800);
+        let suffix = safe_utf8_suffix(&accents, 500);
+        assert!(suffix.len() <= 500);
+        assert!(suffix.is_char_boundary(0));
+    }
+
+    #[test]
+    fn safe_suffix_short_returns_whole_string() {
+        let s = "hello";
+        assert_eq!(safe_utf8_suffix(s, 500), s);
+        let s = "🦀🦀";
+        assert_eq!(safe_utf8_suffix(s, 500), s);
+    }
+
+    #[test]
+    fn safe_suffix_exact_boundary_unchanged() {
+        let s = "x".repeat(500);
+        assert_eq!(safe_utf8_suffix(&s, 500), s);
+        assert_eq!(safe_utf8_suffix("abcdefghij", 5), "fghij");
     }
 }

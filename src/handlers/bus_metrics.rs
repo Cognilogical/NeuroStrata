@@ -26,6 +26,8 @@ pub async fn handle_bus_metrics(bus: Arc<ThalamicBus>) -> String {
             crate::recall_metrics::domain_filter_snapshot(),
         );
         obj.insert("recall".to_string(), crate::recall_metrics::recall_snapshot());
+    } else {
+        tracing::warn!("bus.metrics() did not serialize to a JSON object");
     }
     serde_json::to_string(&value).expect("the composite metrics body always serializes")
 }

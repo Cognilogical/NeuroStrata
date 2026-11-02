@@ -4,12 +4,15 @@
 //! compile it directly (`#[path = "..."] mod fsm;`) without reaching the whole
 //! binary crate.
 
-/// The AC2 preflight decision for one mutating action:
-/// - non-mutating (or a known read-only action type) is always permitted;
-/// - mutating without a claimed task is blocked ("Unpreflighted"), with the
-///   next legal transition named;
-/// - mutating with too many mutations since the last task_update note is
-///   blocked ("BreathRequired", >= 5), with the next legal transition named.
+/// The AC2 preflight decision for one mutating action, judged in order:
+/// 1. non-mutating (or a known read-only action type) is always permitted;
+/// 2. mutating without a claimed task is blocked ("Unpreflighted"), with the
+///    next legal transition named;
+/// 3. mutating with a claimed task but an empty session or worktree is a
+///    broken preflight, blocked ("Unpreflighted") before the Breath check so
+///    routing mistakes surface first;
+/// 4. mutating with too many mutations since the last task_update note is
+///    blocked ("BreathRequired", >= 5), with the next legal transition named.
 pub fn evaluate_fsm_guard(
     session_id: &str,
     active_task_id: Option<&str>,
@@ -38,6 +41,20 @@ pub fn evaluate_fsm_guard(
             )),
         );
     }
+    // A claimed task without a session or a worktree is a broken preflight,
+    // not a live claim: mutating work must say where and by whom it runs
+    // (the MCP caller passes session_id + cwd here). Judged BEFORE the Breath
+    // check so a broken/unroutable claim is reported as such even when the
+    // Breath counter is also hot (AJ-17).
+    if active_task_id.is_some() && (session_id.trim().is_empty() || worktree.trim().is_empty()) {
+        return (
+            false,
+            Some(format!(
+                "Unpreflighted: mutating action ({}) carries an empty session or worktree (session='{}', worktree='{}'); next legal transition: claim -> ContextLoaded -> TaskClaimed",
+                action_type, session_id, worktree
+            )),
+        );
+    }
     // The Breath prompt: a mutating run must surface a status note regularly.
     if mutations_since_note >= 5 {
         return (
@@ -48,18 +65,6 @@ pub fn evaluate_fsm_guard(
                 session_id,
                 active_task_id.unwrap_or(""),
                 worktree
-            )),
-        );
-    }
-    // A claimed task without a session or a worktree is a broken preflight,
-    // not a live claim: mutating work must say where and by whom it runs
-    // (the MCP caller passes session_id + cwd here).
-    if active_task_id.is_some() && (session_id.trim().is_empty() || worktree.trim().is_empty()) {
-        return (
-            false,
-            Some(format!(
-                "Unpreflighted: mutating action ({}) carries an empty session or worktree (session='{}', worktree='{}'); next legal transition: claim -> ContextLoaded -> TaskClaimed",
-                action_type, session_id, worktree
             )),
         );
     }

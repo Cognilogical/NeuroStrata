@@ -7,7 +7,12 @@ use crate::judgment::laya_onnx::RuntimeState;
 use crate::learning::trainer::{TrainingJobState, EvaluationReport};
 
 /// Status snapshot returned by the daemon learning status handler.
+///
+/// `#[serde(default)]` at the struct level: older `status.json` files missing
+/// newer fields deserialize into a complete `LearnStatus` instead of failing
+/// the whole load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LearnStatus {
     pub provider_mode: DedupProviderMode,
     pub active_version: Option<String>,

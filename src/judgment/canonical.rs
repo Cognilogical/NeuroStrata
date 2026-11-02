@@ -78,12 +78,7 @@ pub fn canonical_duplicate_key(namespace: &str, payload: &MemoryPayload) -> Resu
         .unwrap_or(serde_json::Value::Null);
 
     // Fact attempt: presence + four keys.
-    let attempt = if payload.memory_type == "fact" {
-        payload.metadata.get("attempt").cloned()
-    } else {
-        // Still include if present? Plan: fact rows only. Keep null for non-fact.
-        None
-    };
+    let attempt = payload.metadata.get("attempt").cloned();
     let attempt_presence = attempt.is_some();
     let attempt_obj = attempt.unwrap_or(serde_json::Value::Null);
     let attempt_approach = attempt_obj.get("approach").cloned().unwrap_or(serde_json::Value::Null);

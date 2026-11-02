@@ -22,15 +22,22 @@ impl JudgmentProvider for HeuristicJudgmentProvider {
     ) -> Result<Vec<DuplicateJudgment>> {
         let mut judgments = Vec::new();
 
+        // The trait contract (`judgment::JudgmentProvider::judge_duplicates`)
+        // carries no namespace parameter, so both sides of the key comparison
+        // scope to this single explicit value — they MUST agree or the key
+        // match fabricates or misses duplicates. Hoisted out of the loop: the
+        // new memory's key cannot change between candidates.
+        let namespace = "default";
+        // Check canonical key match first. Only compare when both keys resolve
+        // to a real, non-empty key: mapping two Errs to "" via
+        // unwrap_or_default would fabricate a false confidence-1.0 duplicate
+        // on `"" == ""`.
+        let new_key = canonical_duplicate_key(namespace, new_memory)
+            .ok()
+            .filter(|k| !k.is_empty());
+
         for cand in candidates {
-            // Check canonical key match first. Only compare when both keys
-            // resolve to a real, non-empty key: mapping two Errs to "" via
-            // unwrap_or_default would fabricate a false confidence-1.0
-            // duplicate on `"" == ""`.
-            let new_key = canonical_duplicate_key("default", new_memory)
-                .ok()
-                .filter(|k| !k.is_empty());
-            let cand_key = canonical_duplicate_key("default", &cand.payload)
+            let cand_key = canonical_duplicate_key(namespace, &cand.payload)
                 .ok()
                 .filter(|k| !k.is_empty());
 

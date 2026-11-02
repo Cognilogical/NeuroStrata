@@ -63,7 +63,8 @@ pub fn synaptic_mesh_tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "project_root": { "type": "string", "description": "Project root whose pointer file names the mesh. Defaults to the working directory." }
+                    "project_root": { "type": "string", "description": "Project root whose pointer file names the mesh. Defaults to the working directory." },
+                    "namespace": { "type": "string", "description": "Optional namespace to scope store replay after git pull." }
                 },
                 "required": []
             }

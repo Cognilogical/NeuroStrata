@@ -1663,14 +1663,19 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
             if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
                 .downcast_ref::<crate::store::LadybugStore>()
             {
-                if let Ok(edges) = ls.dangling_edges(&namespace).await {
-                    let count = edges.len();
-                    let samples: Vec<_> = edges.into_iter().take(5).collect();
-                    if let Some(obj) = json.as_object_mut() {
-                        obj.insert("dangling_edges".to_string(), serde_json::json!({
-                            "total": count,
-                            "samples": samples,
-                        }));
+                match ls.dangling_edges(&namespace).await {
+                    Ok(edges) => {
+                        let count = edges.len();
+                        let samples: Vec<_> = edges.into_iter().take(5).collect();
+                        if let Some(obj) = json.as_object_mut() {
+                            obj.insert("dangling_edges".to_string(), serde_json::json!({
+                                "total": count,
+                                "samples": samples,
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("dangling_edges query failed for '{namespace}': {e}");
                     }
                 }
                 let sw = ls.shape_warnings(&namespace).await;
@@ -1683,16 +1688,28 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                 }
                 // Enrichment state surface (F12/F14/F24), warn-first.
                 let rid = crate::registry::registry_row_id(&namespace);
-                if let Ok(Some((_, reg_payload))) = crate::traits::VectorStore::get(ls, &namespace, &rid).await {
-                    let es = crate::registry::enrichment_state(&reg_payload.metadata);
-                    if let Some(obj) = json.as_object_mut() {
-                        obj.insert("enrichment_state".to_string(), es.clone());
-                        if es.get("state").and_then(|v| v.as_str()) == Some("failed") {
-                            let warnings = obj.entry("warnings".to_string()).or_insert_with(|| serde_json::json!([]));
-                            if let Some(arr) = warnings.as_array_mut() {
-                                arr.push(serde_json::json!({"kind":"enrichment_failed","state":es}));
+                match crate::traits::VectorStore::get(ls, &namespace, &rid).await {
+                    Ok(Some((_, reg_payload))) => {
+                        let es = crate::registry::enrichment_state(&reg_payload.metadata);
+                        if let Some(obj) = json.as_object_mut() {
+                            obj.insert("enrichment_state".to_string(), es.clone());
+                            if es.get("state").and_then(|v| v.as_str()) == Some("failed") {
+                                let warnings = obj
+                                    .entry("warnings".to_string())
+                                    .or_insert_with(|| serde_json::json!([]));
+                                if let Some(arr) = warnings.as_array_mut() {
+                                    arr.push(
+                                        serde_json::json!({"kind":"enrichment_failed","state":es}),
+                                    );
+                                }
                             }
                         }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "enrichment registry get failed for '{namespace}:{rid}': {e}"
+                        );
                     }
                 }
             }
@@ -2174,7 +2191,9 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     }
     let hooks_dir = git_hooks_dir(root);
     if !hooks_dir.is_dir() {
-        let _ = std::fs::create_dir_all(&hooks_dir);
+        if let Err(e) = std::fs::create_dir_all(&hooks_dir) {
+            tracing::warn!("failed to create hooks dir {}: {e}", hooks_dir.display());
+        }
     }
     let target = hooks_dir.join("pre-push");
     let version = env!("CARGO_PKG_VERSION");
@@ -2642,7 +2661,8 @@ fn detect_project(root: &std::path::Path) -> ProjectScan {
         }
     }
 
-    if let Ok(entries) = std::fs::read_dir(root.join(".git/hooks")) {
+    let hooks_dir = git_hooks_dir(root);
+    if let Ok(entries) = std::fs::read_dir(&hooks_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".sample") {
@@ -2870,7 +2890,10 @@ pub async fn handle_task_setup(
     if let Some(beads_rel) = &scan.beads_path {
         let count = std::fs::read_to_string(root.join(beads_rel))
             .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count())
-            .unwrap_or(0);
+            .unwrap_or_else(|e| {
+                tracing::warn!("failed to read beads file {}: {e}", root.join(beads_rel).display());
+                0
+            });
         let title = format!("Migrate {} beads issues into NeuroStrata tasks", count);
         let import_cmd = format!(
             "neurostrata-mcp task import {} --from-beads {}",
@@ -2913,8 +2936,9 @@ pub async fn handle_task_setup(
             .unwrap_or_default()
             .to_string();
         let mut similar: Vec<Value> = Vec::new();
-        if let Ok(vec) = emb.embed(&content).await {
-            if let Ok(hits) = store.search(&namespace, vec, 3, false, false).await {
+        match emb.embed(&content).await {
+            Ok(vec) => match store.search(&namespace, vec, 3, false, false).await {
+                Ok(hits) => {
                 for hit in hits {
                     let preview: String = hit.payload.content.chars().take(160).collect();
                     similar.push(json!({
@@ -2932,6 +2956,13 @@ pub async fn handle_task_setup(
                         }));
                     }
                 }
+                }
+                Err(e) => {
+                    tracing::warn!("rule similarity search failed for '{namespace}': {e}");
+                }
+            },
+            Err(e) => {
+                tracing::warn!("rule similarity embed failed for '{namespace}': {e}");
             }
         }
         if let Some(obj) = r.as_object_mut() {
@@ -3051,17 +3082,23 @@ pub async fn import_beads(
         .list(namespace, None, None)
         .await
         .map_err(|e| format!("ERROR: could not list '{}': {}", namespace, e))?;
-    let mut seen_bead_ids: HashSet<String> = rows
-        .iter()
-        .filter_map(|r| {
-            r.payload
-                .metadata
-                .get("task")
-                .and_then(|t| t.get("bead_id"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .collect();
+    let mut seen_bead_ids: HashSet<String> = HashSet::new();
+    let mut bead_to_task: HashMap<String, String> = HashMap::new();
+    for r in &rows {
+        if let Some(bead_id) = r
+            .payload
+            .metadata
+            .get("task")
+            .and_then(|t| t.get("bead_id"))
+            .and_then(|v| v.as_str())
+        {
+            seen_bead_ids.insert(bead_id.to_string());
+            // Already-imported beads map to their real NeuroStrata task id, so
+            // downstream beads can still translate their deps (the idempotent
+            // skip must not orphan these mappings).
+            bead_to_task.insert(bead_id.to_string(), r.id.clone());
+        }
+    }
     let mut existing_task_ids: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
 
     struct Pending {
@@ -3187,6 +3224,9 @@ pub async fn import_beads(
     let mut allocations: Vec<Option<String>> = Vec::with_capacity(pending.len());
     for p in &pending {
         if seen_bead_ids.contains(&p.bead_id) {
+            if let Some(existing_task_id) = bead_to_task.get(&p.bead_id) {
+                id_map.insert(p.bead_id.clone(), existing_task_id.clone());
+            }
             allocations.push(None);
             summary.skipped_existing += 1;
             continue;

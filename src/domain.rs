@@ -314,10 +314,17 @@ pub fn inferred_only_facets(memory_type: &str, metadata: &serde_json::Value) -> 
 pub fn materialize_facets_bitemporal(memory_type: &str, metadata: &mut serde_json::Value, now: i64) {
     let entailed = inferred_only_facets(memory_type, metadata);
 
-    // Read existing bitemporal entries
+    // Read existing bitemporal entries, skipping (and logging) malformed ones
+    // so one bad entry cannot shadow the well-formed history.
     let mut existing_entries: Vec<InferredFacetEntry> = if let Some(arr) = metadata.get("facets_bitemporal").and_then(|v| v.as_array()) {
         arr.iter().filter_map(|v| {
-            serde_json::from_value(v.clone()).ok()
+            match serde_json::from_value::<InferredFacetEntry>(v.clone()) {
+                Ok(entry) => Some(entry),
+                Err(e) => {
+                    tracing::warn!("skipping malformed facets_bitemporal entry: {e}");
+                    None
+                }
+            }
         }).collect()
     } else {
         Vec::new()
@@ -367,8 +374,11 @@ pub fn materialize_facets_bitemporal(memory_type: &str, metadata: &mut serde_jso
     rebuilt.sort();
     rebuilt.dedup();
 
-    metadata.as_object_mut().unwrap().insert("facets".to_string(), serde_json::Value::Array(rebuilt.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
-    metadata.as_object_mut().unwrap().insert("facets_bitemporal".to_string(), serde_json::to_value(&existing_entries).unwrap());
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("facets".to_string(), serde_json::Value::Array(rebuilt.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
+        obj.insert("facets_bitemporal".to_string(), serde_json::to_value(&existing_entries).unwrap());
+    }
+    // else: metadata is not an object — never panic on caller-provided values.
 }
 
 /// Retracts all currently active inferred facets by setting their valid_to.
@@ -399,8 +409,11 @@ pub fn retract_inferred_facets(metadata: &mut serde_json::Value, valid_to: i64) 
     let mut rebuilt: Vec<String> = manual_facets.union(&active_inferred).cloned().collect();
     rebuilt.sort();
     rebuilt.dedup();
-    metadata.as_object_mut().unwrap().insert("facets".to_string(), serde_json::Value::Array(rebuilt.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
-    metadata.as_object_mut().unwrap().insert("facets_bitemporal".to_string(), serde_json::to_value(&entries).unwrap());
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("facets".to_string(), serde_json::Value::Array(rebuilt.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
+        obj.insert("facets_bitemporal".to_string(), serde_json::to_value(&entries).unwrap());
+    }
+    // else: metadata is not an object — never panic on caller-provided values.
 }
 
 /// Detect conflict candidates among active memories (F10). Returns (id, disputed_with_ids).

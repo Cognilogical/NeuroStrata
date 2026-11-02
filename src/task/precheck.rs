@@ -27,7 +27,7 @@ pub async fn normalize_and_precheck_namespace(
     ) {
         Ok(Some(warning)) => tracing::warn!("{warning}"),
         Ok(None) => {}
-        Err(e) => tracing::debug!("{e}"),
+        Err(e) => tracing::warn!("task_complete_precheck classify_unmatched blocked: {e}"),
     }
     task_complete_precheck(&summary.declared_targets)
 }

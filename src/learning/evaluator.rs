@@ -4,7 +4,10 @@
 //! computes real classification metrics: accuracy, precision, recall, F1,
 //! Brier score, and negative log-likelihood. Consumed by the trainer's builtin
 //! path (`train_candidate`) to emit a measurable `eval_report.json`, and fail
-//! closed when a candidate cannot be scored.
+//! closed when a candidate cannot be scored. `evaluate_pairs` returns a fully
+//! zeroed `EvalReport` on empty inputs — metrics that are mathematically
+//! undefined read as 0.0 — and clamps the temperature into `[0.1, 10.0]`
+//! (1.0 when non-finite) so no temperature can produce NaN/±inf scores.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +37,13 @@ fn logit_of(p: f32) -> f64 {
 /// hard decision threshold is 0.5. Metrics are 0.0 when undefined
 /// (e.g. precision with no predicted positives).
 pub fn evaluate_pairs(pairs: &[(f32, bool)], temperature: f32) -> EvalReport {
+    // Clamp before division: temperature <= 0 or NaN would otherwise turn
+    // logit/temperature into NaN or ±inf and poison every downstream metric.
+    let temp = if temperature.is_finite() {
+        (temperature as f64).clamp(0.1, 10.0)
+    } else {
+        1.0
+    };
     let mut report = EvalReport {
         pair_count: pairs.len(),
         accuracy: 0.0,
@@ -42,7 +52,7 @@ pub fn evaluate_pairs(pairs: &[(f32, bool)], temperature: f32) -> EvalReport {
         f1: 0.0,
         brier_score: 0.0,
         nll: 0.0,
-        temperature,
+        temperature: temp as f32,
     };
     if pairs.is_empty() {
         return report;
@@ -54,7 +64,7 @@ pub fn evaluate_pairs(pairs: &[(f32, bool)], temperature: f32) -> EvalReport {
     let mut sum_brier: f64 = 0.0;
     let mut sum_nll: f64 = 0.0;
     for (p, is_dup) in pairs {
-        let z = logit_of(*p) / temperature as f64;
+        let z = logit_of(*p) / temp;
         let pred = (1.0 / (1.0 + (-z).exp())).clamp(1e-12, 1.0 - 1e-12);
         let y = if *is_dup { 1.0 } else { 0.0 };
         match (pred >= 0.5, *is_dup) {

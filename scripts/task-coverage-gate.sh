@@ -30,7 +30,7 @@ while IFS= read -r file; do
             echo "task-coverage-gate: untracked work item in $file: $line" >&2
             COUNT=$((COUNT + 1))
         fi
-    done < <(git diff "$RANGE" -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|open item|follow-up|remaining|next step)' || true)
+    done < <(git diff "$RANGE" -- "$file" | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE '(next move|todo:|todo :|fixme:|action item:|deferred:|open item|follow-up|remaining|next step|we should also|later we need to|still need to|must also fix|need to follow up)' || true)
 done <<< "$CHANGED"
 
 if [ "$COUNT" -gt 0 ]; then

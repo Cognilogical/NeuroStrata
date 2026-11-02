@@ -663,7 +663,10 @@ pub async fn process_mcp_request(
                                 "source_digest": { "type": "string", "description": "Content hash for idempotency; same digest = same receipt." },
                                 "text": { "type": "string", "description": "Raw text to analyze for task intents." },
                                 "title": { "type": "string", "description": "Optional explicit title (for manual intake)." },
-                                "description": { "type": "string", "description": "Optional explicit description (for manual intake)." }
+                                "description": { "type": "string", "description": "Optional explicit description (for manual intake)." },
+                                "candidate_kind": { "type": "string", "description": "Optional candidate kind override (e.g. rule, task)." },
+                                "payload": { "type": "object", "description": "Optional payload attached to the generated candidate." },
+                                "confidence": { "type": "number", "description": "Optional confidence score for the generated candidate." }
                             },
                             "required": ["namespace", "source_revision", "source_digest", "text"]
                         }

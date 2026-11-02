@@ -101,11 +101,13 @@ impl UnionFind {
         }
     }
     
-    fn components(&self) -> HashMap<usize, Vec<usize>> {
+    fn components(&mut self) -> HashMap<usize, Vec<usize>> {
         let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (i, &p) in self.parent.iter().enumerate() {
-            // Use the current parent (may have been path-compressed by previous find/union)
-            map.entry(p).or_default().push(i);
+        for i in 0..self.parent.len() {
+            // A stale parent pointer is not a root: only find(i) resolves the
+            // true component root, otherwise a chain unions get torn apart.
+            let root = self.find(i);
+            map.entry(root).or_default().push(i);
         }
         map
     }
@@ -216,7 +218,6 @@ pub fn split_observations(
     });
     
     // Assign each component deterministically to Train/Calibration/Eval
-    let mut assigned: HashSet<usize> = HashSet::new();
     for (idx, component) in component_list.iter().enumerate() {
         let split = match idx % 3 {
             0 => Split::Train,
@@ -230,7 +231,6 @@ pub fn split_observations(
                 splits.insert(obs_id, split);
             }
         }
-        assigned.extend(component);
     }
     
     // Validate no connected group (canonical union-find component) spans
@@ -431,6 +431,55 @@ mod tests {
         splits.insert("c", Split::Eval);
         // Groups are consistent: {a, b} -> Train, {c} -> Eval.
         assert!(verify_no_group_leakage(&obs_ids, &[0, 0, 1], &splits).is_ok());
+    }
+
+    #[test]
+    fn chained_keys_through_two_fields_share_split() {
+        // obs1 ~ obs2 by memory id, obs2 ~ obs3 by payload hash: transitivity
+        // of the union-find must carry all three into one split.
+        let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string(), "obs-3".to_string()];
+        let empty = || HashSet::new();
+        let result = split_observations(
+            &obs_ids,
+            &[HashSet::from(["mid-1".to_string()]), HashSet::from(["mid-1".to_string()]), empty()],
+            &[empty(), HashSet::from(["ph-9".to_string()]), HashSet::from(["ph-9".to_string()])],
+            &[None, None, None],
+            &[None, None, None],
+            &[1000, 2000, 3000], // distinct hour buckets so time unions nothing
+        );
+        let splits = result.expect("splits");
+        let assigned: Vec<Split> = obs_ids.iter().map(|id| splits.split_of(id).expect("assigned")).collect();
+        assert!(
+            assigned.iter().all(|s| *s == assigned[0]),
+            "transitive two-field chain must share one split, got {:?}",
+            assigned
+        );
+    }
+
+    #[test]
+    fn stale_parent_pointers_do_not_split_a_component() {
+        // obs1~obs2 (memory id), obs2~obs3 (governance), obs3~obs4 (payload
+        // hash). The final union merges root {obs1,obs2} with root {obs3,obs4};
+        // obs4's parent pointer is then stale, so grouping by the raw parent
+        // vector instead of find() used to tear obs4 into its own component,
+        // faking a group-leakage violation.
+        let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string(), "obs-3".to_string(), "obs-4".to_string()];
+        let empty = || HashSet::new();
+        let result = split_observations(
+            &obs_ids,
+            &[HashSet::from(["mid-A".to_string()]), HashSet::from(["mid-A".to_string()]), empty(), empty()],
+            &[empty(), empty(), HashSet::from(["ph-X".to_string()]), HashSet::from(["ph-X".to_string()])],
+            &[None, None, None, None],
+            &[None, Some("gov-G".to_string()), Some("gov-G".to_string()), None],
+            &[1000, 2000, 3000, 4000], // distinct hour buckets so time unions nothing
+        );
+        let splits = result.expect("splits");
+        let assigned: Vec<Split> = obs_ids.iter().map(|id| splits.split_of(id).expect("assigned")).collect();
+        assert!(
+            assigned.iter().all(|s| *s == assigned[0]),
+            "stale-pointer component must stay in one split, got {:?}",
+            assigned
+        );
     }
 
     #[test]

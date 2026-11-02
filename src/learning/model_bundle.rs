@@ -1,4 +1,4 @@
-//! Validated ONNX model bundle: manifest, tokenizer, checkpoint, calibration tier.
+//! Validated ONNX model bundle: manifest, checkpoint, calibration tier.
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
@@ -49,9 +49,15 @@ impl ModelBundle {
             // calibration_tier
             if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
                 calibration_tier = match t {
-                    "GoldShipped" | "gold_shipped" | "DatasetCalibrated" | "dataset_calibrated" => crate::judgment::CalibrationTier::Gold,
-                    "Uncalibrated" | "uncalibrated" => crate::judgment::CalibrationTier::ProxyInternal,
-                    _ => crate::judgment::CalibrationTier::ProxyInternal,
+                    "gold" | "Gold" | "GoldShipped" => crate::judgment::CalibrationTier::Gold,
+                    "proxy_internal" | "ProxyInternal" | "DatasetCalibrated" | "Uncalibrated" => crate::judgment::CalibrationTier::ProxyInternal,
+                    other => {
+                        tracing::warn!(
+                            "unknown calibration_tier '{other}' in {}, defaulting to ProxyInternal",
+                            manifest_path.display()
+                        );
+                        crate::judgment::CalibrationTier::ProxyInternal
+                    }
                 };
             }
 
@@ -110,7 +116,7 @@ mod tests {
     #[test]
     fn load_parses_manifest_version_and_tier() {
         let d = temp_bundle("version-tier");
-        fs::write(d.join("manifest.json"), r#"{"model_version":"v2.1.0","calibration_tier":"GoldShipped","embedder_id":"e1"}"#).unwrap();
+        fs::write(d.join("manifest.json"), r#"{"model_version":"v2.1.0","calibration_tier":"gold","embedder_id":"e1"}"#).unwrap();
         let b = ModelBundle::load(&d, "e1").unwrap();
         assert_eq!(b.version, "v2.1.0");
         assert!(matches!(b.calibration_tier, crate::judgment::CalibrationTier::Gold));

@@ -19,7 +19,10 @@ pub struct SetupReport {
 /// Entry point. Dispatches on platform.
 pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
     let bin_path = std::env::current_exe().context("cannot determine current_exe")?;
-    let script_path = repo_path.join("scripts").join("backup.sh");
+    // systemd ExecStart and launchd ProgramArguments require absolute paths;
+    // a relative repo_path (e.g. `./`) would otherwise leak into the units.
+    let canonical_repo = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let script_path = canonical_repo.join("scripts").join("backup.sh");
 
     if !script_path.exists() {
         anyhow::bail!(
@@ -207,6 +210,12 @@ fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
     println!("  {}", daemon_plist.display());
     println!("  {}", backup_plist.display());
 
+    // Unload first so a re-run of setup is idempotent (load -w on an already
+    // loaded agent is a no-op and leaves a stale definition active).
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w", &daemon_plist.to_string_lossy()])
+        .status();
+
     // Load / reload agent
     let load = std::process::Command::new("launchctl")
         .args(["load", "-w", &daemon_plist.to_string_lossy()])
@@ -223,15 +232,18 @@ fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
     });
 
     // Load timer after daemon verified
-    if verified {
+    let timer_started = if verified {
         let timer_load = std::process::Command::new("launchctl")
             .args(["load", "-w", &backup_plist.to_string_lossy()])
-            .status()
-            .with_context(|| format!("launchctl load {}", backup_plist.display()))?;
-        if !timer_load.success() {
+            .status();
+        let ok = timer_load.map(|s| s.success()).unwrap_or(false);
+        if !ok {
             eprintln!("launchctl load backup timer failed — timer not started");
         }
-    }
+        ok
+    } else {
+        false
+    };
 
     println!();
     println!("Next:");
@@ -244,7 +256,7 @@ fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
 
     Ok(SetupReport {
         daemon_installed: true,
-        backup_installed: verified,
+        backup_installed: timer_started,
         verified,
     })
 }
@@ -391,7 +403,6 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
             "/tr", &format!("\"{}\"", script_path),
             "/sc", "daily",
             "/st", "12:00",
-            "/rf", "30",
         ])
         .status()
         .with_context(|| format!("schtasks /create NeuroStrataBackup"))?;

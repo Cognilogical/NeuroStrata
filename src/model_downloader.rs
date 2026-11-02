@@ -74,16 +74,9 @@ pub fn fetch_model(
     if target_sha256.trim().is_empty() {
         return Err(anyhow!("target SHA-256 must not be empty"));
     }
-    // Check cache: verify SHA-256 if file exists
-    if out_path.exists() {
-        let data = std::fs::read(out_path).unwrap_or_default();
-        if !data.is_empty() {
-            let actual = Sha256::digest(&data);
-            let actual_hex = hex_encode(&actual);
-            if actual_hex == target_sha256 {
-                return Ok(out_path.to_path_buf());
-            }
-        }
+    // Cache check: only reuse a cached file whose bytes verify against the pin.
+    if is_cached(out_path, target_sha256, None) {
+        return Ok(out_path.to_path_buf());
     }
 
     // Ensure output dir exists
@@ -125,6 +118,35 @@ pub fn fetch_model(
 
     println!("Model downloaded and verified (SHA-256: {}) to '{}'", actual_sha, out_path.display());
     Ok(out_path.to_path_buf())
+}
+
+/// Cache check for a fetched model. A cached file is only accepted when it
+/// reads successfully, its length matches an optional pinned size, and its
+/// SHA-256 matches the target hash. Read errors are logged, not swallowed.
+fn is_cached(out_path: &Path, target_sha256: &str, expected_size: Option<u64>) -> bool {
+    if !out_path.exists() {
+        return false;
+    }
+    let data = match std::fs::read(out_path) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!("failed to read cached model at {}: {e}", out_path.display());
+            return false;
+        }
+    };
+    if let Some(expected_size) = expected_size {
+        if data.len() as u64 != expected_size {
+            tracing::warn!(
+                "cached model at {} has size {}, expected {}; treating as stale",
+                out_path.display(),
+                data.len(),
+                expected_size
+            );
+            return false;
+        }
+    }
+    let actual = Sha256::digest(&data);
+    hex_encode(&actual) == target_sha256
 }
 
 /// Convenience: fetch from the registry by model ID.
@@ -199,7 +221,29 @@ pub fn fetch_from_registry(
         }
         Ok(out_path)
     } else {
+        // The cache predicate inside fetch_model cannot see the pinned size,
+        // so it is enforced here first: a cached file whose length diverges
+        // from the pinned entry is stale and must be re-fetched.
+        if !is_cached(&out_path, &entry.sha256, entry.size_bytes) && out_path.exists() {
+            let _ = std::fs::remove_file(&out_path);
+        }
         let written = fetch_model(&entry.url, &entry.sha256, &out_path)?;
+        // Fail closed on size, too: SHA-256 equality implies equal bytes, so a
+        // size mismatch after a verified download means something tampered
+        // with the file between the two checks.
+        if let Some(expected_size) = entry.size_bytes {
+            let actual = std::fs::metadata(&written)
+                .map(|m| m.len())
+                .map_err(|e| anyhow!("cannot stat downloaded '{}': {e}", written.display()))?;
+            if actual != expected_size {
+                return Err(anyhow!(
+                    "downloaded '{}' size {} != pinned size {}",
+                    written.display(),
+                    actual,
+                    expected_size
+                ));
+            }
+        }
         if let Some(files) = &entry.files {
             for file in files {
                 if !registry_dir.join(file).exists() {
