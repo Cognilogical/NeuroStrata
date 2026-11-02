@@ -202,7 +202,7 @@ impl SecretScanner {
                 category: "oversized_input",
             });
         }
-        scanner.scan_inner(text, location, 0)
+        scanner.scan_inner(text, location)
     }
 
     /// Scan a JSON value recursively (metadata leaves), returning the first
@@ -212,7 +212,7 @@ impl SecretScanner {
         scanner.scan_value_inner(value, location, 0)
     }
 
-    fn scan_inner(&self, text: &str, location: &str, _depth: usize) -> Option<Rejection> {
+    fn scan_inner(&self, text: &str, location: &str) -> Option<Rejection> {
         if text.len() > MAX_SCAN_BYTES {
             return Some(Rejection {
                 location: location.to_string(),
@@ -311,7 +311,7 @@ impl SecretScanner {
             });
         }
         match value {
-            Value::String(s) => self.scan_inner(s, location, depth),
+            Value::String(s) => self.scan_inner(s, location),
             Value::Array(arr) => {
                 for (i, item) in arr.iter().enumerate() {
                     if let Some(r) =

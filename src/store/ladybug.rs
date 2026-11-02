@@ -3122,12 +3122,12 @@ impl LadybugStore {
 
 #[async_trait]
 impl VectorStore for LadybugStore {
-    async fn init(&self, _namespace: &str) -> Result<()> {
+    async fn init(&self, namespace: &str) -> Result<()> {
         // Composite Recommendation #11: verify the embedding-space identity on
         // every init (including the schema-ready fast path) so an incompatible
         // descriptor is rejected before any vector lands.
         self.verify_or_record_embedding_descriptor(
-            _namespace,
+            namespace,
             &self.store_embedding_descriptor(),
         )?;
 
