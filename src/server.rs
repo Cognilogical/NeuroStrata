@@ -855,6 +855,7 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "Project namespace." },
                                 "query": { "type": "string", "description": "Optional search query." },
                                 "file_path": { "type": "string", "description": "Optional governed file path." },
+                                "files": { "type": "array", "items": { "type": "string" }, "description": "Optional governed file paths." },
                                 "max_items": { "type": "integer", "description": "Max items (default 10)." },
                                 "max_bytes": { "type": "integer", "description": "Approx byte budget (default 1024)." },
                                 "format": { "type": "string", "enum": ["json", "text"], "description": "Output format." }
@@ -1268,6 +1269,24 @@ async fn handle_context_plan(
     let namespace = arguments.get("namespace").and_then(|v| v.as_str()).unwrap_or("global");
     let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let file_path = arguments.get("file_path").and_then(|v| v.as_str());
+    let requested_files: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        if let Some(fp) = file_path {
+            v.push(fp.to_string());
+        }
+        for key in ["files", "file_paths"] {
+            if let Some(Value::Array(arr)) = arguments.get(key) {
+                for it in arr {
+                    if let Some(s) = it.as_str() {
+                        if !s.is_empty() && !v.iter().any(|e| e == s) {
+                            v.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        v
+    };
     let max_items = arguments.get("max_items").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let max_bytes = arguments.get("max_bytes").and_then(|v| v.as_u64()).map(|b| b as usize);
     let format = arguments.get("format").and_then(|v| v.as_str()).unwrap_or("json");
@@ -1321,17 +1340,67 @@ async fn handle_context_plan(
             freshness: Some(freshness),
         });
     }
+    // Graph-read enrichment: when the store is LadybugStore, pull the memory
+    // hits governing each requested file path and surface them as plan items.
+    // `unsupported` backends still yield a plan -- just without this half.
+    {
+        use crate::traits::GraphRead;
+        let ladybug = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>();
+        if let Some(ls) = ladybug {
+            for fp in &requested_files {
+                match ls
+                    .memories_for_file(
+                        namespace,
+                        None,
+                        fp,
+                        None,
+                        true,
+                        &crate::graph_read::memories_for_file::DEFAULT_MEMORY_TYPES
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<String>>(),
+                        &[],
+                        max_items.max(1),
+                    )
+                    .await
+                {
+                    Ok(hits) => {
+                        for hit in hits {
+                            if items.iter().any(|it| it.id == hit.id) {
+                                continue;
+                            }
+                            items.push(ContextItem {
+                                id: hit.id,
+                                memory_type: hit.memory_type,
+                                content: hit.content,
+                                freshness: None,
+                            });
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+    // The requested governed file path itself stays in the plan as a synthetic
+    // source item (deduped in case a graph hit already carries that id).
     if let Some(fp) = file_path {
-        items.push(ContextItem {
-            id: fp.to_string(),
-            memory_type: "source".into(),
-            content: format!("file_path={}", fp),
-            freshness: None,
-        });
+        if !items.iter().any(|it| it.id == fp) {
+            items.push(ContextItem {
+                id: fp.to_string(),
+                memory_type: "source".into(),
+                content: format!("file_path={}", fp),
+                freshness: None,
+            });
+        }
     }
     let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
     let budget = Budget::from(token_budget);
-    let service = ContextService::new_with(Some(1u8), Some(2u8));
+    let ladybug_has_graph_read = crate::traits::VectorStore::as_any(store.as_ref())
+        .downcast_ref::<crate::store::LadybugStore>()
+        .is_some();
+    let service = ContextService::new_with(Some(1u8), ladybug_has_graph_read.then_some(2u8));
     let deny_egress = arguments
         .get("deny_egress")
         .and_then(|v| v.as_bool())

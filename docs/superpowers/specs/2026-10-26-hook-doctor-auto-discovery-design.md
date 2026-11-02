@@ -1,7 +1,7 @@
 # Design: Automatic Hook Discovery & Doctor Scheduling for NeuroStrata Agents
 
 **Date:** 2026-10-26
-**Status:** Draft (pending user review)
+> Status: APPROVED & implemented (v1.14.3) — see src/server.rs + src/registry.rs (doctor_state).
 **Approach:** C — `get_snapshot` hygiene strap + registry state + safe auto-heal (recommended by gemini-arch / Argon)
 
 ## 1. Problem

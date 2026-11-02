@@ -886,6 +886,14 @@ async fn search_inner(
                 results.push(inferred);
             }
 
+            // Decision-shape gain: a `decision`-shaped fact earns a small
+            // additive boost so decisions surface above similarly-scored
+            // unshaped facts (applied before the final sort so the order
+            // reflects it).
+            for r in results.iter_mut() {
+                r.score += crate::search::decision_shape_boost(&r.payload.metadata);
+            }
+
             // Final sort: primaries (DirectMatch, real boosted_distance) first,
             // then expansions (OneHop/Governs2hop, EXPANSION_BASE_SCORE).
             // Within expansions, the admission order (co-occurrence DESC, family order) is preserved.

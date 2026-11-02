@@ -44,6 +44,19 @@ pub fn fact_shape_matches(metadata: &Value, shape: &str) -> bool {
     }
 }
 
+/// The additive score bonus a `decision`-shaped fact earns so decisions
+/// surface above equivalently-similar unshaped facts.
+pub const DECISION_SHAPE_GAIN: f32 = 0.03;
+
+/// Additive search boost for decision-shaped facts (spec: decision shape gain).
+pub fn decision_shape_boost(metadata: &Value) -> f32 {
+    if fact_shape_matches(metadata, "decision") {
+        DECISION_SHAPE_GAIN
+    } else {
+        0.0
+    }
+}
+
 /// Path prefix filter on location.
 pub fn path_prefix_matches(location: &str, prefix: Option<&str>) -> bool {
     match prefix {
@@ -116,6 +129,15 @@ mod tests {
         f2.include_code_ast = true;
         assert!(type_allowed("fact", &f2));
         assert!(!type_allowed("rule", &f2));
+    }
+
+    #[test]
+    fn decision_shape_boost_variants() {
+        let m = json!({"decision": "ship podman only"});
+        assert_eq!(decision_shape_boost(&m), DECISION_SHAPE_GAIN);
+        assert_eq!(decision_shape_boost(&json!({"topology": {"a": 1}})), 0.0);
+        assert_eq!(decision_shape_boost(&json!({})), 0.0);
+        assert_eq!(decision_shape_boost(&json!(null)), 0.0);
     }
 
     #[test]

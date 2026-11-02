@@ -1,7 +1,7 @@
 # Spec: Automatic Agent Adoption of NeuroStrata + Real Graph Usage
 
 **Date:** 2026-10-26  
-**Status:** Draft for review  
+> Status: APPROVED & implemented (v1.14.3) — see src/context/service.rs + src/source_context.rs.
 **Task:** NeuroStrata::neurostrata-f5x3  
 **Source verdicts:** `docs/designs/2026-10-26-agent-adoption-graph-argon-k3-verdict.md` (§14 reconciles Astra)  
 **Scope:** Full 4 phases, specified as one coherent system, delivered incrementally.

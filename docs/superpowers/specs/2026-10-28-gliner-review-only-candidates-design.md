@@ -1,5 +1,7 @@
 # GLiNER Review-Only Candidate Emitter Design
 
+> Status: APPROVED & implemented (v1.14.3) — see src/gliner.rs.
+
 ## Goal
 
 Provide a deterministic, review-only entity candidate emitter that mirrors GLiNER-style
