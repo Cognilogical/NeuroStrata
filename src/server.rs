@@ -999,6 +999,7 @@ pub async fn process_mcp_request(
                                 emb.clone(),
                                 store.clone(),
                                 ingests.clone(),
+                                Some(bus.clone()),
                             )
                             .await;
                         }
@@ -1343,11 +1344,46 @@ async fn handle_context_plan(
     for res in results {
         let metadata = &res.payload.metadata;
         let sha = |key: &str| metadata.get(key).and_then(|v| v.as_str()).map(String::from);
+        let stored_file_sha256 = sha("file_sha256");
+        // Copying the stored hash into `current_*` compared a value to itself,
+        // so file drift could never be detected. Instead, hash the governed
+        // file fresh off disk when the memory names a real one.
+        let governed_path = metadata
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                metadata
+                    .get("location")
+                    .and_then(|v| v.as_str())
+                    .map(|loc| loc.split(':').next().unwrap_or(loc))
+            })
+            .map(|p| p.to_string())
+            // A virtual symbol URI governs no on-disk file to hash.
+            .filter(|p| !p.contains("://") && !p.starts_with("urn:") && !p.is_empty());
+        let current_file_sha256 = match governed_path {
+            Some(p) if stored_file_sha256.is_some() => {
+                let resolved = if std::path::Path::new(p.as_str()).is_absolute() {
+                    std::path::PathBuf::from(p)
+                } else {
+                    crate::daemon::resolve_project_root().join(p.as_str())
+                };
+                match std::fs::read(&resolved) {
+                    Ok(bytes) => Some({
+                        use sha2::{Digest, Sha256};
+                        hex::encode(Sha256::digest(&bytes))
+                    }),
+                    // A governed file that can no longer be read is honestly
+                    // reported as un-hashed (missing), not as unchanged.
+                    Err(_) => None,
+                }
+            }
+            // No governed file path: the stored hash remains the best known
+            // state and currency stays as-is.
+            _ => stored_file_sha256.clone(),
+        };
         let freshness = crate::context::freshness::compute_freshness(&crate::context::freshness::FreshnessInputs {
-            stored_file_sha256: sha("file_sha256"),
-            // Same-turn plan has no re-read of the governed file yet, so the
-            // stored hash is the best known state.
-            current_file_sha256: metadata.get("file_sha256").and_then(|v| v.as_str()).map(String::from),
+            stored_file_sha256: stored_file_sha256.clone(),
+            current_file_sha256,
             stored_span_sha256: sha("span_sha256"),
             current_span_sha256: metadata.get("span_sha256").and_then(|v| v.as_str()).map(String::from),
             verification_status: metadata
@@ -1435,7 +1471,15 @@ async fn handle_context_plan(
         }
     }
     let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
-    let budget = Budget::from(token_budget);
+    let turn_used = arguments
+        .get("turn_tokens_used")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let session_used = arguments
+        .get("session_tokens_used")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let budget = Budget::from(token_budget).with_prior_usage(turn_used, session_used);
     let service = ContextService::new();
     let deny_egress = arguments
         .get("deny_egress")
@@ -3593,6 +3637,7 @@ async fn handle_ingest_directory(
     emb: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
     ingests: Arc<crate::ingest_jobs::IngestJobs>,
+    bus: Option<Arc<ThalamicBus>>,
 ) -> String {
     let dir_path = match arguments.get("dir_path").and_then(|d| d.as_str()) {
         Some(d) => d,
@@ -3637,6 +3682,18 @@ async fn handle_ingest_directory(
             .await
             {
                 tracing::warn!("post-ingest normalize failed: {e}");
+            }
+            // Genuinely trigger the live-bus PostIngestNormalize subscriber on
+            // top of the AC4 direct normalize above.
+            if let Some(bus) = bus {
+                bus.emit(
+                    ThalamicPulse::Created {
+                        id: format!("ingest:{namespace}"),
+                        namespace: namespace.to_string(),
+                        kind: "ingest_done".to_string(),
+                    },
+                    &RecursionToken::root(),
+                );
             }
             format!(
                 "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols, {} declared edges relinked.",

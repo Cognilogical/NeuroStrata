@@ -73,8 +73,14 @@ pub fn compress_snapshot(bytes: &[u8]) -> Result<Vec<u8>, CompressionError> {
     compress(bytes, 3)
 }
 
-pub fn compress_mesh_bundle(bytes: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    compress(bytes, 3)
+/// Compress a mesh bundle at an explicit zstd level (clamped to 1..=22, the
+/// range `zstd::stream::encode_all` accepts).
+pub fn compress_mesh_bundle_with_level(
+    bytes: &[u8],
+    level: i32,
+) -> Result<Vec<u8>, CompressionError> {
+    let clamped = level.clamp(1, 22);
+    zstd::stream::encode_all(bytes, clamped).map_err(CompressionError::Io)
 }
 
 pub fn decompress_bounded(bytes: &[u8], max: usize) -> Result<Vec<u8>, DecompressionError> {
@@ -114,7 +120,7 @@ mod tests {
     #[test]
     fn roundtrip_mesh_bundle() {
         let data = b"mesh bundle payload with some content";
-        let compressed = compress_mesh_bundle(data).unwrap();
+        let compressed = compress_mesh_bundle_with_level(data, 3).unwrap();
         let decompressed = decompress_mesh_bundle(&compressed, 1024).unwrap();
         assert_eq!(decompressed.as_slice(), data.as_slice());
     }

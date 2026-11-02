@@ -182,17 +182,17 @@ impl DeduplicationChecker {
         new_memory: &MemoryPayload,
         candidates: &[SearchResult],
     ) -> Option<Vec<DuplicateJudgment>> {
-        let _active = self.provider_set.active.clone()?;
-        if let Some(provider) = &self.provider_set.active {
-            if !self.circuit_breaker.allow_request() {
-                tracing::debug!(
-                    provider = provider.name(),
-                    cb_state = %self.circuit_breaker.state(),
-                    failures = self.circuit_breaker.failure_count(),
-                    "Circuit breaker open, skipping deduplication"
-                );
-                return None;
-            }
+        let Some(active) = self.provider_set.active.as_ref() else {
+            return None;
+        };
+        if !self.circuit_breaker.allow_request() {
+            tracing::debug!(
+                provider = active.name(),
+                cb_state = %self.circuit_breaker.state(),
+                failures = self.circuit_breaker.failure_count(),
+                "Circuit breaker open, skipping deduplication"
+            );
+            return None;
         }
         // The shadow provider records its verdict alongside without gating
         // the write: store (provider name, verdict) for inspection, and
@@ -216,20 +216,13 @@ impl DeduplicationChecker {
         // Apply timeout to judgment call
         let timeout = Duration::from_secs(self.config.timeout_seconds);
         let result = tokio::time::timeout(timeout, async {
-            self.provider_set
-                .active
-                .as_ref()
-                .unwrap()
-                .judge_duplicates(new_memory, candidates)
-                .await
+            active.judge_duplicates(new_memory, candidates).await
         })
         .await;
 
         match result {
             Ok(Ok(judgments)) => {
-                if let Some(_provider) = &self.provider_set.active {
-                    self.circuit_breaker.record_success();
-                }
+                self.circuit_breaker.record_success();
                 let duplicates: Vec<_> = judgments
                     .into_iter()
                     .filter(|j| j.confidence >= self.config.confidence_threshold)
@@ -249,9 +242,7 @@ impl DeduplicationChecker {
                     failures = self.circuit_breaker.failure_count(),
                     "Judgment provider error"
                 );
-                if let Some(_provider) = &self.provider_set.active {
-                    self.circuit_breaker.record_failure();
-                }
+                self.circuit_breaker.record_failure();
                 None
             }
             Err(_) => {
@@ -260,9 +251,7 @@ impl DeduplicationChecker {
                     timeout_seconds = self.config.timeout_seconds,
                     "Judgment call timed out"
                 );
-                if let Some(_provider) = &self.provider_set.active {
-                    self.circuit_breaker.record_failure();
-                }
+                self.circuit_breaker.record_failure();
                 None
             }
         }

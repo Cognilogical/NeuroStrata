@@ -49,7 +49,7 @@ impl ModelBundle {
             // calibration_tier
             if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
                 calibration_tier = match t {
-                    "GoldShipped" | "gold_shipped" => crate::judgment::CalibrationTier::Gold,
+                    "GoldShipped" | "gold_shipped" | "DatasetCalibrated" | "dataset_calibrated" => crate::judgment::CalibrationTier::Gold,
                     "Uncalibrated" | "uncalibrated" => crate::judgment::CalibrationTier::ProxyInternal,
                     _ => crate::judgment::CalibrationTier::ProxyInternal,
                 };

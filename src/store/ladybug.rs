@@ -1229,6 +1229,13 @@ impl LadybugStore {
                 match Database::new(&local_path, unverified_config()) {
                     Ok(db) => {
                         eprintln!("Recovered by replaying the unverified write-ahead log.");
+                        // The replay only brought the writes back into memory.
+                        // Checkpoint them into the main DB files right away, so
+                        // a later crash does not put the same marginal WAL back
+                        // in front of the strict verifier.
+                        if let Ok(conn) = Connection::new(&db) {
+                            let _ = conn.query("CHECKPOINT;");
+                        }
                         db
                     }
                     Err(retry_e) => {
@@ -1478,8 +1485,17 @@ impl LadybugStore {
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
     {
         let db = self.db.clone();
+        // Held across the engine call on purpose: lbug's C++
+        // DictionaryColumn::scan / BufferManager::optimisticRead segfaults
+        // when a read Connection races a concurrent write Connection on the
+        // same Database, so a reader must not enter the engine while a
+        // writer holds the turn. As in `write_owning_turn`, the guard lives
+        // inside the blocking task, so a dropped await cannot release it
+        // while a statement is still running.
+        let turn = Arc::clone(&self.write_lock).lock_owned().await;
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
+            let _turn = turn;
             // As in `with_locked_conn`: the engine runs on this thread, so
             // the crash handler's alternate signal stack is installed here.
             let _ = crate::crash::install_alt_stack();

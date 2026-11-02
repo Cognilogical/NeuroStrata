@@ -49,9 +49,13 @@ pub fn resolve_node_id_at(home: &Path) -> String {
     }
     let fresh = Uuid::new_v4().to_string();
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("mesh-node-id dir {} could not be created: {e}", dir.display());
+        }
     }
-    let _ = std::fs::write(&path, format!("{}\n", fresh));
+    if let Err(e) = std::fs::write(&path, format!("{}\n", fresh)) {
+        tracing::warn!("mesh-node-id write to {} failed: {e}", path.display());
+    }
     fresh
 }
 

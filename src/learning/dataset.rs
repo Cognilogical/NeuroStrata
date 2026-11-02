@@ -134,29 +134,39 @@ pub async fn build_dedup_dataset(
         out_files.sort();
 
         for path in &obs_files {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(obs) = serde_json::from_str::<DecisionObservation>(line) {
+                            observations.push(obs);
+                        }
                     }
-                    if let Ok(obs) = serde_json::from_str::<DecisionObservation>(line) {
-                        observations.push(obs);
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to read observations file");
                 }
             }
         }
 
         for path in &out_files {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(out) = serde_json::from_str::<LearningOutcome>(line) {
+                            outcomes.push(out);
+                        }
                     }
-                    if let Ok(out) = serde_json::from_str::<LearningOutcome>(line) {
-                        outcomes.push(out);
-                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to read outcomes file");
                 }
             }
         }
@@ -239,8 +249,18 @@ pub async fn build_dedup_dataset(
         s
     }).collect();
 
-    let supersession_lineages: Vec<Option<String>> = observations.iter().map(|_| None).collect();
-    let governance_targets: Vec<Option<String>> = observations.iter().map(|_| None).collect();
+    // Supersession lineage: consecutive decisions on the same memory share
+    // `result_memory_id` (the "new memory" identity), so they must never
+    // straddle train/calibration/eval boundaries.
+    let supersession_lineages: Vec<Option<String>> = observations.iter()
+        .map(|o| o.result_memory_id.clone())
+        .collect();
+    // Governance target: decisions made under the same active task are one
+    // governance unit (namespace would collapse every same-namespace
+    // observation into a single component and degenerate the split).
+    let governance_targets: Vec<Option<String>> = observations.iter()
+        .map(|o| o.context.active_task_id.clone())
+        .collect();
     let time_windows: Vec<i64> = observations.iter().map(|o| o.occurred_at).collect();
 
     let splits = crate::learning::split::split_observations(
@@ -258,10 +278,10 @@ pub async fn build_dedup_dataset(
         .filter_map(|r| r.id.strip_prefix("rule-").map(|s| s.to_string()))
         .collect();
 
-    let _train_ids: Vec<String> = observations.iter()
+    let non_weak_train_ids: std::collections::HashSet<String> = observations.iter()
         .filter(|o| !weak_obs_ids.contains(&o.observation_id))
-        .map(|o| o.observation_id.clone()).collect();
-    // Actually split assigns all; we just filter weak out of calib/eval
+        .map(|o| o.observation_id.clone())
+        .collect();
     // Helper to write JSONL for a subset
     fn write_jsonl(path: &Path, items: &[DecisionObservation]) -> Result<()> {
         let mut f = std::fs::File::create(path)?;
@@ -273,10 +293,21 @@ pub async fn build_dedup_dataset(
         Ok(())
     }
 
-    // Write train (all observations that are assigned to train by split, plus weak-proxy allowed)
-    let train_obs: Vec<&DecisionObservation> = observations.iter()
+    // Write train: observations assigned to the train split, excluding weak
+    // proxies when doing so would not empty the training set (tiny test sets
+    // may only contain weak proxies — keep them so small tests still work).
+    let train_assigned: Vec<&DecisionObservation> = observations.iter()
         .filter(|o| splits.train.contains(&o.observation_id))
         .collect();
+    let train_non_weak: Vec<&DecisionObservation> = train_assigned.iter()
+        .copied()
+        .filter(|o| non_weak_train_ids.contains(&o.observation_id))
+        .collect();
+    let train_obs: Vec<&DecisionObservation> = if !train_non_weak.is_empty() {
+        train_non_weak
+    } else {
+        train_assigned
+    };
     write_jsonl(&out_dir.join("train.jsonl"), &train_obs.iter().map(|o| (*o).clone()).collect::<Vec<_>>())?;
     let train_rows = train_obs.len();
 
@@ -296,11 +327,11 @@ pub async fn build_dedup_dataset(
 
     // Separate gold (ShippedAnchorGold) from proxy calibration/eval
     let gold_calib_obs: Vec<&DecisionObservation> = calib_obs.iter()
-        .filter(|o| rules.iter().any(|r| r.tier == LabelTier::ShippedAnchorGold && (r.id == format!("rule-{}", o.observation_id) || r.id.contains(&o.observation_id))))
+        .filter(|o| rules.iter().any(|r| r.tier == LabelTier::ShippedAnchorGold && (r.id == format!("rule-{}", o.observation_id) || r.id == o.observation_id)))
         .copied()
         .collect();
     let gold_eval_obs: Vec<&DecisionObservation> = eval_obs.iter()
-        .filter(|o| rules.iter().any(|r| r.tier == LabelTier::ShippedAnchorGold && (r.id == format!("rule-{}", o.observation_id) || r.id.contains(&o.observation_id))))
+        .filter(|o| rules.iter().any(|r| r.tier == LabelTier::ShippedAnchorGold && (r.id == format!("rule-{}", o.observation_id) || r.id == o.observation_id)))
         .copied()
         .collect();
 

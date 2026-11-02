@@ -23,17 +23,26 @@ impl JudgmentProvider for HeuristicJudgmentProvider {
         let mut judgments = Vec::new();
 
         for cand in candidates {
-            // Check canonical key match first
-            let new_key = canonical_duplicate_key("default", new_memory).unwrap_or_default();
-            let cand_key = canonical_duplicate_key("default", &cand.payload).unwrap_or_default();
+            // Check canonical key match first. Only compare when both keys
+            // resolve to a real, non-empty key: mapping two Errs to "" via
+            // unwrap_or_default would fabricate a false confidence-1.0
+            // duplicate on `"" == ""`.
+            let new_key = canonical_duplicate_key("default", new_memory)
+                .ok()
+                .filter(|k| !k.is_empty());
+            let cand_key = canonical_duplicate_key("default", &cand.payload)
+                .ok()
+                .filter(|k| !k.is_empty());
 
-            if new_key == cand_key {
-                judgments.push(DuplicateJudgment {
-                    existing_memory_id: cand.id.clone(),
-                    confidence: 1.0,
-                    reason: Some("canonical-key-match".to_string()),
-                });
-                continue;
+            if let (Some(new_key), Some(cand_key)) = (&new_key, &cand_key) {
+                if new_key == cand_key {
+                    judgments.push(DuplicateJudgment {
+                        existing_memory_id: cand.id.clone(),
+                        confidence: 1.0,
+                        reason: Some("canonical-key-match".to_string()),
+                    });
+                    continue;
+                }
             }
 
             // Compute token-set Jaccard similarity

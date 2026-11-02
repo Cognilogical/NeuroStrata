@@ -95,6 +95,10 @@ pub enum MultimodalWarning {
     DuplicateId { id: String },
     AttachmentsNotArray,
     ByteLengthMismatch { declared: usize, actual: usize },
+    /// An element of the `attachments` array did not deserialize into
+    /// [`Attachment`] (missing/ill-typed required fields). Detection is not
+    /// optional: silently skipping would validate a smaller set than declared.
+    AttachmentUnparseable { index: usize, error: String },
 }
 
 impl MultimodalWarning {
@@ -105,7 +109,7 @@ impl MultimodalWarning {
             | TotalSizeExceeded { .. } | CountExceeded { .. } | DigestMalformed { .. }
             | DigestMismatch { .. } | DimensionsExceeded { .. } | DimensionsMismatch { .. }
             | AltTextTooLong { .. } | DuplicateId { .. } | AttachmentsNotArray
-            | ByteLengthMismatch { .. } => true,
+            | AttachmentUnparseable { .. } | ByteLengthMismatch { .. } => true,
             DigestUnverifiable { .. } => false,
             DimensionsMissing { .. } => require_dimensions,
             DimensionsUnparseable { .. } => require_dimensions,
@@ -134,6 +138,7 @@ impl fmt::Display for MultimodalWarning {
             MultimodalWarning::DuplicateId { id } => write!(f, "DuplicateId({})", id),
             MultimodalWarning::AttachmentsNotArray => write!(f, "AttachmentsNotArray"),
             MultimodalWarning::ByteLengthMismatch { declared, actual } => write!(f, "ByteLengthMismatch(declared={}, actual={})", declared, actual),
+            MultimodalWarning::AttachmentUnparseable { index, error } => write!(f, "AttachmentUnparseable(index={}, error={})", index, error),
         }
     }
 }
@@ -270,29 +275,21 @@ fn parse_webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn parse_vp8_lossy(bytes: &[u8]) -> Option<(u32, u32)> {
+    // VP8 chunk: fourcc at 12..16, chunk size at 16..20, payload at 20.
+    // Frame tag is the 3 bytes at 20..23, the keyframe sync code
+    // 0x9D 0x01 0x2A sits at 23..26, and the 14-bit little-endian width and
+    // height follow at 26..30.
+    if bytes.get(12..16)? != b"VP8 " {
+        return None;
+    }
     if bytes.len() < 30 {
         return None;
     }
-    // Frame tag: must have 0x9D 0x01 0x2A at bytes 3..6 of VP8 chunk payload
-    // The VP8 chunk starts at bytes 12 (fourcc) + 4 (chunk size) = 16? Wait.
-    // Let's align: RIFF header (12 bytes), VP8 chunk fourcc (4), chunk size (4), payload starts at 20.
-    if bytes.len() < 30 {
+    if bytes.get(23..26)? != &[0x9D, 0x01, 0x2A] {
         return None;
     }
-    if bytes.get(20..23)? != &[0x9D, 0x01, 0x2A] {
-        return None;
-    }
-    // Width/height are 14-bit little-endian at bytes 26..29
-    let b26 = bytes.get(26)?;
-    let b27 = bytes.get(27)?;
-    let b28 = bytes.get(28)?;
-    let b29 = bytes.get(29)?;
-    let _width = (((*b26 as u16) | ((*b27 as u16) << 8)) & 0x3FFF) as u32;
-    let _height = (((*b28 as u16) | ((*b29 as u16) << 8)) & 0x3FFF) as u32;
-    // Actually width/height are packed differently. Let's use simple approach:
-    // Per spec: width at 26..28 (little-endian 14 bits), height at 28..30.
-    let width_raw = u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF;
-    let height_raw = u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF;
+    let width_raw = u16::from_le_bytes([*bytes.get(26)?, *bytes.get(27)?]) & 0x3FFF;
+    let height_raw = u16::from_le_bytes([*bytes.get(28)?, *bytes.get(29)?]) & 0x3FFF;
     let width = width_raw as u32;
     let height = height_raw as u32;
     if width == 0 || height == 0 {
@@ -302,21 +299,24 @@ fn parse_vp8_lossy(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn parse_vp8l_lossless(bytes: &[u8]) -> Option<(u32, u32)> {
+    // VP8L chunk: fourcc at 12..16, chunk size at 16..20, payload at 20.
+    // Signature byte 0x2F at 20, then the packed bits at 21..25: a 14-bit
+    // little-endian `width-1`, then a 14-bit `height-1`.
+    if bytes.get(12..16)? != b"VP8L" {
+        return None;
+    }
     if bytes.len() < 25 {
         return None;
     }
-    // VP8L chunk: payload starts at 20. Signature 0x2F at byte 20.
-    if bytes.get(20)? != &0x2F {
+    if *bytes.get(20)? != 0x2F {
         return None;
     }
-    // Packed bits at 21..25
-    // 14-bit width-1 at bits 0..13 (little-endian over 2 bytes), then 14-bit height-1
-    // Using 4 bytes: first 2 bytes for width-1, next 2 for height-1 (each 14 bits)
-    let b21 = bytes.get(21).copied()? as u32;
-    let b22 = bytes.get(22).copied()? as u32;
-    let b23 = bytes.get(23).copied()? as u32;
-    let b24 = bytes.get(24).copied()? as u32;
-    let packed = b21 | (b22 << 8) | (b23 << 16) | (b24 << 24);
+    let packed = u32::from_le_bytes([
+        *bytes.get(21)?,
+        *bytes.get(22)?,
+        *bytes.get(23)?,
+        *bytes.get(24)?,
+    ]);
     let width = ((packed & 0x3FFF) + 1) as u32;
     let height = (((packed >> 14) & 0x3FFF) + 1) as u32;
     if width == 0 || height == 0 {
@@ -326,17 +326,17 @@ fn parse_vp8l_lossless(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 fn parse_vp8x_extended(bytes: &[u8]) -> Option<(u32, u32)> {
+    // VP8X chunk: fourcc at 12..16, chunk size at 16..20, payload at 20.
+    // Flags at 20, reserved 21..24, then a 24-bit little-endian `width-1`
+    // (24..27) and `height-1` (27..30).
+    if bytes.get(12..16)? != b"VP8X" {
+        return None;
+    }
     if bytes.len() < 30 {
         return None;
     }
-    // VP8X payload starts at 20. Flags at 20, reserved at 21..23, width-1 at 24..27, height-1 at 27..30 (24-bit little-endian)
-    // Actually width-1 is 24 bits little-endian at 24..27, height-1 at 27..30.
-    let width_raw = (bytes.get(24).copied()? as u32)
-        | ((bytes.get(25).copied()? as u32) << 8)
-        | ((bytes.get(26).copied()? as u32) << 16);
-    let height_raw = (bytes.get(27).copied()? as u32)
-        | ((bytes.get(28).copied()? as u32) << 8)
-        | ((bytes.get(29).copied()? as u32) << 16);
+    let width_raw = (*bytes.get(24)? as u32) | ((*bytes.get(25)? as u32) << 8) | ((*bytes.get(26)? as u32) << 16);
+    let height_raw = (*bytes.get(27)? as u32) | ((*bytes.get(28)? as u32) << 8) | ((*bytes.get(29)? as u32) << 16);
     let width = width_raw + 1;
     let height = height_raw + 1;
     if width == 0 || height == 0 {
@@ -494,17 +494,23 @@ pub fn validate_metadata_attachments(metadata: &serde_json::Value, config: &Mult
         None | Some(serde_json::Value::Null) => Vec::new(),
         Some(serde_json::Value::Array(_)) => {
             let mut atts = Vec::new();
+            let mut warnings = Vec::new();
             if let Some(arr) = metadata.get("attachments").and_then(|v| v.as_array()) {
-                for item in arr {
-                    if let Ok(att) = serde_json::from_value::<Attachment>(item.clone()) {
-                        atts.push(att);
-                    } else {
-                        // If parsing fails, treat as array element error? Per spec: parse each into Attachment.
-                        // We skip unparseable; tests don't include bad objects.
+                for (idx, item) in arr.iter().enumerate() {
+                    match serde_json::from_value::<Attachment>(item.clone()) {
+                        Ok(att) => atts.push(att),
+                        // A declared element that does not parse is a
+                        // validation error, never a silent skip: the plan
+                        // would otherwise validate fewer attachments than the
+                        // record declared.
+                        Err(e) => warnings.push(MultimodalWarning::AttachmentUnparseable {
+                            index: idx,
+                            error: e.to_string(),
+                        }),
                     }
                 }
             }
-            let mut warnings = validate_attachments(&atts, config, bytes_resolver);
+            warnings.extend(validate_attachments(&atts, config, bytes_resolver));
             warnings.extend(verify_inline_attachments(metadata));
             warnings
         }
@@ -596,17 +602,38 @@ mod tests {
         webp.extend_from_slice(b"WEBP");
         webp.extend_from_slice(b"VP8 ");
         webp.extend_from_slice(&(10u32.to_le_bytes())); // chunk size
-        // VP8 frame tag: start code 0x9D 0x01 0x2A + 3 bits scale + 14 bits width/height? We'll approximate
+        // VP8 frame: frame tag (3 bytes) at 20..23, keyframe sync code
+        // 0x9D 0x01 0x2A at 23..26, then 14-bit LE width/height at 26..30.
+        webp.extend_from_slice(&[0x00, 0x00, 0x00]);
         webp.extend_from_slice(&[0x9D, 0x01, 0x2A, 0x01]);
-        // Width 14-bit LE at offset 26 from file start (20 + 6?): let's just put at 26
-        // We'll pad to at least 30 bytes
         webp.resize(30, 0);
         webp[26] = 100;
         webp[27] = 0;
         webp[28] = 200;
         webp[29] = 0;
         let dims = parse_dimensions("image/webp", &webp);
-        assert!(dims.is_some());
+        assert_eq!(dims, Some((100, 200)));
+    }
+
+    #[test]
+    fn unparseable_attachment_element_is_reported() {
+        let c = test_config();
+        // The second element lacks required fields (id, mime, size_bytes,
+        // digest, uri) and must be surfaced, not silently skipped.
+        let meta = serde_json::json!({
+            "attachments": [
+                {
+                    "id": "ok", "mime": "text/plain", "size_bytes": 1,
+                    "digest": "sha256:".to_string() + &"a".repeat(64), "uri": "x"
+                },
+                { "id": "half" }
+            ]
+        });
+        let w = validate_metadata_attachments(&meta, &c, None);
+        assert!(w.iter().any(|x| matches!(
+            x,
+            MultimodalWarning::AttachmentUnparseable { index: 1, .. }
+        )));
     }
 
     #[test]

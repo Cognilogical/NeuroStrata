@@ -52,8 +52,8 @@ fn safe_prefix(s: &str, max_bytes: usize) -> &str {
 /// multi-byte characters like "→", "İ", or emoji). All markers are ASCII,
 /// so ASCII folding matches everything a Unicode fold would for them.
 fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
     }
     let hb = haystack.as_bytes();
     let nb = needle.as_bytes();
@@ -160,6 +160,19 @@ mod tests {
     fn negated_rule_skipped() {
         let sigs = detect_task_intents("Never TODO: do this");
         assert!(sigs.is_empty());
+    }
+
+    #[test]
+    fn short_inputs_never_panic() {
+        assert!(detect_task_intents("").is_empty());
+        assert!(detect_task_intents("a").is_empty());
+        assert!(detect_task_intents("TODO").is_empty());
+        assert_eq!(
+            detect_task_intents("TODO:").len(),
+            1,
+            "haystack exactly needle-length must match"
+        );
+        assert!(detect_task_intents("→ later").is_empty());
     }
 
     #[test]

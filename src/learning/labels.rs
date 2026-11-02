@@ -54,9 +54,11 @@ pub fn derive_labels(
     for obs_id in observation_ids {
         for rule in rules {
             let rule_id = rule.id.as_str();
+            // Production rules are constructed as "rule-<observation_id>"
+            // (src/learning/dataset.rs), so strip that prefix before comparing.
             let matches_obs = rule_id == *obs_id
                 || rule_id == "*"
-                || obs_id.contains(rule_id);
+                || rule_id.strip_prefix("rule-") == Some(obs_id.as_str());
             if !matches_obs {
                 continue;
             }
@@ -83,12 +85,20 @@ mod tests {
         // This test FAILS until Step 2: derive_labels returns the same
         // observation_ids regardless of which rules are applied.
         let obs_ids = vec!["obs-1".to_string(), "obs-2".to_string()];
-        let rules = vec![LabelRule {
-            id: "obs".into(),
-            version: 1,
-            tier: LabelTier::ShippedAnchorGold,
-            fixed_probability: Some(1.0),
-        }];
+        let rules = vec![
+            LabelRule {
+                id: "obs-1".into(),
+                version: 1,
+                tier: LabelTier::ShippedAnchorGold,
+                fixed_probability: Some(1.0),
+            },
+            LabelRule {
+                id: "obs-2".into(),
+                version: 1,
+                tier: LabelTier::ShippedAnchorGold,
+                fixed_probability: Some(1.0),
+            },
+        ];
 
         let labels = derive_labels(&obs_ids, &rules).expect("derive labels");
         // Observations must remain unchanged regardless of rule change

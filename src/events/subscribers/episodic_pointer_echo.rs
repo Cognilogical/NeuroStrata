@@ -62,6 +62,11 @@ const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// keeps a single-project daemon's behavior byte-identical.
 pub struct EpisodicPointerEcho {
     project_root: PathBuf,
+    /// Namespace → project-root anchors, for a daemon that serves more than
+    /// one project. [`Self::root_for`] consults it first and falls back to
+    /// the automatic `.NeuroStrata` marker lookup, then to the construction
+    /// root, so a single-project daemon's behavior is unchanged.
+    anchors: std::collections::HashMap<String, PathBuf>,
     /// The operator's episodic-buffer settings, read fresh on every `Created`.
     ///
     /// A function pointer rather than a call to `buffer::load_config` inline so
@@ -77,8 +82,24 @@ impl EpisodicPointerEcho {
     /// `project_root` is the same root `neurostrata_append_log` is given: the
     /// buffer lives at `<project_root>/.NeuroStrata/sessions/`.
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
+        Self::with_anchors(project_root, std::collections::HashMap::new())
+    }
+
+    /// The subscriber over an explicit namespace → project-root anchor map.
+    ///
+    /// `anchors` is keyed by the pulse's namespace — the only project signal
+    /// a pulse carries — and values are the project roots whose
+    /// `.NeuroStrata` buffers the echoes land in. A namespace absent from
+    /// the map is resolved automatically (the `.NeuroStrata` marker lookup
+    /// [`root_for`](Self::root_for) does per pulse) and, failing that, to
+    /// `project_root`.
+    pub fn with_anchors(
+        project_root: impl Into<PathBuf>,
+        anchors: std::collections::HashMap<String, PathBuf>,
+    ) -> Self {
         Self {
             project_root: project_root.into(),
+            anchors,
             load_config: buffer::load_config,
         }
     }
@@ -93,14 +114,53 @@ impl EpisodicPointerEcho {
     ) -> Self {
         Self {
             project_root: project_root.into(),
+            anchors: std::collections::HashMap::new(),
             load_config,
         }
     }
 
-    /// The project this pulse belongs to: the construction root.
-    fn root_for(&self, _namespace: &str) -> PathBuf {
-        self.project_root.clone()
+    /// The project this pulse's namespace belongs to.
+    ///
+    /// First the explicit anchors, then the automatic lookup: a daemon that
+    /// was never handed an anchor map still resolves a second project — a
+    /// sibling checkout whose directory name is the namespace and which
+    /// carries a `.NeuroStrata` marker — while an unresolvable namespace
+    /// stays on the construction root, exactly where a single-project daemon
+    /// always wrote.
+    fn root_for(&self, namespace: &str) -> PathBuf {
+        self.anchors
+            .get(namespace)
+            .cloned()
+            .unwrap_or_else(|| {
+                resolve_anchor_for_namespace(namespace, &self.project_root)
+                    .unwrap_or_else(|| self.project_root.clone())
+            })
     }
+}
+
+/// Resolves one namespace to a project root without an explicit anchor.
+///
+/// The namespace is trusted as a directory name only after it proves itself:
+/// a candidate root `<candidate>/<namespace>` counts when its `.NeuroStrata`
+/// directory exists. Candidates are the construction root's parent (the
+/// multi-project workspace layout, where each project is a sibling checkout
+/// named for its namespace) and the construction root itself.
+///
+/// `None` means "unresolvable": a namespace carrying path separators, or a
+/// name with no matching checkout, and the caller writes to the construction
+/// root as before.
+fn resolve_anchor_for_namespace(namespace: &str, construction_root: &Path) -> Option<PathBuf> {
+    if namespace.is_empty()
+        || namespace == "."
+        || namespace == ".."
+        || namespace.contains('/')
+        || namespace.contains('\\')
+    {
+        return None;
+    }
+    let parent = construction_root.parent()?;
+    let candidate = parent.join(namespace);
+    candidate.join(".NeuroStrata").is_dir().then_some(candidate)
 }
 
 #[async_trait]
@@ -562,6 +622,118 @@ mod tests {
             text.contains("before the standup"),
             "the agent's entry is untouched: {text:?}"
         );
+    }
+
+    /// With an explicit anchor map, a pulse for a second project echoes into
+    /// THAT project's buffer, while the construction root keeps writing
+    /// namespaces it was not taught about. This is the `with_anchors`
+    /// contract the struct's doc comment promises.
+    #[tokio::test]
+    async fn with_anchors_routes_each_pulse_to_its_own_project_buffer() {
+        let primary = scratch("anchors-primary");
+        let secondary = scratch("anchors-secondary");
+        let mut anchors = std::collections::HashMap::new();
+        anchors.insert("AnchoredSecondProject".to_string(), secondary.clone());
+        let bus = ThalamicBus::new(16);
+        bus.register(Box::new(EpisodicPointerEcho::with_anchors(
+            primary.clone(),
+            anchors,
+        )));
+
+        let pulse_for = |ns: &str| ThalamicPulse::Created {
+            id: "mem-anchors".to_string(),
+            namespace: ns.to_string(),
+            kind: "task".to_string(),
+        };
+        bus.emit(pulse_for("AnchoredSecondProject"), &RecursionToken::root());
+        bus.emit(pulse_for("AnUnanchoredNamespace"), &RecursionToken::root());
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let secondary_text = std::fs::read_to_string(buffer_file(&secondary))
+            .expect("the anchored namespace echoed into the anchored project's buffer");
+        assert!(
+            secondary_text.contains("AnchoredSecondProject"),
+            "the line names the namespace it landed in: {secondary_text:?}"
+        );
+        let primary_text = std::fs::read_to_string(buffer_file(&primary))
+            .expect("the unanchored namespace echoed into the construction root");
+        assert!(
+            primary_text.contains("AnUnanchoredNamespace"),
+            "the unanchored namespace stays on the construction root: {primary_text:?}"
+        );
+        // Each project's buffer holds exactly the line meant for it: the
+        // anchor routed, not duplicated.
+        assert!(
+            !secondary_text.contains("AnUnanchoredNamespace"),
+            "the secondary buffer never saw the other namespace: {secondary_text:?}"
+        );
+        assert!(
+            !primary_text.contains("AnchoredSecondProject"),
+            "the primary buffer never saw the anchored namespace: {primary_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&primary);
+        let _ = std::fs::remove_dir_all(&secondary);
+    }
+
+    /// Without an explicit anchor map, a sibling checkout whose directory
+    /// name is the namespace and which carries a `.NeuroStrata` marker is
+    /// resolved automatically — that is the daemon's multi-project layout.
+    #[tokio::test]
+    async fn a_sibling_checkout_with_a_marker_is_resolved_without_anchors() {
+        let workspace = scratch("discover-workspace");
+        let primary = workspace.join("PrimaryProject");
+        let sibling = workspace.join("AnchorSiblingProject");
+        std::fs::create_dir_all(primary.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(sibling.join(".NeuroStrata")).unwrap();
+
+        let bus = ThalamicBus::new(16);
+        bus.register(Box::new(EpisodicPointerEcho::new(primary.clone())));
+
+        let pulse_for = |ns: &str| ThalamicPulse::Created {
+            id: "mem-sibling".to_string(),
+            namespace: ns.to_string(),
+            kind: "task".to_string(),
+        };
+        bus.emit(pulse_for("AnchorSiblingProject"), &RecursionToken::root());
+        bus.emit(pulse_for("NowhereElseToGo"), &RecursionToken::root());
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let sibling_text = std::fs::read_to_string(buffer_file(&sibling))
+            .expect("the sibling checkout's buffer received its own echo");
+        assert!(
+            sibling_text.contains("AnchorSiblingProject"),
+            "the sibling echo names its namespace: {sibling_text:?}"
+        );
+        let primary_text = std::fs::read_to_string(buffer_file(&primary))
+            .expect("the unresolvable namespace echoed onto the construction root");
+        assert!(
+            primary_text.contains("NowhereElseToGo"),
+            "the unresolvable namespace stays on the construction root: {primary_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// A namespace that is not a usable directory name never anchors anywhere:
+    /// path traversal is refused before the marker check, and the echo stays
+    /// on the construction root.
+    #[test]
+    fn a_path_like_namespace_is_not_anchored() {
+        let root = scratch("traversal");
+        let project = root.join("Primary");
+        std::fs::create_dir_all(&project).unwrap();
+        let echo = EpisodicPointerEcho::new(project.clone());
+
+        for hostile in ["", ".", "..", "a/b", r"a\b"] {
+            assert_eq!(
+                echo.root_for(hostile),
+                project,
+                "a path-like namespace stays on the construction root: {hostile:?}"
+            );
+        }
+        assert_eq!(echo.root_for("AnchoredSecondProject"), project,
+            "no sibling and no anchor: construction root");
     }
 
     /// The production constructor, checked against the machine it runs on. The

@@ -146,7 +146,7 @@ fn build_memory_node(
     edges_by_source: &HashMap<String, Vec<(String, String, Option<String>)>>,
     principal: &str,
     variable_first: Option<i32>,
-    _variable_after: Option<&str>,
+    variable_after: Option<&str>,
     include_archived: bool,
     include_retired: bool,
 ) -> Option<Value> {
@@ -187,11 +187,35 @@ fn build_memory_node(
         .collect();
 
     let first = variable_first.unwrap_or(20).max(1).min(100);
-    let paginated_edges: Vec<Value> = edge_objs.into_iter().take(first as usize).collect();
-    let has_next = paginated_edges.len() < edges_data.len();
-    let end_cursor = paginated_edges.last().map(|_| encode_cursor("edge", id)).unwrap_or_default();
-    // Simplified: edge pagination cursor based on index, but spec focuses on memory pagination
-    // For edges, return all (or paginated) with basic pageInfo
+    // Edge cursors encode the edge's index (`{node_id}:{idx}`), so an `after`
+    // cursor can resume at exactly the edge that follows it.
+    let skipped = match variable_after {
+        Some(after_cur) => decode_cursor(after_cur)
+            .ok()
+            .filter(|(key, _)| key == "edge")
+            .and_then(|(_, value)| {
+                value.rsplit_once(':')
+                    .filter(|(node, _)| *node == id)
+                    .and_then(|(_, idx)| idx.parse::<usize>().ok())
+            })
+            .map(|idx| idx + 1)
+            .unwrap_or(0),
+        None => 0,
+    };
+    let paginated_edges: Vec<Value> = edge_objs
+        .into_iter()
+        .enumerate()
+        .skip(skipped)
+        .take(first as usize)
+        .map(|(_, obj)| obj)
+        .collect();
+    let has_next = skipped + paginated_edges.len() < edges_data.len();
+    // The cursor of the last returned edge carries the next page's resume point.
+    let end_cursor = if !paginated_edges.is_empty() {
+        encode_cursor("edge", &format!("{id}:{}", skipped + paginated_edges.len() - 1))
+    } else {
+        String::new()
+    };
     let edge_connection = json!({
         "edges": paginated_edges,
         "pageInfo": { "hasNextPage": has_next, "endCursor": if has_next { Some(end_cursor.clone()) } else { None } }
@@ -656,20 +680,28 @@ pub async fn execute_async(
     // declared edges are surfaced beside their declaring row so the `edges`
     // selection resolves without a second traversal.
     let mut edges_by_source: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> = std::collections::HashMap::new();
-    if let Ok(search_results) = res {
-        for sr in search_results {
-            let entry = edges_by_source.entry(sr.id.clone()).or_default();
-            for e in crate::store::ladybug::edge_specs(&sr.payload.metadata) {
-                entry.push((
-                    e.target_id.clone(),
-                    e.rel_type.to_string(),
-                    Some("metadata".to_string()),
-                ));
+    match res {
+        Ok(search_results) => {
+            for sr in search_results {
+                let entry = edges_by_source.entry(sr.id.clone()).or_default();
+                for e in crate::store::ladybug::edge_specs(&sr.payload.metadata) {
+                    entry.push((
+                        e.target_id.clone(),
+                        e.rel_type.to_string(),
+                        Some("metadata".to_string()),
+                    ));
+                }
+                records.push((sr.id, sr.payload));
             }
-            records.push((sr.id, sr.payload));
+            execute_on_records(&records, &edges_by_source, namespace, principal, query, variables)
         }
+        Err(e) => GraphQLResponse {
+            data: None,
+            errors: vec![GraphQLError {
+                message: format!("store list error: {e}"),
+            }],
+        },
     }
-    execute_on_records(&records, &edges_by_source, namespace, principal, query, variables)
 }
 
 pub fn execute(

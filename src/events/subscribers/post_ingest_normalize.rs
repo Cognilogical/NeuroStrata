@@ -1,5 +1,20 @@
 //! Post-ingest normalize subscriber (Layer 2 — ThalamicBus).
-//! Triggers `reconcile`-style normalization when ingest completes (AC4 pre-check).
+//!
+//! On an `ingest_done` pulse it runs one AC4 normalization pass over the
+//! pulse's namespace: every declared relation target in `related_to`,
+//! `contained_by`, `governs`, and `extracted_from` that can be resolved to an
+//! id the store holds is rewritten to that exact id in place, so graph edge
+//! canonicalization converges without an agent remembering to do it. The
+//! pass itself is [`normalize_namespace_targets`].
+//!
+//! The same pulse then clears every namespace's export-freshness `dirty`
+//! flag via [`super::clear_export_freshness`]: a normalization pass unions
+//! the affected rows as they already stand, commits them, so the committed
+//! export is not behind the store an ingest just touched.
+//!
+//! Both passes propagate their errors to the dispatcher — a failed
+//! normalization or flag clear is recorded as a subscriber failure on the
+//! bus metrics, never silently swallowed.
 
 // The subscriber is registered by the daemon's thalamic bus at startup: an
 // `ingest_done` pulse runs one normalization pass over the namespace.
@@ -98,8 +113,34 @@ pub async fn normalize_namespace_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{ThalamicPulse, RecursionToken, SubscriberContext};
+    use crate::events::{ThalamicPulse, RecursionToken, SubscriberContext, ExportFreshnessDirty};
+    use crate::traits::MemoryPayload;
     use std::sync::Arc;
+
+    fn payload(user_id: &str, metadata: serde_json::Value) -> MemoryPayload {
+        MemoryPayload {
+            content: "test row".into(),
+            user_id: user_id.into(),
+            memory_type: "task".into(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        }
+    }
+
+    /// The flag row the freshness subscriber writes, found by type so the
+    /// assertion does not have to name the sentinel's private id format.
+    async fn freshness_flag(store_ref: &dyn crate::traits::VectorStore) -> Option<MemoryPayload> {
+        store_ref
+            .list("global", None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.payload.memory_type == "freshness_flag")
+            .map(|r| r.payload)
+    }
+
     #[tokio::test]
     async fn new_handles_ingest_done_pulse() {
         let svc = PostIngestNormalize::new();
@@ -108,9 +149,77 @@ mod tests {
         };
         let mock: Arc<crate::guard::testkit::MockStore> = Arc::new(crate::guard::testkit::MockStore::new());
         let store_ref: &dyn crate::traits::VectorStore = mock.as_ref();
-        assert!(svc.handle(&pulse, &RecursionToken::new(), &SubscriberContext { store: store_ref, namespace: "global", ts: 0 }).await.is_ok());
+        let ctx = SubscriberContext { store: store_ref, namespace: "global", ts: 0 };
+        let token = RecursionToken::new();
+
+        // The ingest left one target row (auto-ingestor) and one task whose
+        // declared relation target is the unqualified form of it.
+        store_ref
+            .upsert(
+                "global",
+                "NeuroStrata::src/lib.rs",
+                vec![0.0; 4],
+                payload("auto-ingestor", serde_json::json!({})),
+            )
+            .await
+            .unwrap();
+        store_ref
+            .upsert(
+                "global",
+                "task-doc",
+                vec![0.0; 4],
+                payload(
+                    "agent",
+                    serde_json::json!({ "related_to": ["src/lib.rs"] }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        // And a genuinely dirty export-freshness flag, written the way the
+        // production writer writes it.
+        ExportFreshnessDirty::new(4)
+            .handle(
+                &ThalamicPulse::Created {
+                    id: "task-doc".into(),
+                    kind: "task".into(),
+                    namespace: "global".into(),
+                },
+                &token,
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let before = freshness_flag(store_ref).await.expect("the flag was written");
+        assert_eq!(before.metadata["dirty"], serde_json::json!(true),
+            "precondition: the flag is dirty before the ingest-done pulse");
+
+        svc.handle(&pulse, &token, &ctx).await.unwrap();
+
+        // The declared target was rewritten to the exact id the store holds.
+        let meta = mock.metadata_of("global", "task-doc").expect("row kept");
+        assert_eq!(
+            meta["related_to"][0], "NeuroStrata::src/lib.rs",
+            "the ingest_done pulse normalized the declared target: {meta}"
+        );
+
+        // The freshness flag was cleared, so export-graph reports fresh.
+        let after = freshness_flag(store_ref).await.expect("the flag row survives");
+        assert_eq!(
+            after.metadata["dirty"],
+            serde_json::json!(false),
+            "the ingest_done pulse cleared the export-freshness flag"
+        );
+
         let other = ThalamicPulse::Created { id: "i2".into(), kind: "task_created".into(), namespace: "global".into() };
-        assert!(svc.handle(&other, &RecursionToken::new(), &SubscriberContext { store: store_ref, namespace: "global", ts: 0 }).await.is_ok());
+        svc.handle(&other, &RecursionToken::new(), &ctx).await.unwrap();
+        // A non-ingest pulse is a no-op: the already-normalized row did not
+        // need (and did not get) a second pass.
+        let meta = mock.metadata_of("global", "task-doc").unwrap();
+        assert_eq!(
+            meta["related_to"][0], "NeuroStrata::src/lib.rs",
+            "no pulse but ingest_done normalizes: {meta}"
+        );
     }
 
     #[test]
@@ -146,10 +255,16 @@ impl MemorySubscriber for PostIngestNormalize {
         _ctx: &SubscriberContext<'_>,
     ) -> Result<(), SubscriberError> {
         match event {
-            // Trigger normalize / reconcile on ingest-done pulse
+            // Trigger normalize / reconcile on ingest-done pulse. Errors are
+            // propagated, not discarded: a normalize or flag-clear failure is
+            // a subscriber error the bus counts, and callers see it.
             ThalamicPulse::Created { kind, namespace, .. } if kind == "ingest_done" => {
-                let _ = normalize_namespace_targets(_ctx.store, namespace).await;
-                let _ = super::clear_export_freshness(_ctx.store).await;
+                normalize_namespace_targets(_ctx.store, namespace)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("post_ingest_normalize failed: {e}"))?;
+                super::clear_export_freshness(_ctx.store)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("clear_export_freshness failed: {e}"))?;
                 Ok(())
             }
             _ => Ok(()),

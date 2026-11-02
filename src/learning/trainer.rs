@@ -121,13 +121,41 @@ impl Trainer {
             let cand_dir = self.runtime.model_cache.join("candidates").join(version);
             std::fs::create_dir_all(&cand_dir)?;
 
-            // Prefer real labeled pairs from train.jsonl; fall back to proxy
-            // pairs only when no valid pairs exist there.
+            // Prefer real labeled pairs from train.jsonl; fall back to sibling
+            // dataset files written by build_dedup_dataset
+            // (<learning-root>/dataset/{calibration,train}.jsonl), and only
+            // then to proxy pairs when no valid pairs exist anywhere.
+            let dataset_dir = self.runtime.model_cache.parent()
+                .and_then(|p| p.parent())
+                .map(|root| root.join("dataset"));
             let train_jsonl = self.runtime.model_cache.join("train.jsonl");
-            let pairs = read_calibration_pairs(&train_jsonl);
+            let mut pairs = read_calibration_pairs(&train_jsonl);
+            if pairs.is_empty() {
+                if let Some(dir) = &dataset_dir {
+                    for fallback_file in ["calibration.jsonl", "train.jsonl"] {
+                        pairs = read_calibration_pairs(&dir.join(fallback_file));
+                        if !pairs.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
             let from_dataset = !pairs.is_empty();
             let fallback_pairs: Vec<(f32, bool)> = vec![(0.8, true), (0.2, false)];
-            let effective_pairs = if from_dataset { pairs } else { fallback_pairs };
+            let effective_pairs = if from_dataset { pairs.clone() } else { fallback_pairs.clone() };
+            // Held-out evaluation: when the dataset build produced eval.jsonl
+            // with usable pairs, evaluate on those rather than re-score the
+            // training pairs (H6: no train-on-eval leakage in the report).
+            let held_out_eval_pairs = dataset_dir.as_ref()
+                .map(|dir| dir.join("eval.jsonl"))
+                .filter(|p| p.exists())
+                .map(|p| read_calibration_pairs(&p))
+                .filter(|pairs| !pairs.is_empty());
+            let (eval_pairs, suite_name) = match (held_out_eval_pairs, from_dataset) {
+                (Some(eval), _) => (eval, "dataset_eval".to_string()),
+                (None, true) => (effective_pairs.clone(), "dataset".to_string()),
+                (None, false) => (fallback_pairs, "proxy_internal".to_string()),
+            };
             let fitted_temp = crate::learning::calibration::TemperatureFitter::new()
                 .fit(&effective_pairs)?;
             let manifest = serde_json::json!({
@@ -142,11 +170,11 @@ impl Trainer {
             // Real evaluation with temperature-scaled metrics; written
             // alongside manifest.json so `learn train` (src/main.rs) reads a
             // measurable eval_report.json and promotes fail-closed.
-            let eval_report = crate::learning::evaluator::evaluate_pairs(&effective_pairs, fitted_temp);
+            let eval_report = crate::learning::evaluator::evaluate_pairs(&eval_pairs, fitted_temp);
             let evaluation = EvaluationReport {
                 candidate: version.clone(),
                 suites: vec![SuiteReport {
-                    name: if from_dataset { "dataset" } else { "proxy_internal" }.to_string(),
+                    name: suite_name,
                     metrics: serde_json::json!({
                         "score": eval_report.accuracy,
                         "accuracy": eval_report.accuracy,
@@ -218,9 +246,40 @@ impl Trainer {
     }
 }
 
+/// Parses a boolean duplicate label from a decision/outcome string.
+/// `"duplicate" | "block" | "confirmed"` (substring match, so
+/// `"blocked_exact"` counts) => `true`; `"distinct" | "allow" |
+/// "rejected"` => `false`; anything else => `None` (row skipped).
+fn duplicate_label_from_wording(word: &str) -> Option<bool> {
+    let w = word.to_ascii_lowercase();
+    if ["duplicate", "block", "confirmed"].iter().any(|k| w.contains(k)) {
+        Some(true)
+    } else if ["distinct", "allow", "reject"].iter().any(|k| w.contains(k)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Derives a similarity score in [0, 1] for a `DecisionObservation` JSONL
+/// row (one written by `build_dedup_dataset`): the best candidate
+/// `provider_confidence`, else the complement of the best `raw_distance`.
+fn similarity_from_observation_row(value: &serde_json::Value) -> Option<f64> {
+    let candidates = value.get("candidates")?.as_array()?;
+    let best_conf = candidates.iter()
+        .filter_map(|c| c.get("provider_confidence").and_then(|x| x.as_f64()))
+        .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
+    let best_dist = candidates.iter()
+        .filter_map(|c| c.get("raw_distance").and_then(|x| x.as_f64()))
+        .fold(None::<f64>, |acc, v| Some(acc.map_or(v, |a| a.min(v))));
+    best_conf.or_else(|| best_dist.map(|d| (1.0 - d).clamp(0.0, 1.0)))
+}
+
 /// Reads labeled calibration pairs from a `train.jsonl` file. Accepts
 /// `"logit"`/`"score"` numeric keys and `"label"`/`"is_duplicate"` boolean
-/// keys; lines that fail to parse or lack a valid pair are skipped.
+/// keys, plus `DecisionObservation` rows (score from the best candidate
+/// confidence/distance converted to a logit, label from the `decision`
+/// wording); lines that fail to parse or lack a valid pair are skipped.
 fn read_calibration_pairs(path: &std::path::Path) -> Vec<(f32, bool)> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -238,11 +297,27 @@ fn read_calibration_pairs(path: &std::path::Path) -> Vec<(f32, bool)> {
         let logit = value
             .get("logit")
             .and_then(|x| x.as_f64())
-            .or_else(|| value.get("score").and_then(|x| x.as_f64()));
+            .or_else(|| value.get("score").and_then(|x| x.as_f64()))
+            .or_else(|| {
+                // DecisionObservation rows carry similarity scores, not
+                // logits; convert (s - 0.5) * 4.0 to the logit scale.
+                value
+                    .get("similarity_score")
+                    .and_then(|x| x.as_f64())
+                    .or_else(|| similarity_from_observation_row(&value))
+                    .map(|s| (((s as f32) - 0.5) * 4.0) as f64)
+            });
         let label = value
             .get("label")
             .and_then(|x| x.as_bool())
-            .or_else(|| value.get("is_duplicate").and_then(|x| x.as_bool()));
+            .or_else(|| value.get("is_duplicate").and_then(|x| x.as_bool()))
+            .or_else(|| {
+                value
+                    .get("decision")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| value.get("outcome").and_then(|x| x.as_str()))
+                    .and_then(duplicate_label_from_wording)
+            });
         if let (Some(logit), Some(label)) = (logit, label) {
             pairs.push((logit as f32, label));
         }

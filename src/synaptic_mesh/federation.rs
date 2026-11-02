@@ -6,7 +6,10 @@ pub async fn remote_list(base_url: &str, namespace: &str, token: &str) -> Result
     let client = reqwest::Client::new();
     let resp = client.get(&url).bearer_auth(token).send().await.map_err(|e| e.to_string())?;
     let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(v.as_array().cloned().unwrap_or_default())
+    v.as_array()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("remote_list expected JSON array from {base_url}, got non-array"))
+        .map_err(|e| format!("{:#}", e))
 }
 
 #[cfg(test)]

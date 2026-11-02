@@ -174,7 +174,7 @@ pub async fn archive_memory(
                     kind: crate::learning::observation::LearningOutcomeKind::MemoryArchived,
                 };
                 if let Err(e) = recorder.record_outcome(&outcome).await {
-                    eprintln!("learning outcome record failed: {}", e);
+                    tracing::warn!("learning outcome record failed: {e}");
                 }
             }
             Err(e) => eprintln!("learning recorder open failed: {}", e),

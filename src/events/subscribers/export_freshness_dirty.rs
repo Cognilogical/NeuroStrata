@@ -171,9 +171,11 @@ pub async fn check_export_freshness(store: &dyn VectorStore) -> Result<(), Strin
 /// `metadata.dirty == true`, and flips it back to `false` so the
 /// export-freshness gate (`check_export_freshness`) passes.
 ///
-/// This is the clear path the doc comment references (`export-graph --clear`
-/// reads it and clears it); the CLI does not yet pass `--clear`, so the
-/// function stands ready for the call site.
+/// Two call sites clear it: the `export-graph --clear` CLI path, and the
+/// post-ingest normalization subscriber (`post_ingest_normalize`), which
+/// clears the flags as part of its `ingest_done` pass — the flags are
+/// propagated to the dispatcher, so a failed clear is a subscriber error
+/// the bus records, never a silent no-op.
 pub async fn clear_export_freshness(store: &dyn VectorStore) -> Result<(), String> {
     let namespaces = store
         .list_namespaces()

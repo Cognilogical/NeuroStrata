@@ -153,11 +153,13 @@ pub fn drain_once(
             })
             .unwrap_or(false)
     {
-        let _ = write_compressed_bundle(
+        if let Err(e) = write_compressed_bundle(
             &mesh.root().join("bundles"),
             &format!("drain-{}", Utc::now().timestamp_millis()),
             &committed_records,
-        );
+        ) {
+            tracing::warn!("SynapticMesh compressed bundle write failed: {e}");
+        }
     }
 
     // Mark committed AFTER the commit: a crash before this line leaves the
@@ -253,8 +255,11 @@ fn apply_one(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| mesh.root().join(".neurostrata-mesh").join("signing.key"));
     if signing_key_path.exists() {
+        // A signing failure with the key present is a real fault (corrupt
+        // or unreadable key); committing an unsigned record silently would
+        // downgrade the mesh's trust surface, so fail the drain.
         if let Err(e) = sign_record(&mut record, &signing_key_path) {
-            tracing::warn!("SynapticMesh record signing failed: {e}");
+            return Err(format!("SynapticMesh record signing failed: {e}"));
         }
     }
 
@@ -299,9 +304,19 @@ fn apply_one(
             if let Ok(stream) =
                 crate::streaming::Stream::from_nquads(&rdf_block.quads, crate::streaming::PatchOp::Add)
             {
-                if !stream.is_empty() && stream.len() > 0 {
+                if !stream.is_empty() {
                     let patch_path = path.with_extension("rdfpatch");
-                    let _ = std::fs::write(&patch_path, stream.to_patch());
+                    match std::fs::write(&patch_path, stream.to_patch()) {
+                        Ok(()) => tracing::debug!(
+                            "SynapticMesh RDF patch ({} quads) written to {}",
+                            stream.len(),
+                            patch_path.display()
+                        ),
+                        Err(e) => tracing::warn!(
+                            "SynapticMesh RDF patch write to {} failed: {e}",
+                            patch_path.display()
+                        ),
+                    }
                 }
             }
         }
@@ -349,7 +364,15 @@ fn build_record(
     // Build canonical RDF block (Phase 1 dual-write: always emit canonical payload)
     let created_at_str = created_at(entry).to_rfc3339();
     let archived_at_str = archived_at.as_ref().map(|dt| dt.to_rfc3339());
-    let tombstoned_at_str = None::<String>; // Not set on creation
+    // Tombstone: not set on creation; an archive operation IS the tombstoning
+    // event, so an archived record carries the archive timestamp forward as
+    // its tombstone time (the publish-time update stamp).
+    let tombstoned_at = if matches!(state, LifecycleState::Archived) {
+        archived_at.clone()
+    } else {
+        None
+    };
+    let tombstoned_at_str = tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
     let superseded_by_str = superseded_by.as_ref().map(|u| u.to_string());
     let update_id_str = entry.stable_op_id.to_string();
     let trust_val = trust_from(&entry.metadata).to_string();
@@ -416,9 +439,14 @@ fn build_record(
     } else {
         crate::streaming::PatchOp::Add
     };
-    let patch = crate::streaming::Stream::from_nquads(&nquads_text, patch_op)
-        .ok()
-        .filter(|s| !s.is_empty());
+    let patch = match crate::streaming::Stream::from_nquads(&nquads_text, patch_op) {
+        Ok(stream) if !stream.is_empty() => Some(stream),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("SynapticMesh RDF patch build failed for update {update_id_str}: {e}");
+            None
+        }
+    };
 
     MeshRecord {
         schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
@@ -431,7 +459,7 @@ fn build_record(
             created_by: node_id.to_string(),
             superseded_by,
             archived_at,
-            tombstoned_at: None,
+            tombstoned_at,
         },
         content,
         metadata: projected_metadata(&entry.metadata),
@@ -478,9 +506,10 @@ pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), Strin
 /// Compress a batch of mesh records with zstd for bundle transport.
 /// Used by `write_compressed_bundle` under the drain-time
 /// `NEUROSTRATA_MESH_BUNDLE_ZSTD` opt-in and the bundle round-trip tests.
-pub fn compress_record_bundle(records: &[MeshRecord], _level: i32) -> Result<Vec<u8>, String> {
+pub fn compress_record_bundle(records: &[MeshRecord], level: i32) -> Result<Vec<u8>, String> {
     let json_bytes = serde_json::to_vec(records).map_err(|e| e.to_string())?;
-    crate::compression::zstd::compress_mesh_bundle(&json_bytes).map_err(|e| e.to_string())
+    crate::compression::zstd::compress_mesh_bundle_with_level(&json_bytes, level)
+        .map_err(|e| e.to_string())
 }
 
 /// Write a compressed bundle to `<bundles_dir>/<bundle_name>.bundle.zst`.
@@ -501,7 +530,7 @@ pub fn write_compressed_bundle(
 /// Rebuild the canonical RDF block from a MeshRecord after lifecycle mutation.
 /// Uses the existing block only to preserve content/relationships (all come
 /// from the record itself); the lifecycle fields are taken from the record.
-fn rebuild_rdf_block(record: &MeshRecord, _existing: &RdfBlock) -> Option<RdfBlock> {
+fn rebuild_rdf_block(record: &MeshRecord, existing: &RdfBlock) -> Option<RdfBlock> {
     let id_str = record.id.to_string();
     let namespace = &record.namespace;
     let memory_type = &record.memory_type;
@@ -510,7 +539,19 @@ fn rebuild_rdf_block(record: &MeshRecord, _existing: &RdfBlock) -> Option<RdfBlo
     let created_by = &record.lifecycle.created_by;
     let superseded_by_str = record.lifecycle.superseded_by.as_ref().map(|u| u.to_string());
     let archived_at_str = record.lifecycle.archived_at.as_ref().map(|dt| dt.to_rfc3339());
-    let tombstoned_at_str = record.lifecycle.tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
+    // Tombstone the update stamp for an archive: the archive op IS the
+    // tombstoning event (the update timestamp), and an already-present
+    // tombstone wins.
+    let tombstoned_at = if record.lifecycle.state == LifecycleState::Archived {
+        record
+            .lifecycle
+            .archived_at
+            .clone()
+            .or_else(|| record.lifecycle.tombstoned_at.clone())
+    } else {
+        record.lifecycle.tombstoned_at.clone()
+    };
+    let tombstoned_at_str = tombstoned_at.as_ref().map(|dt| dt.to_rfc3339());
     let content_str = match &record.content {
         Value::String(s) => s.clone(),
         _ => serde_json::to_string(&record.content).unwrap_or_default(),
@@ -548,8 +589,10 @@ fn rebuild_rdf_block(record: &MeshRecord, _existing: &RdfBlock) -> Option<RdfBlo
         trigger.as_deref(), initial_fires, valid_to.as_deref(), rehearsal_script.as_deref(),
     );
     Some(RdfBlock {
-        schema: "neurostrata-rdf-record/v1".to_string(),
-        format: "n-quads".to_string(),
+        // The rebuilt block retains the existing block's schema/format
+        // identifiers — a rebuilt block is the same projection, refreshed.
+        schema: existing.schema.clone(),
+        format: existing.format.clone(),
         canonical_hash: digest_str,
         quads: nquads_text,
     })

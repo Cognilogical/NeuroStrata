@@ -4,6 +4,22 @@
 //! and rendering it. It is stateless: the caller wires whatever backends a
 //! production plan needs before invoking it, so there are no capability flags
 //! to toggle — a plan is always built the same way.
+//!
+//! Two construction paths, one honest outcome each:
+//!
+//! * [`ContextService::plan`] builds the empty shell of a plan for a request:
+//!   scope from the request, no items, never `Supported` (an empty plan is a
+//!   degraded outcome the caller must observe). It is the base both other
+//!   paths report through, and the shape a caller uses when it only needs the
+//!   degradation and scope semantics probed.
+//! * [`ContextService::plan_with_items`] takes ranked candidate items and a
+//!   [`Budget`], dedups and budgets them down (`plan::rank_dedup_budget`),
+//!   truncates to `max_items`, and reports `Supported` only when at least one
+//!   item survived. This is the production path the server and hosts use.
+//!
+//! Rendering is deliberately not bundled into planning: production hosts render
+//! via the free `render` re-exported from `context`; the test-only `render`
+//! shim lives on the service for convenience in unit tests.
 
 use super::model::{ContextPlan, ContextRequest, Degradation};
 
@@ -25,7 +41,8 @@ impl ContextService {
     {
         let req = request.as_ref();
         let mut plan = ContextPlan::new(req.event_id.clone(), Degradation::Partial);
-        plan.applied_scope = String::new();
+        // The scope the plan was applied to: the caller-authorized namespace.
+        plan.applied_scope = req.session_id.clone();
         plan.items = Vec::new();
         plan.truncation = false;
         plan

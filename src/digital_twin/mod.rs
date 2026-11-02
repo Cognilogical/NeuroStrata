@@ -143,24 +143,34 @@ pub fn set_state(
     if payload.metadata.is_null() || !payload.metadata.is_object() {
         payload.metadata = serde_json::json!({});
     }
-    let meta = payload.metadata.as_object_mut().expect("metadata is object");
+    let meta = payload
+        .metadata
+        .as_object_mut()
+        .ok_or_else(|| TwinError::InvalidPayload("metadata is not an object".to_string()))?;
     if !meta.contains_key("twin") || meta.get("twin").map_or(true, |v| !v.is_object()) {
         meta.insert("twin".to_string(), serde_json::json!({}));
     }
-    let twin = meta.get_mut("twin").unwrap().as_object_mut().expect("twin is object");
+    let twin = meta
+        .get_mut("twin")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| TwinError::InvalidPayload("twin is not an object".to_string()))?;
 
     if merge {
         if !twin.contains_key("variables") || twin.get("variables").map_or(true, |v| !v.is_object()) {
             twin.insert("variables".to_string(), serde_json::json!({}));
         }
-        let vars_obj = twin.get_mut("variables").unwrap().as_object_mut().expect("variables is object");
+        let vars_obj = twin
+            .get_mut("variables")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| TwinError::InvalidPayload("variables is not an object".to_string()))?;
         for (k, v) in vars {
-            vars_obj.insert(k.clone(), serde_json::json!(*v));
+            let clean_k = sanitize_var_name(k);
+            vars_obj.insert(clean_k, serde_json::json!(*v));
         }
     } else {
         let new_vars: serde_json::Map<String, serde_json::Value> = vars
             .iter()
-            .map(|(k, v)| (k.clone(), serde_json::json!(*v)))
+            .map(|(k, v)| (sanitize_var_name(k), serde_json::json!(*v)))
             .collect();
         twin.insert("variables".to_string(), serde_json::Value::Object(new_vars));
     }
@@ -323,7 +333,9 @@ pub fn get_twin_state_from_rows(
     let mut best_version = 0u64;
     let mut best_payload: Option<&crate::traits::MemoryPayload> = None;
     for (_id, payload) in rows {
-        if !DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str()) {
+        let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
+            || payload.metadata.get("twin").is_some();
+        if !is_twin_row {
             continue;
         }
         let payload_twin_id = payload
@@ -366,7 +378,9 @@ pub fn twin_history_from_rows(
 ) -> Vec<(u64, i64, BTreeMap<String, f64>)> {
     let mut matched: Vec<(u64, i64, BTreeMap<String, f64>)> = Vec::new();
     for (_id, payload) in rows {
-        if !DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str()) {
+        let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
+            || payload.metadata.get("twin").is_some();
+        if !is_twin_row {
             continue;
         }
         let payload_twin_id = payload
@@ -407,7 +421,9 @@ pub fn twin_diff_from_rows(
     let mut from_payload: Option<&crate::traits::MemoryPayload> = None;
     let mut to_payload: Option<&crate::traits::MemoryPayload> = None;
     for (_id, payload) in rows {
-        if !DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str()) {
+        let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
+            || payload.metadata.get("twin").is_some();
+        if !is_twin_row {
             continue;
         }
         let payload_twin_id = payload
@@ -450,7 +466,7 @@ pub async fn list_twins(
     store: &dyn crate::traits::VectorStore,
     namespace: &str,
 ) -> Vec<TwinSummary> {
-    match store.list(namespace, None, Some("digital_twin")).await {
+    match store.list(namespace, None, None).await {
         Ok(results) => {
             let rows: Vec<(String, crate::traits::MemoryPayload)> = results
                 .into_iter()
@@ -458,7 +474,10 @@ pub async fn list_twins(
                 .collect();
             list_twins_from_rows(&rows)
         }
-        Err(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            Vec::new()
+        }
     }
 }
 
@@ -467,7 +486,7 @@ pub async fn get_twin_state(
     namespace: &str,
     twin_id: &str,
 ) -> Option<BTreeMap<String, f64>> {
-    match store.list(namespace, None, Some("digital_twin")).await {
+    match store.list(namespace, None, None).await {
         Ok(results) => {
             let rows: Vec<(String, crate::traits::MemoryPayload)> = results
                 .into_iter()
@@ -475,14 +494,18 @@ pub async fn get_twin_state(
                 .collect();
             let state = get_twin_state_from_rows(&rows, twin_id);
             if state.is_none() {
-                eprintln!(
+                tracing::debug!(
                     "[TWIN] state lookup missed for twin '{}' in namespace '{}'",
-                    twin_id, namespace
+                    twin_id,
+                    namespace
                 );
             }
             state
         }
-        Err(_) => None,
+        Err(e) => {
+            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            None
+        }
     }
 }
 
@@ -492,7 +515,7 @@ pub async fn twin_history(
     twin_id: &str,
     limit: usize,
 ) -> Vec<(u64, i64, BTreeMap<String, f64>)> {
-    match store.list(namespace, None, Some("digital_twin")).await {
+    match store.list(namespace, None, None).await {
         Ok(results) => {
             let rows: Vec<(String, crate::traits::MemoryPayload)> = results
                 .into_iter()
@@ -500,7 +523,10 @@ pub async fn twin_history(
                 .collect();
             twin_history_from_rows(&rows, twin_id, limit)
         }
-        Err(_) => Vec::new(),
+        Err(e) => {
+            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            Vec::new()
+        }
     }
 }
 
@@ -511,7 +537,7 @@ pub async fn twin_diff(
     from_version: u64,
     to_version: u64,
 ) -> Result<Vec<TwinDelta>, TwinError> {
-    match store.list(namespace, None, Some("digital_twin")).await {
+    match store.list(namespace, None, None).await {
         Ok(results) => {
             let rows: Vec<(String, crate::traits::MemoryPayload)> = results
                 .into_iter()
@@ -519,10 +545,13 @@ pub async fn twin_diff(
                 .collect();
             twin_diff_from_rows(&rows, twin_id, from_version, to_version)
         }
-        Err(_) => Err(TwinError::NotFound(format!(
-            "store error for twin {}",
-            twin_id
-        ))),
+        Err(e) => {
+            tracing::warn!("digital_twin store.list error in namespace '{}': {e}", namespace);
+            Err(TwinError::NotFound(format!(
+                "store error for twin {}",
+                twin_id
+            )))
+        }
     }
 }
 
