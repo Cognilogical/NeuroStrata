@@ -648,7 +648,10 @@ fn trust_from(metadata: &Value) -> Trust {
 }
 
 fn created_at(entry: &OutboxEntry) -> DateTime<Utc> {
-    DateTime::from_timestamp(entry.ts, 0).unwrap_or_else(Utc::now)
+    DateTime::from_timestamp(entry.ts, 0).unwrap_or_else(|| {
+        tracing::warn!("invalid outbox entry timestamp {}; falling back to Utc::now()", entry.ts);
+        Utc::now()
+    })
 }
 
 /// The archive timestamp: the tombstone the archive handler wrote, falling

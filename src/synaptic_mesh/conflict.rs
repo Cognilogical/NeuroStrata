@@ -149,7 +149,9 @@ pub fn load_overlay(mesh_dir: &Path) -> Overlay {
             tracing::warn!("corrupt mesh conflict overlay at {}: {e}", file.display());
             // Preserve the corrupt bytes for diagnostics (never deleted);
             // the overlay itself reads as empty (fail-soft).
-            let _ = std::fs::copy(&file, file.with_extension("json.corrupt"));
+            if let Err(e) = std::fs::copy(&file, file.with_extension("json.corrupt")) {
+                tracing::warn!("failed to copy corrupt overlay {}: {e}", file.display());
+            }
             return Overlay::empty();
         }
     };

@@ -268,7 +268,15 @@ impl MeshStorage {
     fn ensure_signing_key_ignored(&self) -> Result<()> {
         let wanted = [".neurostrata-mesh/signing.key", "*.key"];
         let path = self.root.join(".gitignore");
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("failed to read {}: {e}", path.display());
+                }
+                String::new()
+            }
+        };
         let have: Vec<&str> = existing.lines().map(|l| l.trim()).collect();
         let missing: Vec<&str> = wanted
             .iter()

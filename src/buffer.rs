@@ -286,11 +286,15 @@ fn prune_rolled(sessions: &Path, retention_days: u64) -> std::io::Result<()> {
         if !name.starts_with("session-") || !name.ends_with(".md") {
             continue;
         }
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| now.duration_since(t).ok())
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("prune_rolled failed to read mtime for {}: {e}", entry.path().display());
+                continue;
+            }
+        };
+        let old = now
+            .duration_since(modified)
             .map(|age| age > cutoff)
             .unwrap_or(false);
         if old {
@@ -419,8 +423,8 @@ pub async fn handle_append_log(
         let query = slugs.join(" ");
         let vec = match emb.embed(&query).await {
             Ok(v) => v,
-            Err(_) => {
-                tracing::warn!("Failed to generate embedding for recall");
+            Err(e) => {
+                tracing::warn!("Failed to generate embedding for recall: {e}");
                 return success_response(&outcome, &tags, vec![], None, signals);
             }
         };

@@ -617,7 +617,15 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             );
             // Live = updated within the staleness window. Stale = the holder
             // probably went away, so the claim is up for grabs (section 5.3).
-            let live = age.map(|a| a <= gate::STALE_AFTER_SECS).unwrap_or(false);
+            let live = age
+                .map(|a| a <= gate::STALE_AFTER_SECS)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "task {} in_progress claim has missing/invalid updated_at timestamp; treating claim as stale",
+                        id
+                    );
+                    false
+                });
             if live {
                 return format!(
                     "ERROR: task {} is claimed by {} (session '{}') and that claim is live (last update {}s ago). Two live sessions on one task duplicate work: ask them to release it (neurostrata_task_update with status 'open'), or claim it yourself after {} minutes without an update.",
@@ -1411,7 +1419,7 @@ pub async fn handle_task_complete(
                     .get("register_domain")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                match crate::registry::check_domain(&store, &emb, &namespace, &raw, register_domain)
+                match crate::registry::check_domain(&store, &namespace, &raw, register_domain)
                     .await
                 {
                     Ok(check) => {
@@ -2250,8 +2258,18 @@ fn set_executable(_path: &std::path::Path) {}
 /// every push (FINDING-bootstrap-wiring-nudge fix round 1).
 fn hook_observable(root: &std::path::Path) -> bool {
     let hook = git_hooks_dir(root).join("pre-push");
-    std::fs::read_to_string(&hook)
-        .ok()
+    let content = if hook.exists() {
+        match std::fs::read_to_string(&hook) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::debug!("hook_observable read failed for {}: {e}", hook.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    content
         .filter(|s| s.contains("NeuroStrata task gate"))
         .is_some()
         && hook_executable(&hook)
@@ -2321,10 +2339,18 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
     };
     let export_fresh: Option<bool> = {
         let export = root.join(".NeuroStrata").join("graph").join("graph.json");
-        match (
-            git,
-            std::fs::metadata(&export).and_then(|m| m.modified()).ok(),
-        ) {
+        let modified = match std::fs::metadata(&export) {
+            Ok(meta) => match meta.modified() {
+                Ok(mtime) => Some(mtime),
+                Err(e) => {
+                    tracing::warn!("failed to read export file mtime: {e}");
+                    None
+                }
+            },
+            // Not exported yet: metadata fails, no mtime to read.
+            Err(_) => None,
+        };
+        match (git, modified) {
             (false, _) => None,
             (true, None) => Some(false),
             (true, Some(mtime)) => {

@@ -120,7 +120,7 @@ pub async fn build_dedup_dataset(
 
     if learning_root.exists() && learning_root.is_dir() {
         let mut obs_files: Vec<_> = std::fs::read_dir(learning_root)?
-            .filter_map(|e| e.ok())
+            .filter_map(|res| match res { Ok(e) => Some(e), Err(e) => { tracing::warn!("failed to read dataset directory entry: {e}"); None } })
             .map(|e| e.path())
             .filter(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -130,7 +130,7 @@ pub async fn build_dedup_dataset(
         obs_files.sort();
 
         let mut out_files: Vec<_> = std::fs::read_dir(learning_root)?
-            .filter_map(|e| e.ok())
+            .filter_map(|res| match res { Ok(e) => Some(e), Err(e) => { tracing::warn!("failed to read dataset directory entry: {e}"); None } })
             .map(|e| e.path())
             .filter(|p| {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");

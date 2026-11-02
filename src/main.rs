@@ -3069,8 +3069,17 @@ async fn run() -> anyhow::Result<()> {
                     if daemon_holds_lock(&db_path) {
                         saw_lock = true;
                     } else if saw_lock {
-                        let report =
-                            std::fs::read_to_string(daemon_lock_path(&db_path)).unwrap_or_default();
+                        let report = match std::fs::read_to_string(daemon_lock_path(&db_path)) {
+                            Ok(report) => report,
+                            Err(e) => {
+                                tracing::debug!(
+                                    "the daemon's final checkpoint at {} could not be read: {}",
+                                    daemon_lock_path(&db_path).display(),
+                                    e
+                                );
+                                String::new()
+                            }
+                        };
                         if report == FINAL_CHECKPOINT_OK {
                             println!("Daemon stopped and checkpointed.");
                             return Ok(());
@@ -3404,13 +3413,24 @@ async fn run() -> anyhow::Result<()> {
                         }
                     };
 
+                    // BB-2: a malformed reply must never read as a clean gate.
+                    // The verdict is either a violations array, or the report
+                    // simply says the verdict is unavailable -- which flows
+                    // through the Err arm's strict-aware could-not-check exit.
+                    let outcome = outcome.and_then(|body| {
+                        body.get("violations")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "the daemon's gate reply was malformed (missing violations array): {}",
+                                    body
+                                )
+                            })
+                    });
+
                     match outcome {
-                        Ok(body) => {
-                            let violations = body
-                                .get("violations")
-                                .and_then(|v| v.as_array())
-                                .cloned()
-                                .unwrap_or_default();
+                        Ok(violations) => {
                             for violation in &violations {
                                 println!(
                                     "- [{}] {}: {}",
@@ -3487,7 +3507,20 @@ async fn run() -> anyhow::Result<()> {
                                         })
                                 })
                             }
-                            _ => None,
+                            Ok(resp) => {
+                                tracing::debug!(
+                                    "daemon /mcp task_validate answered HTTP {}; falling back to the direct report",
+                                    resp.status()
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "the /mcp task_validate request to the daemon failed: {}; falling back to the direct report",
+                                    e
+                                );
+                                None
+                            }
                         }
                     } else {
                         None
@@ -3546,10 +3579,15 @@ async fn run() -> anyhow::Result<()> {
                         let status = res.status();
                         let body = res.text().await.unwrap_or_default();
                         if !status.is_success() {
-                            eprintln!("Import failed: {}", body);
-                            std::process::exit(1);
+                            anyhow::bail!(
+                                "daemon /mcp task import returned HTTP {}: {}",
+                                status,
+                                body
+                            );
                         }
-                        serde_json::from_str(&body).unwrap_or_default()
+                        serde_json::from_str(&body).map_err(|e| {
+                            anyhow::anyhow!("invalid JSON from daemon /mcp task import: {e}")
+                        })?
                     } else {
                         let config = Config::from_default_path()?;
                         if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
@@ -3703,7 +3741,7 @@ async fn run() -> anyhow::Result<()> {
 
                 // AW-C4: `--dry-run` is read-only — it never opens the store —
                 // so it runs even while the daemon holds the lock.
-                if let Commands::Ingest { dry_run: true, dir, namespace: _, schema_path, dry_run_mode } = &other {
+                if let Commands::Ingest { dry_run: true, dir, namespace, schema_path, dry_run_mode } = &other {
                     let dir_str = cli_ingest_root(dir);
                     let dir_path_owned = std::path::PathBuf::from(&dir_str);
                     let schema_str = if let Some(path) = schema_path {
@@ -3722,6 +3760,7 @@ async fn run() -> anyhow::Result<()> {
                         }
                     };
                     let report = crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, &dry_run_mode).await?;
+                    println!("Namespace: {}", namespace);
                     println!("{}", report);
                     return Ok(());
                 }
@@ -3936,25 +3975,9 @@ async fn run() -> anyhow::Result<()> {
                         dir,
                         namespace,
                         schema_path,
-                        dry_run,
-                        dry_run_mode,
+                        dry_run: _,
+                        dry_run_mode: _,
                     } => {
-                        if dry_run {
-                            let dir_owned = cli_ingest_root(&dir);
-                            let dir_path = std::path::Path::new(&dir_owned);
-                            let schema_str = if let Some(path) = schema_path {
-                                std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                                    eprintln!("Failed to read schema from {}: {}", path, e);
-                                    std::process::exit(1);
-                                })
-                            } else {
-                                include_str!("schema.json").to_string()
-                            };
-                            let schema = crate::parser::schema::ParserSchema::load(&schema_str)?;
-                            let report = crate::parser::ingest::dry_run_directory(dir_path, &schema, &dry_run_mode).await?;
-                            println!("{}", report);
-                            return Ok(());
-                        }
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {

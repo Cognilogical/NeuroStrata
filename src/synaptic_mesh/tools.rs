@@ -64,7 +64,11 @@ pub fn synaptic_mesh_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "project_root": { "type": "string", "description": "Project root whose pointer file names the mesh. Defaults to the working directory." },
-                    "namespace": { "type": "string", "description": "Optional namespace to scope store replay after git pull." }
+                    "namespace": {
+                        "type": [ "string", "array" ],
+                        "items": { "type": "string" },
+                        "description": "Optional namespaces to scope store replay after git pull — one string or an array of strings, repeatable via array. Omitted = replay every pending record."
+                    }
                 },
                 "required": []
             }

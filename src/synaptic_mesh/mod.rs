@@ -3,9 +3,11 @@
 //!
 //! Slice 1 landed the on-disk schemas (manifest, record); slice 2 landed the
 //! daemon-owned storage (git checkout per mesh), the CLI dispatch surface,
-//! and the MCP tool schemas. Slice 3 lands the publish path: the durable
-//! outbox and the mesh-worker that drains it. Pull/replay, lifecycle
-//! enforcement, and conflict resolution land in follow-up slices.
+//! and the MCP tool schemas. Slice 3 landed the publish path: the durable
+//! outbox and the mesh-worker that drains it. The implemented surface covers
+//! init, status, push, pull/replay, conflict preservation, and lifecycle
+//! enforcement, so a peer's tombstones and shared records arrive without
+//! clobbering local history.
 
 pub mod cli;
 pub mod conflict;

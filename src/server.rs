@@ -368,7 +368,9 @@ pub async fn process_mcp_request(
                                 "priority": { "type": "integer", "enum": [0, 1, 2, 3, 4], "description": "0 is highest. Defaults to 2." },
                                 "labels": { "type": "array", "items": { "type": "string" }, "description": "Free-form tags carried on the record." },
                                 "parent_id": { "type": "string", "description": "Id of an existing task this one contains (epic/subtask)." },
-                                "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Ids of tasks this one waits on; a ready task has none unfinished." }
+                                "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Ids of tasks this one waits on; a ready task has none unfinished." },
+                                "user_id": { "type": "string", "description": "Optional user identifier for audit receipts." },
+                                "agent_name": { "type": "string", "description": "Optional agent identifier for audit receipts." },
                             },
                             "required": ["namespace", "title"]
                         }
@@ -382,7 +384,8 @@ pub async fn process_mcp_request(
                                 "id": { "type": "string", "description": "The task id, e.g. 'myproj-x7q2'." },
                                 "namespace": { "type": "string", "description": "The exact project name." },
                                 "assignee": { "type": "string", "description": "Who is doing the work (the agent or operator name)." },
-                                "session_id": { "type": "string", "description": "Unique id of this session; the exclusivity check compares it against the holder's." }
+                                "session_id": { "type": "string", "description": "Unique id of this session; the exclusivity check compares it against the holder's." },
+                                "event_id": { "type": "string", "description": "Optional idempotency event ID for the claim receipt." },
                             },
                             "required": ["id", "namespace", "assignee", "session_id"]
                         }
@@ -401,7 +404,9 @@ pub async fn process_mcp_request(
                                 "priority": { "type": "integer", "enum": [0, 1, 2, 3, 4], "description": "0 is highest." },
                                 "assignee": { "type": "string", "description": "Who is working this task." },
                                 "add_labels": { "type": "array", "items": { "type": "string" }, "description": "Labels to add without replacing the existing ones." },
-                                "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Replaces the blocker list outright (an empty array clears it)." }
+                                "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Replaces the blocker list outright (an empty array clears it)." },
+                                "session_id": { "type": "string", "description": "Caller session ID to verify claim ownership." },
+                                "event_id": { "type": "string", "description": "Optional idempotency event ID for the update receipt." },
                             },
                             "required": ["id", "namespace"]
                         }
@@ -444,7 +449,12 @@ pub async fn process_mcp_request(
                                     "required": ["content"]
                                 },
                                 "follow_up_tasks": { "type": "array", "items": { "type": "object", "properties": { "title": { "type": "string" }, "description": { "type": "string" }, "task_type": { "type": "string", "enum": ["task", "bug", "feature", "epic"] }, "priority": { "type": "integer", "enum": [0,1,2,3,4] }, "labels": { "type": "array", "items": { "type": "string" } } }, "required": ["title"] }, "description": "Optional list of follow-up tasks to create after this task is done. Each becomes an open task with spawned_from=parent and a related_to edge." },
-                                "link_memory_id": { "type": "string", "description": "Bind an already-written memory to this task via EXTRACTED_FROM. Its vector is reused as-is; linking never re-embeds." }
+                                "link_memory_id": { "type": "string", "description": "Bind an already-written memory to this task via EXTRACTED_FROM. Its vector is reused as-is; linking never re-embeds." },
+                                "session_id": { "type": "string", "description": "Caller session ID to verify claim ownership." },
+                                "user_id": { "type": "string", "description": "Optional user identifier for audit receipts." },
+                                "agent_name": { "type": "string", "description": "Optional agent identifier for audit receipts." },
+                                "event_id": { "type": "string", "description": "Optional idempotency event ID for the completion receipt." },
+                                "close_reason": { "type": "string", "description": "Alias for reason: why the task was closed." }
                             },
                             "required": ["id", "namespace"]
                         }
@@ -575,7 +585,8 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string", "description": "The id of the memory to archive." },
-                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') the memory lives in." }
+                                "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata') the memory lives in." },
+                                "allow_global": { "type": "boolean", "description": "Must be true to archive a memory in the shared 'global' namespace." }
                             },
                             "required": ["id", "namespace"]
                         }
@@ -891,6 +902,9 @@ pub async fn process_mcp_request(
                                 "target_namespace": { "type": "string", "description": "Optional cross-scope target namespace when authorized." },
                                 "turn_used": { "type": "integer", "description": "Bytes already used in the current turn budget." },
                                 "session_used": { "type": "integer", "description": "Bytes already used in the current session budget." },
+                                "turn_tokens_used": { "type": "integer", "description": "Tokens already used in the current turn budget (alias accepted with turn_used)." },
+                                "session_tokens_used": { "type": "integer", "description": "Tokens already used in the current session budget (alias accepted with session_used)." },
+                                "deny_egress": { "type": "boolean", "description": "When true, restrict planning to local-only context (no external egress)." },
                                 "format": { "type": "string", "enum": ["json", "text"], "description": "Output format." }
                             },
                             "required": ["namespace"]
@@ -1397,7 +1411,10 @@ async fn handle_context_plan(
                     }),
                     // A governed file that can no longer be read is honestly
                     // reported as un-hashed (missing), not as unchanged.
-                    Err(_) => None,
+                    Err(e) => {
+                        tracing::debug!("hash_governed_file failed to read {}: {e}", resolved.display());
+                        None
+                    }
                 }
             }
             // No governed file path: the stored hash remains the best known
@@ -1496,10 +1513,14 @@ async fn handle_context_plan(
     let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
     let turn_used = arguments
         .get("turn_tokens_used")
+        // The schema historically advertised `turn_used`/`session_used`; both
+        // names must keep working so callers cannot silently lose prior usage.
+        .or_else(|| arguments.get("turn_used"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     let session_used = arguments
         .get("session_tokens_used")
+        .or_else(|| arguments.get("session_used"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     let budget = Budget::from(token_budget).with_prior_usage(turn_used, session_used);
@@ -2453,9 +2474,8 @@ pub(crate) async fn embed_dedup_and_upsert(
                         decision = DedupDecision::LinkedExisting;
                         // Update existing candidate's metadata idempotently:
                         // merge extracted_from ids, reuse its vector, no twin row.
-                        if let Ok(Some((existing_vec, mut existing_payload))) =
-                            store.get(namespace, &ec.id).await
-                        {
+                        match store.get(namespace, &ec.id).await {
+                            Ok(Some((existing_vec, mut existing_payload))) => {
                             let meta = existing_payload.metadata.as_object_mut();
                             if let Some(m) = meta {
                                 let arr = m
@@ -2479,6 +2499,14 @@ pub(crate) async fn embed_dedup_and_upsert(
                                     ec.id
                                 );
                             }
+                        }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to fetch existing candidate {} for extracted_from merge: {e}",
+                                    ec.id
+                                );
+                            }
+                            Ok(None) => {}
                         }
                     } else {
                         decision = DedupDecision::BlockedExact;
@@ -2591,15 +2619,26 @@ pub(crate) async fn embed_dedup_and_upsert(
                         .iter()
                         .map(|d| (d.existing_memory_id.as_str(), d.confidence))
                         .collect();
-                    let blob_store =
-                        crate::learning::blob_store::BlobStore::new().ok();
+                    let blob_store = match crate::learning::blob_store::BlobStore::new() {
+                        Ok(bs) => Some(bs),
+                        Err(e) => {
+                            tracing::warn!("BlobStore::new failed for learning capture: {e}");
+                            None
+                        }
+                    };
                     for c in &filtered {
+                        let payload_hash = match blob_store.as_ref().map(|bs| bs.put(&c.payload)) {
+                            Some(Ok(hash)) => hash,
+                            other => {
+                                if let Some(Err(e)) = other {
+                                    tracing::warn!("learning BlobStore put failed: {e}");
+                                }
+                                payload_fallback_hash(&c.payload)
+                            }
+                        };
                         observed_candidates.push(crate::learning::observation::ObservedCandidate {
                             candidate_id: c.id.clone(),
-                            payload_hash: blob_store
-                                .as_ref()
-                                .and_then(|bs| bs.put(&c.payload).ok())
-                                .unwrap_or_else(|| payload_fallback_hash(&c.payload)),
+                            payload_hash,
                             source: crate::learning::observation::CandidateSource::RawDistance,
                             raw_distance: Some(c.raw_distance),
                             provider_confidence: provider_predictions
@@ -2629,7 +2668,10 @@ pub(crate) async fn embed_dedup_and_upsert(
     let report = store
         .upsert(namespace, &new_id, vector, payload.clone())
         .await
-        .map_err(|_| "Failed to store memory in database.".to_string())?;
+        .map_err(|e| {
+            tracing::warn!("store.upsert failed in handle_add_memory for '{namespace}': {e}");
+            "Failed to store memory in database.".to_string()
+        })?;
 
     // Learning-loop capture is opt-in via NEUROSTRATA_LEARNING_DIR so unit
     // tests and bare writes pay no extra disk I/O.
@@ -2744,7 +2786,14 @@ async fn handle_add_memory(
     if namespace != "global" {
         if let Some(project_root) = arguments.get("project_root").and_then(|r| r.as_str()) {
             let ns_dir = std::path::Path::new(project_root).join(".NeuroStrata");
-            if !tokio::fs::try_exists(&ns_dir).await.unwrap_or(false) {
+            let ns_dir_exists = match tokio::fs::try_exists(&ns_dir).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::warn!("try_exists failed for {}: {e}", ns_dir.display());
+                    false
+                }
+            };
+            if !ns_dir_exists {
                 let create_new_namespace = arguments
                     .get("create_new_namespace")
                     .and_then(|v| v.as_bool())
@@ -2996,7 +3045,7 @@ async fn handle_add_memory(
         let mut registry_cache: Option<Vec<String>> = None;
         let mut check_warning: Option<String> = None;
         if let Some(raw) = &raw_domain {
-            match crate::registry::check_domain(&store, &emb, namespace, raw, register_domain).await
+            match crate::registry::check_domain(&store, namespace, raw, register_domain).await
             {
                 Ok(check) => {
                     registry_cache = check.cache;
@@ -13085,6 +13134,70 @@ mod context_plan_tests {
         let args_text = serde_json::json!({"namespace":"test","format":"text"});
         let text_result = handle_context_plan(&args_text, embedder.clone(), store.clone()).await;
         assert!(text_result.contains("context-plan") || text_result.contains("(no items)"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_context_plan_honors_legacy_and_token_key_aliases() {
+        use crate::traits::MemoryPayload;
+        let embedder = Arc::new(LocalStubEmbedder);
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&std::env::temp_dir().join("plan-alias-test"), 4)
+                .expect("open"),
+        );
+        store.init("test").await.unwrap();
+        let seed = vec![0.1f32; 4];
+        store
+            .upsert(
+                "test",
+                "plan-alias-seed",
+                seed,
+                MemoryPayload {
+                    content: "alias seed memory".to_string(),
+                    user_id: "test".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("insert seed");
+        let parse_items = |result: String| -> Vec<String> {
+            let val: serde_json::Value = serde_json::from_str(&result).expect("json parses");
+            val["items"]
+                .as_array()
+                .map(|a| a.iter().map(|i| i["id"].as_str().unwrap_or_default().to_string()).collect())
+                .expect("items array")
+        };
+        // Legacy key names from the original schema.
+        let legacy = handle_context_plan(
+            &serde_json::json!({"namespace":"test","turn_used": 1_000_000_000u64, "session_used": 1_000_000_000u64}),
+            embedder.clone(),
+            store.clone(),
+        )
+        .await;
+        // Token-named keys from the newer schema.
+        let token_keys = handle_context_plan(
+            &serde_json::json!({"namespace":"test","turn_tokens_used": 1_000_000_000u64, "session_tokens_used": 1_000_000_000u64}),
+            embedder.clone(),
+            store.clone(),
+        )
+        .await;
+        // With prior usage beyond every ceiling, no item can be delivered.
+        assert!(parse_items(legacy).is_empty(), "turn_used/session_used must consume prior budget");
+        assert!(parse_items(token_keys).is_empty(), "turn_tokens_used/session_tokens_used must consume prior budget");
+        // Without prior usage the seeded item is delivered.
+        let none = handle_context_plan(
+            &serde_json::json!({"namespace":"test","query":"alias seed memory"}),
+            embedder.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            parse_items(none).iter().any(|id| id == "plan-alias-seed"),
+            "without prior usage the seed must be planned"
+        );
     }
 }
 

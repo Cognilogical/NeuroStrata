@@ -276,7 +276,6 @@ pub struct DomainCheck {
 /// reconcile and `register_domain` run.
 pub async fn check_domain(
     store: &Arc<dyn VectorStore>,
-    _emb: &Arc<dyn Embedder>,
     namespace: &str,
     raw_domain: &Value,
     register_domain: bool,
@@ -417,9 +416,20 @@ pub async fn write_registry(
     let v1_slugs = registry_domains(&existing_meta);
     wanted_slugs = merge(&wanted_slugs, &v1_slugs);
 
-    let vector = match emb.embed(&registry_content(namespace)).await {
-        Ok(vector) => vector,
-        Err(e) => return Some(format!("the registry content could not be embedded: {}", e)),
+    // Embed only when there is no usable existing vector: a fresh registry row
+    // needs a vector, but cache-refresh writes reuse the stored one.
+    let needs_embed = existing
+        .as_ref()
+        .map(|(v, _)| v.is_empty())
+        .unwrap_or(true);
+    let vector = if needs_embed {
+        match emb.embed(&registry_content(namespace)).await {
+            Ok(vector) => vector,
+            Err(e) => return Some(format!("the registry content could not be embedded: {}", e)),
+        }
+    } else {
+        // Never read on that path; vec_to_use clones the stored vector.
+        Vec::new()
     };
 
     // At most three attempts.
@@ -623,7 +633,10 @@ pub async fn cache_project_root(
             let content = registry_content(namespace);
             let vector = match emb.embed(&content).await {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(e) => {
+                    tracing::warn!("cache_project_root embed failed for '{namespace}': {e}");
+                    return;
+                }
             };
             (
                 vector,

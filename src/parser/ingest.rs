@@ -489,7 +489,13 @@ fn run_producer(
         let (file_sha256, content, lang_name, raw_bytes) = if is_file {
             // A single read per file: the bytes below are hashed, parsed (when
             // a grammar applies) and reused for the markdown section pass.
-            let bytes = std::fs::read(path).ok();
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::warn!("failed to read {} for sha256: {e}", path.display());
+                    None
+                }
+            };
             let hash = bytes.as_deref().map(sha256_hex);
             let lang_name = path
                 .extension()
