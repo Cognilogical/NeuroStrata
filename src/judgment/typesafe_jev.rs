@@ -26,6 +26,35 @@ impl TypeSafeJevProvider {
         })
     }
 
+    /// R13: fail closed on non-loopback egress. A remote base_url throws the
+    /// provider's traffic off-host, so it is only allowed when the operator has
+    /// explicitly opted in (`NEUROSTRATA_ALLOW_REMOTE_EGRESS=1`) AND supplied a
+    /// non-empty api_key. Loopback targets are always allowed.
+    fn assert_egress_authorized(&self) -> Result<()> {
+        let host = self
+            .base_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        let loopback = matches!(host, "localhost" | "[::1]" | "::1")
+            || host.starts_with("127.")
+            || host == "[::ffff:127.0.0.1]";
+        if loopback {
+            return Ok(());
+        }
+        let permitted =
+            std::env::var("NEUROSTRATA_ALLOW_REMOTE_EGRESS").ok().as_deref() == Some("1");
+        let has_key = !self.api_key.trim().is_empty();
+        if !permitted || !has_key {
+            anyhow::bail!(
+                "Remote judgment egress refused: non-loopback base_url requires NEUROSTRATA_ALLOW_REMOTE_EGRESS=1 and non-empty api_key (R13)"
+            );
+        }
+        Ok(())
+    }
+
     /// Build the request payload for TypeSafe API.
     fn build_request(
         &self,
@@ -119,6 +148,9 @@ impl JudgmentProvider for TypeSafeJevProvider {
             return Ok(vec![]);
         }
 
+        // R13: fail closed BEFORE any network I/O leaves the process.
+        self.assert_egress_authorized()?;
+
         let request = self.build_request(new_memory, candidates);
 
         let response = self
@@ -146,6 +178,10 @@ impl JudgmentProvider for TypeSafeJevProvider {
     }
 
     async fn health_check(&self) -> Result<bool> {
+        // R13: the health probe is also real network I/O; same fail-closed rule.
+        if self.assert_egress_authorized().is_err() {
+            return Ok(false);
+        }
         let response = self
             .client
             .get(&format!("{}/health", self.base_url))
@@ -158,5 +194,77 @@ impl JudgmentProvider for TypeSafeJevProvider {
 
     fn name(&self) -> &str {
         "typesafe_jev"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_provider() -> TypeSafeJevProvider {
+        let provider = TypeSafeJevProvider::new(String::new())
+            .expect("provider constructs even without a key");
+        provider
+    }
+
+    /// R13: a non-loopback base_url must be refused before any HTTP request is
+    /// sent when the egress opt-in and api_key requirements are unmet.
+    #[tokio::test]
+    async fn remote_base_url_fails_closed_without_egress_authorization() {
+        std::env::set_var("NEUROSTRATA_ALLOW_REMOTE_EGRESS", "0");
+        let provider = remote_provider();
+
+        let err = provider
+            .assert_egress_authorized()
+            .expect_err("remote base_url without authorization is refused");
+        assert!(
+            err.to_string().contains("(R13)"),
+            "unexpected error: {err}"
+        );
+
+        // Fail closed through the actual judgment path (network call never
+        // attempts to reach the remote host).
+        let new_memory = MemoryPayload {
+            content: "new fact".to_string(),
+            user_id: "agent".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        let candidates = vec![SearchResult {
+            id: "existing-1".to_string(),
+            score: 0.9,
+            payload: MemoryPayload {
+                content: "existing fact".to_string(),
+                user_id: "agent".to_string(),
+                memory_type: "fact".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({}),
+            },
+            evidence: None,
+        }];
+
+        let err = provider
+            .judge_duplicates(&new_memory, &candidates)
+            .await
+            .expect_err("egress refused before any network call");
+        assert!(
+            err.to_string().contains("Remote judgment egress refused"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_base_url_is_exempt_from_egress_gate() {
+        let mut provider = TypeSafeJevProvider::new("test-key".to_string())
+            .expect("provider constructs");
+        provider.base_url = "http://127.0.0.1:8080/v1".to_string();
+        provider
+            .assert_egress_authorized()
+            .expect("loopback target never trips the egress gate");
     }
 }

@@ -1537,7 +1537,7 @@ fn parse_edge_specs(
         ("related_to", "RELATES_TO", true),
         ("contained_by", "CONTAINS", false),
         ("governs", "GOVERNS", true),
-        // Vocabulary v2: a memory extracted from a completed task declares it,
+        // Vocabulary v10: a memory extracted from a completed task declares it,
         // and the edge points memory -> task (self_to_target).
         ("extracted_from", "EXTRACTED_FROM", true),
         ("depends_on", "DEPENDS_ON", true),
@@ -3027,7 +3027,7 @@ impl VectorStore for LadybugStore {
             let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
             conn.query(create_governs_table).ok();
 
-            // Vocabulary v2: extraction edges (memory -> task) behind Lock 2.
+            // Vocabulary v10: extraction edges (memory -> task) behind Lock 2.
             let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
             conn.query(create_extracted_table).ok();
 
@@ -3108,6 +3108,10 @@ impl VectorStore for LadybugStore {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn as_intake_store(&self) -> Option<&dyn crate::traits::IntakeStore> {
+        Some(self)
     }
 
     async fn upsert(
@@ -3346,6 +3350,34 @@ impl VectorStore for LadybugStore {
         let dimensions = self.dimensions;
         let zero_vec = zero_vector_str(dimensions);
         let lexical_doc = Self::lexical_doc(&namespace, &id, &payload);
+        // Composite Rec #14: memory ids are globally unique (PRIMARY KEY), so an
+        // upsert of an existing id into a DIFFERENT namespace would silently
+        // relocate the row. Read which namespace owns the id first and fail
+        // closed on a collision.
+        {
+            let check_id = id.clone();
+            let check_ns = namespace.clone();
+            let existing_ns: Option<String> = self
+                .with_conn(move |conn| {
+                    let query = format!(
+                        "MATCH (m:Memory {{id: '{}'}}) WHERE m.namespace <> '{}' RETURN m.namespace LIMIT 1",
+                        escape_ladybug_string(&check_id),
+                        escape_ladybug_string(&check_ns)
+                    );
+                    let mut result = conn.query(&query)?;
+                    let found = result.next().map(|row| format!("{}", row[0]));
+                    Ok(found)
+                })
+                .await?;
+            if let Some(existing_ns) = existing_ns {
+                anyhow::bail!(
+                    "cross-namespace id collision: memory '{}' belongs to namespace '{}', cannot upsert into '{}'",
+                    id,
+                    existing_ns,
+                    namespace
+                );
+            }
+        }
         let outcome = self.write_with_deadline("writing a memory", move |conn| {
 
             let safe_id = escape_ladybug_string(&id);
@@ -4915,7 +4947,7 @@ impl VectorStore for LadybugStore {
                 }));
             }
 
-            // EXTRACTED_FROM (vocabulary v2): the consolidation edge a completed
+            // EXTRACTED_FROM (vocabulary v10): the consolidation edge a completed
             // task left behind. Without it the export loses the very link the
             // done-funnel exists to create.
             let query_extracted = "MATCH (a:Memory)-[r:EXTRACTED_FROM]->(b:Memory) RETURN a.id, b.id;";
@@ -4933,7 +4965,7 @@ impl VectorStore for LadybugStore {
                 }));
             }
 
-            // DEPENDS_ON (vocabulary v2): module dependency edges.
+            // DEPENDS_ON (vocabulary v10): module dependency edges.
             let query_depends = "MATCH (a:Memory)-[r:DEPENDS_ON]->(b:Memory) RETURN a.id, b.id;";
             let res_depends = conn.query(query_depends)?;
             for row in res_depends {
@@ -6133,10 +6165,15 @@ impl crate::traits::IntakeStore for LadybugStore {
             let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let safe_updated = escape_ladybug_string(&now);
 
-            // For "created" disposition, verify the task_id refers to a real task
-            // in the Memory table (memory_type = 'task') in the same namespace.
-            // Reject missing/blank/wrong-namespace/non-task IDs.
-            if disposition == crate::task::intake::Disposition::Created {
+            // For "created" and "linked" dispositions, verify the task_id refers
+            // to a real task in the Memory table (memory_type = 'task') in the
+            // same namespace. Reject missing/blank/wrong-namespace/non-task IDs
+            // (R8: a `linked` disposition must not point at a missing or
+            // cross-namespace task either).
+            if matches!(
+                disposition,
+                crate::task::intake::Disposition::Created | crate::task::intake::Disposition::Linked
+            ) {
                 if safe_task_id.is_empty() {
                     return Err(anyhow::anyhow!("task_id is required for 'created' disposition"));
                 }
@@ -7265,6 +7302,58 @@ eurostrata\src\daemon.rs",
             report.deferred_edges[0].resolution,
             crate::traits::TargetResolution::Missing
         ));
+    }
+
+    /// R8: `linked` runs the same task-existence check as `created`, so a
+    /// candidate cannot be linked to a missing (or cross-namespace) task.
+    #[tokio::test]
+    async fn resolve_candidate_rejects_linked_missing_task() {
+        let store = retired_test_store().await;
+        let err = crate::traits::IntakeStore::resolve_candidate(&store, crate::task::intake::ResolveCandidateRequest {
+                namespace: "probe".to_string(),
+                candidate_id: "cand-linked-no-task".to_string(),
+                disposition: crate::task::intake::Disposition::Linked,
+                task_id: Some("task-does-not-exist".to_string()),
+                cas_version: 0,
+            })
+            .await
+            .expect_err("linked to a non-existent task must fail");
+        assert!(
+            err.contains("does not refer to an existing task"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// R14: a memory id is globally unique, so upserting the same id into a
+    /// second namespace must be rejected instead of silently relocating the row.
+    #[tokio::test]
+    async fn upsert_rejects_cross_namespace_id_collision() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "ns-a",
+                "shared-id",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .expect("first namespace owns the id");
+        let err = store
+            .upsert(
+                "ns-b",
+                "shared-id",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .expect_err("upserting the same id into another namespace must be rejected");
+        assert!(
+            err.to_string().contains("cross-namespace id collision"),
+            "unexpected error: {err}"
+        );
+        // The original row stays intact in ns-a.
+        let original = store.get("ns-a", "shared-id").await.expect("read ns-a row");
+        assert!(original.is_some(), "original row must remain untouched");
     }
 
     #[tokio::test]

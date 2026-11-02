@@ -18,3 +18,47 @@ fn legacy_rows_readable() {
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert!(v["memory_types"].is_object());
 }
+
+/// Composite Rec #27: vocabulary version consistency. The document is the
+/// single source of truth the tool summaries and the docs read, so the
+/// version must be current, every tool must carry a summary, and no stale
+/// superseded-version references ("Vocabulary v2") may survive anywhere in
+/// the shipped schema. The stale `Vocabulary v2` comments in
+/// `src/store/ladybug.rs` belong to that file's owner wave and cannot be
+/// edited here, so this test pins the schema-consistency branch instead.
+#[test]
+fn vocabulary_version_and_tool_summaries_are_consistent() {
+    let raw = fs::read_to_string("src/schemas/memory-vocabulary.v3.json").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    // The current vocabulary version.
+    assert_eq!(v["vocabulary_version"], 10);
+
+    // tool_summaries exists and is non-empty, and every entry is a real
+    // non-blank summary rather than a placeholder.
+    let summaries = v["tool_summaries"]
+        .as_object()
+        .expect("tool_summaries must exist");
+    assert!(!summaries.is_empty(), "tool_summaries must be non-empty");
+    for (tool, summary) in summaries {
+        let summary = summary.as_str().unwrap_or_else(|| {
+            panic!("tool_summaries[{tool}] must be a string");
+        });
+        assert!(
+            !summary.trim().is_empty(),
+            "tool_summaries[{tool}] must be a non-blank summary"
+        );
+        assert!(
+            !summary.to_lowercase().contains("vocabulary v2"),
+            "tool_summaries[{tool}] must not cite a superseded version: {summary}"
+        );
+    }
+
+    // Zero stale superseded-version references anywhere in the schema
+    // document itself (checks shipped JSON, not build-time state).
+    assert!(
+        !raw.to_lowercase().contains("vocabulary v2"),
+        "the schema document carries stale superseded \"Vocabulary v2\" text"
+    );
+}
+

@@ -296,6 +296,12 @@ pub trait VectorStore: Send + Sync + AsAny {
         crate::traits::AsAny::as_any(self)
     }
 
+    /// Access store-specific intake capabilities without downcasting to a
+    /// concrete type. Returns `None` for stores that do not support intake.
+    fn as_intake_store(&self) -> Option<&dyn IntakeStore> {
+        None
+    }
+
     /// Insert or update a memory with its associated vector and metadata.
     async fn upsert(
         &self,

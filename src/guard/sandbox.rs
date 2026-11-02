@@ -5,6 +5,23 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
+/// R26: the sandbox container image is pinned to a specific Alpine release
+/// (instead of `latest`) so a registry re-push cannot silently change the
+/// sandbox behavior. Full digest pin (image@sha256:...) is filed as a follow-up
+/// (needs digest resolution at install).
+pub const SANDBOX_IMAGE: &str = "alpine:3.21";
+
+/// R26: whether a Podman engine is reachable, from a synchronous probe. Callers
+/// that cannot afford the async evaluator constructor use this to degrade
+/// gracefully.
+pub fn probe_podman_available() -> bool {
+    std::process::Command::new("podman")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub struct SandboxEvaluator {
     engine: String, // "podman" or "docker"
     available: bool,
@@ -94,11 +111,7 @@ impl SandboxEvaluator {
                 &format!("-v={}:/workspace:ro", cwd_str),
                 "--tmpfs=/tmp",
                 "-w=/workspace",
-                // Pinned to a specific Alpine release (R26) instead of
-                // `latest` so a registry re-push cannot silently change
-                // the sandbox behavior. Full digest pin (image@sha256:...)
-                // is filed as a follow-up (needs digest resolution at install).
-                "alpine:3.21",
+                SANDBOX_IMAGE,
                 "sh",
                 "-c",
                 payload,

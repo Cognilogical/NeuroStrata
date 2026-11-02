@@ -4430,22 +4430,53 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
     let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
         return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
     };
+    // `kind`/`stage` selects the metric kind, `name`/`metric` selects the
+    // series name (the stage). `metric` alone is intentionally ambiguous: a
+    // kind-shaped string ("ingest_latency_ms") sweeps every stage of that
+    // kind, anything else ("upsert") sweeps that name across every kind.
     let kind_str = arguments
         .get("kind")
         .or_else(|| arguments.get("stage"))
         .or_else(|| arguments.get("metric"))
         .and_then(|v| v.as_str());
-    let name = arguments
+    let name_str = arguments
         .get("name")
         .or_else(|| arguments.get("metric"))
         .or_else(|| arguments.get("stage"))
         .and_then(|v| v.as_str());
-    match (kind_str, name) {
-        (Some(_), Some(_)) => {}
-        (_, _) => {
+    enum Target {
+        /// Shape (a): explicit kind + name — one series.
+        Single(crate::time_series::MetricKind, String),
+        /// Kind-shaped sweep: every stage of one kind.
+        AllStagesOfKind(crate::time_series::MetricKind),
+        /// Name-shaped sweep: one stage name across every metric kind.
+        AllKindsOfName(String),
+    }
+    let kind_parse = kind_str.and_then(|s| crate::time_series::MetricKind::from_str(s).ok());
+    let target = match (kind_str, name_str) {
+        (None, None) => {
             return serde_json::json!({"ok":false,"error":"kind and name (or spec aliases metric/stage/from/to) required"}).to_string()
         }
-    }
+        // A single string serving both slots: classify it as a kind when it
+        // resolves, otherwise treat it as a stage name swept across kinds.
+        (Some(k), Some(n)) if k == n => match kind_parse {
+            Some(kind) => Target::AllStagesOfKind(kind),
+            None => Target::AllKindsOfName(n.to_string()),
+        },
+        (Some(_), Some(n)) => match kind_parse {
+            Some(kind) => Target::Single(kind, n.to_string()),
+            None => {
+                return serde_json::json!({"ok":false,"error":format!("unknown metric kind '{}'", kind_str.unwrap())}).to_string()
+            }
+        },
+        (Some(_), None) => match kind_parse {
+            Some(kind) => Target::AllStagesOfKind(kind),
+            None => {
+                return serde_json::json!({"ok":false,"error":format!("unknown metric kind '{}'", kind_str.unwrap())}).to_string()
+            }
+        },
+        (None, Some(n)) => Target::AllKindsOfName(n.to_string()),
+    };
     let ts_of = |v: &Value| {
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
@@ -4458,33 +4489,113 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
         .get("until_ts")
         .and_then(ts_of)
         .or_else(|| arguments.get("to").and_then(ts_of));
-    let Ok(kind) = crate::time_series::MetricKind::from_str(kind_str.unwrap()) else {
-        return serde_json::json!({"ok":false,"error":format!("unknown metric kind '{}'", kind_str.unwrap())}).to_string();
-    };
-    let name = name.unwrap();
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(100) as usize;
     let namespace = resolve_namespace(&store, ns_raw).await;
-    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
-        let samples = ls
-            .query_db_metrics(&namespace, kind, name, since_ts, until_ts, limit)
+    // One series pointer: the persisted samples merged with the live series,
+    // plus that series' rolling aggregate. Sweeps call this per series and
+    // fold the aggregates into one virtual aggregate.
+    async fn query_series(
+        ls: &crate::store::LadybugStore,
+        namespace: &str,
+        kind: crate::time_series::MetricKind,
+        name: &str,
+        since_ts: Option<i64>,
+        until_ts: Option<i64>,
+        limit: usize,
+    ) -> (
+        Vec<crate::time_series::Sample>,
+        Option<crate::time_series::RollingAgg>,
+    ) {
+        let sample_set = ls
+            .query_db_metrics(namespace, kind, name, since_ts, until_ts, limit)
             .await
             .unwrap_or_default();
-        let key = (namespace.clone(), kind, name.to_string());
-        let agg = ls.metrics().aggregate(&key);
-        // Cross-check the persisted samples against the in-memory series and
-        // report the window the anomaly detector actually looked at.
-        let db_pairs: Vec<(String, crate::time_series::Sample)> = samples
-            .iter()
-            .map(|s| (s.id.clone(), s.clone()))
-            .collect();
-        let query_report = ls.metrics().query_metrics(&namespace, kind, Some(name), since_ts, until_ts, &db_pairs);
-        let anomaly_window = ls.metrics().samples_for_anomaly(&key);
-        let agg_summary = agg.as_ref().map(|a| a.to_json_summary());
+        let agg = ls
+            .metrics()
+            .aggregate(&(namespace.to_string(), kind, name.to_string()));
+        (sample_set, agg)
+    }
+    if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref()).downcast_ref::<crate::store::LadybugStore>() {
+        let (kind_label, name_label, sample_sets, agg_opts, report): (
+            String,
+            String,
+            Vec<Vec<_>>,
+            Vec<Option<_>>,
+            Option<serde_json::Value>,
+        ) = match &target {
+            Target::Single(kind, name) => {
+                let (sample_set, agg) =
+                    query_series(ls, &namespace, *kind, name, since_ts, until_ts, limit).await;
+                // Cross-check the persisted samples against the in-memory
+                // series and report the window the anomaly detector actually
+                // looked at.
+                let db_pairs: Vec<(String, crate::time_series::Sample)> = sample_set
+                    .iter()
+                    .map(|s| (s.id.clone(), s.clone()))
+                    .collect();
+                let report = ls.metrics().query_metrics(&namespace, *kind, Some(name), since_ts, until_ts, &db_pairs);
+                (kind.as_str().to_string(), name.clone(), vec![sample_set], vec![agg], Some(report))
+            }
+            Target::AllStagesOfKind(kind) => {
+                // Every live stage of this kind in the namespace (persisted
+                // series reconnect on flush; live series are enumerable now).
+                let stages: Vec<String> = ls
+                    .metrics()
+                    .list_keys(&namespace)
+                    .iter()
+                    .filter(|(k, _)| k.1 == *kind)
+                    .map(|(k, _)| k.2.clone())
+                    .collect();
+                let mut sample_sets = Vec::new();
+                let mut agg_opts = Vec::new();
+                for stage in stages {
+                    let (sample_set, agg) =
+                        query_series(ls, &namespace, *kind, &stage, since_ts, until_ts, limit).await;
+                    sample_sets.push(sample_set);
+                    agg_opts.push(agg);
+                }
+                (kind.as_str().to_string(), kind.as_str().to_string(), sample_sets, agg_opts, None)
+            }
+            Target::AllKindsOfName(name) => {
+                let mut sample_sets = Vec::new();
+                let mut agg_opts = Vec::new();
+                for kind in crate::time_series::ALL_METRIC_KINDS {
+                    let (sample_set, agg) =
+                        query_series(ls, &namespace, kind, name, since_ts, until_ts, limit).await;
+                    sample_sets.push(sample_set);
+                    agg_opts.push(agg);
+                }
+                ("all".to_string(), name.clone(), sample_sets, agg_opts, None)
+            }
+        };
+        // Merge every point set, newest first, then honor the caller's limit.
+        let mut samples: Vec<crate::time_series::Sample> =
+            sample_sets.into_iter().flatten().collect();
+        samples.sort_by(|a, b| b.ts.cmp(&a.ts).then(b.seq.cmp(&a.seq)));
+        samples.truncate(limit);
+        let aggregate = match &target {
+            // Single-series parity: an empty series still reports its zeroed
+            // aggregate; sweeps report null when nothing matched.
+            Target::Single(_, _) => agg_opts.into_iter().next().unwrap_or(None),
+            _ => crate::time_series::RollingAgg::combine_aggs(
+                &agg_opts.into_iter().flatten().collect::<Vec<_>>(),
+            ),
+        };
+        let agg_summary = aggregate.as_ref().map(|a| a.to_json_summary());
+        let anomaly_window_len = match &target {
+            // The window the anomaly detector actually looked at: only
+            // meaningful for a single series, zero for sweeps.
+            Target::Single(kind, name) => {
+                let key = (namespace.clone(), *kind, name.clone());
+                ls.metrics().samples_for_anomaly(&key).len()
+            }
+            _ => 0,
+        };
         // Spec §5.5 aggregate shape: {count, sum, mean, min, max, ewma}.
-        let agg_json = agg.as_ref().map(|a| {
+        let agg_json = aggregate.as_ref().map(|a| {
             let mut v = serde_json::to_value(a).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("mean".to_string(), serde_json::json!(a.mean()));
@@ -4494,22 +4605,26 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
         return serde_json::json!({
             "ok": true,
             "namespace": namespace,
-            "kind": kind.as_str(),
-            "name": name,
+            "kind": kind_label,
+            "name": name_label,
+            "sweep": !matches!(target, Target::Single(_, _)),
             "samples": samples,
             "aggregate": agg_json,
             "summary": agg_summary,
             "anomalies": ls.metrics().recent_anomalies(&namespace),
-            "report": query_report,
-            "anomaly_window_len": anomaly_window.len(),
+            "report": report,
+            "anomaly_window_len": anomaly_window_len,
         })
         .to_string();
     }
+    let kind_label = match target {
+        Target::Single(kind, _) | Target::AllStagesOfKind(kind) => kind.as_str().to_string(),
+        Target::AllKindsOfName(_) => "all".to_string(),
+    };
     serde_json::json!({
         "ok": true,
         "namespace": namespace,
-        "kind": kind.as_str(),
-        "name": name,
+        "kind": kind_label,
         "samples": [],
         "aggregate": null,
     })
@@ -7575,6 +7690,69 @@ mod tests {
         assert_eq!(
             in_vector, out_vector,
             "the fractional part survives the round-trip"
+        );
+    }
+
+    /// A metrics query naming only a stage ("upsert") with no explicit kind
+    /// sweeps every metric kind instead of erroring: the recorded points come
+    /// back and the merged aggregate carries a mean.
+    #[tokio::test]
+    async fn metrics_query_by_stage_name_only_sweeps_all_kinds() {
+        use crate::time_series::{ALL_METRIC_KINDS, MetricKind};
+        let dir = std::env::temp_dir().join(format!(
+            "ns-metrics-sweep-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&dir, 4).expect("open temp"));
+        store.init("probe").await.expect("init");
+        let ls = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+            .expect("ladybug store");
+        ls.metrics().record(
+            "probe",
+            MetricKind::IngestLatencyMs,
+            "upsert",
+            chrono::Utc::now().timestamp(),
+            5.0,
+            std::collections::BTreeMap::new(),
+        );
+
+        let args = serde_json::json!({"namespace": "probe", "metric": "upsert"});
+        let result: Value =
+            serde_json::from_str(&handle_metrics_query(&args, store.clone()).await).expect("json");
+        assert_eq!(result["ok"], true, "the name-only sweep must not error");
+        let samples = result["samples"].as_array().expect("samples array");
+        assert_eq!(samples.len(), 1, "the recorded point is returned");
+        assert_eq!(samples[0]["value"], 5.0);
+        let aggregate = result["aggregate"].as_object().expect("merged aggregate");
+        assert!(
+            aggregate.contains_key("mean"),
+            "the merged aggregate carries a mean: {aggregate:?}"
+        );
+        let mean = aggregate["mean"].as_f64().unwrap_or_default();
+        assert!((mean - 5.0).abs() < 1e-9, "mean is the recorded value");
+        assert!(
+            result["kind"].as_str().is_some_and(|k| k == "all"),
+            "the sweep reports every kind was considered"
+        );
+        assert_eq!(
+            ALL_METRIC_KINDS.len(),
+            6,
+            "the sweep table tracks every MetricKind variant"
+        );
+
+        // The kind-shaped sibling: `metric` that resolves as a MetricKind
+        // sweeps every stage of that kind.
+        let args = serde_json::json!({"namespace": "probe", "metric": "ingest_latency_ms"});
+        let result: Value =
+            serde_json::from_str(&handle_metrics_query(&args, store).await).expect("json");
+        assert_eq!(result["ok"], true, "the kind-only sweep must not error");
+        assert_eq!(
+            result["samples"].as_array().map(Vec::len),
+            Some(1),
+            "the same live point is reachable by kind sweep"
         );
     }
 

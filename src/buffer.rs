@@ -16,6 +16,31 @@ const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// Retention when `buffer_retention_days` is unset in the config.
 const DEFAULT_RETENTION_DAYS: u64 = 30;
 
+/// Composite Rec #20: process-wide write locks, keyed by the canonical
+/// project root. Two concurrent buffer writers in one process — two MCP
+/// calls appending to the same project while another triggers a rollover —
+/// must never interleave partial lines nor race the rollover rename against
+/// another append, so every mutating operation takes the per-root guard and
+/// holds it until its pending/commit sequence is complete.
+static BUFFER_WRITE_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+
+fn root_lock(project_root: &Path) -> Arc<std::sync::Mutex<()>> {
+    // Canonicalize so `/x/./y` and `/x/y` (same project, different spelling)
+    // contend on the same lock rather than two. When the root does not exist
+    // yet nothing is racing anything, so the literal path is a fine key; the
+    // file checks and creation inside `append_entry` judge the real root.
+    let key = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let map = BUFFER_WRITE_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // A mutex poisoned by a panic in another writer must not brick the
+    // buffer for the rest of the process: resume like a scheduler would.
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Buffer-relevant slice of `~/.config/neurostrata/config.json`.
 /// Read as raw JSON rather than through `config::Config` so the buffer's two
 /// optional keys cannot perturb that struct's invariants and legacy handling.
@@ -121,6 +146,11 @@ pub(crate) fn append_entry(
     max_bytes: u64,
     retention_days: u64,
 ) -> std::io::Result<Outcome> {
+    // Serialize writers of the same project root for the whole
+    // pending/commit span (containment judgment, rollover, append): the
+    // guard drops only after the entry is fully written.
+    let root_guard = root_lock(project_root);
+    let _root_guard = root_guard.lock().unwrap_or_else(|e| e.into_inner());
     let sessions_path = project_root.join(".NeuroStrata").join("sessions");
     // Judge containment before creating anything (M-1): canonicalize the
     // nearest existing ancestor of the sessions path and judge the
@@ -1293,6 +1323,55 @@ mod tests {
             !snippet.starts_with("[FAILED ATTEMPT] "),
             "positive fact must not be prefixed: {}",
             snippet
+        );
+    }
+
+    /// Composite Rec #20: the per-root lock's whole point. Many threads
+    /// appending to the same project simultaneously — every one a partial
+    /// write, a rollover decision, and a commit away from interleaving —
+    /// must produce zero torn lines: each marker appears exactly once and
+    /// sits on a complete `- *[stamp]*: ENTRY-n` line.
+    #[test]
+    fn concurrent_writers_to_one_root_never_interleave_partial_lines() {
+        let root = scratch("concurrent-writers");
+        let writers = 8usize;
+        let per_writer = 20usize;
+        let mut joins = Vec::new();
+        for w in 0..writers {
+            let root = root.clone();
+            joins.push(std::thread::spawn(move || {
+                for i in 0..per_writer {
+                    let marker = format!("ENTRY-{}-{}", w, i);
+                    let outcome =
+                        append_entry(&root, &marker, &[], 500 * 1024, 30).expect("append");
+                    assert!(!outcome.rolled, "200-byte entries must not roll a 500KB buffer");
+                }
+            }));
+        }
+        for join in joins {
+            join.join().unwrap();
+        }
+
+        let text =
+            std::fs::read_to_string(root.join(".NeuroStrata").join("sessions").join("current.md"))
+                .unwrap();
+        assert!(text.ends_with('\n'), "every entry commits as a whole line");
+        for w in 0..writers {
+            for i in 0..per_writer {
+                let marker = format!("ENTRY-{}-{}", w, i);
+                let whole_line = format!(": {}\n", marker);
+                let hits = text.matches(&whole_line).count();
+                assert_eq!(
+                    hits, 1,
+                    "marker {marker} must be written exactly once, not torn or duplicated"
+                );
+            }
+        }
+        let body_lines = text.lines().filter(|l| l.starts_with("- *[")).count();
+        assert_eq!(
+            body_lines,
+            writers * per_writer,
+            "exactly one complete entry line per written entry"
         );
     }
 }

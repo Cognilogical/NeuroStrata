@@ -600,8 +600,6 @@ pub async fn handle_intake(
     args: Value,
     store: Arc<dyn crate::traits::VectorStore>,
 ) -> String {
-    use crate::traits::IntakeStore;
-
     // Parse arguments
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
@@ -634,9 +632,8 @@ pub async fn handle_intake(
     let description = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     // Downcast to IntakeStore
-    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref())
-        .downcast_ref::<crate::store::ladybug::LadybugStore>()
-    {
+    let intake_store = store.as_intake_store();
+    let intake_store = match intake_store {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -672,8 +669,6 @@ pub async fn handle_intake_list(
     args: Value,
     store: Arc<dyn crate::traits::VectorStore>,
 ) -> String {
-    use crate::traits::IntakeStore;
-
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
         _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
@@ -681,9 +676,8 @@ pub async fn handle_intake_list(
 
     let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("candidates");
 
-    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref())
-        .downcast_ref::<crate::store::ladybug::LadybugStore>()
-    {
+    let intake_store = store.as_intake_store();
+    let intake_store = match intake_store {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };
@@ -766,8 +760,6 @@ pub async fn handle_intake_resolve(
     args: Value,
     store: Arc<dyn crate::traits::VectorStore>,
 ) -> String {
-    use crate::traits::IntakeStore;
-
     let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
         _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
@@ -797,9 +789,8 @@ pub async fn handle_intake_resolve(
         None => return "ERROR: 'cas_version' is required (u64).".to_string(),
     };
 
-    let intake_store = match crate::traits::VectorStore::as_any(store.as_ref())
-        .downcast_ref::<crate::store::ladybug::LadybugStore>()
-    {
+    let intake_store = store.as_intake_store();
+    let intake_store = match intake_store {
         Some(s) => s,
         None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
     };

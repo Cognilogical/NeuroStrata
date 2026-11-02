@@ -1462,6 +1462,10 @@ async fn handle_info(State(state): State<AppState>) -> Json<serde_json::Value> {
         "exe_len": state.build.exe_len,
         "pid": state.build.pid,
         "started_at": state.build.started_at,
+        // R26: surface the sandbox image and probe so operators can see the
+        // security posture of this daemon at a glance.
+        "sandbox_image": crate::guard::sandbox::SANDBOX_IMAGE,
+        "sandbox_available": crate::guard::sandbox::probe_podman_available(),
     }))
 }
 
@@ -1504,8 +1508,8 @@ async fn handle_validate(
     State(state): State<AppState>,
     Json(request): Json<crate::guard::ValidateRequest>,
 ) -> Result<Json<crate::guard::ValidateResponse>, (axum::http::StatusCode, String)> {
-    // Use sandbox if podman is available
-    let use_sandbox = true;
+    // Use sandbox if podman is available (R26: probe, never assume)
+    let use_sandbox = crate::guard::sandbox::probe_podman_available();
 
     let (verdict, rule_ids) = state
         .guard_validator

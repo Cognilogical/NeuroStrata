@@ -8,6 +8,17 @@ pub use crate::telemetry::anomaly::MetricKind;
 
 pub type SeriesKey = (String, MetricKind, String);
 
+/// Every metric kind the store tracks. A cross-stage query without an explicit
+/// `kind` sweeps all of these rather than guessing one.
+pub const ALL_METRIC_KINDS: [MetricKind; 6] = [
+    MetricKind::AccessCount,
+    MetricKind::EnrichmentFailure,
+    MetricKind::EnrichmentLatencyMs,
+    MetricKind::RetrievalDistance,
+    MetricKind::MemoryCount,
+    MetricKind::IngestLatencyMs,
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
     pub id: String,
@@ -72,6 +83,43 @@ impl RollingAgg {
             "max": if self.count == 0 || !self.max.is_finite() { 0.0 } else { self.max },
             "ewma": self.ewma,
         })
+    }
+
+    /// Combine per-series rolling aggregates for one stage across metric kinds
+    /// into a single virtual series aggregate. `count` and `sum` add, `min` and
+    /// `max` take the extremes, `ewma` blends each aggregate's value weighted
+    /// by its count, and the smoothing constant carries the shared alpha.
+    /// Empty aggregates (count == 0) contribute nothing; an all-empty input
+    /// yields `None` so the caller can report "no data" rather than zeros.
+    pub fn combine_aggs(aggs: &[RollingAgg]) -> Option<RollingAgg> {
+        let mut combined: Option<RollingAgg> = None;
+        for agg in aggs {
+            if agg.count == 0 {
+                continue;
+            }
+            match combined.as_mut() {
+                None => combined = Some(agg.clone()),
+                Some(c) => {
+                    c.count += agg.count;
+                    c.sum += agg.sum;
+                    c.min = c.min.min(agg.min);
+                    c.max = c.max.max(agg.max);
+                    c.next_seq = c.next_seq.max(agg.next_seq);
+                    c.flushed_seq = c.flushed_seq.max(agg.flushed_seq);
+                }
+            }
+        }
+        let mut c = combined?;
+        let total: u64 = aggs.iter().filter(|a| a.count > 0).map(|a| a.count).sum();
+        if total > 0 {
+            c.ewma = aggs
+                .iter()
+                .filter(|a| a.count > 0)
+                .map(|a| a.ewma * a.count as f64)
+                .sum::<f64>()
+                / total as f64;
+        }
+        Some(c)
     }
 }
 
@@ -618,5 +666,34 @@ mod tests {
         let q1 = s1.query_metrics("d", MetricKind::IngestLatencyMs, Some("upsert"), Some(0), Some(100), &[]);
         let q2 = s2.query_metrics("d", MetricKind::IngestLatencyMs, Some("upsert"), Some(0), Some(100), &[]);
         assert_eq!(q1, q2);
+    }
+
+    #[test]
+    fn combine_aggs_folds_series_into_one_virtual_aggregate() {
+        let mut a = RollingAgg::new(0.3);
+        a.count = 3;
+        a.sum = 6.0;
+        a.min = 1.0;
+        a.max = 3.0;
+        a.ewma = 2.0;
+        let mut b = RollingAgg::new(0.3);
+        b.count = 1;
+        b.sum = 4.0;
+        b.min = 4.0;
+        b.max = 4.0;
+        b.ewma = 4.0;
+        // An empty series contributes nothing and must not zero the fold.
+        let empty = RollingAgg::new(0.3);
+
+        let combined = RollingAgg::combine_aggs(&[a, b, empty]).expect("non-empty fold");
+        assert_eq!(combined.count, 4);
+        assert_eq!(combined.sum, 10.0);
+        assert_eq!(combined.min, 1.0);
+        assert_eq!(combined.max, 4.0);
+        // Ewma blends by count: (2.0*3 + 4.0*1) / 4 = 2.5.
+        assert!((combined.ewma - 2.5).abs() < 1e-9, "ewma weighted by count");
+        // An all-empty input reports "no data" instead of a zero-series lie.
+        let empty_only = [RollingAgg::new(0.3)];
+        assert!(RollingAgg::combine_aggs(&empty_only).is_none());
     }
 }

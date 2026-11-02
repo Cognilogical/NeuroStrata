@@ -22,7 +22,7 @@
 //! v1 keeps due-logic thin: every non-lapsed procedure is due, and only the
 //! day-cadence trigger gets a real `next_due`.
 
-use crate::traits::{MemoryPayload, SearchResult, VectorStore};
+use crate::traits::{SearchResult, VectorStore};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -32,6 +32,26 @@ use std::sync::Arc;
 const ROLLOVER_BYTES: u64 = 500 * 1024;
 /// Seconds in a day, for the `every-n-days:N` cadence.
 const DAY_SECONDS: i64 = 86_400;
+
+/// Composite Rec #20: process-wide per-procedure firing locks, keyed by
+/// `{namespace}::{id}`. Two concurrent perform calls on the same row would
+/// otherwise both read the row before either upserts and both spend one of
+/// the same `remaining_fires` — double-spending the budget against a single
+/// counter. The async mutex is held from the row's authoritative re-read
+/// through `store.upsert`, so concurrent firings serialize.
+static PROCEDURE_FIRE_LOCKS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+
+fn fire_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let map = PROCEDURE_FIRE_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // A poisoned std lock must not brick firings for the rest of the
+    // process: resume, like every other lock site in this crate does.
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 // ── reading procedure metadata ──────────────────────────────────────────────
 
@@ -296,20 +316,38 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
     // row order.
     let mut namespaces = store.list_namespaces().await.unwrap_or_default();
     namespaces.sort();
-    let mut found: Option<(String, Vec<f32>, MemoryPayload)> = None;
+    // Composite Rec #20, first pass: locate the row's namespace only, so the
+    // per-procedure fire lock can be keyed by `{namespace}::{id}` before the
+    // mutation path reads anything. Ids are UUIDs, so the scan lands on one
+    // row; sorting first keeps the answer independent of database row order.
+    let mut holder: Option<String> = None;
     for namespace in namespaces {
         match store.get(&namespace, &id).await {
-            Ok(Some(row)) => {
-                found = Some((namespace, row.0, row.1));
+            Ok(Some(_)) => {
+                holder = Some(namespace);
                 break;
             }
             Ok(None) => {}
             Err(_) => continue,
         }
     }
-    let (namespace, vector, mut payload) = match found {
-        Some(row) => row,
+    let namespace = match holder {
+        Some(ns) => ns,
         None => return reply(false, false, false, None, 0, None, "not found"),
+    };
+
+    // Hold the per-procedure fire lock from before the authoritative read to
+    // past the upsert below: a concurrent second perform of the same row
+    // parks here instead of spending the same `remaining_fires` twice.
+    let lock = fire_lock(&format!("{namespace}::{id}"));
+    let _fire_guard = lock.lock().await;
+
+    // Authoritative re-read UNDER the fire lock: the locating pass above can
+    // be stale by the time the lock is granted — a competing perform may
+    // have already spent a fire between location and lock.
+    let (vector, mut payload) = match store.get(&namespace, &id).await {
+        Ok(Some(row)) => row,
+        _ => return reply(false, false, false, None, 0, None, "not found"),
     };
 
     if payload.memory_type != "procedure" {
@@ -339,6 +377,10 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
     let metadata = payload.metadata.clone();
     let budget = remaining_fires(&metadata);
     let count = performance_count(&metadata);
+    // Composite Rec #20: the fired-from count, so each firing carries an
+    // auditable monotonic transition (count-1 → count) even against a row
+    // whose current count is later rewritten by hand.
+    let prev_count = count;
     let pointer_before = last_episodic_pointer(&metadata);
 
     // The trust gate runs before lapse and before every mutation: an
@@ -422,6 +464,7 @@ pub async fn handle_procedure_perform(arguments: Value, store: Arc<dyn VectorSto
     if let Some(obj) = payload.metadata.as_object_mut() {
         obj.insert("last_performed_at".to_string(), json!(now));
         obj.insert("performance_count".to_string(), json!(after_count));
+        obj.insert("previous_performance_count".to_string(), json!(prev_count));
         obj.insert(
             "last_episodic_pointer".to_string(),
             pointer.clone().map(Value::String).unwrap_or(Value::Null),
@@ -1233,5 +1276,67 @@ mod tests {
             procedures_due_strap(&[row("rule-1", "rule", json!({}))], now),
             "No procedures are due in this namespace.\n"
         );
+    }
+
+    /// Composite Rec #20: the per-procedure fire lock's whole point. Many
+    /// concurrent performs of the same budgeted row must serialize exactly
+    /// `remaining_fires` times: none may spend a fire against a count the
+    /// other also read, none may run after the budget is exhausted, and the
+    /// final row must carry the roll call of every accepted firing through
+    /// `previous_performance_count`. Break the lock (or read outside it) and
+    /// two racers read the same counters before either upserts — the budget
+    /// under-spends and the count lags the lost updates.
+    #[tokio::test]
+    async fn concurrent_performs_serialize_and_never_double_spend_the_budget() {
+        let store = empty_store("probe").await;
+        seed(
+            &store,
+            "probe",
+            "proc-race",
+            "procedure",
+            procedure_metadata(json!(3)),
+        )
+        .await;
+        let root = scratch("race");
+
+        let racers = 6usize;
+        let mut responded: Vec<Value> = Vec::new();
+        for _ in 0..racers {
+            let (store, root) = (store.clone(), root.clone());
+            responded.push(
+                tokio::spawn(async move {
+                    serde_json::from_str(
+                        &handle_procedure_perform(
+                            json!({
+                                "id": "proc-race",
+                                "project_root": root.display().to_string()
+                            }),
+                            store,
+                        )
+                        .await,
+                    )
+                    .expect("json reply")
+                })
+                .await
+                .expect("join"),
+            );
+        }
+
+        let performed = responded
+            .iter()
+            .filter(|r| r["performed"] == json!(true))
+            .count();
+        assert_eq!(
+            performed, 3,
+            "exactly one firing per remaining fire, all others spent-refused: {:?}",
+            responded
+        );
+
+        let meta = stored(&store, "probe", "proc-race").await.metadata;
+        assert_eq!(meta["remaining_fires"], json!(0), "{}", meta);
+        assert_eq!(meta["performance_count"], json!(3), "{}", meta);
+        // The monotonic audit trail: after a wake-up, the very next
+        // serialized firing records 2 → 3.
+        assert_eq!(meta["previous_performance_count"], json!(2), "{}", meta);
     }
 }

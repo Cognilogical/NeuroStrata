@@ -128,7 +128,7 @@ mod tests {
         // from previous test runs.
         let tmpdir2 = std::env::temp_dir().join("ns_learn_test_2");
         std::fs::create_dir_all(&tmpdir2).unwrap();
-        let rec2 = block_on(LearningRecorder::open(tmpdir2, None)).unwrap();
+        let rec2 = block_on(LearningRecorder::open(tmpdir2.clone(), None)).unwrap();
         let v2 = DecisionObservation {
             schema_version: 1,
             observation_id: "obs-2".into(),
@@ -151,8 +151,40 @@ mod tests {
             decision: crate::judgment::DedupDecision::BlockedExact,
         };
         block_on(rec2.record_observation(&v2)).unwrap();
-        assert!(true);
-        let _ = tmpdir;
-        let _ = tmpdir2;
+        // The record has a contract, not just a side effect: the month file in
+        // the recorder root exists, is non-empty, every JSONL line parses back
+        // into a DecisionObservation, and the record written by THIS run is
+        // among them with its fields intact.
+        for (root, observation, label) in [
+            (&tmpdir, &v1, "first recorder"),
+            (&tmpdir2, &v2, "reopened recorder"),
+        ] {
+            let month = chrono::Local::now().format("%Y%m").to_string();
+            let path = root.join(format!("observations-{}.jsonl", month));
+            let data = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{label}: observations file readable: {e}"));
+            assert!(!data.is_empty(), "{label}: the observation was flushed");
+            let text = std::str::from_utf8(&data).expect("utf-8 jsonl");
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert!(!lines.is_empty(), "{label}: at least one JSONL line");
+            // Every line is a well-formed observation, whichever run wrote it.
+            for line in &lines {
+                let parsed: DecisionObservation = serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("{label}: jsonl round-trips: {e}"));
+                assert_ne!(parsed.observation_id.len(), 0, "observation id survives");
+            }
+            // This run's record round-trips field for field.
+            let parsed: DecisionObservation = lines
+                .iter()
+                .rev()
+                .find_map(|l| serde_json::from_str::<DecisionObservation>(l).ok())
+                .filter(|p| p.observation_id == observation.observation_id)
+                .unwrap_or_else(|| panic!("{label}: this run's record is in the file"));
+            assert_eq!(parsed.observation_id, observation.observation_id);
+            assert_eq!(parsed.namespace, observation.namespace);
+            assert_eq!(parsed.context.connection_id, observation.context.connection_id);
+            assert_eq!(parsed.result_memory_id, observation.result_memory_id);
+            assert_eq!(parsed.decision, observation.decision);
+        }
     }
 }
