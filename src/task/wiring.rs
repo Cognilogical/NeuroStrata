@@ -7,6 +7,10 @@
 //! submission) is free text in `gate_point`, never an enum.
 //!
 //! Rule: never hand a project a reminder where a machine will do.
+//!
+//! Registry size: 13 automatic wires and 7 reminder wires. The counts are
+//! stated here so a stale "four wires" claim in prose cannot outlive the
+//! registry it describes.
 
 /// Where a wire runs. Closed enum; "project-ci" is just the software
 /// project's `project-pipeline`.
@@ -174,4 +178,16 @@ pub fn known_wire_ids() -> Vec<&'static str> {
         .map(|w| w.id)
         .chain(REMINDER_WIRES.iter().map(|r| r.id))
         .collect()
+}
+
+/// Whether `name` is an automatic wire id at all (as opposed to a reminder).
+pub fn is_automatic_wire(name: &str) -> bool {
+    AUTOMATIC_WIRES.iter().any(|w| w.id == name)
+}
+
+/// Whether the automatic wire `name` hard-fails. An ENFORCED rule needs a
+/// machine that blocks: citing an advisory wire (`blocks == false`) as the
+/// sole guard is an enforcement claim no machine carries.
+pub fn is_blocking_automatic_wire(name: &str) -> bool {
+    AUTOMATIC_WIRES.iter().any(|w| w.id == name && w.blocks)
 }

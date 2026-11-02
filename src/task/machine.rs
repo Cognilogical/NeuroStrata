@@ -203,6 +203,15 @@ pub fn apply(task: &Task, to: Status, ctx: &Ctx) -> Result<Task, TransitionError
     task_obj.insert("status".into(), serde_json::json!(to.as_str()));
     task_obj.insert("updated_at".into(), serde_json::json!(at));
 
+    // Unclaim is the machine's job, not a handler courtesy: an Open task
+    // carries no live claim, so the InProgress -> Open edge itself clears the
+    // holder's marks. (Only unclaim: reopening a Done row is not a claim, and
+    // Done rows may still say who finished them.)
+    if from == Status::InProgress && to == Status::Open {
+        task_obj.remove("assignee");
+        task_obj.remove("session_id");
+    }
+
     let mut history = match task_obj.get("history").and_then(|h| h.as_array()) {
         Some(entries) => entries.clone(),
         None => Vec::new(),

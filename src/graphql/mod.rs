@@ -463,6 +463,27 @@ pub fn execute_on_records(
                             }
                             data = json!({ "memory": root_result });
                         } else if root_name == "memories" || root_name == "search" {
+                            let mut ns_arg = namespace.to_string();
+                            for (k, v) in &f.arguments {
+                                if *k == "namespace" {
+                                    match v {
+                                        graphql_parser::query::Value::String(s) => ns_arg = s.clone(),
+                                        graphql_parser::query::Value::Variable(name) => {
+                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str()) {
+                                                ns_arg = s.to_string();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if !ns_arg.is_empty() && ns_arg != namespace {
+                                errors.push(GraphQLError { message: format!(
+                                    "namespace isolation violation: query requested '{}' on bound namespace '{}'",
+                                    ns_arg, namespace
+                                ) });
+                                return GraphQLResponse { data: None, errors };
+                            }
                             let first = if var_first < 1 { 1 } else if var_first > 100 { 100 } else { var_first };
                             if var_first > 100 {
                                 errors.push(GraphQLError { message: "first clamped to 100".into() });
@@ -801,6 +822,32 @@ mod tests {
         assert!(resp.data.is_none(), "cross-namespace query must be rejected");
         assert!(resp.errors.iter().any(|e| e.message.contains("namespace isolation violation")
             && e.message.contains("'other'") && e.message.contains("'ns'")));
+    }
+
+    #[test]
+    fn namespace_isolation_violation_rejects_cross_ns_memories_and_search() {
+        let records = vec![("m1".into(), crate::traits::MemoryPayload {
+            content: "x".into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        })];
+        for q in [
+            "{ memories(namespace: \"other\") { edges { node { id } } } }",
+            "{ search(text: \"foo\", namespace: \"other\") { edges { node { id } } } }",
+        ] {
+            let resp = execute_on_records(&records, &Default::default(), "ns", "admin", q, None);
+            assert!(resp.data.is_none(), "cross-namespace query must be rejected: {}", q);
+            assert!(resp.errors.iter().any(|e| e.message.contains("namespace isolation violation")
+                && e.message.contains("'other'") && e.message.contains("'ns'")), "query: {}", q);
+        }
+        // Same-namespace argument is allowed.
+        let ok = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ memories(namespace: \"ns\") { edges { node { id } } } }", None);
+        assert!(ok.errors.is_empty());
     }
 
     #[test]

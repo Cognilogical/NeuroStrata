@@ -203,7 +203,12 @@ pub async fn process_mcp_request(
                                 "domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by domain slug(s) (OR)." },
                                 "node_sets": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Filter by node_set tag(s)." },
                                 "node_set_mode": { "type": "string", "enum": ["all", "any"], "description": "AND/OR semantics for node_sets filter. Default any." },
-                                "domain_expansion": { "type": "boolean", "description": "Expand domain filter to include child domains in the ontology DAG. Default true." }
+                                "domain_expansion": { "type": "boolean", "description": "Expand domain filter to include child domains in the ontology DAG. Default true." },
+                                "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Optional list of memory_type values to filter by." },
+                                "fact_shape": { "type": "string", "enum": ["atomic", "composite", "any"], "description": "Filter fact memories by shape ('atomic', 'composite', or 'any')." },
+                                "path_prefix": { "type": "string", "description": "Optional file/location path prefix filter." },
+                                "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
+                                "include_code_ast": { "type": "boolean", "default": false, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -5970,7 +5975,10 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
                         }));
                     }
                 } else {
-                let combined_score = 0.5 * sim;
+                // Without KGE, use pure text similarity directly: halving it
+                // would cap the score at 0.5 and make thresholds >= 0.5
+                // unreachable.
+                let combined_score = sim;
                 if combined_score >= threshold as f32 {
                     candidates.push(serde_json::json!({
                         "memory_a": a.id,

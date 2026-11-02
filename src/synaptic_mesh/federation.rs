@@ -1,7 +1,6 @@
 //! Federation (in-house approximation): query a remote daemon instance over HTTP.
-// `remote_list` is compiled with tests only: no shipped mesh command performs
-// a remote list yet, and the wrapper on `MeshService` exercises it there.
-#[cfg(test)]
+// `remote_list` is also exercised in production by
+// `MeshService::status_report`, which probes the configured HTTP peer.
 pub async fn remote_list(base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
     let url = format!("{}/list?namespace={}", base_url.trim_end_matches('/'), namespace);
     let client = reqwest::Client::new();

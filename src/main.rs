@@ -3802,52 +3802,6 @@ async fn run() -> anyhow::Result<()> {
                             crate::server::handle_graphql_query(&args, vector_store.clone()).await;
                         println!("{}", out);
                     }
-                    Commands::Learn { action } => match action {
-                        LearnCommands::Status => {
-                            let status = crate::learning::control::load_status(
-                                &crate::learning::control::default_learning_dir(),
-                            );
-                            println!("{}", serde_json::to_string_pretty(&status)?);
-                        }
-                        LearnCommands::Pause => {
-                            print_learn_control(
-                                crate::learning::control::LearningControlRequest {
-                                    action: crate::learning::control::LearningControlAction::Pause,
-                                    purge_observations: false,
-                                },
-                            );
-                        }
-                        LearnCommands::Resume => {
-                            print_learn_control(
-                                crate::learning::control::LearningControlRequest {
-                                    action: crate::learning::control::LearningControlAction::Resume,
-                                    purge_observations: false,
-                                },
-                            );
-                        }
-                        LearnCommands::Rollback => {
-                            print_learn_control(
-                                crate::learning::control::LearningControlRequest {
-                                    action: crate::learning::control::LearningControlAction::Rollback,
-                                    purge_observations: false,
-                                },
-                            );
-                        }
-                        LearnCommands::Reset { purge_observations, confirm_purge } => {
-                            if purge_observations && !confirm_purge {
-                                anyhow::bail!("--purge-observations requires --confirm-purge");
-                            }
-                            print_learn_control(
-                                crate::learning::control::LearningControlRequest {
-                                    action: crate::learning::control::LearningControlAction::Reset,
-                                    purge_observations,
-                                },
-                            );
-                        }
-                        LearnCommands::Train { version } => {
-                            run_learn_train(&version).await?;
-                        }
-                    },
                     Commands::Doctor { namespace } => {
                         run_doctor(&read, namespace.as_deref()).await?;
                     }
@@ -4242,7 +4196,10 @@ async fn run() -> anyhow::Result<()> {
                     | Commands::ProjectContext { .. }
                     | Commands::BusMetrics
                     | Commands::Kge { .. }
-                    | Commands::Hooks { .. } => unreachable!(),
+                    | Commands::Hooks { .. }
+                    // THE OUTER match already handles Learn (src/main.rs ~2822);
+                    // this inner catch-all can never see it.
+                    | Commands::Learn { .. } => unreachable!(),
                 }
             }
         }

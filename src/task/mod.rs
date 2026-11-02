@@ -835,6 +835,39 @@ pub async fn handle_task_update(
                     obj.remove("assignee");
                     obj.remove("session_id");
                     task = moved;
+                }
+                // Claiming through task_update must not hollow the machine:
+                // an InProgress task with no holder fails the Open/InProgress
+                // invariant, and task_update may be the only claim action a
+                // session makes. So Open -> InProgress stamps the caller's
+                // claim while it moves.
+                else if from == Status::Open && to == Status::InProgress {
+                    let mut moved = moved;
+                    let caller_session = arg_str(&args, "session_id")
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string());
+                    let obj = task_obj_mut(&mut moved.payload);
+                    let unclaimed = obj
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true);
+                    if unclaimed {
+                        if let Some(session) = &caller_session {
+                            obj.insert("session_id".to_string(), json!(session));
+                        }
+                        if obj
+                            .get("assignee")
+                            .and_then(Value::as_str)
+                            .map(|s| s.trim().is_empty())
+                            .unwrap_or(true)
+                        {
+                            if let Some(a) = assignee.clone().or_else(|| caller_session.clone()) {
+                                obj.insert("assignee".to_string(), json!(a));
+                            }
+                        }
+                    }
+                    task = moved;
                 } else {
                     task = moved;
                 }
@@ -1104,7 +1137,13 @@ pub async fn handle_task_complete(
     {
         full_text.push_str(mem_content);
     }
-    let has_follow_up = args.get("follow_up_tasks").is_some();
+    // A passed-but-empty list is defer, not compliance: `follow_up_tasks: []`
+    // is not an explicit follow-up plan.
+    let has_follow_up = args
+        .get("follow_up_tasks")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
     if !full_text.is_empty() {
         use crate::task::intent::detect_task_intents;
         let signals = detect_task_intents(&full_text);
@@ -1464,12 +1503,22 @@ pub async fn handle_task_complete(
         );
     }
 
+    // The completing session travels into the "done" history entry: without
+    // it the claim/exclusivity trail stops at the finish line.
+    let caller_session = arg_str(&args, "session_id")
+        .map(|s| s.to_string())
+        .or_else(|| {
+            task.task_field("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+
     // With the edge in place the ExtractionRequired guard is satisfied.
     let ctx = Ctx {
         reason: reason.clone(),
         extraction_edge_exists: true,
         actor,
-        session: String::new(),
+        session: caller_session.unwrap_or_default(),
     };
     let mut completed = apply(&task, Status::Done, &ctx).map_err(|e| format!("ERROR: {}", e))?;
     if !reason.trim().is_empty() {
@@ -2284,6 +2333,10 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
             "blocks": w.blocks,
             "gate_point": resolved,
             "reason": w.reason,
+            // Field contract of docs/design-wiring-panel.md Q1: the schema key
+            // exists even when no reference implementation is shipped, so
+            // consumers read one stable shape.
+            "reference": None::<String>,
         });
         // Q5 honesty, the hard version: no per-guard `client_side` flag. Whether the
         // hook runs a given pipeline guard is read out of the hook body

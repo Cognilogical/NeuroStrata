@@ -286,6 +286,43 @@ impl MeshService {
                 .to_string(),
         );
         lines.push(format!("health: {}", health_line(&root)));
+
+        // Federated remotes: a configured HTTP peer is probed in production
+        // (fail-soft rules — an unreachable peer renders a line, never a
+        // crash, and every count is explicit rather than silent). Only the
+        // manifest's `remote` can name a peer; there is no `remotes` list in
+        // the synaptic-mesh/v1 schema, so one remote is probed per namespace.
+        if let Some(remote) = m.remote.as_deref() {
+            if remote.starts_with("http://") || remote.starts_with("https://") {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        for ns in &m.namespaces {
+                            let ns = ns.clone();
+                            let remote = remote.to_string();
+                            // The status path runs on sync trait signatures; block the
+                            // probe in-place so nested block_on is legal on worker
+                            // threads of the multi-threaded runtime.
+                            let probe = tokio::task::block_in_place(|| {
+                                handle.block_on(self.federated_remote_list(&remote, &ns, ""))
+                            });
+                            match probe {
+                                Ok(rows) => lines.push(format!(
+                                    "federated remote {remote} {ns}: {} record(s)",
+                                    rows.len()
+                                )),
+                                Err(e) => lines.push(format!(
+                                    "federated remote {remote} {ns}: unreachable ({e})"
+                                )),
+                            }
+                        }
+                    }
+                    Err(_) => lines.push(
+                        "federated remote: no async runtime in scope — probe skipped".to_string(),
+                    ),
+                }
+            }
+        }
+
         lines.push(
             "DISCLOSURE: the mesh is a permanent record shared with the team — tombstones suppress content from search, but full erasure requires a coordinated history rewrite, and an uncooperative peer's clone retains the content."
                 .to_string(),
@@ -293,10 +330,8 @@ impl MeshService {
         Ok(lines.join("\n"))
     }
 
-    /// Remote peer probe: listed for the CLI/status surface when the daemon
-    /// runs long-lived; today only the test surface exercises it, so it is
-    /// compiled with tests.
-    #[cfg(test)]
+    /// Remote peer probe: used by `status_report` to inspect a configured
+    /// HTTP federated peer in production, and by the test surface directly.
     pub async fn federated_remote_list(&self, base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
         crate::synaptic_mesh::federation::remote_list(base_url, namespace, token).await
     }

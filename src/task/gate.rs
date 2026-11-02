@@ -14,7 +14,7 @@
 use crate::task::machine::Status;
 use crate::traits::{MemoryPayload, SearchResult, VectorStore};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 /// A blocking rule break: exactly the shape POST /tasks/gate returns.
@@ -125,15 +125,12 @@ pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
 /// lineage is data, not a hang.
 const MAX_CHAIN: usize = 32;
 
-/// The rows a row replaced, as ids. `supersedes` is written as one id, but a
-/// hand-edited row may carry a list, and a list is read as a list.
-fn superseded_ids(metadata: &Value) -> Vec<String> {
+/// The rows a row replaced, as borrowed ids. `supersedes` is written as one
+/// id, but a hand-edited row may carry a list, and a list is read as a list.
+pub(crate) fn superseded_ids<'a>(metadata: &'a Value) -> Vec<&'a str> {
     match metadata.get("supersedes") {
-        Some(Value::String(s)) => vec![s.clone()],
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect(),
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str()).collect(),
         _ => Vec::new(),
     }
 }
@@ -176,22 +173,32 @@ pub(crate) fn live_successor<'a>(
 /// A lesson belongs to the work, not to one row id: the row that replaced a
 /// finished task is the same work under a new id, so the lesson extracted
 /// from the old id is its lesson too.
+///
+/// The walk is a breadth-first traversal, not a single chain: `supersedes`
+/// may name several ids (a row that split its replaced work among successors),
+/// and every branch of the lineage is still the same work. Bounded and
+/// cycle-safe, because a loop in the lineage is data, not a hang.
 pub(crate) fn work_lineage(memories: &[SearchResult], id: &str) -> Vec<String> {
     let mut lineage: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut current = id.to_string();
+    // Borrowing ids: the queue holds references into `memories`, so visiting a
+    // node never clones its supersession list.
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    queue.push_back(id);
     while lineage.len() < MAX_CHAIN {
-        if !seen.insert(current.clone()) {
+        let Some(current) = queue.pop_front() else {
             break;
+        };
+        if !seen.insert(current.to_string()) {
+            continue;
         }
-        lineage.push(current.clone());
+        lineage.push(current.to_string());
         let Some(row) = memories.iter().find(|m| m.id == current) else {
-            break;
+            continue;
         };
-        let Some(next) = superseded_ids(&row.payload.metadata).into_iter().next() else {
-            break;
-        };
-        current = next;
+        for next in superseded_ids(&row.payload.metadata) {
+            queue.push_back(next);
+        }
     }
     lineage
 }
@@ -405,7 +412,8 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                 ),
             });
         }
-        if let Some(enf) = rule.get("enforcement").and_then(|e| e.as_str()) {
+        let enf = rule.get("enforcement").and_then(|e| e.as_str());
+        if let Some(enf) = enf {
             if !matches!(enf, "ENFORCED" | "PARTIAL" | "NOT_ENFORCED") {
                 report.violations.push(Violation {
                     id: row.id.clone(),
@@ -418,53 +426,77 @@ pub fn evaluate(memories: &[SearchResult], now: i64) -> GateReport {
                 continue;
             }
         }
-        if let Some(enf) = rule.get("enforcement").and_then(|e| e.as_str()) {
-            match enf {
-                "ENFORCED" => {}
-                "PARTIAL" => {
-                    let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
-                    if guard.is_empty() || !known.contains(&guard) {
-                        report.violations.push(Violation {
-                            id: row.id.clone(),
-                            kind: "partial_without_guard",
-                            detail: format!(
-                                "rule '{}' claims PARTIAL but names no real guard.",
-                                content_short(&row.payload.content)
-                            ),
-                        });
-                        continue;
-                    }
-                }
-                "NOT_ENFORCED" => {
-                    let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
-                    if !guard.is_empty() {
-                        report.violations.push(Violation {
-                            id: row.id.clone(),
-                            kind: "not_enforced_with_guard",
-                            detail: format!(
-                                "rule '{}' claims NOT_ENFORCED but names a guard.",
-                                content_short(&row.payload.content)
-                            ),
-                        });
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if rule.get("enforcement").and_then(|e| e.as_str()) != Some("ENFORCED") {
-            continue;
-        }
+        // One enforcement decision per rule: the value is parsed once above,
+        // and exactly one arm below judges it.
         let guard = rule.get("guard").and_then(|g| g.as_str()).unwrap_or("");
-        if guard.is_empty() || !known.contains(&guard) {
-            report.violations.push(Violation {
-                id: row.id.clone(),
-                kind: "rule_overclaims_enforcement",
-                detail: format!(
-                    "rule '{}' claims ENFORCED but names no real guard; set enforcement honestly (PARTIAL/NOT_ENFORCED) or name an existing wire id in metadata.guard.",
-                    content_short(&row.payload.content)
-                ),
-            });
+        match enf {
+            Some("ENFORCED") => {
+                if guard.is_empty() || !known.contains(&guard) {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "rule_overclaims_enforcement",
+                        detail: format!(
+                            "rule '{}' claims ENFORCED but names no real guard; set enforcement honestly (PARTIAL/NOT_ENFORCED) or name an existing wire id in metadata.guard.",
+                            content_short(&row.payload.content)
+                        ),
+                    });
+                    continue;
+                }
+                // An automatic wire the rule cites must actually hard-fail:
+                // an advisory wire (`blocks == false`) warns and moves on, so
+                // it is a note behind an ENFORCED claim, not a machine.
+                if crate::task::wiring::is_automatic_wire(guard)
+                    && !crate::task::wiring::is_blocking_automatic_wire(guard)
+                {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "enforced_rule_advisory_guard",
+                        detail: format!(
+                            "rule '{}' claims ENFORCED but its guard '{}' is an advisory (non-blocking) wire; an ENFORCED rule cannot cite a wire that does not hard-fail as its sole guard. Name a blocking wire id, or set enforcement honestly (PARTIAL/NOT_ENFORCED).",
+                            content_short(&row.payload.content), guard
+                        ),
+                    });
+                }
+            }
+            Some("PARTIAL") => {
+                if guard.is_empty() || !known.contains(&guard) {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "partial_without_guard",
+                        detail: format!(
+                            "rule '{}' claims PARTIAL but names no real guard.",
+                            content_short(&row.payload.content)
+                        ),
+                    });
+                }
+            }
+            Some("NOT_ENFORCED") => {
+                if !guard.is_empty() {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "not_enforced_with_guard",
+                        detail: format!(
+                            "rule '{}' claims NOT_ENFORCED but names a guard.",
+                            content_short(&row.payload.content)
+                        ),
+                    });
+                }
+            }
+            Some(_) => {}
+            None => {
+                // A rule that names a machine without claiming enforcement has
+                // a wire with its power unassigned: nothing runs the guard.
+                if !guard.trim().is_empty() {
+                    report.violations.push(Violation {
+                        id: row.id.clone(),
+                        kind: "rule_guard_without_enforcement",
+                        detail: format!(
+                            "rule '{}' names metadata.guard '{}' but declares no enforcement value; a rule with a guard must also declare enforcement (\"ENFORCED\" or \"PARTIAL\"), or drop the guard.",
+                            content_short(&row.payload.content), guard
+                        ),
+                    });
+                }
+            }
         }
     }
 
