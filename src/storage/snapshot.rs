@@ -86,22 +86,25 @@ pub fn compute_storage_status(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let snapshot_count = snapshot_dir
-        .read_dir()
-        .ok()
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().is_dir()
-                        && e.file_name()
-                            .to_str()
-                            .map(|s| s.starts_with("snapshot-"))
-                            .unwrap_or(false)
-                })
-                .count()
-        })
-        .unwrap_or(0);
+    let snapshot_read = snapshot_dir.read_dir();
+    let snapshot_count = match snapshot_read {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().is_dir()
+                    && e.file_name()
+                        .to_str()
+                        .map(|s| s.starts_with("snapshot-"))
+                        .unwrap_or(false)
+            })
+            .count(),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("snapshot read_dir failed: {e}");
+            }
+            0
+        }
+    };
     // Prefer the real checkpoint timestamp recorded in this process; the
     // store directory's mtime is only a proxy and falls back when no
     // checkpoint happened yet in this process.

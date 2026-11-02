@@ -166,7 +166,13 @@ impl JudgmentProvider for TypeSafeJevProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("failed to read TypeSafe Jev error body: {e}");
+                    String::new()
+                }
+            };
             anyhow::bail!("TypeSafe API error: {} - {}", status, body);
         }
 
@@ -190,7 +196,13 @@ impl JudgmentProvider for TypeSafeJevProvider {
             .send()
             .await;
 
-        Ok(response.map(|r| r.status().is_success()).unwrap_or(false))
+        match response {
+            Ok(r) => Ok(r.status().is_success()),
+            Err(e) => {
+                tracing::debug!("TypeSafe Jev health probe transport error: {e}");
+                Ok(false)
+            }
+        }
     }
 
     fn name(&self) -> &str {

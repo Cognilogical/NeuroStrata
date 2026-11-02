@@ -300,7 +300,13 @@ impl DeduplicationChecker {
     /// Health check for the judgment provider.
     pub async fn health_check(&self) -> bool {
         if let Some(provider) = &self.provider_set.active {
-            provider.health_check().await.unwrap_or(false)
+            match provider.health_check().await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    tracing::warn!("judgment provider health_check failed: {e}");
+                    false
+                }
+            }
         } else {
             false
         }

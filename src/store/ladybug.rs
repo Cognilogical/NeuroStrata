@@ -135,7 +135,10 @@ async fn search_inner(
                     Ok(out)
                 })
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|e| {
+                    tracing::warn!("failed to hydrate reasoning payloads: {e}");
+                    std::collections::HashMap::new()
+                });
             let exec_adapter = crate::rdf::reasoning::ReasoningAdapter::new()
                 .with_payloads(hydrated);
             inferred_results = exec_adapter.execute(&ont_idx, &namespace, q, &[]);
@@ -2506,7 +2509,13 @@ impl LadybugStore {
                 break;
             }
         }
-        let rows = self.list(namespace, None, None).await.unwrap_or_default();
+        let rows = match self.list(namespace, None, None).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("shape_warnings list failed for '{namespace}': {e}");
+                Vec::new()
+            }
+        };
         let mut out = Vec::new();
         for r in rows {
             // shacl validate
@@ -2988,8 +2997,17 @@ impl LadybugStore {
                     let ts = format!("{}", row[1]).parse::<i64>().unwrap_or(0);
                     let value = format!("{}", row[2]).parse::<f64>().unwrap_or(0.0);
                     let labels_str = format!("{}", row[3]);
-                    let labels: std::collections::BTreeMap<String, String> =
-                        serde_json::from_str(&labels_str).unwrap_or_default();
+                    let labels: std::collections::BTreeMap<String, String> = if !labels_str.trim().is_empty() {
+                        match serde_json::from_str(&labels_str) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!("failed to parse task labels JSON '{}': {e}", labels_str);
+                                std::collections::BTreeMap::new()
+                            }
+                        }
+                    } else {
+                        std::collections::BTreeMap::new()
+                    };
                     out.push(crate::time_series::Sample {
                         id,
                         seq: 0,

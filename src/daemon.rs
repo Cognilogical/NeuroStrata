@@ -123,12 +123,21 @@ pub(crate) fn load_or_create_operator_token() -> String {
 /// when no usable token is there. Creation is the daemon's job; clients
 /// only read.
 pub(crate) fn read_token_file(name: &str) -> Option<String> {
-    let content = std::fs::read_to_string(token_config_dir().join(name)).ok()?;
-    let trimmed = content.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
+    match std::fs::read_to_string(token_config_dir().join(name)) {
+        Ok(content) => {
+            let trimmed = content.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to read daemon token file {}: {e}", name);
+            }
+            None
+        }
     }
 }
 
@@ -865,7 +874,7 @@ pub(crate) async fn start_daemon_on(
         .route("/sparql", post(handle_http_sparql))
         .route("/graphql", post(handle_http_graphql))
         .route("/chat/ask", post(handle_http_chat_ask))
-        .route("/storage/status", get(handle_http_storage_status))
+        .route("/storage/status", get(handle_http_storage_status).post(handle_http_storage_status))
         .route("/learning/status", get(handle_http_learning_status))
         .route("/learning/control", post(handle_http_learning_control))
         .route("/shutdown", post(handle_shutdown))
@@ -886,9 +895,13 @@ pub(crate) async fn start_daemon_on(
     // a failure costs a retry instead of a request, and the write is already in
     // the log either way.
     // Read-only hygiene knobs: load without materializing a config file.
-    let hygiene: crate::storage::StorageHygieneConfig = crate::config::Config::load()
-        .map(|c| c.storage_hygiene)
-        .unwrap_or_default();
+    let hygiene: crate::storage::StorageHygieneConfig = match crate::config::Config::load() {
+        Ok(c) => c.storage_hygiene,
+        Err(e) => {
+            tracing::warn!("periodic hygiene failed to load Config, using default: {e}");
+            Default::default()
+        }
+    };
 
     let periodic_store = vector_store.clone();
     // Stopped before the final checkpoint, not aborted: a checkpoint it has
@@ -1197,9 +1210,8 @@ async fn handle_export_graph(
     let data = state
         .vector_store
         .export_graph(
-            req.exclude_superseded.unwrap_or(false),
-            req.include_archived.unwrap_or(false),
-            &config.project_contexts,
+            !req.exclude_superseded.unwrap_or(false),
+            req.include_archived.unwrap_or(false),            &config.project_contexts,
             anchor_override.as_ref(),
         )
         .await
@@ -1248,9 +1260,9 @@ struct ReadReq {
     namespace: Option<String>,
 }
 
-/// Read-only CLI proxy (guinea-pig BUG-8): `doctor`, `list` and `namespaces`
-/// run while the daemon holds the store, through this route, without a second
-/// engine ever opening the database.
+/// Read-only CLI proxy (guinea-pig BUG-8): `list` and `namespaces` run while
+/// the daemon holds the store, through this route, without a second engine ever
+/// opening the database. (`doctor` uses /health and /cli/read.)
 async fn handle_cli_read(
     State(state): State<AppState>,
     Json(req): Json<ReadReq>,

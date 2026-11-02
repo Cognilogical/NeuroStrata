@@ -21,7 +21,10 @@ pub fn run_setup(repo_path: &Path) -> Result<SetupReport> {
     let bin_path = std::env::current_exe().context("cannot determine current_exe")?;
     // systemd ExecStart and launchd ProgramArguments require absolute paths;
     // a relative repo_path (e.g. `./`) would otherwise leak into the units.
-    let canonical_repo = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let canonical_repo = std::fs::canonicalize(repo_path).unwrap_or_else(|e| {
+        tracing::debug!("failed to canonicalize {}: {e}", repo_path.display());
+        repo_path.to_path_buf()
+    });
     let script_path = canonical_repo.join("scripts").join("backup.sh");
 
     if !script_path.exists() {
@@ -212,9 +215,11 @@ fn run_setup_macos(bin: &Path, script: &Path, _repo: &Path) -> Result<SetupRepor
 
     // Unload first so a re-run of setup is idempotent (load -w on an already
     // loaded agent is a no-op and leaves a stale definition active).
-    let _ = std::process::Command::new("launchctl")
+    if let Err(e) = std::process::Command::new("launchctl")
         .args(["unload", "-w", &daemon_plist.to_string_lossy()])
-        .status();
+        .status() {
+        tracing::debug!("launchctl unload failed: {e}");
+    }
 
     // Load / reload agent
     let load = std::process::Command::new("launchctl")

@@ -269,7 +269,7 @@ pub fn execute_on_records(
                     return GraphQLResponse { data: None, errors };
                 }
                 graphql_parser::query::OperationDefinition::Subscription(_) => {
-                    errors.push(GraphQLError { message: "mutations are not supported".into() });
+                    errors.push(GraphQLError { message: "subscriptions are not supported".into() });
                     return GraphQLResponse { data: None, errors };
                 }
                 _ => {}

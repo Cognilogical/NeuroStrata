@@ -98,10 +98,23 @@ impl LayaOnnxProvider {
 
         // Build session directly from file (local-first; graceful on bad model).
         let inference_session = {
-            Session::builder()
-                .ok()
-                .and_then(|mut b| b.commit_from_file(&model_path).ok())
-                .map(|s| Arc::new(std::sync::Mutex::new(s)))
+            let builder = Session::builder();
+            match builder {
+                Err(e) => {
+                    tracing::warn!("LayaOnnx failed to build ORT session: {e}");
+                    None
+                }
+                Ok(mut b) => match b.commit_from_file(&model_path) {
+                    Ok(s) => Some(Arc::new(std::sync::Mutex::new(s))),
+                    Err(e) => {
+                        tracing::warn!(
+                            "LayaOnnx failed to commit model from {}: {e}",
+                            model_path.display()
+                        );
+                        None
+                    }
+                },
+            }
         };
 
         let state = match inference_session.as_ref() {
@@ -255,7 +268,10 @@ impl JudgmentProvider for LayaOnnxProvider {
         let tokenizer = if tokenizer_path.exists() {
             match Tokenizer::from_file(&tokenizer_path) {
                 Ok(t) => Some(Arc::new(t)),
-                Err(_) => None,
+                Err(e) => {
+                    tracing::warn!("LayaOnnx failed to load tokenizer from {}: {e}", tokenizer_path.display());
+                    None
+                }
             }
         } else {
             None
@@ -279,7 +295,7 @@ impl JudgmentProvider for LayaOnnxProvider {
             // Fallback logit when the ONNX tensor cannot be extracted.
             let fallback_logit = (token_overlap - 0.5) * 4.0;
             let (similarity, reason) = if let Some(lock) = self.inference_session() {
-                let mut session = lock.lock().unwrap();
+                let mut session = lock.lock().unwrap_or_else(|e| e.into_inner());
                 // Try real ONNX execution with 2-float feature vector
                 let jaccard_sim = token_overlap;
                 let feature_vec = [jaccard_sim as f32, (1.0 - cand.score.clamp(0.0, 1.0)) as f32];
@@ -301,8 +317,13 @@ impl JudgmentProvider for LayaOnnxProvider {
                             // Extract the first output tensor and derive the
                             // model logit from real inference values.
                             let model_logit = outputs.iter().next().and_then(|(_name, value)| {
-                                let (_, data) = value.try_extract_tensor::<f32>().ok()?;
-                                laya_logit_from_tensor(data)
+                                match value.try_extract_tensor::<f32>() {
+                                    Ok((_, data)) => laya_logit_from_tensor(data),
+                                    Err(e) => {
+                                        tracing::warn!("LayaOnnx tensor extraction failed: {e}");
+                                        None
+                                    }
+                                }
                             });
                             match model_logit {
                                 Some(logit) => (
@@ -351,7 +372,7 @@ impl JudgmentProvider for LayaOnnxProvider {
     }
 
     /// Health check - verify the provider is operational.
-    /// Reports true when gliner feature is enabled and inference session is loaded.
+    /// Reports true when the ONNX inference session is loaded and state is Ready.
     async fn health_check(&self) -> Result<bool> {
         {
             let is_healthy = self.inference_session().is_some() &&
