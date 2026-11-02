@@ -85,7 +85,7 @@ mod tests {
     #[tokio::test]
     async fn ac5_real_context_plan_and_upsert_p95_under_100ms() {
         // -- ContextService::plan_with_items over 10 real items, 100 runs --
-        let svc = crate::context::ContextService::new_with(Some(1u8), Some(2u8));
+        let svc = crate::context::ContextService::new();
         let budget = crate::context::Budget::default();
         let mut plan_samples = Vec::<f64>::new();
         for _ in 0..100 {

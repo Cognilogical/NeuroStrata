@@ -657,17 +657,6 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
     Ok(())
 }
 
-/// Env var reader: `NEUROSTRATA_KGE_ENABLED` — KGE channel on/off.
-/// Unset/empty → false (default off, spec §6).
-pub fn kge_enabled_from_env() -> bool {
-    std::env::var("NEUROSTRATA_KGE_ENABLED")
-        .map(|v| {
-            let v = v.trim().to_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
-}
-
 /// Env var reader: `NEUROSTRATA_KGE_WEIGHT` — structural weight, clamped [0, 0.3].
 /// Unset/invalid → DEFAULT_KGE_WEIGHT (spec §6).
 pub fn kge_weight_from_env() -> f32 {
@@ -716,10 +705,6 @@ pub fn load_for_scope(db_path: &std::path::Path, scope: &str) -> Option<KgeModel
     let meta_path = kge_dir.join(scope).join("meta.json");
     if model_path.exists() && meta_path.exists() {
         if let Ok(model) = KgeModel::load(&model_path, &meta_path) {
-            // The artifact exists on disk and the channel is loadable; a
-            // loadable trained model is returned whether or not
-            // NEUROSTRATA_KGE_ENABLED is set.
-            let _enabled = kge_enabled_from_env();
             return Some(model);
         }
     }
@@ -788,11 +773,6 @@ mod tests {
     // Argon review checkpoints: env parsing + artifact path (not hidden stubs).
     #[test]
     fn kge_env_parsing_and_artifact_paths() {
-        std::env::set_var("NEUROSTRATA_KGE_ENABLED", "true");
-        assert!(kge_enabled_from_env());
-        std::env::remove_var("NEUROSTRATA_KGE_ENABLED");
-        assert!(!kge_enabled_from_env());
-
         std::env::set_var("NEUROSTRATA_KGE_WEIGHT", "0.25");
         assert!(kge_weight_from_env() - 0.25 < 1e-6);
         std::env::set_var("NEUROSTRATA_KGE_WEIGHT", "0.99");

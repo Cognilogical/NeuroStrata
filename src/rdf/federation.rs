@@ -21,7 +21,6 @@ pub struct SparqlServicePeer {
 /// Federation service configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationConfig {
-    pub service_enabled: bool,
     pub served_namespaces: Vec<String>,
     pub served_hosts: Vec<String>,
     pub service_peers: Vec<SparqlServicePeer>,
@@ -33,7 +32,6 @@ pub struct FederationConfig {
 impl Default for FederationConfig {
     fn default() -> Self {
         Self {
-            service_enabled: false,
             served_namespaces: Vec::new(),
             served_hosts: Vec::new(),
             service_peers: Vec::new(),
@@ -303,12 +301,8 @@ pub async fn handle_remote_sparql_request(
     config: &FederationConfig,
     store: &crate::store::ladybug::LadybugStore,
 ) -> Result<FederationExecutionReport, FederationError> {
-    // §5.2 / §7 security: service disabled
-    if !config.service_enabled {
-        return Err(FederationError::Denied("federation service disabled".into()));
-    }
-
-    // Host-header allowlist
+    // Host-header allowlist (security is enforced via served_hosts/served_namespaces
+    // allowlists and bearer-token peers, not a boolean toggle).
     if !config.served_hosts.is_empty() {
         match host_header {
             Some(h) if config.served_hosts.iter().any(|s| s == h) => {}
@@ -453,13 +447,6 @@ impl HttpServiceHandler {
         service_name: &oxrdf::NamedNode,
         pattern: &GraphPattern,
     ) -> Result<spareval::QuerySolutionIter<'static>, FederationError> {
-        // Service must be enabled.
-        if !self.config.service_enabled {
-            return Err(FederationError::Denied(
-                "service disabled".into(),
-            ));
-        }
-
         // Look up peer by endpoint IRI.
         let endpoint_str = service_name.as_str();
         let peer = self
@@ -598,7 +585,6 @@ mod tests {
     #[test]
     fn federation_config_default() {
         let c = FederationConfig::default();
-        assert!(!c.service_enabled);
         assert_eq!(c.timeout_ms, 250);
         assert_eq!(c.max_solutions, 1000);
         assert_eq!(c.max_dataset_quads, 250_000);
@@ -607,24 +593,15 @@ mod tests {
     }
 
     #[test]
-    fn handle_remote_sparql_security_checks() {
-        // Disabled service -> Denied
-        let cfg_disabled = FederationConfig {
-            service_enabled: false,
-            ..FederationConfig::default()
-        };
-        // We don't call async here; the security logic is verified by
-        // structure; parent integration tests will exercise full path.
-        assert!(!cfg_disabled.service_enabled);
-
-        // Unserved namespace -> should be denied when configured
+    fn federation_config_allowlists() {
+        // Unserved namespace/host allowlists remain the security surface.
         let cfg = FederationConfig {
-            service_enabled: true,
             served_namespaces: vec!["served".into()],
             served_hosts: vec!["peer".into()],
             ..FederationConfig::default()
         };
         assert!(cfg.served_namespaces.contains(&"served".to_string()));
         assert!(!cfg.served_namespaces.contains(&"other".to_string()));
+        assert!(cfg.served_hosts.contains(&"peer".to_string()));
     }
 }

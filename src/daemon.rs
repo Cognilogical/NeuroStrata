@@ -1567,12 +1567,11 @@ async fn handle_http_sparql(
     Json(req): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
     // `{"federated": true}` names this daemon as a remote SPARQL peer: route
-    // to the federation handler on the underlying LadybugStore. Opt-in per
-    // deployment: service_enabled and the served-host/namespace allowlists
-    // come from env, and everything is denied until configured.
+    // to the federation handler on the underlying LadybugStore. Security per
+    // deployment: served-host/namespace allowlists and peers come from env,
+    // and everything outside the allowlists is denied.
     if req.get("federated").and_then(|v| v.as_bool()).unwrap_or(false) {
         let config = crate::rdf::federation::FederationConfig {
-            service_enabled: env_flag("NEUROSTRATA_SPARQL_SERVICE_ENABLED"),
             served_namespaces: env_csv("NEUROSTRATA_SPARQL_SERVED_NAMESPACES"),
             served_hosts: env_csv("NEUROSTRATA_SPARQL_SERVED_HOSTS"),
             service_peers: env_peers("NEUROSTRATA_SPARQL_SERVICE_PEERS"),
@@ -1627,12 +1626,6 @@ async fn handle_http_sparql(
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 fn env_csv(name: &str) -> Vec<String> {

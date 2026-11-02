@@ -78,11 +78,7 @@ async fn search_inner(
     // KGE secondary distance adjustment: when a trained model exists for this
     // namespace's scope, structural proximity pulls close entities together
     // (bounded so it can never override the semantic order).
-    let kge_model = if crate::kge::kge_enabled_from_env() {
-        crate::kge::load_for_scope(&store.local_path, &namespace)
-    } else {
-        None
-    };
+    let kge_model = crate::kge::load_for_scope(&store.local_path, &namespace);
 
     // Ontology-backed query reasoning (RDFS/SHACL): expand the domain seeds
     // through the compiled index and exercise identifier/relation expansion
@@ -960,7 +956,10 @@ let incomplete = result_count >= fetch_limit;
                         &candidate_symbols,
                     );
                     let d_sym = crate::graph_read::hybrid::normalize_sym(sym_grade);
-                    sr.score = crate::graph_read::hybrid::combine(d_vec, d_graph, d_sym, (0.5, 0.3, 0.2));
+                    let hybrid_weights = crate::config::Config::from_default_path()
+                        .map(|c| c.hybrid_weights)
+                        .unwrap_or((0.5, 0.3, 0.2));
+                    sr.score = crate::graph_read::hybrid::combine(d_vec, d_graph, d_sym, hybrid_weights);
                 }
                 // Sort ASC by hybrid score, tie-break MemoryId ASC.
                 hybrid_results.sort_by(|a, b| {

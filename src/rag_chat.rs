@@ -11,7 +11,6 @@ pub const ALLOWED_API_KEY_ENV_VARS: [&str; 2] = ["OPENAI_API_KEY", "NEUROSTRATA_
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RagChatConfig {
-    pub enabled: bool,
     pub provider: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
@@ -26,7 +25,6 @@ pub struct RagChatConfig {
 impl Default for RagChatConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             provider: "offline".into(),
             base_url: None,
             api_key_env: None,

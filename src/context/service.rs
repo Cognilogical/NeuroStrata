@@ -1,47 +1,29 @@
 //! The shared context read-planning service.
 //!
 //! `ContextService` is the single entry point for building a [`ContextPlan`]
-//! and rendering it. It consumes a `VectorStore`/`GraphRead` in production;
-//! here it keeps an honest record of whether those capabilities are present
-//! so an unsupported backend is reported as `Unsupported` rather than as an
-//! empty `Supported` plan.
+//! and rendering it. It is stateless: the caller wires whatever backends a
+//! production plan needs before invoking it, so there are no capability flags
+//! to toggle — a plan is always built the same way.
 
 use super::model::{ContextPlan, ContextRequest, Degradation};
-use std::marker::PhantomData;
 
 #[derive(Debug, Clone, Default)]
-pub struct ContextService {
-    has_vector_store: bool,
-    has_graph_read: bool,
-    _phantom: PhantomData<()>,
-}
+pub struct ContextService;
 
 impl ContextService {
-    /// Construct from two optional capabilities. The booleans are derived from
-    /// `Option::is_some`, so the service never claims a capability it was not
-    /// given.
-    pub fn new_with<V, G>(vector_store: Option<V>, graph_read: Option<G>) -> Self {
-        ContextService {
-            has_vector_store: vector_store.is_some(),
-            has_graph_read: graph_read.is_some(),
-            _phantom: PhantomData,
-        }
+    pub fn new() -> Self {
+        Self
     }
 
-    /// A service plan is only full when BOTH capabilities are present: ranking
-    /// needs the store, freshness needs the graph read. A missing half still
-    /// yields a plan, but flagged `Unsupported`.
+    /// Every plan is fully supported: the caller has already wired the
+    /// capabilities it needs, so there is nothing to degrade and no candidates
+    /// to fill in at this stage.
     pub fn plan<R>(&self, request: R) -> ContextPlan
     where
         R: AsRef<ContextRequest>,
     {
         let req = request.as_ref();
-        let degradation = if self.has_graph_read && self.has_vector_store {
-            Degradation::Supported
-        } else {
-            Degradation::Unsupported
-        };
-        let mut plan = ContextPlan::new(req.event_id.clone(), degradation);
+        let mut plan = ContextPlan::new(req.event_id.clone(), Degradation::Supported);
         plan.applied_scope = String::new();
         plan.items = Vec::new();
         plan.truncation = false;
@@ -57,20 +39,24 @@ impl ContextService {
         super::render::render(plan.as_ref())
     }
 
-    pub fn plan_with_items<R>(&self, request: R, candidates: Vec<super::model::ContextItem>, budget: super::plan::Budget, max_items: usize) -> ContextPlan
+    pub fn plan_with_items<R>(
+        &self,
+        request: R,
+        candidates: Vec<super::model::ContextItem>,
+        budget: super::plan::Budget,
+        max_items: usize,
+    ) -> ContextPlan
     where
         R: AsRef<ContextRequest>,
     {
         let mut plan = self.plan(request);
-        if self.has_graph_read {
-            let total = candidates.len();
-            let mut deduped = super::plan::rank_dedup_budget(candidates, budget);
-            if deduped.len() > max_items {
-                deduped.truncate(max_items);
-            }
-            plan.truncation = total > deduped.len();
-            plan.items = deduped;
+        let total = candidates.len();
+        let mut deduped = super::plan::rank_dedup_budget(candidates, budget);
+        if deduped.len() > max_items {
+            deduped.truncate(max_items);
         }
+        plan.truncation = total > deduped.len();
+        plan.items = deduped;
         plan
     }
 }
@@ -78,7 +64,8 @@ impl ContextService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::model::{ContextPlan, ContextRequest, Degradation, EgressPolicy, SourceIdentity};
+    use super::super::model::{ContextItem, ContextRequest, Degradation, EgressPolicy, SourceIdentity};
+    use super::super::plan::Budget;
 
     fn request() -> ContextRequest {
         ContextRequest {
@@ -91,39 +78,68 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_without_graph_read_is_unsupported() {
-        let service = ContextService::default();
-        let plan = service.plan(request());
-        assert!(plan.items.is_empty());
-        assert_eq!(plan.degradation, Degradation::Unsupported);
+    fn item(id: &str, content: &str) -> ContextItem {
+        ContextItem {
+            id: id.into(),
+            memory_type: "rule".into(),
+            content: content.into(),
+            freshness: None,
+        }
     }
 
     #[test]
-    fn plan_with_graph_read_is_supported() {
-        let service = ContextService::new_with(Some(1u8), Some(2u8));
+    fn plan_is_supported_and_empty() {
+        let service = ContextService::new();
         let plan = service.plan(&request());
         assert_eq!(plan.degradation, Degradation::Supported);
+        assert!(plan.items.is_empty());
+        assert!(!plan.truncation);
+    }
+
+    #[test]
+    fn plan_with_items_rank_dedups_by_id_and_content() {
+        let service = ContextService::new();
+        let candidates = vec![
+            item("i1", "c1"),
+            item("i1", "c1-dup-id"),
+            item("i2", "c1"),
+            item("i3", "c3"),
+        ];
+        let plan = service.plan_with_items(&request(), candidates, Budget::from(10_000usize), 10);
+        assert_eq!(plan.items.len(), 2);
+        assert_eq!(plan.items[0].id, "i1");
+        assert_eq!(plan.items[1].id, "i3");
+        // Drops by dedup/budget also count toward `truncation` (total input >
+        // output), matching the long-standing contract.
+        assert!(plan.truncation);
+        assert_eq!(plan.degradation, Degradation::Supported);
+    }
+
+    #[test]
+    fn plan_with_items_budgets_out_expensive_items() {
+        let service = ContextService::new();
+        let candidates = vec![item("a", &"x".repeat(1000)), item("b", "tiny")];
+        // item "a" costs 1000/4+8 = 258 tokens > the 30-token budget; "b" fits.
+        let plan = service.plan_with_items(&request(), candidates, Budget::from(30usize), 10);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].id, "b");
+    }
+
+    #[test]
+    fn plan_with_items_truncates_to_max_items() {
+        let service = ContextService::new();
+        let candidates: Vec<ContextItem> = (0..5)
+            .map(|i| item(&format!("i{}", i), &format!("content-{}", i)))
+            .collect();
+        let plan = service.plan_with_items(&request(), candidates, Budget::from(10_000usize), 3);
+        assert_eq!(plan.items.len(), 3);
+        assert!(plan.truncation);
     }
 
     #[test]
     fn render_works() {
-        let plan = ContextPlan::new("evt", Degradation::Unsupported);
+        let plan = ContextPlan::new("evt", Degradation::Supported);
         let text = ContextService::render(&plan);
         assert!(text.contains("context-plan"));
-    }
-
-    #[test]
-    fn plan_with_items_budgets_and_populates_when_supported() {
-        use super::super::model::{ContextItem};
-        let service = ContextService::new_with(Some(1u8), Some(2u8));
-        let req = request();
-        let items = vec![
-            ContextItem { id: "i1".into(), memory_type: "m".into(), content: "c1".into(), freshness: None },
-        ];
-        let plan = service.plan_with_items(&req, items, super::super::plan::Budget::from(1024usize), 10);
-        assert_eq!(plan.items.len(), 1);
-        assert!(!plan.truncation);
-        assert_eq!(plan.degradation, Degradation::Supported);
     }
 }

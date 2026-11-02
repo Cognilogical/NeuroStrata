@@ -8,7 +8,6 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 /// Configuration for deterministic reasoning.
 #[derive(Debug, Clone, Copy)]
 pub struct ReasoningConfig {
-    pub reasoning_enabled: bool,
     pub governs_max_hops: u8,
     pub closure_budget: QueryBudget,
 }
@@ -16,7 +15,6 @@ pub struct ReasoningConfig {
 impl Default for ReasoningConfig {
     fn default() -> Self {
         Self {
-            reasoning_enabled: true,
             governs_max_hops: 2,
             closure_budget: QueryBudget {
                 max_ms: 50,
@@ -70,8 +68,7 @@ impl ReasoningAdapter {
 
     /// Expand domain via subClassOf* closure (RDFS §5.3 query-time expansion).
     pub fn expand_domain(&self, ontology: &OntologyIndex, domain: &str) -> Vec<String> {
-        if !self.config.reasoning_enabled
-            || self.config.governs_max_hops == 0
+        if self.config.governs_max_hops == 0
             || self.config.closure_budget.max_nodes == 0
         {
             return vec![domain.to_string()];
@@ -81,9 +78,6 @@ impl ReasoningAdapter {
 
     /// Expand identifiers via exactMatch / altLabels equivalence closure.
     pub fn expand_identifiers(&self, ontology: &OntologyIndex, query: &str) -> Vec<String> {
-        if !self.config.reasoning_enabled {
-            return vec![query.to_string()];
-        }
         let mut out: BTreeSet<String> = BTreeSet::new();
         out.insert(query.to_string());
         for e in ontology.equivalents_of(query) {
@@ -102,9 +96,6 @@ impl ReasoningAdapter {
 
     /// Expand relation filters via subPropertyOf* closure.
     pub fn expand_relation(&self, ontology: &OntologyIndex, relation: &str) -> Vec<String> {
-        if !self.config.reasoning_enabled {
-            return vec![relation.to_string()];
-        }
         ontology.expand_relation(relation)
     }
 
@@ -191,15 +182,6 @@ impl ReasoningAdapter {
         query: &str,
         edges: &[String],
     ) -> Vec<SearchResult> {
-        if !self.config.reasoning_enabled {
-            return vec![SearchResult {
-                id: query.to_string(),
-                score: 1.0,
-                payload: self.payload_for(query),
-                evidence: None,
-            }];
-        }
-
         // Domain expansion via subClassOf*
         let expanded_domains = self.expand_domain(ontology, domain);
         let expanded_query = self.expand_identifiers(ontology, query);
@@ -260,9 +242,6 @@ impl ReasoningAdapter {
             if d.is_empty() || !out.insert(d.clone()) {
                 continue;
             }
-            if !self.config.reasoning_enabled {
-                continue;
-            }
             for r in index.closure_subclasses(d, &self.config.closure_budget).results {
                 out.insert(r);
             }
@@ -303,9 +282,6 @@ impl ReasoningAdapter {
     ) -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
         out.insert(rel.to_string());
-        if !self.config.reasoning_enabled {
-            return out;
-        }
         for r in index.expand_relation(rel) {
             out.insert(r);
         }

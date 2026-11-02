@@ -91,19 +91,9 @@ pub struct Config {
     #[serde(default)]
     pub allowed_external_dirs: Vec<PathBuf>,
 
-    /// Blend the in-house lexical distance into the default vector search.
-    /// Off by default: the vector track remains the shipped recall path.
-    #[serde(default)]
-    pub lexical_blend_inhouse: bool,
-
     /// Maximum Levenshtein distance for fuzzy lexical clauses, clamped 0..=2.
     #[serde(default = "default_lexical_fuzzy_max_distance")]
     pub lexical_fuzzy_max_distance: usize,
-
-    /// GraphRAG hybrid mode: opt-in normalized distance combination.
-    /// Off by default (spec §6.1, §7, §10, §11).
-    #[serde(default)]
-    pub hybrid_enabled: bool,
 
     /// Hybrid scoring weights (vector, graph, symbol). Must sum to 1.0.
     /// Defaults (0.5, 0.3, 0.2) per spec §6.2.
@@ -182,9 +172,7 @@ impl Config {
                 deduplication: DeduplicationConfig::default(),
                 project_contexts: HashMap::new(),
                 allowed_external_dirs: Vec::new(),
-                lexical_blend_inhouse: false,
                 lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
-                hybrid_enabled: false,
                 hybrid_weights: default_hybrid_weights(),
                 storage_hygiene: crate::storage::snapshot::StorageHygieneConfig::default(),
                 rag_chat: crate::rag_chat::RagChatConfig::default(),
@@ -498,9 +486,7 @@ mod tests {
             deduplication: DeduplicationConfig::default(),
             project_contexts: HashMap::new(),
             allowed_external_dirs: Vec::new(),
-            lexical_blend_inhouse: false,
             lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
-            hybrid_enabled: false,
             hybrid_weights: default_hybrid_weights(),
             storage_hygiene: crate::storage::StorageHygieneConfig::default(),
             rag_chat: crate::rag_chat::RagChatConfig::default(),

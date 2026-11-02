@@ -1397,10 +1397,7 @@ async fn handle_context_plan(
     }
     let token_budget = max_bytes.map(|b| (b / 4).max(64)).unwrap_or_else(|| max_items.saturating_mul(256).max(1024));
     let budget = Budget::from(token_budget);
-    let ladybug_has_graph_read = crate::traits::VectorStore::as_any(store.as_ref())
-        .downcast_ref::<crate::store::LadybugStore>()
-        .is_some();
-    let service = ContextService::new_with(Some(1u8), ladybug_has_graph_read.then_some(2u8));
+    let service = ContextService::new();
     let deny_egress = arguments
         .get("deny_egress")
         .and_then(|v| v.as_bool())
@@ -5703,9 +5700,6 @@ async fn handle_search_memory(
     let fuzzy_max_distance = crate::config::Config::from_default_path()
         .map(|config| config.lexical_fuzzy_max_distance.min(2))
         .unwrap_or(2);
-    let lexical_blend_inhouse = crate::config::Config::from_default_path()
-        .map(|config| config.lexical_blend_inhouse)
-        .unwrap_or(false);
     let facets_filter: Vec<String> = arguments
         .get("facets")
         .map(|v| {
@@ -5961,94 +5955,91 @@ async fn handle_search_memory(
                 if has_upgraded_filters {
                     results.retain(|r| crate::search::passes_filters(&r.payload.memory_type, &r.payload.metadata, &r.payload.location, &search_filters));
                 }
-                // Optional in-house lexical blend (config-gated, off by default).
-                // Merge the lexical candidate set into the vector result set and
-                // re-score with the documented single rule. Vector-only rows
+                // In-house lexical blend: merge the lexical candidate set into the vector
+                // result set and re-score with the documented single rule. Vector-only rows
                 // substitute worst-case lexical distance 1.0; lexical-only rows
                 // substitute worst-case vector distance 1.0.
-                if lexical_blend_inhouse {
-                    let lexical_outcome = store
-                        .search_lexical(
-                            namespace,
-                            &query,
-                            FETCH_LIMIT,
-                            include_tasks,
-                            include_archived,
-                            &slugs,
-                            principal,
-                            fuzzy_max_distance,
-                        )
-                        .await;
-                    if let Ok(lexical_outcome) = lexical_outcome {
-                        let lexical_by_id: std::collections::HashMap<String, f32> =
-                            lexical_outcome.results.iter().map(|r| (r.id.clone(), r.score)).collect();
-                        let vector_ids: std::collections::HashSet<String> =
-                            results.iter().map(|r| r.id.clone()).collect();
-                        for res in &mut results {
-                            let lexical_distance = lexical_by_id.get(&res.id).copied().unwrap_or(1.0);
-                            res.score = 0.7 * res.score + 0.3 * lexical_distance;
-                        }
-                        for lex in lexical_outcome.results {
-                            if vector_ids.contains(&lex.id) {
-                                continue;
-                            }
-                            // Apply the same facet/node-set filters as the
-                            // vector candidates so the merged set stays consistent.
-                            if !facets_filter.is_empty() {
-                                let facets =
-                                    crate::domain::compute_facets(&lex.payload.memory_type, &lex.payload.metadata);
-                                if !facets_filter.iter().all(|f| facets.contains(f)) {
-                                    continue;
-                                }
-                            }
-                            if !node_sets_filter.is_empty() {
-                                let sets: Vec<String> = lex
-                                    .payload
-                                    .metadata
-                                    .get("node_set")
-                                    .map(|v| {
-                                        if let Some(s) = v.as_str() {
-                                            vec![s.to_string()]
-                                        } else if let Some(arr) = v.as_array() {
-                                            arr.iter()
-                                                .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                                                .collect()
-                                        } else {
-                                            vec![]
-                                        }
-                                    })
-                                    .unwrap_or_default();
-                                let keep = if node_set_mode == "all" {
-                                    node_sets_filter.iter().all(|f| sets.contains(f))
-                                } else {
-                                    node_sets_filter.iter().any(|f| sets.contains(f))
-                                };
-                                if !keep {
-                                    continue;
-                                }
-                            }
-                            if has_upgraded_filters && !crate::search::passes_filters(&lex.payload.memory_type, &lex.payload.metadata, &lex.payload.location, &search_filters) {
-                                continue;
-                            }
-                            let blended = 0.7 + 0.3 * lex.score;
-                            let mut lex = lex;
-                            lex.score = blended;
-                            if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
-                                lex.evidence = Some(vec![crate::traits::SearchEvidence {
-                                    kind: crate::traits::EvidenceKind::DirectMatch,
-                                    path: Vec::new(),
-                                    explanation: "This memory matched the lexical query.".to_string(),
-                                    derivation: vec!["lexical-inhouse".to_string()],
-                                }]);
-                            }
-                            results.push(lex);
-                        }
-                        results.sort_by(|a, b| {
-                            a.score
-                                .total_cmp(&b.score)
-                                .then_with(|| a.id.cmp(&b.id))
-                        });
+                let lexical_outcome = store
+                    .search_lexical(
+                        namespace,
+                        &query,
+                        FETCH_LIMIT,
+                        include_tasks,
+                        include_archived,
+                        &slugs,
+                        principal,
+                        fuzzy_max_distance,
+                    )
+                    .await;
+                if let Ok(lexical_outcome) = lexical_outcome {
+                    let lexical_by_id: std::collections::HashMap<String, f32> =
+                        lexical_outcome.results.iter().map(|r| (r.id.clone(), r.score)).collect();
+                    let vector_ids: std::collections::HashSet<String> =
+                        results.iter().map(|r| r.id.clone()).collect();
+                    for res in &mut results {
+                        let lexical_distance = lexical_by_id.get(&res.id).copied().unwrap_or(1.0);
+                        res.score = 0.7 * res.score + 0.3 * lexical_distance;
                     }
+                    for lex in lexical_outcome.results {
+                        if vector_ids.contains(&lex.id) {
+                            continue;
+                        }
+                        // Apply the same facet/node-set filters as the
+                        // vector candidates so the merged set stays consistent.
+                        if !facets_filter.is_empty() {
+                            let facets =
+                                crate::domain::compute_facets(&lex.payload.memory_type, &lex.payload.metadata);
+                            if !facets_filter.iter().all(|f| facets.contains(f)) {
+                                continue;
+                            }
+                        }
+                        if !node_sets_filter.is_empty() {
+                            let sets: Vec<String> = lex
+                                .payload
+                                .metadata
+                                .get("node_set")
+                                .map(|v| {
+                                    if let Some(s) = v.as_str() {
+                                        vec![s.to_string()]
+                                    } else if let Some(arr) = v.as_array() {
+                                        arr.iter()
+                                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    } else {
+                                        vec![]
+                                    }
+                                })
+                                .unwrap_or_default();
+                            let keep = if node_set_mode == "all" {
+                                node_sets_filter.iter().all(|f| sets.contains(f))
+                            } else {
+                                node_sets_filter.iter().any(|f| sets.contains(f))
+                            };
+                            if !keep {
+                                continue;
+                            }
+                        }
+                        if has_upgraded_filters && !crate::search::passes_filters(&lex.payload.memory_type, &lex.payload.metadata, &lex.payload.location, &search_filters) {
+                            continue;
+                        }
+                        let blended = 0.7 + 0.3 * lex.score;
+                        let mut lex = lex;
+                        lex.score = blended;
+                        if lex.evidence.as_ref().map_or(true, |e| e.is_empty()) {
+                            lex.evidence = Some(vec![crate::traits::SearchEvidence {
+                                kind: crate::traits::EvidenceKind::DirectMatch,
+                                path: Vec::new(),
+                                explanation: "This memory matched the lexical query.".to_string(),
+                                derivation: vec!["lexical-inhouse".to_string()],
+                            }]);
+                        }
+                        results.push(lex);
+                    }
+                    results.sort_by(|a, b| {
+                        a.score
+                            .total_cmp(&b.score)
+                            .then_with(|| a.id.cmp(&b.id))
+                    });
                 }
                 // Pre-limit contract: filtering happened against the wider FETCH_LIMIT
                 // candidate set above; truncate to the default page size now.
@@ -12151,7 +12142,7 @@ mod context_plan_tests {
         let plan: ContextPlan = serde_json::from_str(&result_json).expect("json parses");
         assert_eq!(plan.schema_version, CONTEXT_PLAN_SCHEMA_VERSION);
         assert!(plan.event_id.contains("context-plan") || plan.event_id == "context-plan");
-        assert!(plan.degradation == Degradation::Supported || plan.degradation == Degradation::Unsupported);
+        assert_eq!(plan.degradation, Degradation::Supported);
         let val: serde_json::Value = serde_json::from_str(&result_json).unwrap();
         assert!(!val["items"].as_array().unwrap().is_empty());
         // Text format

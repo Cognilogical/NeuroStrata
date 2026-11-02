@@ -16,23 +16,19 @@ use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 /// Configuration for SPARQL query execution.
 #[derive(Debug, Clone)]
 pub struct SparqlConfig {
-    pub enabled: bool,
     pub timeout_ms: u64,
     pub max_solutions: usize,
     pub max_dataset_quads: usize,
     pub max_algebra_nodes: usize,
-    pub service_enabled: bool,
 }
 
 impl Default for SparqlConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             timeout_ms: 250,
             max_solutions: 1000,
             max_dataset_quads: 250000,
             max_algebra_nodes: 1000,
-            service_enabled: false,
         }
     }
 }
@@ -283,9 +279,6 @@ pub async fn execute_sparql_query(
     store: &crate::store::ladybug::LadybugStore,
 ) -> Result<(String, usize, bool, bool), String> {
     let config = get_sparql_config();
-    if !config.enabled {
-        return Err("SPARQL engine is disabled".to_string());
-    }
 
     // Parse the SPARQL query using spargebra with pre-registered prefixes
     let query = parser_with_prefixes()
@@ -304,9 +297,6 @@ pub async fn execute_sparql_query(
 
     let service_endpoints = crate::rdf::federation::inspect_service_clauses(&query)
         .map_err(|e| format!("SPARQL federation error: {}", e))?;
-    if !service_endpoints.is_empty() && !config.service_enabled {
-        return Err("SPARQL SERVICE federation is disabled by default".to_string());
-    }
 
     // Reject UPDATE queries: spargebra separates UPDATE via parse_update; parse_query
     // handles SELECT/ASK/CONSTRUCT/DESCRIBE only, so an UPDATE input errors here.
@@ -324,15 +314,15 @@ pub async fn execute_sparql_query(
     }
 
     // Prepare and evaluate with QueryEvaluator (custom functions registered);
-    // federated SERVICE endpoints get the HTTP default handler when enabled.
+    // federated SERVICE endpoints get the HTTP default handler with the
+    // federation security model (allowlist + loopback/HTTPS validation).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let evaluator = if !service_endpoints.is_empty() && config.service_enabled {
+    let evaluator = if !service_endpoints.is_empty() {
         let handler = crate::rdf::federation::HttpServiceHandler {
             config: crate::rdf::federation::FederationConfig {
-                service_enabled: true,
                 timeout_ms: config.timeout_ms,
                 max_solutions: config.max_solutions,
                 max_dataset_quads: config.max_dataset_quads,
@@ -433,7 +423,6 @@ mod tests {
         assert_eq!(cfg.max_solutions, 1000);
         assert_eq!(cfg.max_dataset_quads, 250000);
         assert_eq!(cfg.max_algebra_nodes, 1000);
-        assert!(!cfg.service_enabled);
     }
 
     #[test]
