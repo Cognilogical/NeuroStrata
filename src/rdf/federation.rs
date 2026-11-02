@@ -363,6 +363,14 @@ pub async fn handle_remote_sparql_request(
                     "malformed or empty Bearer Authorization header".into(),
                 ));
             }
+            if let Ok(expected) = std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN") {
+                let expected = expected.trim();
+                if !expected.is_empty() && token != expected {
+                    return Err(FederationError::Denied(
+                        "invalid Bearer token".into(),
+                    ));
+                }
+            }
         }
         None if requires_bearer => {
             return Err(FederationError::Denied(

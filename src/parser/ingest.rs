@@ -486,7 +486,9 @@ fn run_producer(
         // captured on file and markdown nodes too, not only on parseable code
         // files. The same bytes are parsed only when the extension maps to a
         // grammar; directories carry no hash.
-        let (file_sha256, content, lang_name) = if is_file {
+        let (file_sha256, content, lang_name, raw_bytes) = if is_file {
+            // A single read per file: the bytes below are hashed, parsed (when
+            // a grammar applies) and reused for the markdown section pass.
             let bytes = std::fs::read(path).ok();
             let hash = bytes.as_deref().map(sha256_hex);
             let lang_name = path
@@ -498,9 +500,9 @@ fn run_producer(
                 (Some(b), Some(_)) => Some(String::from_utf8_lossy(b).to_string()),
                 _ => None,
             };
-            (hash, content, lang_name)
+            (hash, content, lang_name, bytes)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // Incremental skip: if this file's hash matches the previous active
@@ -543,11 +545,11 @@ fn run_producer(
 
         // For markdown files, parse into sections and stream them for embedding.
         if is_file && path_str.ends_with(".md") {
-            if let Some(bytes) = std::fs::read(path).ok() {
-                let content = String::from_utf8_lossy(&bytes).to_string();
+            if let Some(bytes) = raw_bytes.as_ref() {
+                let content = String::from_utf8_lossy(bytes).to_string();
                 let sections = parse_markdown_sections(&content);
                 if !sections.is_empty() {
-                    let file_sha = sha256_hex(&bytes);
+                    let file_sha = sha256_hex(bytes);
                     if let Err(e) = tx.blocking_send(IngestItem::DocSections {
                         node_path: node_path.clone(),
                         sections,
@@ -580,7 +582,7 @@ fn run_producer(
                 let query = match Query::new(&ts_lang, query_str) {
                     Ok(q) => q,
                     Err(e) => {
-                        eprintln!("Invalid query for {}: {}", lang_name, e);
+                        tracing::warn!("Invalid tree-sitter query for {lang_name}: {e}");
                         continue;
                     }
                 };
@@ -927,8 +929,15 @@ pub async fn ingest_directory(
     let worktree_id = source_key_for(dir_path);
     let source_key = worktree_id.clone();
     let ingest_start = std::time::Instant::now();
-    if let Err(e) = crate::registry::enrichment_start(&vector_store, Some(&embedder), namespace, &source_key).await {
-        tracing::warn!("enrichment registry update failed: {e}");
+    match crate::registry::enrichment_start(&vector_store, Some(&embedder), namespace, &source_key).await {
+        Ok(status) => {
+            if status.get("acquired").and_then(|v| v.as_bool()) == Some(false) {
+                tracing::warn!("enrichment lock already held for namespace '{namespace}'");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("enrichment registry update failed: {e}");
+        }
     }
     let source_identity = crate::context::model::SourceIdentity {
         worktree_id,
@@ -946,20 +955,25 @@ pub async fn ingest_directory(
     let mut prev_file_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut prev_stamps: Vec<String> = Vec::new();
     if prev_gen > 0 {
-        if let Ok(rows) = vector_store.list(namespace, None, None).await {
-            for r in rows {
-                let id = r.id.clone();
-                let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
-                    Some(x) => x,
-                    None => continue,
-                };
-                if gen != prev_gen { continue; }
-                let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
-                if let Some(h) = hash {
-                    prev_file_map.insert(tail.to_string(), h.clone());
+        match vector_store.list(namespace, None, None).await {
+            Ok(rows) => {
+                for r in rows {
+                    let id = r.id.clone();
+                    let (_ns, gen, tail) = match crate::parser::ingest::split_scoped_id(&id) {
+                        Some(x) => x,
+                        None => continue,
+                    };
+                    if gen != prev_gen { continue; }
+                    let hash = r.payload.metadata.get("file_sha256").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    if let Some(h) = hash {
+                        prev_file_map.insert(tail.to_string(), h.clone());
+                    }
+                    let stamp = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    prev_stamps.push(stamp);
                 }
-                let stamp = r.payload.metadata.get("ingest_version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                prev_stamps.push(stamp);
+            }
+            Err(e) => {
+                tracing::warn!("vector_store.list failed while building prev_file_map for '{namespace}': {e}");
             }
         }
     }
@@ -1107,31 +1121,37 @@ pub async fn ingest_directory(
                 false
             };
             if !carry { continue; }
-            if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &id).await {
-                let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
-                let new_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, generation, crate::parser::generation::NAMESPACE_SEPARATOR);
-                payload.metadata.as_object_mut().map(|o| {
-                    o.insert("index_generation".to_string(), serde_json::json!(generation));
-                    o.insert("ingest_version".to_string(), serde_json::json!(current_version));
-                    // Fix contained_by generation prefixes (F2).
-                    if let Some(serde_json::Value::Array(arr)) = o.get("contained_by").cloned() {
-                        let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
-                        o.insert("contained_by".to_string(), serde_json::Value::Array(updated));
+            match vector_store.get(namespace, &id).await {
+                Ok(Some((vec, mut payload))) => {
+                    let old_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, prev_gen, crate::parser::generation::NAMESPACE_SEPARATOR);
+                    let new_gen_str = format!("{}{}{}{}", namespace, crate::parser::generation::NAMESPACE_SEPARATOR, generation, crate::parser::generation::NAMESPACE_SEPARATOR);
+                    payload.metadata.as_object_mut().map(|o| {
+                        o.insert("index_generation".to_string(), serde_json::json!(generation));
+                        o.insert("ingest_version".to_string(), serde_json::json!(current_version));
+                        // Fix contained_by generation prefixes (F2).
+                        if let Some(serde_json::Value::Array(arr)) = o.get("contained_by").cloned() {
+                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                            o.insert("contained_by".to_string(), serde_json::Value::Array(updated));
+                        }
+                        // Fix depends_on generation prefixes (F2).
+                        if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
+                            let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
+                            o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
+                        }
+                    });
+                    let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
+                    if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {
+                        tracing::warn!(
+                            "carry-forward: failed to re-stage node {} into generation {}: {}",
+                            new_id, generation, e
+                        );
+                    } else {
+                        carried += 1;
                     }
-                    // Fix depends_on generation prefixes (F2).
-                    if let Some(serde_json::Value::Array(arr)) = o.get("depends_on").cloned() {
-                        let updated: Vec<serde_json::Value> = arr.iter().filter_map(|v| v.as_str()).map(|s| serde_json::Value::String(s.replace(&old_gen_str, &new_gen_str))).collect();
-                        o.insert("depends_on".to_string(), serde_json::Value::Array(updated));
-                    }
-                });
-                let new_id = crate::parser::ingest::generation_scoped_id(namespace, generation, &tail);
-                if let Err(e) = vector_store.upsert(namespace, &new_id, vec, payload).await {
-                    tracing::warn!(
-                        "carry-forward: failed to re-stage node {} into generation {}: {}",
-                        new_id, generation, e
-                    );
-                } else {
-                    carried += 1;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("carry-forward: vector_store.get failed for node {id}: {e}");
                 }
             }
         }
@@ -1141,19 +1161,25 @@ pub async fn ingest_directory(
     // Stamp DEPENDS_ON targets onto file nodes (best-effort, warn-first).
     for (src_path, targets) in &dependency_map {
         let src_id = crate::parser::ingest::generation_scoped_id(namespace, generation, src_path);
-        if let Ok(Some((vec, mut payload))) = vector_store.get(namespace, &src_id).await {
-            let target_ids: Vec<String> = targets
-                .iter()
-                .map(|t| crate::parser::ingest::generation_scoped_id(namespace, generation, t))
-                .collect();
-            if let Some(obj) = payload.metadata.as_object_mut() {
-                obj.insert("depends_on".to_string(), serde_json::json!(target_ids));
+        match vector_store.get(namespace, &src_id).await {
+            Ok(Some((vec, mut payload))) => {
+                let target_ids: Vec<String> = targets
+                    .iter()
+                    .map(|t| crate::parser::ingest::generation_scoped_id(namespace, generation, t))
+                    .collect();
+                if let Some(obj) = payload.metadata.as_object_mut() {
+                    obj.insert("depends_on".to_string(), serde_json::json!(target_ids));
+                }
+                if let Err(e) = vector_store.upsert(namespace, &src_id, vec, payload).await {
+                    tracing::warn!(
+                        "depends_on stamping: failed to upsert file node {} for namespace {}: {}",
+                        src_id, namespace, e
+                    );
+                }
             }
-            if let Err(e) = vector_store.upsert(namespace, &src_id, vec, payload).await {
-                tracing::warn!(
-                    "depends_on stamping: failed to upsert file node {} for namespace {}: {}",
-                    src_id, namespace, e
-                );
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("vector_store.get failed for depends_on source '{src_id}': {e}");
             }
         }
     }
@@ -1217,7 +1243,7 @@ pub async fn ingest_directory(
     .await;
 
     // Watermark + stage telemetry on the namespace registry row (F12).
-    let current_version = ingest_version(&schema.fingerprint());
+    // `current_version` was computed at the version gate above (AH-40: no re-shadow).
     // Compute deterministic source_digest over sorted (path, hash) pairs.
     let mut digest_entries: Vec<(String, String)> = current_hashes
         .iter()
@@ -2344,6 +2370,13 @@ pub async fn dry_run_directory(
     let mut stem_dir_map: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
     for path_str in &all_file_paths {
         let p = std::path::Path::new(path_str);
+        // Pattern candidates must test the full file name, not the stem alone:
+        // `.bak`/`.old` suffixes strip off in file_stem() and would never match (AH-17).
+        if p.file_name().and_then(|s| s.to_str()).map_or(false, |name| v_pattern.is_match(name))
+            && !version_candidates.contains(path_str)
+        {
+            version_candidates.push(path_str.clone());
+        }
         if let Some(stem) = p.file_stem() {
             let stem_str = stem.to_string_lossy().to_string();
             let normalized = v_pattern.replace_all(&stem_str, "");

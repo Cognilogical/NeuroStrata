@@ -33,7 +33,7 @@ pub fn build_mesh_canonical_nquads(
     let dt_dt = "http://www.w3.org/2001/XMLSchema#dateTime";
     let int_dt = "http://www.w3.org/2001/XMLSchema#integer";
     let ns = |name: &str| format!("{NS_PREFIX}{name}");
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t");
 
     let mut lines: Vec<String> = Vec::new();
     let mut push = |line: String| { lines.push(line); };

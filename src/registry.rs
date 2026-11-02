@@ -529,7 +529,11 @@ pub async fn write_registry(
 pub async fn registry_domain_count(store: &Arc<dyn VectorStore>, namespace: &str) -> usize {
     match store.get(namespace, &registry_row_id(namespace)).await {
         Ok(Some((_, payload))) => registry_domains(&payload.metadata).len(),
-        Ok(None) | Err(_) => 0,
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!("registry_domain_count failed for '{namespace}': {e}");
+            0
+        }
     }
 }
 

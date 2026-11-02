@@ -117,8 +117,7 @@ fn is_registry_row(metadata: &Value) -> bool {
 }
 
 fn is_mesh_conflicting(metadata: &Value) -> bool {
-    metadata.get("mesh_conflict").and_then(|v| v.as_bool()).unwrap_or(false)
-        || metadata.get("mesh").and_then(|m| m.get("conflicting").or_else(|| m.get("conflict"))).and_then(|v| v.as_bool()).unwrap_or(false)
+    crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
 }
 
 fn is_archived(metadata: &Value) -> bool {
@@ -230,7 +229,7 @@ fn build_memory_node(
         "agentName": payload.agent_name.as_deref().unwrap_or(""),
         "location": payload.location,
         "locationLines": location_lines,
-        "validFrom": payload.metadata.get("valid_from").and_then(|v| v.as_i64()).or(Some(0)).unwrap_or(0),
+        "validFrom": payload.metadata.get("valid_from").and_then(|v| v.as_i64()).unwrap_or(0),
         "validTo": payload.metadata.get("valid_to").and_then(|v| v.as_i64()).unwrap_or(0),
         "feedbackScore": payload.metadata.get("feedback_score").and_then(|v| v.as_f64()).unwrap_or(0.0),
         "metadata": metadata_clean,
@@ -280,8 +279,16 @@ pub fn execute_on_records(
 
     // Introspection shim (§7): a `__schema`/`_sdl` query is served with the
     // SDL the binary ships, so tooling can discover the actual graph without
-    // a live schema server.
-    if query.contains("__schema") || query.contains("_sdl") {
+    // a live schema server. Quoted string literals are stripped first so a
+    // search query containing "__schema" as a literal is not hijacked into
+    // the shim.
+    let stripped: String = query
+        .split('"')
+        .enumerate()
+        .filter_map(|(i, part)| if i % 2 == 0 { Some(part) } else { None })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if stripped.contains("__schema") || stripped.contains("_sdl") {
         return GraphQLResponse {
             data: Some(json!({ "__schema": { "sdl": SCHEMA_SDL } })),
             errors,

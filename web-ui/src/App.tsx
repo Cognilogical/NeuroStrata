@@ -53,7 +53,7 @@ function App() {
       });
 
       setGraphData(data);
-      invoke('log_message', { msg: `Loaded graph: ${data.nodes.length} nodes, ${data.links.length} links` });
+      invoke('log_message', { msg: `Loaded graph: ${data.nodes.length} nodes, ${data.links.length} links` }).catch(() => {});
 
       const uniqueNamespaces = Array.from(new Set(data.nodes.map(n => n.namespace).filter(Boolean))) as string[];
       setNamespaceFilters(prev => {
@@ -73,46 +73,54 @@ function App() {
         return next;
       });
     } catch (e) {
-      invoke('log_message', { msg: `Failed to load graph from Ladybug: ${e}` });
+      invoke('log_message', { msg: `Failed to load graph from Ladybug: ${e}` }).catch(() => {});
       console.error("Failed to load graph from Ladybug", e);
     }
   };
 
-  useEffect(() => {
-    invoke('log_message', { msg: "Registering open-project-dialog listener" });
-    const unlistenMenu = listen('open-project-dialog', async (e) => {
-      invoke('log_message', { msg: `RECEIVED open-project-dialog: ${JSON.stringify(e)}` });
-      try {
-        const selected = await open({
-          directory: true,
-          multiple: false,
-        });
-        invoke('log_message', { msg: `Selected directory: ${selected}` });
-        if (selected && typeof selected === 'string') {
-          setProjectPath(selected);
-          await invoke('save_project_path', { path: selected });
-          
-          // Trigger AST ingest automatically on load
-          setIsIngesting(true);
-          try {
-            await invoke('ingest_ast', { projectPath: selected });
-            invoke('log_message', { msg: "AST ingestion completed successfully." });
-          } catch (e) {
-            invoke('log_message', { msg: `AST Ingestion failed: ${e}` });
-          } finally {
-            setIsIngesting(false);
-          }
-          await loadGraph(selected);
+  // Single source of truth for opening the project dialog, used by both the
+  // native Tauri menu (listen('open-project-dialog')) and the UIPanel button,
+  // so the two entry points cannot drift apart.
+  const handleOpenProjectDialog = async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+      });
+      invoke('log_message', { msg: `Selected directory: ${selected}` }).catch(() => {});
+      if (selected && typeof selected === 'string') {
+        setProjectPath(selected);
+        await invoke('save_project_path', { path: selected });
+
+        // Trigger AST ingest automatically on load
+        setIsIngesting(true);
+        try {
+          await invoke('ingest_ast', { projectPath: selected });
+          invoke('log_message', { msg: "AST ingestion completed successfully." }).catch(() => {});
+        } catch (e) {
+          invoke('log_message', { msg: `AST Ingestion failed: ${e}` }).catch(() => {});
+        } finally {
+          setIsIngesting(false);
         }
-      } catch (e) {
-        invoke('log_message', { msg: `Failed to open project dialog: ${e}` });
+        await loadGraph(selected);
       }
+    } catch (e) {
+      invoke('log_message', { msg: `Failed to open project dialog: ${e}` }).catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    invoke('log_message', { msg: "Registering open-project-dialog listener" }).catch(() => {});
+    const unlistenMenu = listen('open-project-dialog', async (e) => {
+      invoke('log_message', { msg: `RECEIVED open-project-dialog: ${JSON.stringify(e)}` }).catch(() => {});
+      await handleOpenProjectDialog();
     });
 
     return () => {
-      invoke('log_message', { msg: "Unregistering open-project-dialog listener" });
+      invoke('log_message', { msg: "Unregistering open-project-dialog listener" }).catch(() => {});
       unlistenMenu.then(f => f());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Initial load
@@ -339,6 +347,7 @@ function App() {
         setTypeFilters={setTypeFilters}
         namespaceFilters={namespaceFilters}
         setNamespaceFilters={setNamespaceFilters}
+        onOpenProject={handleOpenProjectDialog}
       />
     </div>
   );

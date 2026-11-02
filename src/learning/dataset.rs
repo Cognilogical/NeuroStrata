@@ -49,10 +49,16 @@ impl DistancePolicy {
                 Ok(content) => {
                     match serde_json::from_str::<Self>(&content) {
                         Ok(policy) => return policy,
-                        Err(_) => return Self::missing(),
+                        Err(e) => {
+                            tracing::warn!("failed to parse distance_policy.json at {}: {e}", path.display());
+                            return Self::missing();
+                        }
                     }
                 }
-                Err(_) => return Self::missing(),
+                Err(e) => {
+                    tracing::warn!("failed to read distance_policy.json at {}: {e}", path.display());
+                    return Self::missing();
+                }
             }
         }
         Self::missing()
@@ -230,6 +236,11 @@ pub async fn build_dedup_dataset(
     // dataset stats/manifest instead of discarding the derivation.
     let derived = derive_labels(&observation_ids, &rules)?;
     let derived_label_count = derived.len();
+    tracing::debug!(
+        derived_label_count,
+        total_observations = observation_ids.len(),
+        "derived weak/gold labels for dataset"
+    );
 
     // 5. Component-disjoint split
     let memory_ids: Vec<std::collections::HashSet<String>> = observations.iter().map(|o| {

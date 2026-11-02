@@ -480,10 +480,19 @@ let status: AdapterStatus = initialStatus();
 let activeSessionId: string | null = null;
 let activeTaskId: string | null = null;
 
+/**
+ * Mutations since the heavyweight channels were last touched (a note on the
+ * active task, a claim, or a completion). The guard consumes this through
+ * `neurostrata_guard_validate`'s `mutations_since_note` argument to pin the
+ * Breath prompt.
+ */
+let mutationsSinceNote = 0;
+
 /** Reset the tracked session/task state (test hook). */
 export function resetState(): void {
   activeSessionId = null;
   activeTaskId = null;
+  mutationsSinceNote = 0;
 }
 
 /**
@@ -512,6 +521,16 @@ function trackFromTurn(turn: ConversationTurn): void {
 
   const { taskId, sessionId } = extractTrackingFromText(turn.content);
   if (sessionId) activeSessionId = sessionId;
+  // Heavyweight turn: a note, claim, or completion satisfies the Breath
+  // prompt, so the mutation counter starts over. Best-effort: the turn text
+  // is the only source openclaw exposes, so a bare "note" mention counts.
+  if (
+    lower.includes("neurostrata_task_claim") ||
+    lower.includes("neurostrata_task_complete") ||
+    (lower.includes("neurostrata_task_update") && lower.includes("note"))
+  ) {
+    mutationsSinceNote = 0;
+  }
   if (lower.includes("neurostrata_task_complete")) {
     activeTaskId = null;
   } else if (taskId) {
@@ -855,6 +874,8 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
   }
 
   if (!config.strictMode) {
+    // Executed without validation: it is still a mutation.
+    mutationsSinceNote++;
     return { allowed: true };
   }
 
@@ -878,6 +899,7 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
       cwd,
       is_mutating: true,
       use_sandbox: false,
+      mutations_since_note: mutationsSinceNote,
     });
 
     const result = parseGuardValidate(text);
@@ -913,6 +935,8 @@ async function wrapFileOp(op: FileOperation): Promise<FileOpResult> {
     };
   }
 
+  // Allowed: the operation executes, so it counts as a mutation.
+  mutationsSinceNote++;
   return { allowed: true };
 }
 

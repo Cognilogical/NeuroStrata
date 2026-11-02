@@ -117,6 +117,20 @@ fn daemon_client(timeout: std::time::Duration) -> Result<reqwest::blocking::Clie
         .map_err(|e| e.to_string())
 }
 
+/// Base URL of the NeuroStrata daemon's HTTP surface.
+///
+/// The port is overridable via `NEUROSTRATA_DAEMON_PORT` so tests and
+/// side-cars can point the app at a daemon that is not the default; an
+/// empty or unset variable falls back to the fixed default port.
+fn daemon_base_url() -> String {
+    let port = std::env::var("NEUROSTRATA_DAEMON_PORT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "34343".to_string());
+    format!("http://127.0.0.1:{port}")
+}
+
 /// Ingestion walks and embeds a whole repository, which is minutes of work on a
 /// large one.
 const INGEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
@@ -133,7 +147,7 @@ fn ensure_daemon() -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    if client.get("http://127.0.0.1:34343/health").send().is_err() {
+    if client.get(&format!("{}/health", daemon_base_url())).send().is_err() {
         // Not running, spawn it
         println!("MCP Daemon not running. Starting it...");
 
@@ -240,7 +254,7 @@ fn ingest_ast(project_path: String) -> Result<String, String> {
     let namespace = namespace_for(&project_path);
 
     let client = daemon_client(INGEST_TIMEOUT)?;
-    let resp = client.post("http://127.0.0.1:34343/ingest")
+    let resp = client.post(format!("{}/ingest", daemon_base_url()))
         .json(&serde_json::json!({
             "dir": project_path,
             "namespace": namespace
@@ -268,7 +282,7 @@ fn delete_memory(namespace: String, id: String) -> Result<String, String> {
     let operator = daemon_token_file("operator.token").ok_or_else(|| {
         "operator.token is missing; cannot authorize delete_memory".to_string()
     })?;
-    let request = client.post("http://127.0.0.1:34343/delete")
+    let request = client.post(format!("{}/delete", daemon_base_url()))
         .json(&serde_json::json!({
             "namespace": namespace,
             "id": id
@@ -296,7 +310,7 @@ fn edit_memory(
     ensure_daemon()?;
 
     let client = daemon_client(QUERY_TIMEOUT)?;
-    let resp = client.post("http://127.0.0.1:34343/edit")
+    let resp = client.post(format!("{}/edit", daemon_base_url()))
         .json(&serde_json::json!({
             "old_namespace": old_namespace,
             "id": id,
@@ -324,7 +338,7 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
     }
     
     let client = daemon_client(QUERY_TIMEOUT)?;
-    let resp = client.get("http://127.0.0.1:34343/graph")
+    let resp = client.get(format!("{}/graph", daemon_base_url()))
         .query(&[("namespace", namespace_filter)])
         .send()
         .map_err(|e| e.to_string())?;
@@ -363,7 +377,6 @@ fn main() {
 
             app.set_menu(menu)?;
 
-            let _handle = app.handle().clone();
             app.on_menu_event(move |app, event| {
                 println!("Menu event triggered: {:?}", event.id());
                 if event.id() == "open_project" {

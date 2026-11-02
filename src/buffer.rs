@@ -273,23 +273,28 @@ fn open_session_file(current: &Path) -> std::io::Result<std::fs::File> {
 fn prune_rolled(sessions: &Path, retention_days: u64) -> std::io::Result<()> {
     let cutoff = std::time::Duration::from_secs(retention_days * 24 * 60 * 60);
     let now = std::time::SystemTime::now();
-    if let Ok(entries) = std::fs::read_dir(sessions) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("session-") || !name.ends_with(".md") {
-                continue;
-            }
-            let old = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| now.duration_since(t).ok())
-                .map(|age| age > cutoff)
-                .unwrap_or(false);
-            if old {
-                std::fs::remove_file(entry.path())?;
-            }
+    let dir_entries = match std::fs::read_dir(sessions) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("prune_rolled read_dir failed for {}: {e}", sessions.display());
+            return Ok(());
+        }
+    };
+    for entry in dir_entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("session-") || !name.ends_with(".md") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|age| age > cutoff)
+            .unwrap_or(false);
+        if old {
+            std::fs::remove_file(entry.path())?;
         }
     }
     Ok(())
@@ -369,6 +374,19 @@ pub async fn handle_append_log(
     };
 
     // Append succeeded - now run the recall if we have slugs
+    // Task-intent detection must run before any early-return from the
+    // recall block so `task_intent_signals` survive embedder/store
+    // failures (AH-31).
+    let signals: Vec<Value> = crate::task::intent::detect_task_intents(&content)
+        .into_iter()
+        .map(|s| {
+            json!({
+                "marker": s.marker,
+                "excerpt": s.excerpt,
+                "action": "Call neurostrata_task_create(namespace, title) so this work does not evaporate."
+            })
+        })
+        .collect();
     let (recalled, recalled_from) = if slugs.is_empty() {
         (vec![], None)
     } else {
@@ -403,14 +421,14 @@ pub async fn handle_append_log(
             Ok(v) => v,
             Err(_) => {
                 tracing::warn!("Failed to generate embedding for recall");
-                return success_response(&outcome, &tags, vec![], None, vec![]);
+                return success_response(&outcome, &tags, vec![], None, signals);
             }
         };
 
         // Initialize namespace before searching
         if let Err(e) = store.init(&namespace).await {
             tracing::warn!("Failed to initialize namespace for recall: {}", e);
-            return success_response(&outcome, &tags, vec![], None, vec![]);
+            return success_response(&outcome, &tags, vec![], None, signals);
         }
 
         // Run the recall search
@@ -430,7 +448,7 @@ pub async fn handle_append_log(
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!("Recall search failed: {}", e);
-                return success_response(&outcome, &tags, vec![], None, vec![]);
+                return success_response(&outcome, &tags, vec![], None, signals);
             }
         };
 
@@ -507,16 +525,6 @@ pub async fn handle_append_log(
     crate::registry::cache_project_root(&store, None, &cache_ns, &project_root.to_string_lossy()).await;
 
     // Build the success response
-    let signals: Vec<Value> = crate::task::intent::detect_task_intents(&content)
-        .into_iter()
-        .map(|s| {
-            json!({
-                "marker": s.marker,
-                "excerpt": s.excerpt,
-                "action": "Call neurostrata_task_create(namespace, title) so this work does not evaporate."
-            })
-        })
-        .collect();
     success_response(&outcome, &tags, recalled, recalled_from, signals)
 }
 

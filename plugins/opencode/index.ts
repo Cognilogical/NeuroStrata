@@ -425,10 +425,19 @@ let status: AdapterStatus = initialStatus();
 let activeSessionId: string | null = null;
 let activeTaskId: string | null = null;
 
+/**
+ * Mutations since the heavyweight channels were last touched (a note on the
+ * active task, a full claim, or completion). The guard consumes this through
+ * `neurostrata_guard_validate`'s `mutations_since_note` argument to pin the
+ * Breath prompt.
+ */
+let mutationsSinceNote = 0;
+
 /** Reset the tracked session/task state (test hook). */
 export function resetState(): void {
   activeSessionId = null;
   activeTaskId = null;
+  mutationsSinceNote = 0;
 }
 
 /** The adapter's current state. A degraded core is visible here. */
@@ -756,6 +765,15 @@ export async function initialize(ctx: any): Promise<void> {
         asString(input?.sessionID);
       if (sessionId) activeSessionId = sessionId;
       const taskId = asString(payloadArgs.id);
+      // Heavyweight turn: a note, claim, or completion satisfies the Breath
+      // prompt, so the mutation counter starts over.
+      if (
+        toolName === "neurostrata_task_claim" ||
+        toolName === "neurostrata_task_complete" ||
+        payloadArgs.note !== undefined
+      ) {
+        mutationsSinceNote = 0;
+      }
       if (toolName === "neurostrata_task_complete") {
         activeTaskId = null;
       } else if (taskId) {
@@ -775,7 +793,11 @@ export async function initialize(ctx: any): Promise<void> {
         undefined,
     };
     // Run guard validation (fail closed).
-    if (!config.strictMode) return;
+    if (!config.strictMode) {
+      // Executed without validation: it is still a mutation.
+      mutationsSinceNote++;
+      return;
+    }
     const actionType = toolName;
     const payload = JSON.stringify(call.args);
     const cwd = process.cwd();
@@ -791,6 +813,7 @@ export async function initialize(ctx: any): Promise<void> {
         cwd,
         is_mutating: true,
         use_sandbox: false,
+        mutations_since_note: mutationsSinceNote,
       });
       const result = parseGuardValidate(text);
       if (result.verdict === "reject") {
@@ -825,6 +848,8 @@ export async function initialize(ctx: any): Promise<void> {
         `Guard validation unavailable (NeuroStrata core degraded): ${message}`,
       );
     }
+    // Guard passed and the tool is about to execute: count the mutation.
+    mutationsSinceNote++;
   });
 
   // Intent detection turn hook is best-effort in V2 (no direct conversation hook);
@@ -885,7 +910,10 @@ async function wrapWriteEdit(
   next: (call: any) => Promise<any>,
 ): Promise<any> {
   if (!config.strictMode) {
-    return next(call);
+    const result_ = await next(call);
+    // Executed without validation: it is still a mutation.
+    mutationsSinceNote++;
+    return result_;
   }
 
   const actionType = call.name; // "write" or "edit"
@@ -904,6 +932,7 @@ async function wrapWriteEdit(
       cwd,
       is_mutating: true,
       use_sandbox: false, // semantic-only for speed; sandbox opt-in
+      mutations_since_note: mutationsSinceNote,
     });
 
     const result = parseGuardValidate(text);
@@ -938,7 +967,10 @@ async function wrapWriteEdit(
     };
   }
 
-  return next(call);
+  const result_ = await next(call);
+  // Executed: count the mutation after the call goes through.
+  mutationsSinceNote++;
+  return result_;
 }
 
 /**
@@ -970,7 +1002,10 @@ async function wrapMutatingTool(
   next: (call: any) => Promise<any>,
 ): Promise<any> {
   if (!config.strictMode) {
-    return next(call);
+    const result_ = await next(call);
+    // Executed without validation: it is still a mutation.
+    mutationsSinceNote++;
+    return result_;
   }
 
   const actionType = call.name;
@@ -989,6 +1024,7 @@ async function wrapMutatingTool(
       cwd,
       is_mutating: true,
       use_sandbox: false,
+      mutations_since_note: mutationsSinceNote,
     });
 
     const result = parseGuardValidate(text);
@@ -1019,7 +1055,10 @@ async function wrapMutatingTool(
       data: { degraded: true, state: status.state },
     };
   }
-  return next(call);
+  const result_ = await next(call);
+  // Executed: count the mutation after the call goes through.
+  mutationsSinceNote++;
+  return result_;
 }
 
 // ──────────────────────────────────────────────────────────────────────

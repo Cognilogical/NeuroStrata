@@ -66,7 +66,7 @@ pub fn nquads_digest(nquads: &str) -> String {
 }
 
 fn escape_nq(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r").replace('\t', "\\t")
 }
 
 /// Replace IRI-unsafe characters (<, >, ", whitespace, etc.) in a metadata

@@ -567,20 +567,32 @@ impl LearningPaths {
     pub fn root_dir(&self) -> PathBuf {
         self.root.clone()
     }
+    /// Dataset partition written by `build_dedup_dataset` and consumed by
+    /// the builtin training path (`<root>/dataset/train.jsonl`).
     pub fn train_jsonl(&self) -> PathBuf {
-        self.root.join("train.jsonl")
+        self.root.join("dataset").join("train.jsonl")
     }
 
+    /// Held-out evaluation pairs written by `build_dedup_dataset`
+    /// (`<root>/dataset/eval.jsonl`).
     pub fn proxy_eval_jsonl(&self) -> PathBuf {
-        self.root.join("proxy_eval.jsonl")
+        self.root.join("dataset").join("eval.jsonl")
     }
 
     pub fn base_model_dir(&self) -> PathBuf {
         self.root.join("models")
     }
 
+    /// The model cache directory used by `LearningRuntimeManager::runtime`
+    /// and the builtin training path (`<root>/.cache/laya`).
+    pub fn model_cache_dir(&self) -> PathBuf {
+        self.root.join(".cache").join("laya")
+    }
+
+    /// The directory the builtin training path actually writes candidate
+    /// artifacts into (`<root>/.cache/laya/candidates/<version>`).
     pub fn candidate_dir(&self, version: &ModelVersion) -> PathBuf {
-        self.root.join("candidates").join(version)
+        self.model_cache_dir().join("candidates").join(version)
     }
 }
 
@@ -662,7 +674,7 @@ impl LearningRuntimeManager {
         Ok(LocalTrainingRuntime {
             python,
             laya_train: root.join("laya-train"),
-            model_cache: root.join(".cache").join("laya"),
+            model_cache: self.paths.model_cache_dir(),
         })
     }
 }

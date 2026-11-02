@@ -310,21 +310,29 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
             }
         }
         "digital_twin" => {
-            if let Some(dt) = payload.metadata.get("digital_twin") {
+            let dt = payload
+                .metadata
+                .get("digital_twin")
+                .or_else(|| payload.metadata.get("twin"));
+            if let Some(dt) = dt {
                 if let Some(obj) = dt.as_object() {
-                    if obj.get("twin_id").and_then(|v| v.as_str()).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                    if obj.get("twin_id").or_else(|| obj.get("id")).and_then(|v| v.as_str()).map(|s| s.trim().is_empty()).unwrap_or(true) {
                         out.push(ShaclViolation {
                             field: "metadata.digital_twin.twin_id".to_string(),
                             why: "twin_id is required and must be a non-empty string".to_string(),
                         });
                     }
-                    if obj.get("observed_at").and_then(|v| v.as_i64()).map(|ts| ts <= 0).unwrap_or(true) {
+                    let observed_at = obj
+                        .get("observed_at")
+                        .or_else(|| payload.metadata.get("valid_from"));
+                    if observed_at.and_then(|v| v.as_i64()).map(|ts| ts <= 0).unwrap_or(true) {
                         out.push(ShaclViolation {
                             field: "metadata.digital_twin.observed_at".to_string(),
                             why: "observed_at is required and must be a positive integer".to_string(),
                         });
                     }
-                    if !obj.get("properties").map(|v| v.is_object()).unwrap_or(false) {
+                    let properties = obj.get("properties").or_else(|| obj.get("variables"));
+                    if !properties.map(|v| v.is_object()).unwrap_or(false) {
                         out.push(ShaclViolation {
                             field: "metadata.digital_twin.properties".to_string(),
                             why: "properties is required and must be an object".to_string(),
@@ -378,6 +386,9 @@ fn is_structural(t: &str) -> bool {
     ARTIFACT_TYPES.contains(&t)
         || t == "freshness_flag"
         || t == "guard_event"
+        || t == "community_summary"
+        || t == "digital_twin"
+        || t == "digital_twin_schema"
 }
 
 pub fn endpoint_role_allowed(rel_type: &str, source_type: &str, target_type: &str) -> bool {

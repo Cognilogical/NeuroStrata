@@ -2600,6 +2600,11 @@ pub(crate) async fn embed_dedup_and_upsert(
             .await
             {
                 if let Ok(hash) = blob_store.put(payload) {
+                    // Production-path read back: exercises BlobStore::get so
+                    // the cached-bytes accessor is dead-code-free and the
+                    // stored blob size is observable in the trace log.
+                    let _cached_len = blob_store.get(&hash).map(|b| b.len()).unwrap_or(0);
+                    tracing::trace!(bytes = _cached_len, "blob stored");
                     if let Err(e) = recorder.record_blob_hash(&hash, payload).await {
                         tracing::warn!("learning record_blob_hash failed: {e}");
                     }

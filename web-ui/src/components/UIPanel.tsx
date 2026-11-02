@@ -12,7 +12,19 @@ interface Props {
   setTypeFilters: (f: Record<string, boolean>) => void;
   namespaceFilters: Record<string, boolean>;
   setNamespaceFilters: (f: Record<string, boolean>) => void;
+  onOpenProject?: () => void;
 }
+
+// ForceGraph3D/ForceGraph2D mutate `link.source`/`link.target` from string
+// IDs into node objects on first render, so a selected link renders those
+// endpoints as objects unless we fish the `id` back out. A raw object child
+// used to crash React with a "Objects are not valid as a React child" error.
+const formatEndpointId = (ep: unknown): string => {
+  if (typeof ep === 'object' && ep !== null && 'id' in ep) {
+    return String((ep as { id: unknown }).id);
+  }
+  return String(ep ?? '');
+};
 
 export const UIPanel: React.FC<Props> = ({
   viewMode,
@@ -23,6 +35,7 @@ export const UIPanel: React.FC<Props> = ({
   setTypeFilters,
   namespaceFilters,
   setNamespaceFilters,
+  onOpenProject,
 }) => {
   const [editor, setEditor] = useState<'vscode' | 'cursor'>(() => {
     const saved = localStorage.getItem('neurostrata_editor');
@@ -107,7 +120,13 @@ export const UIPanel: React.FC<Props> = ({
       <div className="w-96 flex flex-col gap-4 pointer-events-none max-h-full">
 
         <button
-          onClick={() => emit('open-project-dialog', "open")}
+          onClick={() => {
+            if (onOpenProject) {
+              onOpenProject();
+            } else {
+              emit('open-project-dialog', 'open');
+            }
+          }}
           className="w-full pointer-events-auto px-4 py-3 bg-blue-600/30 hover:bg-blue-500/40 border border-blue-500/50 rounded-xl text-blue-100 font-bold shadow-lg transition-all flex items-center justify-center gap-2 text-sm backdrop-blur-md"
         >
           📂 Load Project Workspace
@@ -181,12 +200,13 @@ export const UIPanel: React.FC<Props> = ({
                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
                           Open in {editor === 'vscode' ? 'VS Code' : 'Cursor'}
                         </button>
-                        {openError && (
-                          <div className="text-xs text-red-300 bg-red-900/30 border border-red-500/30 rounded p-2 break-all">
-                            {openError}
-                          </div>
-                        )}
                       </div>
+                    </div>
+                  )}
+
+                  {openError && (
+                    <div className="text-xs text-red-300 bg-red-900/30 border border-red-500/30 rounded p-2 break-all">
+                      {openError}
                     </div>
                   )}
 
@@ -205,8 +225,8 @@ export const UIPanel: React.FC<Props> = ({
               {selectedLink && (
                 <div className="flex flex-col gap-2">
                   <div className="text-sm text-gray-300">Type: <span className="font-mono text-white drop-shadow-sm">{selectedLink.type || 'Connection'}</span></div>
-                  <div className="text-sm text-gray-300">From: <span className="font-mono text-white drop-shadow-sm">{selectedLink.source as string}</span></div>
-                  <div className="text-sm text-gray-300">To: <span className="font-mono text-white drop-shadow-sm">{selectedLink.target as string}</span></div>
+                  <div className="text-sm text-gray-300">From: <span className="font-mono text-white drop-shadow-sm">{formatEndpointId(selectedLink.source)}</span></div>
+                  <div className="text-sm text-gray-300">To: <span className="font-mono text-white drop-shadow-sm">{formatEndpointId(selectedLink.target)}</span></div>
                 </div>
               )}
             </div>

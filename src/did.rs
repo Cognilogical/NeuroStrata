@@ -242,12 +242,11 @@ pub fn verify(payload: &[u8], pubkey: &[u8], sig: &[u8]) -> bool {
 pub fn canonicalize_json_value(val: &serde_json::Value) -> serde_json::Value {
     match val {
         serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
             let mut new_map = serde_json::Map::new();
-            for (k, v) in map.iter() {
-                // Strip "signature" only at top-level (when called from canonical_signing_bytes
-                // this isn't needed; when called as root canonicalizer, skip if root object).
-                // To satisfy spec: skip at root only. We handle stripping in canonical_signing_bytes.
-                new_map.insert(k.clone(), canonicalize_json_value(v));
+            for k in keys {
+                new_map.insert(k.clone(), canonicalize_json_value(&map[k]));
             }
             serde_json::Value::Object(new_map)
         }

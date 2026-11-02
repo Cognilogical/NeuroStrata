@@ -132,7 +132,13 @@ impl Trainer {
             let mut pairs = read_calibration_pairs(&train_jsonl);
             if pairs.is_empty() {
                 if let Some(dir) = &dataset_dir {
-                    for fallback_file in ["calibration.jsonl", "train.jsonl"] {
+                    // Gold-adjudicated pairs first; fall back to the proxy
+                    // calibration/train partitions when gold files are empty.
+                    for fallback_file in [
+                        "gold_calibration.jsonl",
+                        "calibration.jsonl",
+                        "train.jsonl",
+                    ] {
                         pairs = read_calibration_pairs(&dir.join(fallback_file));
                         if !pairs.is_empty() {
                             break;
@@ -146,11 +152,20 @@ impl Trainer {
             // Held-out evaluation: when the dataset build produced eval.jsonl
             // with usable pairs, evaluate on those rather than re-score the
             // training pairs (H6: no train-on-eval leakage in the report).
-            let held_out_eval_pairs = dataset_dir.as_ref()
-                .map(|dir| dir.join("eval.jsonl"))
-                .filter(|p| p.exists())
-                .map(|p| read_calibration_pairs(&p))
-                .filter(|pairs| !pairs.is_empty());
+            let held_out_eval_pairs = dataset_dir.as_ref().and_then(|dir| {
+                // Gold partition first; fall back to proxy eval.jsonl when
+                // the gold eval file is absent or parses to zero pairs.
+                for fallback_file in ["gold_eval.jsonl", "eval.jsonl"] {
+                    let path = dir.join(fallback_file);
+                    if path.exists() {
+                        let eval_pairs = read_calibration_pairs(&path);
+                        if !eval_pairs.is_empty() {
+                            return Some(eval_pairs);
+                        }
+                    }
+                }
+                None
+            });
             let (eval_pairs, suite_name) = match (held_out_eval_pairs, from_dataset) {
                 (Some(eval), _) => (eval, "dataset_eval".to_string()),
                 (None, true) => (effective_pairs.clone(), "dataset".to_string()),
@@ -213,6 +228,7 @@ impl Trainer {
     /// Evaluate a candidate model using real evaluation reports.
     /// Does not fabricate metrics; requires actual suite reports.
     pub fn evaluate_candidate(&self, report: &EvaluationReport) -> Result<f64> {
+        tracing::debug!(candidate = %report.candidate, "evaluating candidate report");
         report.gold_metrics()
             .ok_or_else(|| anyhow!("Candidate {} has no measurable metrics; evaluation refused (fail-closed)", report.candidate))
     }
@@ -230,6 +246,7 @@ impl Trainer {
                 Self::PROMOTION_MIN_SCORE
             ));
         }
+        tracing::debug!(candidate = %version, score = score, "promoting candidate report");
         manifest.previous_good_version = manifest.active_version.clone();
         manifest.active_version = Some(version.clone());
         manifest.candidate_version = None;
@@ -275,15 +292,25 @@ fn similarity_from_observation_row(value: &serde_json::Value) -> Option<f64> {
     best_conf.or_else(|| best_dist.map(|d| (1.0 - d).clamp(0.0, 1.0)))
 }
 
-/// Reads labeled calibration pairs from a `train.jsonl` file. Accepts
+/// Reads labeled calibration pairs from a JSONL training file. Accepts
 /// `"logit"`/`"score"` numeric keys and `"label"`/`"is_duplicate"` boolean
 /// keys, plus `DecisionObservation` rows (score from the best candidate
-/// confidence/distance converted to a logit, label from the `decision`
-/// wording); lines that fail to parse or lack a valid pair are skipped.
+/// confidence/distance, label from the `decision` wording); lines that fail
+/// to parse or lack a valid pair are skipped.
+///
+/// Every pair is pushed as a probability in `(0, 1)` — never a logit —
+/// because `TemperatureFitter::fit` and `evaluator::evaluate_pairs` both
+/// consume `(prob, label)` pairs and logit-scale values would be clamped
+/// to `1.0 - 1e-6` inside their `ln(p / (1 - p))` conversions.
 fn read_calibration_pairs(path: &std::path::Path) -> Vec<(f32, bool)> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            if path.exists() {
+                tracing::warn!("unreadable calibration JSONL at {}: {e}", path.display());
+            }
+            return Vec::new();
+        }
     };
     let mut pairs = Vec::new();
     for line in text.lines() {
@@ -291,21 +318,24 @@ fn read_calibration_pairs(path: &std::path::Path) -> Vec<(f32, bool)> {
         if line.is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
+        let value = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("malformed JSON line in {}: {e}", path.display());
+                continue;
+            }
         };
-        let logit = value
+        let score_probability = value
             .get("logit")
             .and_then(|x| x.as_f64())
             .or_else(|| value.get("score").and_then(|x| x.as_f64()))
             .or_else(|| {
-                // DecisionObservation rows carry similarity scores, not
-                // logits; convert (s - 0.5) * 4.0 to the logit scale.
+                // DecisionObservation rows carry a similarity score in
+                // [0, 1] already; keep it on the probability scale.
                 value
                     .get("similarity_score")
                     .and_then(|x| x.as_f64())
                     .or_else(|| similarity_from_observation_row(&value))
-                    .map(|s| (((s as f32) - 0.5) * 4.0) as f64)
             });
         let label = value
             .get("label")
@@ -318,8 +348,8 @@ fn read_calibration_pairs(path: &std::path::Path) -> Vec<(f32, bool)> {
                     .or_else(|| value.get("outcome").and_then(|x| x.as_str()))
                     .and_then(duplicate_label_from_wording)
             });
-        if let (Some(logit), Some(label)) = (logit, label) {
-            pairs.push((logit as f32, label));
+        if let (Some(probability), Some(label)) = (score_probability, label) {
+            pairs.push((probability.clamp(1e-4, 1.0 - 1e-4) as f32, label));
         }
     }
     pairs

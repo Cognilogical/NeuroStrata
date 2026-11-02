@@ -4,7 +4,7 @@
 //! Module path: `src/gliner.rs` (spec line 10). Not in dedup/guard/routing paths.
 //! 
 //! Constraints met:
-//! - No ONNX inference in default build (`gliner` feature gates session)
+//! - Core module, no feature gate; GlinerEngine bundle loaded on demand
 //! - All candidates `review_only = true`, never auto-promoted
 //! - Deterministic extraction: capitalised multi-word phrases only
 //! - Local-first ONNX bundle loading with SHA-256 verification
@@ -30,7 +30,7 @@ pub struct GlinerCandidate {
 
 /// Check if a character is punctuation that terminates a phrase.
 fn is_punct(c: char) -> bool {
-    matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'')
+    matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}')
 }
 
 /// Strip leading/trailing punctuation from a word.
@@ -172,7 +172,29 @@ impl GlinerEngine {
     pub fn load(bundle_dir: &Path) -> Result<Self> {
         let model_path = bundle_dir.join("model.onnx");
         let tokenizer_path = bundle_dir.join("tokenizer.json");
-        
+
+        // Enforce provisioned SHA-256 verification on the load path (AH-10):
+        // a bundle manifest that carries a non-empty model_sha256 must match
+        // the shipped model.onnx before the engine is constructed.
+        let manifest_path = bundle_dir.join("manifest.json");
+        if manifest_path.exists() {
+            let manifest: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+            let expected_sha = manifest
+                .get("model_sha256")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !expected_sha.trim().is_empty() && model_path.exists() {
+                let verified = verify_bundle_sha256(bundle_dir, expected_sha.trim())?;
+                if !verified {
+                    anyhow::bail!(
+                        "GLiNER bundle model.onnx SHA-256 mismatch for {}",
+                        bundle_dir.display()
+                    );
+                }
+            }
+        }
+
         let session = if model_path.exists() {
             match Session::builder() {
                 Ok(mut builder) => match builder.commit_from_file(&model_path) {

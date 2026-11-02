@@ -1089,7 +1089,7 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     let model_cache = runtime.model_cache.clone();
     let trainer = crate::learning::trainer::Trainer::new(runtime);
 
-    trainer.transition(
+    let mut job_state = trainer.transition(
         &crate::learning::trainer::TrainingJobState::WaitingForData,
         crate::learning::trainer::TrainingJobState::Training,
     )?;
@@ -1103,6 +1103,10 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     .await?;
 
     trainer.train_candidate(&version.to_string()).await?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::ProxyShadow,
+    )?;
 
     // The builtin train path writes under runtime model_cache, not LearningPaths.
     let candidate_dir = model_cache.join("candidates").join(version);
@@ -1119,6 +1123,10 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
             anyhow::anyhow!("eval_report.json for {} is not parseable: {}", version, e)
         })?;
     let score = trainer.evaluate_candidate(&eval_report)?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::GoldShadow,
+    )?;
 
     let bundle = crate::learning::model_bundle::ModelBundle::load(&candidate_dir, "laya")?;
 
@@ -1129,6 +1137,10 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
     trainer.promote(&mut manifest, &version.to_string(), score)?;
+    job_state = trainer.transition(
+        &job_state,
+        crate::learning::trainer::TrainingJobState::Promoted,
+    )?;
 
     std::fs::create_dir_all(paths.root_dir())?;
     std::fs::write(
@@ -1141,7 +1153,11 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     status.active_version = manifest.active_version.clone();
     status.previous_good_version = manifest.previous_good_version.clone();
     status.candidate_version = None;
-    status.training_state = crate::learning::trainer::TrainingJobState::Promoted;
+    status.training_state = job_state;
+    status.runtime_state = match rt_state {
+        crate::judgment::laya_onnx::LayaReadiness::Ready => crate::judgment::laya_onnx::RuntimeState::Ready,
+        crate::judgment::laya_onnx::LayaReadiness::Degraded { .. } => crate::judgment::laya_onnx::RuntimeState::Unavailable,
+    };
     status.latest_evaluation = Some(eval_report);
     std::fs::write(
         paths.root_dir().join("status.json"),

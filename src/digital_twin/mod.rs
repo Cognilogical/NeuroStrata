@@ -196,7 +196,7 @@ pub fn diff(old: &crate::traits::MemoryPayload, new: &crate::traits::MemoryPaylo
         let new_v = new_state.get(k);
         match (old_v, new_v) {
             (Some(o), Some(n)) => {
-                if (o - n).abs() > f64::EPSILON {
+                if (o - n).abs() > f64::EPSILON * o.abs().max(n.abs()).max(1.0) {
                     result.push(TwinDelta {
                         name: k.clone(),
                         old: Some(*o),
@@ -249,6 +249,7 @@ pub fn list_twins_from_rows(
     rows: &[(String, crate::traits::MemoryPayload)],
 ) -> Vec<TwinSummary> {
     let mut best: BTreeMap<String, (String, u64, usize, i64, Option<String>, Option<String>)> = BTreeMap::new();
+    let now = chrono::Utc::now().timestamp();
     for (id, payload) in rows {
         let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
             || payload.metadata.get("twin").is_some();
@@ -259,7 +260,7 @@ pub fn list_twins_from_rows(
         let not_retired = match valid_to {
             None => true,
             Some(v) if v.is_null() => true,
-            Some(v) => v.as_i64().map_or(false, |v| v == 0),
+            Some(v) => v.as_i64().map_or(false, |ts| ts == 0 || ts > now),
         };
         if !not_retired {
             continue;
@@ -330,7 +331,7 @@ pub fn get_twin_state_from_rows(
     rows: &[(String, crate::traits::MemoryPayload)],
     twin_id: &str,
 ) -> Option<BTreeMap<String, f64>> {
-    let mut best_version = 0u64;
+    let mut best_version: Option<u64> = None;
     let mut best_payload: Option<&crate::traits::MemoryPayload> = None;
     for (_id, payload) in rows {
         let is_twin_row = DIGITAL_TWIN_MEMORY_TYPES.contains(&payload.memory_type.as_str())
@@ -352,8 +353,8 @@ pub fn get_twin_state_from_rows(
             .and_then(|t| t.get("version"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        if version > best_version {
-            best_version = version;
+        if best_version.map_or(true, |bv| version >= bv) {
+            best_version = Some(version);
             best_payload = Some(payload);
         }
     }
@@ -717,6 +718,37 @@ mod tests {
         assert_eq!(d[0].name, "a");
 
         assert!(twin_diff_from_rows(&rows, "t1", 99, 2).is_err());
+    }
+
+    #[test]
+    fn list_twins_from_rows_future_and_expired_valid_to() {
+        let now = chrono::Utc::now().timestamp();
+        let rows = vec![
+            ("id1".into(), make_payload(json!({
+                "twin": { "id": "tfuture", "version": 1, "variables": { "a": 1.0 } },
+                "valid_to": now + 3600
+            }))),
+            ("id2".into(), make_payload(json!({
+                "twin": { "id": "texpired", "version": 1, "variables": { "b": 1.0 } },
+                "valid_to": now - 60
+            }))),
+        ];
+        let summaries = list_twins_from_rows(&rows);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].twin_id, "tfuture");
+    }
+
+    #[test]
+    fn get_twin_state_from_rows_reaches_version_zero() {
+        let rows = vec![(
+            "id1".into(),
+            make_payload(json!({
+                "twin": { "id": "t0", "version": 0, "variables": { "a": 1.0 } }
+            })),
+        )];
+        let state = get_twin_state_from_rows(&rows, "t0");
+        assert!(state.is_some());
+        assert_eq!(state.unwrap().get("a"), Some(&1.0));
     }
 
     #[test]

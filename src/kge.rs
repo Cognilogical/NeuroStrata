@@ -1,6 +1,6 @@
 //! Knowledge-Graph Embeddings (KGE) — structural embedding channel.
 //!
-//! Optional feature (`--features kge`). TransE over GOVERNS/CONTAINS/RELATES_TO/
+//! Core TransE knowledge-graph embedding engine (always compiled). TransE over GOVERNS/CONTAINS/RELATES_TO/
 //! DEPENDS_ON/EXTRACTED_FROM (5 relations). Training is offline batch
 //! (`neurostrata-mcp kge train`); inference loads artifacts from
 //! `<db_path_parent>/kge/<scope>/` (entity embeddings `E`, relation embeddings `R`).
@@ -204,6 +204,14 @@ impl KgeModel {
             );
         }
 
+        if relation_count_stored != relation_types.len() {
+            anyhow::bail!(
+                "KGE metadata relation_count ({}) does not match relation_types length ({})",
+                relation_count_stored,
+                relation_types.len()
+            );
+        }
+
         let entity_embedding_count = entity_count_stored * model_dim;
         let mut entity_bytes = vec![0u8; entity_embedding_count * 4];
         model_file.read_exact(&mut entity_bytes)?;
@@ -355,6 +363,11 @@ impl KgeModel {
                 // Triples stream in DEFAULT_BATCH_SIZE chunks (spec §5.3).
                 for batch in indexed_edges.chunks(DEFAULT_BATCH_SIZE) {
                     for &(h, r, t) in batch {
+                        // Advance the RNG state so negative sampling draws a
+                        // fresh entity per triple/epoch (AH-2).
+                        state = state
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1);
                         let mut neg_t = ((state >> 32) as usize) % n_ent;
                         if neg_t == t {
                             neg_t = (t + 1) % n_ent;
@@ -642,7 +655,9 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
         1.0,
         DEFAULT_SEED,
     )?;
-    let effective_weight = kge_weight.unwrap_or_else(kge_weight_from_env);
+    let effective_weight = kge_weight
+        .map(|w| w.clamp(0.0, 0.3))
+        .unwrap_or_else(kge_weight_from_env);
 
     // Save artifacts to scope_dir (.NeuroStrata/kge/<scope> or NEUROSTRATA_KGE_DIR)
     let model_path = scope_dir.join("model.bin");

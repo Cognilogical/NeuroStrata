@@ -14,6 +14,14 @@ const XSD_STRING: &str = "http://www.w3.org/2001/XMLSchema#string";
 /// JSON-LD JSON datatype IRI
 const LDP_JSON: &str = "https://www.w3.org/ns/ldp#JSON";
 
+/// Sanitize a dynamic metadata key for use as an IRI suffix so
+/// `NamedNode::new_unchecked` can never panic on spaces or `<`/`>`.
+fn sanitize_iri_suffix(k: &str) -> String {
+    k.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
+}
+
 /// Project a single Memory row into oxrdf RDF quads.
 /// Returns a vector of oxrdf::Quad that can be inserted into a Dataset.
 pub fn memory_to_quads(
@@ -127,7 +135,7 @@ pub fn memory_to_quads(
     if let Some(topology) = payload.metadata.get("topology") {
         if let Some(obj) = topology.as_object() {
             for (k, v) in obj {
-                json_quad!(ns_predicate(&format!("topology_{}", k)), v.to_string(), ldp_json.clone());
+                json_quad!(ns_predicate(&format!("topology_{}", sanitize_iri_suffix(k))), v.to_string(), ldp_json.clone());
             }
         }
     }
@@ -150,7 +158,12 @@ pub fn memory_to_quads(
 
     // Digital twin RDF projection
     if payload.memory_type == "digital_twin" {
-        if let Some(dt) = payload.metadata.get("digital_twin").and_then(|v| v.as_object()) {
+        if let Some(dt) = payload
+            .metadata
+            .get("digital_twin")
+            .or_else(|| payload.metadata.get("twin"))
+            .and_then(|v| v.as_object())
+        {
             let xsd_int = NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer");
             quads.push(Quad {
                 subject: subject.clone(),
@@ -158,16 +171,20 @@ pub fn memory_to_quads(
                 object: Term::NamedNode(NamedNode::new_unchecked(ns_predicate("TwinState"))),
                 graph_name: graph.clone(),
             });
-            if let Some(twin_id) = dt.get("twin_id").and_then(|v| v.as_str()) {
+            if let Some(twin_id) = dt.get("twin_id").or_else(|| dt.get("id")).and_then(|v| v.as_str()) {
                 lit_quad!(ns_predicate("twinId"), twin_id.to_string(), xsd_string.clone());
             }
-            if let Some(obs) = dt.get("observed_at").and_then(|v| v.as_i64()) {
+            if let Some(obs) = dt
+                .get("observed_at")
+                .and_then(|v| v.as_i64())
+                .or_else(|| payload.metadata.get("valid_from").and_then(|v| v.as_i64()))
+            {
                 lit_quad!(ns_predicate("observedAt"), obs.to_string(), xsd_int.clone());
             }
-            if let Some(props) = dt.get("properties").and_then(|v| v.as_object()) {
+            if let Some(props) = dt.get("properties").or_else(|| dt.get("variables")).and_then(|v| v.as_object()) {
                 for (k, v) in props {
                     json_quad!(
-                        ns_predicate(&format!("twinProp_{}", k)),
+                        ns_predicate(&format!("twinProp_{}", sanitize_iri_suffix(k))),
                         v.to_string(),
                         ldp_json.clone()
                     );

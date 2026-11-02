@@ -229,7 +229,7 @@ impl TantivyLexicalIndex {
     pub fn upsert_memory(&self, namespace: &str, id: &str, payload: &MemoryPayload) -> Result<()> {
         let composite = Self::composite_key(namespace, id);
         // Delete existing document by composite id.
-        if let Some(w) = self.writer.lock().unwrap().as_mut() {
+        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let term = Term::from_field_text(self.id_f, &composite);
             w.delete_term(term);
         } else {
@@ -238,7 +238,7 @@ impl TantivyLexicalIndex {
 
         if Self::is_excluded(payload) {
             // Excluded: delete and commit (if writer exists).
-            if let Some(w) = self.writer.lock().unwrap().as_mut() {
+            if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 w.commit()?;
                 self.dirty.store(true, Ordering::SeqCst);
                 // Reload reader after commit.
@@ -266,7 +266,7 @@ impl TantivyLexicalIndex {
         let archived: i64 = if payload.metadata.get("archived").and_then(|v| v.as_i64()).unwrap_or(0) != 0 { 1 } else { 0 };
         doc.add_i64(self.archived_f, archived);
 
-        if let Some(w) = self.writer.lock().unwrap().as_mut() {
+        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             w.add_document(doc)?;
             w.commit()?;
             self.dirty.store(true, Ordering::SeqCst);
@@ -278,7 +278,7 @@ impl TantivyLexicalIndex {
     /// Delete by namespace + id (spec §4).
     pub fn delete_memory(&self, namespace: &str, id: &str) -> Result<()> {
         let composite = Self::composite_key(namespace, id);
-        if let Some(w) = self.writer.lock().unwrap().as_mut() {
+        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let term = Term::from_field_text(self.id_f, &composite);
             w.delete_term(term);
             w.commit()?;
@@ -292,7 +292,7 @@ impl TantivyLexicalIndex {
 
     /// Rebuild from slice (namespace, id, payload) — commit once (§4).
     pub fn rebuild(&self, rows: &[(String, String, MemoryPayload)]) -> Result<usize> {
-        if let Some(w) = self.writer.lock().unwrap().as_mut() {
+        if let Some(w) = self.writer.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             w.delete_all_documents()?;
             let mut indexed = 0usize;
             for (ns, id, payload) in rows {
@@ -396,9 +396,8 @@ impl TantivyLexicalIndex {
                 }
             }
 
-            // Derive id (composite stripped to memory id) — we want the original memory id back.
-            // The spec's TantivyHit.id is the memory id or composite? It says `id: String`; from spec §4 id is composite.
-            // We return the composite or just id? Spec says `id: String` — we'll return the storage id (after "::").
+            // Derive id (composite stripped to memory id) so the caller gets
+            // the original storage id back (spec §4: `id: String`).
             let memory_id_part = comp_id.split_once("::").map(|(_, id)| id).unwrap_or(&comp_id).to_string();
             candidates.push(TantivyHit {
                 id: memory_id_part,
