@@ -90,7 +90,7 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
         });
     }
     if payload.location_lines.trim().is_empty() && !payload.location.trim().is_empty() {
-        // location present implies lines; soft warning only if location present
+        tracing::debug!("location '{}' present without location_lines; location implies lines", payload.location);
     }
 
     match &payload.metadata {

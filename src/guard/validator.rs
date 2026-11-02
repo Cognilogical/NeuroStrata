@@ -115,12 +115,19 @@ impl GuardValidator {
 
             match sandbox_result {
                 Ok(mut verdict) => {
-                    // Extract constraints from rules for context
-                    let constraints: Vec<String> = matching_rules
-                        .iter()
-                        .filter(|r| r.status != "deprecated")
-                        .map(|r| r.constraint_text.clone())
-                        .collect();
+                    // Extract constraints from the rules that FIRED, for
+                    // context. The candidates are a fallback, not the truth:
+                    // a sandbox verdict should name the constraints of the
+                    // triggering rules, never the whole candidate list.
+                    let constraints: Vec<String> = if fired.is_empty() {
+                        matching_rules
+                            .iter()
+                            .filter(|r| r.status != "deprecated")
+                            .map(|r| r.constraint_text.clone())
+                            .collect()
+                    } else {
+                        fired.iter().map(|r| r.constraint_text.clone()).collect()
+                    };
 
                     match &mut verdict {
                         ValidateVerdict::SandboxReject { constraints: ref mut c, .. } => {

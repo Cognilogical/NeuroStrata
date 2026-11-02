@@ -174,16 +174,29 @@ impl GlinerEngine {
         let tokenizer_path = bundle_dir.join("tokenizer.json");
         
         let session = if model_path.exists() {
-            Session::builder()
-                .ok()
-                .and_then(|mut b| b.commit_from_file(&model_path).ok())
-                .map(Mutex::new)
+            match Session::builder() {
+                Ok(mut builder) => match builder.commit_from_file(&model_path) {
+                    Ok(session) => Some(Mutex::new(session)),
+                    Err(e) => {
+                        tracing::warn!("GLiNER ONNX model at {} failed to load: {e}", model_path.display());
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("GLiNER ONNX model at {} failed to load: {e}", model_path.display());
+                    None
+                }
+            }
         } else {
             None
         };
-        
+
         let tokenizer = if tokenizer_path.exists() {
-            Tokenizer::from_file(&tokenizer_path).ok()
+            let tok = Tokenizer::from_file(&tokenizer_path);
+            if let Err(e) = &tok {
+                tracing::warn!("GLiNER tokenizer at {} failed to load: {e}", tokenizer_path.display());
+            }
+            tok.ok()
         } else {
             None
         };

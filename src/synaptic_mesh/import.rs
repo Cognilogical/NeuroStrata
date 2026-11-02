@@ -263,6 +263,15 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
     if report.full_tree {
         out.push_str(" (full-tree reconciliation — no usable accepted-head cursor)");
     }
+    if report.verified_signed > 0
+        || report.signature_rejected > 0
+        || report.unauthorized_signer > 0
+    {
+        out.push_str(&format!(
+            ", signed {} / signature-rejected {} / unauthorized {}",
+            report.verified_signed, report.signature_rejected, report.unauthorized_signer
+        ));
+    }
     let head_len = report.head.len().min(7);
     if head_len > 0 {
         out.push_str(&format!(", head {}", &report.head[..head_len]));
@@ -395,7 +404,7 @@ pub async fn apply_changed(
                 continue;
             }
         };
-        let record = match validate_record(&candidate, served, &raw) {
+        let mut record = match validate_record(&candidate, served, &raw) {
             Ok(r) => r,
             Err(reason) => {
                 report.ignored.push(format!("{rel}: {reason}"));
@@ -424,10 +433,17 @@ pub async fn apply_changed(
                 continue;
             }
         }
+        // RDF patch sidecar attachment: a sibling `<id>.rdfpatch` next to
+        // the `.json` record is parsed (fail-soft) and attached AFTER
+        // signature verification, so canonical signing bytes over the
+        // `.json` record (patch is `skip_serializing_if = "Option::is_none"`)
+        // are unaffected.
+        if let Some(stream) = load_record_patch(&root.join(&rel)) {
+            record.patch = Some(stream);
+        }
         match apply_one(
             root,
             &mesh_id,
-            &candidate,
             record,
             store.clone(),
             emb.clone(),
@@ -1160,6 +1176,32 @@ enum ApplyShape {
     ArchivedCombination { edited: String },
 }
 
+/// Parse the sibling `<id>.rdfpatch` sidecar of a candidate record
+/// (`record_path` is the `.json` path inside the mesh checkout), if any.
+/// Fail-soft: an unreadable or invalid sidecar is a `tracing::warn!` and
+/// returns `None`; the record is still gated by ordinary replay validation.
+/// The caller attaches the stream AFTER `verify_record_signature`, so
+/// canonical signing bytes over the `.json` record are unaffected.
+fn load_record_patch(record_path: &Path) -> Option<crate::streaming::Stream> {
+    let patch_path = record_path.with_extension("rdfpatch");
+    if !patch_path.exists() {
+        return None;
+    }
+    match std::fs::read_to_string(&patch_path) {
+        Ok(text) => match crate::streaming::Stream::parse_patch(&text) {
+            Ok(deltas) => Some(crate::streaming::Stream { events: deltas }),
+            Err(e) => {
+                tracing::warn!("mesh rdf patch {} invalid: {e}", patch_path.display());
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!("mesh rdf patch {} unreadable: {e}", patch_path.display());
+            None
+        }
+    }
+}
+
 /// Validate-and-apply one candidate against the store. `root` is the mesh
 /// checkout (its sibling `.conflicts` dir receives preserved variants);
 /// `concurrent` is true only on the full-tree reconciliation path.
@@ -1169,7 +1211,6 @@ enum ApplyShape {
 async fn apply_one(
     root: &Path,
     mesh_id: &str,
-    _candidate: &Candidate,
     record: MeshRecord,
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
@@ -1403,14 +1444,17 @@ async fn apply_effective(
     // F20 concept_iri mesh mapping (C5): preserve concept_iri (already in metadata
     // via allowlist) and map to receiver's local domain slug(s) when registry has
     // matching concept_iri. Idempotent on replay.
-    let already_imported = store
-        .get(namespace, id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
-        .as_deref()
-        == Some(record.update_id.to_string().as_str());
+    let current_update_id = record.update_id.to_string();
+    let already_imported = match store.get(namespace, id).await {
+        Ok(found) => found
+            .and_then(|(_, p)| mesh_update_id_of(&p.metadata))
+            .as_deref()
+            == Some(current_update_id.as_str()),
+        Err(e) => {
+            tracing::warn!("[neurostrata:mesh] store read failed for {id}: {e}");
+            false
+        }
+    };
 
     if !already_imported {
         if let Some(concept_val) = metadata.get("concept_iri").cloned() {
@@ -1422,7 +1466,13 @@ async fn apply_effective(
             let rid = crate::registry::registry_row_id(namespace);
             let entries = match store.get(namespace, &rid).await {
                 Ok(Some((_, rp))) => crate::registry::registry_domain_entries(&rp.metadata),
-                _ => vec![],
+                Ok(None) => vec![],
+                Err(e) => {
+                    tracing::warn!(
+                        "[neurostrata:mesh] registry row {rid} unreadable: {e}"
+                    );
+                    vec![]
+                }
             };
             let mut matched_slugs: Vec<String> = Vec::new();
             for iri in &iris {
@@ -1445,7 +1495,7 @@ async fn apply_effective(
                     }
                     n => {
                         // ambiguous
-                        eprintln!(
+                        tracing::warn!(
                             "[neurostrata:mesh] ambiguous concept_iri {} matches {} local domains",
                             iri, n
                         );
@@ -1725,7 +1775,15 @@ fn preserved_edit_record(
     let created_at = chrono::Utc::now();
     let content_str = match &content {
         Value::String(s) => s.clone(),
-        _ => serde_json::to_string(&content).unwrap_or_default(),
+        other => match serde_json::to_string(other) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "preserved edit original_id={original_id}: non-serialisable content defaulted to empty: {e}"
+                );
+                String::new()
+            }
+        },
     };
     // Curated metadata for RDF projection
     let eligibility = metadata.get("eligibility").and_then(|v| v.as_str());
@@ -1850,9 +1908,25 @@ pub fn verify_record_signature(
             record.origin_mesh_epoch,
         )
     });
-    let payload_json = serde_json::to_value(record)
-        .ok()
-        .and_then(|v| crate::did::canonical_signing_bytes(&v).ok());
+    let payload_json = match serde_json::to_value(record) {
+        Ok(v) => match crate::did::canonical_signing_bytes(&v) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(
+                    "[neurostrata:mesh] canonical signing bytes unavailable for {}: {e}",
+                    record.id
+                );
+                None
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "[neurostrata:mesh] record {} not canonicalisable: {e}",
+                record.id
+            );
+            None
+        }
+    };
 
     let verified = payload_rdf
         .as_ref()
@@ -2068,8 +2142,16 @@ pub async fn backfill_imported_procedure_trust(
                 .map(|m| m.is_object())
                 .unwrap_or(false);
             // List rows carry no vector; re-read the row to upsert it.
-            let Ok(Some((vector, mut payload))) = store.get(namespace, &row.id).await else {
-                continue;
+            let (vector, mut payload) = match store.get(namespace, &row.id).await {
+                Ok(Some(found)) => found,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "procedure trust backfill: re-read of {} in {namespace} failed: {e}",
+                        row.id
+                    );
+                    continue;
+                }
             };
             // The row may have gained a stamp between list and get.
             if payload
@@ -2087,11 +2169,19 @@ pub async fn backfill_imported_procedure_trust(
                 "trust".to_string(),
                 json!(if imported { "untrusted" } else { "local" }),
             );
-            if store.upsert(namespace, &row.id, vector, payload).await.is_ok() {
-                if imported {
-                    stamped_untrusted += 1;
-                } else {
-                    stamped_local += 1;
+            match store.upsert(namespace, &row.id, vector, payload).await {
+                Ok(_) => {
+                    if imported {
+                        stamped_untrusted += 1;
+                    } else {
+                        stamped_local += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "procedure trust backfill: upsert of {} in {namespace} failed: {e}",
+                        row.id
+                    );
                 }
             }
         }

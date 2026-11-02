@@ -690,7 +690,8 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         return e;
     }
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
-    if let Ok(mut r) = TASK_RECEIPTS.lock() {
+    {
+        let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
         let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session.clone(),
@@ -935,7 +936,8 @@ pub async fn handle_task_update(
     let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
         task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
     });
-    if let Ok(mut r) = TASK_RECEIPTS.lock() {
+    {
+        let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
         let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
         r.record(crate::receipts::store::Receipt {
             session_id: session_for_receipt,
@@ -1473,8 +1475,8 @@ pub async fn handle_task_complete(
                 .as_ref()
                 .map(|u| u.id.clone())
                 .or(report.linked_existing_id.clone())
-                .unwrap_or_default();
-            inline_lesson = Some(lesson_id);
+                .filter(|s| !s.is_empty());
+            inline_lesson = lesson_id;
         }
     }
 
@@ -1533,7 +1535,8 @@ pub async fn handle_task_complete(
     let session_for_receipt = arg_str(&args, "session_id").map(String::from).unwrap_or_else(|| {
         task.task_field("session_id").and_then(|v| v.as_str()).unwrap_or("").to_string()
     });
-    if let Ok(mut r) = TASK_RECEIPTS.lock() {
+    {
+        let mut r = TASK_RECEIPTS.lock().unwrap_or_else(|e| e.into_inner());
         // Bind the completion receipt to the worktree state captured right now
         // (AC5): retention verification later re-checks this binding.
         let binding = crate::task::receipt::Receipt::capture(&id, &crate::daemon::resolve_project_root());
@@ -2190,8 +2193,12 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
         if is_current_hook(&content) {
             return String::new();
         }
-        // stale: back up + rewrite
-        let _ = std::fs::copy(&target, hooks_dir.join("pre-push.bak"));
+        // stale: back up + rewrite. A failed backup must not destroy the
+        // hook content -- rewriting without the .bak loses the only copy.
+        if let Err(e) = std::fs::copy(&target, hooks_dir.join("pre-push.bak")) {
+            tracing::warn!("failed to back up foreign pre-push hook: {e}");
+            return String::new();
+        }
         if std::fs::write(&target, SCAFFOLDED_PRE_PUSH_HOOK).is_ok() {
             set_executable(&target);
             return format!("HOOKS: updated pre-push (stale -> v{})", version);
@@ -2207,7 +2214,9 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
 #[cfg(unix)]
 fn set_executable(path: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
+        tracing::warn!("failed to set executable bit on {}: {e}", path.display());
+    }
 }
 
 #[cfg(not(unix))]
@@ -2223,8 +2232,25 @@ fn set_executable(_path: &std::path::Path) {}
 fn hook_observable(root: &std::path::Path) -> bool {
     let hook = git_hooks_dir(root).join("pre-push");
     std::fs::read_to_string(&hook)
-        .map(|s| s.contains("NeuroStrata task gate"))
+        .ok()
+        .filter(|s| s.contains("NeuroStrata task gate"))
+        .is_some()
+        && hook_executable(&hook)
+}
+
+/// A hook git will not run is not a gate: git executing a pre-push hook
+/// without the executable bit fails, so "installed" must require it too.
+#[cfg(unix)]
+fn hook_executable(hook: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(hook)
+        .map(|m| (m.permissions().mode() & 0o111) != 0)
         .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn hook_executable(_hook: &std::path::Path) -> bool {
+    true
 }
 
 /// The project guards an installed hook actually runs.
@@ -2357,10 +2383,19 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
         uncovered.push("task-gate");
     }
 
+    let core_ids: Vec<&str> = wiring::AUTOMATIC_WIRES
+        .iter()
+        .filter(|w| w.runs_in == wiring::RunsIn::Core)
+        .map(|w| w.id)
+        .collect();
+    let git_ids: Vec<&str> = wiring::AUTOMATIC_WIRES
+        .iter()
+        .filter(|w| w.runs_in == wiring::RunsIn::GitPrePush)
+        .map(|w| w.id)
+        .collect();
     let coverage = json!({
-        "core": ["task-close-lock", "claim-exclusivity", "stale-claim-expiry",
-                 "zero-action-start", "single-daemon-lock", "rule-honesty"],
-        "git-pre-push": if hook_installed { vec!["task-gate"] } else { Vec::<&str>::new() },
+        "core": core_ids,
+        "git-pre-push": if hook_installed { git_ids } else { Vec::<&str>::new() },
         "project-pipeline": pipeline_ids.clone(),
         "uncovered": uncovered,
     });
@@ -2375,7 +2410,9 @@ fn wiring_panel(root: &std::path::Path, namespace: &str) -> (Value, Value, Value
     // install instruction becomes structurally impossible).
     let verified = json!({
         "hook_installed": hook_installed,
-        "status_healthy": true,
+        // Healthy means the gate actually runs on every push; a claim above
+        // the absence of the hook is the same lie the panel exists to kill.
+        "status_healthy": hook_installed,
         "export_fresh": export_fresh,
         "gate_point_resolved": gate_point.is_some(),
         // Read out of the installed hook's PROJECT_GATES, not assumed from
@@ -3240,6 +3277,19 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 
+    /// R5: an "installed" hook must carry the executable bit, so fixtures
+    /// asserting `hook_installed: true` install it the way the installer does.
+    fn write_exec_hook(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
     // hook hash marker tests (Task 1)
     #[test]
     fn hook_sha256_is_64_hex() {
@@ -3432,11 +3482,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             "#!/bin/bash\n# NeuroStrata task gate marker\n",
-        )
-        .unwrap();
+        );
 
         let (wiring_block, verified, wire_instruction) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3554,11 +3603,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
         // install the scaffold exactly as the installer would
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
 
         let (wiring_block, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3592,7 +3640,7 @@ mod tests {
             "    # ./scripts/rules-gate.sh",
             "    ./scripts/rules-gate.sh\n    ./scripts/typecheck.sh",
         );
-        std::fs::write(root.join(".git").join("hooks").join("pre-push"), hook).unwrap();
+        write_exec_hook(&root.join(".git").join("hooks").join("pre-push"), &hook);
 
         let (_, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3613,11 +3661,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
 
         let (_, _, wire_instruction) = wiring_panel(&root, "MyProj");
         assert_eq!(
@@ -3691,11 +3738,10 @@ mod tests {
         git_in(&root, &["init", "-q"]);
         std::fs::create_dir_all(root.join(".githooks")).unwrap();
         git_in(&root, &["config", "core.hooksPath", ".githooks"]);
-        std::fs::write(
-            root.join(".githooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".githooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
 
         let (_, verified, _) = wiring_panel(&root, "MyProj");
         assert_eq!(verified["hook_installed"], json!(true));
@@ -3717,11 +3763,10 @@ mod tests {
         git_in(&root, &["init", "-q"]);
         // the gate that used to run
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
-        std::fs::write(
-            root.join(".git").join("hooks").join("pre-push"),
+        write_exec_hook(
+            &root.join(".git").join("hooks").join("pre-push"),
             SCAFFOLDED_PRE_PUSH_HOOK,
-        )
-        .unwrap();
+        );
         // hooks moved, and nothing was installed at the new location
         std::fs::create_dir_all(root.join(".githooks")).unwrap();
         git_in(&root, &["config", "core.hooksPath", ".githooks"]);

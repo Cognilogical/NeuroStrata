@@ -39,6 +39,7 @@
 //! live reflection in the store.
 #[cfg(test)]
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -135,13 +136,32 @@ pub fn load_overlay(mesh_dir: &Path) -> Overlay {
     let file = conflicts_dir_for(mesh_dir).join(OVERLAY_FILE_NAME);
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
-        Err(_) => return Overlay::empty(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Overlay::empty(),
+        Err(e) => {
+            tracing::warn!(
+                "corrupt or incompatible mesh conflict overlay at {}: read failed ({e}) — treating as empty",
+                file.display()
+            );
+            return Overlay::empty();
+        }
     };
     let overlay: Overlay = match serde_json::from_str(&text) {
         Ok(o) => o,
-        Err(_) => return Overlay::empty(),
+        Err(e) => {
+            tracing::warn!(
+                "corrupt or incompatible mesh conflict overlay at {}: parse failed ({e}) — treating as empty",
+                file.display()
+            );
+            return Overlay::empty();
+        }
     };
     if overlay.schema_version != OVERLAY_SCHEMA_VERSION {
+        tracing::warn!(
+            "corrupt or incompatible mesh conflict overlay at {}: schema_version {:?} (expected {:?}) — treating as empty",
+            file.display(),
+            overlay.schema_version,
+            OVERLAY_SCHEMA_VERSION
+        );
         return Overlay::empty();
     }
     overlay
@@ -155,14 +175,20 @@ pub fn save_overlay(mesh_dir: &Path, overlay: &Overlay) -> anyhow::Result<()> {
         .with_context(|| format!("conflicts dir could not be created at {}", dir.display()))?;
     let file = dir.join(OVERLAY_FILE_NAME);
     let tmp = file.with_extension("json.tmp");
-    std::fs::write(
-        &tmp,
-        format!(
-            "{}\n",
-            serde_json::to_string(overlay).context("overlay serialization")?
-        ),
-    )
-    .with_context(|| format!("overlay tmp could not be written at {}", tmp.display()))?;
+    let json = format!(
+        "{}\n",
+        serde_json::to_string(overlay).context("overlay serialization")?
+    );
+    // Write → flush to disk → rename, so the rename can never publish a
+    // truncated or not-yet-durable buffer (the module doc's durability
+    // guarantee for the overlay).
+    let mut out = std::fs::File::create(&tmp)
+        .with_context(|| format!("overlay tmp could not be created at {}", tmp.display()))?;
+    out.write_all(json.as_bytes())
+        .with_context(|| format!("overlay tmp could not be written at {}", tmp.display()))?;
+    out.sync_all()
+        .with_context(|| format!("overlay tmp could not be flushed at {}", tmp.display()))?;
+    drop(out);
     std::fs::rename(&tmp, &file).with_context(|| {
         format!(
             "overlay could not be moved into place at {}",

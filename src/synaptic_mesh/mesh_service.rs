@@ -158,7 +158,7 @@ impl MeshService {
             let storage = MeshStorage::open(&dir).map_err(|e| format!("{:#}", e))?;
             if storage.manifest().mesh_id.to_string() != mesh_id {
                 return Err(format!(
-                    "no mesh joined — pointer names mesh {} but {} holds {}",
+                    "corrupt mesh pointer — pointer names mesh {} but {} holds {}",
                     mesh_id,
                     dir.display(),
                     storage.manifest().mesh_id
@@ -190,7 +190,7 @@ impl MeshService {
         let m = storage.manifest();
         if m.mesh_id.to_string() != mesh_id {
             return Err(format!(
-                "no mesh joined — pointer names mesh {} but {} holds {}",
+                "corrupt mesh pointer — pointer names mesh {} but {} holds {}",
                 mesh_id,
                 dir.display(),
                 m.mesh_id
@@ -305,10 +305,28 @@ impl MeshService {
                             let remote = remote.to_string();
                             // The status path runs on sync trait signatures; block the
                             // probe in-place so nested block_on is legal on worker
-                            // threads of the multi-threaded runtime.
-                            let probe = tokio::task::block_in_place(|| {
-                                handle.block_on(self.federated_remote_list(&remote, &ns, ""))
-                            });
+                            // threads of the multi-threaded runtime. A current-thread
+                            // runtime (e.g. #[tokio::test]) has no multi-thread worker
+                            // pool for block_in_place, so the probe runs on a scoped
+                            // OS thread instead.
+                            let probe = if handle.runtime_flavor()
+                                == tokio::runtime::RuntimeFlavor::MultiThread
+                            {
+                                tokio::task::block_in_place(|| {
+                                    handle.block_on(self.federated_remote_list(&remote, &ns, ""))
+                                })
+                            } else {
+                                std::thread::scope(|s| {
+                                    s.spawn(|| {
+                                        handle.clone().block_on(self.federated_remote_list(
+                                            &remote, &ns, "",
+                                        ))
+                                    })
+                                    .join()
+                                    .map_err(|_| "federated probe thread panicked".to_string())
+                                    .and_then(|probe| probe)
+                                })
+                            };
                             match probe {
                                 Ok(rows) => lines.push(format!(
                                     "federated remote {remote} {ns}: {} record(s)",
@@ -732,6 +750,17 @@ impl StorageApi for MeshService {
 
     fn push(&mut self) -> Result<String, String> {
         let storage = self.joined()?;
+        // A remote added after this process's initial open (e.g. a teammate's
+        // `join --remote` on the same checkout) must be visible without a
+        // restart: when the cached manifest says "no remote", re-read it from
+        // disk and adopt the fresher storage if a remote now exists.
+        if storage.manifest().remote.is_none() {
+            if let Ok(refreshed) = MeshStorage::open(storage.root()) {
+                if refreshed.manifest().remote.is_some() {
+                    *storage = refreshed;
+                }
+            }
+        }
         // Ordering matters: a mesh with no remote is a CONFIG error and must
         // surface as one even before its first commit. Only a configured
         // mesh gets the "nothing to publish yet" courtesy (a fresh init has

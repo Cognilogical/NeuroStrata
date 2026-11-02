@@ -202,7 +202,10 @@ pub async fn project_federated_sparql_dataset_async(
     let mut dataset = oxrdf::Dataset::new();
     let search_results = match store.list_memories(namespace, None, None).await {
         Ok(r) => r,
-        Err(_) => return (dataset, false),
+        Err(e) => {
+            tracing::warn!("federation dataset load failed for namespace '{}': {e}", namespace);
+            return (dataset, false);
+        }
     };
 
     let now = std::time::SystemTime::now()

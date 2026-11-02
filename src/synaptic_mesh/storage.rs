@@ -111,7 +111,7 @@ impl MeshStorage {
         mesh_dir: &Path,
         remote: Option<&str>,
     ) -> Result<()> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("pointer dir could not be created at {}", parent.display())
@@ -130,7 +130,7 @@ impl MeshStorage {
 
     /// Read the project pointer. `Ok(None)` when the project has no mesh.
     pub fn read_pointer(project: &Path) -> Result<Option<(Uuid, PathBuf, Option<String>)>> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -169,7 +169,7 @@ impl MeshStorage {
     /// `leave()`: drop the project's link to the mesh. Idempotent — a project
     /// with no pointer is already left.
     pub fn remove_pointer(project: &Path) -> Result<()> {
-        let path = pointer_path(project);
+        let path = Self::pointer_path(project);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -192,7 +192,7 @@ impl MeshStorage {
     /// in the caller, never a fallback.
     pub fn commit_all(&self, message: &str, node_id: &str) -> Result<bool> {
         run_ok(&self.root, &["add", "-A"])?;
-        let staged = run(&self.root, &["status", "--porcelain"])?;
+        let staged = run_ok(&self.root, &["status", "--porcelain"])?;
         if String::from_utf8_lossy(&staged.stdout).trim().is_empty() {
             return Ok(false);
         }
@@ -248,10 +248,11 @@ impl MeshStorage {
             ),
         }
     }
-}
 
-fn pointer_path(project: &Path) -> PathBuf {
-    project.join(POINTER_DIR_NAME).join(POINTER_FILE_NAME)
+    /// The project-side pointer path: `<project>/.NeuroStrata/synaptic-mesh-ref`.
+    pub(crate) fn pointer_path(project: &Path) -> PathBuf {
+        project.join(POINTER_DIR_NAME).join(POINTER_FILE_NAME)
+    }
 }
 
 fn write_manifest(root: &Path, manifest: &MeshManifest) -> Result<()> {

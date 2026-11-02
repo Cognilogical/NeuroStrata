@@ -208,6 +208,9 @@ pub fn validate_canonical_rdf(
 ) -> Result<(), Vec<String>> {
     use crate::synaptic_mesh::import::{MAX_RDF_QUADS_BYTES, MAX_RDF_QUADS_COUNT};
     let mut violations: Vec<String> = Vec::new();
+    if !record.metadata.is_object() {
+        violations.push("record.metadata must be a JSON object".to_string());
+    }
     if rdf.schema != "neurostrata-rdf-record/v1" {
         violations.push(format!(
             "rdf.schema is {} (expected neurostrata-rdf-record/v1)",

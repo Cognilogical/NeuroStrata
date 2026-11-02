@@ -51,9 +51,16 @@ pub(crate) struct BufferConfig {
 
 pub(crate) fn load_config() -> BufferConfig {
     let path = dirs::home_dir().map(|h| h.join(".config").join("neurostrata").join("config.json"));
-    let raw = path
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let raw = path.and_then(|p| match std::fs::read_to_string(p) {
+        Ok(s) => match serde_json::from_str::<Value>(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("Failed to parse buffer config.json: {e}");
+                None
+            }
+        },
+        Err(_) => None,
+    });
     let value = raw.unwrap_or_else(|| json!({}));
     BufferConfig {
         enabled: value

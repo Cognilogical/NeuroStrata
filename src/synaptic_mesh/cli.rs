@@ -78,11 +78,6 @@ pub struct MeshContext {
     pub node_id: String,
 }
 
-/// The pointer file a project carries to name its mesh.
-fn pointer_path(project: &std::path::Path) -> std::path::PathBuf {
-    project.join(".NeuroStrata").join("synaptic-mesh-ref")
-}
-
 /// The one message every "no mesh joined" path answers with.
 fn no_mesh_joined() -> &'static str {
     "no mesh joined — run `neurostrata-mcp synaptic-mesh init <name>` first"
@@ -122,7 +117,7 @@ pub fn handle_synaptic_mesh_command(
         SynapticMeshCommands::Pull => render(store.pull(), |line| line),
         SynapticMeshCommands::Status => render(store.status(), |line| line),
         SynapticMeshCommands::Leave => {
-            let pointer = pointer_path(&ctx.project_root);
+            let pointer = super::storage::MeshStorage::pointer_path(&ctx.project_root);
             render(store.remove_pointer(&ctx.project_root), |()| {
                 format!("left mesh — pointer removed at {}", pointer.display())
             })

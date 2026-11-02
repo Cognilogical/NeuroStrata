@@ -106,8 +106,14 @@ impl TantivyLexicalIndex {
     pub fn open_or_create(index_dir: &Path) -> Result<Self> {
         let version_path = index_dir.join("index_version.txt");
         let needs_rebuild = if version_path.exists() {
-            let existing = std::fs::read_to_string(&version_path).unwrap_or_default();
-            existing.trim() != INDEX_VERSION
+            match std::fs::read_to_string(&version_path) {
+                Ok(existing) => existing.trim() != INDEX_VERSION,
+                Err(e) => {
+                    tracing::warn!("failed to read lexical index version file {}: {e}", version_path.display());
+                    // Transient read error: do NOT trigger a full remove_dir_all.
+                    false
+                }
+            }
         } else {
             true
         };
@@ -226,6 +232,8 @@ impl TantivyLexicalIndex {
         if let Some(w) = self.writer.lock().unwrap().as_mut() {
             let term = Term::from_field_text(self.id_f, &composite);
             w.delete_term(term);
+        } else {
+            tracing::warn!("lexical index is in read-only mode; skipping mutation for {composite}");
         }
 
         if Self::is_excluded(payload) {
@@ -276,6 +284,8 @@ impl TantivyLexicalIndex {
             w.commit()?;
             self.dirty.store(true, Ordering::SeqCst);
             self.reader.reload()?;
+        } else {
+            tracing::warn!("lexical index is in read-only mode; skipping mutation for {composite}");
         }
         Ok(())
     }

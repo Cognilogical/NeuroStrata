@@ -627,6 +627,7 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
     }
 
     if entity_ids.len() < 2 {
+        tracing::warn!("namespace '{}' has fewer than 2 entities ({}); KGE training using minimal bootstrap pair", scope, entity_ids.len());
         entity_ids = vec!["entity1".to_string(), "entity2".to_string()];
         edges = vec![];
     }
@@ -654,7 +655,9 @@ pub fn cli_train(namespace: Option<&str>, all: bool, epochs: Option<u32>, dim: O
         if let Ok(cfg) = crate::config::Config::from_default_path() {
             let (db_model_path, db_meta_path) = artifact_paths(std::path::Path::new(&cfg.db_path), scope);
             if db_model_path != model_path {
-                let _ = model.save(&db_model_path, &db_meta_path, epochs, edges.len(), model.final_loss, Some(effective_weight));
+                if let Err(e) = model.save(&db_model_path, &db_meta_path, epochs, edges.len(), model.final_loss, Some(effective_weight)) {
+                    tracing::warn!("Failed to mirror KGE model artifact to {}: {e}", db_model_path.display());
+                }
             }
         }
     }
