@@ -1209,6 +1209,17 @@ fn preserve_unclean_wal(local_path: &std::path::Path) {
     }
 }
 
+impl Drop for LadybugStore {
+    fn drop(&mut self) {
+        if self.dirty.take() {
+            if let Ok(conn) = Connection::new(&self.db) {
+                if let Err(e) = conn.query("CHECKPOINT;") {
+                    tracing::warn!("LadybugStore drop CHECKPOINT failed: {e}");
+                }
+            }
+        }
+    }
+}
 impl LadybugStore {
     /// Construct a `LadybugStore` for tests with a small system footprint so
     /// `cargo test` (parallel by default) does not mmap-reserve 8 TiB per
@@ -2343,7 +2354,13 @@ impl LadybugStore {
                     let mut resolution = if spec.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
                         match exact_target_exists(conn, &spec.target_id) {
                             Ok(true) => crate::traits::TargetResolution::Resolved(spec.target_id.clone()),
-                            Ok(false) => crate::traits::TargetResolution::Missing,
+                            Ok(false) => {
+                                if let Some(stripped) = spec.target_id.strip_prefix(&format!("{}{}", namespace, crate::parser::ingest::NAMESPACE_SEPARATOR)) {
+                                    resolve_target_on_write(conn, &namespace, stripped)
+                                } else {
+                                    crate::traits::TargetResolution::Missing
+                                }
+                            },
                             Err(e) => crate::traits::TargetResolution::Failed(e.to_string()),
                         }
                     } else {
@@ -2396,7 +2413,7 @@ impl LadybugStore {
 
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         let namespace = namespace.to_string();
-        self.with_conn(move |conn| {
+        self.write_with_deadline("repairing namespace hygiene", move |conn| {
             let safe = crate::store::ladybug::escape_ladybug_string(&namespace);
             let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.memory_type, m.location, m.content, m.metadata", safe);
             let mut res = conn.query(&query)?;
@@ -2480,7 +2497,7 @@ impl LadybugStore {
                         .unwrap_or_else(|| "legacy".to_string()));
                 }
                 // (b) dangling refs in edge arrays
-                let keys = ["governs","relates_to","contained_by","extracted_from","depends_on"];
+                let keys = ["governs","related_to","relates_to","contained_by","extracted_from","depends_on"];
                 let mut archived_refs: Vec<String> = meta.get("archived_refs").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
                 let mut unresolvable = Vec::new();
                 for k in &keys {
@@ -2493,8 +2510,18 @@ impl LadybugStore {
                                     unresolvable.push(t.to_string());
                                     continue;
                                 }
-                                let tid = if t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) { t.split(crate::parser::ingest::NAMESPACE_SEPARATOR).last().unwrap_or(t).to_string() } else { t.to_string() };
-                                let exists = known_ids.contains(&tid) || (tid.len() >= 7 && known_ids.iter().any(|k| k.starts_with(&tid)));
+                                // Check existence against known_ids, resolved targets, and prefix-unqualified resolution
+                                let ns_prefix = format!("{}{}", namespace, crate::parser::ingest::NAMESPACE_SEPARATOR);
+                                let exists = known_ids.contains(t)
+                                    || exact_target_exists(conn, t).unwrap_or(false)
+                                    || if let Some(stripped) = t.strip_prefix(&ns_prefix) {
+                                        matches!(resolve_target_on_write(conn, &namespace, stripped), crate::traits::TargetResolution::Resolved(_))
+                                    } else if !t.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                                        matches!(resolve_target_on_write(conn, &namespace, t), crate::traits::TargetResolution::Resolved(_))
+                                    } else {
+                                        false
+                                    }
+                                    || (t.len() >= 7 && known_ids.iter().filter(|k| k.starts_with(t)).count() == 1);
                                 if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
                             } else { kept.push(item.clone()); }
                         }
@@ -2506,7 +2533,7 @@ impl LadybugStore {
                     meta.as_object_mut().unwrap().insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
                     dangling_changed = true;
                 }
-                if shape_changed || content_backfill.is_some() {
+                if shape_changed || dangling_changed || content_backfill.is_some() {
                     let has_backfill = content_backfill.is_some();
                     let q_meta = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'", crate::store::ladybug::escape_ladybug_string(&namespace), crate::store::ladybug::escape_ladybug_string(id), crate::store::ladybug::escape_ladybug_string(&meta.to_string()));
                     if let Err(e) = conn.query(&q_meta) {
@@ -2637,7 +2664,7 @@ impl LadybugStore {
     }
 
     fn lexical_apply_doc(&self, doc: crate::fts::LexicalDoc) {
-        if let Some(ref idx) = *self.tantivy_lexical.read().expect("tantivy lock") {
+        if let Some(ref idx) = *self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()) {
             let mut meta = serde_json::Map::new();
             if !doc.symbol.is_empty() {
                 meta.insert("symbol".to_string(), Value::String(doc.symbol.clone()));
@@ -2679,7 +2706,7 @@ impl LadybugStore {
     }
 
     fn lexical_remove_doc(&self, namespace: &str, id: &str) {
-        if let Some(ref idx) = *self.tantivy_lexical.read().expect("tantivy lock") {
+        if let Some(ref idx) = *self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()) {
             if let Err(e) = idx.delete_memory(namespace, id) {
                 tracing::warn!("tantivy delete_memory failed for {namespace}:{id}: {e}");
             }
@@ -2761,7 +2788,7 @@ impl LadybugStore {
             .await?;
 
         {
-            let mut index = self.lexical.write().expect("lexical index lock");
+            let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
             for doc in docs {
                 index.add(doc);
             }
@@ -2788,7 +2815,7 @@ impl LadybugStore {
     }
 
     fn ensure_tantivy_open(&self) -> Result<()> {
-        if self.tantivy_lexical.read().expect("tantivy lock").is_some() {
+        if self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()).is_some() {
             return Ok(());
         }
         let dir = self.tantivy_index_dir();
@@ -2806,7 +2833,7 @@ impl LadybugStore {
         } else {
             crate::lexical::TantivyLexicalIndex::open_or_create(&dir)?
         };
-        *self.tantivy_lexical.write().expect("tantivy lock") = Some(idx);
+        *self.tantivy_lexical.write().unwrap_or_else(|e| e.into_inner()) = Some(idx);
         Ok(())
     }
 
@@ -2858,7 +2885,7 @@ impl LadybugStore {
 
         self.ensure_tantivy_open()?;
         let indexed = {
-            let guard = self.tantivy_lexical.read().expect("tantivy lock");
+            let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
             idx.rebuild(&rows_data)?
         };
@@ -2877,11 +2904,11 @@ impl LadybugStore {
         principal: &str,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
         self.init(namespace).await?;
-        if self.tantivy_lexical.read().expect("tantivy lock").is_none() {
+        if self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner()).is_none() {
             let _ = self.rebuild_tantivy_lexical(Some(namespace)).await?;
         }
         let hits = {
-            let guard = self.tantivy_lexical.read().expect("tantivy lock");
+            let guard = self.tantivy_lexical.read().unwrap_or_else(|e| e.into_inner());
             let idx = guard.as_ref().expect("tantivy open");
             idx.search(
                 namespace,
@@ -3662,18 +3689,38 @@ impl VectorStore for LadybugStore {
                     match exact_target_exists(conn, &edge.target_id) {
                         Ok(true) => edge.target_id.clone(),
                         Ok(false) => {
-                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
-                                rel_type: edge.rel_type.to_string(),
-                                declared_target: edge.target_id.clone(),
-                                declaration_index: edge.declaration_index,
-                                resolution: crate::traits::TargetResolution::Missing,
-                            });
-                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
-                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
-                                why: "qualified target does not exist".to_string(),
-                                skipped: "this edge materialization".to_string(),
-                            });
-                            continue;
+                            if let Some(stripped) = edge.target_id.strip_prefix(&format!("{}{}", namespace, crate::parser::ingest::NAMESPACE_SEPARATOR)) {
+                                match resolve_target_on_write(conn, &namespace, stripped) {
+                                    crate::traits::TargetResolution::Resolved(found) => found,
+                                    _ => {
+                                        deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                            rel_type: edge.rel_type.to_string(),
+                                            declared_target: edge.target_id.clone(),
+                                            declaration_index: edge.declaration_index,
+                                            resolution: crate::traits::TargetResolution::Missing,
+                                        });
+                                        emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                            field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                            why: "qualified target does not exist".to_string(),
+                                            skipped: "this edge materialization".to_string(),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                    rel_type: edge.rel_type.to_string(),
+                                    declared_target: edge.target_id.clone(),
+                                    declaration_index: edge.declaration_index,
+                                    resolution: crate::traits::TargetResolution::Missing,
+                                });
+                                emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                    field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                    why: "qualified target does not exist".to_string(),
+                                    skipped: "this edge materialization".to_string(),
+                                });
+                                continue;
+                            }
                         }
                         Err(e) => {
                             deferred_edges.push(crate::traits::EdgeResolutionStatus {
@@ -4091,7 +4138,7 @@ impl VectorStore for LadybugStore {
         };
 
         {
-            let mut index = self.lexical.write().expect("lexical index lock");
+            let mut index = self.lexical.write().unwrap_or_else(|e| e.into_inner());
             let mut loaded = self
                 .lexical_loaded
                 .write()

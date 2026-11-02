@@ -539,7 +539,7 @@ static CLAIM_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()
 /// honest atomicity mechanism.
 fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     let registry = CLAIM_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut map = registry.lock().expect("claim lock registry poisoned");
+    let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
     map.retain(|_, lock| lock.strong_count() > 0);
     if let Some(lock) = map.get(task_id).and_then(Weak::upgrade) {
         return lock;

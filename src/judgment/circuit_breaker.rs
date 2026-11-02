@@ -44,7 +44,7 @@ impl CircuitBreaker {
             .unwrap()
             .as_secs();
 
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         match *state {
             CircuitState::Closed => true,
@@ -55,7 +55,7 @@ impl CircuitBreaker {
                     // also claims the single probe slot; a racing caller must
                     // not sneak a second probe in through this branch.
                     drop(state);
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     *state = CircuitState::HalfOpen;
                     tracing::debug!(
                         last_failure_epoch_secs = self.last_failure_epoch_secs(),
@@ -85,7 +85,7 @@ impl CircuitBreaker {
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::SeqCst);
         self.half_open_probe_in_flight.store(false, Ordering::SeqCst);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *state = CircuitState::Closed;
     }
 
@@ -112,7 +112,7 @@ impl CircuitBreaker {
 
             self.backoff_until.store(backoff_until, Ordering::SeqCst);
 
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             *state = CircuitState::Open;
 
             tracing::warn!(
@@ -135,7 +135,7 @@ impl CircuitBreaker {
 
     /// Get current circuit state (for monitoring).
     pub fn state(&self) -> String {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         format!("{:?}", *state)
     }
 

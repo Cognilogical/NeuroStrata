@@ -338,7 +338,7 @@ impl DeduplicationChecker {
 
     /// The last recorded shadow provider verdict, if any: (provider name, judgments).
     pub fn last_shadow_verdict(&self) -> Option<(String, DuplicateVerdict)> {
-        self.last_shadow.lock().expect("last_shadow lock").clone()
+        self.last_shadow.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Test-only constructor injecting both an active and a shadow provider.

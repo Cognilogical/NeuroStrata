@@ -3597,10 +3597,10 @@ async fn run() -> anyhow::Result<()> {
                         let embedder = build_embedder()?;
                         let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                             config.db_path.to_string_lossy().to_string(),
-                            embedder.dimensions(),
+                            embed::configured_dimensions()?,
                         )?);
-                        match crate::task::import_beads(
-                            vector_store,
+                        let res = match crate::task::import_beads(
+                            vector_store.clone(),
                             embedder.clone(),
                             &namespace,
                             &from_beads,
@@ -3612,7 +3612,13 @@ async fn run() -> anyhow::Result<()> {
                                 eprintln!("{}", e);
                                 std::process::exit(1);
                             }
+                        };
+                        if vector_store.is_dirty() {
+                            if let Err(e) = vector_store.checkpoint().await {
+                                tracing::warn!("task import checkpoint failed: {e}");
+                            }
                         }
+                        res
                     };
                     let get = |k: &str| summary_json.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                     println!(
@@ -3847,6 +3853,97 @@ async fn run() -> anyhow::Result<()> {
                             run_list(&read, namespace).await?;
                             return Ok(());
                         }
+                        Commands::Delete { namespace, id } => {
+                            let res = daemon_operator_client()
+                                .post(format!("http://{DAEMON_ADDR}/delete"))
+                                .json(&serde_json::json!({ "namespace": namespace, "id": id }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("delete request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("Memory deleted successfully.");
+                                return Ok(());
+                            }
+                            eprintln!("Delete failed: {}", body);
+                            std::process::exit(1);
+                        }
+                        Commands::Archive { namespace, id } => {
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/memory/archive"))
+                                .json(&serde_json::json!({ "namespace": namespace, "id": id }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("archive request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("{}", body);
+                                return Ok(());
+                            }
+                            eprintln!("{}", body);
+                            std::process::exit(1);
+                        }
+                        Commands::Edit { namespace, id, new_namespace, content, location } => {
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/edit"))
+                                .json(&serde_json::json!({
+                                    "old_namespace": namespace,
+                                    "id": id,
+                                    "new_namespace": new_namespace,
+                                    "content": content,
+                                    "location": location,
+                                }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("edit request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("Successfully edited memory {}", id);
+                                return Ok(());
+                            }
+                            if status == reqwest::StatusCode::NOT_FOUND {
+                                eprintln!("No memory with id {} in namespace {}.", id, namespace);
+                                std::process::exit(1);
+                            }
+                            if status == reqwest::StatusCode::CONFLICT {
+                                eprintln!("{} was written by directory ingestion, so the next ingest would overwrite an edit. Change the file and ingest again instead.", id);
+                                std::process::exit(1);
+                            }
+                            eprintln!("Edit failed: {}", body);
+                            std::process::exit(1);
+                        }
+                        Commands::SetMetadata { namespace, id, metadata } => {
+                            let new_metadata: serde_json::Value = serde_json::from_str(metadata).map_err(|e| anyhow::anyhow!("Invalid JSON metadata: {}", e))?;
+                            let res = daemon_http_client()
+                                .post(format!("http://{DAEMON_ADDR}/set-metadata"))
+                                .json(&serde_json::json!({
+                                    "namespace": namespace,
+                                    "id": id,
+                                    "metadata": new_metadata,
+                                }))
+                                .send()
+                                .await
+                                .map_err(|e| anyhow::anyhow!("set-metadata request failed: {e}"))?;
+                            let status = res.status();
+                            let body = res.text().await.unwrap_or_default();
+                            if status.is_success() {
+                                println!("Successfully updated metadata for memory {}", id);
+                                return Ok(());
+                            }
+                            if status == reqwest::StatusCode::NOT_FOUND {
+                                eprintln!("No memory with id {} in namespace {}.", id, namespace);
+                                std::process::exit(1);
+                            }
+                            if status == reqwest::StatusCode::CONFLICT {
+                                eprintln!("{} was written by directory ingestion and cannot be updated.", id);
+                                std::process::exit(1);
+                            }
+                            eprintln!("Set-metadata failed: {}", body);
+                            std::process::exit(1);
+                        }
                         _ => {}
                     }
                     eprintln!("CRITICAL ERROR: The NeuroStrata daemon is currently running (likely via OpenCode) and holds the database lock.");
@@ -3860,10 +3957,9 @@ async fn run() -> anyhow::Result<()> {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
                 }
-                let embedder = build_embedder()?;
                 let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
+                    embed::configured_dimensions()?,
                 )?);
                 let read = ReadSource::Direct(vector_store.clone());
 
@@ -3907,6 +4003,7 @@ async fn run() -> anyhow::Result<()> {
                             question,
                             top_k,
                         } => {
+                            let embedder = build_embedder()?;
                             let args = serde_json::json!({
                                 "namespace": namespace,
                                 "question": question,
@@ -3978,6 +4075,7 @@ async fn run() -> anyhow::Result<()> {
                         dry_run: _,
                         dry_run_mode: _,
                     } => {
+                        let embedder = build_embedder()?;
                         let dir = cli_ingest_root(&dir);
                         let dir_path = std::path::Path::new(&dir);
                         let schema_str = if let Some(path) = schema_path {
@@ -4014,7 +4112,7 @@ async fn run() -> anyhow::Result<()> {
                             dir_path,
                             &schema,
                             embedder,
-                            vector_store,
+                            vector_store.clone(),
                             &namespace,
                             // The CLI has nowhere to report progress to: it
                             // is already printing each file as it goes.
@@ -4238,6 +4336,7 @@ async fn run() -> anyhow::Result<()> {
                         content,
                         location,
                     } => {
+                        let embedder = build_embedder()?;
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -4261,6 +4360,7 @@ async fn run() -> anyhow::Result<()> {
                         content,
                         location,
                     } => {
+                        let embedder = build_embedder()?;
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,
@@ -4335,6 +4435,11 @@ async fn run() -> anyhow::Result<()> {
                     // THE OUTER match already handles Learn (src/main.rs ~2822);
                     // this inner catch-all can never see it.
                     | Commands::Learn { .. } => unreachable!(),
+                }
+                if vector_store.is_dirty() {
+                    if let Err(e) = vector_store.checkpoint().await {
+                        tracing::warn!("final CLI checkpoint failed: {e}");
+                    }
                 }
             }
         }
