@@ -70,10 +70,23 @@ pub fn propagate_domains(
 ) -> Vec<PropagatedTag> {
     let config = config.clamped();
 
+    // Epoch-timestamped validity must be judged against the wall clock, so it
+    // is computed once per propagation pass, before the adjacency build below.
+    let now_secs = chrono::Utc::now().timestamp();
+
     // Deterministic adjacency for the relations that may carry attributes.
     let mut adjacency: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
     for edge in edges {
         if !is_propagation_relation(&edge.relation) {
+            continue;
+        }
+        // An inverted validity window can only be a data error (or an expired
+        // row that was never retired); it is never a live relationship. An
+        // epoch-timestamped `valid_to` in the past is the same: expired.
+        if edge.valid_to > 0
+            && ((edge.valid_from > 0 && edge.valid_to < edge.valid_from)
+                || (edge.valid_to >= 1_000_000_000 && edge.valid_to < now_secs))
+        {
             continue;
         }
         adjacency
@@ -109,7 +122,7 @@ pub fn propagate_domains(
             confidence: 1.0,
             propagation_path: vec![key.0.clone()],
         });
-        queue.push_back((key.0, key.1, 1.0, queue_path(node)));
+        queue.push_back((key.0, key.1, 1.0, vec![node.to_string()]));
     }
 
     while let Some((node, domain, confidence, path)) = queue.pop_front() {
@@ -154,10 +167,6 @@ pub fn propagate_domains(
             .then_with(|| a.domain.cmp(&b.domain))
     });
     tags
-}
-
-fn queue_path(node: &str) -> Vec<String> {
-    vec![node.to_string()]
 }
 
 #[cfg(test)]
@@ -250,6 +259,22 @@ mod tests {
         let tags = propagate_domains(&[seed("a", "auth")], &edges, &PropagationConfig::default());
         let ids: Vec<&str> = tags.iter().map(|t| t.node_id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn expired_epoch_validity_edges_are_skipped() {
+        // `valid_to: 1_700_000_000` is 2023-11-14 — long past the wall clock.
+        let mut expired = edge("rule", "GOVERNS", "stale_file");
+        expired.valid_to = 1_700_000_000;
+        let live = edge("rule", "GOVERNS", "live_file");
+        let tags = propagate_domains(
+            &[seed("rule", "auth")],
+            &[live, expired],
+            &PropagationConfig::default(),
+        );
+        let ids: Vec<&str> = tags.iter().map(|t| t.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["live_file", "rule"]);
+        assert!(!tags.iter().any(|t| t.node_id == "stale_file"));
     }
 
     #[test]

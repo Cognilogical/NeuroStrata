@@ -17,6 +17,15 @@
 
 #[path = "../src/recall_metrics.rs"]
 mod recall_metrics;
+// The upgraded-search filter module is also deliberately `crate::`-free, so
+// the exact-identifier behavior below is exercised against the real shipped
+// code compiled from its source path — not a transcription.
+#[path = "../src/search.rs"]
+mod search;
+
+use search::{
+    fact_shape_matches, is_stale_for_filter, path_prefix_matches, type_allowed, SearchFilters,
+};
 
 use recall_metrics::{
     record_domain_query, record_promotion, record_recall, recall_snapshot,
@@ -146,4 +155,68 @@ fn raw_distance_lane_source_carries_the_semantic_contract() {
             "traits.rs must declare the contract name: {name}"
         );
     }
+}
+
+// ── 3. exact-identifier / exact-match behavioral lane ───────────────────────
+
+/// The exact-matching predicate behavior, exercised on the real shipped
+/// `src/search.rs` compiled from its source path above: identifiers match by
+/// exact equality (never by substring or case-folding), the path prefix is a
+/// real boundary-prefix match, a fact's shape is keyed by the exact
+/// `decision` object presence, and staleness excludes exact "changed" source
+/// currency only when semantic verification is not "verified".
+#[test]
+fn exact_match_predicates_match_exactly_and_nothing_else() {
+    // Exact type identity: a declared list matches those types and only
+    // those; a case variant is a different identifier and must not pass.
+    let filters = SearchFilters {
+        memory_types: vec!["fact".to_string()],
+        fact_shape: None,
+        path_prefix: None,
+        exclude_stale: false,
+        include_code_ast: false,
+    };
+    assert!(type_allowed("fact", &filters));
+    assert!(!type_allowed("Fact", &filters), "match is case-exact");
+    assert!(!type_allowed("factor", &filters), "match is not a substring");
+    assert!(!type_allowed("code_ast", &filters));
+
+    // code_ast stays opt-in.
+    let with_ast = SearchFilters {
+        memory_types: vec![],
+        fact_shape: None,
+        path_prefix: None,
+        exclude_stale: false,
+        include_code_ast: true,
+    };
+    assert!(type_allowed("fact", &with_ast));
+    assert!(type_allowed("code_ast", &with_ast));
+
+    // Path prefix: a real segment-boundary-anchored starts_with, empty
+    // prefix means "no filter", not "match nothing".
+    assert!(path_prefix_matches("src/store/ladybug.rs", Some("src/")));
+    assert!(
+        !path_prefix_matches("src/store/ladybug.rs", Some("sources/")),
+        "a wrong prefix must not match"
+    );
+    assert!(path_prefix_matches("anything", Some("")));
+    assert!(path_prefix_matches("anything", None));
+
+    // Fact shape: exact-shaped keys, checked on the decision object itself.
+    assert!(fact_shape_matches(&serde_json::json!({"decision": {"component": "c"}}), "decision"));
+    assert!(!fact_shape_matches(&serde_json::json!({"Decision": {}}), "decision"), "key is exact");
+    assert!(!fact_shape_matches(&serde_json::json!({"decision": null}), "decision"), "a null key is absent");
+    assert!(fact_shape_matches(&serde_json::json!({"topology": {}}), "topology"));
+    assert!(fact_shape_matches(&serde_json::json!({}), "any"));
+
+    // Staleness: exclude exactly "changed"-unless-verified, nothing else.
+    let changed_unverified =
+        serde_json::json!({"source_currency": "changed", "verification": {"status": "unverified"}});
+    let changed_verified =
+        serde_json::json!({"source_currency": "changed", "verification": {"status": "verified"}});
+    let untouched = serde_json::json!({"source_currency": "unchanged"});
+    assert!(is_stale_for_filter(&changed_unverified));
+    assert!(!is_stale_for_filter(&changed_verified));
+    assert!(!is_stale_for_filter(&untouched));
+    assert!(!is_stale_for_filter(&serde_json::json!({})));
 }

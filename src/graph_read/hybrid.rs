@@ -1,5 +1,7 @@
-/// Normalized vector distance in [0.0, 1.0] (lower = better).
-/// Reuses existing capped usage + provenance + feedback gain.
+/// Normalize a vector-search distance into `[0.0, 1.0]` (lower = better).
+/// The distance is clamped to that range first, then a signed feedback gain
+/// (itself clamped to ±0.5) is subtracted, and the result is re-clamped so the
+/// output always stays inside `[0.0, 1.0]`.
 pub fn normalize_vec(distance: f32, feedback_gain: f32) -> f32 {
     // Clamp to [0, 1.0] and apply the same capped gain logic as in search_inner.
     let capped = distance.clamp(0.0, 1.0);
@@ -7,10 +9,10 @@ pub fn normalize_vec(distance: f32, feedback_gain: f32) -> f32 {
     (capped - capped_gain).clamp(0.0, 1.0)
 }
 
-/// Normalized graph distance in [0.0, 1.0].
-/// e.g. 1.0 / (1.0 + co_occurrence_count) or hop-weighted distance.
+/// Normalize a graph co-occurrence count into `[0.0, 1.0]`: higher counts mean
+/// stronger evidence (a smaller distance). `count == 0` scores `1.0` (no
+/// signal), and the score decays as `1.0 / (1.0 + count)`.
 pub fn normalize_graph(count: u64) -> f32 {
-    // Example: higher count → lower score (1.0 / (1.0 + count)) bounded to [0,1]
     1.0 / (1.0 + count as f32)
 }
 
@@ -35,8 +37,9 @@ pub enum SymbolMatchGrade {
     None,
 }
 
-/// Combine normalized distances into hybrid score.
-/// Weights must sum to 1.0.
+/// Combine normalized distances into one hybrid score in `[0.0, 1.0]`.
+/// Weights that do not sum to ~1.0 (within `1e-4`) are re-normalized by their
+/// sum so caller-supplied weights are honoured without drifting off scale.
 pub fn combine(
     d_vec: f32,
     d_graph: f32,
@@ -44,7 +47,13 @@ pub fn combine(
     weights: (f32, f32, f32),
 ) -> f32 {
     let (w_vec, w_graph, w_sym) = weights;
-    d_vec * w_vec + d_graph * w_graph + d_sym * w_sym
+    let w_sum = w_vec + w_graph + w_sym;
+    let raw = if (w_sum - 1.0).abs() > 1e-4 && w_sum > 0.0 {
+        (d_vec * w_vec + d_graph * w_graph + d_sym * w_sym) / w_sum
+    } else {
+        d_vec * w_vec + d_graph * w_graph + d_sym * w_sym
+    };
+    raw.clamp(0.0, 1.0)
 }
 
 /// Compute symbol match grade between a query text and a list of candidate symbols.
@@ -52,6 +61,11 @@ pub fn combine(
 pub fn compute_symbol_match(query: &str, candidate_symbols: &[String]) -> SymbolMatchGrade {
     // Simple implementation: exact match first, prefix next, token substring last.
     let query_lower = query.to_lowercase();
+    // An empty query matches everything as a prefix, which would grade every
+    // candidate as `Prefix`; treat it as "no query" instead.
+    if query_lower.is_empty() {
+        return SymbolMatchGrade::None;
+    }
     for sym in candidate_symbols {
         let sym_lower = sym.to_lowercase();
         if sym_lower == query_lower {

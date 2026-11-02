@@ -135,13 +135,26 @@ fn has_unattached_occurrence(text: &str, needle: &str) -> bool {
     false
 }
 
+/// The index surface the mention detector reads. Implementors that memoize
+/// the derived candidate map hand it back via [`SymbolIndex::cached_candidates`];
+/// the detector falls back to a fresh [`build_candidates`] derivation when
+/// the cache is absent.
+pub trait SymbolIndex {
+    /// Returns the candidate map when the implementor has it cached.
+    fn cached_candidates(&self) -> Option<std::collections::HashMap<String, String>> {
+        None
+    }
+}
+
 /// Detect mention symbol ids in `content` and `location`.
 pub fn detect_mentions(content: &str, location: &str, index: &KnownIds) -> Vec<String> {
     if content.len() > 1_048_576 {
         eprintln!("[neurostrata:mention] content exceeds 1 MiB; skipping detection");
         return Vec::new();
     }
-    let candidates = build_candidates(index);
+    let candidates = index
+        .cached_candidates()
+        .unwrap_or_else(|| build_candidates(index));
     if candidates.is_empty() {
         return Vec::new();
     }

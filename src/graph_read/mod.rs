@@ -1,4 +1,5 @@
-/// Deterministic graph-read capability: deterministic, zero-embedding lookups beside the vector store (`VectorStore`).
+/// Deterministic graph-read capability: file-scoped memory lookups (the memory
+/// rows anchored to one file path) beside the vector store (`VectorStore`).
 pub mod memories_for_file;
 pub mod related;
 

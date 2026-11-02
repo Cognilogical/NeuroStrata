@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-/// The four relations the traversal may follow (vocabulary v7).
+/// The five relations the traversal may follow (vocabulary v7).
 pub const DEFAULT_RELATIONS: [&str; 5] = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
 
 /// The default and maximum hop counts (spec §4.2: default 1, max 2).
@@ -88,12 +88,18 @@ pub fn is_allowed_relation(relation: &str) -> bool {
     DEFAULT_RELATIONS.contains(&relation)
 }
 
-/// Parse a caller-supplied direction, defaulting to `Both`.
+/// Parse a caller-supplied direction, defaulting to `Both`. An unrecognized
+/// non-empty value is warned about (warn-first, never fail the query) and read
+/// as `Both`.
 pub fn parse_direction(raw: Option<&str>) -> Direction {
     match raw {
         Some("outgoing") => Direction::Outgoing,
         Some("incoming") => Direction::Incoming,
-        _ => Direction::Both,
+        Some("both" | "") | None => Direction::Both,
+        Some(other) => {
+            tracing::warn!("unknown graph_read direction '{}'; defaulting to Both", other);
+            Direction::Both
+        }
     }
 }
 
@@ -171,12 +177,23 @@ pub struct TraversalEdge {
 }
 
 /// The chain of edges that led the traversal to one node. `kind` is `"direct"`
-/// for the seed and `"path"` otherwise.
+/// for the seed and `"path"` otherwise; the seed's entry is built by
+/// [`direct_evidence_for_seed`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidencePath {
     pub kind: String,
     pub path: Vec<TraversalEdge>,
     pub explanation: String,
+}
+
+/// Build the seed's own evidence entry: `kind == "direct"` with no edges,
+/// because the seed is the explicit query target and was never "reached".
+pub fn direct_evidence_for_seed() -> EvidencePath {
+    EvidencePath {
+        kind: "direct".to_string(),
+        path: Vec::new(),
+        explanation: "seed node (direct match)".to_string(),
+    }
 }
 
 /// A pagination cursor: the query fingerprint plus the generation the query ran
@@ -268,7 +285,7 @@ pub fn graph_read_related(
         return empty();
     }
 
-    // Relation allowlist: empty means the four defaults.
+    // Relation allowlist: empty means the five defaults.
     let allowed: HashSet<&str> = if relations.is_empty() {
         DEFAULT_RELATIONS.iter().copied().collect()
     } else {
@@ -396,6 +413,7 @@ pub fn graph_read_related(
     let mut evidence: Vec<EvidencePath> = Vec::new();
     for node in &all_nodes {
         if node.id == seed {
+            evidence.push(direct_evidence_for_seed());
             continue;
         }
         let mut path: Vec<TraversalEdge> = Vec::new();
@@ -570,10 +588,18 @@ pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> 
             let len = items.len();
             return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
         }
-        // Gather outgoing GOVERNS neighbors sorted lexicographically.
+        // Gather outgoing GOVERNS neighbors sorted lexicographically. Every
+        // matched edge counts against the edge budget here -- in the edge loop
+        // itself -- so edges to already-visited neighbours are counted too.
         let mut neighbors: Vec<String> = Vec::new();
         for edge in edges {
             if edge.relation == "GOVERNS" && edge.source == current {
+                edge_crossed += 1;
+                if edge_crossed > budget.max_edges {
+                    truncated = true;
+                    let len = items.len();
+                    return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
+                }
                 neighbors.push(edge.target.clone());
             }
         }
@@ -590,16 +616,9 @@ pub fn closure_governs(root: &str, edges: &[EdgeSpec], budget: &QueryBudget) -> 
                 continue;
             }
             // Hard cap on nodes.
-            if items.len() >= budget.max_nodes {
+            if visited.len() >= budget.max_nodes {
                 truncated = true;
                 // Stop expanding further.
-                let len = items.len();
-                return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
-            }
-            // Hard cap on edges.
-            edge_crossed += 1;
-            if edge_crossed > budget.max_edges {
-                truncated = true;
                 let len = items.len();
                 return build_result(items, truncated, budget, true, "closure_governs".to_string(), len);
             }

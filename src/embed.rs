@@ -42,28 +42,6 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
 
     let config_path = config_dir.join("embedders.json");
 
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
-        if let Ok(mut models) = serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
-            if !models.is_empty() {
-                // Backfill known pins for configs written before supply-chain
-                // verification existed; unknown models remain unpinned and fail
-                // closed at load time.
-                for model in &mut models {
-                    if model.model_sha256.is_none()
-                        && model.model_name.eq_ignore_ascii_case("NomicEmbedTextV15")
-                    {
-                        model.model_sha256 = Some(
-                            "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
-                                .to_string(),
-                        );
-                    }
-                }
-                return Ok(models);
-            }
-        }
-    }
-
     // Default list if file doesn't exist or is empty
     let default_models = vec![
         AcceptableEmbedder {
@@ -77,7 +55,41 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
         },
     ];
 
-    // Write default to file so user can edit it
+    if config_path.exists() {
+        let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
+        match serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) {
+            Ok(mut models) => {
+                if !models.is_empty() {
+                    // Backfill known pins for configs written before supply-chain
+                    // verification existed; unknown models remain unpinned and fail
+                    // closed at load time.
+                    for model in &mut models {
+                        if model.model_sha256.is_none()
+                            && model.model_name.eq_ignore_ascii_case("NomicEmbedTextV15")
+                        {
+                            model.model_sha256 = Some(
+                                "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    return Ok(models);
+                }
+            }
+            Err(e) => {
+                // A corrupt user file must never be silently overwritten: the
+                // user's edits stay on disk while we run on the in-memory default.
+                tracing::warn!(
+                    "Failed to parse {}: {e}; using default embedder list in memory without overwriting existing file",
+                    config_path.display()
+                );
+                return Ok(default_models);
+            }
+        }
+    }
+
+    // Write default to file so user can edit it (only when the file is absent
+    // or was an empty, valid list)
     if let Ok(json_content) = serde_json::to_string_pretty(&default_models) {
         let _ = fs::write(&config_path, json_content);
     }
@@ -171,17 +183,48 @@ pub fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: 
         ));
     }
 
-    // Verify the first candidate (deterministic: sorted).
+    // Verify candidates: at least one must match the pinned SHA, and the
+    // newest candidate (sorted order ⇒ last entry) must match too. Stale
+    // non-matching candidates only warn, so a fresh valid download beside an
+    // old one still verifies.
     candidates.sort();
-    let path = &candidates[0];
-    let data = std::fs::read(path)
-        .context("Failed to read model file for checksum verification")?;
-    let actual = hex::encode(Sha256::digest(&data));
-    if actual != pinned_sha {
+    let oldest_sha = |path: &PathBuf| -> Result<String> {
+        let data = std::fs::read(path).with_context(|| {
+            format!(
+                "Failed to read model file {} for checksum verification",
+                path.display()
+            )
+        })?;
+        Ok(hex::encode(Sha256::digest(&data)))
+    };
+
+    let mut matched: Option<&PathBuf> = None;
+    let mut stale: Vec<(&PathBuf, String)> = Vec::new();
+    for path in &candidates {
+        let actual = oldest_sha(path)?;
+        if actual == pinned_sha {
+            matched = Some(path);
+        } else {
+            stale.push((path, actual));
+        }
+    }
+
+    let newest = candidates.last().expect("candidates checked non-empty");
+    if matched.is_none() || stale.iter().any(|(p, _)| *p == newest) {
+        let path = newest;
+        let actual = oldest_sha(path)?;
         return Err(anyhow!(
             "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
             model_name, path.display(), pinned_sha, actual
         ));
+    }
+
+    for (path, actual) in stale {
+        tracing::warn!(
+            "Embedder '{}': stale model file {} does not match pin (expected {}, actual {}); using verified candidate {}",
+            model_name, path.display(), pinned_sha, actual,
+            matched.map_or("", |m| m.to_str().unwrap_or(""))
+        );
     }
     Ok(())
 }
@@ -190,17 +233,22 @@ fn collect_onnx_files(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, max_d
     if depth > max_depth {
         return;
     }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name == "model.onnx" {
-                    out.push(path);
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name == "model.onnx" {
+                        out.push(path);
+                    }
+                } else if path.is_dir() {
+                    collect_onnx_files(&path, out, depth + 1, max_depth);
                 }
-            } else if path.is_dir() {
-                collect_onnx_files(&path, out, depth + 1, max_depth);
             }
+        }
+        Err(e) => {
+            tracing::warn!("collect_onnx_files: read_dir({}) failed: {e}", dir.display());
         }
     }
 }
@@ -347,6 +395,13 @@ impl RemoteEmbedder {
         api_model: String,
         dimensions: usize,
     ) -> Result<Self> {
+        if dimensions == 0 {
+            // Dimension validation becomes disabled (try_embed only checks len
+            // when dimensions>0); surface that loudly at construction.
+            tracing::warn!(
+                "RemoteEmbedder configured with dimensions=0; dimension validation is disabled"
+            );
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()

@@ -27,7 +27,8 @@ git commit -m "add hello.txt"
 
 if grep -iq "neurostrata" .neuroplasticity/rules.json 2>/dev/null; then
     echo "Agent read the new rule! Adding memory..."
-    neurostrata_add_memory "Added hello.txt"
+    curl -s -X POST http://127.0.0.1:34343/mcp -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"neurostrata_add_memory","arguments":{"namespace":"'"$(basename "$PWD")"'","content":"Added hello.txt"}}}'
 fi
 
 echo ">>> AGENT DONE."

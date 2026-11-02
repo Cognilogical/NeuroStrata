@@ -19,6 +19,13 @@
 
 use std::fs;
 
+// The receipts store is deliberately crate-free (std + a HashMap only), so the
+// real `ReceiptStore` ships here compiled from its real path and the tests
+// below exercise its actual record/replay/current-binding behavior over the
+// written receipt lines — no transcription of it can drift into this target.
+#[path = "../src/receipts/store.rs"]
+pub mod receipt_store;
+
 // ── 1. the serialization hardware exists and is wired in ────────────────────
 
 #[test]
@@ -198,6 +205,99 @@ fn the_episodic_buffer_writes_persist_entry_ids_and_round_trip_content() {
     );
 
     fs::remove_dir_all(&root).unwrap();
+}
+
+/// The real `ReceiptStore` behavior over a receipt lines file: receipts
+/// keyed `session:task:event` (the line key format the ledger replays)
+/// reload into a fresh store, duplicate lines are idempotently ignored, and
+/// only a receipt whose worktree binding still matches the observed state
+/// reads as current.
+#[test]
+fn receipt_store_replays_receipt_lines_idempotently_and_judges_currency() {
+    use receipt_store::{Receipt, ReceiptStore};
+
+    let receipt = |event_id: &str, head: &str, dirty: &str| Receipt {
+        session_id: "ses_1".into(),
+        task_id: "task_1".into(),
+        event_id: event_id.into(),
+        outcome: "completed".into(),
+        exposed_ids: vec!["m1".into()],
+        worktree: "/tmp/wt".into(),
+        head_sha: head.into(),
+        dirty_tree_hash: dirty.into(),
+    };
+
+    let r1 = receipt("e1", "abc", "dead");
+    let r2 = receipt("e2", "abc", "dead");
+    let lines = vec![r1.clone(), r2.clone(), r1.clone()];
+
+    // Live record path: record() itself reports idempotency — the duplicate
+    // replay of e1 collapses onto its already-stored key.
+    let mut store = ReceiptStore::new();
+    assert!(
+        store.record(r1.clone()),
+        "the first recording of an event is new"
+    );
+    assert!(
+        !store.record(r1.clone()),
+        "a duplicate event key is idempotently ignored"
+    );
+    assert!(store.record(r2.clone()), "a distinct event key records");
+    assert_eq!(store.len(), 2, "three receipts, one duplicate: two live");
+    assert!(store.get("ses_1", "task_1", "e1").is_some());
+    assert!(store.get("ses_1", "task_1", "e2").is_some());
+    assert!(store.get("ses_1", "task_1", "e3").is_none());
+
+    // Write the receipt keys one-per-line, then replay that file into a
+    // fresh store: the same idempotency holds on replay, and no phantom
+    // receipt is born from lines that were never in the ledger.
+    let dir = std::env::temp_dir().join(format!(
+        "neurostrata-receipt-lines-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let log_path = dir.join("receipts.keys");
+    fs::write(
+        &log_path,
+        lines
+            .iter()
+            .map(|r| r.key())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+
+    let log = fs::read_to_string(&log_path).unwrap();
+    let mut replayed = ReceiptStore::new();
+    for line in log.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.splitn(3, ':');
+        let (session_id, task_id, event_id) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        let replayed_receipt = receipt(event_id, "abc", "dead");
+        let newly = replayed.record(replayed_receipt);
+        assert!(
+            newly || replayed.get(session_id, task_id, event_id).is_some(),
+            "a replayed line must either be new or already in the store"
+        );
+    }
+    assert_eq!(replayed.len(), 2, "the replay collapses the duplicate line");
+
+    // Currency: a binding still matching the observed tree state passes;
+    // a moved head or a dirty-tree change fails closed (never current).
+    let stored = store.get("ses_1", "task_1", "e1").unwrap();
+    assert!(
+        stored.is_current("abc", "dead"),
+        "identical binding is current"
+    );
+    assert!(!stored.is_current("fff", "dead"), "a moved head is stale");
+    assert!(!stored.is_current("abc", "beef"), "a dirty change is stale");
+
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// A uuid-shaped id for the lifecycle: the integration test is std-only;

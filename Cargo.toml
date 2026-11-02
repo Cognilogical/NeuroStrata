@@ -145,6 +145,23 @@ name = "v8_decision_test"
 path = "tests/vocabulary/v8_decision_test.rs"
 
 
+# Binary-crate crate-free contract pins: declare the top-level integration
+# tests explicitly so their target names and paths are pinned in one place
+# (these are the only tests/*.rs top-level files in the crate).
+[[test]]
+name = "shacl_validation_test"
+path = "tests/shacl_validation_test.rs"
+
+[[test]]
+name = "recall_exact_identifier"
+path = "tests/recall_exact_identifier.rs"
+
+[[test]]
+name = "procedure_ack_contract"
+path = "tests/procedure_ack_contract.rs"
+
+
+
 
 [[test]]
 name = "receipt_test"

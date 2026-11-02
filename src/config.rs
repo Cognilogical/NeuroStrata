@@ -200,6 +200,13 @@ impl Config {
         Self::load_from(&config_path)
     }
 
+    /// Load from the default path WITHOUT creating a default config file
+    /// (unlike `from_default_path`, which materializes one when missing).
+    pub fn load() -> Result<Self> {
+        let path = Self::default_path()?;
+        Self::load_from(&path)
+    }
+
     pub fn load_from(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not read config at {}", path.display()))?;

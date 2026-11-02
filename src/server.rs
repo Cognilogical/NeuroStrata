@@ -2038,13 +2038,30 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                 let mut relations: std::collections::HashMap<String, Vec<String>> =
                     std::collections::HashMap::new();
                 for evidence in &result.evidence {
-                    if let Some(last) = evidence.path.last() {
-                        relations.insert(
-                            last.target.clone(),
-                            evidence.path.iter().map(|e| e.relation.clone()).collect(),
-                        );
-                    }
+                    // Walk the edge chain forward from the seed to find the
+                    // node this evidence path reached. `TraversalEdge` keeps
+                    // the stored endpoints, so an incoming edge (`other -->
+                    // seed`) has `target == seed`; keying by the last edge's
+                    // target would mis-attribute the reached node.
+                    let mut cur = seed.to_string();
+                    let chain: Vec<String> = evidence
+                        .path
+                        .iter()
+                        .map(|edge| {
+                            if edge.source == cur {
+                                cur = edge.target.clone();
+                            } else if edge.target == cur {
+                                cur = edge.source.clone();
+                            } else {
+                                cur = edge.target.clone();
+                            }
+                            edge.relation.clone()
+                        })
+                        .collect();
+                    relations.insert(cur, chain);
                 }
+                // The seed itself is a direct match with no relation chain.
+                relations.entry(seed.to_string()).or_default();
                 let items: Vec<crate::graph_read::prioritized::RelatedItem> = result
                     .nodes
                     .iter()
@@ -5795,7 +5812,10 @@ async fn handle_rebuild_communities(
     embedder: Arc<dyn Embedder>,
     store: Arc<dyn VectorStore>,
 ) -> String {
-    use crate::community::{detect_communities_with_resolution, filter_structural, COMMUNITY_STRUCTURAL_TYPES};
+    use crate::community::{
+        assign_hubs_by_access_count, detect_communities_with_resolution,
+        filter_structural_with_access_counts, COMMUNITY_STRUCTURAL_TYPES,
+    };
     use crate::store::ladybug::edge_specs;
 
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
@@ -5833,6 +5853,7 @@ async fn handle_rebuild_communities(
     // Filter eligible nodes (spec §5.2): active-generation, not retired, not archived, not mesh-conflicting, not registry.
     let mut node_ids: Vec<String> = Vec::new();
     let mut node_type_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut access_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut edges: Vec<(String, String, f64)> = Vec::new();
 
     for r in &all_memories {
@@ -5864,6 +5885,10 @@ async fn handle_rebuild_communities(
 
         node_ids.push(r.id.clone());
         node_type_map.insert(r.id.clone(), r.payload.memory_type.clone());
+        access_counts.insert(
+            r.id.clone(),
+            metadata.get("access_count").and_then(|v| v.as_u64()).unwrap_or(0),
+        );
 
         // Extract edges (spec §5.2: typed relations GOVERNS/CONTAINS/RELATES_TO/DEPENDS_ON/EXTRACTED_FROM)
         for edge in edge_specs(metadata) {
@@ -5901,21 +5926,23 @@ async fn handle_rebuild_communities(
         }
     }
 
-    // Filter communities by min_community_size (using non-structural members only)
-    let mut filtered_communities: Vec<_> = detection
-        .communities
-        .into_iter()
-        .filter_map(|mut c| {
-            filter_structural(&mut c, &node_type_map, &COMMUNITY_STRUCTURAL_TYPES);
-            // c.size and c.hub_id are recomputed by filter_structural from the
-            // surviving (non-structural) members.
-            if c.size >= min_community_size {
-                Some((c.id, c.member_ids, c.hub_id, c.size))
-            } else {
-                None
-            }
-        })
+    // Filter communities by min_community_size (using non-structural members only).
+    // Structural ids are removed and hub_id/size recomputed from the survivors,
+    // with hub selection driven by real access counts (spec §5.2: hub = highest
+    // access_count, tie-break lexicographically smallest id).
+    let structural_ids: std::collections::HashSet<String> = node_type_map
+        .iter()
+        .filter(|(_, t)| COMMUNITY_STRUCTURAL_TYPES.contains(&t.as_str()))
+        .map(|(id, _)| id.clone())
         .collect();
+    let mut raw_communities = detection.communities;
+    assign_hubs_by_access_count(&mut raw_communities, &access_counts);
+    let mut filtered_communities: Vec<_> =
+        filter_structural_with_access_counts(raw_communities, &structural_ids, &access_counts)
+            .into_iter()
+            .filter(|c| c.size >= min_community_size)
+            .map(|c| (c.id, c.member_ids, c.hub_id, c.size))
+            .collect();
 
     // Sort by size DESC, min_member_id ASC (spec §5.2a)
     filtered_communities.sort_by(|a, b| {

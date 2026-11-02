@@ -1819,6 +1819,19 @@ pub struct KnownIds<'a> {
     /// held by more than one namespace is recorded as ambiguous and resolves to
     /// neither: a GOVERNS edge into another project's file is worse than none.
     by_path: std::collections::HashMap<&'a str, Option<&'a str>>,
+    /// The mention candidate map, derived once on first use. Rebuilding it
+    /// per memory was O(memories x ids) on the edge-replay pass.
+    candidates_cache: std::sync::OnceLock<std::collections::HashMap<String, String>>,
+}
+
+impl crate::mention::SymbolIndex for KnownIds<'_> {
+    /// The candidate map the detector needs is already memoized on the
+    /// index, so it is handed back instead of re-derived per memory.
+    fn cached_candidates(
+        &self,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        Some(self.mention_candidates())
+    }
 }
 
 impl<'a> KnownIds<'a> {
@@ -1873,6 +1886,7 @@ impl<'a> KnownIds<'a> {
         Self {
             ids: id_set,
             by_path,
+            candidates_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -1885,9 +1899,12 @@ impl<'a> KnownIds<'a> {
         self.ids.iter().copied()
     }
 
-    /// Build the mention candidate map (candidate string -> symbol id).
+    /// Build the mention candidate map (candidate string -> symbol id),
+    /// memoized: repeated calls share one derivation.
     pub fn mention_candidates(&self) -> std::collections::HashMap<String, String> {
-        crate::mention::build_candidates(self)
+        self.candidates_cache
+            .get_or_init(|| crate::mention::build_candidates(self))
+            .clone()
     }
 
     /// Finds the node a declaration means, when it does not name one exactly.
@@ -2953,6 +2970,7 @@ impl LadybugStore {
     )> {
         self.init(namespace).await?;
         let ns_owned = namespace.to_string();
+        let warn_ns = ns_owned.clone();
         let now_ts = chrono::Utc::now().timestamp();
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&ns_owned);
@@ -3020,8 +3038,13 @@ impl LadybugStore {
                                 }
                             }
                         }
-                        let _ = src_str;
-                        let _ = vf;
+                        if !src_str.is_empty() && src_str != *warn_ns {
+                            tracing::debug!(
+                                "edge in '{}' carries origin source '{}'",
+                                warn_ns,
+                                src_str
+                            );
+                        }
                         edges.push(crate::graph_read::related::EdgeSpec {
                             source: from,
                             relation: rel_name.to_string(),
@@ -3856,8 +3879,13 @@ impl VectorStore for LadybugStore {
             crate::traits::SearchMode::Default,
         )
         .await?;
-        // The pagination hint rides through to handlers that page results.
-        let _incomplete = outcome.incomplete;
+        if outcome.incomplete {
+            tracing::debug!(
+                "search_with_domain in '{}' reached fetch_limit ({} results); outcome.incomplete=true",
+                namespace,
+                outcome.results.len()
+            );
+        }
         Ok(outcome)
     }
 
@@ -4449,8 +4477,9 @@ impl VectorStore for LadybugStore {
         // active generation's nodes are reachable: a rule always re-attaches to
         // this source's published tree, never to a superseded one.
         let known = KnownIds::active(memories.iter().map(|m| m.id.as_str()), active_gen);
-        // Materialize the candidate map once here so the index-backed
-        // mention candidate derivation is warm for the mention pass below.
+        // Cache warm-up for the mention pass below: derives the candidate
+        // map once; every `detect_mentions` call thereafter reads the
+        // memoized map instead of rebuilding it per memory.
         let _ = known.mention_candidates();
 
         // Grouped by relationship because the type is part of the statement and

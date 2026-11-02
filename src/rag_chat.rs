@@ -96,6 +96,13 @@ pub async fn retrieve_context_with_egress(
         .search_with_domain(namespace, vector, limit, include_tasks, include_archived, &[], Some(query), false)
         .await
         .map_err(|e| ChatError::Retrieval(format!("search: {}", e)))?;
+    if outcome.incomplete {
+        tracing::debug!(
+            "rag_chat search in '{}' was incomplete ({} hits)",
+            namespace,
+            outcome.results.len()
+        );
+    }
     let principal = if principal.is_empty() { "admin" } else { principal };
     let mut results: Vec<crate::traits::SearchResult> = Vec::new();
     for r in outcome.results {
@@ -169,10 +176,18 @@ pub fn build_prompt_with_citations(
         prompt.push_str("No relevant context found.\n");
     } else {
         for hit in &ctx.hits {
-            let line = format!(
+            let mut line = format!(
                 "[{}] (id={}, score={:.2}) {}\n",
                 hit.rank, hit.memory_id, hit.score, hit.snippet
             );
+            // The first line must respect max_context_chars too: an oversized
+            // first hit is truncated instead of being included whole.
+            if included_lines == 0
+                && max_context_chars > 0
+                && line.chars().count() > max_context_chars
+            {
+                line = line.chars().take(max_context_chars).collect();
+            }
             if context_lines_total + line.chars().count() > max_context_chars && included_lines > 0 {
                 break;
             }
@@ -326,7 +341,22 @@ impl OpenAiCompatibleProvider {
             if !ALLOWED_API_KEY_ENV_VARS.contains(&env_name) {
                 return Err(ChatError::Config(format!("disallowed api_key_env: {}", env_name)));
             }
-            std::env::var(env_name).ok().filter(|v| !v.is_empty())
+            match std::env::var(env_name) {
+                Ok(v) => {
+                    if v.trim().is_empty() {
+                        tracing::warn!(
+                            "RAG chat API key env var '{}' is set but empty",
+                            env_name
+                        );
+                    }
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v)
+                    }
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };

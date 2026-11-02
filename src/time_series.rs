@@ -29,14 +29,40 @@ pub struct Sample {
     pub labels: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SeriesConfig {
     pub capacity: usize,
+    /// Seconds between persisted flushes of the in-memory ring.
+    pub flush_interval_secs: u64,
+    /// EWMA smoothing factor for the rolling aggregate (clamped to 0.01..=1.0).
+    pub ewma_alpha: f64,
 }
 
 impl Default for SeriesConfig {
     fn default() -> Self {
-        Self { capacity: 1024 }
+        default_series_config_from_app_config()
+    }
+}
+
+/// Derive the in-memory series defaults from the app config (metrics_* keys).
+/// Falls back to the hard-coded serde defaults when the app config cannot be
+/// loaded, so metric collection never blocks on config resolution.
+pub fn default_series_config_from_app_config() -> SeriesConfig {
+    match crate::config::Config::load() {
+        Ok(cfg) => SeriesConfig {
+            capacity: cfg.metrics_ring_capacity.max(1),
+            flush_interval_secs: cfg.metrics_flush_interval_secs.max(1),
+            ewma_alpha: cfg.metrics_ewma_alpha.clamp(0.01, 1.0),
+        },
+        Err(_) => bad_app_config_fallback(),
+    }
+}
+
+fn bad_app_config_fallback() -> SeriesConfig {
+    SeriesConfig {
+        capacity: 1024,
+        flush_interval_secs: 60,
+        ewma_alpha: 0.2,
     }
 }
 
@@ -157,6 +183,11 @@ impl TimeSeriesStore {
 
     pub fn push(&self, key: SeriesKey, mut sample: Sample) {
         if !sample.value.is_finite() {
+            tracing::warn!(
+                "time_series: dropping non-finite sample value {} for {:?}",
+                sample.value,
+                key
+            );
             return;
         }
 
@@ -166,7 +197,7 @@ impl TimeSeriesStore {
         let series = guard.entry(key.clone()).or_insert_with(|| Series {
             key: key.clone(),
             samples: VecDeque::with_capacity(capacity),
-            agg: RollingAgg::new(0.2),
+            agg: RollingAgg::new(self.config.ewma_alpha),
             capacity,
             last_flushed: Instant::now(),
         });
@@ -229,7 +260,9 @@ impl TimeSeriesStore {
                 cb(&key, &sample);
             }));
             if result.is_err() {
-                // Callbacks must never block push; swallow panic silently.
+                // Callbacks must never block push; the panic is swallowed, but
+                // surfaced at warn level so a broken callback is visible.
+                tracing::warn!("time_series: anomaly callback panicked for {:?}", key);
             }
         }
     }
@@ -396,12 +429,14 @@ impl TimeSeriesStore {
             seen.insert(s.id.clone(), s);
         }
         for (_, samp) in db_map.iter() {
-            if (namespace.is_empty() || samp.id.contains(namespace))
-                || (samp.id.contains(namespace) || (namespace == "" || namespace.len() == 0))
+            // Drop DB samples that belong to a different namespace; the id
+            // format is `namespace::metric::stage::ts::seq` so both the
+            // prefixed and the contains-check cover legacy unprefixed ids.
+            if !namespace.is_empty()
+                && !samp.id.starts_with(&format!("{namespace}:"))
+                && !samp.id.contains(namespace)
             {
-                // We filter by namespace/metric/stage via query parameters; db_samples_ref
-                // should already be pre-filtered for this namespace/metric/stage.
-                // For simplicity include all DB samples in reference list.
+                continue;
             }
             // Include DB sample if it matches range
             if from.map_or(true, |f| samp.ts >= f) && to.map_or(true, |t| samp.ts <= t) {
@@ -428,8 +463,8 @@ impl TimeSeriesStore {
         } else {
             result_samples.iter().map(|s| s.value).fold(f64::NEG_INFINITY, f64::max)
         };
-        // Compute EWMA sequentially over sorted values with alpha 0.2
-        let alpha = 0.2;
+        // Compute EWMA sequentially over sorted values with the configured alpha
+        let alpha = self.config.ewma_alpha;
         let mut ewma_val = 0.0;
         let mut first_ewma = true;
         for s in &result_samples {
@@ -489,7 +524,10 @@ mod tests {
 
     #[test]
     fn ring_eviction_at_capacity() {
-        let store = TimeSeriesStore::new(SeriesConfig { capacity: 3 });
+        let store = TimeSeriesStore::new(SeriesConfig {
+            capacity: 3,
+            ..SeriesConfig::default()
+        });
         for i in 0..5 {
             store.push(
                 ("test".to_string(), MetricKind::AccessCount, "search".to_string()),
@@ -695,5 +733,94 @@ mod tests {
         // An all-empty input reports "no data" instead of a zero-series lie.
         let empty_only = [RollingAgg::new(0.3)];
         assert!(RollingAgg::combine_aggs(&empty_only).is_none());
+    }
+
+    #[test]
+    fn series_config_fallback_matches_documented_defaults() {
+        assert_eq!(
+            bad_app_config_fallback(),
+            SeriesConfig {
+                capacity: 1024,
+                flush_interval_secs: 60,
+                ewma_alpha: 0.2,
+            }
+        );
+    }
+
+    #[test]
+    fn non_finite_samples_are_dropped_with_warn() {
+        let store = TimeSeriesStore::new(SeriesConfig {
+            capacity: 8,
+            ..SeriesConfig::default()
+        });
+        let key = ("nf".to_string(), MetricKind::MemoryCount, "s".to_string());
+        store.push(
+            key.clone(),
+            Sample {
+                id: String::new(),
+                seq: 0,
+                ts: 1,
+                value: f64::NAN,
+                labels: BTreeMap::new(),
+            },
+        );
+        store.push(
+            key.clone(),
+            Sample {
+                id: String::new(),
+                seq: 0,
+                ts: 2,
+                value: f64::INFINITY,
+                labels: BTreeMap::new(),
+            },
+        );
+        store.push(
+            key.clone(),
+            Sample {
+                id: String::new(),
+                seq: 0,
+                ts: 3,
+                value: 7.0,
+                labels: BTreeMap::new(),
+            },
+        );
+        let agg = store.aggregate(&key).expect("series exists");
+        assert_eq!(agg.count, 1, "only the finite sample is stored");
+        assert_eq!(agg.sum, 7.0);
+    }
+
+    #[test]
+    fn query_metrics_excludes_foreign_namespace_db_samples() {
+        let store = TimeSeriesStore::new(SeriesConfig {
+            capacity: 8,
+            ..SeriesConfig::default()
+        });
+        let db = vec![
+            (
+                "other::memory_count::s::50::1".to_string(),
+                Sample {
+                    id: "other::memory_count::s::50::1".to_string(),
+                    seq: 1,
+                    ts: 50,
+                    value: 100.0,
+                    labels: BTreeMap::new(),
+                },
+            ),
+            (
+                "alpha::memory_count::s::50::2".to_string(),
+                Sample {
+                    id: "alpha::memory_count::s::50::2".to_string(),
+                    seq: 2,
+                    ts: 50,
+                    value: 2.0,
+                    labels: BTreeMap::new(),
+                },
+            ),
+        ];
+        let out = store.query_metrics("alpha", MetricKind::MemoryCount, Some("s"), None, None, &db);
+        let samples = out["samples"].as_array().expect("samples array");
+        assert_eq!(samples.len(), 1, "foreign-namespace DB sample must be filtered out");
+        assert_eq!(samples[0]["id"], "alpha::memory_count::s::50::2");
+        assert!(out["aggregate"]["sum"].as_f64().unwrap() - 2.0 < 1e-6);
     }
 }

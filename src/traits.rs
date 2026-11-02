@@ -387,6 +387,9 @@ pub trait VectorStore: Send + Sync + AsAny {
         _source_key: &str,
         _generation: u64,
     ) -> Result<()> {
+        tracing::warn!(
+            "VectorStore::publish_generation default no-op called for '{_namespace}:{_source_key}' gen {_generation}"
+        );
         Ok(())
     }
 
@@ -399,6 +402,9 @@ pub trait VectorStore: Send + Sync + AsAny {
         _source_key: &str,
         _generation: u64,
     ) -> Result<()> {
+        tracing::warn!(
+            "VectorStore::abort_generation default no-op called for '{_namespace}:{_source_key}' gen {_generation}"
+        );
         Ok(())
     }
 

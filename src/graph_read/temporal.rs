@@ -54,6 +54,7 @@ pub fn parse_temporal(raw: &str) -> Option<i64> {
             .and_hms_opt(0, 0, 0)
             .map(|dt| dt.and_utc().timestamp());
     }
+    tracing::warn!("unparseable temporal timestamp '{}'; treating bound as absent", raw);
     None
 }
 

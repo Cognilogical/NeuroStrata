@@ -1063,10 +1063,25 @@ fn classify_merge(
     // Both live (active/archived): gate the state change through the spec
     // transition table, then overlay the merge-table combinations.
     if cand_state != local_state {
+        // A legal transition gate in at least one direction is the
+        // precondition for ANY combination overlay — `archive + edit`
+        // only ever pairs Active with Archived, both of which connect
+        // through the state machine. When neither direction is legal the
+        // pair is a candidate-state the gate cannot accept at all
+        // (e.g. two live states a future vocabulary might introduce), and
+        // the merge table must refuse before decorating the decision.
+        let any_direction_legal = local_state.can_transition_to(cand_state)
+            || cand_state.can_transition_to(local_state);
         if content_changed {
-            return MergeDecision::ApplyCombination(
-                "archive + edit; edited content stays archived",
-            );
+            return if any_direction_legal {
+                MergeDecision::ApplyCombination(
+                    "archive + edit; edited content stays archived",
+                )
+            } else {
+                MergeDecision::Refuse(format!(
+                    "illegal transition {local_state} -> {cand_state}"
+                ))
+            };
         }
         // Same content, one side archived and the other restored: the spec's
         // "restore + archive" pair — unresolved only when concurrent.
@@ -1521,6 +1536,56 @@ async fn apply_effective(
             metadata.insert("trust".to_string(), json!(policy.to_string()));
         }
     }
+
+    // F7: an attached `.rdfpatch` sidecar (loaded after signature
+    // verification in the batch apply) is genuinely applied to the stored
+    // row here: `references` / `related_to` deltas land on the metadata
+    // arrays the edge tables read, fail-soft per delta, and the delta count
+    // is recorded so a no-op sidecar is distinguishable from an absent one.
+    if let Some(ref stream) = record.patch {
+        if !stream.is_empty() {
+            metadata.insert("rdf_patch_quad_count".to_string(), json!(stream.len()));
+            for delta in &stream.events {
+                let predicate = delta
+                    .predicate
+                    .trim_start_matches('<')
+                    .trim_end_matches('>');
+                let key = if predicate.ends_with("references") {
+                    "references"
+                } else if predicate.ends_with("related_to") {
+                    "related_to"
+                } else {
+                    continue;
+                };
+                let object = delta
+                    .object
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string();
+                let mut targets: Vec<String> = metadata
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match delta.op {
+                    crate::streaming::PatchOp::Add => {
+                        if !object.is_empty() && !targets.iter().any(|t| t == &object) {
+                            targets.push(object);
+                        }
+                    }
+                    crate::streaming::PatchOp::Delete => {
+                        targets.retain(|t| *t != object);
+                    }
+                }
+                metadata.insert(key.to_string(), json!(targets));
+            }
+        }
+    }
     let mut mesh_prov = mesh_provenance(
         mesh_id,
         &record.update_id,
@@ -1759,13 +1824,14 @@ async fn preserve_superseded_edit(
         created_by,
         source_rels,
         source_metadata,
+        import_trust,
         cand.origin_mesh_epoch,
     );
     let new_id = new_record.id.to_string();
     // No trust_stamp: `preserved_edit_record` is funnel code and has
-    // already set the preserved record's stamp ("untrusted") itself —
-    // the embryo this task generalizes. Stamping the manifest policy
-    // here would overwrite the funnel's own decision.
+    // already set the preserved record's stamp from `import_trust`
+    // (untrusted by default, the manifest policy when overridden) —
+    // stamping again here would only repeat the funnel's own decision.
     apply_effective(
         root,
         mesh_id,
@@ -1848,9 +1914,13 @@ fn local_relationships(payload: &MemoryPayload) -> Vec<Relationship> {
 /// The losing edit's own content/type/creator/relationships/metadata are
 /// carried forward; the record references the retired `original_id`
 /// (`relationships: [{kind: "references", target: original_id}]`, spec
-/// §"Concurrent merge policy"), surfaced in metadata too so the linkage is
-/// visible on the store row. Only `eligibility`, `trust` and `references` are
-/// (re)set on the metadata — every other key the edit carried survives.
+/// §"Concurrent merge policy"), surfaced in metadata as `references`
+/// alongside the edit's own reference links so the linkage is visible on
+/// the store row and no carried link is discarded. Only `eligibility`,
+/// `trust` and `references` are (re)set on the metadata — every other key
+/// the edit carried survives. `import_trust` is the trust the stored row
+/// carries (defaulting to untrusted, honoring the manifest's
+/// `imported_procedures_trust` when it is configured differently).
 fn preserved_edit_record(
     namespace: &str,
     original_id: &str,
@@ -1859,6 +1929,7 @@ fn preserved_edit_record(
     created_by: String,
     source_rels: Vec<Relationship>,
     source_metadata: Value,
+    import_trust: Trust,
     origin_mesh_epoch: u32,
 ) -> MeshRecord {
     let mut rels = source_rels;
@@ -1873,8 +1944,17 @@ fn preserved_edit_record(
         None => serde_json::Map::new(),
     };
     metadata.insert("eligibility".to_string(), json!("shareable"));
-    metadata.insert("trust".to_string(), json!("untrusted"));
-    metadata.insert("references".to_string(), json!([original_id]));
+    metadata.insert("trust".to_string(), json!(import_trust.to_string()));
+    // The edit's own reference links survive alongside the spec-mandated
+    // link to the retired original: dropping them would lose the losing
+    // edit's graph edges on the preserved row.
+    let mut refs: Vec<String> = vec![original_id.to_string()];
+    for r in &rels {
+        if !refs.contains(&r.target.to_string()) {
+            refs.push(r.target.to_string());
+        }
+    }
+    metadata.insert("references".to_string(), json!(refs));
 
     // Build canonical RDF block for the preserved-edit record (spec §5.2c).
     // Always emit: Phase 1 dual-write.
@@ -3833,9 +3913,14 @@ mod tests {
             json!(["read spec", "act"])
         );
 
-        // Original tags survive; the references link lands in metadata.
+        // Original tags survive; the references metadata carries the ORIGINAL
+        // id link first, then the edit's own carried reference (F5: the
+        // preserved edit no longer discards its reference links).
         assert_eq!(z.payload.metadata["tags"], json!(["mesh", "procedure"]));
-        assert_eq!(z.payload.metadata["references"], json!([id.to_string()]));
+        assert_eq!(
+            z.payload.metadata["references"],
+            json!([id.to_string(), referenced.to_string()])
+        );
 
         // The typed relationships carry the row's own references link forward
         // AND append the spec's references -> original_id link.
@@ -3847,6 +3932,7 @@ mod tests {
             local_origin(&local_payload),
             local_relationships(&local_payload),
             local_payload.metadata.clone(),
+            Trust::Untrusted,
             cand.origin_mesh_epoch,
         );
         assert!(
@@ -3956,13 +4042,14 @@ mod tests {
         assert_eq!(z.payload.metadata["eligibility"], json!("shareable"));
     }
 
-    /// Program Task 3 (fix round, M-2): under a Trusted manifest the
-    /// supersession candidate takes the manifest stamp, but the
-    /// preserved edit keeps the funnel's own "untrusted" — its apply
-    /// passes no stamp. This pins that threading: handing the preserved
-    /// record the manifest stamp turns this test red.
+    /// Program Task 3 (fix round, M-2), superseded 2026-11-02 (Slice X, F6):
+    /// under a Trusted manifest the supersession candidate AND the
+    /// preserved edit both take the manifest's `imported_procedures_trust`
+    /// stamp — `preserved_edit_record` now threads `import_trust` into its
+    /// metadata stamp (untrusted by default, the manifest policy when it
+    /// is configured differently). This pins that threading.
     #[tokio::test]
-    async fn preserved_edit_stays_untrusted_under_a_trusted_manifest() {
+    async fn preserved_edit_honors_the_manifest_policy_under_a_trusted_manifest() {
         let root = scratch("dirb-trusted");
         let mesh_id = "mesh-dirb".to_string();
         let namespace = "probe".to_string();
@@ -4062,8 +4149,8 @@ mod tests {
             .expect("the preserved edit record");
         assert_eq!(
             z.payload.metadata["trust"],
-            json!("untrusted"),
-            "the preserved edit keeps the funnel's own stamp: {:?}",
+            json!("trusted"),
+            "the preserved edit honors the manifest policy stamp: {:?}",
             z.payload.metadata
         );
     }

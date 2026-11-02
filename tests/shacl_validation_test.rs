@@ -14,6 +14,8 @@
 // Minimal stand-in for the crate's MemoryPayload (src/traits.rs can't compile
 // standalone: it references crate::graph_read, crate::source_context and
 // crate::task::intake). shacl.rs only needs this struct via crate::traits::.
+// Its field surface is pinned against the real shipped struct by
+// `local_memory_payload_matches_the_shipped_struct` below.
 pub mod traits {
     use serde_json::Value;
 
@@ -37,23 +39,23 @@ pub mod multimodal;
 #[path = "../src/rdf/shacl.rs"]
 mod shacl;
 
-use serde_json::Value;
 use shacl::validate_memory;
+use traits::MemoryPayload;
 
-// Replicate MemoryPayload inline (same as src/traits.rs definition)
-struct TestMemoryPayload {
-    pub content: String,
-    pub user_id: String,
-    pub memory_type: String,
-    pub agent_name: Option<String>,
-    pub location: String,
-    pub location_lines: String,
-    pub metadata: Value,
-}
+/// The payload surface this stand-in pins against the shipped struct.
+const MEMORY_PAYLOAD_FIELDS: [&str; 7] = [
+    "content",
+    "user_id",
+    "memory_type",
+    "agent_name",
+    "location",
+    "location_lines",
+    "metadata",
+];
 
 // Create minimal payload (missing required fields → should produce violations)
-fn create_minimal_payload() -> TestMemoryPayload {
-    TestMemoryPayload {
+fn create_minimal_payload() -> MemoryPayload {
+    MemoryPayload {
         content: "test content".to_string(),
         user_id: "test_user".to_string(),
         memory_type: "fact".to_string(),
@@ -65,8 +67,8 @@ fn create_minimal_payload() -> TestMemoryPayload {
 }
 
 // Create valid payload (all fields OK → should have no violations)
-fn create_valid_payload() -> TestMemoryPayload {
-    TestMemoryPayload {
+fn create_valid_payload() -> MemoryPayload {
+    MemoryPayload {
         content: "valid content".to_string(),
         user_id: "valid_user".to_string(),
         memory_type: "fact".to_string(),
@@ -78,8 +80,8 @@ fn create_valid_payload() -> TestMemoryPayload {
 }
 
 // Create rule payload without source → should produce violation
-fn create_rule_payload_no_source() -> TestMemoryPayload {
-    TestMemoryPayload {
+fn create_rule_payload_no_source() -> MemoryPayload {
+    MemoryPayload {
         content: "rule content".to_string(),
         user_id: "rule_user".to_string(),
         memory_type: "rule".to_string(),
@@ -90,21 +92,38 @@ fn create_rule_payload_no_source() -> TestMemoryPayload {
     }
 }
 
+/// The stand-in struct is not allowed to drift from the shipped one: every
+/// field the test's `traits::MemoryPayload` declares must exist, by name, in
+/// `src/traits.rs`'s real `pub struct MemoryPayload` (the struct literals in
+/// the helpers above keep the local side from dropping a field; this test
+/// keeps the real side's field names from drifting under it).
+#[test]
+fn local_memory_payload_matches_the_shipped_struct() {
+    let src =
+        std::fs::read_to_string("src/traits.rs").expect("src/traits.rs readable");
+    let start = src
+        .find("pub struct MemoryPayload {")
+        .expect("src/traits.rs declares pub struct MemoryPayload");
+    let rest = &src[start..];
+    let body_len = rest
+        .find("\n}")
+        .expect("the MemoryPayload struct closes");
+    let body = &rest[..body_len];
+
+    for field in MEMORY_PAYLOAD_FIELDS {
+        assert!(
+            body.contains(&format!("pub {field}:")),
+            "tests/shacl_validation_test.rs's MemoryPayload field `{field}` \
+             must exist in src/traits.rs's pub struct MemoryPayload"
+        );
+    }
+}
+
 #[test]
 fn test_memory_shacl_content_validation() {
     let mut payload = create_minimal_payload();
     payload.content = "".to_string();
-    
-    // Convert to the actual MemoryPayload struct for validation
-    let mp = crate::traits::MemoryPayload {
-        content: payload.content,
-        user_id: payload.user_id,
-        memory_type: payload.memory_type,
-        agent_name: payload.agent_name,
-        location: payload.location,
-        location_lines: payload.location_lines,
-        metadata: payload.metadata,
-    };
+    let mp = payload;
     
     let violations = validate_memory(&mp);
     assert!(!violations.is_empty(), "Empty content should produce violation");
@@ -120,16 +139,7 @@ fn test_memory_shacl_content_validation() {
 fn test_memory_shacl_user_id_validation() {
     let mut payload = create_minimal_payload();
     payload.user_id = "".to_string();
-    
-    let mp = crate::traits::MemoryPayload {
-        content: payload.content,
-        user_id: payload.user_id,
-        memory_type: payload.memory_type,
-        agent_name: payload.agent_name,
-        location: payload.location,
-        location_lines: payload.location_lines,
-        metadata: payload.metadata,
-    };
+    let mp = payload;
     
     let violations = validate_memory(&mp);
     assert!(!violations.is_empty(), "Empty user_id should produce violation");
@@ -145,16 +155,7 @@ fn test_memory_shacl_user_id_validation() {
 fn test_memory_shacl_memory_type_validation() {
     let mut payload = create_minimal_payload();
     payload.memory_type = "".to_string();
-    
-    let mp = crate::traits::MemoryPayload {
-        content: payload.content,
-        user_id: payload.user_id,
-        memory_type: payload.memory_type,
-        agent_name: payload.agent_name,
-        location: payload.location,
-        location_lines: payload.location_lines,
-        metadata: payload.metadata,
-    };
+    let mp = payload;
     
     let violations = validate_memory(&mp);
     assert!(!violations.is_empty(), "Empty memory_type should produce violation");
@@ -169,7 +170,7 @@ fn test_memory_shacl_memory_type_validation() {
 #[test]
 fn test_memory_shacl_metadata_object_validation() {
     let payload = create_minimal_payload();
-    let mp = crate::traits::MemoryPayload {
+    let mp = MemoryPayload {
         content: payload.content,
         user_id: payload.user_id,
         memory_type: payload.memory_type,
@@ -192,15 +193,7 @@ fn test_memory_shacl_metadata_object_validation() {
 #[test]
 fn test_memory_shacl_rule_source_validation() {
     let payload = create_rule_payload_no_source();
-    let mp = crate::traits::MemoryPayload {
-        content: payload.content,
-        user_id: payload.user_id,
-        memory_type: payload.memory_type,
-        agent_name: payload.agent_name,
-        location: payload.location,
-        location_lines: payload.location_lines,
-        metadata: payload.metadata,
-    };
+    let mp = payload;
     
     let violations = validate_memory(&mp);
     assert!(!violations.is_empty(), "Rule without source should produce violation");
@@ -223,16 +216,7 @@ fn test_memory_shacl_topology_validation() {
             // missing channel, credential_boundary, reason - required
         }
     });
-    
-    let mp = crate::traits::MemoryPayload {
-        content: payload.content,
-        user_id: payload.user_id,
-        memory_type: payload.memory_type,
-        agent_name: payload.agent_name,
-        location: payload.location,
-        location_lines: payload.location_lines,
-        metadata: payload.metadata,
-    };
+    let mp = payload;
     
     let violations = validate_memory(&mp);
     assert!(!violations.is_empty(), "Missing topology keys should produce violations");
@@ -247,15 +231,7 @@ fn test_memory_shacl_topology_validation() {
 #[test]
 fn test_memory_shacl_valid_payload_no_violations() {
     let payload = create_valid_payload();
-    let mp = crate::traits::MemoryPayload {
-        content: payload.content,
-        user_id: payload.user_id,
-        memory_type: payload.memory_type,
-        agent_name: payload.agent_name,
-        location: payload.location,
-        location_lines: payload.location_lines,
-        metadata: payload.metadata,
-    };
+    let mp = payload;
     
     let violations = validate_memory(&mp);
     assert!(violations.is_empty(), "Valid payload should have no violations, got: {:?}", violations);
@@ -265,16 +241,7 @@ fn test_memory_shacl_valid_payload_no_violations() {
 fn test_shacl_violation_structure() {
     let mut payload = create_minimal_payload();
     payload.content = "".to_string();
-    
-    let mp = crate::traits::MemoryPayload {
-        content: payload.content,
-        user_id: payload.user_id,
-        memory_type: payload.memory_type,
-        agent_name: payload.agent_name,
-        location: payload.location,
-        location_lines: payload.location_lines,
-        metadata: payload.metadata,
-    };
+    let mp = payload;
     
     let violations = validate_memory(&mp);
     

@@ -14,6 +14,31 @@ pub mod community_inner {
         pub size: usize,
     }
 
+    /// Spec §5.2: `hub_id` is the member with the highest `access_count`,
+    /// breaking ties by the lexicographically smallest id. Members absent from
+    /// the map count as 0; empty member lists yield an empty hub.
+    pub fn select_hub_id(member_ids: &[String], access_counts: &HashMap<String, u64>) -> String {
+        member_ids
+            .iter()
+            .min_by(|a, b| {
+                let ca = access_counts.get(a.as_str()).copied().unwrap_or(0);
+                let cb = access_counts.get(b.as_str()).copied().unwrap_or(0);
+                cb.cmp(&ca).then_with(|| a.cmp(b))
+            })
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Recompute `hub_id` for every community from the supplied access counts.
+    pub fn assign_hubs_by_access_count(
+        communities: &mut [Community],
+        access_counts: &HashMap<String, u64>,
+    ) {
+        for c in communities.iter_mut() {
+            c.hub_id = select_hub_id(&c.member_ids, access_counts);
+        }
+    }
+
     /// Partition + converged quality, bundled for the resolution-parameterized
     /// entry point.
     #[derive(Debug, Clone)]
@@ -161,7 +186,9 @@ pub mod community_inner {
         for (i, c) in communities.iter_mut().enumerate() {
             c.id = i as u32;
             c.size = c.member_ids.len();
-            c.hub_id = c.member_ids.iter().min().cloned().unwrap_or_default();
+            // Empty access-count map → all counts 0 → smallest id wins,
+            // identical to the previous `member_ids.iter().min()` behavior.
+            c.hub_id = select_hub_id(&c.member_ids, &HashMap::new());
         }
 
         Ok((communities, quality))
@@ -172,6 +199,9 @@ pub mod community_inner {
     /// The filter runs first, then `hub_id` is RECOMPUTED from the surviving
     /// members, so the hub of a filtered community is never an excluded
     /// structural node.
+    // Production callers use `filter_structural_with_access_counts`; retained
+    // for the single-community contract its unit test pins down.
+    #[cfg(test)]
     pub fn filter_structural(
         community: &mut Community,
         types: &HashMap<String, String>,
@@ -183,14 +213,26 @@ pub mod community_inner {
                 .map(|t| !structural_types.contains(&t.as_str()))
                 .unwrap_or(true)
         });
-        community.hub_id =
-            community
-                .member_ids
-                .iter()
-                .min()
-                .cloned()
-                .unwrap_or_default();
+        // Empty access-count map → smallest surviving id becomes the hub.
+        community.hub_id = select_hub_id(&community.member_ids, &HashMap::new());
         community.size = community.member_ids.len();
+    }
+
+    /// Vec-of-communities variant of `filter_structural` driven by a set of
+    /// structural node ids rather than a type map, with `hub_id` recomputed
+    /// from the surviving members via `select_hub_id` and the supplied access
+    /// counts (spec §5.2: hub = highest access_count, tie-break smallest id).
+    pub fn filter_structural_with_access_counts(
+        mut communities: Vec<Community>,
+        structural_ids: &std::collections::HashSet<String>,
+        access_counts: &HashMap<String, u64>,
+    ) -> Vec<Community> {
+        for c in communities.iter_mut() {
+            c.member_ids.retain(|id| !structural_ids.contains(id));
+            c.hub_id = select_hub_id(&c.member_ids, access_counts);
+            c.size = c.member_ids.len();
+        }
+        communities
     }
 }
 
@@ -335,5 +377,71 @@ mod tests {
             "hub must be recomputed after the structural filter, never a structural node"
         );
         assert_eq!(community.size, 2);
+    }
+
+    #[test]
+    fn hub_selection_prefers_highest_access_count_then_smallest_id() {
+        let members = vec!["b".to_string(), "c".to_string(), "a".to_string()];
+
+        // Empty map → all counts 0 → lexicographically smallest id wins.
+        let empty = HashMap::new();
+        assert_eq!(select_hub_id(&members, &empty), "a");
+        assert_eq!(select_hub_id(&[], &empty), "");
+
+        // Highest access_count wins regardless of id order.
+        let mut counts = HashMap::new();
+        counts.insert("c".to_string(), 7u64);
+        counts.insert("a".to_string(), 3u64);
+        counts.insert("b".to_string(), 1u64);
+        assert_eq!(select_hub_id(&members, &counts), "c");
+
+        // Ties break to the smallest id, not to input order.
+        let mut tied = HashMap::new();
+        tied.insert("c".to_string(), 5u64);
+        tied.insert("a".to_string(), 5u64);
+        tied.insert("b".to_string(), 5u64);
+        assert_eq!(select_hub_id(&members, &tied), "a");
+
+        // assign_hubs_by_access_count applies the same rule per community.
+        let mut communities = vec![
+            Community {
+                id: 0,
+                member_ids: members.clone(),
+                hub_id: "b".to_string(),
+                size: 3,
+            },
+            Community {
+                id: 1,
+                member_ids: vec!["x".to_string(), "y".to_string()],
+                hub_id: "x".to_string(),
+                size: 2,
+            },
+        ];
+        assign_hubs_by_access_count(&mut communities, &counts);
+        assert_eq!(communities[0].hub_id, "c");
+        // Missing counts default to 0 → tie-break to "x".
+        assert_eq!(communities[1].hub_id, "x");
+    }
+
+    #[test]
+    fn filter_structural_with_access_counts_retains_and_recomputes_hubs() {
+        use std::collections::HashSet;
+        let communities = vec![
+            Community {
+                id: 0,
+                member_ids: vec!["s1".to_string(), "b".to_string(), "a".to_string()],
+                hub_id: "s1".to_string(),
+                size: 3,
+            },
+        ];
+        let structural: HashSet<String> = ["s1".to_string()].into_iter().collect();
+        let mut counts = HashMap::new();
+        counts.insert("a".to_string(), 2u64);
+        counts.insert("b".to_string(), 9u64);
+
+        let out = filter_structural_with_access_counts(communities, &structural, &counts);
+        assert_eq!(out[0].member_ids, vec!["b", "a"]);
+        assert_eq!(out[0].hub_id, "b", "highest access_count survivor wins");
+        assert_eq!(out[0].size, 2);
     }
 }

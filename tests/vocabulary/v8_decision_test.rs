@@ -23,9 +23,9 @@ fn legacy_rows_readable() {
 /// single source of truth the tool summaries and the docs read, so the
 /// version must be current, every tool must carry a summary, and no stale
 /// superseded-version references ("Vocabulary v2") may survive anywhere in
-/// the shipped schema. The stale `Vocabulary v2` comments in
-/// `src/store/ladybug.rs` belong to that file's owner wave and cannot be
-/// edited here, so this test pins the schema-consistency branch instead.
+/// the shipped schema — nor in `src/store/ladybug.rs`, whose stale comments
+/// were remediated; this now checks that real shipped source, not just the
+/// schema document.
 #[test]
 fn vocabulary_version_and_tool_summaries_are_consistent() {
     let raw = fs::read_to_string("src/schemas/memory-vocabulary.v3.json").unwrap();
@@ -59,6 +59,13 @@ fn vocabulary_version_and_tool_summaries_are_consistent() {
     assert!(
         !raw.to_lowercase().contains("vocabulary v2"),
         "the schema document carries stale superseded \"Vocabulary v2\" text"
+    );
+
+    // The shipped store source cannot blindly carry its stale "Vocabulary v2" comments anymore.
+    let ladybug_src = fs::read_to_string("src/store/ladybug.rs").expect("ladybug.rs readable");
+    assert!(
+        !ladybug_src.contains("Vocabulary v2"),
+        "src/store/ladybug.rs still carries stale superseded \"Vocabulary v2\" comments"
     );
 }
 

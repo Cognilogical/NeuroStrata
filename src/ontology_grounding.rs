@@ -155,7 +155,11 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
     let rid = registry::registry_row_id(namespace);
     let meta = match crate::traits::VectorStore::get(store, namespace, &rid).await {
         Ok(Some((_, payload))) => payload.metadata,
-        _ => Value::Null,
+        Ok(None) => Value::Null,
+        Err(e) => {
+            tracing::warn!("ontology_warnings store.get failed for '{namespace}:{rid}': {e}");
+            Value::Null
+        }
     };
 
     let cfg = match resolve_config(&meta) {
@@ -166,6 +170,10 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
         }
     };
 
+    // annotate mode keeps messages unchanged; strict mode prefixes each
+    // warning so downstream tooling can filter hard-gated findings.
+    let warn_prefix = strict_warn_prefix(&cfg.mode);
+
     let vocab = match load_vocabulary_classified(&cfg.path) {
         Ok(vocab) => vocab,
         Err((reason, msg)) => {
@@ -173,7 +181,7 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
                 namespace,
                 reason,
                 Some(cfg.path.clone()),
-                msg,
+                format!("{warn_prefix}{msg}"),
             ));
             return out;
         }
@@ -185,11 +193,21 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
             let iris = concept_iris_from_vocabulary(&vocab, &[slug.to_string()]);
             if iris.is_empty() {
                 out.push(Value::json_obj(namespace, "out_of_vocabulary", Some(cfg.path.clone()),
-                    format!("domain '{}' has no concept_iri in vocabulary", slug)));
+                    format!("{warn_prefix}domain '{}' has no concept_iri in vocabulary", slug)));
             }
         }
     }
     out
+}
+
+/// `[strict] ` when the configured ontology mode is strict (case-insensitive),
+/// empty otherwise (annotate mode output must stay unchanged).
+fn strict_warn_prefix(mode: &str) -> &'static str {
+    if mode.eq_ignore_ascii_case("strict") {
+        "[strict] "
+    } else {
+        ""
+    }
 }
 
 trait JsonObjExt {
@@ -258,5 +276,22 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn strict_mode_prefixes_warning_messages_annotate_unchanged() {
+        assert_eq!(strict_warn_prefix("annotate"), "");
+        assert_eq!(strict_warn_prefix(""), "");
+        assert_eq!(strict_warn_prefix("STRICT"), "[strict] ");
+        assert_eq!(strict_warn_prefix("strict"), "[strict] ");
+
+        // The prefix is prepended to the emitted message text, keeping the
+        // annotate-mode message identical to the pre-strict surface.
+        let annotate_msg = "domain 'auth' has no concept_iri in vocabulary";
+        assert_eq!(format!("{}{annotate_msg}", strict_warn_prefix("annotate")), annotate_msg);
+        assert_eq!(
+            format!("{}{annotate_msg}", strict_warn_prefix("strict")),
+            format!("[strict] {annotate_msg}")
+        );
     }
 }
