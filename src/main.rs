@@ -3040,17 +3040,27 @@ async fn run() -> anyhow::Result<()> {
                 // A busy daemon may not answer this either. That is not a
                 // failure: the request is queued, so fall through to the wait.
                 if probe != DaemonProbe::Absent {
-                    if let Err(e) = client
+                    match client
                         .post("http://127.0.0.1:34343/shutdown")
                         .timeout(std::time::Duration::from_secs(10))
                         .send()
                         .await
                     {
-                        if e.is_connect() && !daemon_holds_lock(&db_path) {
-                            println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
-                            return Ok(());
+                        Ok(res) => {
+                            if !res.status().is_success() {
+                                let status = res.status();
+                                let body = res.text().await.unwrap_or_default();
+                                eprintln!("Shutdown refused by daemon (HTTP {}): {}", status, body);
+                                std::process::exit(1);
+                            }
                         }
-                        eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
+                        Err(e) => {
+                            if e.is_connect() && !daemon_holds_lock(&db_path) {
+                                println!("Nothing is listening on 127.0.0.1:34343 now -- either a daemon stopped as this ran, or there was never one to stop.");
+                                return Ok(());
+                            }
+                            eprintln!("The stop request has not been acknowledged yet: {}. Waiting for the daemon to go anyway.", e);
+                        }
                     }
                 }
 
@@ -3665,9 +3675,13 @@ async fn run() -> anyhow::Result<()> {
             }
             Commands::Hooks { action } => match action {
                 HooksCommands::Install { force } => {
-                    let root = git_toplevel()
-                        .or_else(|| std::env::current_dir().ok())
-                        .unwrap();
+                    let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
+                        Some(r) => r,
+                        None => {
+                            eprintln!("ERROR: cannot determine git repository root or current working directory.");
+                            std::process::exit(1);
+                        }
+                    };
                     if !root.join(".git").exists() {
                         eprintln!(
                             "ERROR: {:?} is not a git repository; there is nowhere to install the pre-push hook.",
@@ -3690,9 +3704,13 @@ async fn run() -> anyhow::Result<()> {
                     }
                 }
                 HooksCommands::InstallPreCommit => {
-                    let root = git_toplevel()
-                        .or_else(|| std::env::current_dir().ok())
-                        .unwrap();
+                    let root = match git_toplevel().or_else(|| std::env::current_dir().ok()) {
+                        Some(r) => r,
+                        None => {
+                            eprintln!("ERROR: cannot determine git repository root or current working directory.");
+                            std::process::exit(1);
+                        }
+                    };
                     if !root.join(".git").exists() {
                         eprintln!(
                             "ERROR: {:?} is not a git repository; there is nowhere to install the pre-commit hook.",

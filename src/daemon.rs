@@ -981,9 +981,7 @@ pub(crate) async fn start_daemon_on(
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let why = shutdown_signal(shutdown_rx).await;
-            if let Ok(mut slot) = recorded_cause.lock() {
-                *slot = why;
-            }
+            *recorded_cause.lock().unwrap_or_else(|e| e.into_inner()) = why;
         })
         .await?;
 
@@ -1054,7 +1052,7 @@ async fn handle_get_graph(
     let requested = query.namespace.unwrap_or_else(|| "global".to_string());
     let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
     let config = crate::config::Config::load()
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| { tracing::warn!("handle_get_graph Config::load failed: {e}"); axum::http::StatusCode::INTERNAL_SERVER_ERROR })?;
     let anchor_root = query.anchor_root.as_deref().map(Path::new);
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, query.source_id.as_deref());
@@ -1077,7 +1075,7 @@ async fn handle_get_graph(
             anchor_override.as_ref(),
         )
         .await
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| { tracing::warn!("handle_get_graph export_graph failed: {e}"); axum::http::StatusCode::INTERNAL_SERVER_ERROR })?;
 
     if query.all.unwrap_or(false) {
         return Ok(Json(data));
@@ -1510,11 +1508,17 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
     let os_signal = async {
         let mut close = match tokio::signal::windows::ctrl_close() {
             Ok(s) => s,
-            Err(_) => return std::future::pending::<ShutdownCause>().await,
+            Err(_) => {
+                tracing::warn!("signal registration failed: could not register shutdown signal listener");
+                return std::future::pending::<ShutdownCause>().await
+            },
         };
         let mut shutdown = match tokio::signal::windows::ctrl_shutdown() {
             Ok(s) => s,
-            Err(_) => return std::future::pending::<ShutdownCause>().await,
+            Err(_) => {
+                tracing::warn!("signal registration failed: could not register shutdown signal listener");
+                return std::future::pending::<ShutdownCause>().await
+            },
         };
         tokio::select! {
             _ = close.recv() => eprintln!("Console is closing, shutting down."),
@@ -1528,7 +1532,10 @@ async fn shutdown_signal(rx: oneshot::Receiver<()>) -> ShutdownCause {
         let mut term =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 Ok(s) => s,
-                Err(_) => return std::future::pending::<ShutdownCause>().await,
+                Err(_) => {
+                tracing::warn!("signal registration failed: could not register shutdown signal listener");
+                return std::future::pending::<ShutdownCause>().await
+            },
             };
         term.recv().await;
         eprintln!("Received SIGTERM, shutting down.");

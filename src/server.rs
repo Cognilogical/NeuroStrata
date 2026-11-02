@@ -3119,27 +3119,21 @@ async fn handle_add_memory(
                 };
 
                 // Exact reuse / blocked exact duplicate: no new row, no Created pulse.
-                if upsert.is_none() {
-                    match decision {
+                let Some(upsert) = upsert else {
+                    return match decision {
                         DedupDecision::LinkedExisting => {
                             let id = linked_id.unwrap_or_default();
-                            return format!("Reused existing memory for namespace: {}\nMemory ID: {}", namespace, id);
+                            format!("Reused existing memory for namespace: {}\nMemory ID: {}", namespace, id)
                         }
-                        DedupDecision::BlockedExact => {
-                            return format!(
-                                "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
-                            );
-                        }
-                        DedupDecision::BlockedModel => {
-                            return format!(
-                                "Blocked by promoted model. Use neurostrata_supersede_memory or neurostrata_archive_memory."
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-
-                let upsert = upsert.unwrap();
+                        DedupDecision::BlockedExact => format!(
+                            "Potential duplicate detected: Memory is similar to an existing memory. Use neurostrata_supersede_memory to update the existing memory instead, or neurostrata_archive_memory to archive it."
+                        ),
+                        DedupDecision::BlockedModel => format!(
+                            "Blocked by promoted model. Use neurostrata_supersede_memory or neurostrata_archive_memory."
+                        ),
+                        _ => "Memory was not written.".to_string(),
+                    };
+                };
                 // Emit site 1 only for a newly inserted memory.
                 bus.emit(
                     ThalamicPulse::Created {
