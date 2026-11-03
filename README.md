@@ -2,55 +2,64 @@
 
 ![NeuroStrata Banner](docs/assets/NeuroStrata-banner.png)
 
-### **Stop Being the Copy-Paste Memory Between Your AI Coding Sessions.**
+### **The World's Most Advanced Agentic Memory, Task, and Workflow System.**
 
-Every time you start a new chat, switch worktrees, or spawn a subagent, your AI forgets your architecture. It repeats last week's bug, ignores rules buried in `AGENTS.md`, greps blindly through thousands of files, and claims a task is "done" while leaving broken callers and `TODO` stubs behind.
+**Superhuman cognitive architecture for your AI agents—without needing to be a brain surgeon to understand or operate it.**
 
-**NeuroStrata fixes that permanently.**
+Most AI coding tools force an impossible trade-off: either settle for flat markdown files (`AGENTS.md`, `MEMORY.md`, `TODO.md`) that your agent forgets or ignores the moment context compacts, or spend weeks manually wiring vector databases, graph engines, AST indexers, and custom git hooks.
 
-Packed into **one compiled Rust binary** with an embedded vector, graph, and W3C RDF/SPARQL engine, NeuroStrata gives your coding agent an **enforceable long-term memory, a live software knowledge graph, and mechanical quality gates** that the agent cannot talk its way past—and **your agent sets it up and upgrades it automatically with zero manual configuration.**
+**NeuroStrata eliminates that trade-off.**
+
+Packed into **one compiled Rust binary**, NeuroStrata gives your coding agents **six distinct ways to think, remember, plan, and verify work**—combining an embedded vector & property graph database, an 11-language Tree-sitter AST software graph, a W3C RDF/SPARQL/OWL/SHACL semantic reasoner, neural cross-encoder reranking, digital-twin state simulation, and binary-enforced task gates.
+
+And here is the best part: **100% of it is automated.** Your agent installs the plugins, wires the hooks, builds the knowledge graph, propagates context to every subagent, enforces its own completion gates, and upgrades itself across versions—**with zero manual configuration from you.**
 
 👉 **[Explore the Complete Feature & Benefit Catalog (`docs/FEATURES.md`)](docs/FEATURES.md)**
 
----
 
-## Why Use NeuroStrata? (The Benefits)
 
-### 1. Zero-Touch Setup & Upgrades — *Your Agent Does It All*
-You never hand-write config files, wire hooks, or run database migrations.
-- **Say *"Initialize NeuroStrata"* and walk away:** On init, NeuroStrata automatically detects which CLI/terminal harness your agent is running in (**OpenCode**, **Claude Code**, **Hermes Agent**, **OpenAI Codex CLI**, **GitHub Copilot CLI**, or **OpenClaw**), extracts and wires the matching zero-dependency plugin, installs git hooks, scans your repo, and ingests your codebase AST.
-- **Drop-in self-upgrading binary:** When you update `neurostrata-mcp`, the very next session snapshot automatically detects the version delta, upgrades stale git hooks and harness plugins in place, backfills new schema defaults, and instructs the agent to wire any new lifecycle capabilities.
+## How NeuroStrata Helps Your Agents Think (In Every Dimension)
 
-### 2. Teach Once, Enforce Forever (No More Ignored Prompts)
-System prompts get compacted and ignored. Binary gates do not.
-- **Zero-Action Start:** Your agent is mechanically blocked from editing files or running mutating commands until it has loaded the project snapshot and claimed a tracked task.
-- **Closing Work Requires Teaching (Lock 2 Done-Funnel):** A task *cannot* transition to `done` unless the agent extracts at least one architectural rule, fix, or lesson into permanent memory. Every completed task makes your repository smarter.
-- **Unfinished Work Cannot Be Pushed (Lock 1 Pre-Push Gate):** `git push` is automatically gated—if any task is left `in_progress`, lacks an extracted memory, or leaves untracked `TODO`/`FIXME` debt in diffs, the push is blocked before it leaves your machine.
+### 1. Associative & Experiential Thinking — *Remember Every Rule, Fix, and Failed Attempt*
+Every time you start a new session, switch worktrees, or compact context, ordinary agents get amnesia. NeuroStrata gives them a persistent **Tri-Strata Memory** (Global, Project Domain, and Task Working Memory):
+- **4-Stage Hybrid Retrieval:** Queries run simultaneously through **Tantivy BM25** lexical search and **LadybugDB HNSW** vector search, fuse via **Reciprocal Rank Fusion (RRF)**, expand across **1–2 hop Personalized PageRank (PPR)** graph neighbors, and rerank through an embedded **FlashRank ONNX** cross-encoder weighted by **bi-temporal salience decay**.
+- **Negative Exemplars (Never Repeat a Dead End):** Failed approaches are stored as first-class evidence (`outcome: "failed"`), so future sessions immediately see what *didn't* work and why.
+- **Procedural Memory (Habits with Rehearsal Budgets):** Recurring routines (`session-start`, `before-edit`, `after-mutation`) fire automatically as tracked procedures (`neurostrata_procedure_perform`) until they become ingrained.
 
-### 3. Subagents Never Spawn With a Blank Brain Again
-When your primary agent delegates work to a subagent, context usually evaporates.
-- **Automatic Context Injection:** Creating or claiming a task automatically runs a hybrid vector + 1-hop graph search and builds a ready-to-inject `subagent_prompt_injection` block containing the governing architectural rules and AST call-chain neighbors.
-- **Harness-Level Interception:** All 6 NeuroStrata harness plugins automatically prepend that context block into every spawned subagent (`subagent`, `Task`, `delegate_task`, `spawn_agent`).
+### 2. Structural & Blast-Radius Thinking — *See the Whole Codebase Before Touching a Line*
+Instead of burning tokens on blind `grep` loops and breaking callers three files away, your agent thinks in terms of **live software structure**:
+- **Unified 11-Language AST + Rule Graph:** Incremental **Tree-sitter** parsing (Rust, TypeScript/TSX, Python, Go, C#, Java, C/C++, HTML, CSS, Bash, Markdown) links functions, structs, classes, and imports directly to the architectural `[rule]` memories that govern them (`GOVERNS`, `DEPENDS_ON`, `calls`, `imports`).
+- **Automatic Graph-First Reflex:** Before editing a file, one deterministic lookup (`neurostrata_memories_for_file`, `neurostrata_impact_analysis`, `neurostrata_trace_call_chain`) reveals every governing constraint and the transitive upstream/downstream blast radius.
 
-### 4. Instant Blast-Radius & Architectural Awareness Before Every Edit
-Instead of burning tokens on blind `grep` loops and breaking downstream callers:
-- **Unified Code + Memory Graph:** Tree-sitter parses **11 languages** (Rust, TypeScript/TSX, Python, Go, C#, Java, C/C++, HTML, CSS, Bash, Markdown) into the same graph as your architectural rules.
-- **Know What Breaks First:** One tool call (`neurostrata_memories_for_file`, `neurostrata_impact_analysis`, `neurostrata_trace_call_chain`, or `neurostrata_sparql_query`) tells the agent every rule governing a file and every upstream/downstream caller affected by a change.
-- **Negative Exemplars:** Failed approaches are recorded as first-class evidence (`outcome: "failed"`), so future sessions never waste hours repeating a dead end.
+### 3. Deductive & Semantic Thinking — *Exact W3C Logic When Fuzzy Search Isn't Enough*
+Vector similarity is great for concepts, but terrible for strict invariants. NeuroStrata embeds a native **OxiRS W3C Semantic Web engine** alongside its property graph:
+- **SPARQL 1.1 Queries (`SELECT` / `ASK` / `CONSTRUCT`):** Agents run exact multi-hop logical queries across code symbols, tasks, and domain rules (`neurostrata_sparql_query`).
+- **OWL 2 RL Inference & SHACL Closed-World Validation:** Automatically materializes transitive relationships (`skos:broader`, `owl:sameAs`) and validates memory/graph writes against strict structural shapes.
 
-### 5. Pre-Execution Safety Conscience (Podman Sandbox)
-- **Semantic Guard Rules:** Proposed shell commands and file mutations are semantically matched against your project's `guard_rule` memories before execution.
-- **Isolated Dry-Run:** Borderline commands are dry-run inside an ephemeral, rootless `podman --network=none --read-only` container before a single byte touches your real disk.
+### 4. Executive & Workflow Thinking — *Tasks That Cannot Be Half-Finished or Deferred*
+Prompts get rationalized away; binary locks do not. NeuroStrata's **Central Executive** governs the entire work lifecycle through **Three Resilient Soft Locks**:
+- **Zero-Action Start:** Agents are mechanically blocked from editing files or running mutating commands until they call `neurostrata_get_snapshot` and claim an active task (`neurostrata_task_claim`).
+- **Lock 3 — The Breath Working-Memory Prompt:** Every 3–5 mutation steps, the agent pauses and records a state checkpoint on the task (`neurostrata_task_update`) so crash recovery is instant.
+- **Lock 2 — Done-Funnel Mandatory Extraction:** A task **cannot** transition to `done` (`neurostrata_task_complete`) unless the agent extracts at least one architectural rule or lesson into permanent memory. Every finished task makes the system smarter.
+- **Lock 1 — Pre-Push Git Gate & Lexical `TODO` Detector:** `git push` runs `neurostrata-mcp task gate <namespace> --strict`. Any `in_progress` task, unextracted `done` task, or untracked `TODO`/`FIXME`/`later` deferral blocks the push automatically.
 
-### 6. 100% Local Sovereignty + Brokerless Git Team Sync
-- **Zero Cloud Lock-In, Zero Docker:** Embedded **LadybugDB** (vector + property graph), **Tantivy** (BM25 full-text), **FlashRank ONNX** (neural cross-encoder reranking), **OxiRS** (W3C RDF / SPARQL 1.1 / OWL 2 RL / SHACL), **Laya** (local duplicate judgment), and **fastembed** all run inside a single native binary on `127.0.0.1:34343`.
-- **Team Memory Over Plain Git (`SynapticMesh`):** Share approved rules and procedures across your team via standard `git push` and `git pull --ff-only`. Private memories stay on your disk, and team conflicts are preserved visibly—no SaaS account or message broker needed.
+### 5. Collective & Subagent Thinking — *Subagents Never Spawn With a Blank Brain*
+When an orchestrator delegates to a subagent (`worker`, `checker`, `craftsman`, `Task`), context normally evaporates. NeuroStrata makes context propagation automatic:
+- **Auto-Retrieved Subagent Injection (`subagent_prompt_injection`):** Creating or claiming a task automatically runs a hybrid vector + 1-hop graph search and returns a ready-to-paste `subagent_prompt_injection` block containing the active Goal, governing `[rule]` constraints, and AST neighbors.
+- **Zero-Dependency Harness Interception:** Embedded plugins for **OpenCode**, **Claude Code**, **Hermes Agent**, **OpenAI Codex CLI**, **GitHub Copilot CLI**, and **OpenClaw** automatically prepend that context block into every spawned subagent call.
+- **Brokerless Team Sync (`SynapticMesh`):** Share approved rules and procedures across machines and teammates over standard `git push` and `git pull --ff-only` while keeping private memories sovereign on your disk.
 
----
+### 6. Predictive & Conscience Thinking — *Simulate State & Sandbox Risky Commands First*
+- **Digital Twins & Neuroplasticity Telemetry:** Agents model complex system state with versioned **Digital Twins** (`neurostrata_twin_create`, `diff`, `rollback`, `simulate`) and track rolling time-series performance metrics (`neurostrata_metrics_*`).
+- **Prefrontal Cortex Safety Sandbox:** Proposed shell commands and file edits are evaluated against semantic `guard_rule` memories and dry-run inside an ephemeral, rootless `podman --network=none --read-only` container before touching your real filesystem.
 
-## How Easy Is Setup & Upgrading?
 
-### First-Time Install (Once Per Machine)
+
+## Why You Don't Need to Be a Brain Surgeon to Run It
+
+All of that cognitive machinery lives inside **one self-managing binary**. There is no Docker Compose stack, no Python virtualenv to babysit, no YAML configuration labyrinth, and no manual database maintenance.
+
+### 1. First-Time Install (Once Per Machine)
 ```bash
 # 1. Build and install the single Rust binary (includes embedded LadybugDB + OxiRS + ONNX)
 scripts/build.sh
@@ -59,40 +68,40 @@ scripts/build.sh
 neurostrata-mcp setup
 ```
 
-### Initialize Any Repository (Zero User Involvement)
-Open your AI coding agent in any repository and say:
+### 2. Initialize Any Project in One Sentence
+Open your AI coding agent in any repository (new or existing) and say:
 > **"Initialize NeuroStrata for this project."**
 
-**Your agent does the rest automatically:**
+**NeuroStrata and your agent handle everything else automatically:**
 1. Calls `neurostrata_bootstrap` (new repo) or `neurostrata_task_setup` (existing repo).
-2. Auto-detects your active harness (**OpenCode**, **Claude Code**, **Hermes**, **Codex CLI**, **GitHub Copilot CLI**, or **OpenClaw**) and installs/wires the embedded zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`.
-3. Installs and activates the `pre-commit` (secret scan + incremental AST re-ingest) and `pre-push` (strict task gate + SynapticMesh sync) git hooks.
-4. Ingests your codebase AST and seeds your initial architectural rules.
+2. Auto-detects your active CLI/terminal harness (**OpenCode**, **Claude Code**, **Hermes**, **Codex CLI**, **GitHub Copilot CLI**, or **OpenClaw**), extracts and wires the embedded zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`, installs the `neurostrata` skill (`.agents/skills/neurostrata/SKILL.md` + global harness skill dir), and patches existing subagent `.md` definitions with the Graph-First & `subagent_prompt_injection` rules.
+3. Installs and activates both `.git/hooks/pre-commit` (graph-query ledger) and `.git/hooks/pre-push` (strict task gate + SynapticMesh sync).
+4. Scans your repository, ingests the multi-language AST graph, and seeds your initial architectural rules.
 
-### Upgrading (Zero Manual Migration)
-When a new version of NeuroStrata ships, update the binary (`scripts/build.sh` or replace `~/.cargo/bin/neurostrata-mcp`) and keep working. On the very next session start (`neurostrata_get_snapshot`), NeuroStrata **automatically upgrades your git hooks, refreshes your embedded harness plugins, backfills database schemas, and wires any new lifecycle features.**
+### 3. Zero-Touch Upgrades
+When a new version of NeuroStrata ships, replace the binary (`scripts/build.sh` or download the release binary) and keep working. On the very next session start (`neurostrata_get_snapshot`), NeuroStrata **automatically detects the version delta, upgrades your git hooks, refreshes your harness plugins and skills, backfills schema defaults, and reconciles any new lifecycle wires.**
 
----
+
 
 ## Feature Overview at a Glance
 
 > For the complete 12-part breakdown of every subsystem, tool, and code reference, see **[`docs/FEATURES.md`](docs/FEATURES.md)**.
 
-| Subsystem | What It Delivers | Deep-Dive Docs |
+| Subsystem | How It Helps Agents Think & Work | Deep-Dive Docs |
 | :--- | :--- | :--- |
-| **Zero-Touch Harness Auto-Installer** | Auto-detects and wires plugins for **OpenCode, Claude Code, Hermes, Codex CLI, GitHub Copilot CLI, and OpenClaw** on init and snapshot. | [Features §1–2](docs/FEATURES.md#1-zero-touch-onboarding--self-upgrading-lifecycle) |
-| **Graph-First & Subagent Injection** | Auto-retrieves vector + 1-hop graph context on task claim and injects governing rules into every subagent prompt. | [Features §3](docs/FEATURES.md#3-automatic-graph-first-exploration--subagent-context-propagation) |
-| **Central Executive (Tasks & Locks)** | 4-state task lifecycle, Zero-Action Start, Lock 2 Done-Funnel (mandatory extraction), Lock 1 Pre-Push Gate, and lexical `TODO` intent detection. | [Central Executive](docs/organs/central-executive.md) |
+| **Zero-Touch Harness Auto-Installer** | Auto-detects and wires plugins, skills (`SKILL.md`), and subagent rules for **OpenCode, Claude Code, Hermes, Codex CLI, GitHub Copilot CLI, and OpenClaw**. | [Features §1–2](docs/FEATURES.md#1-zero-touch-onboarding--self-upgrading-lifecycle) |
+| **Graph-First & Subagent Injection** | Auto-retrieves vector + 1-hop AST/rule context on task claim and injects `subagent_prompt_injection` into every spawned subagent. | [Features §3](docs/FEATURES.md#3-automatic-graph-first-exploration--subagent-context-propagation) |
+| **Central Executive (Tasks & 3 Soft Locks)** | Zero-Action Start, Lock 3 Breath checkpoints, Lock 2 Done-Funnel (mandatory memory extraction), Lock 1 Pre-Push Gate, and lexical `TODO` detection. | [Central Executive](docs/organs/central-executive.md) |
 | **Memory Core (SynapticGraph)** | Embedded LadybugDB vector + graph store, Tantivy BM25 + HNSW + RRF + PPR + FlashRank ONNX 4-stage retrieval, negative exemplars, and Leiden communities. | [SynapticGraph](docs/architecture/synapticgraph.md) · [Tri-Strata](docs/architecture/tri-strata.md) |
 | **Multi-Language AST & Impact Graph** | Incremental Tree-sitter AST ingestion for 11 languages, upstream/downstream call-chain tracing, blast-radius analysis, and GLiNER entity extraction. | [Features §6](docs/FEATURES.md#6-multi-language-tree-sitter-ast-software-graph--blast-radius-analysis) |
 | **W3C Semantic Graph (OxiRS)** | Native RDF quad projection, **SPARQL 1.1** queries (`SELECT`/`ASK`/`CONSTRUCT`), **OWL 2 RL** inference, and closed-world **SHACL** validation. | [Features §7](docs/FEATURES.md#7-w3c-semantic-knowledge-graph--rdf-sparql-11-owl-2-rl--shacl) |
 | **Prefrontal Cortex (Safety Guard)** | Semantic rule matching against `guard_rule` memories + rootless `podman --network=none` dry-run sandbox before disk mutation. | [Prefrontal Cortex](docs/organs/prefrontal-cortex.md) |
 | **Digital Twins & Telemetry** | Versioned state modeling, structural diffs, rollbacks, policy simulations (`neurostrata_twin_*`), and rolling time-series metrics (`neurostrata_metrics_*`). | [Features §9](docs/FEATURES.md#9-digital-twins-state-simulation--neuroplasticity-telemetry) |
 | **Procedural Memory & Laya Judge** | Triggered habits with finite rehearsal budgets (`neurostrata_procedure_perform`) + local trainable **Laya** duplicate/contradiction judgment. | [Procedural Memory](docs/organs/procedural-memory.md) · [Judgment](docs/architecture/domains/judgment-providers.md) |
-| **SynapticMesh (Git Team Sync)** | Brokerless team memory sharing over standard `git push` / `git pull --ff-only` with sovereign private rows and visible conflict resolution. | [SynapticMesh](docs/mesh/synaptic-mesh.md) |
-| **Thalamic Bus, Obsidian & Security** | In-process pub/sub bus, rolling 500 KB episodic session logs, bidirectional Obsidian vault sync, secret scrubbing, and loopback-only security. | [Thalamic Bus](docs/organs/thalamic-bus.md) · [Security](docs/ops/security.md) · [Obsidian](docs/ops/obsidian.md) |
+| **SynapticMesh (Git Team Sync)** | Brokerless team memory sharing over standard `git push` / `git pull --ff-only` with sovereign private rows and visible conflict resolution. | [Features §10](docs/FEATURES.md#10-synapticmesh-brokerless-git-team-sync) |
+| **Thalamic Bus, Obsidian & Security** | In-process pub/sub bus, rolling 500 KB episodic session logs, bidirectional Obsidian vault sync, secret scrubbing, and caller-path authority (`J6`). | [Thalamic Bus](docs/organs/thalamic-bus.md) · [Security](docs/ops/security.md) · [Obsidian](docs/ops/obsidian.md) |
 
----
+
 
 ## Technical Documentation & Architecture Links
 
