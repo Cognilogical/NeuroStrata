@@ -15,10 +15,13 @@ import plugin, {
   prefetchedPaths,
   injectedMemoryIds,
   PREFETCH_LRU_CAP,
+  SUBAGENT_CONTEXT_MARKER,
+  buildSubagentContextHeader,
+  injectSubagentPrompt,
 } from "./dist/index.js";
 
 test("Plugin.define exports V2 setup and registers execute.before hook", async () => {
-  assert.equal(plugin.id, "neurostrata");
+  assert.ok(plugin.id.startsWith("neurostrata"));
   assert.equal(typeof plugin.setup, "function");
 
   let registeredHook = null;
@@ -402,4 +405,49 @@ test("prefetchMemoriesForFile: LRU path dedup and injectedMemoryIds dedup", asyn
   } finally {
     server.close();
   }
+});
+
+test("injectSubagentPrompt prepends context header once and is idempotent", () => {
+  const target = { prompt: "Original prompt text" };
+  const namespace = "test-ns";
+  const taskId = "task-123";
+
+  // First call should inject
+  const first = injectSubagentPrompt(target, namespace, taskId);
+  assert.equal(first, true, "first call returns true");
+  assert.ok(target.prompt.includes(SUBAGENT_CONTEXT_MARKER));
+  assert.ok(target.prompt.startsWith(`### NeuroStrata Task & Graph Context (AUTO-INJECTED BY NEUROSTRATA PLUGIN)`));
+  assert.ok(target.prompt.includes(`Namespace: \`${namespace}\``));
+  assert.ok(target.prompt.includes(`Active Task ID: \`${taskId}\``));
+  assert.ok(target.prompt.endsWith("Original prompt text"));
+
+  // Second call should be idempotent (no double-injection)
+  const second = injectSubagentPrompt(target, namespace, taskId);
+  assert.equal(second, false, "second call returns false");
+  // Count occurrences of the marker
+  const markerCount = (target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []).length;
+  assert.equal(markerCount, 1, "marker appears exactly once");
+
+  // Missing prompt property returns false
+  const noPrompt = { other: "data" };
+  assert.equal(injectSubagentPrompt(noPrompt, namespace, taskId), false);
+
+  // null prompt property returns false
+  const nullPrompt = { prompt: null };
+  assert.equal(injectSubagentPrompt(nullPrompt, namespace, taskId), false);
+});
+
+test("buildSubagentContextHeader includes required fields", () => {
+  const header = buildSubagentContextHeader("my-ns", "task-abc");
+  assert.ok(header.includes("### NeuroStrata Task & Graph Context"));
+  assert.ok(header.includes("AUTO-INJECTED BY NEUROSTRATA PLUGIN"));
+  assert.ok(header.includes("Namespace: \`my-ns\`"));
+  assert.ok(header.includes("Active Task ID: \`task-abc\`"));
+  assert.ok(header.includes("Graph-First Lookup Rule"));
+  assert.ok(header.includes("neurostrata_memories_for_file"));
+  assert.ok(header.includes("neurostrata_search_memory"));
+
+  // With null taskId
+  const headerNull = buildSubagentContextHeader("other-ns", null);
+  assert.ok(headerNull.includes("Active Task ID: \`unclaimed (claim a task first)\`"));
 });

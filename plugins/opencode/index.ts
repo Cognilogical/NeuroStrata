@@ -661,12 +661,37 @@ export async function prefetchMemoriesForFile(
   return capSnippets(out);
 }
 
+export const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
+
+export function buildSubagentContextHeader(
+  namespace: string,
+  taskId: string | null,
+): string {
+  const taskLabel = taskId ?? "unclaimed (claim a task first)";
+  return (
+    `${SUBAGENT_CONTEXT_MARKER} (AUTO-INJECTED BY NEUROSTRATA PLUGIN)\n` +
+    `- Namespace: \`${namespace}\` | Active Task ID: \`${taskLabel}\`\n` +
+    `- Mandatory Graph-First Lookup Rule: Before blind \`grep\`/\`glob\` or editing files, query \`neurostrata_memories_for_file\`, \`neurostrata_related\`, \`neurostrata_search_memory\` (\`include_related: true\`), or \`neurostrata_sparql_query\` (or \`neurostrata-mcp\` CLI) to inspect governing rules (\`GOVERNS\`) and AST call/import edges (\`DEPENDS_ON\`, \`calls\`, \`imports\`).\n\n`
+  );
+}
+
+export function injectSubagentPrompt(
+  target: Record<string, unknown>,
+  namespace: string,
+  taskId: string | null,
+): boolean {
+  const raw = typeof target.prompt === "string" ? target.prompt : null;
+  if (raw === null || raw.includes(SUBAGENT_CONTEXT_MARKER)) return false;
+  target.prompt = buildSubagentContextHeader(namespace, taskId) + raw;
+  return true;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Plugin Entry Point
 // ──────────────────────────────────────────────────────────────────────
 
 let config: PluginConfig = DEFAULT_CONFIG;
-let mcpClient: NeuroStrataMCPClient | undefined;
+let mcpClient!: NeuroStrataMCPClient;
 
 /**
  * Test hook: drop the cached MCP client so un-initialized code paths (like
@@ -747,6 +772,28 @@ export async function initialize(ctx: any): Promise<void> {
             error: String(err),
           });
         }
+      }
+    }
+
+    if (
+      toolName === "subagent" ||
+      toolName === "Task" ||
+      toolName === "task" ||
+      toolName === "dispatch_agent"
+    ) {
+      if (input?.input && typeof input.input === "object") {
+        injectSubagentPrompt(
+          input.input as Record<string, unknown>,
+          config.namespace,
+          activeTaskId,
+        );
+      }
+      if (input?.args && typeof input.args === "object") {
+        injectSubagentPrompt(
+          input.args as Record<string, unknown>,
+          config.namespace,
+          activeTaskId,
+        );
       }
     }
 
