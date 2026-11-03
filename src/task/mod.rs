@@ -386,6 +386,143 @@ async fn store_new_task(
     Ok((id, payload))
 }
 
+/// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
+/// graph edges for a task, and format a ready-to-paste subagent prompt block.
+pub async fn build_task_graph_context(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+    vector: &[f32],
+    payload: &MemoryPayload,
+) -> (Value, String) {
+    let raw_hits = store
+        .search(namespace, vector.to_vec(), 12, false, false)
+        .await
+        .unwrap_or_default();
+    let mut hits_json = Vec::new();
+    let mut prompt_lines = Vec::new();
+    for r in raw_hits {
+        if r.id == task_id
+            || r.payload.memory_type == "task"
+            || crate::registry::is_registry_row(&r.payload.metadata)
+            || crate::handlers::archive_memory::is_archived(&r.payload)
+        {
+            continue;
+        }
+        let snippet: String = r.payload.content.chars().take(140).collect();
+        let calls = r.payload.metadata.get("calls").cloned().unwrap_or(Value::Null);
+        let imports = r.payload.metadata.get("imports").cloned().unwrap_or(Value::Null);
+        let governs = r.payload.metadata.get("governs").cloned().unwrap_or(Value::Null);
+        let depends_on = r.payload.metadata.get("depends_on").cloned().unwrap_or(Value::Null);
+        prompt_lines.push(format!(
+            "  - [{}] `{}` ({}): {}",
+            r.payload.memory_type,
+            r.id,
+            if r.payload.location.is_empty() { "memory" } else { &r.payload.location },
+            snippet.replace('\n', " ")
+        ));
+        hits_json.push(json!({
+            "id": r.id,
+            "memory_type": r.payload.memory_type,
+            "location": r.payload.location,
+            "snippet": snippet,
+            "calls": calls,
+            "imports": imports,
+            "governs": governs,
+            "depends_on": depends_on,
+            "evidence": r.evidence,
+        }));
+        if hits_json.len() >= 5 {
+            break;
+        }
+    }
+    let hits_block = if prompt_lines.is_empty() {
+        "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
+    } else {
+        prompt_lines.join("\n")
+    };
+    let subagent_prompt = format!(
+        "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
+         - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
+         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}\n\
+         - Mandatory Graph-First Lookup Rule: Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` (or `neurostrata-mcp` CLI) to inspect governing rules (`GOVERNS`) and AST call/import edges (`DEPENDS_ON`, `calls`, `imports`).",
+        namespace, task_id, payload.content, hits_block
+    );
+    (Value::Array(hits_json), subagent_prompt)
+}
+
+/// Record a graph or memory lookup against any active `in_progress` task in
+/// `namespace` and append to `.NeuroStrata/session_queries.json` if a project
+/// root is known.
+pub async fn record_graph_query(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+) {
+    let ns = crate::server::resolve_namespace(store, namespace).await;
+    let Ok(rows) = store.list(&ns, None, None).await else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let entry_str = format!("{}:{}", tool_name, query_hint.chars().take(80).collect::<String>());
+    let mut project_root: Option<String> = None;
+    for r in &rows {
+        if project_root.is_none() && crate::registry::is_registry_row(&r.payload.metadata) {
+            if let Some(p) = r.payload.metadata.get("project_root").and_then(|v| v.as_str()) {
+                project_root = Some(p.to_string());
+            }
+        }
+        if project_root.is_none() && r.payload.memory_type == "directory" {
+            if let Some(p) = r.payload.metadata.get("absolute_path").and_then(|v| v.as_str()) {
+                if std::path::Path::new(p).join(".git").exists() {
+                    project_root = Some(p.to_string());
+                }
+            }
+        }
+        if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
+            if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
+                let obj = task_obj_mut(&mut payload);
+                let count = obj.get("graph_queries_count").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+                obj.insert("graph_queries_count".to_string(), json!(count));
+                obj.insert("graph_queried".to_string(), json!(true));
+                let mut recent: Vec<String> = obj
+                    .get("recent_queries")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                recent.push(entry_str.clone());
+                if recent.len() > 10 {
+                    let drop_n = recent.len() - 10;
+                    recent.drain(0..drop_n);
+                }
+                obj.insert("recent_queries".to_string(), json!(recent));
+                let _ = store.upsert(&ns, &r.id, vec, payload).await;
+            }
+        }
+    }
+    if let Some(root) = project_root {
+        let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
+        if let Some(parent) = ledger_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut doc: Value = std::fs::read_to_string(&ledger_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
+        if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
+            arr.push(json!({
+                "ts": now,
+                "tool": tool_name,
+                "query": query_hint,
+            }));
+            if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
+                let _ = std::fs::write(&ledger_path, serialized);
+            }
+        }
+    }
+}
+
 // ── tool: neurostrata_task_create ──────────────────────────────────────────
 
 pub async fn handle_task_create(
@@ -512,11 +649,19 @@ pub async fn handle_task_create(
     )
     .await
     {
-        Ok((id, payload)) => encode(&json!({
-            "id": id,
-            "namespace": namespace,
-            "task": task_summary(&id, &payload),
-        })),
+        Ok((id, payload)) => {
+            let vector = emb.embed(&payload.content).await.unwrap_or_default();
+            let (hits_json, subagent_prompt) = build_task_graph_context(
+                &store, &namespace, &id, &vector, &payload,
+            ).await;
+            encode(&json!({
+                "id": id,
+                "namespace": namespace,
+                "task": task_summary(&id, &payload),
+                "auto_retrieved_context": hits_json,
+                "subagent_prompt_injection": subagent_prompt,
+            }))
+        }
         Err(e) => e,
     }
 }
@@ -694,7 +839,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     // ever fire for an out-of-process claim writer, and none exists — every
     // claim enters through this handler in the daemon process.)
 
-    if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
+    if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
         return e;
     }
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
@@ -712,6 +857,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
+    let (hits_json, subagent_prompt) = build_task_graph_context(
+        &store, &namespace, &id, &vector, &task.payload,
+    ).await;
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -719,6 +867,8 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         "claimed": true,
         "transition": { "from": from.as_str(), "to": "in_progress" },
         "task": task_summary(&id, &task.payload),
+        "auto_retrieved_context": hits_json,
+        "subagent_prompt_injection": subagent_prompt,
     }))
 }
 
@@ -958,6 +1108,10 @@ pub async fn handle_task_update(
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
+    let graph_queries_count = task.payload.metadata.get("task").and_then(|t| t.get("graph_queries_count")).and_then(|v| v.as_i64()).unwrap_or(0);
+    let graph_lookup_nudge = if graph_queries_count == 0 {
+        Some("Graph-First Lookup: run neurostrata_memories_for_file / neurostrata_related / neurostrata_search_memory before editing files.")
+    } else { None };
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -965,6 +1119,8 @@ pub async fn handle_task_update(
         "transition": transition,
         "renamed": rename_note,
         "task": task_summary(&id, &task.payload),
+        "graph_queries_count": graph_queries_count,
+        "graph_lookup_nudge": graph_lookup_nudge,
     }))
 }
 
@@ -1761,6 +1917,7 @@ pub fn snapshot_prefix(memories: &[SearchResult]) -> String {
 
     let mut out = String::from("Zero-Action Start: claim or create a task before editing.\n");
     out.push_str("Task recognition: a statement of future/deferred work ('TODO:', 'we should also', 'later we need to', 'remaining work:', ...) is a task, not a note — capture it with neurostrata_task_create.\n");
+    out.push_str("Graph-First & Subagent Propagation: before blind grep/glob or editing files, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges. Write this into your session plan and paste the `subagent_prompt_injection` block from neurostrata_task_claim into EVERY subagent prompt you spawn.\n");
     if claimed.is_empty() && ready.is_empty() {
         out.push_str("No tasks are claimed or ready in this namespace.\n");
         return out;
@@ -1825,9 +1982,11 @@ Progress notes go on the task: `neurostrata_task_update` with `note` appends
 to history. The task record IS Tier-3 task memory -- recover a session with
 `neurostrata_task_list` + `neurostrata_get_memory`, not log archaeology.
 
-## 4. Memory
+## 4. Memory & Automatic Graph-First Propagation
 Architectural rules, decisions, and fixes -> `neurostrata_add_memory`.
 Pre-flight every new task with `neurostrata_get_snapshot` first.
+- **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
+- **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
 
 ## 5. Task vs procedure (do not confuse)
 A `task` is a unit of work that finishes (it must reach `done` via
@@ -2102,6 +2261,14 @@ if [ -z "$TouchedModules" ]; then
     TouchedModules=$(git diff --name-only | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
 fi
 
+# ── Check each touched module against governing memories ─────────────────────
+for module in $TouchedModules; do
+    if ! grep -q "\"query\": \"$module\"" "$LEDGER" 2>/dev/null; then
+        echo "warning: module '$module' has no recorded neurostrata_search_memory hit in this session" >&2
+        echo "  → call: neurostrata-mcp search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+    fi
+done
+
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
@@ -2116,13 +2283,6 @@ for module in $TouchedModules; do
     fi
 done
 
-# ── Check each touched module against governing memories ─────────────────────
-for module in $TouchedModules; do
-    if ! grep -q "\"query\": \"$module\"" "$LEDGER" 2>/dev/null; then
-        echo "warning: module '$module' has no recorded neurostrata_search_memory hit in this session" >&2
-        echo "  → call: neurostrata-mcp search_memory --namespace $NAMESPACE --query \"$module\"" >&2
-    fi
-done
 
 exit 0
 "#;

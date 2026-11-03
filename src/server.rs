@@ -1324,6 +1324,37 @@ pub async fn process_mcp_request(
                             result_text = format!("Unknown tool: {}", name);
                         }
                     }
+                    
+                    if matches!(
+                        name,
+                        "neurostrata_search_memory"
+                            | "neurostrata_memories_for_file"
+                            | "neurostrata_related"
+                            | "neurostrata_sparql_query"
+                            | "neurostrata_graphql_query"
+                            | "neurostrata_chat_ask"
+                            | "neurostrata_context_plan"
+                            | "neurostrata_provenance_for"
+                    ) {
+                        if let Some(ns) = params
+                            .get("arguments")
+                            .and_then(|a| a.get("namespace"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let args_ref = params.get("arguments");
+                            let hint = args_ref
+                                .and_then(|a| {
+                                    a.get("query")
+                                        .or_else(|| a.get("file_path"))
+                                        .or_else(|| a.get("memory_id"))
+                                        .or_else(|| a.get("question"))
+                                        .or_else(|| a.get("goal"))
+                                })
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(name);
+                            crate::task::record_graph_query(&store, ns, name, hint).await;
+                        }
+                    }
                 }
             }
 

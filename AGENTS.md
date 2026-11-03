@@ -53,6 +53,11 @@ A statement of future/deferred work is a TASK, not a note:
 - Modal deferral: `we should also`, `later we need to`, `still need to`, `must also fix`, `need to follow up`, `filed follow-up`, `defer`/`deferred`.
 When you see one in user/agent speech, logs, or memory content, capture it with `neurostrata_task_create` (namespace, title) instead of letting it evaporate. The lexical detector surfaces these as `task_intent_signals` in `neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
 
+## 3d. Automatic Graph-First Exploration & Subagent Context Propagation (MANDATORY)
+- **Auto-Retrieved Task Context:** `neurostrata_task_create` and `neurostrata_task_claim` automatically run a hybrid vector + 1-hop graph search on the task's title/description and return `auto_retrieved_context` and a ready-to-paste `subagent_prompt_injection` block.
+- **Graph-First Lookup Reflex:** Before using blind `grep`/`glob` or editing a file, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` to inspect `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
+- **Subagent Prompt Propagation:** Subagents start with a blank context window and no memory of `neurostrata_get_snapshot`. On session init, write the Graph-First rule into your active plan, and whenever you spawn ANY subagent (`subagent` / `Task`), paste the `subagent_prompt_injection` block from `neurostrata_task_claim` into the subagent's prompt and instruct it to query NeuroStrata before blind file searches.
+
 ## 3b. SynapticMesh (inter-instance memory — honesty rules)
 
 When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh status` tells you), some memory mutations are additionally mirrored to the team mesh. The rules an agent must not bend:

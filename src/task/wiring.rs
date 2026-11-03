@@ -171,6 +171,16 @@ pub const REMINDER_WIRES: &[Reminder] = &[
         fires_on: "during-work",
         text: "when speech or a log entry contains a task-shaped statement (TODO:, 'later we need to', 'we should also', ...), capture it with neurostrata_task_create instead of letting it evaporate",
     },
+    Reminder {
+        id: "graph-first-lookup",
+        fires_on: "during-work",
+        text: "before blind grep/glob or file edits, query neurostrata_memories_for_file, neurostrata_related, neurostrata_search_memory (include_related: true), or neurostrata_sparql_query for GOVERNS/DEPENDS_ON/calls/imports edges",
+    },
+    Reminder {
+        id: "subagent-context-propagation",
+        fires_on: "before-edit",
+        text: "subagents start with zero memory context: paste the subagent_prompt_injection block from neurostrata_task_claim into EVERY subagent prompt you spawn",
+    },
 ];
 
 /// Every id a rule may name in its `guard` field (A6). A dangling guard is
