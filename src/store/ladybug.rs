@@ -2442,8 +2442,10 @@ impl LadybugStore {
                     let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
                     if src.is_empty() || src.trim().is_empty() || src == "N/A" {
                         let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
-                        meta.as_object_mut().unwrap().insert("source".to_string(), serde_json::Value::String(val));
-                        shape_changed = true;
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert("source".to_string(), serde_json::Value::String(val));
+                            shape_changed = true;
+                        }
                     }
                 }
                 // (a2) procedure trigger repair
@@ -2451,13 +2453,17 @@ impl LadybugStore {
                     let trigger = meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
                     let is_valid = !trigger.is_empty() && (trigger == "session-start" || trigger == "before-edit" || trigger == "after-mutation" || trigger.starts_with("every-n-sessions:") || trigger.starts_with("every-n-days:"));
                     if !is_valid {
-                        meta.as_object_mut().unwrap().insert("trigger".to_string(), serde_json::Value::String("session-start".to_string()));
-                        shape_changed = true;
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert("trigger".to_string(), serde_json::Value::String("session-start".to_string()));
+                            shape_changed = true;
+                        }
                     }
                     let remaining_missing = meta.get("remaining_fires").and_then(|v| v.as_u64()).is_none();
                     if remaining_missing {
-                        meta.as_object_mut().unwrap().insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
-                        shape_changed = true;
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert("remaining_fires".to_string(), serde_json::Value::Number(serde_json::Number::from(5)));
+                            shape_changed = true;
+                        }
                     }
                 }
                 // (a3) task memory repair: backfill metadata.task defaults
@@ -2478,8 +2484,10 @@ impl LadybugStore {
                         task_changed = true;
                     }
                     if task_changed || meta.get("task").is_none() || !meta.get("task").map_or(false, |v| v.is_object()) {
-                        meta.as_object_mut().unwrap().insert("task".to_string(), serde_json::Value::Object(task_obj));
-                        shape_changed = true;
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert("task".to_string(), serde_json::Value::Object(task_obj));
+                            shape_changed = true;
+                        }
                     }
                 }
                 // (a4) content / fact and generic repair: backfill blank content and missing required fields from title/location/legacy
@@ -2525,12 +2533,43 @@ impl LadybugStore {
                                 if exists { kept.push(item.clone()); } else { unresolvable.push(t.to_string()); }
                             } else { kept.push(item.clone()); }
                         }
-                        if kept.len() != arr.len() { meta.as_object_mut().unwrap().insert(k.to_string(), serde_json::Value::Array(kept)); dangling_changed = true; }
+                        // Materialize missing graph edges for kept targets (borrow; move happens below)
+                        for item in &kept {
+                            if let Some(t) = item.as_str() {
+                                if known_ids.contains(t) || exact_target_exists(conn, t).unwrap_or(false) {
+                                    let rel_table = match *k {
+                                        "governs" => "GOVERNS",
+                                        "related_to" | "relates_to" => "RELATES_TO",
+                                        "contained_by" => "CONTAINS",
+                                        "extracted_from" => "EXTRACTED_FROM",
+                                        "depends_on" => "DEPENDS_ON",
+                                        _ => "RELATES_TO",
+                                    };
+                                    let safe_self = crate::store::ladybug::escape_ladybug_string(id);
+                                    let safe_target = crate::store::ladybug::escape_ladybug_string(t);
+                                    let (from_id, to_id) = if *k == "contained_by" {
+                                        (safe_target.as_str(), safe_self.as_str())
+                                    } else {
+                                        (safe_self.as_str(), safe_target.as_str())
+                                    };
+                                    let merge_edge_q = format!(
+                                        "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.confidence = 1.0, r.evidence_id = '{}', r.origin = 'local'",
+                                        from_id, to_id, rel_table, safe, safe_self
+                                    );
+                                    if let Err(e) = conn.query(&merge_edge_q) {
+                                         tracing::debug!("hygiene edge merge note: {e}");
+                                     }
+                                }
+                            }
+                        } // end for item in &kept
+                        if kept.len() != arr.len() { if let Some(obj) = meta.as_object_mut() { obj.insert(k.to_string(), serde_json::Value::Array(kept)); dangling_changed = true; } }
                     }
                 }
                 if !unresolvable.is_empty() {
                     archived_refs.extend(unresolvable);
-                    meta.as_object_mut().unwrap().insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
+                    if let Some(obj) = meta.as_object_mut() {
+                        obj.insert("archived_refs".to_string(), serde_json::Value::Array(archived_refs.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
+                    }
                     dangling_changed = true;
                 }
                 if shape_changed || dangling_changed || content_backfill.is_some() {
@@ -3263,6 +3302,15 @@ impl VectorStore for LadybugStore {
                     }
                 }
             }
+            for table in EDGE_PROVENANCE_TABLES {
+                let backfill_sql = format!(
+                    "MATCH (a:Memory)-[r:{}]->(b:Memory) WHERE r.valid_to IS NULL SET r.source = a.namespace, r.valid_from = 0, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.confidence = 1.0, r.evidence_id = a.id, r.origin = 'local'",
+                    table
+                );
+                if let Err(e) = conn.query(&backfill_sql) {
+                    tracing::debug!("edge provenance backfill note for {}: {}", table, e);
+                }
+            }
 
             // PQTH: Intake receipts table (operational, not memory rows)
             let create_receipts_table = "CREATE NODE TABLE IntakeReceipt (id STRING, namespace STRING, source_kind STRING, source_revision STRING, source_digest STRING, detected_intents STRING, raw_text STRING, created_at STRING, PRIMARY KEY (id))";
@@ -3294,6 +3342,11 @@ impl VectorStore for LadybugStore {
                     tracing::debug!("schema DDL query note: {e}");
                 }
             }
+            if let Err(e) = conn.query(
+                "MATCH (c:IntakeCandidate) WHERE c.candidate_kind IS NULL OR c.candidate_kind = '' SET c.candidate_kind = 'task', c.payload = '{}', c.source_span = '', c.extractor_fingerprint = ''",
+            ) {
+                tracing::debug!("IntakeCandidate backfill note: {e}");
+            }
 
             // Source-scoped staged ingestion. Two row kinds live in this table:
             //   * the counter row, `id = namespace`, whose `counter` allocates
@@ -3310,6 +3363,15 @@ impl VectorStore for LadybugStore {
                     tracing::debug!("schema DDL query note: {e}");
                 } else {
                     tracing::warn!("schema DDL table creation failed: {e}");
+                }
+            }
+            for stmt in [
+                "ALTER TABLE IngestGeneration ADD source_key STRING",
+                "ALTER TABLE IngestGeneration ADD active_generation INT64",
+                "ALTER TABLE IngestGeneration ADD counter INT64",
+            ] {
+                if let Err(e) = conn.query(stmt) {
+                    tracing::debug!("schema DDL query note: {e}");
                 }
             }
 
@@ -6557,7 +6619,7 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let source_span_str: String = format!("{}", row[14]);
                 let extractor_fingerprint: Option<String> = {
                     let s = format!("{}", row[15]);
-                    if s.is_empty() { None } else { Some(s) }
+                    if s.is_empty() || s.eq_ignore_ascii_case("null") { None } else { Some(s) }
                 };
 
                 let review_state = match review_state_str.as_str() {
@@ -6581,17 +6643,17 @@ impl crate::traits::IntakeStore for LadybugStore {
                     namespace: ns,
                     receipt_id,
                     title,
-                    description: if description.is_empty() { None } else { Some(description) },
+                    description: if description.is_empty() || description.eq_ignore_ascii_case("null") { None } else { Some(description) },
                     review_state,
                     disposition,
-                    task_id: if task_id.is_empty() { None } else { Some(task_id) },
+                    task_id: if task_id.is_empty() || task_id.eq_ignore_ascii_case("null") { None } else { Some(task_id) },
                     cas_version: cas_version as u64,
                     created_at,
                     updated_at,
-                    candidate_kind: if candidate_kind.is_empty() { "task".to_string() } else { candidate_kind },
+                    candidate_kind: if candidate_kind.is_empty() || candidate_kind.eq_ignore_ascii_case("null") { "task".to_string() } else { candidate_kind },
                     payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
                     confidence,
-                    source_span: if source_span_str.is_empty() { None } else { serde_json::from_str(&source_span_str).ok() },
+                    source_span: if source_span_str.is_empty() || source_span_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&source_span_str).ok() },
                     extractor_fingerprint,
                 });
             }
@@ -6704,7 +6766,7 @@ impl crate::traits::IntakeStore for LadybugStore {
             let source_span_str: String = format!("{}", row[14]);
             let extractor_fingerprint: Option<String> = {
                 let s = format!("{}", row[15]);
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() || s.eq_ignore_ascii_case("null") { None } else { Some(s) }
             };
 
             let review_state = match review_state_str.as_str() {
@@ -6728,17 +6790,17 @@ impl crate::traits::IntakeStore for LadybugStore {
                 namespace: ns,
                 receipt_id,
                 title,
-                description: if description.is_empty() { None } else { Some(description) },
+                description: if description.is_empty() || description.eq_ignore_ascii_case("null") { None } else { Some(description) },
                 review_state,
                 disposition: disposition_enum,
-                task_id: if task_id_db.is_empty() { None } else { Some(task_id_db) },
+                task_id: if task_id_db.is_empty() || task_id_db.eq_ignore_ascii_case("null") { None } else { Some(task_id_db) },
                 cas_version: cas_version_db as u64,
                 created_at,
                 updated_at,
-                candidate_kind: if candidate_kind.is_empty() { "task".to_string() } else { candidate_kind },
+                candidate_kind: if candidate_kind.is_empty() || candidate_kind.eq_ignore_ascii_case("null") { "task".to_string() } else { candidate_kind },
                 payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
                 confidence,
-                source_span: if source_span_str.is_empty() { None } else { serde_json::from_str(&source_span_str).ok() },
+                source_span: if source_span_str.is_empty() || source_span_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&source_span_str).ok() },
                 extractor_fingerprint,
             };
 

@@ -132,8 +132,12 @@ enum Commands {
 
     /// Repair namespace hygiene (source, dangling refs, endpoint mismatches)
     RepairHygiene {
-        /// The namespace to repair
-        namespace: String,
+        /// The namespace to repair (optional when --all is passed)
+        namespace: Option<String>,
+
+        /// Repair all namespaces in the database
+        #[arg(long)]
+        all: bool,
     },
 
     /// Delete a memory from a namespace by ID
@@ -4286,7 +4290,7 @@ async fn run() -> anyhow::Result<()> {
                             scanned, updated, skipped
                         );
                     }
-                    Commands::RepairHygiene { namespace } => {
+                    Commands::RepairHygiene { namespace, all } => {
                         use crate::store::ladybug::LadybugStore;
                         let direct =
                             crate::traits::VectorStore::as_any(vector_store.as_ref())
@@ -4294,8 +4298,28 @@ async fn run() -> anyhow::Result<()> {
                                 .ok_or_else(|| {
                                     anyhow::anyhow!("repair-hygiene requires LadybugStore backend")
                                 })?;
-                        let (fixed_shape, fixed_dangling) = direct.repair_namespace_hygiene(&namespace).await?;
-                        println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
+                        if all {
+                            let namespaces = vector_store.list_namespaces().await?;
+                            let mut total_shape = 0usize;
+                            let mut total_dangling = 0usize;
+                            for ns in &namespaces {
+                                let (fixed_shape, fixed_dangling) =
+                                    direct.repair_namespace_hygiene(ns).await?;
+                                total_shape += fixed_shape;
+                                total_dangling += fixed_dangling;
+                            }
+                            println!(
+                                "Namespace hygiene repaired across {} namespaces: {} shape fixes, {} dangling fixes.",
+                                namespaces.len(),
+                                total_shape,
+                                total_dangling
+                            );
+                        } else {
+                            let ns = namespace.ok_or_else(|| anyhow::anyhow!("Provide <NAMESPACE> or --all"))?;
+                            let (fixed_shape, fixed_dangling) =
+                                direct.repair_namespace_hygiene(&ns).await?;
+                            println!("Namespace hygiene repaired: {} shape fixes, {} dangling fixes.", fixed_shape, fixed_dangling);
+                        }
                     }
                     Commands::Delete { namespace, id } => {
                         vector_store.delete(&namespace, &id).await?;
