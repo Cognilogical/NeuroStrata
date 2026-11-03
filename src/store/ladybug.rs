@@ -3815,7 +3815,7 @@ impl VectorStore for LadybugStore {
                 // F18: GOVERNS source must be rule even when target missing/stubbed.
                 // (handled above for resolved targets; missing targets skip role check)
                 // F6: stamp edge provenance for this resolved declaration.
-                {
+                let evidence_id = {
                     let declared = edge.target_id.clone();
                     let resolved = target.clone();
                     let logical = crate::parser::generation::logical_path_of(&resolved).to_string();
@@ -3863,6 +3863,11 @@ impl VectorStore for LadybugStore {
                         }
                         _ => (None, None),
                     };
+                    let evidence_id = match (&file, &content_hash) {
+                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.len().min(12)]),
+                        (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
+                        _ => id.clone(),
+                    };
                     let entry = serde_json::json!({
                         "declaring_id": id,
                         "rel_type": edge.rel_type,
@@ -3875,10 +3880,12 @@ impl VectorStore for LadybugStore {
                         "content_hash": content_hash,
                         "line_start": line_start,
                         "line_end": line_end,
+                        "evidence_id": evidence_id,
                         "extractor": "upsert",
                     });
                     resolved_edge_entries.push(entry);
-                }
+                    evidence_id
+                };
                 if !is_valid_relation_name(edge.rel_type) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
                         rel_type: edge.rel_type.to_string(),
@@ -3896,9 +3903,10 @@ impl VectorStore for LadybugStore {
                 } else {
                     (target_safe.as_str(), safe_id.as_str())
                 };
+                let evidence_id_safe = escape_ladybug_string(&evidence_id);
                 let edge_query = format!(
-                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = {}, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert' ON MATCH SET r.source = '{}', r.valid_from = {}, r.extractor = 'upsert'",
-                    from, to, edge.rel_type, safe_ns, edge_now, safe_ns, edge_now
+                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{}]->(b) ON CREATE SET r.source = '{}', r.valid_from = {}, r.valid_to = 0, r.generation = 0, r.extractor = 'upsert', r.evidence_id = '{}' ON MATCH SET r.source = '{}', r.valid_from = {}, r.extractor = 'upsert', r.evidence_id = '{}'",
+                    from, to, edge.rel_type, safe_ns, edge_now, evidence_id_safe, safe_ns, edge_now, evidence_id_safe
                 );
                 if let Err(e) = conn.query(&edge_query) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
@@ -3971,11 +3979,12 @@ impl VectorStore for LadybugStore {
             for m in &mentions_for_write {
                 let m_safe = escape_ladybug_string(m);
                 let q = format!(
-                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:RELATES_TO {{source: '{}', valid_from: {}, valid_to: 0, generation: 0, extractor: 'mention-detector'}}]->(b)",
+                    "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:RELATES_TO {{source: '{}', valid_from: {}, valid_to: 0, generation: 0, extractor: 'mention-detector', evidence_id: '{}'}}]->(b)",
                     escape_ladybug_string(&id),
                     m_safe,
                     escape_ladybug_string(&namespace),
-                    edge_now
+                    edge_now,
+                    escape_ladybug_string(&id),
                 );
                 if let Err(e) = conn.query(&q) {
                     tracing::warn!("mention-edge creation failed for '{namespace}:{id}': {e}");

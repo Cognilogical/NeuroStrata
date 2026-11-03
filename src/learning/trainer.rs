@@ -7,6 +7,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::judgment::laya_onnx::{LocalTrainingRuntime, ModelVersion};
 
+pub fn builtin_onnx_model_bytes() -> Vec<u8> {
+    vec![
+        0x08, 0x07, 0x3a, 0x7b, 0x0a, 0x1a, 0x0a, 0x05, 0x69, 0x6e, 0x70, 0x75,
+        0x74, 0x0a, 0x01, 0x57, 0x12, 0x06, 0x6f, 0x75, 0x74, 0x70, 0x75, 0x74,
+        0x22, 0x06, 0x4d, 0x61, 0x74, 0x4d, 0x75, 0x6c, 0x12, 0x0d, 0x62, 0x75,
+        0x69, 0x6c, 0x74, 0x69, 0x6e, 0x2d, 0x67, 0x72, 0x61, 0x70, 0x68, 0x2a,
+        0x1b, 0x08, 0x02, 0x08, 0x02, 0x10, 0x01, 0x22, 0x10, 0x00, 0x00, 0x00,
+        0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0xc0, 0x42, 0x01, 0x57, 0x5a, 0x17, 0x0a, 0x05, 0x69, 0x6e, 0x70, 0x75,
+        0x74, 0x12, 0x0e, 0x0a, 0x0c, 0x08, 0x01, 0x12, 0x08, 0x0a, 0x02, 0x08,
+        0x01, 0x0a, 0x02, 0x08, 0x02, 0x62, 0x18, 0x0a, 0x06, 0x6f, 0x75, 0x74,
+        0x70, 0x75, 0x74, 0x12, 0x0e, 0x0a, 0x0c, 0x08, 0x01, 0x12, 0x08, 0x0a,
+        0x02, 0x08, 0x01, 0x0a, 0x02, 0x08, 0x02, 0x42, 0x04, 0x0a, 0x00, 0x10,
+        0x0d,
+    ]
+}
+
 /// Training job state machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -173,12 +190,29 @@ impl Trainer {
             };
             let fitted_temp = crate::learning::calibration::TemperatureFitter::new()
                 .fit(&effective_pairs)?;
+            let model_path = self.runtime.model_cache.join("model.onnx");
+            let model_bytes: Vec<u8> = if model_path.exists() {
+                let len = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+                if len > 16 {
+                    std::fs::read(&model_path)?
+                } else {
+                    builtin_onnx_model_bytes()
+                }
+            } else {
+                builtin_onnx_model_bytes()
+            };
+            std::fs::write(cand_dir.join("model.onnx"), &model_bytes)?;
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&model_bytes);
+            let model_sha256 = hex::encode(hasher.finalize());
             let manifest = serde_json::json!({
                 "embedder_id": "laya",
                 "model_version": version,
                 "calibration_tier": if from_dataset { "DatasetCalibrated" } else { "ProxyInternal" },
                 "temperature": fitted_temp,
                 "pair_count": effective_pairs.len(),
+                "model_sha256": model_sha256,
             });
             std::fs::write(cand_dir.join("manifest.json"), manifest.to_string())?;
 
@@ -251,6 +285,18 @@ impl Trainer {
         manifest.active_version = Some(version.clone());
         manifest.candidate_version = None;
         manifest.shadow_version = Some(version.clone());
+        // Copy active bundle to root cache so it stays in sync.
+        let cand_bundle = self.runtime.model_cache.join("candidates").join(version);
+        let root_model = self.runtime.model_cache.join("model.onnx");
+        let root_manifest = self.runtime.model_cache.join("manifest.json");
+        if cand_bundle.join("model.onnx").exists() && cand_bundle.join("manifest.json").exists() {
+            if let Err(e) = std::fs::copy(cand_bundle.join("model.onnx"), &root_model) {
+                tracing::warn!(?e, "failed to copy model onnx to root cache");
+            }
+            if let Err(e) = std::fs::copy(cand_bundle.join("manifest.json"), &root_manifest) {
+                tracing::warn!(?e, "failed to copy manifest.json to root cache");
+            }
+        }
         Ok(())
     }
 
@@ -259,6 +305,20 @@ impl Trainer {
         manifest.active_version = manifest.previous_good_version.clone();
         manifest.candidate_version = None;
         manifest.shadow_version = None;
+        // Copy previous version bundle to root cache if available.
+        if let Some(prev) = manifest.previous_good_version.as_ref() {
+            let cand_bundle = self.runtime.model_cache.join("candidates").join(prev);
+            let root_model = self.runtime.model_cache.join("model.onnx");
+            let root_manifest = self.runtime.model_cache.join("manifest.json");
+            if cand_bundle.join("model.onnx").exists() && cand_bundle.join("manifest.json").exists() {
+                if let Err(e) = std::fs::copy(cand_bundle.join("model.onnx"), &root_model) {
+                    tracing::warn!(?e, "failed to copy rollback bundle file to root cache");
+                }
+                if let Err(e) = std::fs::copy(cand_bundle.join("manifest.json"), &root_manifest) {
+                    tracing::warn!(?e, "failed to copy rollback bundle file to root cache");
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -513,5 +573,39 @@ mod tests {
         ).unwrap();
         assert_eq!(eval.candidate, "v1.0.0");
         assert_eq!(eval.gold_metrics(), Some(1.0), "fallback pairs are perfectly separable");
+    }
+
+    #[tokio::test]
+    async fn builtin_train_candidate_produces_valid_onnx_bundle() {
+        use crate::judgment::JudgmentProvider;
+        use crate::judgment::laya_onnx::{LayaOnnxProvider, RuntimeState};
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("python"),
+            laya_train: PathBuf::from("laya-train"),
+            model_cache: tmp_dir.path().to_path_buf(),
+        }));
+        t.train_candidate(&"v1.0.0".to_string()).await.unwrap();
+        let cand_dir = tmp_dir.path().join("candidates/v1.0.0");
+        let provider = LayaOnnxProvider::load(&cand_dir, Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
+        assert_eq!(provider.state(), crate::judgment::RuntimeState::Ready);
+        let mem = crate::traits::MemoryPayload {
+            content: String::new(),
+            user_id: String::new(),
+            memory_type: String::new(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::Value::Null,
+        };
+        let cand = crate::traits::SearchResult {
+            id: "c1".to_string(),
+            score: 0.9,
+            payload: mem.clone(),
+            evidence: None,
+        };
+        let judgments = provider.judge_duplicates(&mem, &[cand]).await.unwrap();
+        assert!(!judgments.is_empty());
+        assert!(judgments.iter().any(|j| j.reason.as_ref().map_or(false, |r| r.contains("laya-onnx-model-logit"))));
     }
 }

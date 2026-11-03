@@ -312,3 +312,64 @@ mod tests {
         );
     }
 }
+
+pub fn purge_observations_offline_at(root: &Path, confirm_purge: bool) -> Result<LearningControlResult, String> {
+    if !confirm_purge {
+        return Err("--purge-observations requires --confirm-purge".to_string());
+    }
+    for dir in ["observations", "blobs", "dataset"] {
+        let p = root.join(dir);
+        if p.exists() {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+    let res = apply_control_at(root, &LearningControlRequest {
+        action: LearningControlAction::Reset,
+        purge_observations: false,
+    })?;
+    let mut status = res.status;
+    status.observation_count = 0;
+    status.labeled_pair_count = 0;
+    persist_status(root, &status)?;
+    Ok(LearningControlResult { ok: true, status })
+}
+
+pub fn purge_observations_offline(confirm_purge: bool) -> Result<LearningControlResult, String> {
+    purge_observations_offline_at(&default_learning_dir(), confirm_purge)
+}
+
+#[cfg(test)]
+mod offline_purge_tests {
+    use super::*;
+
+    #[test]
+    fn purge_observations_offline_requires_confirm_purge() {
+        let dir = std::env::temp_dir().join(format!("ns-purge-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            purge_observations_offline_at(&dir, false).unwrap_err(),
+            "--purge-observations requires --confirm-purge".to_string()
+        );
+    }
+
+    #[test]
+    fn purge_observations_offline_discards_observations_and_dataset() {
+        let dir = std::env::temp_dir().join(format!("ns-purge-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("observations")).unwrap();
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        std::fs::create_dir_all(dir.join("dataset")).unwrap();
+        std::fs::write(dir.join("status.json"), b"{}").unwrap();
+        let res = purge_observations_offline_at(&dir, true).unwrap();
+        assert!(res.ok);
+        assert!(!dir.join("observations").exists());
+        assert!(!dir.join("blobs").exists());
+        assert!(!dir.join("dataset").exists());
+        let status: LearnStatus = serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status.observation_count, 0);
+        assert_eq!(status.labeled_pair_count, 0);
+        assert!(std::fs::read_to_string(dir.join("control.json")).unwrap().contains("\"action\""));
+    }
+}

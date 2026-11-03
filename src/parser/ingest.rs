@@ -166,6 +166,43 @@ struct SymbolRow {
     /// SHA-256 of the full (untruncated) definition text. This is the symbol's
     /// stable identity tail (`symbol_id`), stable across line moves.
     span_sha256: String,
+    calls: Vec<String>,
+}
+
+/// Extract identifiers followed by `(` from `body`, excluding `self_name` and
+/// language keywords/builtins. Sorted and deduplicated.
+fn extract_called_identifiers(body: &str, self_name: &str) -> Vec<String> {
+    const KEYWORDS: &[&str] = &[
+        "if", "else", "for", "while", "loop", "match", "switch", "return",
+        "sizeof", "typeof", "catch", "fn", "def", "function", "pub", "Some",
+        "None", "Ok", "Err", "vec", "format", "println", "eprintln", "assert",
+        "assert_eq", "assert_ne",
+    ];
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let ident = &body[start..i];
+            if i < bytes.len()
+                && bytes[i] == b'('
+                && ident != self_name
+                && !KEYWORDS.contains(&ident)
+            {
+                out.push(ident.to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 /// One embedded markdown section.
 #[derive(Clone)]
@@ -624,6 +661,7 @@ fn run_producer(
                         end_line: definition.end_position().row + 1,
                         body: truncate_for_embedding(full),
                         span_sha256: sha256_hex(full.as_bytes()),
+                        calls: extract_called_identifiers(full, name),
                     });
                 }
             }
@@ -750,6 +788,24 @@ async fn run_consumer(
                 file_sha256,
             } => {
                 let mut symbols_stored = 0usize;
+                let file_symbol_ids: std::collections::HashMap<String, String> = symbols
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            generation_scoped_id(
+                                namespace,
+                                generation,
+                                &symbol_id(
+                                    &node_path,
+                                    &s.kind,
+                                    &s.name,
+                                    &s.span_sha256,
+                                ),
+                            ),
+                        )
+                    })
+                    .collect();
                 for symbol in symbols {
                     let summary = format!(
                         "{} {} in {}\nlines {}-{}\n\n{}",
@@ -799,6 +855,20 @@ async fn run_consumer(
                         with_relative_path(&source_identity, &node_path),
                     );
                     metadata.insert("index_generation".to_string(), serde_json::json!(generation));
+
+                    if !symbol.calls.is_empty() {
+                        metadata.insert("calls".to_string(), serde_json::json!(symbol.calls));
+                        let called_ids: Vec<String> = symbol
+                            .calls
+                            .iter()
+                            .filter_map(|c| file_symbol_ids.get(c))
+                            .filter(|cid| *cid != &id)
+                            .cloned()
+                            .collect();
+                        if !called_ids.is_empty() {
+                            metadata.insert("depends_on".to_string(), serde_json::json!(called_ids));
+                        }
+                    }
 
                     let payload = MemoryPayload {
                         content: summary.clone(),
@@ -1175,6 +1245,7 @@ pub async fn ingest_directory(
                     .collect();
                 if let Some(obj) = payload.metadata.as_object_mut() {
                     obj.insert("depends_on".to_string(), serde_json::json!(target_ids));
+                    obj.insert("imports".to_string(), serde_json::json!(targets));
                 }
                 if let Err(e) = vector_store.upsert(namespace, &src_id, vec, payload).await {
                     tracing::warn!(
@@ -1519,6 +1590,19 @@ mod tests {
         assert!(cut.starts_with(&"x".repeat(MAX_SYMBOL_CHARS)));
         assert!(cut.contains("truncated"));
         assert!(cut.chars().filter(|c| *c == 'x').count() == MAX_SYMBOL_CHARS);
+    }
+
+    #[test]
+    fn extract_called_identifiers_finds_function_calls_and_skips_keywords_and_self() {
+        // Test that extract_called_identifiers finds function calls and skips keywords and self
+        let body = "fn foo() { bar() }";
+        let self_name = "foo";
+        let result = extract_called_identifiers(body, self_name);
+        // Should find "bar" as a function call, skip "foo" (self), and skip keywords
+        assert!(result.iter().any(|s| s == "bar"));
+        assert!(!result.iter().any(|s| s == "foo"));
+        assert!(!result.iter().any(|s| s == "if"));
+        assert!(!result.iter().any(|s| s == "fn"));
     }
 
     #[test]

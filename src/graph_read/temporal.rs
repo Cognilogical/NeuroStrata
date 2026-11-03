@@ -58,6 +58,62 @@ pub fn parse_temporal(raw: &str) -> Option<i64> {
     None
 }
 
+/// Extract the earliest ISO-8601 date or RFC-3339 timestamp from `query` text.
+/// Tokens are split on whitespace and surrounding punctuation trimmed. Returns
+/// the first candidate parsed into epoch seconds; ordinary words are ignored.
+pub fn extract_query_timestamp(query: &str) -> Option<i64> {
+    for tok_raw in query.split_whitespace() {
+        let tok = tok_raw.trim_matches(|c: char| ". ,;!?()[]\"'".contains(c));
+        if tok.len() == 10 && tok.as_bytes()[4] == b'-' && tok.as_bytes()[7] == b'-' {
+            if let Ok(date) = chrono::NaiveDate::parse_from_str(tok, "%Y-%m-%d") {
+                return Some(
+                    date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc().timestamp()).unwrap_or(0),
+                );
+            }
+        } else if tok.contains('T') && tok.len() >= 19 {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(tok) {
+                return Some(dt.timestamp());
+            }
+        }
+    }
+    None
+}
+
+/// Compute a time-proximity boost applied to a search result score.
+///
+/// Looks up the result's timestamp metadata field (`valid_from`,
+/// `created_at`, `timestamp`, or `date`) and derives days elapsed since the
+/// query timestamp. The closer the boost happens, the lower the penalty.
+/// Missing timestamps yield `0.0`, which skips the rerank pass entirely.
+pub fn temporal_proximity_boost(query_ts: i64, metadata: &serde_json::Value) -> f32 {
+    let ts = if let Some(v) = metadata.get("valid_from").and_then(|v| v.as_str()) {
+        parse_temporal(v).filter(|&t| t > 0)
+    } else if let Some(v) = metadata.get("valid_from").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+        Some(v)
+    } else if let Some(v) = metadata.get("created_at").and_then(|v| v.as_str()) {
+        parse_temporal(v).filter(|&t| t > 0)
+    } else if let Some(v) = metadata.get("created_at").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+        Some(v)
+    } else if let Some(v) = metadata.get("timestamp").and_then(|v| v.as_str()) {
+        parse_temporal(v).filter(|&t| t > 0)
+    } else if let Some(v) = metadata.get("timestamp").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+        Some(v)
+    } else if let Some(v) = metadata.get("date").and_then(|v| v.as_str()) {
+        parse_temporal(v).filter(|&t| t > 0)
+    } else if let Some(v) = metadata.get("date").and_then(|v| v.as_i64()).filter(|&n| n > 0) {
+        Some(v)
+    } else {
+        None
+    };
+    match ts {
+        Some(t) => {
+            let days_diff = ((t - query_ts).abs() as f32) / 86_400.0;
+            0.15_f32 / (1.0_f32 + days_diff / 30.0_f32)
+        }
+        None => 0.0,
+    }
+}
+
 /// The effective `[lo, hi]` validity interval of one relationship. `0` on an
 /// INT64 edge column and a missing/unparseable payload stamp both mean
 /// "unbounded"; intersecting the two sources can make the interval empty.
@@ -76,10 +132,10 @@ fn item_window(
     if edge_valid_to > 0 {
         hi = hi.min(edge_valid_to);
     }
-    if let Some(from) = payload_valid_from.and_then(parse_temporal).filter(|v| *v > 0) {
+    if let Some(from) = payload_valid_from.and_then(parse_temporal).filter(|&v| v > 0) {
         lo = lo.max(from);
     }
-    if let Some(to) = payload_valid_to.and_then(parse_temporal).filter(|v| *v > 0) {
+    if let Some(to) = payload_valid_to.and_then(parse_temporal).filter(|&v| v > 0) {
         hi = hi.min(to);
     }
 
@@ -205,5 +261,55 @@ mod tests {
         assert_eq!(parse_temporal(" 2026-10-27 "), Some(1_793_059_200));
         assert_eq!(parse_temporal("not-a-date"), None);
         assert_eq!(parse_temporal(""), None);
+    }
+
+    #[test]
+    fn extract_query_timestamp_finds_iso_date() {
+        assert_eq!(extract_query_timestamp("hello world 2026-10-27 test"), Some(1_793_059_200));
+    }
+
+    #[test]
+    fn extract_query_timestamp_finds_rfc3339() {
+        assert_eq!(extract_query_timestamp("query 2026-10-27T12:00:00Z more text"), Some(1_793_102_400));
+    }
+
+    #[test]
+    fn extract_query_timestamp_skips_ordinary_words() {
+        assert_eq!(extract_query_timestamp("the quick brown fox jumps over the lazy dog"), None);
+    }
+
+    #[test]
+    fn extract_query_timestamp_ignores_short_words() {
+        assert_eq!(extract_query_timestamp("2026-10 test end"), None);
+    }
+
+    #[test]
+    fn extract_query_timestamp_handles_punctuation_around_dates() {
+        assert_eq!(extract_query_timestamp("(\"2026-10-27\") and [2026-11-15] data"), Some(1_793_059_200));
+    }
+
+    #[test]
+    fn temporal_proximity_boost_closer_result_higher_boost() {
+        let today = chrono::Utc::now().timestamp();
+        // Very recent: boost is high (~0.15).
+        let recent_meta = serde_json::json!({"valid_from": today});
+        assert!(temporal_proximity_boost(today, &recent_meta) > 0.0);
+        // Older result: lower boost.
+        let older_meta = serde_json::json!({"valid_from": (today - 365 * 86400)});
+        let close_boost = temporal_proximity_boost(today, &recent_meta);
+        let old_boost = temporal_proximity_boost(today, &older_meta);
+        assert!(old_boost < close_boost);
+    }
+
+    #[test]
+    fn temporal_proximity_boost_missing_metadata_returns_zero() {
+        assert_eq!(temporal_proximity_boost(1_000_000, &serde_json::Value::Null), 0.0);
+    }
+
+    #[test]
+    fn temporal_proximity_boost_no_valid_timestamp_returns_zero() {
+        // No positive timestamp field present.
+        let meta = serde_json::json!({"deleted_at": -1});
+        assert_eq!(temporal_proximity_boost(1_000_000, &meta), 0.0);
     }
 }

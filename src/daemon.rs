@@ -2914,3 +2914,39 @@ impl crate::traits::AsAny for RecordingStore {
         );
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonState {
+    Running { since: String },
+    Stopped,
+}
+
+pub fn daemon_status(db_path: &std::path::Path) -> DaemonState {
+    if daemon_holds_lock_local(db_path) {
+        DaemonState::Running { since: "active".to_string() }
+    } else {
+        DaemonState::Stopped
+    }
+}
+
+fn daemon_lock_path_local(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.to_path_buf();
+    path.push(".daemon.lock");
+    path
+}
+
+fn daemon_holds_lock_local(db_path: &std::path::Path) -> bool {
+    if !daemon_lock_path_local(db_path).exists() {
+        return false;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(daemon_lock_path_local(db_path))
+    {
+        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
+    }
+}

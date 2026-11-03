@@ -112,10 +112,24 @@ impl TypeSafeJevProvider {
         for (i, candidate) in candidates.iter().enumerate() {
             let question_key = format!("is_duplicate_{}", i);
             if let Some(answer) = answers.get(&question_key) {
-                let confidence = answer.get("probability").and_then(|p| p.as_f64());
-                if confidence.is_none() {
-                    tracing::warn!("TypeSafe Jev response missing numeric 'probability' field");
-                }
+                let confidence = match answer.get("probability") {
+                    Some(prob) if prob.is_f64() => prob.as_f64(),
+                    Some(prob) if prob.is_i64() => Some((prob.as_i64().unwrap_or(0) as f64) / 100.0),
+                    Some(prob) if prob.is_string() => {
+                        let s = prob.as_str().unwrap_or("");
+                        match s.to_ascii_lowercase().as_str() {
+                            "yes" | "true" | "duplicate" => Some(0.9),
+                            "no" | "false" => Some(0.1),
+                            _ => None,
+                        }
+                    }
+                    // Fallback: check for SystemOne noul in alternative fields
+                    _ => answer.get("answer").or_else(|| answer.get("verdict")).or_else(|| answer.get("noul")).and_then(|v| v.as_str()).map(|s| Some(match s.to_ascii_lowercase().as_str() {
+                        "yes" | "true" | "duplicate" => 0.9,
+                        "no" | "false" => 0.1,
+                        _ => 0.0,
+                    })).flatten(),
+                };
                 let confidence = confidence.unwrap_or(0.0) as f32;
 
                 let reason = answer
@@ -154,9 +168,14 @@ impl JudgmentProvider for TypeSafeJevProvider {
 
         let request = self.build_request(new_memory, candidates);
 
+        let post_url = if self.base_url.ends_with("/systemone") || self.base_url.ends_with("/evaluate") {
+            self.base_url.clone()
+        } else {
+            format!("{}/systemone", self.base_url.trim_end_matches('/'))
+        };
         let response = self
             .client
-            .post(&format!("{}/evaluate", self.base_url))
+            .post(&post_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&request)
@@ -279,5 +298,74 @@ mod tests {
         provider
             .assert_egress_authorized()
             .expect("loopback target never trips the egress gate");
+    }
+
+    #[tokio::test]
+    async fn parse_response_handles_systemone_noui_answers() {
+        // Test that parse_response accepts both numeric probability and SystemOne noul fields
+        let provider = TypeSafeJevProvider::new(String::new())
+            .expect("provider constructs even without a key");
+
+        // Yes answer via "noui" field (SystemOne style)
+        let resp_yes = serde_json::json!({
+            "answers": {
+                "is_duplicate_0": {
+                    "answer": "yes",
+                    "verdict": null,
+                    "noui": "yes"
+                }
+            }
+        });
+        let mut cands = vec![];
+        let new_mem = MemoryPayload {
+            content: "test".to_string(),
+            user_id: String::new(),
+            memory_type: String::new(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        // dummy candidate
+        cands.push(crate::traits::SearchResult {
+            id: "c1".to_string(),
+            score: 0.9,
+            payload: new_mem.clone(),
+            evidence: None,
+        });
+        let judgments = provider
+            .parse_response(&resp_yes, &cands)
+            .unwrap();
+        assert!(!judgments.is_empty());
+        assert!(
+            judgments[0].confidence > 0.5,
+            "noui 'yes' should yield confidence > 0.5"
+        );
+
+        // No answer via "noui" field
+        let resp_no = serde_json::json!({
+            "answers": {
+                "is_duplicate_0": {
+                    "answer": "no",
+                    "verdict": null,
+                    "noui": "no"
+                }
+            }
+        });
+        let judgments2 = provider.parse_response(&resp_no, &cands).unwrap();
+        assert!(judgments2.is_empty(), "noui 'no' should yield confidence <= 0.5");
+
+        // Probability answer still works
+        let resp_prob = serde_json::json!({
+            "answers": {
+                "is_duplicate_0": {
+                    "probability": 0.8,
+                    "reasoning": "duplicate"
+                }
+            }
+        });
+        let judgments3 = provider.parse_response(&resp_prob, &cands).unwrap();
+        assert!(!judgments3.is_empty());
+        assert_eq!(judgments3[0].confidence, 0.8);
     }
 }

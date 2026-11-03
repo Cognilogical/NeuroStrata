@@ -2943,13 +2943,30 @@ async fn run() -> anyhow::Result<()> {
                     purge_observations,
                     confirm_purge,
                 } => {
-                    if purge_observations && !confirm_purge {
-                        anyhow::bail!("--purge-observations requires --confirm-purge");
+                    if purge_observations {
+                        let config = Config::load().unwrap();
+                        let daemon_state = crate::daemon::daemon_status(&config.db_path);
+                        if matches!(daemon_state, crate::daemon::DaemonState::Running { .. }) {
+                            print_learn_control(crate::learning::control::LearningControlRequest {
+                                action: crate::learning::control::LearningControlAction::Reset,
+                                purge_observations: true,
+                            });
+                        } else {
+                            let result = crate::learning::control::purge_observations_offline(confirm_purge);
+                            match result {
+                                Ok(res) => println!("{}", serde_json::to_string_pretty(&res).unwrap()),
+                                Err(e) => {
+                                    eprintln!("{}", e);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    } else {
+                        print_learn_control(crate::learning::control::LearningControlRequest {
+                            action: crate::learning::control::LearningControlAction::Reset,
+                            purge_observations,
+                        });
                     }
-                    print_learn_control(crate::learning::control::LearningControlRequest {
-                        action: crate::learning::control::LearningControlAction::Reset,
-                        purge_observations,
-                    });
                 }
                 LearnCommands::Train { version } => {
                     run_learn_train(&version).await?;

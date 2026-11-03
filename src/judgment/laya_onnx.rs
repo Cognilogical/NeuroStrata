@@ -232,10 +232,11 @@ impl JudgmentProvider for LayaOnnxProvider {
         {
             anyhow::bail!("Laya ONNX inference session unavailable (model not loaded or invalid)");
         }
-        // Bound concurrent inference: one permit per judge_duplicates call.
-        let _permit = self
+        // Bound concurrent inference: owned semaphore permit.
+        let permit = self
             .inference_semaphore
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|e| anyhow::anyhow!("Laya inference semaphore closed: {e}"))?;
 
@@ -252,8 +253,6 @@ impl JudgmentProvider for LayaOnnxProvider {
         let active_version = crate::learning::control::read_active_version();
         let gating = self.may_block(active_version.as_deref(), !inline_extraction);
         let verdict_mode = if gating { "gating" } else { "shadow" };
-        // Model identity travels with every verdict reason so the judged
-        // duplicates are traceable to the exact bundle that produced them.
         let model_meta = format!(
             "; model_version={}; embedder_id={}; calibration_tier={:?}; mode={}",
             self.model_version(),
@@ -262,117 +261,93 @@ impl JudgmentProvider for LayaOnnxProvider {
             verdict_mode,
         );
 
-        // Obtain a tokenizer: bundled tokenizer.json if present, otherwise
-        // fall back to subword/whitespace token IDs.
-        let tokenizer_path = self.bundle_root.join("tokenizer.json");
-        let tokenizer = if tokenizer_path.exists() {
-            match Tokenizer::from_file(&tokenizer_path) {
-                Ok(t) => Some(Arc::new(t)),
-                Err(e) => {
-                    tracing::warn!("LayaOnnx failed to load tokenizer from {}: {e}", tokenizer_path.display());
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let new_content = new_memory.content.clone();
+        let candidates_vec: Vec<(String, f32, String)> = candidates
+            .iter()
+            .map(|c| (c.id.clone(), c.score, c.payload.content.clone()))
+            .collect();
+        let session_arc = self.inference_session.clone();
+        let temperature = self.temperature;
+        let bundle_root = self.bundle_root.clone();
 
-        let new_tokens = tokenize_content(&new_memory.content, tokenizer.as_deref());
-
-        let mut judgments = Vec::new();
-        for cand in candidates {
-            let cand_tokens = tokenize_content(&cand.payload.content, tokenizer.as_deref());
-
-            let intersection: usize = new_tokens
-                .intersection(&cand_tokens)
-                .count();
-            let union: usize = new_tokens
-                .union(&cand_tokens)
-                .count();
-
-            let token_overlap = if union == 0 { 0.0f32 } else { intersection as f32 / union as f32 };
-
-            // Fallback logit when the ONNX tensor cannot be extracted.
-            let fallback_logit = (token_overlap - 0.5) * 4.0;
-            let (similarity, reason) = if let Some(lock) = self.inference_session() {
-                let mut session = lock.lock().unwrap_or_else(|e| e.into_inner());
-                // Try real ONNX execution with 2-float feature vector
-                let jaccard_sim = token_overlap;
-                let feature_vec = [jaccard_sim as f32, (1.0 - cand.score.clamp(0.0, 1.0)) as f32];
-                // Build the ONNX input without panicking:
-                // from_shape_vec cannot fail for a literal (1, 2) from a
-                // 2-element vec, but a failure falls back to the
-                // token-overlap path instead of aborting the search.
-                let feature_array = match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec())
-                {
-                    Ok(arr) => match ort::value::Value::from_array(arr) {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            tracing::warn!("Laya ONNX Value::from_array failed: {e}; using token-overlap fallback");
-                            None
-                        }
-                    },
-                    Err(_) => {
-                        tracing::warn!("Laya ONNX feature vector could not be shaped (1,2); using token-overlap fallback");
-                        None
-                    }
-                };
-                match feature_array {
-                    Some(arr) => match session.run(ort::inputs! {"input" => arr}) {
-                        Ok(outputs) => {
-                            // Extract the first output tensor and derive the
-                            // model logit from real inference values.
-                            let model_logit = outputs.iter().next().and_then(|(_name, value)| {
-                                match value.try_extract_tensor::<f32>() {
-                                    Ok((_, data)) => laya_logit_from_tensor(data),
-                                    Err(e) => {
-                                        tracing::warn!("LayaOnnx tensor extraction failed: {e}");
-                                        None
-                                    }
-                                }
-                            });
-                            match model_logit {
-                                Some(logit) => (
-                                    temperature_scaled_sigmoid(logit, self.temperature),
-                                    "laya-onnx-model-logit",
-                                ),
-                                None => (
-                                    temperature_scaled_sigmoid(fallback_logit, self.temperature),
-                                    "laya-onnx-token-overlap-fallback",
-                                ),
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Laya ONNX session.run failed, using token-overlap fallback: {e}"
-                            );
-                            (
-                                temperature_scaled_sigmoid(fallback_logit, self.temperature),
-                                "laya-onnx-token-overlap-fallback",
-                            )
-                        }
-                    },
-                    None => (
-                        temperature_scaled_sigmoid(fallback_logit, self.temperature),
-                        "laya-onnx-token-overlap-fallback",
-                    ),
+        let judgments = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let tokenizer_path = bundle_root.join("tokenizer.json");
+            let tokenizer = if tokenizer_path.exists() {
+                match Tokenizer::from_file(&tokenizer_path) {
+                    Ok(t) => Some(Arc::new(t)),
+                    Err(_) => None,
                 }
             } else {
-                (
-                    temperature_scaled_sigmoid(fallback_logit, self.temperature),
-                    "laya-onnx-token-overlap-fallback",
-                )
+                None
             };
-
-            // Ensure similarity stays bounded
-            let similarity = similarity.clamp(0.0, 1.0);
-
-            judgments.push(DuplicateJudgment {
-                existing_memory_id: cand.id.clone(),
-                confidence: similarity,
-                reason: Some(format!("{}{}", reason, model_meta)),
-            });
-        }
+            let new_tokens = tokenize_content(&new_content, tokenizer.as_deref());
+            let mut judgments = Vec::new();
+            for (id, score, payload_content) in candidates_vec {
+                let cand_tokens = tokenize_content(&payload_content, tokenizer.as_deref());
+                let intersection: usize = new_tokens.intersection(&cand_tokens).count();
+                let union: usize = new_tokens.union(&cand_tokens).count();
+                let token_overlap = if union == 0 { 0.0f32 } else { intersection as f32 / union as f32 };
+                let fallback_logit = (token_overlap - 0.5) * 4.0;
+                let (similarity, reason) = if let Some(ref session_ref) = session_arc {
+                    let mut session = session_ref.lock().unwrap_or_else(|e| e.into_inner());
+                    let jaccard_sim = token_overlap;
+                    let feature_vec = [jaccard_sim as f32, (1.0 - score.clamp(0.0, 1.0)) as f32];
+                    let feature_array = match ndarray::Array2::from_shape_vec((1, 2), feature_vec.to_vec())
+                    {
+                        Ok(arr) => match ort::value::Value::from_array(arr) {
+                            Ok(v) => Some(v),
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
+                    };
+                    match feature_array {
+                        Some(arr) => match session.run(ort::inputs! {"input" => arr}) {
+                            Ok(outputs) => {
+                                let model_logit = outputs.iter().next().and_then(|(_name, value)| {
+                                    match value.try_extract_tensor::<f32>() {
+                                        Ok((_, data)) => laya_logit_from_tensor(data),
+                                        Err(_) => None,
+                                    }
+                                });
+                                match model_logit {
+                                    Some(logit) => (
+                                        temperature_scaled_sigmoid(logit, temperature),
+                                        "laya-onnx-model-logit",
+                                    ),
+                                    None => (
+                                        temperature_scaled_sigmoid(fallback_logit, temperature),
+                                        "laya-onnx-token-overlap-fallback",
+                                    ),
+                                }
+                            }
+                            Err(_) => (
+                                temperature_scaled_sigmoid(fallback_logit, temperature),
+                                "laya-onnx-token-overlap-fallback",
+                            ),
+                        },
+                        None => (
+                            temperature_scaled_sigmoid(fallback_logit, temperature),
+                            "laya-onnx-token-overlap-fallback",
+                        ),
+                    }
+                } else {
+                    (
+                        temperature_scaled_sigmoid(fallback_logit, temperature),
+                        "laya-onnx-token-overlap-fallback",
+                    )
+                };
+                let similarity = similarity.clamp(0.0, 1.0);
+                judgments.push(DuplicateJudgment {
+                    existing_memory_id: id.clone(),
+                    confidence: similarity,
+                    reason: Some(format!("{}{}", reason, model_meta)),
+                });
+            }
+            judgments
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Laya inference task panicked: {e}"))?;
 
         Ok(judgments)
     }

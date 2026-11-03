@@ -212,7 +212,8 @@ pub async fn process_mcp_request(
                                 "path_prefix": { "type": "string", "description": "Optional file/location path prefix filter." },
                                 "exclude_stale": { "type": "boolean", "default": false, "description": "Exclude memories marked stale." },
                                 "include_code_ast": { "type": "boolean", "default": true, "description": "Include structural code AST memories even when memory_type is not explicitly set to structural." },
-                                "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." }
+                                "include_archived": { "type": "boolean", "description": "When true, include archived memories in search results." },
+                                "include_references": { "type": "boolean", "description": "When true, append edge_sources provenance citations for each returned memory. Defaults to false." }
                             },
                             "required": ["query", "namespace"]
                         }
@@ -670,7 +671,8 @@ pub async fn process_mcp_request(
                                 "timeout_ms": { "type": "integer", "description": "Query timeout budget in milliseconds (default 250)." },
                                 "max_solutions": { "type": "integer", "description": "Maximum number of solutions to return (default 1000)." },
                                 "max_dataset_quads": { "type": "integer", "description": "Maximum dataset quads to load (default 250000)." },
-                                "max_algebra_nodes": { "type": "integer", "description": "Maximum SPARQL algebra nodes (default 1000)." }
+                                "max_algebra_nodes": { "type": "integer", "description": "Maximum SPARQL algebra nodes (default 1000)." },
+                                "federated": { "type": "boolean", "description": "When true, execute via the federated SPARQL SERVICE gateway. Defaults to false." }
                             },
                             "required": ["query"]
                         }
@@ -828,6 +830,20 @@ pub async fn process_mcp_request(
                                 "namespace": { "type": "string", "description": "The project namespace to query against." }
                             },
                             "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "neurostrata_kge_train",
+                        "description": "Train or update the knowledge graph embedding model for a namespace or all namespaces.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "Namespace to train on (optional)." },
+                                "all": { "type": "boolean", "description": "Train on all namespaces when true." },
+                                "epochs": { "type": "integer", "description": "Number of training epochs." },
+                                "dim": { "type": "integer", "description": "Embedding dimension size." },
+                                "kge_weight": { "type": "number", "description": "Weight factor for KGE embeddings." }
+                            }
                         }
                     },
                     {
@@ -1244,6 +1260,28 @@ pub async fn process_mcp_request(
                         }
                         "neurostrata_graphql_query" => {
                             result_text = handle_graphql_query(&arguments, store.clone()).await;
+                        }
+                        "neurostrata_kge_train" => {
+                            let namespace = arguments.get("namespace").and_then(|v| v.as_str());
+                            let all = arguments.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let epochs = arguments.get("epochs").and_then(|v| v.as_u64()).map(|v| v as u32);
+                            let dim = arguments.get("dim").and_then(|v| v.as_u64()).map(|v| v as u32);
+                            let kge_weight = arguments.get("kge_weight").and_then(|v| v.as_f64()).map(|v| v as f32);
+                            match crate::kge::cli_train(namespace, all, epochs, dim, kge_weight) {
+                                Ok(_) => {
+                                    let scope = namespace.unwrap_or("global");
+                                    result_text = serde_json::json!({
+                                        "ok": true,
+                                        "scope": scope,
+                                        "epochs": epochs.unwrap_or(10),
+                                        "dim": dim.unwrap_or(64),
+                                        "kge_weight": kge_weight.unwrap_or(1.0),
+                                    }).to_string();
+                                }
+                                Err(e) => {
+                                    result_text = serde_json::json!({"ok": false, "error": format!("{}", e)}).to_string();
+                                }
+                            }
                         }
                         "neurostrata_metrics_query" => {
                             result_text = handle_metrics_query(&arguments, store.clone()).await;
@@ -4417,6 +4455,42 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
         }
     };
 
+    let federated = arguments.get("federated").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if federated {
+        let served_env = std::env::var("NEUROSTRATA_SPARQL_SERVED_NAMESPACES").unwrap_or_default();
+        let served_namespaces = if served_env.trim().is_empty() {
+            vec![namespace.clone()]
+        } else {
+            served_env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<String>>()
+        };
+        let fed_cfg = crate::rdf::federation::FederationConfig {
+            served_namespaces,
+            served_hosts: vec![],
+            service_peers: vec![],
+            timeout_ms: cfg.timeout_ms,
+            max_solutions: cfg.max_solutions,
+            max_dataset_quads: cfg.max_dataset_quads,
+        };
+        match crate::rdf::federation::handle_remote_sparql_request(&query, &namespace, None, None, &fed_cfg, ladybug_store).await {
+            Ok(report) => {
+                let response = serde_json::json!({
+                    "ok": true,
+                    "federated": true,
+                    "results": report.body,
+                    "solution_count": report.solution_count,
+                    "truncated": report.truncated,
+                    "timed_out": report.timed_out,
+                    "warnings": report.warnings,
+                });
+                return serde_json::to_string(&response).unwrap_or_else(|_| serde_json::json!({"ok":false,"error":"serialization"}).to_string());
+            }
+            Err(e) => {
+                return serde_json::json!({"ok":false,"error":format!("{}",e)}).to_string();
+            }
+        }
+    }
+
     let execution = execute_sparql_query_with_config(ladybug_store, &namespace, &query, format, include_retired, include_archived, cfg).await;
     match execution {
         Ok((results, solution_count, truncated, timed_out)) => {
@@ -6517,6 +6591,7 @@ async fn handle_search_memory(
         .unwrap_or_default();
     let node_set_mode = arguments.get("node_set_mode").and_then(|v| v.as_str()).unwrap_or("any").to_string();
     let domain_expansion = arguments.get("domain_expansion").and_then(|v| v.as_bool()).unwrap_or(true);
+    let include_references = arguments.get("include_references").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Upgraded SearchFilters (src/search.rs). Optional: defaults preserve
     // existing search behavior (include_code_ast defaults to true so searches
@@ -6656,6 +6731,15 @@ async fn handle_search_memory(
         if has_upgraded_filters {
             results.retain(|r| crate::search::passes_filters(&r.payload.memory_type, &r.payload.metadata, &r.payload.location, &search_filters));
         }
+        if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
+            for r in &mut results {
+                let boost = crate::graph_read::temporal::temporal_proximity_boost(q_ts, &r.payload.metadata);
+                if boost > 0.0 {
+                    r.score = (r.score - boost).max(0.0);
+                }
+            }
+            results.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
+        }
         results.truncate(DEFAULT_LIMIT);
 
         if results.is_empty() {
@@ -6682,6 +6766,25 @@ async fn handle_search_memory(
 
         let conflicts = crate::domain::detect_conflicts(&results);
         let mut report = render_search_results(&results);
+        if include_references {
+            let refs: Vec<serde_json::Value> = results
+                .iter()
+                .filter_map(|r| {
+                    r.payload
+                        .metadata
+                        .get("edge_sources")
+                        .and_then(|v| v.as_array())
+                        .filter(|a| !a.is_empty())
+                        .map(|a| serde_json::json!({"id": r.id, "edge_sources": a}))
+                })
+                .collect();
+            if !refs.is_empty() {
+                report.push_str(&format!(
+                    "\n\nedge_references: {}",
+                    serde_json::to_string(&refs).unwrap_or_default()
+                ));
+            }
+        }
         if !conflicts.is_empty() {
             let arr: Vec<serde_json::Value> = conflicts
                 .iter()
@@ -6857,6 +6960,15 @@ async fn handle_search_memory(
                             .then_with(|| a.id.cmp(&b.id))
                     });
                 }
+                if let Some(q_ts) = crate::graph_read::temporal::extract_query_timestamp(&query) {
+                    for r in &mut results {
+                        let boost = crate::graph_read::temporal::temporal_proximity_boost(q_ts, &r.payload.metadata);
+                        if boost > 0.0 {
+                            r.score = (r.score - boost).max(0.0);
+                        }
+                    }
+                    results.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)));
+                }
                 // Pre-limit contract: filtering happened against the wider FETCH_LIMIT
                 // candidate set above; truncate to the default page size now.
                 results.truncate(DEFAULT_LIMIT);
@@ -6894,6 +7006,25 @@ async fn handle_search_memory(
                     // F10: surface conflict candidates in recall as a warning badge.
                     let conflicts = crate::domain::detect_conflicts(&results);
                     let mut report = render_search_results(&results);
+                    if include_references {
+                        let refs: Vec<serde_json::Value> = results
+                            .iter()
+                            .filter_map(|r| {
+                                r.payload
+                                    .metadata
+                                    .get("edge_sources")
+                                    .and_then(|v| v.as_array())
+                                    .filter(|a| !a.is_empty())
+                                    .map(|a| serde_json::json!({"id": r.id, "edge_sources": a}))
+                            })
+                            .collect();
+                        if !refs.is_empty() {
+                            report.push_str(&format!(
+                                "\n\nedge_references: {}",
+                                serde_json::to_string(&refs).unwrap_or_default()
+                            ));
+                        }
+                    }
                     if !conflicts.is_empty() {
                         let arr: Vec<serde_json::Value> = conflicts.iter().map(|(id, dw)| serde_json::json!({"id": id, "disputed_with": dw})).collect();
                         report.push_str(&format!("\n\nconflict_candidates: {}", serde_json::to_string(&arr).unwrap_or_default()));

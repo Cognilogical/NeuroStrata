@@ -23,6 +23,8 @@ pub struct LearnStatus {
     pub training_state: TrainingJobState,
     pub pending_reason: Option<String>,
     pub unlabeled_observations: usize,
+    pub observation_count: usize,
+    pub labeled_pair_count: usize,
     pub counts_by_label_tier: BTreeMap<String, usize>,
     pub latest_evaluation: Option<EvaluationReport>,
     /// The last recorded control request (`control.json`), read at load time
@@ -43,6 +45,8 @@ impl Default for LearnStatus {
             training_state: TrainingJobState::WaitingForData,
             pending_reason: None,
             unlabeled_observations: 0,
+            observation_count: 0,
+            labeled_pair_count: 0,
             counts_by_label_tier: BTreeMap::new(),
             latest_evaluation: None,
             last_control: None,
