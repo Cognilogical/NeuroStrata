@@ -7,6 +7,7 @@
 //! sections 1 through 3 and 6 through 8.
 
 pub mod gate;
+pub mod harness_plugins;
 pub mod intake;
 pub mod intent;
 pub mod machine;
@@ -1987,6 +1988,7 @@ Architectural rules, decisions, and fixes -> `neurostrata_add_memory`.
 Pre-flight every new task with `neurostrata_get_snapshot` first.
 - **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
+- **Zero-Touch Harness Plugin Auto-Install:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) and installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`.
 
 ## 5. Task vs procedure (do not confuse)
 A `task` is a unit of work that finishes (it must reach `done` via
@@ -2041,6 +2043,7 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
+    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -2130,6 +2133,7 @@ pub async fn handle_bootstrap(
             { "path": ".NeuroStrata/docs/.gitkeep", "overwrite": false, "content": "" }
         ],
         "first_task": { "id": task_id, "title": title },
+        "harness_plugins": harness_plugins,
         "tasks_created": tasks_created,
         "hooks": { "install_command": "neurostrata-mcp hooks install" },
         "instructions": instructions,
@@ -2357,6 +2361,11 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     if !root.join(".git").exists() {
         return String::new();
     }
+    let repo_ns = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    let _ = harness_plugins::auto_install_detected_plugins(root, repo_ns, None);
     let hooks_dir = git_hooks_dir(root);
     if !hooks_dir.is_dir() {
         if let Err(e) = std::fs::create_dir_all(&hooks_dir) {
@@ -3035,6 +3044,7 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
+    let harness_plugins = harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -3287,6 +3297,7 @@ pub async fn handle_task_setup(
         "wiring": wiring_block,
         "verified": verified,
         "lifecycle_delta": lifecycle_delta,
+        "harness_plugins": harness_plugins,
     }))
 }
 

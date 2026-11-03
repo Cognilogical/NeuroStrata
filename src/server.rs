@@ -496,7 +496,8 @@ pub async fn process_mcp_request(
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'MyProj'). Not a folder path." },
                                 "project_root": { "type": "string", "description": "Absolute path to the project root." },
-                                "project_description": { "type": "string", "description": "One line on what this project is; recorded on the first task." }
+                                "project_description": { "type": "string", "description": "One line on what this project is; recorded on the first task." },
+                                "harness": { "type": "string", "description": "Optional harness override ('opencode', 'openclaw', 'claude', 'hermes', 'codex', 'github-cli'); auto-detected from environment and project markers when omitted." }
                             },
                             "required": ["namespace", "project_root"]
                         }
@@ -508,7 +509,8 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name." },
-                                "project_root": { "type": "string", "description": "Absolute path to the project root." }
+                                "project_root": { "type": "string", "description": "Absolute path to the project root." },
+                                "harness": { "type": "string", "description": "Optional harness override ('opencode', 'openclaw', 'claude', 'hermes', 'codex', 'github-cli'); auto-detected from environment and project markers when omitted." }
                             },
                             "required": ["namespace", "project_root"]
                         }

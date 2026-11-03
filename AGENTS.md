@@ -71,6 +71,7 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 
 ## 4. Bootstrapping & Ingestion
 - **Docs:** If `.NeuroStrata/docs/` is missing, call `neurostrata_bootstrap` (new project) or `neurostrata_task_setup` (existing project) and follow the returned instructions — they carry the AGENTS.md template and the first mandatory Goal.
+- **Zero-Touch Harness Plugin Auto-Install:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) from environment and project markers and installs/wires the zero-dependency plugin bundle under `.NeuroStrata/plugins/<harness>/` with zero user involvement.
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
 ## 5. Global Database Constraints (Safety)
