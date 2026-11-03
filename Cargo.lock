@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "neurostrata-mcp"
-version = "1.14.3"
+version = "1.15.0"
 dependencies = [
  "anyhow",
  "arc-swap",
