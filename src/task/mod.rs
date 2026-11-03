@@ -2203,6 +2203,21 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
             tracing::warn!("failed to create hooks dir {}: {e}", hooks_dir.display());
         }
     }
+    // Auto-install / refresh pre-commit hook if missing or stale.
+    let pre_commit_target = hooks_dir.join("pre-commit");
+    if !pre_commit_target.exists() {
+        if std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
+            set_executable(&pre_commit_target);
+        }
+    } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
+        if pc_content.contains("NeuroStrata pre-commit hook") && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK {
+            if std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
+                && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
+            {
+                set_executable(&pre_commit_target);
+            }
+        }
+    }
     let target = hooks_dir.join("pre-push");
     let version = env!("CARGO_PKG_VERSION");
     if !target.exists() {
@@ -3061,6 +3076,37 @@ pub async fn handle_task_setup(
         }
     }
 
+    let rid = crate::registry::registry_row_id(&namespace);
+    let mut prev_wires: Vec<String> = Vec::new();
+    let mut prev_fires: Vec<String> = Vec::new();
+    if let Ok(Some((reg_vec, mut reg_payload))) = store.get(&namespace, &rid).await {
+        if let Some(ds) = reg_payload.metadata.get("doctor_state") {
+            if let Some(arr) = ds.get("configured_wires").and_then(|v| v.as_array()) {
+                prev_wires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            }
+            if let Some(arr) = ds.get("configured_fires_on").and_then(|v| v.as_array()) {
+                prev_fires = arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+            }
+        }
+        if let Some(obj) = reg_payload.metadata.as_object_mut() {
+            let mut ds = obj
+                .get("doctor_state")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            ds["configured_wires"] = json!(crate::task::wiring::known_wire_ids());
+            ds["configured_fires_on"] = json!(crate::task::wiring::VALID_FIRES_ON);
+            obj.insert("doctor_state".to_string(), ds);
+        }
+        let _ = store.upsert(&namespace, &rid, reg_vec, reg_payload).await;
+    }
+    let (new_auto, new_rem, new_fires) =
+        crate::task::wiring::compute_lifecycle_delta(&prev_wires, &prev_fires);
+    let lifecycle_delta = json!({
+        "new_automatic_wires": new_auto.iter().map(|w| w.id).collect::<Vec<_>>(),
+        "new_reminder_wires": new_rem.iter().map(|r| r.id).collect::<Vec<_>>(),
+        "new_fires_on_triggers": new_fires,
+    });
+
     encode(&json!({
         "namespace": namespace,
         "detected": {
@@ -3080,6 +3126,7 @@ pub async fn handle_task_setup(
         "instructions": instructions,
         "wiring": wiring_block,
         "verified": verified,
+        "lifecycle_delta": lifecycle_delta,
     }))
 }
 

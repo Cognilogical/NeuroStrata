@@ -3328,16 +3328,29 @@ async fn handle_get_snapshot(
         crate::registry::cache_project_root(&store, None, namespace, pr).await;
     }
 
-    // Hook hygiene: auto-heal missing/stale pre-push hook (best-effort).
-    let hooks_line = project_root
-        .as_ref()
-        .map(|r| crate::task::hook_hygiene(std::path::Path::new(r)))
-        .unwrap_or_default();
-
+    // Fetch all memories first so hook hygiene can infer a git root when none
+    // was explicitly provided or cached.
     let mut all_memories = store
         .list(namespace, None, None)
         .await
         .map_err(|_| "Failed to list memories or namespace does not exist.".to_string())?;
+
+    // Hook hygiene: auto-heal missing/stale pre-push hook (best-effort).
+    // When no project_root is available, infer one from directory memories
+    // that point at a real git repository.
+    let inferred_root: Option<String> = project_root.clone().or_else(|| {
+        all_memories
+            .iter()
+            .filter(|m| m.payload.memory_type == "directory")
+            .filter_map(|m| m.payload.metadata.get("absolute_path").and_then(|v| v.as_str()))
+            .filter(|p| std::path::Path::new(p).join(".git").exists())
+            .min_by_key(|p| p.len())
+            .map(|s| s.to_string())
+    });
+    let hooks_line = inferred_root
+        .as_ref()
+        .map(|r| crate::task::hook_hygiene(std::path::Path::new(r)))
+        .unwrap_or_default();
 
     // Default recall hides tombstoned rows. The snapshot is the operator's
     // daily-start view; an archived row that still shows up there means the
@@ -3620,6 +3633,7 @@ async fn handle_get_snapshot(
         .unwrap_or(0);
     let current_version = env!("CARGO_PKG_VERSION");
     let trigger = last_run_version != current_version
+        || doctor_state.get("configured_wires").is_none()
         || session_counter % 20 == 0
         || (now_ts - last_run_ts) > 7 * 86400;
 
@@ -3652,6 +3666,21 @@ async fn handle_get_snapshot(
             }
         }
         let mut findings: Vec<String> = Vec::new();
+        // If version changed, auto-upgrade namespace hygiene.
+        if !last_run_version.is_empty() && last_run_version != current_version {
+            if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+                .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            {
+                if let Ok((shape_fixes, dangling_fixes)) = ls.repair_namespace_hygiene(namespace).await {
+                    if shape_fixes > 0 || dangling_fixes > 0 {
+                        findings.push(format!(
+                            "  auto-upgraded namespace hygiene (v{} -> v{}): {} shape fixes, {} dangling fixes",
+                            last_run_version, current_version, shape_fixes, dangling_fixes
+                        ));
+                    }
+                }
+            }
+        }
         if unqualified_ingested > 0 {
             findings.push(format!(
                 "  unqualified ingested nodes: {} (re-ingest to qualify)",
@@ -3692,6 +3721,50 @@ async fn handle_get_snapshot(
                 findings.push("  enrichment state: failed".to_string());
             }
         }
+        // Lifecycle & hook delta against doctor_state.
+        let configured_wires: Vec<String> = doctor_state
+            .get("configured_wires")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let configured_fires_on: Vec<String> = doctor_state
+            .get("configured_fires_on")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        if !configured_wires.is_empty() || !last_run_version.is_empty() {
+            let (new_auto, new_rem, new_fires) =
+                crate::task::wiring::compute_lifecycle_delta(&configured_wires, &configured_fires_on);
+            if !new_auto.is_empty() || !new_rem.is_empty() || !new_fires.is_empty() {
+                let auto_ids: Vec<&str> = new_auto.iter().map(|w| w.id).collect();
+                let rem_ids: Vec<&str> = new_rem.iter().map(|r| r.id).collect();
+                let root_hint = inferred_root.as_deref().unwrap_or("<project_root>");
+                findings.push(format!(
+                    "  LIFECYCLE & HOOK DELTA (v{}): new automatic wires {:?}, new reminder wires {:?}, new triggers {:?} -> call neurostrata_task_setup (namespace: '{}', project_root: '{}') to configure delta hooks & lifecycle items",
+                    current_version, auto_ids, rem_ids, new_fires, namespace, root_hint
+                ));
+            }
+        }
+        // Check if ingested symbol nodes predate the AST call-graph schema.
+        let symbol_count = all_memories
+            .iter()
+            .filter(|m| m.payload.user_id == "auto-ingestor" && m.payload.memory_type == "symbol")
+            .count();
+        let symbols_with_calls = all_memories
+            .iter()
+            .filter(|m| {
+                m.payload.user_id == "auto-ingestor"
+                    && m.payload.memory_type == "symbol"
+                    && m.payload.metadata.get("calls").is_some()
+            })
+            .count();
+        if symbol_count > 5 && symbols_with_calls == 0 {
+            let root_hint = inferred_root.as_deref().unwrap_or("<project_root>");
+            findings.push(format!(
+                "  UPGRADE ACTION (Code Graph): {} ingested symbols lack v{} AST call/import edges -> call neurostrata_ingest_directory (namespace: '{}', dir_path: '{}') followed by neurostrata_rebuild_communities and neurostrata_kge_train",
+                symbol_count, current_version, namespace, root_hint
+            ));
+        }
         if !findings.is_empty() {
             let mut report = String::from("DOCTOR REPORT:");
             for f in &findings {
@@ -3707,6 +3780,8 @@ async fn handle_get_snapshot(
     if trigger {
         doctor_state["last_run_version"] = serde_json::json!(current_version);
         doctor_state["last_run_ts"] = serde_json::json!(now_ts);
+        doctor_state["configured_wires"] = serde_json::json!(crate::task::wiring::known_wire_ids());
+        doctor_state["configured_fires_on"] = serde_json::json!(crate::task::wiring::VALID_FIRES_ON);
     }
     if let (Some(vec), Some(mut payload)) = (reg_vec_opt, reg_payload_opt) {
         if let Some(obj) = payload.metadata.as_object_mut() {

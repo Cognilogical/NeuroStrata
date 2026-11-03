@@ -215,6 +215,29 @@ pub const VALID_FIRES_ON: &[&str] = &[
     "during-work",
 ];
 
+/// Compute the delta of newly added automatic wires, reminder wires, and
+/// `fires_on` lifecycle triggers relative to the lists previously recorded
+/// on a project's namespace registry row.
+pub fn compute_lifecycle_delta(
+    configured_wires: &[String],
+    configured_fires_on: &[String],
+) -> (Vec<&'static Wire>, Vec<&'static Reminder>, Vec<&'static str>) {
+    let new_auto: Vec<&'static Wire> = AUTOMATIC_WIRES
+        .iter()
+        .filter(|w| !configured_wires.iter().any(|c| c == w.id))
+        .collect();
+    let new_rem: Vec<&'static Reminder> = REMINDER_WIRES
+        .iter()
+        .filter(|r| !configured_wires.iter().any(|c| c == r.id))
+        .collect();
+    let new_fires: Vec<&'static str> = VALID_FIRES_ON
+        .iter()
+        .copied()
+        .filter(|t| !configured_fires_on.iter().any(|c| c == *t))
+        .collect();
+    (new_auto, new_rem, new_fires)
+}
+
 /// Whether `s` is a legitimate `Reminder.fires_on` trigger.
 pub fn is_valid_fires_on(s: &str) -> bool {
     VALID_FIRES_ON.contains(&s)
@@ -237,6 +260,23 @@ mod tests {
                 r.fires_on
             );
         }
+    }
+
+    /// The delta identifies newly added automatic wires, reminder wires, and
+    /// lifecycle triggers relative to previously configured lists.
+    #[test]
+    fn compute_lifecycle_delta_identifies_new_wires_and_triggers() {
+        let (new_auto, new_rem, new_fires) = compute_lifecycle_delta(&[], &[]);
+        assert!(!new_auto.is_empty());
+        assert!(!new_rem.is_empty());
+        assert!(!new_fires.is_empty());
+        let (new_auto2, new_rem2, new_fires2) = compute_lifecycle_delta(
+            &known_wire_ids().into_iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &VALID_FIRES_ON.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+        assert!(new_auto2.is_empty());
+        assert!(new_rem2.is_empty());
+        assert!(new_fires2.is_empty());
     }
 
     /// The closed enum is exhaustive over the registry: every trigger
