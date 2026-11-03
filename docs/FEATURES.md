@@ -154,6 +154,7 @@ All six plugins ship compiled inside the binary and under `plugins/` with zero e
 | **Episodic Buffer Session Logs** | `neurostrata_append_log` + `### 🔄 Topic Switch` + 500 KB rollover | Maintains a rolling, searchable Markdown transcript of reasoning and topic switches in `.NeuroStrata/sessions/`. | `src/server.rs` |
 | **Bidirectional Obsidian Vault Sync** | `neurostrata-mcp obsidian-sync` | Exports and syncs your project's memory graph as human-readable Markdown notes with YAML frontmatter and `[[wikilinks]]`. | [Obsidian Integration](ops/obsidian.md) |
 | **Loopback-Only Daemon & Secret Scrubbing** | `127.0.0.1:34343` + regex/entropy secret scrubber + Cypher escaping | Automatically redacts API keys, tokens, and credentials before storage, enforces strict Host/Origin headers, and exposes WAL health (`neurostrata_wal_status`, `neurostrata_storage_status`). | [Security](ops/security.md) |
+| **Daemon Caller-Path Authority (`J6`)** | `check_caller_path` + `allowed_external_dirs` (`src/daemon.rs`, `src/config.rs`) | Every caller-supplied filesystem path on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` is canonicalized and verified against the startup project root or `allowed_external_dirs` allowlist before the daemon reads or writes a byte (`neurostrata-p1ex`). | `src/daemon.rs`, [Security](ops/security.md) |
 
 ---
 

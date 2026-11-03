@@ -578,7 +578,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_train_candidate_produces_valid_onnx_bundle() {
         use crate::judgment::JudgmentProvider;
-        use crate::judgment::laya_onnx::{LayaOnnxProvider, RuntimeState};
+        use crate::judgment::laya_onnx::LayaOnnxProvider;
         let tmp_dir = tempfile::tempdir().unwrap();
         let t = Trainer::new(Arc::new(LocalTrainingRuntime {
             python: PathBuf::from("python"),
