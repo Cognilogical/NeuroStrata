@@ -3712,8 +3712,16 @@ async fn run() -> anyhow::Result<()> {
                     }
                     match install_pre_push_hook(&root, force) {
                         Ok(target) => {
+                            let _ = install_pre_commit_hook(&root);
+                            let repo_ns = root
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("default");
+                            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
+                                &root, repo_ns, None,
+                            );
                             println!(
-                                "Installed the NeuroStrata task gate at {}.",
+                                "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
                                 target.display()
                             );
                             return Ok(());

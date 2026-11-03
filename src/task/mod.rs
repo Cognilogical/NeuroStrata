@@ -1961,34 +1961,43 @@ fn agents_template(namespace: &str) -> String {
     format!(
         r#"# Agent Rules — {ns}
 
+## 0. The Prime Directive: Never Defer Anything
+No task, feature, or implementation may be left in a "deferred", "todo",
+"stub", "phase-2", or "later" state. Every open item must be either completed
+and committed in this session or filed as a tracked task via
+`neurostrata_task_create` with assignee and description.
+
 ## 1. Zero-Action Start (mandatory)
+Pre-flight every session with `neurostrata_get_snapshot` (`namespace: "{ns}"`).
 No code or file edits until a task exists AND is claimed by this session:
 1. `neurostrata_task_list` with `ready: true` to pick up existing work, or
 2. `neurostrata_task_create` (namespace, title) then `neurostrata_task_claim`
    (id, namespace, assignee, session_id).
-Never use TodoWrite, TaskCreate, or markdown TODO lists: tasks live in
+Never use TodoWrite, TaskCreate, `bd`, or markdown TODO lists: tasks live in
 NeuroStrata, not in the repo.
 
 ## 2. Session completion (all three, in order)
 1. `neurostrata_task_complete` on every claimed task. It is the only entrance
-   to `done`, and it forces extraction: pass `memory.content` (what did this
-   task teach? what rule does it prove?) or `link_memory_id`. An inline
+   to `done`, and it forces extraction (Lock 2): pass `memory.content` (what did
+   this task teach? what rule does it prove?) or `link_memory_id`. An inline
    `memory.metadata` is persisted exactly as add_memory persists one -- pass
-   `source` there for a rule that must carry provenance.
-2. `neurostrata-mcp task gate {ns}` must exit 0.
+   `source` and `governs` there for a rule that must carry provenance.
+2. `neurostrata-mcp task gate {ns} --strict` must exit 0 (Lock 1).
 3. `git pull --rebase` then `git push` (the pre-push hook runs the gate).
 
-## 3. Mid-task state
-Progress notes go on the task: `neurostrata_task_update` with `note` appends
-to history. The task record IS Tier-3 task memory -- recover a session with
-`neurostrata_task_list` + `neurostrata_get_memory`, not log archaeology.
+## 3. Mid-task state & Episodic Buffer (Lock 3 — Breath prompt)
+Every 3–5 mutation steps, pause and append a state summary on the task via
+`neurostrata_task_update` (`note` appends to history). Maintain a running
+conversational transcript via `neurostrata_append_log`. The task record IS
+Tier-3 task memory -- recover a session with `neurostrata_task_list` +
+`neurostrata_get_memory`, not log archaeology.
 
 ## 4. Memory & Automatic Graph-First Propagation
-Architectural rules, decisions, and fixes -> `neurostrata_add_memory`.
-Pre-flight every new task with `neurostrata_get_snapshot` first.
-- **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
+Architectural rules, decisions, and fixes -> `neurostrata_add_memory`
+(correct outdated rules via `neurostrata_supersede_memory`; never bulk-delete).
+- **Graph-First Lookup:** Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` for `GOVERNS`, `DEPENDS_ON`, and AST `calls`/`imports` edges.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. Write the Graph-First rule into your session plan on init, and paste the `subagent_prompt_injection` block returned by `neurostrata_task_claim` into EVERY subagent prompt you spawn.
-- **Zero-Touch Harness Plugin Auto-Install:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) and installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`.
+- **Zero-Touch Harness Plugin Auto-Install & Hooks:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`), installs/wires the zero-dependency plugin under `.NeuroStrata/plugins/<harness>/`, and self-heals both `.git/hooks/pre-push` and `.git/hooks/pre-commit`.
 
 ## 5. Task vs procedure (do not confuse)
 A `task` is a unit of work that finishes (it must reach `done` via
@@ -2019,6 +2028,11 @@ When you see one in user/agent speech, logs, or memory content, capture it
 with `neurostrata_task_create` (namespace, title) instead of letting it
 evaporate. The lexical detector surfaces these as `task_intent_signals` in
 `neurostrata_append_log` and as a `TASK NUDGE` line in `neurostrata_add_memory`.
+
+## 7. SynapticMesh, Security & Infrastructure Constraints
+- **SynapticMesh Honesty:** Only `eligibility: "shareable"` rule/fact/procedure definitions cross the mesh (stripped of local runtime counters). Private rows are sovereign; preserve mesh conflicts visibly and never force-push the mesh repo.
+- **Daemon Caller-Path Authority (`J6`):** Caller-supplied filesystem paths on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` must reside within the project root or `allowed_external_dirs` in `~/.config/neurostrata/config.json`.
+- **Tooling & Safety:** Never delete the shared LadybugDB directory or tables. Always use `podman` (never `docker`), strict JSON/JSON Schema, and non-interactive CLI flags.
 "#,
         ns = namespace
     )
@@ -2309,6 +2323,12 @@ mkdir -p "$dest_dir"
 
 install -m 0755 "$src" "$dest_dir/pre-push"
 echo "Installed $dest_dir/pre-push"
+
+pre_commit_src="$root/scripts/hooks/pre-commit"
+if [ -f "$pre_commit_src" ]; then
+    install -m 0755 "$pre_commit_src" "$dest_dir/pre-commit"
+    echo "Installed $dest_dir/pre-commit"
+fi
 
 # Read-back only: report presence, never execute. Running it here would run
 # every project guard in PROJECT_GATES as a side effect of installing.

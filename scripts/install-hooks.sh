@@ -15,6 +15,12 @@ mkdir -p "$dest_dir"
 install -m 0755 "$src" "$dest_dir/pre-push"
 echo "Installed $dest_dir/pre-push"
 
+pre_commit_src="$root/scripts/hooks/pre-commit"
+if [ -f "$pre_commit_src" ]; then
+    install -m 0755 "$pre_commit_src" "$dest_dir/pre-commit"
+    echo "Installed $dest_dir/pre-commit"
+fi
+
 # Read-back only: report presence, never execute. Running it here would run
 # every project guard in PROJECT_GATES as a side effect of installing.
 if [ -x "$dest_dir/pre-push" ]; then

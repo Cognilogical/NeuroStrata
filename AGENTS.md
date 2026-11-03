@@ -74,10 +74,12 @@ When this project is joined to a SynapticMesh (`neurostrata-mcp synaptic-mesh st
 - **Zero-Touch Harness Plugin Auto-Install:** On init (`neurostrata_bootstrap`, `neurostrata_task_setup`, and `neurostrata_get_snapshot`), NeuroStrata automatically detects the active CLI/terminal agent harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) from environment and project markers and installs/wires the zero-dependency plugin bundle under `.NeuroStrata/plugins/<harness>/` with zero user involvement.
 - **AST Ingestion:** On fresh install, entering a new codebase, or after structural changes, proactively ingest the AST using `neurostrata_ingest_directory` (or `neurostrata-mcp ingest ...`), followed by `neurostrata-mcp export-graph` to refresh the UI.
 
-## 5. Global Database Constraints (Safety)
+## 5. Global Database & Daemon Security Constraints (Safety)
 - **Shared Architecture:** The database (LadybugDB) is a SHARED, global memory architecture.
 - **No Destructive Operations:** NEVER attempt to delete the DB directory, drop tables, or run destructive operations.
 - **No Bulk Deletes:** Only delete specific memory IDs, one at a time, via the CLI (`neurostrata-mcp delete`) when explicitly correcting a hallucination — deletion is deliberately absent from the MCP surface.
+- **Daemon Caller-Path Authority (`J6` / `neurostrata-p1ex`):** Every caller-supplied filesystem path on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` is canonicalized via `check_caller_path` and must resolve inside `startup_root` or an explicit `allowed_external_dirs` entry in `~/.config/neurostrata/config.json`.
+- **Dual Git Hooks (`pre-push` + `pre-commit`):** `neurostrata-mcp hooks install` (and `hook_hygiene` on `neurostrata_get_snapshot`) automatically installs/refreshes both `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (graph-query ledger) plus all detected CLI/terminal harness plugins (`neurostrata-lf3p`).
 
 ## 6. Global Infrastructure & Tooling Constraints
 - **Containers:** ALWAYS use `podman` and `podman-compose`. NEVER use `docker`.
