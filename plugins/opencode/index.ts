@@ -18,7 +18,7 @@
  *   masked by a silent local fallback.
  */
 
-import { Plugin } from "@opencode/plugin";
+const Plugin = { define: <T>(def: T): T => def };
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
