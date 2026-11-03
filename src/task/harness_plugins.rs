@@ -58,6 +58,13 @@ main().catch((err) => {
 });
 "#;
 
+const EMBEDDED_NEUROSTRATA_SKILL_MD: &str =
+    include_str!("../../.agents/skills/neurostrata/SKILL.md");
+const EMBEDDED_NEUROSTRATA_TASK_AGENT_MD: &str =
+    include_str!("../../.agents/agents/NeuroStrata-Task.md");
+const SUBAGENT_RULE_MARKER: &str = "subagent_prompt_injection";
+const SUBAGENT_GRAPH_FIRST_RULE_SNIPPET: &str = "\n- **NEUROSTRATA GRAPH-FIRST & SUBAGENT CONTEXT RULE:** Honor the `### NeuroStrata Task & Graph Context` (`subagent_prompt_injection`) block in your prompt — every `[rule]` entry is a binding architectural constraint. Before blind `grep`/`glob` or editing files (unless the parent prompt states the snapshot/file-memory lookup was already done), query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` to inspect governing rules (`GOVERNS`) and AST call/import edges (`DEPENDS_ON`, `calls`, `imports`). Never leave `TODO`, `FIXME`, `stub`, or `phase-2` deferrals.\n";
+
 const KNOWN_HARNESSES: &[&str] = &[
     "opencode",
     "openclaw",
@@ -259,11 +266,121 @@ pub fn auto_install_detected_plugins(
         }));
     }
 
+    let (skills_installed, patched_agents) =
+        sync_skills_and_agent_rules(project_root, active, &detected);
+
     json!({
         "active_harness": active,
         "detected_harnesses": detected,
         "installed_plugins": installed,
+        "skills_installed": skills_installed,
+        "patched_agents": patched_agents,
     })
+}
+
+fn sync_skills_and_agent_rules(
+    project_root: &Path,
+    active: Option<&str>,
+    detected: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let mut skills_installed = Vec::new();
+    let mut patched_agents = Vec::new();
+
+    let write_file_if_changed = |path: &Path, content: &str| -> bool {
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return false;
+            }
+        }
+        let needs_write = std::fs::read_to_string(path)
+            .map(|existing| existing != content)
+            .unwrap_or(true);
+        if needs_write && std::fs::write(path, content).is_err() {
+            return false;
+        }
+        true
+    };
+
+    // 1. Always scaffold project-local .agents/skills/neurostrata/SKILL.md and .agents/agents/NeuroStrata-Task.md
+    let proj_skill = project_root.join(".agents/skills/neurostrata/SKILL.md");
+    if write_file_if_changed(&proj_skill, EMBEDDED_NEUROSTRATA_SKILL_MD) {
+        skills_installed.push(proj_skill.to_string_lossy().to_string());
+    }
+    let proj_task_agent = project_root.join(".agents/agents/NeuroStrata-Task.md");
+    let _ = write_file_if_changed(&proj_task_agent, EMBEDDED_NEUROSTRATA_TASK_AGENT_MD);
+
+    // 2. Sync harness-specific skill & agent directories (project-level and machine-level)
+    if active == Some("opencode")
+        || project_root.join(".opencode").exists()
+        || project_root.join("opencode.json").exists()
+    {
+        let oc_skill = project_root.join(".opencode/skills/neurostrata/SKILL.md");
+        if write_file_if_changed(&oc_skill, EMBEDDED_NEUROSTRATA_SKILL_MD) {
+            skills_installed.push(oc_skill.to_string_lossy().to_string());
+        }
+    }
+    if active == Some("claude") || project_root.join(".claude").exists() {
+        let cl_skill = project_root.join(".claude/skills/neurostrata/SKILL.md");
+        if write_file_if_changed(&cl_skill, EMBEDDED_NEUROSTRATA_SKILL_MD) {
+            skills_installed.push(cl_skill.to_string_lossy().to_string());
+        }
+        let cl_agent = project_root.join(".claude/agents/NeuroStrata-Task.md");
+        let _ = write_file_if_changed(&cl_agent, EMBEDDED_NEUROSTRATA_TASK_AGENT_MD);
+    }
+
+    if let Some(home) = home_dir() {
+        if detected.contains(&"opencode") && home.join(".config/opencode").exists() {
+            let global_oc_skill = home.join(".config/opencode/skills/neurostrata/SKILL.md");
+            if write_file_if_changed(&global_oc_skill, EMBEDDED_NEUROSTRATA_SKILL_MD) {
+                skills_installed.push(global_oc_skill.to_string_lossy().to_string());
+            }
+        }
+        if detected.contains(&"claude") && home.join(".claude").exists() {
+            let global_cl_skill = home.join(".claude/skills/neurostrata/SKILL.md");
+            if write_file_if_changed(&global_cl_skill, EMBEDDED_NEUROSTRATA_SKILL_MD) {
+                skills_installed.push(global_cl_skill.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    // 3. Idempotently propagate subagent_prompt_injection + Graph-First rule to existing agent .md definitions
+    let mut agent_dirs = vec![
+        project_root.join(".agents/agents"),
+        project_root.join(".opencode/agents"),
+        project_root.join(".claude/agents"),
+    ];
+    if let Some(home) = home_dir() {
+        if detected.contains(&"opencode") {
+            agent_dirs.push(home.join(".config/opencode/agents"));
+        }
+        if detected.contains(&"claude") {
+            agent_dirs.push(home.join(".claude/agents"));
+        }
+    }
+
+    for dir in agent_dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if content.contains(SUBAGENT_RULE_MARKER) || content.contains("tools: false") {
+                continue;
+            }
+            let updated = format!("{}{}", content.trim_end(), SUBAGENT_GRAPH_FIRST_RULE_SNIPPET);
+            if std::fs::write(&path, updated).is_ok() {
+                patched_agents.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    (skills_installed, patched_agents)
 }
 
 fn wire_harness_config(
@@ -415,11 +532,23 @@ mod tests {
     #[test]
     fn auto_install_detected_plugins_writes_bundles_and_wires_explicit_harness() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let custom_agent_dir = tmp.path().join(".claude/agents");
+        std::fs::create_dir_all(&custom_agent_dir).expect("create .claude/agents");
+        let custom_agent_md = custom_agent_dir.join("custom-worker.md");
+        std::fs::write(&custom_agent_md, "# Custom Worker\n\n- Run assigned tasks.\n")
+            .expect("write custom-worker.md");
+
         let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
         assert_eq!(report["active_harness"], json!("claude"));
         let installed = report["installed_plugins"].as_array().expect("installed array");
         assert!(!installed.is_empty());
         assert!(tmp.path().join(".NeuroStrata/plugins/claude/dist/index.js").exists());
         assert!(tmp.path().join(".claude/settings.local.json").exists());
+        assert!(tmp.path().join(".agents/skills/neurostrata/SKILL.md").exists());
+        assert!(tmp.path().join(".agents/agents/NeuroStrata-Task.md").exists());
+        assert!(tmp.path().join(".claude/skills/neurostrata/SKILL.md").exists());
+        assert!(tmp.path().join(".claude/agents/NeuroStrata-Task.md").exists());
+        let patched = std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
+        assert!(patched.contains("subagent_prompt_injection"));
     }
 }

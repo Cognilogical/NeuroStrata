@@ -7,24 +7,24 @@
 # and the agent did NOT query NeuroStrata for that module, the hook emits a
 # warning (non-blocking) so the agent can verify against source before push.
 #
-# Install with:  neurostrata-mcp hooks install --pre-commit
+# Install with:  neurostrata-mcp hooks install
 # (git honors core.hooksPath; the hook text is one file, no drift.)
 
 NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 ROOT=$(git rev-parse --show-toplevel)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 
-# ── Collect touched modules from staged diff ─────────────────────────────────
-TouchedModules=$(git diff --name-only --cached | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+# ── Collect touched src/ modules from staged diff ────────────────────────────
+TouchedModules=$(git diff --name-only --cached | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
 if [ -z "$TouchedModules" ]; then
-    TouchedModules=$(git diff --name-only | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+    TouchedModules=$(git diff --name-only | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
 fi
 
 # ── Check each touched module against governing memories ─────────────────────
 for module in $TouchedModules; do
-    if ! grep -q "\"query\": \"$module\"" "$LEDGER" 2>/dev/null; then
-        echo "warning: module '$module' has no recorded neurostrata_search_memory hit in this session" >&2
-        echo "  → call: neurostrata-mcp search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
+        echo "warning: module '$module' has no recorded NeuroStrata graph/memory lookup in this session" >&2
+        echo "  → call: neurostrata_memories_for_file or neurostrata_search_memory --namespace $NAMESPACE --query \"$module\"" >&2
     fi
 done
 
@@ -36,11 +36,9 @@ fi
 for module in $TouchedModules; do
     TS=$(date +%s)
     ENTRY="{\"ts\": $TS, \"query\": \"$module\", \"domains\": [\"$module\"], \"returned_ids\": [], \"governed_prefixes\": [\"$module/\"]}"
-    if ! grep -q "\"query\": \"$module\"" "$LEDGER"; then
-        # Append to the queries array
-        sed -i 's/], "queries": \[\]/], "queries": [\n    '"$ENTRY"'\n  ]/' "$LEDGER" 2>/dev/null || true
+    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
+        sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
     fi
 done
-
 
 exit 0

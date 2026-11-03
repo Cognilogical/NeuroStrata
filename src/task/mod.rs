@@ -2237,9 +2237,9 @@ pub(crate) fn hook_sha256() -> String {
     hex::encode(hasher.finalize())
 }
 
-/// True when `content` was written by NeuroStrata (contains the gate marker).
+/// True when `content` was written by NeuroStrata (contains the gate or pre-commit marker).
 pub(crate) fn is_ours_hook(content: &str) -> bool {
-    content.contains("NeuroStrata task gate")
+    content.contains("NeuroStrata task gate") || content.contains("NeuroStrata pre-commit hook")
 }
 
 /// True when `content` is a NeuroStrata hook whose embedded hash matches the
@@ -2254,9 +2254,6 @@ pub(crate) fn is_current_hook(content: &str) -> bool {
 
 /// The scaffolded `pre-commit` hook: records the module-query ledger and
 /// stamps `graph_queried` on the active task before any commit lands.
-/// Optional: only installed when `neurostrata-mcp hooks install --pre-commit`
-/// is run on a git repo. Non-git projects skip it; the git-free
-/// `.NeuroStrata/session_queries.json` path remains the primary mechanism.
 pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
 #
@@ -2266,24 +2263,24 @@ pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # and the agent did NOT query NeuroStrata for that module, the hook emits a
 # warning (non-blocking) so the agent can verify against source before push.
 #
-# Install with:  neurostrata-mcp hooks install --pre-commit
+# Install with:  neurostrata-mcp hooks install
 # (git honors core.hooksPath; the hook text is one file, no drift.)
 
 NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 ROOT=$(git rev-parse --show-toplevel)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 
-# ── Collect touched modules from staged diff ─────────────────────────────────
-TouchedModules=$(git diff --name-only --cached | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+# ── Collect touched src/ modules from staged diff ────────────────────────────
+TouchedModules=$(git diff --name-only --cached | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
 if [ -z "$TouchedModules" ]; then
-    TouchedModules=$(git diff --name-only | sed 's|^src/\([^/]*\).*|\1|' | sort -u)
+    TouchedModules=$(git diff --name-only | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
 fi
 
 # ── Check each touched module against governing memories ─────────────────────
 for module in $TouchedModules; do
-    if ! grep -q "\"query\": \"$module\"" "$LEDGER" 2>/dev/null; then
-        echo "warning: module '$module' has no recorded neurostrata_search_memory hit in this session" >&2
-        echo "  → call: neurostrata-mcp search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
+        echo "warning: module '$module' has no recorded NeuroStrata graph/memory lookup in this session" >&2
+        echo "  → call: neurostrata_memories_for_file or neurostrata_search_memory --namespace $NAMESPACE --query \"$module\"" >&2
     fi
 done
 
@@ -2295,12 +2292,10 @@ fi
 for module in $TouchedModules; do
     TS=$(date +%s)
     ENTRY="{\"ts\": $TS, \"query\": \"$module\", \"domains\": [\"$module\"], \"returned_ids\": [], \"governed_prefixes\": [\"$module/\"]}"
-    if ! grep -q "\"query\": \"$module\"" "$LEDGER"; then
-        # Append to the queries array
-        sed -i 's/], "queries": \[\]/], "queries": [\n    '"$ENTRY"'\n  ]/' "$LEDGER" 2>/dev/null || true
+    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
+        sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
     fi
 done
-
 
 exit 0
 "#;
@@ -2405,6 +2400,16 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
             {
                 set_executable(&pre_commit_target);
             }
+        }
+    }
+    let repo_scripts_hooks = root.join("scripts/hooks");
+    if repo_scripts_hooks.is_dir() {
+        let repo_pc = repo_scripts_hooks.join("pre-commit");
+        let needs_repo_pc = std::fs::read_to_string(&repo_pc)
+            .map(|c| c != SCAFFOLDED_PRE_COMMIT_HOOK)
+            .unwrap_or(true);
+        if needs_repo_pc && std::fs::write(&repo_pc, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok() {
+            set_executable(&repo_pc);
         }
     }
     let target = hooks_dir.join("pre-push");
