@@ -41,5 +41,10 @@ target/
 # Generated plugin build artifacts (rebuilt by npm run build)
 plugins/opencode/dist/
 plugins/opencode/node_modules/
+plugins/claude/node_modules/
+plugins/hermes/node_modules/
+plugins/codex/node_modules/
+plugins/github-cli/node_modules/
+plugins/openclaw/node_modules/
 plugins/opencode/@opencode/
 kge/
