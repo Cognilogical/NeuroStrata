@@ -33,17 +33,20 @@ NeuroStrata carries an explicit declarative `domain` tag on a memory (e.g., `fro
 *Inspired by the psychological concept of "Working Memory Priming".*
 Instead of forcing agents to blindly search a new repository and waste expensive token processing, NeuroStrata features a `neurostrata_get_snapshot` tool. This instantly returns the top-5 highest-weighted, active cognitive nodes for any project. This "wake-up context" perfectly grounds an agent in a repository's most critical rules the second a session begins.
 
-### 6. Deterministic Retrieval — Boosted Distance + Bounded Graph Evidence
-*Inspired by human dual-process theory (gist vs. verbatim recall) — of which only the "gist" track is built.*
+### 6. 4-Stage Hybrid Retrieval — Lexical + Vector + Graph PPR + Cross-Encoder Reranking
+*Inspired by human dual-process theory (verbatim token recall + conceptual gist + associative spreading activation).*
 
-Retrieval is one deterministic pipeline. No LLM, no rank fusion, no keyword index:
+Retrieval executes a deterministic 4-stage hybrid pipeline that combines exact-identifier precision, dense semantic similarity, multi-hop graph topology, and neural cross-encoder reranking:
 
-1. **Row-class filter, then vector distance.** The store filters row classes *before* the candidate budget is spent — structural rows (`directory`, `file`, `markdown`, `freshness_flag`, `guard_event`) are always excluded (`:1264-1270`, `:76`), `task` rows are excluded unless the caller passes `include_tasks` (`:77-79`), tombstoned rows are excluded unless the caller passes `include_archived` (`:121`), and mesh-conflicting rows are excluded outright (`:124`; the same filters run over expansion candidates at `:282-284` and `:338-340`). What remains is scanned with `array_distance` and ordered by `dist ASC, id ASC` (`:87`). There is **no lexical/BM25 track, no full-text index, and no Reciprocal Rank Fusion** anywhere in the codebase — `tantivy` was never a dependency of this crate (`git log -S'tantivy' -- Cargo.toml` is empty, and the current `Cargo.toml` contains no FTS crate), and the store creates exactly one node table plus four relation tables (`:1408-1429`). Earlier documentation described this step as "hybrid semantic + BM25 retrieval fused by RRF"; that description never matched the code, and it is corrected by the erratum in `CHANGELOG.md` (see also `docs/designs/2026-10-20-argon-k3-panel-verdicts.md` §1, DOC-1).
-2. **Capped boost.** §3's usage-and-provenance boost is applied to that distance, bounded at `0.5 * distance` (`:146-151`). A direct match carries `EvidenceKind::DirectMatch` (`:166`).
-3. **Bounded directed-graph expansion.** Direct matches are expanded along the graph: one hop over `RELATES_TO`, `CONTAINS` and `GOVERNS` in both directions, and two hops over `GOVERNS` (`:219`, `:224-241`). Each expanded row carries the evidence path that reached it, capped at three paths per result (`:515`). Candidates are admitted per family — the one-hop family first, then the episode-sibling family (the other memories extracted from the same task, reached over `EXTRACTED_FROM`), then the governing-only family — at most `limit` per family, and within a family by co-occurrence count (how many distinct primaries reached the row) descending, with the id as the tie-break (`:465-493`).
-4. **Ordering and rendering.** Direct matches sort first on their real boosted distance; expansion rows follow in their admission order, and the discriminator is the evidence kind, not a magic score constant (`:496-499`, `:525-537`). The store returns its primaries plus their bounded expansions without a second truncation (`:539-541`), and the server asks for five primaries and renders everything it gets back (`src/server.rs:2026-2035`, `:2056`).
-
-**Exact-identifier recall — the known gap, and the recommendation (NOT IMPLEMENTED).** Relying solely on dense vector embeddings *is* poor at finding exact variable names, acronyms, or specific syntax: a memory whose text is an exact identifier — a function name, an env var, a config key, an error string — is found only if its *embedding* lands near the query. The adjudicated recommendation for closing that gap is a **narrow deterministic `CONTAINS` / symbol-id match** — reusing the relation and `symbol` rows the store already holds — rather than a Tantivy + RRF build: it adds no dependency, no index to operate, and no second ranking rule to keep auditable (`docs/designs/2026-10-20-argon-k3-panel-verdicts.md` §5, Phase 4). **This is a recommendation only. It is not implemented, and no part of the shipped retrieval path performs exact-token matching today.**
+1. **Stage 1 — Dual-Track Candidate Generation (Tantivy BM25 + LadybugDB HNSW Vector):**
+   - **Lexical Track (`src/lexical.rs`):** A full-text Tantivy BM25 index scores exact identifiers, function names, config keys, file paths, and error codes (`recall_exact_identifier`).
+   - **Dense Vector Track (`src/store/ladybug.rs`):** Active, non-archived, non-conflicting Engrams are scanned via 384-dimensional HNSW cosine distance (`BGESmallENV15`) with §3's capped Neural Gain boost (`min(usage_gain + source_gain, 0.5 * d)`).
+2. **Stage 2 — Reciprocal Rank Fusion (RRF) & Temporal Proximity Boost:**
+   - Lexical and vector rankings are fused via Reciprocal Rank Fusion (`k = 60`), while queries carrying temporal expressions (`src/graph_read/temporal.rs`) apply `temporal_proximity_boost` to surface chronologically aligned memories.
+3. **Stage 3 — Bounded Directed-Graph Expansion & Personalized PageRank (PPR):**
+   - Primary hits expand across `RELATES_TO`, `CONTAINS`, `DEPENDS_ON`, `EXTRACTED_FROM`, and 2-hop `GOVERNS` + Tree-sitter AST (`calls`, `imports`) edges. Each expanded node carries its explicit provenance path (`EvidenceKind`) and Personalized PageRank weight.
+4. **Stage 4 — FlashRank ONNX Cross-Encoder Reranking (`src/reranker.rs`):**
+   - Top candidate pairs `(query, memory)` are jointly scored through a local ONNX cross-encoder (`ms-marco-MiniLM-L-12-v2`) to ensure only the highest-precision context reaches the agent's prompt window.
 
 ### 7. 3-Tier Stratification (Contextual Hierarchy)
 *Inspired by the division of Working Memory vs. Long-Term Memory.*
@@ -94,6 +97,15 @@ Open gaps, documented in `src/synaptic_mesh/acceptance.rs`: *old-epoch quarantin
 
 Design provenance: **Anthropic/Kimi verdict** (`docs/design-mesh-verdict-kimi.md`) — identified the breaking C-flush merge-conflict, recommended the git-checkout-per-mesh approach (D); **OpenAI/Astra verdict** (`docs/design-mesh-verdict-openai.md`) — supplied the durable-outbox, merge table, sharing-boundary, and trust-model refinements. Full spec: `docs/superpowers/specs/2026-10-10-synaptic-mesh-design.md`.
 
+### 15. Symbolic Reasoning, Community Topology & World-Model Simulation
+*Inspired by neocortical symbolic reasoning, topological modularity, and prefrontal mental simulation.*
+
+Beyond associative recall, NeuroStrata embeds four higher-order cognitive faculties directly in the binary:
+- **W3C Semantic Web Reasoning (`src/rdf/`):** Projects graph nodes into RDF triples, executes federated SPARQL 1.1 queries (`neurostrata_sparql_query`), materializes OWL 2 RL transitive and inverse inferences (`neurostrata_owl_reason`), and validates every write against versioned Turtle SHACL shapes (`src/schemas/shacl/`).
+- **Leiden Community Detection (`src/community.rs`):** Continuously partitions densely connected memory and AST nodes into modular communities with thematic summaries.
+- **TransE Knowledge Graph Embeddings (`src/kge.rs`):** Learns relational translation vectors (`h + r ≈ t`) over graph triples (`neurostrata_kge_train`) to predict missing links and structural analogies.
+- **Digital Twin State Simulation (`src/twin.rs`):** Maintains versioned state models (`neurostrata_twin_define`, `neurostrata_twin_observe`, `neurostrata_twin_simulate`) so agents can test hypothetical state transitions and compare branched outcomes before mutating production systems.
+
 ## Cognitive-name glossary
 
-See `README.md` § Biological Nomenclature ↔ Engineering Primitives for the canonical table — one table, one set of name conventions, no drift. The 1.8.0 additions appended to that table are the `ThalamicBus`, `ThalamicPulse`, `ExportFreshnessDirty`, `GuardEventLog`, `EpisodicPointerEcho`, `RecursionToken`, and `Procedural Memory` rows.
+See [`docs/science/nomenclature.md`](science/nomenclature.md) for the canonical translation table mapping every biological term to its Rust systems-engineering primitive.

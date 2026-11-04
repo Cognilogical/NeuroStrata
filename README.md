@@ -105,10 +105,10 @@ When a new version of NeuroStrata ships, replace the binary (`scripts/build.sh` 
 
 ## Technical Documentation & Architecture Links
 
-- **Product & Feature Inventory:** [Complete Feature & Benefit Catalog (`docs/FEATURES.md`)](docs/FEATURES.md)
+- **Documentation Index:** [NeuroStrata Documentation Hub (`docs/README.md`)](docs/README.md) · [Complete Feature & Benefit Catalog (`docs/FEATURES.md`)](docs/FEATURES.md)
 - **Architecture & Cognitive Science:** [Cognitive Architecture](docs/COGNITIVE_ARCHITECTURE.md) · [SynapticGraph Engine](docs/architecture/synapticgraph.md) · [Tri-Strata Isolation](docs/architecture/tri-strata.md) · [Why Agent Memory Fails](docs/science/why-memory-fails.md) · [Nomenclature](docs/science/nomenclature.md)
 - **Cognitive Organs:** [Central Executive](docs/organs/central-executive.md) · [Prefrontal Cortex](docs/organs/prefrontal-cortex.md) · [Dendritic Bridge (Embedders)](docs/organs/dendritic-bridge.md) · [Thalamic Bus](docs/organs/thalamic-bus.md) · [Procedural Memory](docs/organs/procedural-memory.md)
-- **Operations & Reference:** [Zero-Touch Upgrading](docs/ops/upgrading.md) · [CLI Reference](docs/ops/cli-reference.md) · [Security & OWASP Mitigations](docs/ops/security.md) · [SynapticMesh Team Sync](docs/mesh/synaptic-mesh.md) · [Obsidian Sync](docs/ops/obsidian.md) · [Crash & WAL Recovery](docs/ops/crashes.md) · [Building from Source](docs/BUILDING.md) · [Release Changelogs](docs/releases/changelog/)
+- **Operations & Reference:** [Zero-Touch Upgrading](docs/ops/upgrading.md) · [CLI Reference](docs/ops/cli-reference.md) · [Security & OWASP Mitigations](docs/ops/security.md) · [SynapticMesh Team Sync](docs/mesh/synaptic-mesh.md) · [Obsidian Sync](docs/ops/obsidian.md) · [Crash & WAL Recovery](docs/ops/crashes.md) · [Visual UI Guide](docs/UI_GUIDE.md) · [Building from Source](docs/BUILDING.md) · [Release Changelogs](docs/releases/changelog/)
 
 ## License
 

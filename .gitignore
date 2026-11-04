@@ -37,7 +37,10 @@ target/
 .neuroplasticity/
 .worktrees/
 
-.superpowers/sdd/
+.superpowers/
+.neurostrata/
+binaries/
+downloads/
 # Generated plugin build artifacts (rebuilt by npm run build)
 plugins/opencode/dist/
 plugins/opencode/node_modules/

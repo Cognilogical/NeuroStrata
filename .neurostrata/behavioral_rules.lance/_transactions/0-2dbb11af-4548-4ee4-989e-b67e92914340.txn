@@ -1,4 +1,0 @@
-$2dbb11af-4548-4ee4-989e-b67e92914340²ûid ÿÿÿÿÿÿÿÿÿ*string82vector ÿÿÿÿÿÿÿÿÿ*fixed_size_list:float:7688 version ÿÿÿÿÿÿÿÿÿ*uint328#
-rule_class ÿÿÿÿÿÿÿÿÿ*string8(trigger_pattern ÿÿÿÿÿÿÿÿÿ*string8(constraint_text ÿÿÿÿÿÿÿÿÿ*string8"	hit_count ÿÿÿÿÿÿÿÿÿ*uint328status ÿÿÿÿÿÿÿÿÿ*string8"!
-lance.auto_cleanup.interval20"'
-lance.auto_cleanup.older_than14days
