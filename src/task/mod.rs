@@ -1280,18 +1280,18 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
     let mut pending: Vec<(usize, String, MemoryPayload)> = Vec::new();
     for (i, m) in tasks.iter().enumerate() {
         if gate::task_status(m) == Status::InProgress {
-            let already_cached = summaries[i]
-                .as_object()
-                .and_then(|o| o.get("subagent_prompt_injection"))
+            if let Some(cached) = m
+                .payload
+                .metadata
+                .get("task")
+                .and_then(|t| t.get("subagent_prompt_injection"))
                 .and_then(|v| v.as_str())
-                .is_some()
-                || m.payload
-                    .metadata
-                    .get("task")
-                    .and_then(|t| t.get("subagent_prompt_injection"))
-                    .and_then(|v| v.as_str())
-                    .is_some();
-            if !already_cached {
+                .filter(|s| !s.trim().is_empty())
+            {
+                if let Some(obj) = summaries[i].as_object_mut() {
+                    obj.insert("subagent_prompt_injection".to_string(), json!(cached));
+                }
+            } else {
                 pending.push((i, m.id.clone(), m.payload.clone()));
             }
         }

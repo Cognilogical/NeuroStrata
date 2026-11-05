@@ -1331,7 +1331,6 @@ pub async fn process_mcp_request(
                     if matches!(
                         name,
                         "neurostrata_search_memory"
-                            | "neurostrata_memories_for_file"
                             | "neurostrata_related"
                             | "neurostrata_sparql_query"
                             | "neurostrata_graphql_query"
@@ -7771,6 +7770,7 @@ async fn handle_guard_validate(
                         .and_then(|m| m.payload.metadata.get("task"))
                         .and_then(|t| t.get("session_id"))
                         .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
                         .map(String::from)
                         .unwrap_or_else(|| "daemon-resolved".to_string())
                 } else {
