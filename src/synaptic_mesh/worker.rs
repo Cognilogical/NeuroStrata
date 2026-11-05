@@ -170,6 +170,12 @@ pub fn drain_once(
     Ok(report)
 }
 
+/// Fixed probe payload for the signing-key gate in [`apply_one`]: the
+/// gate signs exactly this with the gated keypair through
+/// `crate::did::sign`, so any key that operation would reject fails the
+/// gate, whatever the payload. The probe signature is discarded.
+const SIGNABILITY_PROBE_PAYLOAD: &[u8] = b"neurostrata-mesh signing-key signability probe";
+
 /// Apply one entry: classify (skip) or build + atomically write the record.
 /// On success returns the written record (only for `Applied` — a written
 /// file); the record is `None` for skip/already-applied/quarantine
@@ -259,20 +265,45 @@ fn apply_one(
         .filter(|p| std::path::Path::new(p).exists())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| mesh.root().join(".neurostrata-mesh").join("signing.key"));
-    let signing_key_present = signing_key_path.exists();
-    if signing_key_present {
+    // The signing keypair, loaded ONCE here when a key is present and
+    // threaded to the seal below — no second load anywhere in this apply
+    // path, so the seal can never sign under a key the gate did not
+    // validate (a key deleted between two loads would make the second
+    // load generate and write a brand-new key; a key rotated between
+    // two loads would seal under a different DID than the gated one).
+    let signing_keypair = if signing_key_path.exists() {
         // Signing doubles as an early failure gate, and that gate must
-        // keep its pre-reorder placement: validate key readability NOW,
-        // before `load_existing` and the `AlreadyApplied` early return,
-        // so a corrupt or unreadable key still fails the drain even when
-        // every entry would otherwise be consumed as already applied.
-        // A signing failure with the key present is a real fault;
-        // committing an unsigned record silently would downgrade the
-        // mesh's trust surface, so fail the drain.
-        if let Err(e) = crate::did::load_or_generate_keypair(&signing_key_path) {
+        // keep its pre-reorder placement: validate the key NOW, before
+        // `load_existing` and the `AlreadyApplied` early return, so a
+        // bad key still fails the drain even when every entry would
+        // otherwise be consumed as already applied. A signing failure
+        // with the key present is a real fault; committing an unsigned
+        // record silently would downgrade the mesh's trust surface, so
+        // fail the drain.
+        let keypair = match crate::did::load_or_generate_keypair(&signing_key_path) {
+            Ok(keypair) => keypair,
+            Err(e) => {
+                return Err(format!("SynapticMesh record signing failed: {e}"));
+            }
+        };
+        // Loadability is not signability: the loader accepts any
+        // parseable PEM private key with no algorithm check, so a key
+        // such as X25519 — parseable, with an extractable raw public
+        // key, but rejected by the signing operation ("operation not
+        // supported for this keytype") — would pass a load-only gate
+        // and then never be exercised on an `AlreadyApplied`-only
+        // drain. Exercise the exact signing path the seal uses
+        // (`crate::did::sign`: `Signer::new_without_digest` +
+        // `sign_oneshot`) on a fixed probe payload, so the gate fails
+        // for precisely the keys the seal would fail for, with the
+        // signing operation's own error.
+        if let Err(e) = crate::did::sign(SIGNABILITY_PROBE_PAYLOAD, &keypair.0) {
             return Err(format!("SynapticMesh record signing failed: {e}"));
         }
-    }
+        Some(keypair)
+    } else {
+        None
+    };
 
     let path = record_path(mesh, &record);
 
@@ -301,9 +332,11 @@ fn apply_one(
 
     // Seal the final stored form: every mutation above (lifecycle
     // preservation, RDF rebuild) is already reflected in `record`, so the
-    // signature covers exactly what is written and exported below.
-    if signing_key_present {
-        if let Err(e) = sign_record(&mut record, &signing_key_path) {
+    // signature covers exactly what is written and exported below. The
+    // seal uses the SAME keypair the gate loaded and probed — it does
+    // not load the key a second time.
+    if let Some((pkey, did, pubkey)) = &signing_keypair {
+        if let Err(e) = sign_record_with_keypair(&mut record, pkey, did, pubkey) {
             return Err(format!("SynapticMesh record signing failed: {e}"));
         }
     }
@@ -505,8 +538,22 @@ fn build_record(
 /// Sign a [`MeshRecord`] in place using the Ed25519 keypair at `key_path`.
 pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), String> {
     let (pkey, did, pubkey) = crate::did::load_or_generate_keypair(key_path)?;
-    record.signer_did = Some(did);
-    record.public_key = Some(hex::encode(&pubkey));
+    sign_record_with_keypair(record, &pkey, &did, &pubkey)
+}
+
+/// Sign a [`MeshRecord`] in place with an already-loaded keypair — the
+/// seal [`apply_one`] applies with the keypair its early gate loaded and
+/// probe-signed with, so the gate and the seal always act on the same
+/// key. Behaviour is identical to a fresh load of that keypair in
+/// [`sign_record`].
+fn sign_record_with_keypair(
+    record: &mut MeshRecord,
+    pkey: &openssl::pkey::PKey<openssl::pkey::Private>,
+    did: &str,
+    pubkey: &[u8],
+) -> Result<(), String> {
+    record.signer_did = Some(did.to_string());
+    record.public_key = Some(hex::encode(pubkey));
     record.signature = None;
     let payload = if let Some(ref rdf_block) = record.rdf {
         crate::did::signing_payload(
@@ -518,7 +565,7 @@ pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), Strin
         let val = serde_json::to_value(&*record).map_err(|e| e.to_string())?;
         crate::did::canonical_signing_bytes(&val)?
     };
-    let sig = crate::did::sign(&payload, &pkey)?;
+    let sig = crate::did::sign(&payload, pkey)?;
     record.signature = Some(crate::did::encode_base64(&sig));
     Ok(())
 }
@@ -1719,6 +1766,86 @@ mod tests {
             outbox.pending().unwrap().len(),
             1,
             "the already-applied entry stays pending when the key is corrupt"
+        );
+    }
+
+    /// Write a loadable-but-unsignable signing key at the mesh's
+    /// default signing-key path and return that path: an X25519 keypair
+    /// serialised as a PKCS#8 PEM. The loader accepts it (it parses and
+    /// its raw public key extracts — the loader performs no algorithm
+    /// check), but the signing operation rejects it ("operation not
+    /// supported for this keytype"), because X25519 is a key-agreement
+    /// algorithm, not a signing one.
+    fn unsignable_signing_key(mesh: &MeshStorage) -> PathBuf {
+        let key_dir = mesh.root().join(".neurostrata-mesh");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("signing.key");
+        let x25519 = openssl::pkey::PKey::generate_x25519().unwrap();
+        let pem = crate::did::keypair_to_private_pem(&x25519).unwrap();
+        std::fs::write(&key_path, pem).unwrap();
+        assert!(
+            crate::did::load_or_generate_keypair(&key_path).is_ok(),
+            "the fixture key must be loadable — unsignable, not unreadable"
+        );
+        key_path
+    }
+
+    /// (c′) Panel regression for the load-only gate: an X25519 key
+    /// passes a gate that only loads the keypair, so on an
+    /// `AlreadyApplied`-only drain — which returns before the late
+    /// seal — the pre-fix gate silently succeeded where the pre-reorder
+    /// code failed at `sign_record`. The gate must exercise the signing
+    /// operation itself, so this key fails the drain as a signing
+    /// failure — for a fresh entry, and for a drain whose only entry is
+    /// already applied (mirroring test (c)'s phases).
+    #[test]
+    fn a_loadable_but_unsignable_signing_key_still_fails_the_drain_after_the_reorder() {
+        let (mesh, outbox) = fixture("sign-unsignable-key", None);
+        let key_path = unsignable_signing_key(&mesh);
+
+        let id = Uuid::now_v7();
+        let entry = created(&id.to_string(), shareable_metadata());
+        outbox.append(&entry).unwrap();
+
+        // A fresh entry with a loadable-but-unsignable key fails the
+        // drain and stays pending; no record file is written.
+        let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
+        assert!(
+            err.contains("signing failed"),
+            "an unsignable key must fail the drain as a signing failure: {err}"
+        );
+        assert_eq!(outbox.pending().unwrap().len(), 1, "the entry stays pending");
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        assert!(!path.exists(), "no record file for a failed drain");
+
+        // With a valid Ed25519 key the same entry applies and verifies.
+        std::fs::remove_file(&key_path).unwrap();
+        let _ = crate::did::load_or_generate_keypair(&key_path).unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 1);
+        assert_verified(&mesh, &stored_record(&mesh, &id));
+
+        // Replace the key with the unsignable one again and replay the
+        // same entry (the crash between rename and mark-committed
+        // state): the stored file already carries this `update_id`, so
+        // the apply would return `AlreadyApplied` — but the gate
+        // exercises signing first, so the drain still fails and the
+        // entry stays pending.
+        let _ = unsignable_signing_key(&mesh);
+        outbox.append(&entry).unwrap();
+        let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
+        assert!(
+            err.contains("signing failed"),
+            "an unsignable key must fail even an already-applied drain: {err}"
+        );
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "the already-applied entry stays pending when the key is unsignable"
         );
     }
 
