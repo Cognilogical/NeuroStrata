@@ -73,6 +73,29 @@ jobs:
           echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
           echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
 
+      # src/task/harness_plugins.rs embeds plugins/opencode/dist/index.js with
+      # include_str!, but that file is a gitignored build artifact (see
+      # .gitignore), so a fresh checkout cannot build without this step.
+      # Sibling plugins track their dist/ output; opencode does not, by
+      # design — it is rebuilt here instead (Issue #42, Option B).
+      - name: Set up Node.js for opencode plugin build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build opencode plugin
+        shell: bash
+        working-directory: plugins/opencode
+        run: npm install && npm run build
+
+      # Diagnostic only: names any include_str! target still missing before
+      # cargo fails on it opaquely. Passing here is not acceptance — a
+      # persisting local dist/ would also pass; only a fresh-checkout CI
+      # run proves the plugin-build step works.
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
+
       - name: Build
         shell: bash
         run: cargo build --release --locked
@@ -129,6 +152,27 @@ jobs:
             echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
             exit 1
           }
+
+      # Same reason as in the build job: the test job compiles the crate
+      # (cargo test builds it first), and src/task/harness_plugins.rs embeds
+      # plugins/opencode/dist/index.js, a gitignored build artifact absent
+      # from a fresh checkout. Build it here, before the first compiling step.
+      - name: Set up Node.js for opencode plugin build
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build opencode plugin
+        shell: bash
+        working-directory: plugins/opencode
+        run: npm install && npm run build
+
+      # Diagnostic only, as in the build job: names any missing include_str!
+      # target before cargo fails on it opaquely. A local pass is not
+      # acceptance; only a fresh-checkout CI run proves the step works.
+      - name: Guard include_str targets
+        shell: bash
+        run: bash scripts/check-include-str-targets.sh
 
       - name: Test
         shell: bash
