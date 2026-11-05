@@ -1,47 +1,49 @@
 # Dendritic Bridge — Hybrid Retrieval & Embedding Pipeline
 
-> **Why you care:** Pure vector search misses exact symbol names (`check_caller_path`), while pure keyword search misses conceptual rules. The Dendritic Bridge fuses lexical BM25, dense HNSW vectors, graph Personalized PageRank, and neural cross-encoder reranking—running locally via ONNX with explicit degradation if an external provider is offline.
+> **Why you care:** Pure vector search misses exact symbol names (`check_caller_path`), while pure keyword search misses conceptual rules. The Dendritic Bridge offers three deterministic retrieval surfaces — a dense HNSW vector index, a disk-backed Tantivy full-text index, and an in-house BM25 scorer — plus a bounded graph expansion, so you can pick the surface that matches the question instead of paying for a reranking pipeline that does not exist.
 
 ---
 
-## 1. Local-First Embedding Architecture (`src/embedder.rs`)
+## 1. Local-First Embedding Architecture (`src/embed.rs`)
 
 The Dendritic Bridge abstracts embedding generation behind a unified trait supporting both zero-config local inference and external API providers:
 
 | Provider Mode | Default Model | Dimensions | Operational Posture |
 | :--- | :--- | :--- | :--- |
-| **Local ONNX (Default)** | `BGESmallENV15` (`fastembed`) | 384 | Runs 100% offline on CPU; zero API keys or external traffic. |
+| **Local ONNX (Default)** | `NomicEmbedTextV15` (`fastembed`) | 768 | Runs 100% offline on CPU; zero API keys or external traffic. |
 | **External HTTP Providers** | Configurable (OpenAI, Ollama, vLLM, compatible endpoints) | Provider-defined | Authenticated HTTP client with automatic fallback and explicit telemetry. |
 
 If a configured external provider becomes unreachable, the Dendritic Bridge never fails silently: it records the degradation state explicitly in the response diagnostics and falls back according to the configured policy.
 
 ---
 
-## 2. The 4-Stage Hybrid Retrieval Pipeline
+## 2. The Three Retrieval Surfaces
 
-Every call to `neurostrata_search_memory` (and auto-retrieval during `neurostrata_task_claim`) executes a 4-stage retrieval pipeline:
+Every call to `neurostrata_search_memory` (and auto-retrieval during `neurostrata_task_claim`) picks **one** retrieval surface with the `mode` argument. The surfaces are alternatives — their scores are never fused together.
 
 ```text
 Query ("caller path validation on ingest")
   │
-  ├─► Stage 1a: Tantivy BM25 Lexical Search (exact identifiers, file paths, error codes)
-  ├─► Stage 1b: LadybugDB HNSW Cosine Vector Search (semantic conceptual match)
+  ├─► mode: vector          → LadybugDB HNSW cosine (NomicEmbedTextV15, 768 dims)
+  │                            + capped neural-gain / decision-shape boosts
+  ├─► mode: lexical         → disk-backed Tantivy full-text index
+  └─► mode: lexical-inhouse → deterministic 5-field BM25 (src/fts/mod.rs)
   │
   ▼
-Stage 2: Reciprocal Rank Fusion (RRF, k=60) + Temporal Proximity Boost
+Temporal proximity boost (src/graph_read/temporal.rs) when the query carries a date
   │
   ▼
-Stage 3: 1-to-2 Hop Graph Expansion & Personalized PageRank (PPR) over GOVERNS / DEPENDS_ON / AST edges
+Bounded graph expansion over GOVERNS / RELATES_TO / CONTAINS / DEPENDS_ON /
+EXTRACTED_FROM edges, ranked by distinct-primary co-occurrence
   │
   ▼
-Stage 4: FlashRank ONNX Cross-Encoder Reranking (`ms-marco-MiniLM-L-12-v2`)
-  │
-  ▼
-Top-K High-Precision Context Nodes + Provenance Evidence Paths
+Top-K Context Nodes + Provenance Evidence Paths
 ```
 
-### Why Each Stage Matters
-1. **Tantivy BM25 + HNSW Vector:** Captures both exact Rust/TypeScript symbol identifiers and natural-language architectural intent.
-2. **Reciprocal Rank Fusion (RRF) & Temporal Boost (`src/graph_read/temporal.rs`):** Merges lexical and dense rankings without calibration drift, while queries containing temporal expressions (`2026-10-28`, `recent`, `last week`) receive a temporal proximity boost.
-3. **Personalized PageRank (PPR) Graph Walk:** Propagates relevance from seed matches across `GOVERNS`, `RELATES_TO`, `DEPENDS_ON`, and Tree-sitter AST (`calls`, `imports`) edges so rules governing a dependency are surfaced automatically.
-4. **FlashRank Neural Reranking (`src/reranker.rs`):** Scores each `(query, candidate)` pair jointly through a local ONNX cross-encoder to eliminate false-positive vector neighbors before tokens ever reach your LLM context window.
+### Why Each Surface Matters
+1. **Vector surface (`src/store/ladybug.rs`):** Captures natural-language architectural intent. Candidates are filtered by row class first, then the raw HNSW cosine distance has a capped usage-and-provenance gain (`≤ 0.5 × d`) and a decision-shape boost subtracted from it.
+2. **Lexical surfaces (`src/lexical.rs`, `src/fts/mod.rs`):** Capture exact Rust/TypeScript symbol identifiers, config keys, file paths, and error codes. The in-house scorer runs a deterministic BM25 over `Content` / `Symbol` / `Location` / `Namespace` / `MemoryType` with domain-ontology expansion.
+3. **Temporal proximity boost (`src/graph_read/temporal.rs`):** Queries containing temporal expressions (`2026-10-28`, `recent`, `last week`) receive a boost so chronologically aligned memories surface first.
+4. **Bounded graph expansion (`src/store/ladybug.rs`):** Relevance propagates from seed matches across `GOVERNS`, `RELATES_TO`, `CONTAINS`, `DEPENDS_ON` and `EXTRACTED_FROM` edges, so rules governing a dependency are surfaced automatically. Each expanded node carries its provenance path and is ranked by how many distinct primaries reach it.
+
+**What does not exist:** no Reciprocal Rank Fusion, no Personalized PageRank, and no neural cross-encoder reranker — there is no `src/rerank.rs`, no `src/reranker.rs`, and no FlashRank dependency in this codebase.

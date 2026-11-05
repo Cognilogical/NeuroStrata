@@ -35,7 +35,7 @@ Key design properties:
 
 Distributed teams occasionally modify the same shared rule concurrently. SynapticMesh never guesses or silently drops an edit (`src/synaptic_mesh/conflict.rs`):
 1. If an incoming mesh record diverges from a locally modified record with a non-ancestor provenance chain, both variants are preserved and recorded in the conflict registry.
-2. `neurostrata-mcp synaptic-mesh status` and `synaptic-mesh conflicts` surface the exact conflicting record IDs and authors.
+2. `neurostrata-mcp synaptic-mesh status` surfaces the exact conflicting records: the unresolved and preserved-variant counts, and per conflict its `namespace/id`, the reason, and the preserved variant file (`src/synaptic_mesh/conflict.rs`). It does **not** name an author -- `ConflictEntry` carries no author field, only `namespace`, `id`, `update_id`, `reason`, `variant_file`, `kind` and `recorded_at`. There is no `synaptic-mesh conflicts` subcommand -- `status` is the only inspector (`src/synaptic_mesh/cli.rs`).
 3. Agents are instructed by the honesty protocol to halt synthesis over conflicted IDs until resolved.
 
 ---
@@ -50,18 +50,24 @@ Distributed teams occasionally modify the same shared rule concurrently. Synapti
 
 ## 5. CLI Usage
 
+The subcommands are `init`, `join`, `push`, `pull`, `status`, `leave` and `recover` (`src/synaptic_mesh/cli.rs`). There is no `sync` and no `conflicts` subcommand -- transport is `pull` then `push`.
+
 ```bash
-# Bind a local directory/repo as the team SynapticMesh transport
-neurostrata-mcp synaptic-mesh init /path/to/team-mesh-repo
+# Create a new mesh and join this project to it (name, not a path)
+neurostrata-mcp synaptic-mesh init team-mesh --remote git@example.com:team/mesh.git
+
+# Adopt a mesh repo that already exists on this machine
+neurostrata-mcp synaptic-mesh join /path/to/team-mesh-repo
 
 # Inspect outbox queue, inbox replay state, and conflict count
-neurostrata-mcp synaptic-mesh status --namespace NeuroStrata
+neurostrata-mcp synaptic-mesh status
 
-# Pull peer records (--ff-only), validate & import, and push local outbox
-neurostrata-mcp synaptic-mesh sync --namespace NeuroStrata
+# Fetch and replay peer records (--ff-only), then push the local outbox
+neurostrata-mcp synaptic-mesh pull
+neurostrata-mcp synaptic-mesh push
 
-# Inspect any divergent record variants
-neurostrata-mcp synaptic-mesh conflicts --namespace NeuroStrata
+# Drop this project's pointer; the records stay on disk
+neurostrata-mcp synaptic-mesh leave
 
 # Print non-destructive recovery steps if the mesh git tree diverged
 neurostrata-mcp synaptic-mesh recover

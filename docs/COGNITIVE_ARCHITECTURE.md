@@ -33,20 +33,17 @@ NeuroStrata carries an explicit declarative `domain` tag on a memory (e.g., `fro
 *Inspired by the psychological concept of "Working Memory Priming".*
 Instead of forcing agents to blindly search a new repository and waste expensive token processing, NeuroStrata features a `neurostrata_get_snapshot` tool. This instantly returns the top-5 highest-weighted, active cognitive nodes for any project. This "wake-up context" perfectly grounds an agent in a repository's most critical rules the second a session begins.
 
-### 6. 4-Stage Hybrid Retrieval — Lexical + Vector + Graph PPR + Cross-Encoder Reranking
+### 6. Deterministic Retrieval — Three Surfaces, Not One Fused Pipeline
 *Inspired by human dual-process theory (verbatim token recall + conceptual gist + associative spreading activation).*
 
-Retrieval executes a deterministic 4-stage hybrid pipeline that combines exact-identifier precision, dense semantic similarity, multi-hop graph topology, and neural cross-encoder reranking:
+`neurostrata_search_memory` offers three **alternative** retrieval surfaces, selected with the `mode` argument (`vector` — the default, `lexical`, `lexical-inhouse`). They are not stages of one pipeline and their scores are never combined: the caller picks one surface per call.
 
-1. **Stage 1 — Dual-Track Candidate Generation (Tantivy BM25 + LadybugDB HNSW Vector):**
-   - **Lexical Track (`src/lexical.rs`):** A full-text Tantivy BM25 index scores exact identifiers, function names, config keys, file paths, and error codes (`recall_exact_identifier`).
-   - **Dense Vector Track (`src/store/ladybug.rs`):** Active, non-archived, non-conflicting Engrams are scanned via 384-dimensional HNSW cosine distance (`BGESmallENV15`) with §3's capped Neural Gain boost (`min(usage_gain + source_gain, 0.5 * d)`).
-2. **Stage 2 — Reciprocal Rank Fusion (RRF) & Temporal Proximity Boost:**
-   - Lexical and vector rankings are fused via Reciprocal Rank Fusion (`k = 60`), while queries carrying temporal expressions (`src/graph_read/temporal.rs`) apply `temporal_proximity_boost` to surface chronologically aligned memories.
-3. **Stage 3 — Bounded Directed-Graph Expansion & Personalized PageRank (PPR):**
-   - Primary hits expand across `RELATES_TO`, `CONTAINS`, `DEPENDS_ON`, `EXTRACTED_FROM`, and 2-hop `GOVERNS` + Tree-sitter AST (`calls`, `imports`) edges. Each expanded node carries its explicit provenance path (`EvidenceKind`) and Personalized PageRank weight.
-4. **Stage 4 — FlashRank ONNX Cross-Encoder Reranking (`src/reranker.rs`):**
-   - Top candidate pairs `(query, memory)` are jointly scored through a local ONNX cross-encoder (`ms-marco-MiniLM-L-12-v2`) to ensure only the highest-precision context reaches the agent's prompt window.
+1. **Vector surface (default) — LadybugDB HNSW (`src/store/ladybug.rs`):** Active, non-archived, non-conflicting Engrams are scanned via 768-dimensional HNSW cosine distance (`NomicEmbedTextV15`) with §3's capped Neural Gain boost (`min(usage_gain + source_gain, 0.5 * d)`) and a decision-shape boost, both subtracted from the raw distance.
+2. **Lexical surfaces — Tantivy (`src/lexical.rs`) and the in-house BM25 (`src/fts/mod.rs`):** `mode: lexical` runs the disk-backed Tantivy full-text index; `mode: lexical-inhouse` runs a deterministic 5-field BM25 scorer over `Content` / `Symbol` / `Location` / `Namespace` / `MemoryType` with domain-ontology expansion and `valid_to` retirement visibility. Both score exact identifiers, function names, config keys, file paths, and error codes.
+3. **Temporal proximity boost (`src/graph_read/temporal.rs`):** A query carrying a temporal expression (`2026-10-28`, `recent`, `last week`) has `temporal_proximity_boost` subtracted from the score, so chronologically aligned memories surface first. The boost applies inside the chosen surface — it is not a fusion across surfaces.
+4. **Bounded directed-graph expansion (`src/store/ladybug.rs`):** Primary hits expand across `RELATES_TO`, `CONTAINS`, `GOVERNS`, `DEPENDS_ON` and `EXTRACTED_FROM` (including episode siblings reached through their shared task) in a bounded walk with per-family caps. Each expanded node carries its explicit provenance path (`EvidenceKind`) and is ranked by the number of distinct originating primaries that reach it. Tree-sitter AST (`calls`, `imports`) edges reach the same neighborhood through `neurostrata_memories_for_file` (`include_ast_edges`).
+
+**What does not exist:** there is no Reciprocal Rank Fusion, no Personalized PageRank, and no neural cross-encoder reranker in the search path — there is no `src/rerank.rs`, no `src/reranker.rs`, and no FlashRank dependency.
 
 ### 7. 3-Tier Stratification (Contextual Hierarchy)
 *Inspired by the division of Working Memory vs. Long-Term Memory.*
@@ -61,7 +58,7 @@ An AI's memory and task state must never decouple. Goals (tracked work) are Engr
 
 ### 9. Extended Cognition Workspace (Human-AI Symbiosis via NeuroVault)
 *Inspired by the extended mind thesis.*
-Memory is not locked in a black-box database. Through the NeuroVault and Obsidian integration, the exact same memory nodes the AI uses to structure code are exposed as a visual, navigable markdown graph for human developers. Humans can curate, audit, and organically learn from the same cognitive graph the AI relies on, creating true symbiosis.
+Memory is not locked in a black-box database: the graph is inspectable through the web UI (`web-ui/`), the CLI graph export (`neurostrata-mcp export-graph`), and the RDF/SPARQL surface (`neurostrata_sparql_query`, `neurostrata_export_canonical_rdf`). **The planned NeuroVault Obsidian mirror — a bidirectional Markdown vault that a human can curate — is not implemented yet**: there is no `src/obsidian.rs`, no `neurostrata_sync_obsidian` tool, and no `obsidian-sync` command. It is tracked by NeuroStrata task `neurostrata-dlag`; see `docs/ops/obsidian.md`.
 
 ### 10. Asynchronous Delegation (Orchestrator-Worker Pattern)
 *Inspired by the brain's division of labor across specialized regions.*
@@ -101,10 +98,10 @@ Design provenance: **Anthropic/Kimi verdict** (`docs/design-mesh-verdict-kimi.md
 *Inspired by neocortical symbolic reasoning, topological modularity, and prefrontal mental simulation.*
 
 Beyond associative recall, NeuroStrata embeds four higher-order cognitive faculties directly in the binary:
-- **W3C Semantic Web Reasoning (`src/rdf/`):** Projects graph nodes into RDF triples, executes federated SPARQL 1.1 queries (`neurostrata_sparql_query`), materializes OWL 2 RL transitive and inverse inferences (`neurostrata_owl_reason`), and validates every write against versioned Turtle SHACL shapes (`src/schemas/shacl/`).
+- **W3C Semantic Web Reasoning (`src/rdf/`):** Projects graph nodes into RDF triples (`oxrdf` / `oxttl`), executes SPARQL 1.1 queries (`neurostrata_sparql_query`), materializes transitive RDFS/OWL closure over `subPropertyOf` and subclasses (`src/rdf/ontology.rs`, `src/rdf/reasoning.rs`), and validates every write against versioned Turtle SHACL shapes (`src/schemas/shacl/`). The closure is computed inside the store and the SPARQL console — there is no separate `neurostrata_owl_reason` MCP tool.
 - **Leiden Community Detection (`src/community.rs`):** Continuously partitions densely connected memory and AST nodes into modular communities with thematic summaries.
 - **TransE Knowledge Graph Embeddings (`src/kge.rs`):** Learns relational translation vectors (`h + r ≈ t`) over graph triples (`neurostrata_kge_train`) to predict missing links and structural analogies.
-- **Digital Twin State Simulation (`src/twin.rs`):** Maintains versioned state models (`neurostrata_twin_define`, `neurostrata_twin_observe`, `neurostrata_twin_simulate`) so agents can test hypothetical state transitions and compare branched outcomes before mutating production systems.
+- **Digital Twin State Modeling (`src/digital_twin/`):** Maintains versioned state vectors inside the memory store (`neurostrata_twin_set`, `neurostrata_twin_get`, `neurostrata_twin_list`) and compares versions structurally (`neurostrata_twin_diff`), so an agent can inspect and compare recorded state before mutating production systems. There is no `neurostrata_twin_simulate` or `neurostrata_twin_rollback` tool.
 
 ## Cognitive-name glossary
 

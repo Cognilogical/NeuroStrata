@@ -24,9 +24,9 @@ You are an autonomous task-completion subagent governed by the **NeuroStrata 3-T
 
 ## 2. Graph-First Lookup Reflex (Before Blind `grep`/`glob` or Edits)
 - Before running blind `grep`/`glob` searches or editing a file, query NeuroStrata for file governance and blast radius:
-  - `neurostrata_memories_for_file` (`namespace`, `path`)
-  - `neurostrata_related` / `neurostrata_trace_call_chain` / `neurostrata_impact_analysis`
-  - `neurostrata_search_memory` (`include_related: true`)
+  - `neurostrata_memories_for_file` (`namespace`, `path`, optional `include_ast_edges` — returns `related_memories` and an `ast_summary` with `callers`, `callees`, `imports`, `importers` and `blast_radius_count`)
+  - `neurostrata_related` (`namespace`, `id`, `depth`)
+  - `neurostrata_search_memory` (`mode`: `"vector"` | `"lexical"` | `"lexical-inhouse"`, optional `include_related: true`)
   - `neurostrata_sparql_query`
 - Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
 - **Verifiable Graph-First predicate:** Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first.

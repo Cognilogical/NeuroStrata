@@ -12,7 +12,7 @@ NeuroStrata partitions knowledge into three hierarchical tiers inspired by human
 | :--- | :--- | :--- | :--- |
 | **Tier 1: `global` (Semantic Cortex)** | Cross-project universal mandates | Container policies (`podman` over `docker`), security baselines, operator coding preferences, global guard rules. | Permanent in LadybugDB; queried alongside every project snapshot. |
 | **Tier 2: `<project>` / Domain (Declarative Memory)** | Single repository or bounded domain | Module invariants, API contracts, Tree-sitter AST graph, `GOVERNS` file bindings, procedures, and domain schemas. | Permanent per-namespace; shareable across teammates via **SynapticMesh**. |
-| **Tier 3: Task & Episodic Buffer (Working Memory)** | Active session & Goal lifecycle | Claimed `task` state machines, Breath checkpoints, and rolling 500 KB `.NeuroStrata/sessions/*.jsonl` conversational logs. | Consolidated into Tier 2 via Lock 2 (`neurostrata_task_complete`) when work finishes. |
+| **Tier 3: Task & Episodic Buffer (Working Memory)** | Active session & Goal lifecycle | Claimed `task` state machines, Breath checkpoints, and rolling 500 KB `.NeuroStrata/sessions/current.md` conversational log (the Episodic Buffer, `src/buffer.rs`). | Consolidated into Tier 2 via Lock 2 (`neurostrata_task_complete`) when work finishes. |
 
 ---
 

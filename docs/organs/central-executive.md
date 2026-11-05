@@ -32,7 +32,6 @@ Before an agent touches any file or runs any mutating command, it must first cla
 - Any task in `in_progress` (unfinished work blocks everyone).
 - Any task marked `done` that lacks an extracted memory (the Done-Funnel guard).
 - Any P0 task open for more than 24 hours.
-- Untracked `TODO`/`FIXME`/`later` markers in any diff.
 
 The pre-push hook (`pre-push` binary hook, installed via `neurostrata-mcp hooks install`) enforces this — including on merged branches and pushed tags. A hard failure exits the hook non-zero so git refuses the push automatically.
 
@@ -46,7 +45,7 @@ This is the central Anti-Amnesia mechanism: every finished task makes the codeba
 
 Every 3–5 mutation steps, the agent pauses and records a state checkpoint onto the task's immutable history log via `neurostrata_task_update` (`note` field). This gives instant crash recovery — if a session dies mid-edit, the replay log reconstructs exactly where the agent was, rather than losing weeks of reasoning archaeology. The working-memory notes are stamped with a timestamp, session ID, and a compact summary of the current intent.
 
-The checkpoint budget is enforced per step: an agent that skips checkpoints accumulates warnings rather than failing outright, but a skipped sequence over many steps transitions the session to a `blocked` advisory state.
+The checkpoint budget is **enforced, not advisory**: the guard state machine (`src/guard/fsm.rs`) returns a `BreathRequired` rejection once `mutations_since_note >= 5`, which blocks further mutations until the agent records a note via `neurostrata_task_update(note=...)`. The rejection names the session, the task and the worktree, plus the next legal transition.
 
 ## Auto-Retrieved Graph Context & Subagent Prompt Injection
 

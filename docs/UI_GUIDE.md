@@ -2,7 +2,7 @@
 
 NeuroStrata provides two complementary visual interfaces for exploring, auditing, and curating your AI agent's cognitive graph:
 1. **The Embedded Web UI & Tauri Desktop App (`web-ui/` / `src-tauri/`):** An interactive 3D/2D Force Graph, Central Executive Task Board, SynapticMesh Inspector, and SPARQL/Digital-Twin console connected directly to the Rust daemon (`http://127.0.0.1:34343`).
-2. **NeuroVault Obsidian Integration (`src/obsidian.rs`):** Bidirectional Markdown note synchronization and JSON Canvas spatial topology export.
+2. **NeuroVault Obsidian Integration — Planned, not implemented:** Bidirectional Markdown note synchronization and JSON Canvas spatial topology export are tracked by task `neurostrata-dlag`; no `src/obsidian.rs` module exists in this release.
 
 ---
 
@@ -33,14 +33,11 @@ The Task Board view surfaces the live state of the Central Executive (`src/task/
 ## 3. SynapticMesh, SPARQL & Digital Twin Panels
 
 - **SynapticMesh Status:** Inspect queued outbox records, peer sync history, and any preserved conflict variants across your team's Git mesh (`docs/mesh/synaptic-mesh.md`).
-- **SPARQL 1.1 & OWL Reasoner Console:** Run W3C SPARQL queries (`neurostrata_sparql_query`) and inspect SHACL shape conformance reports (`src/schemas/shacl/`).
-- **Digital Twin Simulator:** Inspect stateful system variables, record observations (`neurostrata_twin_observe`), and compare simulated branches (`neurostrata_twin_simulate`).
+- **SPARQL 1.1 & SHACL Console:** Run W3C SPARQL queries (`neurostrata_sparql_query`) and inspect SHACL shape conformance reports (`src/schemas/shacl/`).
+- **Digital Twin Panel:** Inspect versioned state vectors, compare versions (`neurostrata_twin_diff`), and list the twins of a namespace (`neurostrata_twin_list`).
 
 ---
 
 ## 4. Obsidian Vault Synchronization (`NeuroVault`)
 
-For developers who prefer curating knowledge in Markdown, `neurostrata_sync_obsidian` mirrors any namespace into an Obsidian vault:
-- Every memory node is written as a Markdown file with YAML frontmatter (`id`, `namespace`, `memory_type`, `valid_from`, `valid_to`, `governs`, `related_to`).
-- Graph edges are rendered as native `[[WikiLinks]]` and `.canvas` files.
-- Edits saved in Obsidian sync back into LadybugDB on the next `neurostrata_sync_obsidian` invocation. See [`docs/ops/obsidian.md`](ops/obsidian.md) for full frontmatter details.
+This feature is **not available in this release**. There is no `neurostrata_sync_obsidian` MCP tool, no `obsidian-sync` CLI subcommand, and no `src/obsidian.rs` module. The bidirectional Markdown sync and JSON Canvas export are planned and tracked by task `neurostrata-dlag`. See [`docs/ops/obsidian.md`](ops/obsidian.md) for the planned design and current status.

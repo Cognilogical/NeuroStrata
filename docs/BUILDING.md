@@ -82,9 +82,9 @@ of memory; the file's header covers that and the named-volume setup.
 
 | Workflow | Trigger | Publishes |
 | --- | --- | --- |
-| `ci.yml` | push, PR | nothing — a `--release --locked` build on linux, windows, and macOS arm64 and x64, plus a version assertion |
+| `ci.yml` | push, PR | nothing — a `--release --locked` build on linux, windows, and macOS arm64, plus a version assertion (there is no macOS x64 runner: `ort` rc.13, pinned by `fastembed >= 5`, ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`) |
 | `nightly.yml` | cron, dispatch | linux + windows amd64 → the `nightly` tag, prerelease |
-| `release.yml` | `v*` tags | all five targets → that tag |
+| `release.yml` | `v*` tags | all four targets → that tag (linux amd64 + linux arm64, darwin arm64, windows amd64) |
 
 Both publishing workflows attach `SHA256SUMS`, and they target separate tags;
 the nightly archives also carry `nightly` in their filenames.
@@ -93,7 +93,7 @@ Cross-compilation is impractical for releases — vendored OpenSSL, `cxx-build`,
 and ONNX via `fastembed` — so each target builds on its own native runner.
 
 Timings on GitHub-hosted runners, every run cold — nothing is cached between
-them: macOS arm64 ~20 min, linux ~18-24 min, macOS x64 ~28 min, windows ~61 min.
+them: macOS arm64 ~20 min, linux ~18-24 min, windows ~61 min.
 The four run concurrently, so a full CI cycle is bounded by Windows.
 
 ---
@@ -143,11 +143,13 @@ cargo install --path . --force --locked
 
 `--locked` is the important one. Without it `cargo install` ignores `Cargo.lock`
 and re-resolves dependencies, which picks up whatever newer `lbug` has been
-published -- installing 0.15.4 where the lockfile pins 0.15.3. That silently
-swaps the storage engine underneath an existing database. The pin is deliberate:
-`recovering_config()` in `src/store/ladybug.rs` disables WAL checksums because
-leaving them on loses every row after an ungraceful stop, and the engine version
-that behaviour was measured against is the one in the lockfile.
+published -- installing a release newer than the 0.20.4 the lockfile pins. That
+silently swaps the storage engine underneath an existing database. The pin is
+deliberate: WAL behaviour is governed by `strict_wal_verification()` in
+`src/store/ladybug.rs`, which refuses an unauthenticated WAL by default
+(`NEUROSTRATA_STRICT_WAL=1`) and only falls back to the unverified recovery
+open (`unverified_config()`) when the operator explicitly opts out, and the
+engine version that behaviour was measured against is the one in the lockfile.
 
 `--force` is needed because the binary already exists after the first install;
 without it cargo stops with "binary `neurostrata-mcp.exe` already exists".

@@ -92,7 +92,7 @@ neurostrata-mcp delete <namespace> <id>
 ## 3. Codebase Ingestion & Graph Export
 
 ### `ingest`
-Scans a source directory with the 11-language Tree-sitter AST engine, extracts structural symbols (`function`, `class`, `struct`, `interface`, `trait`, `method`, `calls`, `imports`), and indexes them into the namespace.
+Scans a source directory with the six-language Tree-sitter AST engine (`rust`, `typescript`, `tsx`, `python`, `go`, `java`), extracts structural symbols (`function`, `class`, `struct`, `interface`, `trait`, `method`, `calls`, `imports`), and indexes them into the namespace.
 ```bash
 neurostrata-mcp ingest <dir_path> <namespace> [schema_path]
 ```
@@ -151,41 +151,38 @@ neurostrata-mcp hooks install [--force]
 
 Synchronizes shareable `rule`, `fact`, and `procedure` definitions across teammates over standard Git (`--ff-only` pull and push) while preserving local private sovereignty.
 ```bash
-neurostrata-mcp synaptic-mesh init <mesh_repo_path>
-neurostrata-mcp synaptic-mesh status [--namespace <ns>]
-neurostrata-mcp synaptic-mesh sync [--namespace <ns>]
-neurostrata-mcp synaptic-mesh conflicts [--namespace <ns>]
+neurostrata-mcp synaptic-mesh init <mesh_name> [--namespace <ns>] [--remote <url>]
+neurostrata-mcp synaptic-mesh join <mesh_repo_path>
+neurostrata-mcp synaptic-mesh push
+neurostrata-mcp synaptic-mesh pull
+neurostrata-mcp synaptic-mesh status
+neurostrata-mcp synaptic-mesh leave
 neurostrata-mcp synaptic-mesh recover
 ```
 
 ---
 
-## 6. Local Learning, Laya & GLiNER
+## 6. Local Learning & Laya
 
-### `learning`
-Manages local self-improvement datasets, candidate model training, evaluation gates, promotion, and rollback.
+### `learn`
+Manages the local deduplication learning loop: datasets, candidate training, evaluation gates, promotion, and rollback.
 ```bash
-neurostrata-mcp learning status
-neurostrata-mcp learning train
-neurostrata-mcp learning eval
-neurostrata-mcp learning promote
-neurostrata-mcp learning rollback
-neurostrata-mcp learning reset
+neurostrata-mcp learn status
+neurostrata-mcp learn pause
+neurostrata-mcp learn resume
+neurostrata-mcp learn train
+neurostrata-mcp learn rollback
+neurostrata-mcp learn reset
 ```
 
-### `laya-export`
-Exports and verifies a calibrated local Laya ONNX duplicate-judgment bundle (`manifest.json` + `model.onnx`).
+### `laya`
+Fetches a pinned, checksum-verified Laya ONNX duplicate-judgment bundle into `artifacts/laya-bundle` by default.
 ```bash
-neurostrata-mcp laya-export [--output <dir>]
+neurostrata-mcp laya [MODEL] [--out-dir <dir>]
 ```
 
-### `gliner`
-Manages local zero-shot GLiNER entity/relation candidate extraction and human/agent review queues.
-```bash
-neurostrata-mcp gliner status
-neurostrata-mcp gliner extract <namespace>
-neurostrata-mcp gliner review <namespace>
-```
+### GLiNER (no CLI subcommand)
+GLiNER entity/relation extraction runs **inside the daemon**, not as a CLI subcommand: `neurostrata_add_memory` with `extract_entities: true` runs the local ONNX GLiNER engine (`src/gliner.rs`) and stores the extracted entities as `metadata.gliner_candidates` on the memory, each marked `review_only`. There is no `neurostrata-mcp gliner` command.
 
 ---
 

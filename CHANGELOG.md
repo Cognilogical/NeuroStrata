@@ -4,6 +4,187 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.16.0] - 2026-11-05
+
+### Added
+
+- **A shared `@neurostrata/plugin-core` (`plugins/core/`) with four thin harness adapters.** The OpenCode, Claude Code, Codex and GitHub CLI plugins are now 13-line adapters that re-export one implementation (`plugins/core/index.ts`, ~1.8k lines); the Hermes (`plugins/hermes/index.ts`, 863 lines) and OpenClaw (`plugins/openclaw/index.ts`, 1000 lines) bundles still carry their own implementations and were **not** converted to the shared core in this release. The core ships zero runtime dependencies (Node built-ins only).
+- **The shared core is embedded in the binary.** `src/task/harness_plugins.rs` embeds `plugins/core/dist/index.js` and `plugins/core/package.json` via `include_str!` and installs them into `.NeuroStrata/plugins/core/` on init, so the shared implementation ships with the binary and needs no npm install.
+- **Daemon-backed active-task resolution (`src/server.rs`, `src/task/mod.rs`).** `neurostrata_guard_validate` now falls back to the `session_id` of the active `in_progress` task when the caller's `session_id` is empty or `"unknown"`, so a stateless client is no longer treated as an unattributed caller. `neurostrata_task_list` returns `session_id` and `subagent_prompt_injection` on `in_progress` rows, so a plugin can resolve the active task and its prompt in one call.
+- **AST neighborhood in `neurostrata_memories_for_file` (`include_ast_edges`, default `true`).** The response now carries `related_memories` (1-hop `DEPENDS_ON` / `RELATES_TO` neighbours and `SUPERSEDES` targets) and a compact `ast_summary` — `symbols`, `callers`, `callees`, `imports`, `importers`, `blast_radius_count` — computed by `LadybugStore::ast_neighborhood_for_file` (`src/store/ladybug.rs`).
+- **Dynamic subagent prompt injection (`plugins/core/index.ts`).** `enrichAndInjectSubagentPrompt` prefetches the governing memories of every repo-relative file path mentioned in a subagent prompt and embeds them, alongside the daemon's `subagent_prompt_injection`, in the injected header.
+- **A verifiable Graph-First rule predicate.** The rule shipped in `SUBAGENT_GRAPH_FIRST_RULE_SNIPPET`, `build_task_graph_context` and the `.agents/` templates no longer carries the prose bypass "unless the parent prompt states" — it names a check an agent can actually run: for any file it touches that is not listed under `### NeuroStrata Task & Graph Context`, call `neurostrata_memories_for_file` first.
+
+### Fixed
+
+- **The OpenCode plugin was never loaded.** `wire_harness_config` wrote `.opencode/neurostrata-plugin.json` — a file OpenCode does not read — and merged the plugin path into a root `opencode.json` under a `"plugin"` key, and only when that root file already existed. It now writes the `.opencode/plugins/neurostrata.js` loader OpenCode auto-discovers, and always creates or merges `.opencode/opencode.json` → `"plugins"`, preserving every other key and entry. A root `opencode.json` is still only touched when it already exists.
+- **The plugins hardcoded the namespace `NeuroStrata`.** Every bundle shipped `namespace: "NeuroStrata"`, so the guard, the task list and the memory lookups ran against the wrong namespace outside the NeuroStrata repo. `resolveConfig` (`plugins/core/index.ts`) now resolves it in order: plugin config → `NEUROSTRATA_NAMESPACE` → the namespace discovered from the project root, and never falls back to a hardcoded name.
+- **Tool classification was incomplete and the Code Mode path was invisible.** `TOOL_CLASSIFICATION` now names the read, mutating-file, shell, subagent and code-exec sets explicitly, with `isFileTouchTool` / `isMutatingTool` / `isSubagentTool` / `isCodeExecTool` predicates; `inspectCodeModeExecution` reads an OpenCode V2 Code Mode `execute` payload (`input.input.code` / `input.args.code`) and extracts the `id`, `session_id`, `note` and `path` arguments, so a claim, a note and a completion performed inside a Code Mode block are tracked like any other tool call.
+- **Hook handling was per-harness.** `handleHookEvent` / `handleClaudeHookEvent` now handle `PreToolUse` and `Stop` the same way across harnesses: a subagent tool gets its prompt enriched, a file-touch tool gets the governing memories attached as `additionalContext` and `systemMessage`, and a mutating tool is checked against `neurostrata_guard_validate` and denied on reject.
+- **The governing memories of a file never reached the model.** The plugin queried NeuroStrata for a touched file but never delivered the result to the LLM, and the Rust and TypeScript sides of `.NeuroStrata/session_queries.json` did not agree on what they wrote. The recall block is now delivered in `execute.before` (`additionalContext` / `neurostrataContext`) and in `execute.after` (appended to the tool output), and the ledger is written in one shape by both sides.
+- **The scaffolded pre-commit hook assumed a Rust `src/<module>/` layout.** It collected `git diff --name-only --cached | grep '^src/'` and derived a module name from the first path segment, so every file outside `src/` was invisible to it — a Go, TypeScript or Python repository got no ledger check at all. The hook is now layout- and language-agnostic: it checks every staged file (excluding `.NeuroStrata/`) by full path and by directory prefix, and appends to the ledger whether or not the ledger already exists.
+- **`/graph` and `/export-graph` returned 500 when the config file could not be read.** Both daemon routes treated a `Config::load()` failure as fatal; they now fall back to an empty `project_contexts` (`src/daemon.rs`).
+- **The Windows MSVC build failed on a duplicate-symbol link.** `build.rs` passed `--allow-multiple-definition` unconditionally, which is a GNU-ld flag. It now passes `/FORCE:MULTIPLE` on `windows-msvc` and keeps the GNU flag on Linux and `windows-gnu`.
+- **The "no daemon" plugin tests were not hermetic.** `plugins/core/test.mjs` reset the MCP client and then let it be recreated against the default endpoint, so on a machine with a NeuroStrata daemon running, the fail-soft test received real memories instead of none. The two no-daemon tests now pin the client to an unreachable endpoint.
+- **The shipped documentation claimed features the code does not have.** A repo-wide honesty sweep corrected claims that had accumulated across the v1.15.0 documentation pass (commit `06c9957`) and earlier:
+  - **Retrieval was described as a 4-stage fused pipeline.** It is not. `neurostrata_search_memory` exposes three *alternative* surfaces selected by `mode` (`vector` — the default, `lexical`, `lexical-inhouse`); there is no Reciprocal Rank Fusion, no Personalized PageRank, and no neural cross-encoder reranker. There is no `src/rerank.rs`, no `src/reranker.rs`, and no FlashRank dependency anywhere in the crate.
+  - **The embedder was described as `BGESmallENV15` at 384 dimensions.** It is `NomicEmbedTextV15` at 768 dimensions (`src/embed.rs`).
+  - **The Tree-sitter graph was described as 11 languages.** Six are supported — Rust, TypeScript, TSX, Python, Go, Java (`src/parser/mod.rs::get_language`).
+  - **The semantic-web stack was described as the `oxirs-*` family.** That family was never a dependency. The shipped crates are `oxrdf`, `oxttl`, `spargebra`, `sparopt`, `spareval`, `sparesults`, `shacl` and `petgraph`; closure inference is computed in-house by `src/rdf/ontology.rs` and `src/rdf/reasoning.rs`.
+  - **Community detection was described as "Leiden/Louvain" and file digests as "`blake3` / `sha256`".** Only Leiden exists (`src/community.rs`), and only `sha2` is used (`src/parser/generation.rs`).
+  - **MCP tool names that were never registered were removed** — `neurostrata_validate_action`, `neurostrata_guard_action`, `neurostrata_owl_reason`, `neurostrata_trace_call_chain`, `neurostrata_impact_analysis`, `neurostrata_enrichment_candidates` / `_promote`, `neurostrata_twin_create` / `_define` / `_observe` / `_rollback` / `_simulate`, `neurostrata_metrics_record`, `neurostrata_mesh_status` / `_conflicts` / `_resolve`, `neurostrata_wal_status`, `neurostrata_domain_register` / `_list`. The authoritative surface is the **51 tools** registered in `src/server.rs` `tools/list`; the documented replacements are `neurostrata_guard_validate` / `_learn` / `_list_rules`, `neurostrata_twin_set` / `_get` / `_list` / `_diff`, `neurostrata_metrics_query` / `_list`, `neurostrata_synaptic_mesh_*`, `neurostrata_domain_registry`, and `neurostrata_memories_for_file` with `include_ast_edges` (whose `ast_summary` carries `callers`, `callees`, `imports`, `importers` and `blast_radius_count`).
+  - **CLI commands that do not exist were removed** — `neurostrata-mcp learning` (the command is `learn`), `neurostrata-mcp laya-export` (it is `laya`), `neurostrata-mcp gliner` (GLiNER runs in the daemon and stores `metadata.gliner_candidates` on the memory), and `neurostrata-mcp synaptic-mesh sync` / `conflicts` (the subcommands are `push` and `pull`).
+  - **The guard was described as returning `ALLOW` / `WARN` / `BLOCK`.** `ValidateVerdict` has five variants: `DeterministicReject`, `SandboxReject`, `SandboxPassHighFidelity`, `SandboxPassLowFidelity`, `ApprovedFailOpen`. The sandbox invocation was also corrected to the flags the code actually uses (`--rm --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp` — there is no `--read-only`).
+  - **The secret scanner was described as redacting with `[REDACTED]` markers.** `src/secrets.rs` fails closed and **rejects** the write; it never redacts. The `src/scrubber.rs` path never existed.
+  - **The global namespace was described as a directory.** `.agents/skills/neurostrata/SKILL.md` pointed at `~/.config/neurostrata/global/`. There is no such directory: `global` is a namespace **column** in the same LadybugDB store (`Memory.namespace`), and the config file is `~/.config/neurostrata/config.json`. The skill file is `include_str!`-embedded in the binary, so the correction ships with the release.
+  - **The Obsidian / NeuroVault sync was documented as a shipped feature.** It was never implemented — there is no `src/obsidian.rs` in any commit, no `neurostrata_sync_obsidian` MCP tool, and no `obsidian-sync` CLI subcommand. `docs/ops/obsidian.md`, `docs/UI_GUIDE.md`, `docs/FEATURES.md`, `docs/README.md`, `docs/COGNITIVE_ARCHITECTURE.md` and `docs/science/nomenclature.md` now say plainly that it is planned and not implemented, and point at the tracking task `neurostrata-dlag`.
+  - **The pre-push gate was credited with scanning diffs for `TODO`/`FIXME` markers.** `src/task/gate.rs` never did that; it blocks on `in_progress` tasks, `done` tasks without an extracted memory, and P0 tasks open for more than 24 hours. The gate bullet in `docs/organs/central-executive.md` now names only those three rules and points deferral language at the lexical task-intent detector, which is what actually catches it.
+  - **The Breath checkpoint was described as advisory.** It is a hard block: `src/guard/fsm.rs` returns `BreathRequired` once `mutations_since_note >= 5`, and further mutations are refused until `neurostrata_task_update(note=...)` records a note. `docs/organs/central-executive.md` now says so, including the rejection's next-legal-transition hint.
+  - **The Episodic Buffer was documented as `*.jsonl`.** It is a rolling Markdown file, `.NeuroStrata/sessions/current.md`, with a 500 KB rollover (`src/buffer.rs`). `docs/architecture/tri-strata.md` was corrected.
+  - **The SynapticMesh CLI was documented with `sync` and `conflicts` subcommands and a `--namespace` flag on `status`.** The real surface (`src/synaptic_mesh/cli.rs`) is `init <name>` (with `--namespace` / `--remote`), `join <dir>`, `push`, `pull`, `status` (no flags), `leave` and `recover` — there is no `sync` and no `conflicts`; transport is `pull` then `push`. `docs/mesh/synaptic-mesh.md` was rewritten to match.
+  - **The crash-breadcrumb directory, the store path and the breadcrumb contents were wrong.** Breadcrumbs go to `<db_path parent>/crash` — `~/.config/NeuroStrata/data/db/crash/` (capital `N` and `S`) — not `~/.config/neurostrata/crash/`, and the main store is the file `~/.config/NeuroStrata/data/db/ladybug.db`. The breadcrumb itself was described as carrying the binary version, commit hash, target triple, thread name, panic payload, source location, lock state and WAL size: it carries none of those. `src/crash.rs` installs a handler for `SIGSEGV` / `SIGBUS` / `SIGABRT` / `SIGFPE` that writes `crash-<pid>-<epoch>.txt` containing the signal number and name, the pid, the faulting thread id, the epoch second, the alternate-stack size and — only when the stack had room for it — a backtrace. There is no Rust panic hook, so an ordinary `panic!` unwinds and produces no breadcrumb. `docs/ops/crashes.md` now says exactly that.
+  - **The build documentation described runners and targets that do not exist.** The CI matrix is `ubuntu-latest` / `windows-latest` / `macos-15` — Apple Silicon only, no macOS x64 (the pinned `ort` release ships no prebuilt ONNX Runtime for `x86_64-apple-darwin`). `release.yml` publishes **four** targets (linux amd64 + arm64, darwin arm64, windows amd64), not five. `docs/BUILDING.md` now says so, drops the "macOS x64 ~28 min" timing, corrects the `lbug` pin to 0.20.4, and replaces the nonexistent `recovering_config()` citation with `strict_wal_verification()`, which is the function that actually governs WAL checksum behaviour.
+  - **The `guard_rule` shape was wrong.** There is no `metadata.guard_rule` sub-object with `action_pattern` / `verdict` / `reason`. `neurostrata_guard_learn` takes a rule carrying exactly `id`, `version`, `rule_class`, `trigger_pattern`, `constraint_text`, `hit_count` and `status`; `trigger_pattern` is matched as a **case-insensitive substring** of the action type or payload, not as a regular expression, and there is no built-in list of banned binaries or destructive flags. `docs/organs/prefrontal-cortex.md` now shows the real call shape and states that `metadata.source`, `metadata.enforcement` and `metadata.guard` belong to the separate task-gate honesty audit.
+  - **The Podman sandbox section did not say how the sandbox is invoked.** `docs/organs/prefrontal-cortex.md` now carries the exact command (`podman run --rm --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp -w=/workspace alpine:3.21 sh -c <payload>`), the 5-second timeout, and the rule that the sandbox only runs for the `bash` and `script` action types — any other action type returns `ApprovedFailOpen` *after* the deterministic and semantic checks pass.
+  - **The store's typed relations were listed as including `CALLS` and `IMPORTS`.** The five typed relation tables are `RELATES_TO`, `CONTAINS`, `GOVERNS`, `EXTRACTED_FROM` and `DEPENDS_ON`; the Tree-sitter indexer records `calls`, `callees`, `imports` and `importers` as **metadata arrays** on the symbol and file nodes, which `neurostrata_memories_for_file` surfaces as the `ast_summary` fields of the same name. `docs/architecture/synapticgraph.md` was corrected, along with the store path and the `as_of` time-travel behaviour of `neurostrata_related`.
+  - **`petgraph` was credited with computing the OWL/RDFS closure.** It is a direct dependency, but it backs the in-memory graph type `leiden-rs` operates on for community detection; the closure is computed in-house by `src/rdf/ontology.rs` and `src/rdf/reasoning.rs`. `docs/architecture/domains/core_installer.md` was corrected.
+  - **The Self-Reinforced Testing Framework page described LanceDB, a `bd`/Beads tracker and a `neurostrata_generate_canvas` tool.** The store is LadybugDB, `bd` is deprecated in favour of the NeuroStrata task tools, and there is no canvas generator — `neurostrata-mcp export-graph <out.json>` is what ships. `docs/architecture/self_reinforced_testing_framework.md` was corrected.
+  - Affected files: `README.md`, `docs/README.md`, `docs/FEATURES.md`, `docs/COGNITIVE_ARCHITECTURE.md`, `docs/UI_GUIDE.md`, `docs/BUILDING.md`, `docs/ops/cli-reference.md`, `docs/ops/crashes.md`, `docs/ops/security.md`, `docs/ops/obsidian.md`, `docs/organs/central-executive.md`, `docs/organs/dendritic-bridge.md`, `docs/organs/prefrontal-cortex.md`, `docs/architecture/synapticgraph.md`, `docs/architecture/tri-strata.md`, `docs/architecture/self_reinforced_testing_framework.md`, `docs/architecture/domains/core_installer.md`, `docs/mesh/synaptic-mesh.md`, `docs/science/nomenclature.md`, `docs/science/why-memory-fails.md`, `.agents/skills/neurostrata/SKILL.md` and `.agents/agents/NeuroStrata-Task.md`.
+
+### Changed
+
+- **`tokenizers` and `openssl` build configuration.** `tokenizers` now builds with `default-features = false, features = ["onig"]`, and `openssl` is vendored for every target rather than only for non-Apple targets (the Apple system-path resolution is unchanged).
+- **The OpenCode bundle and the new shared core bundle are tracked in git.** `plugins/opencode/dist/` was removed from `.gitignore` and `plugins/core/dist/` is committed, so a fresh clone builds and runs without an npm build step. The tracked plugin bundles went from 20 files (5 plugins) to 28 (7 plugins).
+- **`web-ui/public/graph.json` is no longer tracked.** The generated graph export was removed from the repository and gitignored.
+- **Root scratch scripts were removed.** `scripts/push_and_pr.sh`, `scripts/run_mock_agent.sh`, `scripts/sync_github_issues.sh` and `scripts/wave48_remediation.py` are gone.
+
+### Verification
+
+- 1,496 Rust tests pass, 0 failures (`cargo test --locked -- --test-threads=1`); the build is warning-free and `neurostrata-mcp --version` reports `1.16.0`.
+- 136 plugin tests pass, 0 failures: `plugins/core` 73, `plugins/opencode` 13, `plugins/claude` 11, `plugins/codex` 11, `plugins/github-cli` 11, `plugins/hermes` 11, `plugins/openclaw` 6.
+
+---
+
+---
+
+## [1.15.0] - 2026-11-03
+
+### Added
+
+- **Zero-Touch Harness Detection & Plugin Auto-Install** (`src/task/harness_plugins.rs`) — on init (`neurostrata_bootstrap`, `neurostrata_task_setup`, `neurostrata_get_snapshot`), `neurostrata-mcp` detects the active CLI harness (`opencode`, `openclaw`, `claude`, `hermes`, `codex`, `github-cli`) from environment and project markers, extracts the embedded zero-dependency plugin bundle into `.NeuroStrata/plugins/<harness>/`, and wires harness config with zero user involvement. (Wave 60)
+- **Six zero-dependency CLI/terminal harness plugins** under `plugins/` — OpenCode, Claude Code CLI, Hermes Agent CLI, OpenAI Codex CLI, GitHub Copilot CLI (`gh`), and OpenClaw — each shipping a compiled bundle plus unit tests (61/61 passing) enforcing pre-flight snapshot, Zero-Action Start, Graph-First lookup nudges, Breath checkpoints, turn-end deferred-work detection, and automatic subagent prompt context injection. (Wave 59)
+- **Automatic Graph-First Exploration & Subagent Context Propagation** (`src/task/mod.rs`, `src/server.rs`) — `neurostrata_task_create` and `neurostrata_task_claim` compute hybrid vector + 1-hop graph context (`auto_retrieved_context`) and return a ready-to-paste `subagent_prompt_injection` block; all eight graph/memory lookup tools record per-task and per-session telemetry (`graph_queries_count` and `.NeuroStrata/session_queries.json`). (Wave 58)
+- **Seamless Upgrade & Lifecycle Delta Engine** (`src/task/wiring.rs`, `src/store/ladybug.rs`) — `neurostrata_get_snapshot` infers `project_root` when omitted, auto-heals both `pre-commit` and `pre-push` git hooks, backfills schema defaults on startup, and reports `LIFECYCLE & HOOK DELTA` when a binary upgrade introduces new wires or triggers. (Wave 57)
+- **Daemon Caller-Path Authority** (`src/daemon.rs`, PR #36 / `neurostrata-p1ex`) — `check_caller_path`, `resolve_caller_path`, `load_allowed_external_dirs`, and `caller_path_refusal` applied across `/ingest`, `/backup`, `/export-graph`, and `/tasks/import`, canonicalizing each caller-supplied path and verifying it against `startup_root` or `allowed_external_dirs` before use.
+- **W3C RDF/SPARQL 1.1 / OWL 2 RL / SHACL validation via OxiRS** — full RDF-star/SPARQL support, SPARQL custom functions, SHACL `.ttl` shape loading into `OntologyIndex`, and OWL/RDFS reasoning with `closure_subclasses`/`closure_governs`. (Waves 42, 43, 45)
+- **Local Laya duplicate judgment + centroid-margin training** — `LayaOnnxProvider::judge_duplicates` and `health_check` functional, ONNX bundle/spawn_blocking/offline purge/systemone, Laya ONNX logits/trainer pairs wired. (Waves 3, 53)
+- **GraphRAG hybrid search** — `SearchMode` enum, hybrid scorer, symbol matching, community detection MCP, and opt-in integration in `search_inner` (`src/store/ladybug.rs`). (Waves 2, 3)
+- **In-house full-text lexical upgrade** — a 5-field BM25 scorer over `Content` / `Symbol` / `Location` / `Namespace` / `MemoryType`, with domain-ontology expansion, `valid_to` parsing and retirement visibility (`src/fts/mod.rs`), plus `tantivy` 0.27 integrated as a dependency (`Cargo.toml`). **Rank fusion (RRF) still does not exist.**
+- **Digital twin, KGE, GLiNER, stream, multimodal, RAG chat, time-series, anomaly, and community modules** — shipped end-to-end across Waves 2–5, 11–12, 14–16, 22–28, including `KGE cli_train` graph extraction, pure-Rust `Trainer`, `LearningRuntimeManager`, GLiNER engine, and duplicate-candidates MCP.
+- **SynapticMesh mesh sharing** (slices 1–7) — `synaptic-mesh/v1` manifest and record files, daemon-owned git checkout per mesh, `mesh init/join/leave/status/pull/push/recover`, WAL-first outbox, import/replay with named conflict variants, trust gates; slice-8 acceptance evidence (four cross-node scenarios over real git) verified. (Waves 36–40)
+- **NeuroStrata-Task.md embedding** and benefit-driven README restructure (Wave 65) — README leads with "The World's Most Advanced Agentic Memory, Task, and Workflow System" and effortless-automation flow; `NeuroStrata-Task.md` and `SKILL.md` embedded into plugin bundles on init. (Waves 64–65)
+- **Wave 52–55 spec parity** — ONNX bundle/spawn_blocking/offline purge/systemone, temporal rerank/SPARQL federation/KGE MCP, edge `evidence_id` & AST call graph, SPARQL Graph result serialization, `base_iri` forwarding, fallback hardening.
+
+### Changed
+
+- **Full 60-Wave Codebase Audit & Zero-Flags Architecture** — all 51 root modules in `src/` audited; zero Cargo feature flags, zero runtime capability-toggle booleans, zero `#[allow(dead_code)]`/`#[allow(unused_imports)]`, zero production `.unwrap()`/`.expect()` calls. (Wave 27 purge, Waves 28–60)
+- **The Tantivy FTS/RRF claim was retracted by erratum, and the erratum is itself superseded here.** The erratum in the 2026-10-20 section below was accurate as of that date: `tantivy` was not a dependency, and there was no BM25 scorer and no rank fusion. This release integrates `tantivy` 0.27 and ships an in-house 5-field BM25 (`src/fts/mod.rs`); **RRF rank fusion still does not exist.** The 1.0.0 section line is left exactly as it was written — the erratum supersedes it rather than rewriting history.
+- **ERRATUM — two claims in this 1.15.0 section never matched the code.** The lines above are left exactly as they were written; these errata supersede them.
+  - **"W3C RDF/SPARQL 1.1 / OWL 2 RL / SHACL validation via OxiRS".** The `oxirs-*` crate family was **never** a dependency of this project — `Cargo.toml` never listed it and no commit added it. The semantic-web stack that actually ships is `oxrdf`, `oxttl`, `spargebra`, `sparopt`, `spareval`, `sparesults`, `shacl` and `petgraph`. The rest of that line is accurate: RDF-star support, SPARQL custom functions (`src/rdf/sparql.rs`), SHACL `.ttl` shape loading into `OntologyIndex`, and closure inference via `closure_subclasses` (`src/rdf/ontology.rs`) and `closure_governs` (`src/graph_read/related.rs`). "OWL 2 RL" overstates the profile — what is implemented is transitive `subPropertyOf` and subclass closure plus a bounded `GOVERNS` closure, not the full OWL 2 RL rule set. There is no `neurostrata_owl_reason` MCP tool; the closure is computed inside the store.
+  - **"Local Laya duplicate judgment + centroid-margin training".** There is no centroid-margin code in this codebase — `grep -ri centroid src/` returns nothing, so the "centroid-margin weights" claim describes work that was never written. The rest of the line is accurate: `LayaOnnxProvider::judge_duplicates` and `health_check` are implemented in `src/judgment/laya_onnx.rs`, and the local training loop that does exist is the pure-Rust `Trainer` in `src/learning/trainer.rs`, driven by `neurostrata-mcp learn train`.
+- **Beam stubs replaced** — Wave 14–18 Beam artifacts remediated with real AC2/AC4/AC5/receipt logic; KGE cwd test race fixed.
+
+### Fixed
+
+- **SPARQL Graph result serialization, `base_iri` forwarding, and fallback hardening** across RDF/judgment/GraphQL/RAG chat/ingest. (Wave 52)
+- **Remove last three unguarded `.unwrap()` calls** in CLI/server/daemon; check `/shutdown` HTTP status; log daemon errors. (Wave 50)
+- **Forward CLI mutations to daemon**, checkpoint on drop/exit, fix qualified-target hygiene, recover poisoned locks. (Wave 49)
+- **Remove read-only hygiene mutation cheat**, log Cypher/JSON errors in `ladybug.rs`, clean up opencode/openclaw plugins, sync pre-push sha256 marker. (Wave 47)
+
+### Security
+
+- **Caller-path authority** blocks path traversal and symlink escapes on daemon mutation endpoints. (PR #36)
+
+---
+
+## [1.14.3-patch] - 2026-10-26
+
+### Added
+
+- **Retention/retrieval/gate Layer 2 + Lock 2 enforcement (task-3 through task-14)** — `TaskService::plan` verified to compile with `graph_read` budget wiring (rank_dedup_budget 512/1500/1500 defaults, 19 context_service_test tests pass); `ThalamicBus` post-ingest `normalize` subscriber and `task_complete_precheck` enforcing AC4 (zero dirty targets required before Done); `LadybugStore::upsert` canonicalizes edge targets at write time via `KnownIds::resolve`; unmatched-target classification (`Materialized`/`Declared`/`Orphaned`) with orphan warnings non-blocking (AC4: zero resolvable targets = pass); receipt binding to `HEAD_sha` + `dirty_tree_hash` with `is_current` hash-delta check that invalidates receipts on edits; AC5 baseline benchmark for p95 latency on `ContextService::plan` + `LadybugStore::upsert`; OpenCode plugin shim blocking mutating tools in `Unpreflighted` state via `guard_validate` (AC2); `guard_validate(session_id, active_task_id, worktree, action_type, is_mutating)` state check permitting reads at all states and blocking mutates when `active_task_id` is none; macOS launchd + Windows NSSM install in `setup.rs`.
+
+### Changed
+
+- **Retention/retrieval/gate enforcement verified end-to-end** (AC5 verified) across tasks 3–14; `cargo check` passes on all Layer 2 writes.
+
+---
+
+## [1.14.3] - 2026-10-26
+
+### Changed
+
+- **README setup sequence** — explicit setup init sequence added to `README.md` (`docs: add explicit setup init sequence to README`).
+
+---
+
+## [1.14.2] - 2026-10-26
+
+### Added
+
+- **Graph-read capability + `memories_for_file` tool** — `query RELATES_TO` edges (both orientations) with new `GraphMatchKind::Related`; honour `source`/`project_root` in `memories_for_file` and its handler; retire replaced stubs on ingest; unindexed ancestor dir stubs marked `directory`; apply `exclude_ids` before `limit`; replace full-namespace `list()` scan with targeted Cypher (`discover_candidates`); tests for related edge, stub retirement, parent-dir rules, unsupported backend; `task-3-report.md` relocated to gitignored `.superpowers/sdd/`.
+- **Source-scoped staged ingestion** — physical ids become `namespace::generation::path` so two worktrees of one repository never confluate on a single primary key; ingestion stages into a fresh generation and atomically flips the active pointer on publish; symbol identity moves to body hash (`span_sha256`); per-node `relative_path` and `file_sha256` stamped on file/markdown/symbol nodes; superseded generations filtered from `list`/`relink_edges`/`export_graph` against the active `(namespace, generation)` set; `run_consumer` propagates upsert/embed errors instead of logging and returning `Ok`. (832 tests passed, 0 failed.)
+- **Phase 0 adapter/auth contracts and context DTOs** — `ContextRequest`, `ContextPlan`, `ContextItem`, `SourceIdentity`, `EgressPolicy`, `Freshness`, `Coverage`, `Degradation` in `src/context/model.rs`; freshness dimensions and degradation state as typed enums; OpenCode/OpenClaw adapter repair with real `tools/call` dispatch, bearer token from `~/.config/neurostrata/daemon.token`, daemon `:34343` endpoint.
+- **Privacy/egress helpers, durable receipts module, embedding-space identity descriptor, vocabulary v8 typed decision envelope, 4-dimension freshness computation, shared context read-planning service, bounded related traversal tool, upgraded search filters.**
+
+### Fixed
+
+- **Resolve 7 review findings on graph-read capability** — edge orientation, source scoping, stub retirement, exclusion-before-limit, targeted Cypher, and test coverage.
+- **Resolve 7 review findings on source-scoped staged ingestion** — generation pointer rows, error propagation, mid-stage abort test, hash capture, superseded filtering, integration test exercising id/generation helpers.
+- **`cas_version` LONG → INT64** in `IntakeCandidate`.
+
+---
+
+## [1.14.1] - 2026-10-26
+
+### Added
+
+- **Hook/doctor auto-discovery (Approach C)** — spec and plan for hook/doctor auto-discovery; `neurostrata_get_snapshot` accepts optional `project_root` arg and caches it; hook hygiene + throttled in-memory doctor pass; fallback hook-hash check when daemon down; back up overwritten hook to `.bak`; add hash marker to scaffolded pre-push hook.
+- **`normalize-metadata` CLI command** — in-place metadata target normalization.
+
+### Fixed
+
+- **Don't leak absolute-path parent id for root node** — trim trailing slash in `KnownIds::resolve`.
+- **Update-only `project_root` cache** on append path; drop temp smoke test.
+
+---
+
+## [1.14.0] - 2026-10-26
+
+### Added
+
+- **Laya ONNX functional** — `LayaOnnxProvider::judge_duplicates Ok`, `health_check Ok(true)` in `src/judgment/laya_onnx.rs`; `AcceptableEmbedder.model_sha256` + `verify_model_checksum` in `src/embed.rs`.
+- **Pinned model downloads** — `ModelDownloader` with pinned SHA-256, supply-chain protected (`src/model_downloader.rs`); `artifacts/laya-bundle/registry.json`.
+- **Pre-commit graph hook** — `PRE_COMMIT_HOOK` + `HooksCommands::InstallPreCommit` in `src/main.rs`; `src/task/mod.rs` wiring; `src/server.rs` and `src/config.rs` changes.
+- **Decision 2.0 rejected** — Kai-0.6B Index 16.3 < JEV-1.0.
+
+### Changed
+
+- **§0 Prime Directive active with a 783-test green suite.**
+
+---
+
+## [1.13.1] - 2026-10-25
+
+### Added
+
+- **Task coverage enforcement via intent detection + pre-push gate** — `task_complete` rejects untracked work items (intent markers without explicit `follow_up_tasks` or task ID citation via `detect_task_intents`); `scripts/task-coverage-gate.sh` wired into `SCAFFOLDED_PRE_PUSH_HOOK` `PROJECT_GATES` so changed docs lacking task IDs block the push. Gate audit matrix 5/5 scenarios passed; 65/65 task tests green.
+
+### Fixed
+
+- **`PROJECT_GATES` skip missing guards** — loop skips missing guard files with warning instead of failing, fixing test fixtures without `task-coverage-gate.sh`; `scripts/install-hooks.sh` and `scripts/hooks/pre-push` created from embedded `SCAFFOLDED_INSTALL_HOOKS` template.
+
+---
+
 ## [1.13.0] - 2026-10-25
 
 ### Added

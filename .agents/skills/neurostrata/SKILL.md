@@ -2,10 +2,10 @@
 name: neurostrata
 description: "Manage the 3-Tier Memory Architecture (Global, Domain, Task), Central Executive Task Machine, Automatic Graph-First Exploration, and Subagent Context Propagation. Replaces legacy MEMORY.md and bd remember."
 ---
-# NeuroStrata (v1.15.0 — Tri-Strata Memory, Central Executive & Graph-First Architecture)
+# NeuroStrata (v1.16.0 — Tri-Strata Memory, Central Executive & Graph-First Architecture)
 
 ## Overview
-NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust binary housing an embedded vector, property graph, full-text, neural reranking, and W3C RDF/SPARQL 1.1/OWL 2 RL/SHACL engine (LadybugDB + Tantivy + FlashRank ONNX + OxiRS + Laya). It completely replaces `MEMORY.md`, local markdown TODO lists, `TodoWrite`, and deprecated `bd` commands with binary-enforced task and memory gates.
+NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust binary housing an embedded vector, property graph, full-text, and W3C RDF/SPARQL 1.1/SHACL engine (LadybugDB + Tantivy + `oxrdf`/`oxttl` + `spargebra`/`spareval` + `shacl` + Laya). It completely replaces `MEMORY.md`, local markdown TODO lists, `TodoWrite`, and deprecated `bd` commands with binary-enforced task and memory gates.
 
 ---
 
@@ -43,12 +43,10 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
 ## 3. Automatic Graph-First Exploration & Subagent Context Propagation
 - **Auto-Retrieved Task Context:** `neurostrata_task_create` and `neurostrata_task_claim` automatically execute a hybrid vector + 1-hop graph search on the task's title/description and return `auto_retrieved_context` plus a ready-to-paste `subagent_prompt_injection` markdown block.
 - **Graph-First Lookup Reflex:** Before using blind `grep`/`glob` or editing a file, inspect governing rules (`GOVERNS`) and AST call/import edges (`DEPENDS_ON`, `calls`, `imports`) using:
-  - `neurostrata_memories_for_file` (`namespace`, `path`, optional `symbol`) — deterministic, zero-embedding file governance lookup.
+  - `neurostrata_memories_for_file` (`namespace`, `path`, optional `symbol`, optional `include_ast_edges`) — deterministic, zero-embedding file governance lookup; with `include_ast_edges` (default `true`) it also returns `related_memories` and an `ast_summary` (`symbols`, `callers`, `callees`, `imports`, `importers`, `blast_radius_count`) — this is the call-chain and blast-radius lookup.
   - `neurostrata_related` (`namespace`, `id`, `depth`) — 1–2 hop graph neighborhood.
-  - `neurostrata_trace_call_chain` (`namespace`, `symbol`, `direction`: `"upstream" | "downstream" | "both"`).
-  - `neurostrata_impact_analysis` (`namespace`, `target`, `max_depth`) — transitive blast radius + governing rules.
-  - `neurostrata_search_memory` (`include_related: true`) — 4-stage hybrid retrieval (Tantivy BM25 + HNSW Vector → RRF → PPR Graph Expansion → FlashRank ONNX Reranking → Bi-Temporal Salience).
-  - `neurostrata_sparql_query` (`namespace`, `query`) — W3C SPARQL 1.1 (`SELECT`, `ASK`, `CONSTRUCT`) over the OxiRS RDF quad store.
+  - `neurostrata_search_memory` (`mode`: `"vector"` (default) | `"lexical"` | `"lexical-inhouse"`, optional `include_related: true`) — three alternative retrieval surfaces (LadybugDB HNSW vector, Tantivy full-text, in-house BM25) plus a bounded graph expansion. They are **not** fused: there is no rank fusion, no Personalized PageRank and no neural reranker in the search path.
+  - `neurostrata_sparql_query` (`namespace`, `query`) — W3C SPARQL 1.1 (`SELECT`, `ASK`, `CONSTRUCT`) over the `oxrdf` RDF store.
   - Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
 - **Verifiable Graph-First predicate:** Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. On session init, write the Graph-First rule into your active plan, and whenever you spawn ANY subagent (`subagent`, `Task`, `delegate_task`, `spawn_agent`), paste the `subagent_prompt_injection` block from `neurostrata_task_claim` into the subagent's prompt (the 6 harness plugins also prepend it automatically).
@@ -57,8 +55,8 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
 
 ## 4. Tri-Strata Memory, Negative Exemplars & Non-Destructive Lifecycle
 - **Tri-Strata Isolation:**
-  1. `namespace="global"` — Machine-wide rules ONLY when explicitly requested by the user (`~/.config/neurostrata/global/`).
-  2. `namespace="<ProjectName>"` — Project domain rules, facts, procedures, and AST graph nodes. Register domain slugs via `neurostrata_domain_register` / `neurostrata_domain_list`.
+  1. `namespace="global"` — Machine-wide rules ONLY when explicitly requested by the user. There is no separate global directory: `global` is a namespace **column** in the same LadybugDB store (`Memory.namespace`), and the config file is `~/.config/neurostrata/config.json`.
+  2. `namespace="<ProjectName>"` — Project domain rules, facts, procedures, and AST graph nodes. Manage domain slugs via `neurostrata_domain_registry` (actions `list` / `set` / `remove`).
   3. Task Stratum — Task working memory stored on the task record via `neurostrata_task_update` (`note`) and linked via `EXTRACTED_FROM`.
 - **Pointer-Wiki Engrams & Anchors:** Pass `locations: [{path, lines, symbol}]` and `metadata.governs: ["<Namespace>::<rel_path>"]` on `neurostrata_add_memory` so rules attach directly to file and symbol nodes in the graph.
 - **Negative Exemplars (Failed Attempts):** Record dead-end approaches using `metadata.attempt: { approach, outcome: "failed", failure_mode }` so future sessions never repeat a failed experiment.
@@ -68,7 +66,7 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
 ---
 
 ## 5. Prefrontal Cortex Guard, Digital Twins, Telemetry & SynapticMesh
-- **Prefrontal Cortex (`neurostrata_guard_action`):** Evaluates proposed shell commands and file edits against `guard_rule` memories and dry-runs borderline commands in a rootless `podman --network=none --read-only` sandbox.
-- **Digital Twins & Telemetry:** Model and simulate state with `neurostrata_twin_create`, `neurostrata_twin_update_state`, `neurostrata_twin_get`, `neurostrata_twin_list`, `neurostrata_twin_diff`, `neurostrata_twin_rollback`, `neurostrata_twin_simulate`, and record time-series metrics with `neurostrata_metrics_record`, `neurostrata_metrics_query`, `neurostrata_metrics_list`.
-- **SynapticMesh (`neurostrata_mesh_*`):** Shares `eligibility: "shareable"` rules, facts, and procedure definitions (stripped of local runtime counters) over plain `git`. Private rows are sovereign; conflicts are preserved visibly (`neurostrata_mesh_status`, `neurostrata_mesh_conflicts`, `neurostrata_mesh_resolve`) and never force-pushed.
+- **Prefrontal Cortex (`neurostrata_guard_validate`):** Evaluates proposed shell commands and file edits against learned behavioral rules (`neurostrata_guard_learn`, `neurostrata_guard_list_rules`) and dry-runs borderline commands in a rootless Podman sandbox (`podman run --rm --network=none -v=<cwd>:/workspace:ro --tmpfs=/tmp`, 5 s timeout).
+- **Digital Twins & Telemetry:** Model state with `neurostrata_twin_set`, `neurostrata_twin_get`, `neurostrata_twin_list` and `neurostrata_twin_diff`, and read rolling time-series summaries with `neurostrata_metrics_query` and `neurostrata_metrics_list`.
+- **SynapticMesh (`neurostrata_synaptic_mesh_*`):** Shares `eligibility: "shareable"` rules, facts, and procedure definitions (stripped of local runtime counters) over plain `git`. Private rows are sovereign; conflicts are preserved visibly (`neurostrata_synaptic_mesh_status`) and never force-pushed. The CLI surface is `neurostrata-mcp synaptic-mesh` (alias `mesh`) with `init`, `join`, `leave`, `pull`, `push` and `status`.
 - **Daemon Caller-Path Authority (`J6`):** Every caller-supplied filesystem path on `/ingest`, `/backup`, `/export-graph`, and `/tasks/import` is canonicalized via `check_caller_path` and must reside inside `startup_root` or `allowed_external_dirs` in `~/.config/neurostrata/config.json`.

@@ -345,6 +345,27 @@ describe("inspectCodeModeExecution", () => {
 // Bug 4: handleHookEvent / handleClaudeHookEvent (PreToolUse)
 // ──────────────────────────────────────────────────────────────────────
 
+// Hermetic "no daemon" fixture. A live NeuroStrata daemon on the default
+// 127.0.0.1:34343 answers the memories_for_file / task_list lookups that the
+// no-daemon tests below must exercise with NO daemon reachable, so the MCP
+// client is pointed at a port nothing listens on. initialize() sets mcpClient,
+// which keeps handleHookEvent's auto-init branch (that would otherwise
+// recreate the client against DEFAULT_ENDPOINT) from running.
+const NO_DAEMON_ENDPOINT = "http://127.0.0.1:1/mcp";
+async function runWithoutDaemon(fn) {
+  resetClientForTesting();
+  await initialize({
+    config: { namespace: "no-daemon-ns", endpoint: NO_DAEMON_ENDPOINT, bearerToken: null, strictMode: false, requestTimeoutMs: 50 },
+    tool: { hook: async () => {} },
+    hooks: {},
+  });
+  try {
+    return await fn();
+  } finally {
+    resetModuleState();
+  }
+}
+
 describe("handleHookEvent / handleClaudeHookEvent alias", () => {
   it("handleClaudeHookEvent is the same function as handleHookEvent", () => {
     assert.equal(handleClaudeHookEvent, handleHookEvent);
@@ -352,10 +373,12 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
 
   it("PreToolUse subagent tool returns allow + enriches prompt (no daemon)", async () => {
     const target = { prompt: "Help me refactor this." };
-    const out = await handleHookEvent({
-      hook_event_name: "PreToolUse",
-      tool_name: "subagent",
-      tool_input: target,
+    const out = await runWithoutDaemon(async () => {
+      return await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "subagent",
+        tool_input: target,
+      });
     });
     assert.equal(out.continue, true);
     assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
@@ -384,11 +407,12 @@ describe("handleHookEvent / handleClaudeHookEvent alias", () => {
   });
 
   it("PreToolUse file-touch with no daemon still allows (fail-soft)", async () => {
-    resetClientForTesting();
-    const out = await handleHookEvent({
-      hook_event_name: "PreToolUse",
-      tool_name: "read",
-      tool_input: { file_path: "src/foo.ts" },
+    const out = await runWithoutDaemon(async () => {
+      return await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "read",
+        tool_input: { file_path: "src/foo.ts" },
+      });
     });
     assert.equal(out.continue, true);
     assert.equal(out.hookSpecificOutput.permissionDecision, "allow");

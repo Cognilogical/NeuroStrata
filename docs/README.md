@@ -9,9 +9,9 @@ Welcome to the official documentation for **NeuroStrata** — the single-binary 
 | Document | Description |
 | :--- | :--- |
 | [**Main README (`../README.md`)**](../README.md) | 60-second quickstart, zero-touch installation, and high-level system overview. |
-| [**Complete Feature & Benefit Catalog (`FEATURES.md`)**](FEATURES.md) | Exhaustive inventory of v1.15.0 features, MCP tools, and codebase module mappings. |
+| [**Complete Feature & Benefit Catalog (`FEATURES.md`)**](FEATURES.md) | Exhaustive inventory of v1.16.0 features, MCP tools, and codebase module mappings. |
 | [**Building from Source (`BUILDING.md`)**](BUILDING.md) | Toolchain prerequisites (Rust, CMake, C++20) and cross-platform build scripts (`scripts/build.sh`, `scripts/build.ps1`). |
-| [**Visual Interface & Obsidian Guide (`UI_GUIDE.md`)**](UI_GUIDE.md) | Using the 3D/2D SynapticGraph Web UI, Task Board, and Obsidian NeuroVault sync. |
+| [**Visual Interface & Obsidian Guide (`UI_GUIDE.md`)**](UI_GUIDE.md) | Using the 3D/2D SynapticGraph Web UI and the Task Board. (The Obsidian NeuroVault sync is planned, not implemented — see `ops/obsidian.md`.) |
 
 ---
 
@@ -20,7 +20,7 @@ Welcome to the official documentation for **NeuroStrata** — the single-binary 
 | Document | Description |
 | :--- | :--- |
 | [**Cognitive Architecture (`COGNITIVE_ARCHITECTURE.md`)**](COGNITIVE_ARCHITECTURE.md) | Formal specification of the 15 neuroscience-inspired mechanisms powering NeuroStrata. |
-| [**SynapticGraph Engine (`architecture/synapticgraph.md`)**](architecture/synapticgraph.md) | Embedded LadybugDB storage, bi-temporal validity (`valid_from`/`valid_to`), 11-language Tree-sitter AST graph, and OxiRS RDF/SPARQL/OWL/SHACL reasoning. |
+| [**SynapticGraph Engine (`architecture/synapticgraph.md`)**](architecture/synapticgraph.md) | Embedded LadybugDB storage, bi-temporal validity (`valid_from`/`valid_to`), six-language Tree-sitter AST graph, and W3C RDF/SPARQL/OWL/SHACL reasoning. |
 | [**Tri-Strata Isolation (`architecture/tri-strata.md`)**](architecture/tri-strata.md) | Global, Domain/Project, and Task memory partitioning plus multi-worktree source anchoring. |
 | [**Episodic Log Recall (`recall.md`)**](recall.md) | How `neurostrata_append_log` piggybacks tag-matched memory recall onto every conversational turn. |
 | [**Why Traditional AI Memory Fails (`science/why-memory-fails.md`)**](science/why-memory-fails.md) | Analysis of the 5 failure modes of flat Markdown and naive RAG—and how NeuroStrata eliminates them. |
@@ -33,8 +33,8 @@ Welcome to the official documentation for **NeuroStrata** — the single-binary 
 | Organ | Document | Role |
 | :--- | :--- | :--- |
 | **Central Executive** | [`organs/central-executive.md`](organs/central-executive.md) | 4-state Task FSM, Zero-Action Start, 60-minute claim leases, Lock 1 (`pre-push` gate), Lock 2 (`EXTRACTED_FROM` done-funnel), Lock 3 (Breath notes), and subagent context injection. |
-| **Prefrontal Cortex** | [`organs/prefrontal-cortex.md`](organs/prefrontal-cortex.md) | Semantic & pattern action interceptor (`neurostrata_validate_action`), `guard_rule` enforcement, and Podman sandboxing. |
-| **Dendritic Bridge** | [`organs/dendritic-bridge.md`](organs/dendritic-bridge.md) | Local FastEmbed ONNX (`BGESmallENV15`) + external embedders and the 4-stage hybrid search pipeline (Tantivy BM25 + HNSW + RRF + PPR + FlashRank). |
+| **Prefrontal Cortex** | [`organs/prefrontal-cortex.md`](organs/prefrontal-cortex.md) | Semantic & pattern action interceptor (`neurostrata_guard_validate`), learned behavioral-rule enforcement, and Podman sandboxing. |
+| **Dendritic Bridge** | [`organs/dendritic-bridge.md`](organs/dendritic-bridge.md) | Local FastEmbed ONNX (`NomicEmbedTextV15`, 768 dims) + external embedders, and three alternative retrieval surfaces (HNSW vector, Tantivy lexical, in-house BM25) with a bounded graph expansion. |
 | **Thalamic Bus** | [`organs/thalamic-bus.md`](organs/thalamic-bus.md) | Non-blocking in-process typed pub/sub event relay, post-ingest edge normalizer, and export-freshness gate. |
 | **Procedural Memory** | [`organs/procedural-memory.md`](organs/procedural-memory.md) | Triggered engineering habits (`memory_type: "procedure"`) with finite rehearsal budgets (`neurostrata_procedure_perform`). |
 
@@ -44,12 +44,12 @@ Welcome to the official documentation for **NeuroStrata** — the single-binary 
 
 | Document | Description |
 | :--- | :--- |
-| [**CLI Reference (`ops/cli-reference.md`)**](ops/cli-reference.md) | Complete guide to all `neurostrata-mcp` subcommands (`daemon`, `status`, `ingest`, `export-graph`, `task gate`, `synaptic-mesh`, `learning`, `gliner`, `backup`, `doctor`, etc.). |
+| [**CLI Reference (`ops/cli-reference.md`)**](ops/cli-reference.md) | Complete guide to all `neurostrata-mcp` subcommands (`daemon`, `status`, `namespaces`, `ingest`, `export-graph`, `task gate`, `synaptic-mesh`, `learn`, `kge`, `storage`, `metrics`, `backup`, `doctor`, etc.). |
 | [**Zero-Touch Upgrading (`ops/upgrading.md`)**](ops/upgrading.md) | Automatic in-place schema migration, git hook self-healing, and harness plugin refresh on startup. |
 | [**SynapticMesh Team Sync (`mesh/synaptic-mesh.md`)**](mesh/synaptic-mesh.md) | Brokerless Git team memory synchronization, private row sovereignty, and conflict preservation. |
-| [**Security & OWASP Mitigations (`ops/security.md`)**](ops/security.md) | Loopback bearer auth, Caller-Path Authority (`J6`), secret scrubbing, query escaping, and non-destructive MCP design. |
-| [**Obsidian & NeuroVault (`ops/obsidian.md`)**](ops/obsidian.md) | Bidirectional Markdown frontmatter sync (`neurostrata_sync_obsidian`) and JSON Canvas export. |
-| [**Crash Recovery (`ops/crashes.md`)**](ops/crashes.md) | Crash breadcrumbs (`~/.config/neurostrata/crash/`), lock recovery, and checkpointed backups. |
+| [**Security & OWASP Mitigations (`ops/security.md`)**](ops/security.md) | Loopback bearer auth, Caller-Path Authority (`J6`), fail-closed secret rejection, query escaping, and non-destructive MCP design. |
+| [**Obsidian & NeuroVault (`ops/obsidian.md`)**](ops/obsidian.md) | *Planned, not implemented.* No `neurostrata_sync_obsidian` tool or `obsidian-sync` command ships today — tracked by task `neurostrata-dlag`. |
+| [**Crash Recovery (`ops/crashes.md`)**](ops/crashes.md) | Crash breadcrumbs (`~/.config/NeuroStrata/data/db/crash/`), lock recovery, and checkpointed backups. |
 | [**WAL Recovery Runbook (`runbooks/wal-recovery.md`)**](runbooks/wal-recovery.md) | Step-by-step runbook for inspecting and recovering quarantined LadybugDB write-ahead logs. |
 | [**Release Changelogs (`releases/changelog/`)**](releases/changelog/) | Per-version release notes and historical changelog archive. |
 
