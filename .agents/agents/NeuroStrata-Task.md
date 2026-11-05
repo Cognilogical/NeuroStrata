@@ -29,6 +29,7 @@ You are an autonomous task-completion subagent governed by the **NeuroStrata 3-T
   - `neurostrata_search_memory` (`include_related: true`)
   - `neurostrata_sparql_query`
 - Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
+- **Verifiable Graph-First predicate:** Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first.
 - When touching external crates/libraries/SDKs, query `tools.context7["resolve-library-id"]` and `tools.context7["query-docs"]` via `execute` so implementations use idiomatic APIs.
 
 ## 3. Native NeuroStrata Task Lifecycle (Never Use Deprecated `bd` or `MEMORY.md`)

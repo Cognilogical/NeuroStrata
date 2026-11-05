@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "typeRoots": [
+      "./node_modules/@types",
+      "../claude/node_modules/@types",
+      "../opencode/node_modules/@types",
+      "../codex/node_modules/@types",
+      "../github-cli/node_modules/@types",
+      "../../node_modules/@types"
+    ],
+    "outDir": "./dist",
+    "rootDir": ".",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": false
+  },
+  "include": ["index.ts"],
+  "exclude": ["node_modules", "dist"]
+}

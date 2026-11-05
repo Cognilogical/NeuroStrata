@@ -446,7 +446,7 @@ pub async fn build_task_graph_context(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
          - Auto-Retrieved Governing Rules & Graph Nodes:\n{}\n\
-         - Mandatory Graph-First Lookup Rule: Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` (or `neurostrata-mcp` CLI) to inspect governing rules (`GOVERNS`) and AST call/import edges (`DEPENDS_ON`, `calls`, `imports`).",
+         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).",
         namespace, task_id, payload.content, hits_block
     );
     (Value::Array(hits_json), subagent_prompt)
@@ -502,6 +502,42 @@ pub async fn record_graph_query(
             }
         }
     }
+    if project_root.is_none() {
+        // Start from `resolve_project_root()` (which honors `NEUROSTRATA_PROJECT_ROOT`
+        // before falling back to `std::env::current_dir()`) and walk up through
+        // parent directories looking for `.git` or `.NeuroStrata`.
+        let start = crate::daemon::resolve_project_root();
+        if !start.as_os_str().is_empty() {
+            let mut cur = start;
+            loop {
+                if cur.join(".git").exists() || cur.join(".NeuroStrata").exists() {
+                    project_root = Some(cur.to_string_lossy().to_string());
+                    break;
+                }
+                match cur.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => cur = parent.to_path_buf(),
+                    _ => break,
+                }
+            }
+        }
+    }
+    let governed_prefix = if query_hint.ends_with('/')
+        || (project_root.is_some()
+            && std::path::Path::new(project_root.as_ref().unwrap()).join(query_hint).is_dir())
+    {
+        // Explicit directory coverage: preserve trailing slash without
+        // widening to the top-level directory.
+        format!("{}/", query_hint.trim_end_matches('/'))
+    } else if tool_name == "neurostrata_memories_for_file"
+        || query_hint.contains('/')
+        || query_hint.contains('.')
+    {
+        // Exact file coverage: preserve the queried path verbatim.
+        query_hint.to_string()
+    } else {
+        // Bare module/domain keyword: widen to directory coverage.
+        format!("{}/", query_hint)
+    };
     if let Some(root) = project_root {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
         if let Some(parent) = ledger_path.parent() {
@@ -516,6 +552,7 @@ pub async fn record_graph_query(
                 "ts": now,
                 "tool": tool_name,
                 "query": query_hint,
+                "governed_prefixes": [governed_prefix],
             }));
             if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
                 let _ = std::fs::write(&ledger_path, serialized);
@@ -650,11 +687,26 @@ pub async fn handle_task_create(
     )
     .await
     {
-        Ok((id, payload)) => {
+        Ok((id, mut payload)) => {
             let vector = emb.embed(&payload.content).await.unwrap_or_default();
             let (hits_json, subagent_prompt) = build_task_graph_context(
                 &store, &namespace, &id, &vector, &payload,
             ).await;
+            // Re-read the freshest row under the task claim lock so a
+            // concurrent create/update cannot be overwritten mid-context-build.
+            let claim_mutex = claim_lock(&id);
+            let _claim_guard = claim_mutex.lock().await;
+            if let Ok((mut latest_task, latest_vec)) = load_task(&store, &namespace, &id).await {
+                {
+                    let obj = task_obj_mut(&mut latest_task.payload);
+                    obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+                }
+                let _ = save_task(&store, &namespace, &id, latest_vec, latest_task.payload).await;
+            }
+            {
+                let obj = task_obj_mut(&mut payload);
+                obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+            }
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
@@ -839,7 +891,18 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     // and the upsert. (The R7 best-effort re-read this replaces could only
     // ever fire for an out-of-process claim writer, and none exists — every
     // claim enters through this handler in the daemon process.)
+    //
+    // Build the graph context and stamp the prompt injection onto the row
+    // BEFORE the single save, while _claim_guard is still held, so a
+    // concurrent claim cannot observe a row without the injection.
 
+    let (hits_json, subagent_prompt) = build_task_graph_context(
+        &store, &namespace, &id, &vector, &task.payload,
+    ).await;
+    {
+        let obj = task_obj_mut(&mut task.payload);
+        obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+    }
     if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
         return e;
     }
@@ -858,9 +921,6 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    let (hits_json, subagent_prompt) = build_task_graph_context(
-        &store, &namespace, &id, &vector, &task.payload,
-    ).await;
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -1060,9 +1120,24 @@ pub async fn handle_task_update(
         }
     }
 
+    let refreshed_prompt = if rename_note.is_some() && task.status() == Status::InProgress {
+        let (_hits, prompt) =
+            build_task_graph_context(&store, &namespace, &id, &vector, &task.payload).await;
+        Some(prompt)
+    } else {
+        None
+    };
+
     // Field updates ride on whatever the transition produced.
     {
         let obj = task_obj_mut(&mut task.payload);
+        if rename_note.is_some() {
+            if let Some(prompt) = refreshed_prompt {
+                obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+            } else {
+                obj.remove("subagent_prompt_injection");
+            }
+        }
         if let Some(p) = priority {
             obj.insert("priority".to_string(), json!(p));
         }
@@ -1211,7 +1286,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let summaries: Vec<Value> = tasks
+    let mut summaries: Vec<Value> = tasks
         .iter()
         .map(|m| {
             let retired = gate::is_retired(&m.payload.metadata, now);
@@ -1229,6 +1304,45 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             summary
         })
         .collect();
+
+    // Enhancement 1: stateless plugins (cli-hook.mjs, resumed sessions) resolve
+    // the active task's id + subagent_prompt_injection in one task_list call.
+    // For InProgress tasks: if cached subagent_prompt_injection starts with the
+    // standard header "### NeuroStrata Task & Graph Context", ALWAYS recompute
+    // via build_task_graph_context (so archived rules / new rules are reflected).
+    // If cached does NOT start with that header (synthetic test fixture), keep it.
+    for (i, m) in tasks.iter().enumerate() {
+        if gate::task_status(m) == Status::InProgress {
+            let expected_goal = format!("| Goal: {}\n", m.payload.content);
+            let cached = m
+                .payload
+                .metadata
+                .get("task")
+                .and_then(|t| t.get("subagent_prompt_injection"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty() && s.contains(&expected_goal));
+            let should_recompute = cached
+                .map(|s| s.starts_with("### NeuroStrata Task & Graph Context"))
+                .unwrap_or(true);
+            if let Some(cached_str) = cached {
+                if !should_recompute {
+                    if let Some(obj) = summaries[i].as_object_mut() {
+                        obj.insert("subagent_prompt_injection".to_string(), json!(cached_str));
+                    }
+                    continue;
+                }
+            }
+            let vector = load_task(&store, &namespace, &m.id)
+                .await
+                .map(|(_task, vec)| vec)
+                .unwrap_or_default();
+            let (_hits, prompt) =
+                build_task_graph_context(&store, &namespace, &m.id, &vector, &m.payload).await;
+            if let Some(obj) = summaries[i].as_object_mut() {
+                obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+            }
+        }
+    }
 
     encode(&json!({
         "namespace": namespace,
@@ -2257,45 +2371,373 @@ pub(crate) fn is_current_hook(content: &str) -> bool {
 pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
 #
-# Records the modules touched by this commit into `.NeuroStrata/session_queries.json`
+# Records the files/prefixes touched by this commit into `.NeuroStrata/session_queries.json`
 # and stamps `graph_queried` on the active in_progress task for the namespace.
-# If the commit touches files in a governed module (per memory `governs`/`refs`)
-# and the agent did NOT query NeuroStrata for that module, the hook emits a
-# warning (non-blocking) so the agent can verify against source before push.
+# Works across any repository layout (src/, pkg/, cmd/, apps/, packages/, scripts/, root files).
 #
 # Install with:  neurostrata-mcp hooks install
-# (git honors core.hooksPath; the hook text is one file, no drift.)
 
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-ROOT=$(git rev-parse --show-toplevel)
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
-
-# ── Collect touched src/ modules from staged diff ────────────────────────────
-TouchedModules=$(git diff --name-only --cached | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
-if [ -z "$TouchedModules" ]; then
-    TouchedModules=$(git diff --name-only | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
+NAMESPACE=""
+if [ -f "$LEDGER" ]; then
+    NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+fi
+if [ -z "$NAMESPACE" ]; then
+    NAMESPACE=$(basename "$ROOT")
 fi
 
-# ── Check each touched module against governing memories ─────────────────────
-for module in $TouchedModules; do
-    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
-        echo "warning: module '$module' has no recorded NeuroStrata graph/memory lookup in this session" >&2
-        echo "  → call: neurostrata_memories_for_file or neurostrata_search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+# ── Collect staged file paths (excluding .NeuroStrata/ internal files) ───────
+StagedFiles=()
+while IFS= read -r -d '' file; do
+    case "$file" in
+        .NeuroStrata/*|"") ;;
+        *) StagedFiles+=("$file") ;;
+    esac
+done < <(git diff --name-only -z --cached 2>/dev/null)
+if [ "${#StagedFiles[@]}" -eq 0 ]; then
+    while IFS= read -r -d '' file; do
+        case "$file" in
+            .NeuroStrata/*|"") ;;
+            *) StagedFiles+=("$file") ;;
+        esac
+    done < <(git diff --name-only -z 2>/dev/null)
+fi
+
+# ── Path normalization for ledger matching ─────────────────────────────────
+# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`), but the
+# ledger may have recorded `"$ROOT/$file"` (absolute), `"./$file"` (dot-slash),
+# or the bare `"$file"`. Match all three spellings.
+normalize_rel_path() {
+    local p="$1"
+    p="${p#"$ROOT"/}"
+    while [ "${p#./}" != "$p" ]; do
+        p="${p#./}"
+    done
+    p="${p%/}"
+    printf '%s' "$p"
+}
+
+# Dump decoded, normalized ledger paths (one per line) using node or python3.
+# Empty if ledger missing or neither runtime is available.
+dump_ledger_paths() {
+    if [ ! -f "$LEDGER" ]; then
+        return 0
+    fi
+    export LEDGER ROOT
+    if command -v node >/dev/null 2>&1; then
+        node -e '
+          const fs = require("fs");
+          const ledger = process.env.LEDGER;
+          const root = process.env.ROOT || "";
+          let parsed;
+          try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
+          const queries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.queries) ? parsed.queries : []);
+          const out = new Set();
+          const norm = (p) => {
+            if (typeof p !== "string" || !p) return;
+            if (root && (p === root || p.startsWith(root + "/"))) p = p.slice(root.length).replace(/^\//, "");
+            while (p.startsWith("./")) p = p.slice(2);
+            if (p.endsWith("/")) p = p.slice(0, -1);
+            if (p) out.add(p);
+          };
+          for (const q of queries) {
+            if (!q || typeof q !== "object") continue;
+            norm(q.query);
+            for (const k of ["domains", "governed_prefixes"]) {
+              if (Array.isArray(q[k])) q[k].forEach(norm);
+            }
+          }
+          for (const p of out) process.stdout.write(p + "\n");
+        ' 2>/dev/null || true
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, os, sys
+ledger = os.environ["LEDGER"]
+root = os.environ.get("ROOT") or ""
+try:
+    with open(ledger) as f:
+        parsed = json.load(f)
+except Exception:
+    sys.exit(0)
+queries = parsed if isinstance(parsed, list) else (parsed.get("queries") if isinstance(parsed, dict) else [])
+if not isinstance(queries, list):
+    queries = []
+out = set()
+def norm(p):
+    if not isinstance(p, str) or not p:
+        return
+    if root and (p == root or p.startswith(root + "/")):
+        p = p[len(root):].lstrip("/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.rstrip("/")
+    if p:
+        out.add(p)
+for q in queries:
+    if not isinstance(q, dict):
+        continue
+    norm(q.get("query"))
+    for k in ("domains", "governed_prefixes"):
+        v = q.get(k)
+        if isinstance(v, list):
+            for item in v:
+                norm(item)
+for p in out:
+    sys.stdout.write(p + "\n")
+' 2>/dev/null || true
+    fi
+}
+
+LEDGER_PATHS=$(dump_ledger_paths)
+
+ledger_has_file() {
+    local rel="$1"
+    if [ -n "$LEDGER_PATHS" ]; then
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel"
+        return $?
+    fi
+    [ -f "$LEDGER" ] || return 1
+    grep -qF "\"$rel\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"./$rel\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$ROOT/$rel\"" "$LEDGER" 2>/dev/null
+}
+
+ledger_has_dir() {
+    local rel_dir="${1%/}"
+    if [ -n "$LEDGER_PATHS" ]; then
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel_dir"
+        return $?
+    fi
+    [ -f "$LEDGER" ] || return 1
+    grep -qF "\"$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"./$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$ROOT/$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$rel_dir\"" "$LEDGER" 2>/dev/null
+}
+
+# ── Check each staged file / ancestor dir-prefix against session_queries.json ──
+for raw_file in "${StagedFiles[@]}"; do
+    file=$(normalize_rel_path "$raw_file")
+    [ -z "$file" ] && continue
+    matched=0
+    if [ -f "$LEDGER" ]; then
+        if ledger_has_file "$file"; then
+            matched=1
+        else
+            # Walk ancestor directories of $file; only match if the exact
+            # ancestor path was recorded in $LEDGER (not widened to top-level).
+            anc=$(dirname "$file")
+            while [ "$anc" != "." ] && [ "$anc" != "/" ] && [ -n "$anc" ]; do
+                if ledger_has_dir "$anc"; then
+                    matched=1
+                    break
+                fi
+                anc=$(dirname "$anc")
+            done
+        fi
+    fi
+    if [ "$matched" -eq 0 ]; then
+        echo "warning: file '$file' has no recorded NeuroStrata graph/memory lookup in this session" >&2
+        echo "  → call: neurostrata_memories_for_file --namespace $NAMESPACE --path \"$file\"" >&2
     fi
 done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
-    echo '{"namespace": "'"$NAMESPACE"'", "queries": []}' > "$LEDGER"
+    printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
-for module in $TouchedModules; do
-    TS=$(date +%s)
-    ENTRY="{\"ts\": $TS, \"query\": \"$module\", \"domains\": [\"$module\"], \"returned_ids\": [], \"governed_prefixes\": [\"$module/\"]}"
-    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
-        sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
+
+MissingFiles=()
+for raw_file in "${StagedFiles[@]}"; do
+    file=$(normalize_rel_path "$raw_file")
+    [ -z "$file" ] && continue
+    if [ -n "$LEDGER_PATHS" ]; then
+        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$file"; then
+            continue
+        fi
     fi
+    if ledger_has_file "$file"; then
+        continue
+    fi
+    MissingFiles+=("$file")
 done
+
+if [ "${#MissingFiles[@]}" -gt 0 ]; then
+    TS=$(date +%s)
+    export LEDGER NAMESPACE TS
+    if command -v node >/dev/null 2>&1; then
+        printf '%s\n' "${MissingFiles[@]}" | node -e '
+          const fs = require("fs");
+          const ledger = process.env.LEDGER;
+          const ns = process.env.NAMESPACE;
+          const ts = parseInt(process.env.TS, 10) || 0;
+          const files = fs.readFileSync(0, "utf8").split("\n").filter(Boolean);
+          let doc = { namespace: ns, queries: [] };
+          try {
+            const raw = fs.readFileSync(ledger, "utf8");
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              doc = { namespace: ns, queries: parsed };
+            } else if (parsed && typeof parsed === "object") {
+              doc = parsed;
+            }
+          } catch {}
+          if (typeof doc.namespace !== "string" || !doc.namespace) doc.namespace = ns;
+          if (!Array.isArray(doc.queries)) doc.queries = [];
+          const have = new Set(doc.queries.filter((q) => q && typeof q === "object" && typeof q.query === "string").map((q) => q.query));
+          for (const file of files) {
+            if (have.has(file)) continue;
+            have.add(file);
+            doc.queries.push({ ts, tool: "pre-commit", query: file, domains: [file], returned_ids: [], governed_prefixes: [file] });
+          }
+          fs.writeFileSync(ledger, JSON.stringify(doc, null, 2) + "\n");
+        ' 2>/dev/null || true
+    elif command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "${MissingFiles[@]}" | python3 -c '
+import json, os, sys
+ledger = os.environ["LEDGER"]
+ns = os.environ["NAMESPACE"]
+ts = int(os.environ.get("TS", "0") or "0")
+files = [line.rstrip("\n") for line in sys.stdin if line.strip()]
+try:
+    with open(ledger) as f:
+        parsed = json.load(f)
+except Exception:
+    parsed = {}
+if isinstance(parsed, list):
+    doc = {"namespace": ns, "queries": parsed}
+elif isinstance(parsed, dict):
+    doc = parsed
+else:
+    doc = {"namespace": ns, "queries": []}
+if not isinstance(doc.get("namespace"), str) or not doc.get("namespace"):
+    doc["namespace"] = ns
+if not isinstance(doc.get("queries"), list):
+    doc["queries"] = []
+have = {q.get("query") for q in doc["queries"] if isinstance(q, dict)}
+for file in files:
+    if file in have:
+        continue
+    have.add(file)
+    doc["queries"].append({"ts": ts, "tool": "pre-commit", "query": file, "domains": [file], "returned_ids": [], "governed_prefixes": [file]})
+with open(ledger, "w") as f:
+    json.dump(doc, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+' 2>/dev/null || true
+    else
+        # awk fallback: still ONE invocation. Read missing files from a temp list.
+        FILELIST=$(mktemp)
+        printf '%s\n' "${MissingFiles[@]}" > "$FILELIST"
+        export FILELIST
+        TMP=$(mktemp)
+        awk '
+          function json_escape(s,    i, n, c, out) {
+            out = ""
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+              c = substr(s, i, 1)
+              if (c == "\\") out = out "\\\\"
+              else if (c == "\"") out = out "\\\""
+              else if (c == "\t") out = out "\\t"
+              else if (c == "\r") out = out "\\r"
+              else if (c == "\n") out = out "\\n"
+              else if (c == "\f") out = out "\\f"
+              else if (c == "\b") out = out "\\b"
+              else out = out c
+            }
+            return out
+          }
+          function entry_str(file, comma,    s) {
+            s = "    {\n"
+            s = s "      \"ts\": " ts ",\n"
+            s = s "      \"tool\": \"pre-commit\",\n"
+            s = s "      \"query\": \"" file "\",\n"
+            s = s "      \"domains\": [\"" file "\"],\n"
+            s = s "      \"returned_ids\": [],\n"
+            s = s "      \"governed_prefixes\": [\"" file "\"]\n"
+            s = s (comma ? "    }," : "    }")
+            return s
+          }
+          BEGIN {
+            ns = json_escape(ENVIRON["NAMESPACE"])
+            ts = ENVIRON["TS"] + 0
+            nfiles = 0
+            while ((getline line < ENVIRON["FILELIST"]) > 0) {
+              if (line != "") {
+                nfiles++
+                files[nfiles] = json_escape(line)
+              }
+            }
+            close(ENVIRON["FILELIST"])
+            doc = ""
+          }
+          {
+            doc = (NR == 1 ? $0 : doc "\n" $0)
+          }
+          END {
+            nent = 0
+            for (i = 1; i <= nfiles; i++) {
+              if (index(doc, "\"" files[i] "\"") > 0) continue
+              nent++
+              newf[nent] = files[i]
+            }
+            trimmed = doc
+            sub(/^[[:space:]]+/, "", trimmed)
+            sub(/[[:space:]]+$/, "", trimmed)
+            if (substr(trimmed, 1, 1) == "[" && substr(trimmed, length(trimmed), 1) == "]") {
+              inner = substr(trimmed, 2, length(trimmed) - 2)
+              sub(/^[[:space:]]*\n?/, "", inner)
+              sub(/\n?[[:space:]]*$/, "", inner)
+              print "{"
+              print "  \"namespace\": \"" ns "\","
+              print "  \"queries\": ["
+              if (nent == 0) {
+                if (inner != "") print inner
+              } else if (inner == "") {
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
+              } else {
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], 1)
+                print inner
+              }
+              print "  ]"
+              print "}"
+              exit
+            }
+            if (nent == 0) {
+              print doc
+              exit
+            }
+            if (match(doc, /"queries"[[:space:]]*:[[:space:]]*\[/)) {
+              open_idx = RSTART + RLENGTH - 1
+              prefix = substr(doc, 1, open_idx)
+              rest = substr(doc, open_idx + 1)
+              if (match(rest, /^[[:space:]]*\]/)) {
+                close_part = substr(rest, RSTART + RLENGTH - 1)
+                print prefix
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
+                print "  " close_part
+                exit
+              } else {
+                sub(/^[[:space:]]*\n?/, "", rest)
+                print prefix
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], 1)
+                print "    " rest
+                exit
+              }
+            }
+            print "{"
+            print "  \"namespace\": \"" ns "\","
+            print "  \"queries\": ["
+            for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
+            print "  ]"
+            print "}"
+          }
+        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER" || rm -f "$TMP"
+        rm -f "$FILELIST"
+    fi
+fi
 
 exit 0
 "#;
@@ -4707,6 +5149,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_rename_invalidates_and_recomputes_subagent_prompt_injection() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "original title", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent",
+                "session_id": "sess-rename"
+            }),
+            store.clone(),
+        )
+        .await;
+
+        let list_before: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_before = list_before["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .unwrap();
+        assert!(prompt_before.contains("Goal: original title"));
+
+        handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "title": "updated renamed title",
+                "session_id": "sess-rename"
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+
+        let list_after: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_after = list_after["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .unwrap();
+        assert!(
+            prompt_after.contains("Goal: updated renamed title"),
+            "expected updated goal in prompt: {}",
+            prompt_after
+        );
+        assert!(!prompt_after.contains("Goal: original title"));
+    }
+
+    #[tokio::test]
     async fn task_create_and_rename_agree_on_the_title_limit() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
@@ -6877,6 +7378,111 @@ impl crate::traits::AsAny for ListHidingStore {
         assert_eq!(
             DONE_FUNNEL_MESSAGE,
             "ERROR: done is reachable only via neurostrata_task_complete, which requires memory extraction (Lock 2)."
+        );
+    }
+
+    /// R6: `handle_task_list` must recompute `subagent_prompt_injection` for
+    /// InProgress tasks whenever the cached prompt starts with the standard
+    /// header, so an archived governing rule no longer appears in the prompt.
+    #[tokio::test]
+    async fn task_list_recomputes_prompt_when_governing_rule_is_archived() {
+        let store = store_with_namespace("MyProj").await;
+
+        // 1. Insert a live rule memory in the namespace.
+        let rule_id = uuid::Uuid::new_v4().to_string();
+        let rule_vector = StubEmbedder
+            .embed("Never use unwrap in production")
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rule_id,
+                rule_vector,
+                MemoryPayload {
+                    content: "Never use unwrap in production".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .expect("seed the rule");
+
+        // 2. Create and claim a task in MyProj.
+        let task_id = create_task(&store, "MyProj", "Fix production unwrap", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": task_id,
+                "assignee": "agent-a",
+                "session_id": "ses_rule"
+            }),
+            store.clone(),
+        )
+        .await;
+
+        // 3. handle_task_list must include the rule id/snippet in the prompt.
+        let list_before: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_before = list_before["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .expect("prompt present before archive");
+        assert!(
+            prompt_before.contains(&rule_id),
+            "the live rule id must appear in the prompt: {}",
+            prompt_before
+        );
+        assert!(
+            prompt_before.contains("Never use unwrap in production"),
+            "the live rule snippet must appear in the prompt: {}",
+            prompt_before
+        );
+
+        // 4. Archive the rule.
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        let _ = crate::handlers::archive_memory::handle_archive_memory(
+            json!({ "namespace": "MyProj", "id": rule_id }),
+            store.clone(),
+            bus.clone(),
+        )
+        .await;
+        let (_, rule_payload) = store.get("MyProj", &rule_id).await.unwrap().unwrap();
+        assert!(
+            crate::handlers::archive_memory::is_archived(&rule_payload),
+            "the rule must really be archived"
+        );
+
+        // 5. handle_task_list again: the archived rule must no longer appear.
+        let list_after: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_after = list_after["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .expect("prompt present after archive");
+        assert!(
+            !prompt_after.contains(&rule_id),
+            "the archived rule id must not appear in the recomputed prompt: {}",
+            prompt_after
+        );
+        assert!(
+            !prompt_after.contains("Never use unwrap in production"),
+            "the archived rule snippet must not appear in the recomputed prompt: {}",
+            prompt_after
         );
     }
 }

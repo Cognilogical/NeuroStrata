@@ -23,11 +23,32 @@ const CODEX_PKG_JSON: &str = include_str!("../../plugins/codex/package.json");
 const GITHUB_CLI_INDEX_JS: &str = include_str!("../../plugins/github-cli/dist/index.js");
 const GITHUB_CLI_PKG_JSON: &str = include_str!("../../plugins/github-cli/package.json");
 
+// @neurostrata/plugin-core, bundled once so the harness adapters' relative
+// `../../core/dist/index.js` imports resolve on disk under
+// `.NeuroStrata/plugins/core/dist/index.js`.
+const CORE_INDEX_JS: &str = include_str!("../../plugins/core/dist/index.js");
+const CORE_PKG_JSON: &str = include_str!("../../plugins/core/package.json");
+
 const CLI_HOOK_RUNNER_MJS: &str = r#"#!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import plugin, { initialize, onTurnEnd } from "./dist/index.js";
+import plugin, * as mod from "./dist/index.js";
 
 async function main() {
+  // Redirect all diagnostic logging to stderr so stdout carries only the
+  // JSON hook response (critical when this runner is invoked by a CLI hook
+  // whose stdout is parsed as structured output).
+  console.log = console.error;
+  console.info = console.error;
+  console.warn = console.error;
+
+  // A large hook response (e.g. a big `updatedInput`) can still be buffered in
+  // stdout when `process.exit(0)` runs, so the host reads a truncated JSON
+  // body. Awaiting the write callback guarantees the payload is flushed first.
+  const writeStdout = (text) =>
+    new Promise((resolve) => {
+      process.stdout.write(text, () => resolve());
+    });
+
   let raw = "";
   try {
     raw = readFileSync(0, "utf8");
@@ -41,16 +62,27 @@ async function main() {
   } catch {
     process.exit(0);
   }
-  await initialize({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
-  if (typeof plugin.handleClaudeHookEvent === "function") {
-    const out = await plugin.handleClaudeHookEvent(event);
-    process.stdout.write(JSON.stringify(out));
+  const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
+  if (typeof init === "function") {
+    await init({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+  }
+  const handler =
+    mod.handleHookEvent ??
+    plugin?.handleHookEvent ??
+    mod.handleClaudeHookEvent ??
+    plugin?.handleClaudeHookEvent;
+  if (typeof handler === "function") {
+    const out = await handler(event);
+    await writeStdout(JSON.stringify(out));
     process.exit(0);
   }
   if (event.hook_event_name === "Stop" && typeof event.transcript === "string") {
-    await onTurnEnd({ role: "assistant", content: event.transcript });
+    const turnEnd = mod.onTurnEnd ?? plugin?.onTurnEnd;
+    if (typeof turnEnd === "function") {
+      await turnEnd({ role: "assistant", content: event.transcript });
+    }
   }
-  process.stdout.write(JSON.stringify({ continue: true }));
+  await writeStdout(JSON.stringify({ continue: true }));
 }
 main().catch((err) => {
   process.stderr.write(String(err) + "\n");
@@ -63,7 +95,7 @@ const EMBEDDED_NEUROSTRATA_SKILL_MD: &str =
 const EMBEDDED_NEUROSTRATA_TASK_AGENT_MD: &str =
     include_str!("../../.agents/agents/NeuroStrata-Task.md");
 const SUBAGENT_RULE_MARKER: &str = "subagent_prompt_injection";
-const SUBAGENT_GRAPH_FIRST_RULE_SNIPPET: &str = "\n- **NEUROSTRATA GRAPH-FIRST & SUBAGENT CONTEXT RULE:** Honor the `### NeuroStrata Task & Graph Context` (`subagent_prompt_injection`) block in your prompt — every `[rule]` entry is a binding architectural constraint. Before blind `grep`/`glob` or editing files (unless the parent prompt states the snapshot/file-memory lookup was already done), query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` to inspect governing rules (`GOVERNS`) and AST call/import edges (`DEPENDS_ON`, `calls`, `imports`). Never leave `TODO`, `FIXME`, `stub`, or `phase-2` deferrals.\n";
+const SUBAGENT_GRAPH_FIRST_RULE_SNIPPET: &str = "\n- **NEUROSTRATA GRAPH-FIRST & SUBAGENT CONTEXT RULE:** Honor the `### NeuroStrata Task & Graph Context` (`subagent_prompt_injection`) block in your prompt — every `[rule]` entry is a binding architectural constraint. Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`). Never leave `TODO`, `FIXME`, `stub`, or `phase-2` deferrals.\n";
 
 const KNOWN_HARNESSES: &[&str] = &[
     "opencode",
@@ -202,6 +234,28 @@ pub fn auto_install_detected_plugins(
     }
     let base_dir = project_root.join(".NeuroStrata/plugins");
     let mut installed = Vec::new();
+
+    // Bundle the shared plugin-core once so every harness adapter's relative
+    // `../../core/dist/index.js` import resolves on disk under
+    // `.NeuroStrata/plugins/core/dist/index.js`.
+    if !detected.is_empty() {
+        let core_dir = base_dir.join("core");
+        let core_dist = core_dir.join("dist");
+        if std::fs::create_dir_all(&core_dist).is_ok() {
+            let core_index = core_dist.join("index.js");
+            let core_pkg = core_dir.join("package.json");
+            let write_if_changed = |path: &Path, content: &str| {
+                let needs_write = std::fs::read_to_string(path)
+                    .map(|existing| existing != content)
+                    .unwrap_or(true);
+                if needs_write {
+                    let _ = std::fs::write(path, content);
+                }
+            };
+            write_if_changed(&core_index, CORE_INDEX_JS);
+            write_if_changed(&core_pkg, CORE_PKG_JSON);
+        }
+    }
 
     for &harness in &detected {
         let Some((index_js, pkg_json)) = bundle_for(harness) else {
@@ -370,12 +424,31 @@ fn sync_skills_and_agent_rules(
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if content.contains(SUBAGENT_RULE_MARKER) || content.contains("tools: false") {
-                continue;
-            }
-            let updated = format!("{}{}", content.trim_end(), SUBAGENT_GRAPH_FIRST_RULE_SNIPPET);
-            if std::fs::write(&path, updated).is_ok() {
-                patched_agents.push(path.to_string_lossy().to_string());
+            // Upgrade path: if an older agent .md still carries the unenforceable
+            // "unless the parent prompt states ..." bypass clause, replace that
+            // rule line with the verifiable Graph-First predicate.
+            let updated: Option<String> = if content.contains("unless the parent prompt states") {
+                let replaced = content
+                    .lines()
+                    .map(|line| {
+                        if line.contains("unless the parent prompt states") {
+                            SUBAGENT_GRAPH_FIRST_RULE_SNIPPET.trim_end()
+                        } else {
+                            line
+                        }
+                    })
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                if replaced != content { Some(replaced) } else { None }
+            } else if !content.contains(SUBAGENT_RULE_MARKER) && !content.contains("tools: false") {
+                Some(format!("{}{}", content.trim_end(), SUBAGENT_GRAPH_FIRST_RULE_SNIPPET))
+            } else {
+                None
+            };
+            if let Some(updated) = updated {
+                if std::fs::write(&path, updated).is_ok() {
+                    patched_agents.push(path.to_string_lossy().to_string());
+                }
             }
         }
     }
@@ -408,6 +481,114 @@ fn wire_harness_config(
     match harness {
         "opencode" => {
             if is_active || project_root.join(".opencode").exists() || project_root.join("opencode.json").exists() {
+                // 1. Write the thin OpenCode loader at .opencode/plugins/neurostrata.js
+                //    (creating .opencode/plugins/ if needed). The relative import
+                //    resolves from the loader file's location back to the bundled core.
+                let plugins_dir = project_root.join(".opencode/plugins");
+                let loader_path = plugins_dir.join("neurostrata.js");
+                let loader = "export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n\
+                              export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n";
+                let _ = std::fs::create_dir_all(&plugins_dir);
+                let _ = std::fs::write(&loader_path, loader);
+
+                // 2. Always create or merge .opencode/opencode.json -> "plugins",
+                //    preserving every other key/entry.
+                let loader_rel = "./.NeuroStrata/plugins/opencode/dist/index.js";
+                let oc_cfg = project_root.join(".opencode/opencode.json");
+                // Preserve the existing file on read/parse failure: only
+                // populate when the file is absent, or when it parses to a
+                // JSON object. A malformed or non-object existing file is left
+                // untouched (never overwritten with `{}`).
+                let mut doc: Value = json!({});
+                let mut write_doc = false;
+                if oc_cfg.exists() {
+                    if let Some(d) = std::fs::read_to_string(&oc_cfg)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    {
+                        if d.is_object() {
+                            doc = d;
+                            write_doc = true;
+                        }
+                    }
+                } else {
+                    write_doc = true;
+                }
+                if write_doc {
+                    if let Some(obj) = doc.as_object_mut() {
+                        let entry = obj.get("plugins");
+                        let (is_array, already_in_array, key_absent) = {
+                            let e = entry;
+                            (
+                                e.map(|v| v.is_array()).unwrap_or(false),
+                                e.and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter().any(|v| {
+                                            v.as_str()
+                                                .map(|s| s == loader_rel)
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .unwrap_or(false),
+                                entry.is_none(),
+                            )
+                        };
+                        if is_array && !already_in_array {
+                            obj.get_mut("plugins")
+                                .and_then(|v| v.as_array_mut())
+                                .unwrap()
+                                .push(json!(loader_rel));
+                        } else if key_absent {
+                            obj.insert("plugins".to_string(), json!([loader_rel]));
+                        }
+                    }
+                    let _ = write_json_if_changed(&oc_cfg, &doc);
+                }
+
+                // 3. Root opencode.json: only update if it already exists; never
+                //    create a root opencode.json (the loader lives in .opencode/).
+                let root_cfg = project_root.join("opencode.json");
+                if root_cfg.exists() {
+                    if let Ok(raw) = std::fs::read_to_string(&root_cfg) {
+                        if let Ok(mut root_doc) = serde_json::from_str::<Value>(&raw) {
+                            if let Some(obj) = root_doc.as_object_mut() {
+                                for key in ["plugins", "plugin"] {
+                                    let create_if_missing = key == "plugins";
+                                    // Inspect immutably first so no borrow is outstanding when we mutate.
+                                    let (is_array, already_in_array, key_absent) = {
+                                        let entry = obj.get(key);
+                                        (
+                                            entry.map(|v| v.is_array()).unwrap_or(false),
+                                            entry
+                                                .and_then(|v| v.as_array())
+                                                .map(|arr| {
+                                                    arr.iter().any(|v| {
+                                                        v.as_str()
+                                                            .map(|s| s == loader_rel)
+                                                            .unwrap_or(false)
+                                                    })
+                                                })
+                                                .unwrap_or(false),
+                                            entry.is_none(),
+                                        )
+                                    };
+                                    if is_array && !already_in_array {
+                                        obj.get_mut(key)
+                                            .and_then(|v| v.as_array_mut())
+                                            .unwrap()
+                                            .push(json!(loader_rel));
+                                    } else if create_if_missing && key_absent {
+                                        obj.insert(key.to_string(), json!([loader_rel]));
+                                    }
+                                }
+                            }
+                            let _ = write_json_if_changed(&root_cfg, &root_doc);
+                        }
+                    }
+                }
+
+                // 3. Keep writing .opencode/neurostrata-plugin.json (the historical
+                //    plugin registration) unchanged.
                 let cfg_path = project_root.join(".opencode/neurostrata-plugin.json");
                 let doc = json!({
                     "plugin": [abs_dist],
@@ -416,29 +597,9 @@ fn wire_harness_config(
                         "pluginPath": abs_dist
                     }
                 });
-                let res = write_json_if_changed(&cfg_path, &doc);
-                let root_cfg = project_root.join("opencode.json");
-                if root_cfg.exists() {
-                    if let Ok(raw) = std::fs::read_to_string(&root_cfg) {
-                        if let Ok(mut root_doc) = serde_json::from_str::<Value>(&raw) {
-                            if let Some(obj) = root_doc.as_object_mut() {
-                                let plugins = obj.entry("plugin").or_insert_with(|| json!([]));
-                                if let Some(arr) = plugins.as_array_mut() {
-                                    let already = arr.iter().any(|v| {
-                                        v.as_str()
-                                            .map(|s| s == abs_dist || s.contains("plugins/opencode"))
-                                            .unwrap_or(false)
-                                    });
-                                    if !already {
-                                        arr.push(json!(abs_dist));
-                                    }
-                                }
-                            }
-                            let _ = write_json_if_changed(&root_cfg, &root_doc);
-                        }
-                    }
-                }
-                return res;
+                let _ = write_json_if_changed(&cfg_path, &doc);
+
+                return Some(loader_path.to_string_lossy().to_string());
             }
             None
         }
@@ -446,27 +607,40 @@ fn wire_harness_config(
             if is_active || project_root.join(".claude").exists() {
                 let cfg_path = project_root.join(".claude/settings.local.json");
                 let cmd = format!("NEUROSTRATA_NAMESPACE={} node \"{}\"", namespace, abs_runner);
-                let mut doc: Value = std::fs::read_to_string(&cfg_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| json!({}));
-                if let Some(obj) = doc.as_object_mut() {
-                    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-                    if let Some(h_obj) = hooks.as_object_mut() {
-                        h_obj.entry("PreToolUse").or_insert_with(|| {
-                            json!([{
-                                "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
-                                "hooks": [{ "type": "command", "command": cmd }]
-                            }])
-                        });
-                        h_obj.entry("Stop").or_insert_with(|| {
-                            json!([{
-                                "hooks": [{ "type": "command", "command": cmd }]
-                            }])
-                        });
+                let mut doc: Value = json!({});
+                let mut write_doc = false;
+                if cfg_path.exists() {
+                    if let Some(d) = std::fs::read_to_string(&cfg_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    {
+                        if d.is_object() {
+                            doc = d;
+                            write_doc = true;
+                        }
                     }
+                } else {
+                    write_doc = true;
                 }
-                return write_json_if_changed(&cfg_path, &doc);
+                if write_doc {
+                    if let Some(obj) = doc.as_object_mut() {
+                        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+                        if let Some(h_obj) = hooks.as_object_mut() {
+                            h_obj.entry("PreToolUse").or_insert_with(|| {
+                                json!([{
+                                    "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+                                    "hooks": [{ "type": "command", "command": cmd }]
+                                }])
+                            });
+                            h_obj.entry("Stop").or_insert_with(|| {
+                                json!([{
+                                    "hooks": [{ "type": "command", "command": cmd }]
+                                }])
+                            });
+                        }
+                    }
+                    return write_json_if_changed(&cfg_path, &doc);
+                }
             }
             None
         }
@@ -550,5 +724,86 @@ mod tests {
         assert!(tmp.path().join(".claude/agents/NeuroStrata-Task.md").exists());
         let patched = std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
         assert!(patched.contains("subagent_prompt_injection"));
+    }
+
+    #[test]
+    fn auto_install_detected_plugins_writes_core_and_opencode_loader() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".opencode")).expect("create .opencode");
+
+        // Root opencode.json pre-exists with unrelated entries; it must be
+        // updated without clobbering them.
+        let root_cfg = tmp.path().join("opencode.json");
+        std::fs::write(
+            &root_cfg,
+            serde_json::to_string_pretty(&json!({ "plugins": ["./other.js"], "otherKey": "preserve" })).unwrap(),
+        )
+        .expect("write root opencode.json");
+
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("opencode"));
+        assert_eq!(report["active_harness"], json!("opencode"));
+
+        // Core plugin-core bundle must be present so relative imports resolve.
+        assert!(tmp.path().join(".NeuroStrata/plugins/core/dist/index.js").exists());
+        assert!(tmp.path().join(".NeuroStrata/plugins/core/package.json").exists());
+        // Opencode bundle + hook runner.
+        assert!(tmp.path().join(".NeuroStrata/plugins/opencode/dist/index.js").exists());
+        assert!(tmp.path().join(".NeuroStrata/plugins/opencode/cli-hook.mjs").exists());
+
+        // Thin loader wired into OpenCode.
+        let loader = tmp.path().join(".opencode/plugins/neurostrata.js");
+        assert!(loader.exists());
+        let loader_src = std::fs::read_to_string(&loader).expect("read loader");
+        assert!(
+            loader_src.contains("export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
+            "loader re-exports default"
+        );
+        assert!(
+            loader_src.contains("export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
+            "loader re-exports all"
+        );
+
+        // .opencode/opencode.json always created/merged with the loader in "plugins".
+        let oc_cfg = tmp.path().join(".opencode/opencode.json");
+        assert!(oc_cfg.exists(), ".opencode/opencode.json must be created");
+        let oc_doc: Value = serde_json::from_str(&std::fs::read_to_string(oc_cfg).expect("read .opencode/opencode.json"))
+            .expect("parse .opencode/opencode.json");
+        let oc_plugins = oc_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
+        assert!(
+            oc_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
+            ".opencode/opencode.json plugins contains loader path: {oc_plugins:?}"
+        );
+
+        // Root opencode.json updated, preserving existing keys/entries (not created when absent,
+        // never clobbered when present).
+        let root_doc: Value = serde_json::from_str(&std::fs::read_to_string(root_cfg).expect("read opencode.json"))
+            .expect("parse opencode.json");
+        let root_plugins = root_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
+        assert!(
+            root_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
+            "root opencode.json plugins contains loader path"
+        );
+        assert!(
+            root_plugins.iter().any(|v| v.as_str() == Some("./other.js")),
+            "root opencode.json preserves existing plugins entries"
+        );
+        assert_eq!(root_doc.get("otherKey").and_then(|v| v.as_str()), Some("preserve"));
+    }
+
+    #[test]
+    fn subagent_graph_first_rule_is_verifiable() {
+        let snippet = SUBAGENT_GRAPH_FIRST_RULE_SNIPPET;
+        assert!(
+            snippet.contains("check whether its path and governing memory IDs"),
+            "snippet must use the verifiable path/governing-IDs predicate"
+        );
+        assert!(
+            !snippet.contains("unless the parent prompt states"),
+            "snippet must not contain the unenforceable parent-prompt bypass"
+        );
+        assert!(
+            snippet.contains("memories_for_file"),
+            "snippet must still direct to memories_for_file"
+        );
     }
 }

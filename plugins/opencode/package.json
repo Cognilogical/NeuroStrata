@@ -5,9 +5,11 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": ["index.ts", "dist", "cli-hook.mjs", "README.md"],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs",
+    "dev": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs --watch",
     "test": "node --test test.mjs",
     "lint": "eslint src --ext .ts"
   },
