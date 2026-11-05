@@ -50,7 +50,7 @@ Distributed teams occasionally modify the same shared rule concurrently. Synapti
 
 ## 5. CLI Usage
 
-The subcommands are `init`, `join`, `push`, `pull`, `status`, `leave` and `recover` (`src/synaptic_mesh/cli.rs`). There is no `sync` and no `conflicts` subcommand -- transport is `pull` then `push`.
+The visible subcommands are `init`, `join`, `push`, `pull`, `status`, `leave` and `recover` (`src/synaptic_mesh/cli.rs`). There is no `sync` and no `conflicts` subcommand -- transport is `pull` then `push`. One further variant exists but is hidden from `--help` (`#[command(hide = true)]`): `sync-enqueue`, the pull-then-push-in-one-call target of the project-side pre-push hook (`src/main.rs:950-957`). It is an internal hook target, not a user-facing transport command, and it always prints one line and never exits non-zero.
 
 ```bash
 # Create a new mesh and join this project to it (name, not a path)

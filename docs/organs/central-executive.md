@@ -29,9 +29,20 @@ Before an agent touches any file or runs any mutating command, it must first cla
 
 `git push` runs `neurostrata-mcp task gate <namespace> --strict`. The gate refuses to ship when any of the following exist:
 
+**Task conditions** (`src/task/gate.rs`):
+
 - Any task in `in_progress` (unfinished work blocks everyone).
 - Any task marked `done` that lacks an extracted memory (the Done-Funnel guard).
 - Any P0 task open for more than 24 hours.
+
+**Rule-honesty conditions** (`src/task/gate.rs:399-530`) — a `rule` row is a load-bearing claim, and the gate refuses to ship one that overclaims:
+
+- A live rule with no `metadata.source`.
+- A rule whose `metadata.enforcement` is not `ENFORCED`, `PARTIAL` or `NOT_ENFORCED`.
+- A rule claiming `ENFORCED` whose `metadata.guard` names no known wire, or names an advisory/reminder wire that never blocks.
+- A rule claiming `PARTIAL` whose `metadata.guard` names no known wire.
+- A rule claiming `NOT_ENFORCED` that still names a guard.
+- A rule that names a guard but declares no enforcement value.
 
 The pre-push hook (`pre-push` binary hook, installed via `neurostrata-mcp hooks install`) enforces this — including on merged branches and pushed tags. A hard failure exits the hook non-zero so git refuses the push automatically.
 
