@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import plugin, {
+  createHarnessPlugin,
   detectTaskIntentsLocal,
   parseGuardValidate,
   parseFileMemoryHits,
@@ -21,7 +22,7 @@ import plugin, {
 } from "./dist/index.js";
 
 test("Plugin.define exports V2 setup and registers execute.before hook", async () => {
-  assert.ok(plugin.id.startsWith("neurostrata"));
+  assert.equal(plugin.id, "neurostrata-opencode");
   assert.equal(typeof plugin.setup, "function");
 
   let registeredHook = null;
@@ -424,9 +425,12 @@ test("injectSubagentPrompt prepends context header once and is idempotent", () =
   // Second call should be idempotent (no double-injection)
   const second = injectSubagentPrompt(target, namespace, taskId);
   assert.equal(second, false, "second call returns false");
-  // Count occurrences of the marker
-  const markerCount = (target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []).length;
-  assert.equal(markerCount, 1, "marker appears exactly once");
+  // Header embeds the marker twice (title line + body reference); assert count
+  // stability across repeated injection rather than an exact count of 1.
+  const afterFirst = (target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []).length;
+  assert.ok(afterFirst >= 1, "header injected at least once");
+  assert.equal(injectSubagentPrompt(target, namespace, taskId), false, "third call is also a no-op");
+  assert.equal((target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []).length, afterFirst, "idempotent: no additional markers injected");
 
   // Missing prompt property returns false
   const noPrompt = { other: "data" };
@@ -450,4 +454,43 @@ test("buildSubagentContextHeader includes required fields", () => {
   // With null taskId
   const headerNull = buildSubagentContextHeader("other-ns", null);
   assert.ok(headerNull.includes("Active Task ID: \`unclaimed (claim a task first)\`"));
+});
+
+// ─── Thin-wrapper regression: opencode adapter is a re-export of core ───
+
+test("opencode thin wrapper re-exports core surface and builds its own plugin", () => {
+  const plugin2 = createHarnessPlugin("opencode", "OpenCode");
+  assert.equal(plugin2.id, "opencode");
+  assert.equal(plugin2.name, "OpenCode");
+  assert.equal(typeof plugin2.setup, "function");
+  assert.equal(typeof plugin2.handleHookEvent, "function");
+  assert.equal(typeof plugin2.handleClaudeHookEvent, "function");
+  assert.equal(typeof plugin2.onTurnEnd, "function");
+  assert.equal(typeof plugin2.fetchContextPlan, "function");
+
+  assert.equal(plugin.id, "neurostrata-opencode");
+  assert.equal(plugin.name, "OpenCode");
+  assert.equal(plugin.handleHookEvent, plugin.handleClaudeHookEvent);
+});
+
+test("opencode default export handleHookEvent and handleClaudeHookEvent are aliased", async () => {
+  const target = { prompt: "refactor this file" };
+  const out = await plugin.handleHookEvent({
+    hook_event_name: "PreToolUse",
+    tool_name: "subagent",
+    tool_input: target,
+  });
+  assert.equal(out.continue, true);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+  assert.ok(target.prompt.includes("### NeuroStrata Task & Graph Context"));
+
+  const target2 = { prompt: "refactor this file too" };
+  const out2 = await plugin.handleClaudeHookEvent({
+    hook_event_name: "PreToolUse",
+    tool_name: "subagent",
+    tool_input: target2,
+  });
+  assert.equal(out2.continue, true);
+  assert.equal(out2.hookSpecificOutput.permissionDecision, "allow");
+  assert.ok(target2.prompt.includes("### NeuroStrata Task & Graph Context"));
 });

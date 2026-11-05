@@ -5,7 +5,6 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
     "types": ["node"],
-    "typeRoots": ["./node_modules/@types", "../opencode/node_modules/@types"],
     "rootDir": ".",
     "outDir": "./dist",
     "strict": true,
