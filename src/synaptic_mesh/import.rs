@@ -472,24 +472,33 @@ pub async fn apply_changed(
     // Bundle-only records: everything `scan_bundles_and_patches` decoded
     // whose `(namespace, id)` did NOT arrive as a `.json` candidate this
     // pass. Identical gates as the `.json` path, by construction: both
-    // routes call `pre_apply_gate` (validation, then epoch, then
-    // signature) before `apply_one`, and the bundle validation is the
-    // portable subset of `validate_record` (see `validate_bundle_record`
-    // — a bundle record has no path and no file stem, so the two
-    // path-dependent checks — path-namespace parity and
-    // id == file-stem — do not transfer). A record already
-    // presented as a `.json` candidate is applied exactly once through
-    // that authoritative route, so its bundle copy is skipped here
-    // without a second report entry; every other rejection — including
-    // an unserved namespace, which the validation step now refuses —
-    // lands in `report.ignored` like any other candidate, and the
-    // report counts the Disposition like any other candidate.
+    // routes pass their validation result through `pre_apply_gate`
+    // (epoch gate, then signature, then disposition) before
+    // `apply_one` — each route evaluates its own validator first
+    // (`validate_record` on the `.json` route, `validate_bundle_record`
+    // here, both over `validate_parsed_record`) and passes the `Result`
+    // in — and the bundle validation is the portable subset of
+    // `validate_record` (see `validate_bundle_record` — a bundle record
+    // has no path and no file stem, so the two path-dependent checks —
+    // path-namespace parity and id == file-stem — do not transfer).
+    // The dedup skip here is keyed on the path-derived `(namespace,
+    // file-stem)` pair collected before validation, and content is NOT
+    // compared: a bundle record under a key whose `.json` candidate was
+    // applied OR ignored inherits that route's disposition for the pass
+    // and is not separately evaluated or reported. Rejections of
+    // decoded records — including an unserved namespace, which the
+    // validation step now refuses — land in `report.ignored` like any
+    // other candidate, and the report counts the Disposition like any
+    // other candidate; a bundle that fails to decode at all (corrupt
+    // stream, malformed element, aggregate decompression cap) is
+    // logged and skipped wholesale by the scan — pre-existing
+    // behaviour, no report entry.
     for (bundle_path, record) in bundled_records {
         let id = record.id.to_string();
         if json_candidate_ids.contains(&(record.namespace.clone(), id.clone())) {
             continue;
         }
-        let rel = bundle_path.display().to_string();
+        let rel = format!("{} ({})", bundle_path.display(), record.id);
         let record = match pre_apply_gate(
             validate_bundle_record(record, served),
             manifest_epoch,
