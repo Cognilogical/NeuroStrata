@@ -536,6 +536,11 @@ fn build_record(
 }
 
 /// Sign a [`MeshRecord`] in place using the Ed25519 keypair at `key_path`.
+///
+/// Test-only since the seal moved: [`apply_one`] signs with the keypair
+/// its gate already loaded and probe-signed with, so this path-loading
+/// wrapper has no non-test caller left.
+#[cfg(test)]
 pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), String> {
     let (pkey, did, pubkey) = crate::did::load_or_generate_keypair(key_path)?;
     sign_record_with_keypair(record, &pkey, &did, &pubkey)
@@ -545,7 +550,7 @@ pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), Strin
 /// seal [`apply_one`] applies with the keypair its early gate loaded and
 /// probe-signed with, so the gate and the seal always act on the same
 /// key. Behaviour is identical to a fresh load of that keypair in
-/// [`sign_record`].
+/// `sign_record`.
 fn sign_record_with_keypair(
     record: &mut MeshRecord,
     pkey: &openssl::pkey::PKey<openssl::pkey::Private>,
