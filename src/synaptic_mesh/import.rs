@@ -79,6 +79,16 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const MAX_RDF_QUADS_BYTES: usize = 512 * 1024; // 512 KiB
 pub const MAX_RDF_QUADS_COUNT: usize = 1000;
 
+/// RDF validation diagnostic carried out-of-band from validation to the
+/// pre-apply gate. This preserves signature verification over the record
+/// EXACTLY as it arrived (no metadata mutation before verify_record_signature),
+/// while still attaching the diagnostic to the applied record for audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdfDiagnostic {
+    pub violations: Vec<String>,
+    pub phase: String,
+}
+
 /// What one replay pass did.
 #[derive(Debug, Clone)]
 pub struct ApplyReport {
@@ -772,13 +782,13 @@ fn has_exec_bit(_meta: &std::fs::Metadata) -> bool {
 
 /// Parse + validate one `.json` record against the pinned contract: known
 /// schema version, served namespace parity with its path, shareable memory
-/// type, id/filename agreement, no runtime counter keys. `Ok(record)` is
-/// apt for apply; `Err(reason)` is an ignore entry.
+/// type, id/filename agreement, no runtime counter keys. `Ok((record, diagnostic))`
+/// is apt for apply; `Err(reason)` is an ignore entry.
 pub fn validate_record(
     candidate: &Candidate,
     served: &[String],
     raw: &str,
-) -> Result<MeshRecord, String> {
+) -> Result<(MeshRecord, Option<RdfDiagnostic>), String> {
     if raw.len() > MAX_RECORD_BYTES {
         return Err(format!(
             "record is {} bytes, over the {}-byte per-record cap (MAX_RECORD_BYTES)",
@@ -804,9 +814,12 @@ pub fn validate_record(
 /// warn-and-apply canonical-RDF diagnostic, and the secret scan over
 /// content and metadata — is the shared [`validate_parsed_record`], so
 /// the two routes cannot drift apart.
-fn validate_bundle_record(record: MeshRecord, served: &[String]) -> Result<MeshRecord, String> {
-    let serialized = serde_json::to_string(&record)
-        .map_err(|e| format!("unparseable MeshRecord ({e})"))?;
+fn validate_bundle_record(
+    record: MeshRecord,
+    served: &[String],
+) -> Result<(MeshRecord, Option<RdfDiagnostic>), String> {
+    let serialized =
+        serde_json::to_string(&record).map_err(|e| format!("unparseable MeshRecord ({e})"))?;
     if serialized.len() > MAX_RECORD_BYTES {
         return Err(format!(
             "record is {} bytes, over the {}-byte per-record cap (MAX_RECORD_BYTES)",
@@ -823,10 +836,10 @@ fn validate_bundle_record(record: MeshRecord, served: &[String]) -> Result<MeshR
 /// and the id == file-stem check. `None` (the bundle route) runs every
 /// remaining check unchanged.
 fn validate_parsed_record(
-    mut record: MeshRecord,
+    record: MeshRecord,
     served: &[String],
     candidate: Option<&Candidate>,
-) -> Result<MeshRecord, String> {
+) -> Result<(MeshRecord, Option<RdfDiagnostic>), String> {
     if record.schema_version != MESH_RECORD_SCHEMA_VERSION {
         return Err(format!(
             "unknown schema_version {} (supported: {})",
@@ -875,21 +888,25 @@ fn validate_parsed_record(
     // If the record carries an rdf block, verify its canonical_hash,
     // predicate allowlist, and subject agreement. On violation, report it
     // as a diagnostic but do NOT refuse the record — Phase 1 accepts the
-    // valid JSON envelope and emits the violation for audit.
+    // valid JSON envelope and emits the violation for audit. The diagnostic
+    // is carried OUT OF BAND (not attached to `record.metadata`) so that
+    // signature verification over the canonical bytes runs over the record
+    // exactly as it arrived — no metadata mutation before verify_record_signature.
+    let mut diagnostic = None;
     if let Some(ref rdf_block) = record.rdf {
         if let Err(violations) = crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block) {
             // Phase 1: emit diagnostic (spec §5.3 warn-first); record is still
-            // applied. The violation is tagged into metadata for audit.
+            // applied. The violation is carried out-of-band for later attachment.
             tracing::warn!(
                 target: "neurostrata::import::rdf",
                 "canonical RDF violation on {} (ns={}) — Phase 1 apply-with-diagnostic: {}",
                 record.id, record.namespace,
                 violations.join("; ")
             );
-            if let Some(obj) = record.metadata.as_object_mut() {
-                obj.insert("rdf_diagnostic_violations".to_string(), json!(violations));
-                obj.insert("rdf_diagnostic_phase".to_string(), json!("1"));
-            }
+            diagnostic = Some(RdfDiagnostic {
+                violations,
+                phase: "1".to_string(),
+            });
         }
     }
     // Secret scan (J15, import leg): the same scanner every local write
@@ -900,10 +917,22 @@ fn validate_parsed_record(
     // from the record's own metadata key names, which are
     // sender-controlled and could carry secret-shaped text of their
     // own into the operator-visible report (fix round, M-1).
+    // Scan metadata AS IT WOULD BE after diagnostic attachment, so secret
+    // scan coverage of diagnostic text is preserved.
+    let mut metadata_for_scan = record.metadata.clone();
+    if let Some(ref diag) = diagnostic {
+        if let Some(obj) = metadata_for_scan.as_object_mut() {
+            obj.insert(
+                "rdf_diagnostic_violations".to_string(),
+                json!(diag.violations),
+            );
+            obj.insert("rdf_diagnostic_phase".to_string(), json!(diag.phase));
+        }
+    }
     let content_scan_text = serde_json::to_string(&record.content)
         .map_err(|e| format!("unparseable MeshRecord content ({e})"))?;
     if let Some(rejection) =
-        crate::secrets::scan_entry_point(&content_scan_text, &record.metadata, "mesh_import")
+        crate::secrets::scan_entry_point(&content_scan_text, &metadata_for_scan, "mesh_import")
     {
         let surface = if rejection.location.starts_with("mesh_import.metadata") {
             "record metadata"
@@ -915,7 +944,7 @@ fn validate_parsed_record(
             rejection.category
         ));
     }
-    Ok(record)
+    Ok((record, diagnostic))
 }
 
 /// The epoch gate (spec §"Deletion & erasure" / §"Import validation"): a
@@ -955,19 +984,20 @@ pub fn epoch_gate(candidate_epoch: u32, manifest_epoch: u32) -> Result<(), Strin
 /// reached), the record is NOT applied, and the caller must not count
 /// it as applied.
 fn pre_apply_gate(
-    validated: Result<MeshRecord, String>,
+    validated: Result<(MeshRecord, Option<RdfDiagnostic>), String>,
     manifest_epoch: u32,
     signers: &[super::manifest::SignerEntry],
     rel: &str,
     report: &mut ApplyReport,
 ) -> Option<MeshRecord> {
-    let record = match validated {
-        Ok(r) => r,
+    let (mut record, rdf_diagnostic) = match validated {
+        Ok((r, d)) => (r, d),
         Err(reason) => {
             report.ignored.push(format!("{rel}: {reason}"));
             return None;
         }
     };
+
     if let Err(reason) = epoch_gate(record.origin_mesh_epoch, manifest_epoch) {
         report.ignored.push(format!("{rel}: {reason}"));
         return None;
@@ -988,6 +1018,18 @@ fn pre_apply_gate(
             report.unauthorized_signer += 1;
             report.ignored.push(format!("{rel}: {reason}"));
             return None;
+        }
+    }
+    // Attach the RDF diagnostic AFTER signature verification, so the
+    // canonical signing bytes used for verification are over the record
+    // EXACTLY as it arrived — no metadata mutation beforehand.
+    if let Some(diag) = rdf_diagnostic {
+        if let Some(obj) = record.metadata.as_object_mut() {
+            obj.insert(
+                "rdf_diagnostic_violations".to_string(),
+                json!(diag.violations),
+            );
+            obj.insert("rdf_diagnostic_phase".to_string(), json!(diag.phase));
         }
     }
     Some(record)
@@ -2850,7 +2892,11 @@ mod tests {
             joined.contains("synaptic-mesh-record/v1"),
             "the supported version is named: {joined}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// A bundle-only record carrying a detectable secret is refused by
@@ -2871,7 +2917,11 @@ mod tests {
             joined.contains("secret scan"),
             "the refusal names the scan: {joined}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// A bundle-only record carrying a runtime procedure counter is
@@ -2884,8 +2934,7 @@ mod tests {
         let id = Uuid::new_v4();
         let mut value = simple_rule(id, "carries a local counter");
         value["metadata"]["remaining_fires"] = json!(3);
-        let (report, store) =
-            run_bundle_route("bundle-counter", bundle_record(value), None).await;
+        let (report, store) = run_bundle_route("bundle-counter", bundle_record(value), None).await;
         assert_eq!(report.applied, 0, "report: {report:?}");
         assert!(report.applied_ids.is_empty(), "report: {report:?}");
         assert_eq!(report.verified_signed, 0, "report: {report:?}");
@@ -2900,7 +2949,11 @@ mod tests {
             joined.contains(&id.to_string()),
             "the entry identifies the record: {joined}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// The per-record byte cap is part of the portable validation
@@ -2944,15 +2997,18 @@ mod tests {
         let id = Uuid::new_v4();
         let big_text = "x".repeat(MAX_RECORD_BYTES + 1);
         let record = bundle_record(simple_rule(id, &big_text));
-        let (report, store) =
-            run_bundle_route("bundle-over-cap", record, None).await;
+        let (report, store) = run_bundle_route("bundle-over-cap", record, None).await;
         assert_eq!(report.applied, 0, "report: {report:?}");
         assert!(report.applied_ids.is_empty(), "report: {report:?}");
         assert!(
             report.ignored.is_empty(),
             "an undecodable bundle leaves no report entry: {report:?}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// A bundle-only record born in an older epoch is rejected by the
@@ -2984,7 +3040,11 @@ mod tests {
             joined.contains("origin_mesh_epoch 1") && joined.contains("manifest epoch 2"),
             "both epochs are named: {joined}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// A bundle-only record in a namespace this node does not serve is
@@ -3003,8 +3063,7 @@ mod tests {
             None,
             json!({"text": "belongs to another team"}),
         );
-        let (report, store) =
-            run_bundle_route("bundle-unserved", bundle_record(value), None).await;
+        let (report, store) = run_bundle_route("bundle-unserved", bundle_record(value), None).await;
         assert_eq!(report.applied, 0, "report: {report:?}");
         assert_eq!(report.ignored.len(), 1, "report: {report:?}");
         let joined = report.ignored.join(" | ");
@@ -3012,7 +3071,11 @@ mod tests {
             joined.contains("elsewhere") && joined.contains("is not served"),
             "the unserved refusal is named: {joined}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// The legitimate replay path stays open: a valid, signed
@@ -3029,8 +3092,7 @@ mod tests {
         let mut record = bundle_record(simple_rule(id, "signed bundle record"));
         let key_dir = scratch("bundle-signed-key");
         let key_path = key_dir.join("signing.key");
-        crate::synaptic_mesh::worker::sign_record(&mut record, &key_path)
-            .expect("record signs");
+        crate::synaptic_mesh::worker::sign_record(&mut record, &key_path).expect("record signs");
         let signers = vec![super::super::manifest::SignerEntry {
             did: record
                 .signer_did
@@ -3045,7 +3107,10 @@ mod tests {
         let (report, store) =
             run_bundle_route_with_signers("bundle-signed", record, None, signers).await;
         assert_eq!(report.applied, 1, "report: {report:?}");
-        assert!(report.applied_ids.contains(&id.to_string()), "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
         assert_eq!(report.verified_signed, 1, "report: {report:?}");
         assert_eq!(report.unsigned_accepted, 0, "report: {report:?}");
         assert_eq!(report.unauthorized_signer, 0, "report: {report:?}");
@@ -3056,6 +3121,93 @@ mod tests {
             .unwrap()
             .expect("row applied from signed bundle");
         assert_eq!(payload.content, "signed bundle record");
+    }
+
+    /// A bundle-only record that is SIGNED over the canonical-JSON
+    /// payload and carries an RDF block with a Phase-1 violation (empty
+    /// `rdf.quads`) is still APPLIED: the RDF diagnostic is attached
+    /// AFTER signature verification, so the signature is checked over the
+    /// record exactly as it arrived.
+    ///
+    /// Before the deferral the diagnostic was inserted into
+    /// `record.metadata` before `verify_record_signature`. The canonical
+    /// JSON signing bytes cover `metadata`, so the valid signature no
+    /// longer matched and the whole record was ignored — a signed record
+    /// that arrived with a warn-worthy RDF block could never be applied.
+    ///
+    /// The record is signed over the canonical-JSON payload on purpose:
+    /// that is the payload whose bytes include `metadata`, and therefore
+    /// the one the diagnostic mutation could break. (A record signed over
+    /// the RDF payload — `{quads}\n{update_id}\n{origin_mesh_epoch}` —
+    /// would verify either way, because that payload carries no
+    /// metadata.)
+    #[tokio::test]
+    async fn bundle_only_signed_record_with_rdf_diagnostic_is_still_applied() {
+        let id = Uuid::new_v4();
+        let mut record = bundle_record(simple_rule(id, "signed bundle record with rdf diagnostic"));
+        // An RDF block that trips a Phase-1 canonical-RDF violation.
+        record.rdf = Some(RdfBlock {
+            schema: "neurostrata-rdf-record/v1".to_string(),
+            format: "n-quads".to_string(),
+            canonical_hash: String::new(),
+            quads: String::new(),
+        });
+        let key_dir = scratch("bundle-rdf-diagnostic-key");
+        let key_path = key_dir.join("signing.key");
+        let (pkey, did, pubkey) =
+            crate::did::load_or_generate_keypair(&key_path).expect("the scratch signing key loads");
+        // Sign over the canonical-JSON bytes of the record AS IT ARRIVED:
+        // the signer DID and public key are part of those bytes, the
+        // signature field is not (it is stripped before canonicalizing),
+        // and the Phase-1 diagnostic is not in them yet.
+        record.signer_did = Some(did.clone());
+        record.public_key = Some(hex::encode(&pubkey));
+        let payload = crate::did::canonical_signing_bytes(
+            &serde_json::to_value(&record).expect("the record canonicalizes"),
+        )
+        .expect("the canonical signing bytes are computable");
+        let sig = crate::did::sign(&payload, &pkey).expect("the record signs");
+        record.signature = Some(crate::did::encode_base64(&sig));
+        let signers = vec![super::super::manifest::SignerEntry {
+            did: record
+                .signer_did
+                .clone()
+                .expect("a signed record carries a signer DID"),
+            public_key: record
+                .public_key
+                .clone()
+                .expect("a signed record carries a public key"),
+            role: "signer".to_string(),
+        }];
+        let (report, store) =
+            run_bundle_route_with_signers("bundle-rdf-diagnostic", record, None, signers).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert_eq!(report.verified_signed, 1, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 0, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied from signed bundle");
+        assert_eq!(
+            payload
+                .metadata
+                .get("rdf_diagnostic_phase")
+                .and_then(|v| v.as_str()),
+            Some("1"),
+            "the applied record still carries the Phase-1 diagnostic: {:?}",
+            payload.metadata
+        );
+        let violations = payload
+            .metadata
+            .get("rdf_diagnostic_violations")
+            .and_then(|v| v.as_array())
+            .expect("the applied record still carries the diagnostic violations");
+        assert!(
+            !violations.is_empty(),
+            "the diagnostic names at least one violation"
+        );
     }
 
     /// A bundle record signed with a scratch key and then tampered
@@ -3070,8 +3222,7 @@ mod tests {
         let mut record = bundle_record(simple_rule(id, "signed bundle record"));
         let key_dir = scratch("bundle-tampered-key");
         let key_path = key_dir.join("signing.key");
-        crate::synaptic_mesh::worker::sign_record(&mut record, &key_path)
-            .expect("record signs");
+        crate::synaptic_mesh::worker::sign_record(&mut record, &key_path).expect("record signs");
         record.content = json!({"text": "tampered after signing"});
         let (report, store) = run_bundle_route("bundle-tampered", record, None).await;
         assert_eq!(report.applied, 0, "report: {report:?}");
@@ -3089,7 +3240,11 @@ mod tests {
             joined.contains(&id.to_string()),
             "the entry identifies the record: {joined}"
         );
-        assert_eq!(row_count(&store, "probe").await, 0, "nothing reached the store");
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
     }
 
     /// Behavioural equivalence: the same record is accepted or rejected
@@ -3113,8 +3268,7 @@ mod tests {
         let pat_meta = format!("ghp_{}", "C".repeat(36));
         let mut metadata_secret =
             simple_rule(metadata_secret_id, "clean content, secret in metadata");
-        metadata_secret["metadata"]["note"] =
-            json!(format!("use this token: {pat_meta}"));
+        metadata_secret["metadata"]["note"] = json!(format!("use this token: {pat_meta}"));
         let cases: Vec<(&str, Value, usize)> = vec![
             ("valid", simple_rule(valid_id, "applies on both routes"), 1),
             (
@@ -3219,8 +3373,7 @@ mod tests {
         // in epoch 1): both routes refuse with the epoch gate's reason.
         let epoch_id = Uuid::new_v4();
         let epoch_value = simple_rule(epoch_id, "born before the migration");
-        let (json_report, _) =
-            run_json_route("equiv-json-epoch", &epoch_value, Some(2)).await;
+        let (json_report, _) = run_json_route("equiv-json-epoch", &epoch_value, Some(2)).await;
         let (bundle_report, _) =
             run_bundle_route("equiv-bundle-epoch", bundle_record(epoch_value), Some(2)).await;
         assert_eq!(json_report.applied, 0, "json report: {json_report:?}");
