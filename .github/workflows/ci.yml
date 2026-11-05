@@ -74,9 +74,9 @@ jobs:
           echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
 
       # src/task/harness_plugins.rs embeds plugins/opencode/dist/index.js with
-      # include_str!, and PR #52 tracked the dist/ bundle into the repo, so
-      # the bundle is present on a fresh checkout and no plugin build is
-      # needed before the guard and the compile.
+      # include_str!, and the dist/ bundle is tracked in the repo, so the
+      # bundle is present on a fresh checkout and no plugin build is needed
+      # before the guard and the compile.
 
       # Diagnostic only: names any missing include_str! target before
       # cargo fails on it opaquely. Passing here is not acceptance — a
@@ -143,9 +143,9 @@ jobs:
             exit 1
           }
 
-      # The bundles PR #52 tracked into the repo now provide the
-      # include_str! target on a fresh checkout, so no plugin build is
-      # needed here (see the build job for the rationale).
+      # The tracked plugin bundles now provide the include_str! target on a
+      # fresh checkout, so no plugin build is needed here (see the build job
+      # for the rationale).
 
       # Diagnostic only, as in the build job: names any missing include_str!
       # target before cargo fails on it opaquely. A local pass is not

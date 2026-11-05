@@ -4,8 +4,8 @@
 # (see .github/workflows/ci.yml).
 #
 # Why: src/task/harness_plugins.rs embeds plugin bundles with include_str!.
-# Since PR #52 the bundles are tracked in git, so they are present on a fresh
-# checkout. Without them, cargo fails with an include_str! error that does
+# The bundles are tracked in git, so they are present on a fresh checkout.
+# Without them, cargo fails with an include_str! error that does
 # not name the missing file at fault. This guard fails first, naming the
 # missing target(s) explicitly.
 #
