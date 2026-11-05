@@ -69,7 +69,7 @@ All of that cognitive machinery lives inside **one self-managing binary**. There
 > `cargo build`.) Run, from the repository root:
 >
 > ```bash
-> cd plugins/opencode && npm install && npm run build
+> (cd plugins/opencode && npm install && npm run build)
 > ```
 >
 > This step needs Node 22 (the plugin declares `engines >= 18`, and CI pins
