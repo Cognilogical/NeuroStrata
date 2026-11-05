@@ -1595,8 +1595,18 @@ mod tests {
     }
 
     /// (a) A lifecycle transition preserves `created_at` / `created_by`
-    /// from the existing record — both signed fields — so the stored
-    /// record only verifies if it was signed after that preservation.
+    /// from the existing record, and the stored record verifies against
+    /// its stored signature afterwards.
+    ///
+    /// Accuracy note: this test does NOT isolate lifecycle preservation
+    /// as an independent gate. The existing record here carries an RDF
+    /// block, so preservation and the RDF rebuild co-occur on this
+    /// path: in the RDF-present path the preserved lifecycle fields
+    /// enter the signed bytes only via the rebuild's quads (the rebuilt
+    /// block is built from the post-preservation record), so this
+    /// test's pre-fix failure is rebuild-mediated. Tests (a) and (b)
+    /// exercise preservation and rebuild as they co-occur on this
+    /// path, not as two independent gates.
     /// FAILS on the pre-fix order, passes after.
     #[test]
     fn a_preserved_lifecycle_record_verifies_against_its_stored_signature() {
@@ -1707,6 +1717,115 @@ mod tests {
             rdf.quads.contains(&preserved_created_at),
             "the rebuilt quads carry the preserved created_at: {}",
             rdf.quads
+        );
+        assert_verified(&mesh, &record);
+    }
+
+    /// (e) The preservation-only corner tests (a)/(b) cannot reach:
+    /// `build_record` always attaches an RDF block, so an existing
+    /// record with `rdf == None` never arises from a drain. On that
+    /// corner preservation still mutates `created_at` / `created_by` /
+    /// `origin_mesh_epoch`, but the RDF rebuild is skipped (there is
+    /// no existing block to rebuild from). The corner is constructed
+    /// by hand: create the record through the normal signed drain,
+    /// then rewrite the stored file with its `rdf` field removed.
+    /// Removal matches the on-disk serde shape of `rdf: None` —
+    /// `MeshRecord.rdf` is
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`,
+    /// so a `None` block serializes as the field's absence and the
+    /// hand-written file parses back through the same parse
+    /// `load_existing` performs. The final record's RDF block is the
+    /// one `build_record` attached to the second entry (never rebuilt,
+    /// never replaced); the signature's discrimination here rests on
+    /// `origin_mesh_epoch`, a direct component of the signing payload,
+    /// which preservation pulls back from 2 to the hand-written
+    /// record's 1 — the stored record only verifies if it was signed
+    /// after preservation, with no rebuild in between.
+    /// FAILS on the pre-fix order, passes after.
+    #[test]
+    fn a_preserved_record_whose_existing_record_has_no_rdf_block_verifies() {
+        let (mesh, outbox) = fixture("sign-after-preserve-no-rdf", None);
+        let _key_path = signing_key(&mesh);
+        let id = Uuid::now_v7();
+
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
+        drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_verified(&mesh, &stored_record(&mesh, &id));
+
+        // Hand-rewrite the stored record with its `rdf` field removed
+        // (see the doc comment for why removal matches the on-disk
+        // serde shape of `rdf: None`).
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        let removed = value
+            .as_object_mut()
+            .expect("the stored record is a JSON object")
+            .remove("rdf");
+        assert!(
+            removed.is_some(),
+            "the created record stored an RDF block to remove"
+        );
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+        )
+        .unwrap();
+
+        // The hand-written file loads as a record with no RDF block,
+        // still carrying the lifecycle fields preservation must keep.
+        let hand_written = stored_record(&mesh, &id);
+        assert!(
+            hand_written.rdf.is_none(),
+            "the hand-written record has no RDF block"
+        );
+        assert_eq!(hand_written.lifecycle.created_by, "node-author");
+        assert_eq!(hand_written.origin_mesh_epoch, 1);
+
+        // Migrate the mesh to epoch 2, then archive the record from a
+        // DIFFERENT author at a later timestamp with an epoch-2 entry:
+        // the freshly built record would carry the new `created_at`,
+        // `created_by` ("node-other") and `origin_mesh_epoch` (2);
+        // preservation must overwrite all three with the hand-written
+        // record's — and, `existing.rdf` being `None`, no rebuild runs.
+        let mesh = reopen_with_epoch(&mesh, 2);
+        let archive = OutboxEntry {
+            stable_op_id: Uuid::now_v7(),
+            op: OP_ARCHIVED.to_string(),
+            id: id.to_string(),
+            namespace: "ns".to_string(),
+            memory_type: "rule".to_string(),
+            content: "the memory text".to_string(),
+            metadata: json!({ "eligibility": "shareable", "archived_at": 1_700_000_100_i64 }),
+            superseded_by: None,
+            ts: 1_700_000_100,
+            epoch: 2,
+        };
+        outbox.append(&archive).unwrap();
+        drain_once(&outbox, &mesh, "node-other").unwrap();
+
+        let record = stored_record(&mesh, &id);
+        // Preservation really happened (the mutation the signature must
+        // cover), and the state transition landed.
+        assert_eq!(record.lifecycle.state, LifecycleState::Archived);
+        assert_eq!(
+            record.lifecycle.created_at,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            "created_at is preserved from the hand-written record"
+        );
+        assert_eq!(
+            record.lifecycle.created_by, "node-author",
+            "created_by is preserved from the hand-written record"
+        );
+        assert_eq!(
+            record.origin_mesh_epoch, 1,
+            "origin epoch is preserved from the hand-written record"
         );
         assert_verified(&mesh, &record);
     }
@@ -1850,11 +1969,19 @@ mod tests {
     }
 
     /// (d) A fresh record with no existing counterpart undergoes no
-    /// preservation and no rebuild, so its signature path is unaffected
-    /// by the reorder: the stored record verifies, and re-signing the
-    /// stored form with the same key reproduces the stored signature
-    /// byte-for-byte (Ed25519 signing is deterministic), yielding a
-    /// record identical to the stored one.
+    /// preservation and no rebuild: the stored record verifies, and
+    /// re-signing the stored form with the same key reproduces the
+    /// stored signature byte-for-byte (Ed25519 signing is deterministic),
+    /// yielding a record identical to the stored one.
+    ///
+    /// Accuracy note: this proves self-consistency — the stored form
+    /// re-signs to itself — not byte-identity against pre-fix output:
+    /// the test holds no golden (pre-fix) signature or record value to
+    /// compare against. The byte-identity property ("signs exactly as
+    /// before") rests on the construction — `build_record` and the
+    /// signing path are unchanged by the reorder, and on the fresh
+    /// path no mutation intervenes between build and seal — rather
+    /// than on this test alone.
     #[test]
     fn a_fresh_record_with_no_existing_counterpart_signs_exactly_as_before() {
         let (mesh, outbox) = fixture("sign-fresh-unaffected", None);
