@@ -74,24 +74,14 @@ jobs:
           echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
 
       # src/task/harness_plugins.rs embeds plugins/opencode/dist/index.js with
-      # include_str!, but that file is a gitignored build artifact (see
-      # .gitignore), so a fresh checkout cannot build without this step.
-      # Sibling plugins track their dist/ output; opencode does not, by
-      # design — it is rebuilt here instead (Issue #42, Option B).
-      - name: Set up Node.js for opencode plugin build
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+      # include_str!, and PR #52 tracked the dist/ bundle into the repo, so
+      # the bundle is present on a fresh checkout and no plugin build is
+      # needed before the guard and the compile.
 
-      - name: Build opencode plugin
-        shell: bash
-        working-directory: plugins/opencode
-        run: npm install && npm run build
-
-      # Diagnostic only: names any include_str! target still missing before
+      # Diagnostic only: names any missing include_str! target before
       # cargo fails on it opaquely. Passing here is not acceptance — a
       # persisting local dist/ would also pass; only a fresh-checkout CI
-      # run proves the plugin-build step works.
+      # run proves the bundle is tracked.
       - name: Guard include_str targets
         shell: bash
         run: bash scripts/check-include-str-targets.sh
@@ -153,23 +143,13 @@ jobs:
             exit 1
           }
 
-      # Same reason as in the build job: the test job compiles the crate
-      # (cargo test builds it first), and src/task/harness_plugins.rs embeds
-      # plugins/opencode/dist/index.js, a gitignored build artifact absent
-      # from a fresh checkout. Build it here, before the first compiling step.
-      - name: Set up Node.js for opencode plugin build
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Build opencode plugin
-        shell: bash
-        working-directory: plugins/opencode
-        run: npm install && npm run build
+      # The bundles PR #52 tracked into the repo now provide the
+      # include_str! target on a fresh checkout, so no plugin build is
+      # needed here (see the build job for the rationale).
 
       # Diagnostic only, as in the build job: names any missing include_str!
       # target before cargo fails on it opaquely. A local pass is not
-      # acceptance; only a fresh-checkout CI run proves the step works.
+      # acceptance; only a fresh-checkout CI run proves the bundle is tracked.
       - name: Guard include_str targets
         shell: bash
         run: bash scripts/check-include-str-targets.sh

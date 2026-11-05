@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 # Guard: every include_str! target in src/task/harness_plugins.rs must exist
-# on disk at this point in the pipeline. Run AFTER the plugin-build step and
-# BEFORE `cargo build` in CI (see .github/workflows/ci.yml).
+# on disk at this point in the pipeline. Run BEFORE `cargo build` in CI
+# (see .github/workflows/ci.yml).
 #
 # Why: src/task/harness_plugins.rs embeds plugin bundles with include_str!.
-# One target, plugins/opencode/dist/index.js, is a build artifact that is
-# gitignored (see .gitignore) and therefore absent from a fresh checkout.
-# Without a prior plugin build, cargo fails with an include_str! error that
-# does not name the CI step at fault. This guard fails first, naming the
+# Since PR #52 the bundles are tracked in git, so they are present on a fresh
+# checkout. Without them, cargo fails with an include_str! error that does
+# not name the missing file at fault. This guard fails first, naming the
 # missing target(s) explicitly.
 #
 # Diagnostic only: passing here does NOT prove CI is green. A persisting
-# local dist/ makes this pass regardless of whether the CI plugin-build
-# step works; only the PR's fresh-checkout CI run proves that (see AC1
-# for Issue #42).
+# dist/ makes this pass regardless of whether CI ever built from a fresh
+# checkout; only a fresh-checkout CI run proves the bundle is tracked.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

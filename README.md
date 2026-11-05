@@ -61,22 +61,23 @@ All of that cognitive machinery lives inside **one self-managing binary**. There
 
 ### 1. First-Time Install (Once Per Machine)
 
-> **Build the OpenCode plugin first.** `src/task/harness_plugins.rs` embeds
-> `plugins/opencode/dist/index.js` with `include_str!`, but that file is a
-> gitignored build artifact — it is absent from a fresh clone, so the Rust
-> build fails without this step. (Sibling plugins track their `dist/`
-> output; opencode is rebuilt instead, and CI does the same step before
-> `cargo build`.) Run, from the repository root:
+> **No plugin build step needed for a fresh checkout.** `src/task/harness_plugins.rs`
+> embeds `plugins/opencode/dist/index.js` with `include_str!`, and PR #52 tracked
+> that bundle into the repository, so it is present on a fresh clone and the Rust
+> build compiles without any manual step. The CI include-str guard runs before the
+> first compiling step to assert the bundle exists.
+
+> **Rebuilding the OpenCode plugin.** If you edit plugin sources under
+> `plugins/opencode/`, you must rebuild the bundle and commit it before the change
+> ships — the Rust binary embeds the committed `dist/index.js`, not the source.
+> From the repository root:
 >
 > ```bash
 > (cd plugins/opencode && npm install && npm run build)
 > ```
 >
 > This step needs Node 22 (the plugin declares `engines >= 18`, and CI pins
-> Node 22 via `actions/setup-node`). Note the remainder honestly: a local
-> fresh clone still needs this manual step — only tracking `dist/index.js`
-> in git would remove it, and that is a separate, reviewer-gated fallback,
-> not this change.
+> Node 22 via `actions/setup-node`).
 ```bash
 # 1. Build and install the single Rust binary (includes embedded LadybugDB + OxiRS + ONNX)
 scripts/build.sh
