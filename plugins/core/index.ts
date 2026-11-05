@@ -867,6 +867,38 @@ let config: PluginConfig = DEFAULT_CONFIG;
 let mcpClient: NeuroStrataMCPClient | undefined = undefined;
 let pluginCtx: any | null = null;
 
+const TASK_MUTATION_TOOLS = new Set([
+  "neurostrata_task_claim",
+  "neurostrata_task_update",
+  "neurostrata_task_complete",
+]);
+
+function trackNativeTaskToolCall(
+  toolName: string,
+  payloadArgs: Record<string, unknown>,
+  outerInput?: Record<string, unknown>,
+): void {
+  if (!TASK_MUTATION_TOOLS.has(toolName)) return;
+  const sessionId =
+    asString(payloadArgs.session_id) ??
+    asString(outerInput?.session_id) ??
+    asString(outerInput?.sessionID);
+  if (sessionId) activeSessionId = sessionId;
+  const taskId = asString(payloadArgs.id);
+  if (
+    toolName === "neurostrata_task_claim" ||
+    toolName === "neurostrata_task_complete" ||
+    payloadArgs.note !== undefined
+  ) {
+    mutationsSinceNote = 0;
+  }
+  if (toolName === "neurostrata_task_complete") {
+    activeTaskId = null;
+  } else if (taskId) {
+    activeTaskId = taskId;
+  }
+}
+
 export let activeSessionId: string | null = null;
 export let activeTaskId: string | null = null;
 export let mutationsSinceNote = 0;
@@ -961,6 +993,9 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     }
   }
 
+  // Track native task mutation tools (claim/update/complete).
+  trackNativeTaskToolCall(toolName, firstRecord(args, altArgs), asRecord(input));
+
   // Enhancement 2 & 3: subagent tool prompt enrichment.
   if (isSubagentTool(toolName)) {
     const target =
@@ -1043,8 +1078,8 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
         if (message.includes("Zero-Action Start violation:") || message.includes("Guard rejected")) throw err;
         throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
       }
-      mutationsSinceNote++;
     }
+    mutationsSinceNote++;
   }
 
   if (block) return { additionalContext: block, neurostrataContext: block, snippets };
@@ -1059,7 +1094,7 @@ let initializeResolveGuard = false;
 
 export async function initialize(ctx: any): Promise<void> {
   pluginCtx = ctx;
-  config = resolveConfig(ctx?.config ?? {});
+  config = resolveConfig(ctx?.config ?? ctx?.pluginConfig ?? {});
   const token = config.bearerToken ?? loadDaemonToken(config.tokenFile);
   mcpClient = new NeuroStrataMCPClient({ endpoint: config.endpoint, token, timeoutMs: config.requestTimeoutMs });
 
@@ -1080,6 +1115,39 @@ export async function initialize(ctx: any): Promise<void> {
     }
   };
 
+  // Alternative hook handler for beforeToolExec, beforeToolCall, beforeCommand (used by Codex / GitHub CLI hosts):
+  const altBeforeHook = async (input: any): Promise<any> => {
+    const toolName: string =
+      input?.tool ?? input?.tool_name ?? input?.name ?? input?.action ?? input?.command ?? "";
+    if (isSubagentTool(toolName)) {
+      if (!activeTaskId) {
+        try {
+          await resolveActiveTaskFromDaemon(config.namespace);
+        } catch {
+          // fail-soft
+        }
+      }
+      const targets: Record<string, unknown>[] = [];
+      if (input?.input && typeof input.input === "object") {
+        targets.push(input.input as Record<string, unknown>);
+      }
+      if (input?.args && typeof input.args === "object") {
+        targets.push(input.args as Record<string, unknown>);
+      }
+      if (targets.length === 0 && input && typeof input === "object") {
+        targets.push(input as Record<string, unknown>);
+      }
+      for (const target of targets) {
+        try {
+          await enrichAndInjectSubagentPrompt(target, config.namespace, activeTaskId);
+        } catch {
+          injectSubagentPrompt(target, config.namespace, activeTaskId);
+        }
+      }
+    }
+    return input;
+  };
+
   // Register execute.after FIRST, execute.before SECOND (tests overwrite registeredHook
   // on each ctx.tool.hook call and expect execute.before as the last registered hook).
   await registerHook("execute.after", executeAfterHandler);
@@ -1088,6 +1156,21 @@ export async function initialize(ctx: any): Promise<void> {
   // Claude Code style hook events.
   if (ctx?.hooks?.PreToolUse && typeof ctx.hooks.PreToolUse === "function") {
     await ctx.hooks.PreToolUse(async (event: Record<string, unknown>) => handleHookEvent(event));
+  }
+
+  // Fix 2: Register beforeToolExec, beforeToolCall, beforeCommand, and onTurnEnd hooks
+  // (used by Codex / GitHub CLI hosts that route tool calls through these hook names).
+  if (ctx?.hooks?.beforeToolExec && typeof ctx.hooks.beforeToolExec === "function") {
+    await ctx.hooks.beforeToolExec(altBeforeHook);
+  }
+  if (ctx?.hooks?.beforeToolCall && typeof ctx.hooks.beforeToolCall === "function") {
+    await ctx.hooks.beforeToolCall(altBeforeHook);
+  }
+  if (ctx?.hooks?.beforeCommand && typeof ctx.hooks.beforeCommand === "function") {
+    await ctx.hooks.beforeCommand(altBeforeHook);
+  }
+  if (ctx?.hooks?.onTurnEnd && typeof ctx.hooks.onTurnEnd === "function") {
+    await ctx.hooks.onTurnEnd(onTurnEnd);
   }
 
   await negotiateCapabilities();
@@ -1134,6 +1217,9 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
   const toolInput = firstRecord(event.tool_input ?? event.input ?? event.args ?? {});
 
   if (hookEventName === "PreToolUse") {
+    // Track native task mutation tools (claim/update/complete) for state bookkeeping.
+    trackNativeTaskToolCall(toolNameRaw, firstRecord(toolInput), asRecord(event));
+
     // Code execution: inspect OpenCode V2 Code Mode to update task/session state.
     if (isCodeExecTool(toolNameRaw)) {
       const code = String(toolInput.code ?? asRecord(toolInput.input)?.code ?? "");
@@ -1223,10 +1309,9 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
             },
           };
         }
-        mutationsSinceNote++;
       }
+      mutationsSinceNote++;
     }
-
     return {
       continue: true,
       ...(recallBlock ? { systemMessage: recallBlock } : {}),

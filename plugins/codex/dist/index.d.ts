@@ -228,15 +228,5 @@ export declare function createHarnessPlugin(pluginId?: string, harnessName?: str
     fetchContextPlan: typeof fetchContextPlan;
     adapterStatus: typeof adapterStatus;
 };
-    id: string;
-    name: string;
-    setup: typeof initialize;
-    initialize: typeof initialize;
-    handleHookEvent: typeof handleHookEvent;
-    handleClaudeHookEvent: typeof handleHookEvent;
-    onTurnEnd: typeof onTurnEnd;
-    fetchContextPlan: typeof fetchContextPlan;
-    adapterStatus: typeof adapterStatus;
-};
 export declare const plugin: ReturnType<typeof createHarnessPlugin>;
 export default plugin;

@@ -5,10 +5,11 @@
   "types": "./dist/index.d.ts",
   "version": "1.14.3",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test test.mjs"
   },
+  "files": ["index.ts", "dist", "cli-hook.mjs", "README.md"],
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"

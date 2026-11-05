@@ -18,13 +18,24 @@ if [ -z "$NAMESPACE" ]; then
 fi
 
 # ── Collect staged file paths (excluding .NeuroStrata/ internal files) ───────
-StagedFiles=$(git diff --name-only --cached | grep -v '^\.NeuroStrata/' | sort -u)
-if [ -z "$StagedFiles" ]; then
-    StagedFiles=$(git diff --name-only | grep -v '^\.NeuroStrata/' | sort -u)
+StagedFiles=()
+while IFS= read -r -d '' file; do
+    case "$file" in
+        .NeuroStrata/*|"") ;;
+        *) StagedFiles+=("$file") ;;
+    esac
+done < <(git diff --name-only -z --cached 2>/dev/null)
+if [ "${#StagedFiles[@]}" -eq 0 ]; then
+    while IFS= read -r -d '' file; do
+        case "$file" in
+            .NeuroStrata/*|"") ;;
+            *) StagedFiles+=("$file") ;;
+        esac
+    done < <(git diff --name-only -z 2>/dev/null)
 fi
 
 # ── Check each staged file / ancestor dir-prefix against session_queries.json ──
-for file in $StagedFiles; do
+for file in "${StagedFiles[@]}"; do
     matched=0
     if [ -f "$LEDGER" ]; then
         if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
@@ -53,7 +64,7 @@ mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
-for file in $StagedFiles; do
+for file in "${StagedFiles[@]}"; do
     if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
         continue
     fi
@@ -104,40 +115,68 @@ for file in $StagedFiles; do
     else
         TMP=$(mktemp)
         awk -v ns="$NAMESPACE" -v file="$file" -v ts="$TS" '
+          function print_entry(comma) {
+            print "    {"
+            print "      \"ts\": " ts ","
+            print "      \"tool\": \"pre-commit\","
+            print "      \"query\": \"" file "\","
+            print "      \"domains\": [\"" file "\"],"
+            print "      \"returned_ids\": [],"
+            print "      \"governed_prefixes\": [\"" file "\"]"
+            if (comma) {
+              print "    },"
+            } else {
+              print "    }"
+            }
+          }
           BEGIN {
             gsub(/\\/, "\\\\", file)
             gsub(/"/, "\\\"", file)
             found = 0
             inserted = 0
+            pending_open = 0
           }
           {
-            if ($0 ~ ("\"" file "\"")) found = 1
-            if (!inserted && !found && $0 ~ /"queries"[[:space:]]*:[[:space:]]*\[/) {
-              if ($0 ~ /\[[[:space:]]*\][[:space:]]*$/) {
-                sub(/\[[[:space:]]*\][[:space:]]*$/, "[", $0)
+            if (index($0, "\"" file "\"") > 0) found = 1
+            if (pending_open) {
+              if ($0 ~ /^[[:space:]]*\]/) {
+                print_entry(0)
                 print $0
-                print "    {"
-                print "      \"ts\": " ts ","
-                print "      \"tool\": \"pre-commit\","
-                print "      \"query\": \"" file "\","
-                print "      \"domains\": [\"" file "\"],"
-                print "      \"returned_ids\": [],"
-                print "      \"governed_prefixes\": [\"" file "\"]"
-                print "    }"
-                print "  ]"
+                inserted = 1
+                pending_open = 0
+                next
+              } else if ($0 ~ /^[[:space:]]*$/) {
+                print $0
+                next
+              } else {
+                print_entry(1)
+                print $0
+                inserted = 1
+                pending_open = 0
+                next
+              }
+            }
+            if (!inserted && !found && $0 ~ /"queries"[[:space:]]*:[[:space:]]*\[/) {
+              if ($0 ~ /\[[[:space:]]*\][[:space:]]*,?[[:space:]]*$/) {
+                has_trailing_comma = ($0 ~ /\][[:space:]]*,[[:space:]]*$/)
+                sub(/\[[[:space:]]*\][[:space:]]*,?[[:space:]]*$/, "[", $0)
+                print $0
+                print_entry(0)
+                print (has_trailing_comma ? "  ]," : "  ]")
+                inserted = 1
+                next
+              } else if ($0 ~ /\[[[:space:]]*\{/) {
+                idx = index($0, "[")
+                print substr($0, 1, idx)
+                print_entry(1)
+                rest = substr($0, idx + 1)
+                sub(/^[[:space:]]*/, "", rest)
+                print "    " rest
                 inserted = 1
                 next
               } else {
                 print $0
-                print "    {"
-                print "      \"ts\": " ts ","
-                print "      \"tool\": \"pre-commit\","
-                print "      \"query\": \"" file "\","
-                print "      \"domains\": [\"" file "\"],"
-                print "      \"returned_ids\": [],"
-                print "      \"governed_prefixes\": [\"" file "\"]"
-                print "    }"
-                inserted = 1
+                pending_open = 1
                 next
               }
             }
@@ -145,16 +184,16 @@ for file in $StagedFiles; do
           }
           END {
             if (found) exit
+            if (pending_open && !inserted) {
+              print_entry(0)
+              print "  ]"
+              inserted = 1
+            }
             if (!inserted) {
+              print "{"
+              print "  \"namespace\": \"" ns "\","
               print "  \"queries\": ["
-              print "    {"
-              print "      \"ts\": " ts ","
-              print "      \"tool\": \"pre-commit\","
-              print "      \"query\": \"" file "\","
-              print "      \"domains\": [\"" file "\"],"
-              print "      \"returned_ids\": [],"
-              print "      \"governed_prefixes\": [\"" file "\"]"
-              print "    }"
+              print_entry(0)
               print "  ]"
               print "}"
             }

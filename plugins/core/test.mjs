@@ -713,3 +713,177 @@ describe("ESM-only surface", () => {
     assert.ok(!/require\s*\(/.test(code), "compiled core dist must not contain require()");
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────
+// Round-2 PR review regression tests
+// ──────────────────────────────────────────────────────────────────────
+
+describe("native task tool tracking + hook registration + pre-commit awk fallback", () => {
+  it("resets mutationsSinceNote on native neurostrata_task_claim / update(note) / complete in execute.before and handleHookEvent", async () => {
+    const { server, url: endpoint } = await createMockDaemonServer();
+    try {
+      resetClientForTesting();
+      let beforeHook = null;
+      await initialize({
+        config: {
+          namespace: "native-task-ns",
+          endpoint,
+          bearerToken: "tok",
+          strictMode: true,
+          requestTimeoutMs: 1000,
+        },
+        tool: {
+          hook: async (name, fn) => {
+            if (name === "execute.before") beforeHook = fn;
+          },
+        },
+      });
+
+      // Claim task via native tool call in execute.before
+      await beforeHook({
+        tool: "neurostrata_task_claim",
+        args: { id: "neurostrata-native1", session_id: "ses-native" },
+      });
+      assert.equal(getTrackingState().activeTaskId, "neurostrata-native1");
+      assert.equal(getTrackingState().activeSessionId, "ses-native");
+      assert.equal(getTrackingState().mutationsSinceNote, 0);
+
+      await beforeHook({ tool: "edit", args: { path: "src/a.rs" } });
+      await beforeHook({ tool: "edit", args: { path: "src/b.rs" } });
+      assert.equal(getTrackingState().mutationsSinceNote, 2);
+
+      // Native neurostrata_task_update with note resets mutationsSinceNote to 0
+      await beforeHook({
+        tool: "neurostrata_task_update",
+        args: { id: "neurostrata-native1", note: "Breath checkpoint" },
+      });
+      assert.equal(getTrackingState().mutationsSinceNote, 0, "execute.before native task_update(note) resets counter");
+
+      // Same via handleHookEvent (Claude / CLI PreToolUse)
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "Edit",
+        tool_input: { file_path: "src/d.rs" },
+      });
+      assert.equal(getTrackingState().mutationsSinceNote, 1);
+
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "neurostrata_task_update",
+        tool_input: { id: "neurostrata-native1", note: "Claude breath" },
+      });
+      assert.equal(getTrackingState().mutationsSinceNote, 0, "handleHookEvent native task_update(note) resets counter");
+
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "neurostrata_task_complete",
+        tool_input: { id: "neurostrata-native1" },
+      });
+      assert.equal(getTrackingState().activeTaskId, null, "native task_complete clears activeTaskId");
+    } finally {
+      server.close();
+      resetClientForTesting();
+    }
+  });
+
+  it("initialize registers beforeToolExec, beforeToolCall, beforeCommand, and onTurnEnd on ctx.hooks", async () => {
+    const { SUBAGENT_CONTEXT_MARKER } = await import("./dist/index.js");
+    let beforeToolExecFn = null;
+    let beforeToolCallFn = null;
+    let beforeCommandFn = null;
+    let onTurnEndFn = null;
+
+    resetClientForTesting();
+    await initialize({
+      config: {
+        namespace: "hooks-ns",
+        endpoint: "http://127.0.0.1:1/mcp",
+        bearerToken: "tok",
+        strictMode: false,
+        requestTimeoutMs: 50,
+      },
+      hooks: {
+        beforeToolExec: async (fn) => {
+          beforeToolExecFn = fn;
+        },
+        beforeToolCall: async (fn) => {
+          beforeToolCallFn = fn;
+        },
+        beforeCommand: async (fn) => {
+          beforeCommandFn = fn;
+        },
+        onTurnEnd: async (fn) => {
+          onTurnEndFn = fn;
+        },
+      },
+    });
+
+    assert.equal(typeof beforeToolExecFn, "function");
+    assert.equal(typeof beforeToolCallFn, "function");
+    assert.equal(typeof beforeCommandFn, "function");
+    assert.equal(typeof onTurnEndFn, "function");
+
+    const callPayload = { tool: "subagent", input: { prompt: "Check status" } };
+    await beforeToolCallFn(callPayload);
+    assert.ok(callPayload.input.prompt.includes(SUBAGENT_CONTEXT_MARKER));
+
+    const cmdPayload = { command: "Task", args: { prompt: "Run worker" } };
+    await beforeCommandFn(cmdPayload);
+    assert.ok(cmdPayload.args.prompt.includes(SUBAGENT_CONTEXT_MARKER));
+    resetClientForTesting();
+  });
+
+  it("pre-commit awk fallback handles filenames with spaces and & and produces valid comma-separated JSON", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-awk-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
+    try {
+      for (const cmd of ["bash", "sh", "git", "grep", "sed", "awk", "date", "mkdir", "printf", "mktemp", "mv", "rm", "dirname", "basename", "head", "pwd"]) {
+        for (const prefix of ["/usr/bin", "/bin"]) {
+          try {
+            symlinkSync(join(prefix, cmd), join(binDir, cmd));
+            break;
+          } catch {}
+        }
+      }
+
+      execFileSync("git", ["init", "-q"], { cwd: repoDir });
+      mkdirSync(join(repoDir, "src"), { recursive: true });
+      writeFileSync(join(repoDir, "src", "file one.rs"), "fn a() {}\n");
+      execFileSync("git", ["add", "src/file one.rs"], { cwd: repoDir });
+
+      const hookPath = join(repoDir, "pre-commit-test.sh");
+      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      chmodSync(hookPath, 0o755);
+
+      // Run 1: populates empty queries array with "src/file one.rs"
+      execFileSync(hookPath, [], {
+        cwd: repoDir,
+        env: { PATH: binDir, HOME: repoDir },
+      });
+
+      const ledgerPath = join(repoDir, ".NeuroStrata", "session_queries.json");
+      const doc1 = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      assert.equal(doc1.queries.length, 1);
+      assert.equal(doc1.queries[0].query, "src/file one.rs");
+
+      // Run 2: stages second file with '&' and appends to populated queries array
+      writeFileSync(join(repoDir, "src", "a&b.rs"), "fn b() {}\n");
+      execFileSync("git", ["add", "src/a&b.rs"], { cwd: repoDir });
+      execFileSync(hookPath, [], {
+        cwd: repoDir,
+        env: { PATH: binDir, HOME: repoDir },
+      });
+
+      const doc2 = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      assert.equal(doc2.queries.length, 2);
+      const queries = doc2.queries.map((q) => q.query).sort();
+      assert.deepEqual(queries, ["src/a&b.rs", "src/file one.rs"]);
+    } finally {
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+});

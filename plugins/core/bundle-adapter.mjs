@@ -23,7 +23,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(__dirname, "..");
 
 function stripCoreFooter(content) {
-  return content
+  const withoutDefaultDecl = content.replace(
+    /\r?\ndeclare const _default:\s*\{[\s\S]*?\};\r?\n?/g,
+    "\n",
+  );
+  return withoutDefaultDecl
     .split("\n")
     .filter(
       (line) =>
@@ -32,7 +36,8 @@ function stripCoreFooter(content) {
         !line.trim().startsWith("declare const _default:") &&
         line.trim() !== "export default _default;",
     )
-    .join("\n");
+    .join("\n")
+    .trimEnd();
 }
 
 function extractPluginLines(indexTsPath) {
