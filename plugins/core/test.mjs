@@ -904,6 +904,18 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
       const doc3 = JSON.parse(readFileSync(ledgerPath, "utf8"));
       assert.equal(doc3.namespace, "app");
       assert.equal(doc3.queries.length, 2);
+
+      // Run 4: legacy top-level array ledger `[{"ts":1,"tool":"legacy","query":"old.rs"}]`
+      writeFileSync(ledgerPath, '[{"ts":1,"tool":"legacy","query":"old.rs"}]');
+      execFileSync(hookPath, [], {
+        cwd: repoDir,
+        env: { PATH: binDir, HOME: repoDir },
+      });
+      const doc4 = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      assert.equal(typeof doc4.namespace, "string");
+      assert.ok(Array.isArray(doc4.queries));
+      assert.equal(doc4.queries.length, 3);
+      assert.ok(doc4.queries.some((q) => q.query === "old.rs"));
     } finally {
       rmSync(repoDir, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });
@@ -1006,6 +1018,117 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
       const guardBefore = counters.guardValidate;
       await beforeExecFn({ name: "write", args: { path: "src/shared.rs", content: "x" } });
       assert.equal(counters.guardValidate, guardBefore + 1, "beforeToolExec enforces guard_validate on mutating tools");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("round-5 fixes: str_replace_editor classification, per-call Code Mode arg extraction, Breath reset only on claim/complete/note, call-keyed recall correlation, Stop onTurnEnd, and pre-commit legacy array normalization", async () => {
+    assert.ok(TOOL_CLASSIFICATION.MUTATING_FILE_TOOLS.has("str_replace_editor"));
+
+    // 1. Per-call Code Mode arg extraction ignores unrelated preceding properties
+    const code = `
+      const other = { id: "wrong-id", session_id: "wrong-sess", path: "wrong/path.ts", note: "wrong-note" };
+      await tools.neurostrata.neurostrata_task_claim({ id: "real-task", session_id: "real-sess" });
+      await tools.neurostrata.neurostrata_memories_for_file({ path: "src/real.ts" });
+      await tools.neurostrata.neurostrata_memories_for_file({ path: "src/second.ts" });
+    `;
+    const inspected = inspectCodeModeExecution(code);
+    assert.equal(inspected.id, "real-task");
+    assert.equal(inspected.sessionId, "real-sess");
+    assert.equal(inspected.taskClaimed, true);
+    assert.equal(inspected.note, undefined);
+    assert.deepEqual(inspected.queriedFiles, ["src/real.ts", "src/second.ts"]);
+
+    // 2. Note-less task_update in Code Mode does NOT reset mutationsSinceNote
+    const { server, url, counters } = await createMockDaemonServer({
+      returnTask: [{ id: "real-task", session_id: "real-sess", status: "in_progress" }],
+    });
+    try {
+      let beforeHandler;
+      let afterHandler;
+      await initialize({
+        config: {
+          namespace: "round5-ns",
+          endpoint: url,
+          bearerToken: "tok",
+          strictMode: true,
+          requestTimeoutMs: 500,
+          intentDetection: { enabled: true, injectReminder: true },
+        },
+        tool: {
+          hook: async (name, cb) => {
+            if (name === "execute.before") beforeHandler = cb;
+            if (name === "execute.after") afterHandler = cb;
+          },
+        },
+        hooks: {},
+      });
+
+      await beforeHandler({
+        tool: "execute",
+        input: { code: 'neurostrata_task_claim({ id: "real-task", session_id: "real-sess" })' },
+      });
+      await beforeHandler({ tool: "bash", input: { command: "echo 1" } });
+      assert.equal(getTrackingState().mutationsSinceNote, 1);
+
+      // Note-less task_update in Code Mode must NOT reset mutationsSinceNote
+      await beforeHandler({
+        tool: "execute",
+        input: { code: 'neurostrata_task_update({ id: "real-task", priority: 1 })' },
+      });
+      assert.equal(getTrackingState().mutationsSinceNote, 1, "note-less Code Mode task_update preserves mutationsSinceNote");
+
+      // Note-less task_update in handleHookEvent must also NOT reset mutationsSinceNote
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "execute",
+        tool_input: { code: 'neurostrata_task_update({ id: "real-task", priority: 2 })' },
+      });
+      assert.equal(getTrackingState().mutationsSinceNote, 1, "note-less PreToolUse Code Mode task_update preserves mutationsSinceNote");
+
+      // 3. Call-correlated recall: read A queues recall, shell B finishes first without stealing A's recall
+      const readBefore = await beforeHandler({
+        tool: "read",
+        callID: "call-read-A",
+        input: { path: "src/corr.ts" },
+      });
+      assert.ok(readBefore?.additionalContext?.includes("src/corr.ts"));
+
+      const shellAfter = await afterHandler({
+        tool: "bash",
+        callID: "call-shell-B",
+        output: "shell stdout",
+      });
+      assert.equal(shellAfter.output, "shell stdout", "shell B must not consume read A's recall block");
+
+      const readAfter = await afterHandler({
+        tool: "read",
+        callID: "call-read-A",
+        output: "file body",
+      });
+      assert.ok(
+        readAfter.output.startsWith(readBefore.additionalContext),
+        "read A receives its own correlated recall block",
+      );
+
+      // 4. Stop event with transcript in handleHookEvent triggers onTurnEnd
+      const capturedErrors = [];
+      const origError = console.error;
+      console.error = (...args) => capturedErrors.push(args.join(" "));
+      try {
+        await handleHookEvent({
+          hook_event_name: "Stop",
+          transcript: "Completed work. TODO: add follow-up integration verification.",
+        });
+      } finally {
+        console.error = origError;
+      }
+      assert.ok(
+        capturedErrors.some((msg) => msg.includes("Task intent detected")),
+        "Stop hook event with transcript invokes onTurnEnd",
+      );
     } finally {
       server.close();
       resetModuleState();

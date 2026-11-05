@@ -1120,9 +1120,24 @@ pub async fn handle_task_update(
         }
     }
 
+    let refreshed_prompt = if rename_note.is_some() && task.status() == Status::InProgress {
+        let (_hits, prompt) =
+            build_task_graph_context(&store, &namespace, &id, &vector, &task.payload).await;
+        Some(prompt)
+    } else {
+        None
+    };
+
     // Field updates ride on whatever the transition produced.
     {
         let obj = task_obj_mut(&mut task.payload);
+        if rename_note.is_some() {
+            if let Some(prompt) = refreshed_prompt {
+                obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+            } else {
+                obj.remove("subagent_prompt_injection");
+            }
+        }
         if let Some(p) = priority {
             obj.insert("priority".to_string(), json!(p));
         }
@@ -1297,13 +1312,14 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
     let mut pending: Vec<(usize, String, MemoryPayload)> = Vec::new();
     for (i, m) in tasks.iter().enumerate() {
         if gate::task_status(m) == Status::InProgress {
+            let expected_goal = format!("| Goal: {}\n", m.payload.content);
             if let Some(cached) = m
                 .payload
                 .metadata
                 .get("task")
                 .and_then(|t| t.get("subagent_prompt_injection"))
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty())
+                .filter(|s| !s.trim().is_empty() && s.contains(&expected_goal))
             {
                 if let Some(obj) = summaries[i].as_object_mut() {
                     obj.insert("subagent_prompt_injection".to_string(), json!(cached));
@@ -2434,35 +2450,52 @@ for file in "${StagedFiles[@]}"; do
           let doc = { namespace: ns, queries: [] };
           try {
             const raw = fs.readFileSync(ledger, "utf8");
-            doc = JSON.parse(raw);
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              doc = { namespace: ns, queries: parsed };
+            } else if (parsed && typeof parsed === "object") {
+              doc = parsed;
+            }
           } catch {}
+          if (typeof doc.namespace !== "string" || !doc.namespace) doc.namespace = ns;
           if (!Array.isArray(doc.queries)) doc.queries = [];
-          if (doc.queries.some((q) => q.query === file)) { process.exit(0); }
+          if (doc.queries.some((q) => q && typeof q === "object" && q.query === file)) {
+            fs.writeFileSync(ledger, JSON.stringify(doc, null, 2));
+            process.exit(0);
+          }
           doc.queries.push({ ts, tool: "pre-commit", query: file, domains: [file], returned_ids: [], governed_prefixes: [file] });
           fs.writeFileSync(ledger, JSON.stringify(doc, null, 2));
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-          import json, os, sys
-          ledger = os.environ["LEDGER"]
-          ns = os.environ["NAMESPACE"]
-          file = os.environ["FILE"]
-          ts = int(os.environ.get("TS", "0") or "0")
-          try:
-            with open(ledger) as f:
-              doc = json.load(f)
-          except Exception:
-            doc = {}
-          if not isinstance(doc, dict):
-            doc = {}
-          if not isinstance(doc.get("queries"), list):
-            doc["queries"] = []
-          if any(isinstance(q, dict) and q.get("query") == file for q in doc["queries"]):
-            sys.exit(0)
-          doc["queries"].append({"ts": ts, "tool": "pre-commit", "query": file, "domains": [file], "returned_ids": [], "governed_prefixes": [file]})
-          with open(ledger, "w") as f:
-            json.dump(doc, f, indent=2)
-        ' 2>/dev/null || true
+import json, os, sys
+ledger = os.environ["LEDGER"]
+ns = os.environ["NAMESPACE"]
+file = os.environ["FILE"]
+ts = int(os.environ.get("TS", "0") or "0")
+try:
+    with open(ledger) as f:
+        parsed = json.load(f)
+except Exception:
+    parsed = {}
+if isinstance(parsed, list):
+    doc = {"namespace": ns, "queries": parsed}
+elif isinstance(parsed, dict):
+    doc = parsed
+else:
+    doc = {"namespace": ns, "queries": []}
+if not isinstance(doc.get("namespace"), str) or not doc.get("namespace"):
+    doc["namespace"] = ns
+if not isinstance(doc.get("queries"), list):
+    doc["queries"] = []
+if any(isinstance(q, dict) and q.get("query") == file for q in doc["queries"]):
+    with open(ledger, "w") as f:
+        json.dump(doc, f, indent=2)
+    sys.exit(0)
+doc["queries"].append({"ts": ts, "tool": "pre-commit", "query": file, "domains": [file], "returned_ids": [], "governed_prefixes": [file]})
+with open(ledger, "w") as f:
+    json.dump(doc, f, indent=2)
+' 2>/dev/null || true
     else
         TMP=$(mktemp)
         awk '
@@ -2482,91 +2515,74 @@ for file in "${StagedFiles[@]}"; do
             }
             return out
           }
-          function print_entry(comma) {
-            print "    {"
-            print "      \"ts\": " ts ","
-            print "      \"tool\": \"pre-commit\","
-            print "      \"query\": \"" file "\","
-            print "      \"domains\": [\"" file "\"],"
-            print "      \"returned_ids\": [],"
-            print "      \"governed_prefixes\": [\"" file "\"]"
-            if (comma) {
-              print "    },"
-            } else {
-              print "    }"
-            }
+          function entry_str(comma,    s) {
+            s = "    {\n"
+            s = s "      \"ts\": " ts ",\n"
+            s = s "      \"tool\": \"pre-commit\",\n"
+            s = s "      \"query\": \"" file "\",\n"
+            s = s "      \"domains\": [\"" file "\"],\n"
+            s = s "      \"returned_ids\": [],\n"
+            s = s "      \"governed_prefixes\": [\"" file "\"]\n"
+            s = s (comma ? "    }," : "    }")
+            return s
           }
           BEGIN {
             ns = json_escape(ENVIRON["NAMESPACE"])
             file = json_escape(ENVIRON["FILE"])
             ts = ENVIRON["TS"] + 0
-            found = 0
-            inserted = 0
-            pending_open = 0
+            doc = ""
           }
           {
-            if (index($0, "\"" file "\"") > 0) found = 1
-            if (pending_open) {
-              if ($0 ~ /^[[:space:]]*\]/) {
-                print_entry(0)
-                print $0
-                inserted = 1
-                pending_open = 0
-                next
-              } else if ($0 ~ /^[[:space:]]*$/) {
-                print $0
-                next
-              } else {
-                print_entry(1)
-                print $0
-                inserted = 1
-                pending_open = 0
-                next
-              }
-            }
-            if (!inserted && !found && match($0, /"queries"[[:space:]]*:[[:space:]]*\[/)) {
-              open_idx = RSTART + RLENGTH - 1
-              line_prefix = substr($0, 1, open_idx)
-              after_open = substr($0, open_idx + 1)
-              if (after_open ~ /^[[:space:]]*\]/) {
-                suffix = after_open
-                sub(/^[[:space:]]*/, "", suffix)
-                print line_prefix
-                print_entry(0)
-                print "  " suffix
-                inserted = 1
-                next
-              } else if (after_open ~ /^[[:space:]]*\{/) {
-                rest = after_open
-                sub(/^[[:space:]]*/, "", rest)
-                print line_prefix
-                print_entry(1)
-                print "    " rest
-                inserted = 1
-                next
-              } else {
-                print $0
-                pending_open = 1
-                next
-              }
-            }
-            print
+            doc = (NR == 1 ? $0 : doc "\n" $0)
           }
           END {
-            if (found) exit
-            if (pending_open && !inserted) {
-              print_entry(0)
-              print "  ]"
-              inserted = 1
-            }
-            if (!inserted) {
+            has_file = (index(doc, "\"" file "\"") > 0)
+            trimmed = doc
+            sub(/^[[:space:]]+/, "", trimmed)
+            sub(/[[:space:]]+$/, "", trimmed)
+            if (substr(trimmed, 1, 1) == "[" && substr(trimmed, length(trimmed), 1) == "]") {
+              inner = substr(trimmed, 2, length(trimmed) - 2)
+              sub(/^[[:space:]]*\n?/, "", inner)
+              sub(/\n?[[:space:]]*$/, "", inner)
               print "{"
               print "  \"namespace\": \"" ns "\","
               print "  \"queries\": ["
-              print_entry(0)
+              if (has_file) {
+                if (inner != "") print inner
+              } else if (inner == "") {
+                print entry_str(0)
+              } else {
+                print entry_str(1)
+                print inner
+              }
               print "  ]"
               print "}"
+              exit
             }
+            if (has_file) {
+              print doc
+              exit
+            }
+            if (match(doc, /"queries"[[:space:]]*:[[:space:]]*\[/)) {
+              open_idx = RSTART + RLENGTH - 1
+              prefix = substr(doc, 1, open_idx)
+              rest = substr(doc, open_idx + 1)
+              if (match(rest, /^[[:space:]]*\]/)) {
+                close_part = substr(rest, RSTART + RLENGTH - 1)
+                print prefix "\n" entry_str(0) "\n  " close_part
+                exit
+              } else {
+                sub(/^[[:space:]]*\n?/, "", rest)
+                print prefix "\n" entry_str(1) "\n    " rest
+                exit
+              }
+            }
+            print "{"
+            print "  \"namespace\": \"" ns "\","
+            print "  \"queries\": ["
+            print entry_str(0)
+            print "  ]"
+            print "}"
           }
         ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER" || rm -f "$TMP"
     fi
@@ -4979,6 +4995,65 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_rename_invalidates_and_recomputes_subagent_prompt_injection() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "original title", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent",
+                "session_id": "sess-rename"
+            }),
+            store.clone(),
+        )
+        .await;
+
+        let list_before: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_before = list_before["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .unwrap();
+        assert!(prompt_before.contains("Goal: original title"));
+
+        handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "title": "updated renamed title",
+                "session_id": "sess-rename"
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+
+        let list_after: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_after = list_after["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .unwrap();
+        assert!(
+            prompt_after.contains("Goal: updated renamed title"),
+            "expected updated goal in prompt: {}",
+            prompt_after
+        );
+        assert!(!prompt_after.contains("Goal: original title"));
     }
 
     #[tokio::test]

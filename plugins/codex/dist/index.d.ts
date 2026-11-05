@@ -142,13 +142,16 @@ export interface CodeModeInspection {
     id?: string;
     sessionId?: string;
     note?: string;
+    taskClaimed?: boolean;
+    taskUpdated?: boolean;
     taskCompleted?: boolean;
     queriedFiles: string[];
 }
 /**
  * Inspect JS code strings passed to OpenCode V2 `execute` (Code Mode).
  * Detects neurostrata_task_claim / _update / _complete / _memories_for_file
- * calls and extracts id / session_id / note / path arguments.
+ * calls in order and extracts id / session_id / note / path arguments from
+ * each matched call's own argument slice.
  */
 export declare function inspectCodeModeExecution(code: string): CodeModeInspection;
 export declare const PREFETCH_LRU_CAP = 128;
@@ -202,6 +205,7 @@ export declare function getTrackingState(): {
     mutationsSinceNote: number;
 };
 export declare const pendingRecallBlocks: string[];
+export declare const pendingRecallByCall: Map<string, string>;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;

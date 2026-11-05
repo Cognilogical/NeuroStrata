@@ -5,6 +5,14 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
     "types": ["node"],
+    "typeRoots": [
+      "./node_modules/@types",
+      "../claude/node_modules/@types",
+      "../opencode/node_modules/@types",
+      "../codex/node_modules/@types",
+      "../github-cli/node_modules/@types",
+      "../../node_modules/@types"
+    ],
     "outDir": "./dist",
     "rootDir": ".",
     "declaration": true,

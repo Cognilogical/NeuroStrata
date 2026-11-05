@@ -448,6 +448,7 @@ export const MUTATING_FILE_TOOLS = new Set([
   "Edit",
   "MultiEdit",
   "edit_file",
+  "str_replace_editor",
   "patch",
   "patch_file",
   "apply_patch",
@@ -511,36 +512,76 @@ export interface CodeModeInspection {
   id?: string;
   sessionId?: string;
   note?: string;
+  taskClaimed?: boolean;
+  taskUpdated?: boolean;
   taskCompleted?: boolean;
   queriedFiles: string[];
+}
+
+function extractBalancedCallArgs(code: string, startAfterOpenParen: number): string {
+  let depth = 1;
+  let quote: string | null = null;
+  let i = startAfterOpenParen;
+  while (i < code.length && depth > 0) {
+    const ch = code[i];
+    if (quote) {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+      if (depth === 0) break;
+    }
+    i++;
+  }
+  return code.slice(startAfterOpenParen, i);
 }
 
 /**
  * Inspect JS code strings passed to OpenCode V2 `execute` (Code Mode).
  * Detects neurostrata_task_claim / _update / _complete / _memories_for_file
- * calls and extracts id / session_id / note / path arguments.
+ * calls in order and extracts id / session_id / note / path arguments from
+ * each matched call's own argument slice.
  */
 export function inspectCodeModeExecution(code: string): CodeModeInspection {
   const result: CodeModeInspection = { queriedFiles: [] };
-  const hasClaim = /neurostrata_task_claim\b/.test(code);
-  const hasUpdate = /neurostrata_task_update\b/.test(code);
-  const hasComplete = /neurostrata_task_complete\b/.test(code);
-  const hasMemories = /neurostrata_memories_for_file\b/.test(code);
-  const idMatch = code.match(/(?:^|[^\w$])id\s*:\s*["']([^"']+)["']/);
-  const sessionMatch = code.match(/(?:^|[^\w$])session_id\s*:\s*["']([^"']+)["']/);
-  const noteMatch = code.match(/(?:^|[^\w$])note\s*:\s*["']([^"']*)["']/);
-  const pathMatch = code.match(/(?:^|[^\w$])path\s*:\s*["']([^"']+)["']/);
-  if (hasClaim && idMatch && sessionMatch) {
-    result.id = idMatch[1];
-    result.sessionId = sessionMatch[1];
+  const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file))\b(?:\s*["']\s*\])?\s*\(/g;
+  let match: RegExpExecArray | null;
+  while ((match = callRe.exec(code)) !== null) {
+    const tool = match[1];
+    const argSlice = extractBalancedCallArgs(code, match.index + match[0].length);
+    const idMatch = argSlice.match(/(?:^|[^\w$])id\s*:\s*["']([^"']+)["']/);
+    const sessionMatch = argSlice.match(/(?:^|[^\w$])session_id\s*:\s*["']([^"']+)["']/);
+    const noteMatch = argSlice.match(/(?:^|[^\w$])note\s*:\s*["']([^"']*)["']/);
+    const pathMatch = argSlice.match(/(?:^|[^\w$])path\s*:\s*["']([^"']+)["']/);
+
+    if (tool === "neurostrata_task_claim") {
+      if (idMatch && sessionMatch) {
+        result.id = idMatch[1];
+        result.sessionId = sessionMatch[1];
+        result.taskClaimed = true;
+        result.taskCompleted = false;
+      }
+    } else if (tool === "neurostrata_task_update") {
+      result.taskUpdated = true;
+      if (idMatch) result.id = idMatch[1];
+      if (sessionMatch) result.sessionId = sessionMatch[1];
+      if (noteMatch) result.note = noteMatch[1];
+    } else if (tool === "neurostrata_task_complete") {
+      result.taskCompleted = true;
+    } else if (tool === "neurostrata_memories_for_file") {
+      if (pathMatch) result.queriedFiles.push(pathMatch[1]);
+    }
   }
-  if (hasUpdate) {
-    if (idMatch) result.id = idMatch[1];
-    if (sessionMatch) result.sessionId = sessionMatch[1];
-    if (noteMatch) result.note = noteMatch[1];
-  }
-  if (hasComplete) result.taskCompleted = true;
-  if (hasMemories && pathMatch) result.queriedFiles.push(pathMatch[1]);
   return result;
 }
 
@@ -1032,6 +1073,110 @@ export function getTrackingState() {
 // ──────────────────────────────────────────────────────────────────────
 
 export const pendingRecallBlocks: string[] = [];
+export const pendingRecallByCall = new Map<string, string>();
+
+function extractRecallCallKey(
+  primary?: Record<string, unknown>,
+  secondary?: Record<string, unknown>,
+): string | undefined {
+  for (const src of [primary, secondary]) {
+    if (!src) continue;
+    const id =
+      asString(src.callID) ??
+      asString(src.call_id) ??
+      asString(src.toolCallId) ??
+      asString(src.tool_call_id) ??
+      asString(src.id);
+    if (id) return `call:${id}`;
+  }
+  return undefined;
+}
+
+function extractRecallSessionKey(
+  primary?: Record<string, unknown>,
+  secondary?: Record<string, unknown>,
+): string | undefined {
+  for (const src of [primary, secondary]) {
+    if (!src) continue;
+    const sid = asString(src.sessionID) ?? asString(src.session_id);
+    if (sid) return `session:${sid}`;
+  }
+  return undefined;
+}
+
+function enqueuePendingRecall(
+  block: string,
+  outerInput?: Record<string, unknown>,
+  innerArgs?: Record<string, unknown>,
+): void {
+  if (pendingRecallBlocks.length === 0) {
+    pendingRecallByCall.clear();
+  }
+  pendingRecallBlocks.push(block);
+  const key =
+    extractRecallCallKey(outerInput, innerArgs) ??
+    extractRecallSessionKey(outerInput, innerArgs);
+  if (key) {
+    pendingRecallByCall.set(key, block);
+  }
+}
+
+function consumePendingRecall(
+  meta?: Record<string, unknown>,
+  target?: Record<string, unknown>,
+): string | undefined {
+  if (pendingRecallBlocks.length === 0) {
+    pendingRecallByCall.clear();
+  }
+  const afterTool =
+    asString(meta?.tool) ??
+    asString(meta?.tool_name) ??
+    asString(meta?.name) ??
+    asString(target?.tool) ??
+    asString(target?.tool_name);
+  if (afterTool && !isFileTouchTool(afterTool)) {
+    return undefined;
+  }
+
+  const removeFromArray = (val: string) => {
+    const idx = pendingRecallBlocks.indexOf(val);
+    if (idx !== -1) pendingRecallBlocks.splice(idx, 1);
+  };
+
+  const callKey = extractRecallCallKey(meta, target);
+  if (callKey) {
+    const matched = pendingRecallByCall.get(callKey);
+    if (matched !== undefined) {
+      pendingRecallByCall.delete(callKey);
+      removeFromArray(matched);
+    }
+    return matched;
+  }
+
+  const sessionKey = extractRecallSessionKey(meta, target);
+  if (sessionKey) {
+    const matched = pendingRecallByCall.get(sessionKey);
+    if (matched !== undefined) {
+      pendingRecallByCall.delete(sessionKey);
+      removeFromArray(matched);
+      return matched;
+    }
+    if (pendingRecallByCall.size > 0) {
+      return undefined;
+    }
+  }
+
+  const shifted = pendingRecallBlocks.shift();
+  if (shifted !== undefined) {
+    for (const [k, v] of pendingRecallByCall.entries()) {
+      if (v === shifted) {
+        pendingRecallByCall.delete(k);
+        break;
+      }
+    }
+  }
+  return shifted;
+}
 
 function extractPatchPath(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
@@ -1054,14 +1199,20 @@ function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string,
   );
 }
 
-const executeAfterHandler = async (output: any): Promise<any> => {
-  // The host may pass the output object directly, or a single `event` argument
-  // whose `.output` holds the real output. Resolve the target object.
-  let target = output;
-  if (target && typeof target === "object" && target.output !== undefined && typeof target.output === "object") {
+const executeAfterHandler = async (output: any, secondArg?: any): Promise<any> => {
+  // The host may pass (input, output) or a single `output`/`event` argument
+  // whose `.output` holds the real output. Resolve metadata and target object.
+  const hasSecondObject = secondArg !== undefined && secondArg !== null && typeof secondArg === "object";
+  const meta = asRecord(output);
+  let target = hasSecondObject ? secondArg : output;
+  if (!hasSecondObject && target && typeof target === "object" && target.output !== undefined && typeof target.output === "object") {
     target = target.output;
   }
-  const block = pendingRecallBlocks.shift() ?? (target && typeof target === "object" ? (target as Record<string, unknown>).neurostrataContext : undefined);
+  const targetRec = asRecord(target);
+  const block =
+    consumePendingRecall(meta, targetRec) ??
+    (targetRec ? (targetRec.neurostrataContext as string | undefined) : undefined) ??
+    (meta ? (meta.neurostrataContext as string | undefined) : undefined);
   if (block && target && typeof target === "object") {
     const out = target as Record<string, unknown>;
     if (typeof out.output === "string") out.output = `${block}\n\n${out.output}`;
@@ -1086,7 +1237,9 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
       activeTaskId = inspection.id;
     }
     if (inspection.sessionId) activeSessionId = inspection.sessionId;
-    if (inspection.id || inspection.note !== undefined) mutationsSinceNote = 0;
+    if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
+      mutationsSinceNote = 0;
+    }
     if (inspection.taskCompleted) {
       if (activeTaskId) cachedTaskInjection.delete(activeTaskId);
       activeTaskId = null;
@@ -1151,11 +1304,11 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     block = formatFileTouchRecallBlock(filePath, snippets);
     input.additionalContext = block;
     input.neurostrataContext = block;
-    pendingRecallBlocks.push(block);
   }
 
   // Non-mutating file-touch with recalled snippets -> return the recall block.
   if (snippets.length > 0 && !isMutatingTool(toolName)) {
+    if (block) enqueuePendingRecall(block, asRecord(input), args);
     return { additionalContext: block, neurostrataContext: block, snippets };
   }
 
@@ -1202,7 +1355,10 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     mutationsSinceNote++;
   }
 
-  if (block) return { additionalContext: block, neurostrataContext: block, snippets };
+  if (block) {
+    enqueuePendingRecall(block, asRecord(input), args);
+    return { additionalContext: block, neurostrataContext: block, snippets };
+  }
   return input;
 };
 
@@ -1318,7 +1474,9 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
         activeTaskId = inspection.id;
       }
       if (inspection.sessionId) activeSessionId = inspection.sessionId;
-      if (inspection.id || inspection.note !== undefined) mutationsSinceNote = 0;
+      if (inspection.taskClaimed || inspection.taskCompleted || inspection.note !== undefined) {
+        mutationsSinceNote = 0;
+      }
       if (inspection.taskCompleted) {
         if (activeTaskId) cachedTaskInjection.delete(activeTaskId);
         activeTaskId = null;
@@ -1427,6 +1585,13 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
   }
 
   if (["Stop", "SubagentStop"].includes(hookEventName)) {
+    const transcript =
+      asString(event.transcript) ??
+      asString(event.content) ??
+      asString(event.last_assistant_message);
+    if (hookEventName === "Stop" && transcript) {
+      await onTurnEnd({ role: "assistant", content: transcript });
+    }
     return { hookSpecificOutput: { hookEventName, permissionDecision: "allow" } };
   }
 
