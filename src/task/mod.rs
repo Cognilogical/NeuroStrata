@@ -503,26 +503,21 @@ pub async fn record_graph_query(
         }
     }
     if project_root.is_none() {
-        // Walk up from the process working directory through parent directories
-        // looking for `.git` or `.NeuroStrata` (instead of only checking cwd
-        // directly), then fall back to the daemon's resolved project root.
-        if let Ok(cwd) = std::env::current_dir() {
-            let mut cur = cwd;
+        // Start from `resolve_project_root()` (which honors `NEUROSTRATA_PROJECT_ROOT`
+        // before falling back to `std::env::current_dir()`) and walk up through
+        // parent directories looking for `.git` or `.NeuroStrata`.
+        let start = crate::daemon::resolve_project_root();
+        if !start.as_os_str().is_empty() {
+            let mut cur = start;
             loop {
                 if cur.join(".git").exists() || cur.join(".NeuroStrata").exists() {
                     project_root = Some(cur.to_string_lossy().to_string());
                     break;
                 }
                 match cur.parent() {
-                    Some(parent) => cur = parent.to_path_buf(),
-                    None => break,
+                    Some(parent) if !parent.as_os_str().is_empty() => cur = parent.to_path_buf(),
+                    _ => break,
                 }
-            }
-        }
-        if project_root.is_none() {
-            let root = crate::daemon::resolve_project_root();
-            if root.join(".git").exists() || root.join(".NeuroStrata").exists() {
-                project_root = Some(root.to_string_lossy().to_string());
             }
         }
     }
@@ -2529,21 +2524,23 @@ for file in "${StagedFiles[@]}"; do
                 next
               }
             }
-            if (!inserted && !found && $0 ~ /"queries"[[:space:]]*:[[:space:]]*\[/) {
-              if ($0 ~ /\[[[:space:]]*\][[:space:]]*,?[[:space:]]*$/) {
-                has_trailing_comma = ($0 ~ /\][[:space:]]*,[[:space:]]*$/)
-                sub(/\[[[:space:]]*\][[:space:]]*,?[[:space:]]*$/, "[", $0)
-                print $0
+            if (!inserted && !found && match($0, /"queries"[[:space:]]*:[[:space:]]*\[/)) {
+              open_idx = RSTART + RLENGTH - 1
+              line_prefix = substr($0, 1, open_idx)
+              after_open = substr($0, open_idx + 1)
+              if (after_open ~ /^[[:space:]]*\]/) {
+                suffix = after_open
+                sub(/^[[:space:]]*/, "", suffix)
+                print line_prefix
                 print_entry(0)
-                print (has_trailing_comma ? "  ]," : "  ]")
+                print "  " suffix
                 inserted = 1
                 next
-              } else if ($0 ~ /\[[[:space:]]*\{/) {
-                idx = index($0, "[")
-                print substr($0, 1, idx)
-                print_entry(1)
-                rest = substr($0, idx + 1)
+              } else if (after_open ~ /^[[:space:]]*\{/) {
+                rest = after_open
                 sub(/^[[:space:]]*/, "", rest)
+                print line_prefix
+                print_entry(1)
                 print "    " rest
                 inserted = 1
                 next

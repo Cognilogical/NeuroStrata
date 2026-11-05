@@ -5,7 +5,7 @@
   "types": "./dist/index.d.ts",
   "version": "1.14.3",
   "scripts": {
-    "build": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs",
+    "build": "tsc --project ../core/tsconfig.json --typeRoots ./node_modules/@types && node ../core/bundle-adapter.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test test.mjs"
   },

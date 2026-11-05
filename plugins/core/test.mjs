@@ -894,6 +894,16 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
       assert.equal(doc2.queries.length, 2);
       const queries = doc2.queries.map((q) => q.query).sort();
       assert.deepEqual(queries, ["src/a&b.rs", "src/file one.rs"]);
+
+      // Run 3: legacy compact single-line empty-array ledger `{"namespace":"app","queries":[]}`
+      writeFileSync(ledgerPath, '{"namespace":"app","queries":[]}');
+      execFileSync(hookPath, [], {
+        cwd: repoDir,
+        env: { PATH: binDir, HOME: repoDir },
+      });
+      const doc3 = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      assert.equal(doc3.namespace, "app");
+      assert.equal(doc3.queries.length, 2);
     } finally {
       rmSync(repoDir, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });

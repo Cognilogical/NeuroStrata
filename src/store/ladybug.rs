@@ -6342,6 +6342,46 @@ fn fetch_related_subgraph(
 }
 
 impl LadybugStore {
+    /// Hard budgets for `ast_neighborhood_for_file` so a high-fan-out governing
+    /// rule or file node cannot produce an unbounded reply or hold the shared
+    /// store connection lock while scanning thousands of neighbors.
+    pub const MAX_RELATED_MEMORIES: usize = 20;
+    pub const MAX_AST_COLLECTION_ITEMS: usize = 20;
+    pub const MAX_NEIGHBORHOOD_QUERY_ROWS: usize = 64;
+    pub const MAX_NEIGHBOR_CONTENT_CHARS: usize = 200;
+    pub const MAX_NEIGHBOR_METADATA_BYTES: usize = 1024;
+    pub const MAX_NEIGHBORHOOD_RESPONSE_BYTES: usize = 16 * 1024;
+
+    fn truncate_neighbor_content(raw: &str) -> (String, bool) {
+        let mut chars = raw.chars();
+        let prefix: String = chars.by_ref().take(Self::MAX_NEIGHBOR_CONTENT_CHARS).collect();
+        if chars.next().is_some() {
+            (format!("{prefix}\u{2026}"), true)
+        } else {
+            (raw.to_string(), false)
+        }
+    }
+
+    fn bound_neighbor_metadata(meta: Value) -> (Value, bool) {
+        if meta.is_null() {
+            return (Value::Null, false);
+        }
+        let raw_len = serde_json::to_string(&meta).map(|s| s.len()).unwrap_or(0);
+        if raw_len <= Self::MAX_NEIGHBOR_METADATA_BYTES {
+            return (meta, false);
+        }
+        let mut compact = serde_json::Map::new();
+        if let Some(obj) = meta.as_object() {
+            for key in ["governs", "superseded_by", "symbol_name", "ast_kind", "eligibility"] {
+                if let Some(val) = obj.get(key) {
+                    compact.insert(key.to_string(), val.clone());
+                }
+            }
+        }
+        compact.insert("truncated".to_string(), Value::Bool(true));
+        (Value::Object(compact), true)
+    }
+
     /// Compact AST + related-memory neighborhood for a file, used by
     /// `neurostrata_memories_for_file` when `include_ast_edges` is true
     /// (Enhancement 4). Returns `(related_memories, ast_summary)`.
@@ -6351,7 +6391,8 @@ impl LadybugStore {
     /// named in `metadata.superseded_by`.
     ///
     /// `ast_summary` is `{ symbols, callers, callees, imports, importers,
-    /// blast_radius_count }` for the file node at `path`.
+    /// blast_radius_count, truncated, truncated_collections,
+    /// related_memories_truncated }` for the file node at `path`.
     pub async fn ast_neighborhood_for_file(
         &self,
         namespace: &str,
@@ -6385,15 +6426,20 @@ impl LadybugStore {
                 };
                 let mut related: Vec<Value> = Vec::new();
                 let mut seen: HashSet<String> = HashSet::new();
+                let mut related_truncated = ids.len() > Self::MAX_RELATED_MEMORIES;
+                let mut related_bytes: usize = 0;
+                let related_byte_budget = Self::MAX_NEIGHBORHOOD_RESPONSE_BYTES / 2;
 
                 if !ids.is_empty() {
                     let id_list = ids
                         .iter()
+                        .take(Self::MAX_RELATED_MEMORIES)
                         .map(|id| format!("'{}'", escape_ladybug_string(id)))
                         .collect::<Vec<_>>()
                         .join(", ");
+                    let row_limit = Self::MAX_NEIGHBORHOOD_QUERY_ROWS;
 
-                    for (rel, direction) in [
+                    'rel_dirs: for (rel, direction) in [
                         ("DEPENDS_ON", "outgoing"),
                         ("DEPENDS_ON", "incoming"),
                         ("RELATES_TO", "outgoing"),
@@ -6401,42 +6447,66 @@ impl LadybugStore {
                     ] {
                         let query = match direction {
                             "outgoing" => format!(
-                                "MATCH (m:Memory)-[:{rel}]->(t:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                                "MATCH (m:Memory)-[:{rel}]->(t:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata LIMIT {row_limit}"
                             ),
                             "incoming" => format!(
-                                "MATCH (t:Memory)-[:{rel}]->(m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                                "MATCH (t:Memory)-[:{rel}]->(m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata LIMIT {row_limit}"
                             ),
                             _ => unreachable!(),
                         };
                         let mut res = conn.query(&query)?;
+                        let mut rows_seen = 0usize;
                         while let Some(row) = res.next() {
+                            rows_seen += 1;
                             let id = Self::cell_string(&row[0]);
                             let metadata = Self::cell_metadata(&row[3]);
-                            if !seen.insert(id.clone()) {
-                                continue;
-                            }
-                            if !is_active_id(&id, &active_gens)
-                                || is_registry_row(&metadata)
-                                || is_archived(&metadata)
-                                || is_retired_at(&metadata, now)
-                                || is_mesh_conflicting(&metadata)
+                            if !seen.contains(&id)
+                                && is_active_id(&id, &active_gens)
+                                && !is_registry_row(&metadata)
+                                && !is_archived(&metadata)
+                                && !is_retired_at(&metadata, now)
+                                && !is_mesh_conflicting(&metadata)
                             {
-                                continue;
+                                if related.len() >= Self::MAX_RELATED_MEMORIES {
+                                    related_truncated = true;
+                                    break 'rel_dirs;
+                                }
+                                let (content, content_trunc) =
+                                    Self::truncate_neighbor_content(&Self::cell_string(&row[1]));
+                                let (bounded_meta, meta_trunc) =
+                                    Self::bound_neighbor_metadata(metadata);
+                                let mut entry = serde_json::json!({
+                                    "id": id,
+                                    "memory_type": Self::cell_string(&row[2]),
+                                    "content": content,
+                                    "relation": rel,
+                                    "direction": direction,
+                                    "metadata": bounded_meta,
+                                });
+                                if content_trunc || meta_trunc {
+                                    entry["truncated"] = Value::Bool(true);
+                                }
+                                let entry_bytes =
+                                    serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(128);
+                                if !related.is_empty()
+                                    && related_bytes + entry_bytes > related_byte_budget
+                                {
+                                    related_truncated = true;
+                                    break 'rel_dirs;
+                                }
+                                seen.insert(id);
+                                related_bytes += entry_bytes;
+                                related.push(entry);
                             }
-                            related.push(serde_json::json!({
-                                "id": id,
-                                "memory_type": Self::cell_string(&row[2]),
-                                "content": Self::cell_string(&row[1]),
-                                "relation": rel,
-                                "direction": direction,
-                                "metadata": metadata,
-                            }));
+                        }
+                        if rows_seen >= row_limit {
+                            related_truncated = true;
                         }
                     }
 
                     // SUPERSEDES: memories the governing memories were superseded by.
                     let query = format!(
-                        "MATCH (m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.metadata"
+                        "MATCH (m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.metadata LIMIT {row_limit}"
                     );
                     let mut res = conn.query(&query)?;
                     while let Some(row) = res.next() {
@@ -6453,7 +6523,7 @@ impl LadybugStore {
                             {
                                 let safe_by = escape_ladybug_string(by);
                                 let target_q = format!(
-                                    "MATCH (t:Memory) WHERE t.id = '{safe_by}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                                    "MATCH (t:Memory) WHERE t.id = '{safe_by}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata LIMIT 1"
                                 );
                                 let mut tres = conn.query(&target_q)?;
                                 if let Some(trow) = tres.next() {
@@ -6462,17 +6532,42 @@ impl LadybugStore {
                                     if !is_archived(&tmeta)
                                         && !is_retired_at(&tmeta, now)
                                         && !is_mesh_conflicting(&tmeta)
-                                        && seen.insert(tid.clone())
+                                        && !seen.contains(&tid)
                                     {
-                                        related.push(serde_json::json!({
+                                        if related.len() >= Self::MAX_RELATED_MEMORIES {
+                                            related_truncated = true;
+                                            break;
+                                        }
+                                        let (content, content_trunc) =
+                                            Self::truncate_neighbor_content(&Self::cell_string(
+                                                &trow[1],
+                                            ));
+                                        let (bounded_meta, meta_trunc) =
+                                            Self::bound_neighbor_metadata(tmeta);
+                                        let mut entry = serde_json::json!({
                                             "id": tid,
                                             "memory_type": Self::cell_string(&trow[2]),
-                                            "content": Self::cell_string(&trow[1]),
+                                            "content": content,
                                             "relation": "SUPERSEDES",
                                             "direction": "outgoing",
                                             "supersedes": id,
-                                            "metadata": tmeta,
-                                        }));
+                                            "metadata": bounded_meta,
+                                        });
+                                        if content_trunc || meta_trunc {
+                                            entry["truncated"] = Value::Bool(true);
+                                        }
+                                        let entry_bytes = serde_json::to_string(&entry)
+                                            .map(|s| s.len())
+                                            .unwrap_or(128);
+                                        if !related.is_empty()
+                                            && related_bytes + entry_bytes > related_byte_budget
+                                        {
+                                            related_truncated = true;
+                                            break;
+                                        }
+                                        seen.insert(tid);
+                                        related_bytes += entry_bytes;
+                                        related.push(entry);
                                     }
                                 }
                             }
@@ -6480,7 +6575,17 @@ impl LadybugStore {
                     }
                 }
 
-                let ast_summary = Self::ast_summary_for_file(conn, &safe_ns, &path_c, &active_gens, now)?;
+                let ast_byte_budget =
+                    Self::MAX_NEIGHBORHOOD_RESPONSE_BYTES.saturating_sub(related_bytes);
+                let ast_summary = Self::ast_summary_for_file(
+                    conn,
+                    &safe_ns,
+                    &path_c,
+                    &active_gens,
+                    now,
+                    related_truncated,
+                    ast_byte_budget,
+                )?;
 
                 Ok((related, ast_summary))
             })
@@ -6516,12 +6621,30 @@ impl LadybugStore {
         path: &str,
         active_gens: &std::collections::HashSet<u64>,
         now: i64,
+        related_truncated: bool,
+        byte_budget: usize,
     ) -> Result<Value> {
         let safe_path = escape_ladybug_string(path);
+        let row_limit = Self::MAX_NEIGHBORHOOD_QUERY_ROWS;
+        let max_items = Self::MAX_AST_COLLECTION_ITEMS;
+        let mut ast_bytes: usize = 0;
+        let mut ast_truncated = false;
+        let mut truncated_collections: Vec<&'static str> = Vec::new();
+        let mark_collection_truncated =
+            |name: &'static str, flag: &mut bool, cols: &mut Vec<&'static str>| {
+                *flag = true;
+                if !cols.contains(&name) {
+                    cols.push(name);
+                }
+            };
 
         // Helper closure for visibility filtering
         let is_visible = |id: &str, meta: &Value| -> bool {
-            is_active_id(id, active_gens) && !crate::registry::is_registry_row(meta) && !is_archived(meta) && !is_retired_at(meta, now) && !is_mesh_conflicting(meta)
+            is_active_id(id, active_gens)
+                && !crate::registry::is_registry_row(meta)
+                && !is_archived(meta)
+                && !is_retired_at(meta, now)
+                && !is_mesh_conflicting(meta)
         };
 
         // Symbol nodes of the file: symbol locations are `path#kind:name@hash`.
@@ -6529,12 +6652,14 @@ impl LadybugStore {
         let mut symbol_ids: HashSet<String> = HashSet::new();
         {
             let symbol_query = format!(
-                "MATCH (s:Memory) WHERE s.namespace = '{safe_ns}' AND (s.location = '{safe_path}' OR s.location STARTS WITH '{safe_path}#') RETURN s.id, s.content, s.memory_type, s.location, s.metadata"
+                "MATCH (s:Memory) WHERE s.namespace = '{safe_ns}' AND (s.location = '{safe_path}' OR s.location STARTS WITH '{safe_path}#') RETURN s.id, s.content, s.memory_type, s.location, s.metadata LIMIT {row_limit}"
             );
             let mut res = conn.query(&symbol_query)?;
+            let mut rows_seen = 0usize;
             while let Some(row) = res.next() {
+                rows_seen += 1;
                 let id = Self::cell_string(&row[0]);
-                let content = Self::cell_string(&row[1]);
+                let raw_content = Self::cell_string(&row[1]);
                 let memory_type = Self::cell_string(&row[2]);
                 let loc = Self::cell_string(&row[3]);
                 let meta = Self::cell_metadata(&row[4]);
@@ -6544,15 +6669,50 @@ impl LadybugStore {
                 let logical = crate::parser::ingest::logical_path_of(&id);
                 let is_symbol_node = loc.starts_with(&format!("{path}#"))
                     || logical.starts_with(&format!("{path}#"))
-                    || (loc == path && (memory_type == "symbol" || meta.get("symbol_name").is_some() || meta.get("ast_kind").is_some()));
+                    || (loc == path
+                        && (memory_type == "symbol"
+                            || meta.get("symbol_name").is_some()
+                            || meta.get("ast_kind").is_some()));
 
-                if is_symbol_node && symbol_ids.insert(id.clone()) {
-                    symbols.push(serde_json::json!({
+                if is_symbol_node && !symbol_ids.contains(&id) {
+                    if symbols.len() >= max_items {
+                        mark_collection_truncated(
+                            "symbols",
+                            &mut ast_truncated,
+                            &mut truncated_collections,
+                        );
+                        break;
+                    }
+                    let (content, content_trunc) = Self::truncate_neighbor_content(&raw_content);
+                    let mut entry = serde_json::json!({
                         "id": id,
                         "memory_type": memory_type,
                         "content": content,
-                    }));
+                    });
+                    if content_trunc {
+                        entry["truncated"] = Value::Bool(true);
+                    }
+                    let entry_bytes =
+                        serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                    if !symbols.is_empty() && ast_bytes + entry_bytes > byte_budget {
+                        mark_collection_truncated(
+                            "symbols",
+                            &mut ast_truncated,
+                            &mut truncated_collections,
+                        );
+                        break;
+                    }
+                    symbol_ids.insert(id);
+                    ast_bytes += entry_bytes;
+                    symbols.push(entry);
                 }
+            }
+            if rows_seen >= row_limit {
+                mark_collection_truncated(
+                    "symbols",
+                    &mut ast_truncated,
+                    &mut truncated_collections,
+                );
             }
         }
 
@@ -6562,7 +6722,7 @@ impl LadybugStore {
         let mut file_ids: Vec<String> = Vec::new();
         {
             let file_query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location = '{safe_path}' RETURN m.id, m.metadata"
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location = '{safe_path}' RETURN m.id, m.metadata LIMIT {row_limit}"
             );
             let mut res = conn.query(&file_query)?;
             while let Some(row) = res.next() {
@@ -6571,10 +6731,32 @@ impl LadybugStore {
                 if !is_visible(&id, &meta) || symbol_ids.contains(&id) {
                     continue;
                 }
-                file_ids.push(id);
+                if file_ids.len() < max_items {
+                    file_ids.push(id);
+                }
                 if let Some(arr) = meta.get("imports").and_then(|v| v.as_array()) {
                     for entry in arr {
-                        imports.push(serde_json::json!({ "path": entry }));
+                        if imports.len() >= max_items {
+                            mark_collection_truncated(
+                                "imports",
+                                &mut ast_truncated,
+                                &mut truncated_collections,
+                            );
+                            break;
+                        }
+                        let item = serde_json::json!({ "path": entry });
+                        let item_bytes =
+                            serde_json::to_string(&item).map(|s| s.len()).unwrap_or(32);
+                        if !imports.is_empty() && ast_bytes + item_bytes > byte_budget {
+                            mark_collection_truncated(
+                                "imports",
+                                &mut ast_truncated,
+                                &mut truncated_collections,
+                            );
+                            break;
+                        }
+                        ast_bytes += item_bytes;
+                        imports.push(item);
                     }
                 }
             }
@@ -6590,43 +6772,114 @@ impl LadybugStore {
         if !symbol_ids.is_empty() {
             let sym_list = symbol_ids
                 .iter()
+                .take(max_items)
                 .map(|id| format!("'{}'", escape_ladybug_string(id)))
                 .collect::<Vec<_>>()
                 .join(", ");
             // Callee: a file symbol DEPENDS_ON it.
             {
                 let callee_query = format!(
-                    "MATCH (s:Memory)-[:DEPENDS_ON]->(t:Memory) WHERE s.id IN [{sym_list}] AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                    "MATCH (s:Memory)-[:DEPENDS_ON]->(t:Memory) WHERE s.id IN [{sym_list}] AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata LIMIT {row_limit}"
                 );
                 let mut res = conn.query(&callee_query)?;
+                let mut rows_seen = 0usize;
                 while let Some(row) = res.next() {
+                    rows_seen += 1;
                     let id = Self::cell_string(&row[0]);
                     let meta = Self::cell_metadata(&row[3]);
-                    if is_visible(&id, &meta) && callee_ids.insert(id.clone()) {
-                        callees.push(serde_json::json!({
+                    if is_visible(&id, &meta) && !callee_ids.contains(&id) {
+                        if callees.len() >= max_items {
+                            mark_collection_truncated(
+                                "callees",
+                                &mut ast_truncated,
+                                &mut truncated_collections,
+                            );
+                            break;
+                        }
+                        let (content, content_trunc) =
+                            Self::truncate_neighbor_content(&Self::cell_string(&row[1]));
+                        let mut entry = serde_json::json!({
                             "id": id,
                             "memory_type": Self::cell_string(&row[2]),
-                            "content": Self::cell_string(&row[1]),
-                        }));
+                            "content": content,
+                        });
+                        if content_trunc {
+                            entry["truncated"] = Value::Bool(true);
+                        }
+                        let entry_bytes =
+                            serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                        if !callees.is_empty() && ast_bytes + entry_bytes > byte_budget {
+                            mark_collection_truncated(
+                                "callees",
+                                &mut ast_truncated,
+                                &mut truncated_collections,
+                            );
+                            break;
+                        }
+                        callee_ids.insert(id);
+                        ast_bytes += entry_bytes;
+                        callees.push(entry);
                     }
+                }
+                if rows_seen >= row_limit {
+                    mark_collection_truncated(
+                        "callees",
+                        &mut ast_truncated,
+                        &mut truncated_collections,
+                    );
                 }
             }
             // Caller: something DEPENDS_ON a file symbol.
             {
                 let caller_query = format!(
-                    "MATCH (c:Memory)-[:DEPENDS_ON]->(s:Memory) WHERE s.id IN [{sym_list}] AND c.namespace = '{safe_ns}' RETURN c.id, c.content, c.memory_type, c.metadata"
+                    "MATCH (c:Memory)-[:DEPENDS_ON]->(s:Memory) WHERE s.id IN [{sym_list}] AND c.namespace = '{safe_ns}' RETURN c.id, c.content, c.memory_type, c.metadata LIMIT {row_limit}"
                 );
                 let mut res = conn.query(&caller_query)?;
+                let mut rows_seen = 0usize;
                 while let Some(row) = res.next() {
+                    rows_seen += 1;
                     let id = Self::cell_string(&row[0]);
                     let meta = Self::cell_metadata(&row[3]);
-                    if is_visible(&id, &meta) && caller_ids.insert(id.clone()) {
-                        callers.push(serde_json::json!({
+                    if is_visible(&id, &meta) && !caller_ids.contains(&id) {
+                        if callers.len() >= max_items {
+                            mark_collection_truncated(
+                                "callers",
+                                &mut ast_truncated,
+                                &mut truncated_collections,
+                            );
+                            break;
+                        }
+                        let (content, content_trunc) =
+                            Self::truncate_neighbor_content(&Self::cell_string(&row[1]));
+                        let mut entry = serde_json::json!({
                             "id": id,
                             "memory_type": Self::cell_string(&row[2]),
-                            "content": Self::cell_string(&row[1]),
-                        }));
+                            "content": content,
+                        });
+                        if content_trunc {
+                            entry["truncated"] = Value::Bool(true);
+                        }
+                        let entry_bytes =
+                            serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                        if !callers.is_empty() && ast_bytes + entry_bytes > byte_budget {
+                            mark_collection_truncated(
+                                "callers",
+                                &mut ast_truncated,
+                                &mut truncated_collections,
+                            );
+                            break;
+                        }
+                        caller_ids.insert(id);
+                        ast_bytes += entry_bytes;
+                        callers.push(entry);
                     }
+                }
+                if rows_seen >= row_limit {
+                    mark_collection_truncated(
+                        "callers",
+                        &mut ast_truncated,
+                        &mut truncated_collections,
+                    );
                 }
             }
         }
@@ -6636,14 +6889,17 @@ impl LadybugStore {
         if found_edge_importers {
             let file_list = file_ids
                 .iter()
+                .take(max_items)
                 .map(|id| format!("'{}'", escape_ladybug_string(id)))
                 .collect::<Vec<_>>()
                 .join(", ");
             let edge_importer_query = format!(
-                "MATCH (m:Memory)-[:DEPENDS_ON]->(f:Memory) WHERE f.id IN [{file_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.location, m.memory_type, m.metadata"
+                "MATCH (m:Memory)-[:DEPENDS_ON]->(f:Memory) WHERE f.id IN [{file_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.location, m.memory_type, m.metadata LIMIT {row_limit}"
             );
             let mut res = conn.query(&edge_importer_query)?;
+            let mut rows_seen = 0usize;
             while let Some(row) = res.next() {
+                rows_seen += 1;
                 let id = Self::cell_string(&row[0]);
                 let meta = Self::cell_metadata(&row[3]);
                 if !is_visible(&id, &meta) {
@@ -6654,22 +6910,54 @@ impl LadybugStore {
                     continue; // the file itself is not its own importer
                 }
                 let m_type = Self::cell_string(&row[2]);
-                if (m_type == "file" || meta.get("imports").is_some()) && importer_ids.insert(id.clone()) {
-                    importers.push(serde_json::json!({
+                if (m_type == "file" || meta.get("imports").is_some())
+                    && !importer_ids.contains(&id)
+                {
+                    if importers.len() >= max_items {
+                        mark_collection_truncated(
+                            "importers",
+                            &mut ast_truncated,
+                            &mut truncated_collections,
+                        );
+                        break;
+                    }
+                    let entry = serde_json::json!({
                         "id": id,
                         "memory_type": m_type,
                         "content": location,
                         "path": location,
-                    }));
+                    });
+                    let entry_bytes =
+                        serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                    if !importers.is_empty() && ast_bytes + entry_bytes > byte_budget {
+                        mark_collection_truncated(
+                            "importers",
+                            &mut ast_truncated,
+                            &mut truncated_collections,
+                        );
+                        break;
+                    }
+                    importer_ids.insert(id);
+                    ast_bytes += entry_bytes;
+                    importers.push(entry);
                 }
+            }
+            if rows_seen >= row_limit {
+                mark_collection_truncated(
+                    "importers",
+                    &mut ast_truncated,
+                    &mut truncated_collections,
+                );
             }
         }
         if importers.is_empty() {
             let fallback_importer_query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.metadata CONTAINS '{safe_path}' RETURN m.id, m.location, m.memory_type, m.metadata"
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.metadata CONTAINS '{safe_path}' RETURN m.id, m.location, m.memory_type, m.metadata LIMIT {row_limit}"
             );
             let mut res = conn.query(&fallback_importer_query)?;
+            let mut rows_seen = 0usize;
             while let Some(row) = res.next() {
+                rows_seen += 1;
                 let id = Self::cell_string(&row[0]);
                 let meta = Self::cell_metadata(&row[3]);
                 if !is_visible(&id, &meta) {
@@ -6679,14 +6967,47 @@ impl LadybugStore {
                 if location == path {
                     continue; // the file itself is not its own importer
                 }
-                if meta.get("imports").and_then(|v| v.as_array()).is_some_and(|arr| arr.iter().any(|e| e.as_str() == Some(path))) {
-                    importers.push(serde_json::json!({
+                if meta
+                    .get("imports")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| arr.iter().any(|e| e.as_str() == Some(path)))
+                    && !importer_ids.contains(&id)
+                {
+                    if importers.len() >= max_items {
+                        mark_collection_truncated(
+                            "importers",
+                            &mut ast_truncated,
+                            &mut truncated_collections,
+                        );
+                        break;
+                    }
+                    let entry = serde_json::json!({
                         "id": id,
                         "memory_type": Self::cell_string(&row[2]),
                         "content": location,
                         "path": location,
-                    }));
+                    });
+                    let entry_bytes =
+                        serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(64);
+                    if !importers.is_empty() && ast_bytes + entry_bytes > byte_budget {
+                        mark_collection_truncated(
+                            "importers",
+                            &mut ast_truncated,
+                            &mut truncated_collections,
+                        );
+                        break;
+                    }
+                    importer_ids.insert(id);
+                    ast_bytes += entry_bytes;
+                    importers.push(entry);
                 }
+            }
+            if rows_seen >= row_limit {
+                mark_collection_truncated(
+                    "importers",
+                    &mut ast_truncated,
+                    &mut truncated_collections,
+                );
             }
         }
 
@@ -6703,6 +7024,9 @@ impl LadybugStore {
             "imports": imports,
             "importers": importers,
             "blast_radius_count": blast_radius_count,
+            "truncated": ast_truncated,
+            "truncated_collections": truncated_collections,
+            "related_memories_truncated": related_truncated,
         }))
     }
 }
@@ -13031,6 +13355,84 @@ eurostrata\src\daemon.rs",
             Some(8),
             "blast radius: {summary}"
         );
+        assert_eq!(
+            summary.get("truncated").and_then(|v| v.as_bool()),
+            Some(false),
+            "small neighborhood is not truncated: {summary}"
+        );
+        assert_eq!(
+            summary.get("related_memories_truncated").and_then(|v| v.as_bool()),
+            Some(false),
+            "small related_memories is not truncated: {summary}"
+        );
+
+        // Seed high-fan-out neighbors exceeding MAX_RELATED_MEMORIES and MAX_AST_COLLECTION_ITEMS
+        // with oversized content to verify query/node and content budgets + truncation indicators.
+        let long_content = "x".repeat(LadybugStore::MAX_NEIGHBOR_CONTENT_CHARS + 50);
+        for i in 0..25 {
+            let rel_id = format!("mem-fanout-rel-{i}");
+            let caller_id = format!("mem-fanout-caller-{i}");
+            let create_rel = format!(
+                "CREATE (m:Memory {{id: '{rel_id}', namespace: 'probe', content: '{long_content}', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'other.rs', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            );
+            let create_caller = format!(
+                "CREATE (m:Memory {{id: '{caller_id}', namespace: 'probe', content: '{long_content}', user_id: 'u', memory_type: 'symbol', agent_name: 'a', location: 'caller.rs#function:c{i}@1', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            );
+            let edge_rel = edge("RELATES_TO", "mem-rule-a", &rel_id);
+            let edge_caller = edge("DEPENDS_ON", &caller_id, "mem-sym-foo");
+            store
+                .with_conn(move |conn| {
+                    conn.query(&create_rel)?;
+                    conn.query(&create_caller)?;
+                    conn.query(&edge_rel)?;
+                    conn.query(&edge_caller)?;
+                    Ok(())
+                })
+                .await
+                .expect("seed fanout");
+        }
+
+        let (related_capped, summary_capped) = store
+            .ast_neighborhood_for_file(
+                "probe",
+                None,
+                "src/lib.rs",
+                &["mem-rule-a".to_string(), "mem-rule-b".to_string()],
+            )
+            .await
+            .expect("capped neighborhood summary");
+        assert_eq!(
+            related_capped.len(),
+            LadybugStore::MAX_RELATED_MEMORIES,
+            "related_memories capped at MAX_RELATED_MEMORIES"
+        );
+        assert_eq!(
+            summary_capped
+                .get("related_memories_truncated")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "related_memories_truncated set on fanout overflow: {summary_capped}"
+        );
+        assert_eq!(
+            summary_capped.get("truncated").and_then(|v| v.as_bool()),
+            Some(true),
+            "ast_summary.truncated set on callers overflow: {summary_capped}"
+        );
+        assert_eq!(
+            summary_capped
+                .get("callers")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(LadybugStore::MAX_AST_COLLECTION_ITEMS),
+            "callers capped at MAX_AST_COLLECTION_ITEMS"
+        );
+        assert!(
+            related_capped
+                .iter()
+                .any(|v| v.get("truncated").and_then(|b| b.as_bool()) == Some(true)),
+            "oversized neighbor content is truncated with indicator"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

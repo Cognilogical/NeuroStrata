@@ -2014,11 +2014,18 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                     .await
                 {
                     Ok((related_memories, ast_summary)) => {
+                        let related_truncated = ast_summary
+                            .get("related_memories_truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         response["related_memories"] = serde_json::Value::Array(related_memories);
+                        response["related_memories_truncated"] =
+                            serde_json::Value::Bool(related_truncated);
                         response["ast_summary"] = ast_summary;
                     }
                     Err(e) => {
                         response["related_memories"] = serde_json::json!([]);
+                        response["related_memories_truncated"] = serde_json::json!(false);
                         response["ast_summary"] = serde_json::json!({});
                         response["ast_error"] = serde_json::Value::String(e.to_string());
                     }
