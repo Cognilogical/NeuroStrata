@@ -16,7 +16,9 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": false
+    "noEmit": false,
+    "baseUrl": ".",
+    "paths": { "../../core/dist/index.js": ["../core/dist/index.d.ts"] }
   },
   "include": ["index.ts"],
   "exclude": ["node_modules", "dist"]

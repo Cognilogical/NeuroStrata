@@ -446,7 +446,7 @@ pub async fn build_task_graph_context(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
          - Auto-Retrieved Governing Rules & Graph Nodes:\n{}\n\
-         - Mandatory Graph-First Lookup Rule: Before blind `grep`/`glob` or editing files, query `neurostrata_memories_for_file`, `neurostrata_related`, `neurostrata_search_memory` (`include_related: true`), or `neurostrata_sparql_query` (or `neurostrata-mcp` CLI) to inspect governing rules (`GOVERNS`) and AST call/import edges (`DEPENDS_ON`, `calls`, `imports`).",
+         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).",
         namespace, task_id, payload.content, hits_block
     );
     (Value::Array(hits_json), subagent_prompt)
@@ -502,6 +502,27 @@ pub async fn record_graph_query(
             }
         }
     }
+    if project_root.is_none() {
+        // Fall back to the process working directory when it anchors a git
+        // worktree or a .NeuroStrata directory, else to the daemon's resolved
+        // project root (PROJECT_ROOT_ENV or cwd).
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.join(".git").exists() || cwd.join(".NeuroStrata").exists() {
+                project_root = Some(cwd.to_string_lossy().to_string());
+            }
+        }
+        if project_root.is_none() {
+            let root = crate::daemon::resolve_project_root();
+            if root.join(".git").exists() || root.join(".NeuroStrata").exists() {
+                project_root = Some(root.to_string_lossy().to_string());
+            }
+        }
+    }
+    let top_prefix = if query_hint.contains('/') {
+        format!("{}/", query_hint.split('/').next().unwrap_or(query_hint))
+    } else {
+        format!("{}/", query_hint)
+    };
     if let Some(root) = project_root {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
         if let Some(parent) = ledger_path.parent() {
@@ -516,6 +537,7 @@ pub async fn record_graph_query(
                 "ts": now,
                 "tool": tool_name,
                 "query": query_hint,
+                "governed_prefixes": [top_prefix],
             }));
             if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
                 let _ = std::fs::write(&ledger_path, serialized);
@@ -650,11 +672,19 @@ pub async fn handle_task_create(
     )
     .await
     {
-        Ok((id, payload)) => {
+        Ok((id, mut payload)) => {
             let vector = emb.embed(&payload.content).await.unwrap_or_default();
             let (hits_json, subagent_prompt) = build_task_graph_context(
                 &store, &namespace, &id, &vector, &payload,
             ).await;
+            // Persist the prompt injection on the task row so stateless
+            // callers (plugins, task_list) can fetch active task state +
+            // prompt injection in one call.
+            {
+                let obj = task_obj_mut(&mut payload);
+                obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+            }
+            let _ = save_task(&store, &namespace, &id, vector.clone(), payload.clone()).await;
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
@@ -861,6 +891,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let (hits_json, subagent_prompt) = build_task_graph_context(
         &store, &namespace, &id, &vector, &task.payload,
     ).await;
+    {
+        let obj = task_obj_mut(&mut task.payload);
+        obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+    }
+    let _ = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await;
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -1211,7 +1246,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let summaries: Vec<Value> = tasks
+    let mut summaries: Vec<Value> = tasks
         .iter()
         .map(|m| {
             let retired = gate::is_retired(&m.payload.metadata, now);
@@ -1229,6 +1264,36 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             summary
         })
         .collect();
+
+    // Enhancement 1: stateless plugins (cli-hook.mjs, resumed sessions) resolve
+    // the active task's id + subagent_prompt_injection in one task_list call.
+    // Compute the prompt for any in_progress task that doesn't already cache it
+    // in metadata.task.subagent_prompt_injection.
+    let mut pending: Vec<(usize, String, MemoryPayload)> = Vec::new();
+    for (i, m) in tasks.iter().enumerate() {
+        if gate::task_status(m) == Status::InProgress {
+            let already_cached = summaries[i]
+                .as_object()
+                .and_then(|o| o.get("subagent_prompt_injection"))
+                .and_then(|v| v.as_str())
+                .is_some()
+                || m.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get("subagent_prompt_injection"))
+                    .and_then(|v| v.as_str())
+                    .is_some();
+            if !already_cached {
+                pending.push((i, m.id.clone(), m.payload.clone()));
+            }
+        }
+    }
+    for (i, id, payload) in pending {
+        let (_hits, prompt) = build_task_graph_context(&store, &namespace, &id, &[], &payload).await;
+        if let Some(obj) = summaries[i].as_object_mut() {
+            obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+        }
+    }
 
     encode(&json!({
         "namespace": namespace,
@@ -2257,42 +2322,58 @@ pub(crate) fn is_current_hook(content: &str) -> bool {
 pub(crate) const SCAFFOLDED_PRE_COMMIT_HOOK: &str = r#"#!/bin/bash
 # NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
 #
-# Records the modules touched by this commit into `.NeuroStrata/session_queries.json`
+# Records the files/prefixes touched by this commit into `.NeuroStrata/session_queries.json`
 # and stamps `graph_queried` on the active in_progress task for the namespace.
-# If the commit touches files in a governed module (per memory `governs`/`refs`)
-# and the agent did NOT query NeuroStrata for that module, the hook emits a
-# warning (non-blocking) so the agent can verify against source before push.
+# Works across any repository layout (src/, pkg/, cmd/, apps/, packages/, scripts/, root files).
 #
 # Install with:  neurostrata-mcp hooks install
-# (git honors core.hooksPath; the hook text is one file, no drift.)
 
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-ROOT=$(git rev-parse --show-toplevel)
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
-
-# ── Collect touched src/ modules from staged diff ────────────────────────────
-TouchedModules=$(git diff --name-only --cached | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
-if [ -z "$TouchedModules" ]; then
-    TouchedModules=$(git diff --name-only | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
+NAMESPACE=""
+if [ -f "$LEDGER" ]; then
+    NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+fi
+if [ -z "$NAMESPACE" ]; then
+    NAMESPACE=$(basename "$ROOT")
 fi
 
-# ── Check each touched module against governing memories ─────────────────────
-for module in $TouchedModules; do
-    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
-        echo "warning: module '$module' has no recorded NeuroStrata graph/memory lookup in this session" >&2
-        echo "  → call: neurostrata_memories_for_file or neurostrata_search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+# ── Collect staged file paths (excluding .NeuroStrata/ internal files) ───────
+StagedFiles=$(git diff --name-only --cached | grep -v '^\.NeuroStrata/' | sort -u)
+if [ -z "$StagedFiles" ]; then
+    StagedFiles=$(git diff --name-only | grep -v '^\.NeuroStrata/' | sort -u)
+fi
+
+# ── Check each staged file / top-level prefix against session_queries.json ──
+for file in $StagedFiles; do
+    top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
+    matched=0
+    if [ -f "$LEDGER" ]; then
+        if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+            matched=1
+        elif [ -n "$top_prefix" ] && grep -qF "\"$top_prefix\"" "$LEDGER" 2>/dev/null; then
+            matched=1
+        fi
+    fi
+    if [ "$matched" -eq 0 ]; then
+        echo "warning: file '$file' has no recorded NeuroStrata graph/memory lookup in this session" >&2
+        echo "  → call: neurostrata_memories_for_file --namespace $NAMESPACE --path \"$file\"" >&2
     fi
 done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
-    echo '{"namespace": "'"$NAMESPACE"'", "queries": []}' > "$LEDGER"
+    echo "{\"namespace\": \"$NAMESPACE\", \"queries\": []}" > "$LEDGER"
 fi
-for module in $TouchedModules; do
+for file in $StagedFiles; do
+    top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
+    if [ -z "$top_prefix" ]; then
+        top_prefix="$file"
+    fi
     TS=$(date +%s)
-    ENTRY="{\"ts\": $TS, \"query\": \"$module\", \"domains\": [\"$module\"], \"returned_ids\": [], \"governed_prefixes\": [\"$module/\"]}"
-    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
+    ENTRY="{\"ts\": $TS, \"tool\": \"pre-commit\", \"query\": \"$file\", \"domains\": [\"$top_prefix\"], \"returned_ids\": [], \"governed_prefixes\": [\"$top_prefix\"]}"
+    if ! grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
         sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
     fi
 done

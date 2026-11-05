@@ -276,7 +276,8 @@ pub async fn process_mcp_request(
                                 "include_ancestors": { "type": "boolean", "description": "Include memories governing ancestor directories. Default true." },
                                 "memory_types": { "type": "array", "items": { "type": "string" }, "description": "Memory types to return. Default [\"rule\",\"fact\",\"procedure\"]." },
                                 "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
-                                "limit": { "type": "integer", "description": "Max results. Default 5, max 20." }
+                                "limit": { "type": "integer", "description": "Max results. Default 5, max 20." },
+                                "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." }
                             },
                             "required": ["namespace", "path"]
                         }
@@ -1347,7 +1348,9 @@ pub async fn process_mcp_request(
                             let hint = args_ref
                                 .and_then(|a| {
                                     a.get("query")
+                                        .or_else(|| a.get("path"))
                                         .or_else(|| a.get("file_path"))
+                                        .or_else(|| a.get("id"))
                                         .or_else(|| a.get("memory_id"))
                                         .or_else(|| a.get("question"))
                                         .or_else(|| a.get("goal"))
@@ -1991,12 +1994,33 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         .await
     {
         Ok(hits) => {
-            serde_json::json!({
+            let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+            let mut response = serde_json::json!({
                 "memories": hits,
                 "unsupported": false,
                 "path": path,
-            })
-            .to_string()
+            });
+            let include_ast_edges = arguments
+                .get("include_ast_edges")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if include_ast_edges {
+                match store
+                    .ast_neighborhood_for_file(&namespace, source.as_deref(), path, &hit_ids)
+                    .await
+                {
+                    Ok((related_memories, ast_summary)) => {
+                        response["related_memories"] = serde_json::Value::Array(related_memories);
+                        response["ast_summary"] = ast_summary;
+                    }
+                    Err(e) => {
+                        response["related_memories"] = serde_json::json!([]);
+                        response["ast_summary"] = serde_json::json!({});
+                        response["ast_error"] = serde_json::Value::String(e.to_string());
+                    }
+                }
+            }
+            response.to_string()
         }
         Err(e) => serde_json::json!({
             "memories": [],
@@ -7708,33 +7732,47 @@ async fn handle_guard_validate(
                 // the session/worktree preflight before rule validation runs.
                 // Caller-named active task wins when it is InProgress; else any
                 // InProgress row in the namespace.
-                let session_id = arguments
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let active_task_id = arguments
+                // Resolve the active InProgress task: caller-named active_task_id
+                // wins when it is an InProgress row; else any InProgress row.
+                let active_task_row: Option<&SearchResult> = arguments
                     .get("active_task_id")
                     .and_then(|v| v.as_str())
-                    .filter(|tid| {
-                        memories.iter().any(|m| {
-                            m.id == *tid
+                    .and_then(|tid| {
+                        memories.iter().find(|m| {
+                            m.id == tid
                                 && crate::task::gate::is_task(m)
                                 && crate::task::gate::task_status(m)
                                     == crate::task::machine::Status::InProgress
                         })
                     })
                     .or_else(|| {
-                        memories
-                            .iter()
-                            .find(|m| {
-                                crate::task::gate::is_task(m)
-                                    && crate::task::gate::task_status(m)
-                                        == crate::task::machine::Status::InProgress
-                            })
-                            .map(|m| m.id.as_str())
+                        memories.iter().find(|m| {
+                            crate::task::gate::is_task(m)
+                                && crate::task::gate::task_status(m)
+                                    == crate::task::machine::Status::InProgress
+                        })
                     });
+                let active_task_id = active_task_row.map(|m| m.id.as_str());
+                let session_id = arguments
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                // Enhancement 1: a stateless caller (cli-hook.mjs) may send an empty
+                // or "unknown" session_id with active_task_id: null. Fall back to the
+                // session recorded on the active InProgress task so Zero-Action Start
+                // preflight passes when an InProgress task exists in the namespace.
+                let effective_session_id: String = if session_id.is_empty() || session_id == "unknown" {
+                    active_task_row
+                        .and_then(|m| m.payload.metadata.get("task"))
+                        .and_then(|t| t.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| "daemon-resolved".to_string())
+                } else {
+                    session_id.to_string()
+                };
                 let (allowed, transition) = validator.guard_validate_with_mutations(
-                    session_id,
+                    &effective_session_id,
                     active_task_id,
                     cwd,
                     action_type,
@@ -9048,6 +9086,71 @@ mod tests {
         assert_eq!(parsed["unsupported"], serde_json::json!(true));
         assert_eq!(parsed["memories"], serde_json::json!([]));
         assert_eq!(parsed["path"], serde_json::json!("src/lib.rs"));
+    }
+
+    /// `include_ast_edges: true` bundles `related_memories` and `ast_summary`
+    /// into the response; `false` (or omission relies on the default `true`)
+    /// controls their presence (Enhancement 4).
+    #[tokio::test]
+    async fn memories_for_file_includes_ast_edges_when_requested() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+
+        // Seed a file node the rule governs, so the file resolves and the AST
+        // neighborhood is non-empty.
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+        lb.with_conn(move |conn| {
+            conn.query(
+                "CREATE (m:Memory {id: 'mem-file', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'mem-file'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + edge");
+
+        let with_ast = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+            "include_ast_edges": true,
+        });
+        let text = handle_memories_for_file(with_ast, store.clone()).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["unsupported"], serde_json::json!(false));
+        assert!(parsed.get("memories").is_some(), "memories present: {text}");
+        assert!(parsed.get("related_memories").is_some(), "related_memories present: {text}");
+        let ast = parsed.get("ast_summary").expect("ast_summary present: {text}");
+        assert!(ast.get("symbols").is_some());
+        assert!(ast.get("blast_radius_count").is_some());
+        assert_eq!(
+            ast.get("imports").and_then(|v| v.as_array()).unwrap().len(),
+            1,
+            "imports from file metadata: {ast}"
+        );
+
+        // Omitting the param defaults to true: keys still present.
+        let defaulted = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+        });
+        let text = handle_memories_for_file(defaulted, store.clone()).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(parsed.get("related_memories").is_some(), "default true: {text}");
+        assert!(parsed.get("ast_summary").is_some(), "default true: {text}");
+
+        // `include_ast_edges: false` omits them.
+        let without = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+            "include_ast_edges": false,
+        });
+        let text = handle_memories_for_file(without, store).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert!(parsed.get("related_memories").is_none(), "related_memories omitted: {text}");
+        assert!(parsed.get("ast_summary").is_none(), "ast_summary omitted: {text}");
     }
 
     #[tokio::test]
@@ -10989,6 +11092,7 @@ mod tests {
                 "neurostrata_provenance_for",
                 "neurostrata_storage_status",
                 "neurostrata_graphql_query",
+                "neurostrata_kge_train",
                 "neurostrata_metrics_query",
                 "neurostrata_metrics_list",
                 "neurostrata_chat_ask",

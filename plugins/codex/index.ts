@@ -6,8 +6,8 @@
  * core; this file contains zero logic.
  */
 
-export * from "../core/dist/index.js";
-import { createHarnessPlugin } from "../core/dist/index.js";
+export * from "../../core/dist/index.js";
+import { createHarnessPlugin } from "../../core/dist/index.js";
 
 export const plugin = createHarnessPlugin("neurostrata-codex", "Codex");
 export default plugin;

@@ -1565,7 +1565,7 @@ impl LadybugStore {
     /// The connection is opened inside the closure on purpose. It borrows the
     /// Database and is not Send, so it must never be created here and moved, nor
     /// held across an await.
-    async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    pub(crate) async fn with_conn<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -6333,6 +6333,269 @@ fn fetch_related_subgraph(
 
     let nodes: Vec<NodeSpec> = nodes.into_values().collect();
     Ok((nodes, edges, generation))
+}
+
+impl LadybugStore {
+    /// Compact AST + related-memory neighborhood for a file, used by
+    /// `neurostrata_memories_for_file` when `include_ast_edges` is true
+    /// (Enhancement 4). Returns `(related_memories, ast_summary)`.
+    ///
+    /// `related_memories` are the 1-hop `DEPENDS_ON`/`RELATES_TO` neighbors
+    /// (both directions) of the governing memories, plus `SUPERSEDES` targets
+    /// named in `metadata.superseded_by`.
+    ///
+    /// `ast_summary` is `{ symbols, callers, callees, imports, importers,
+    /// blast_radius_count }` for the file node at `path`.
+    pub async fn ast_neighborhood_for_file(
+        &self,
+        namespace: &str,
+        source: Option<&str>,
+        path: &str,
+        governing_ids: &[String],
+    ) -> Result<(Vec<Value>, Value)> {
+        let namespace = namespace.to_string();
+        let path = crate::parser::ingest::normalize_node_path(path);
+        let governing_ids = governing_ids.to_vec();
+        let _source = source.map(|s| s.to_string()); // pins the active generation, mirroring memories_for_file
+
+        let ns = namespace.clone();
+        let path_c = path.clone();
+        let ids = governing_ids.clone();
+
+        let (related_memories, ast_summary) = self
+            .with_conn(move |conn| {
+                let safe_ns = escape_ladybug_string(&ns);
+                let mut related: Vec<Value> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+
+                if !ids.is_empty() {
+                    let id_list = ids
+                        .iter()
+                        .map(|id| format!("'{}'", escape_ladybug_string(id)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    for (rel, direction) in [
+                        ("DEPENDS_ON", "outgoing"),
+                        ("DEPENDS_ON", "incoming"),
+                        ("RELATES_TO", "outgoing"),
+                        ("RELATES_TO", "incoming"),
+                    ] {
+                        let query = match direction {
+                            "outgoing" => format!(
+                                "MATCH (m:Memory)-[:{rel}]->(t:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                            ),
+                            "incoming" => format!(
+                                "MATCH (t:Memory)-[:{rel}]->(m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                            ),
+                            _ => unreachable!(),
+                        };
+                        let mut res = conn.query(&query)?;
+                        while let Some(row) = res.next() {
+                            let id = Self::cell_string(&row[0]);
+                            if !seen.insert(id.clone()) {
+                                continue;
+                            }
+                            related.push(serde_json::json!({
+                                "id": id,
+                                "memory_type": Self::cell_string(&row[2]),
+                                "content": Self::cell_string(&row[1]),
+                                "relation": rel,
+                                "direction": direction,
+                                "metadata": Self::cell_metadata(&row[3]),
+                            }));
+                        }
+                    }
+
+                    // SUPERSEDES: memories the governing memories were superseded by.
+                    let query = format!(
+                        "MATCH (m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.metadata"
+                    );
+                    let mut res = conn.query(&query)?;
+                    while let Some(row) = res.next() {
+                        let id = Self::cell_string(&row[0]);
+                        if let Some(by) = Self::cell_metadata(&row[1])
+                            .get("superseded_by")
+                            .and_then(|v| v.as_str())
+                        {
+                            if !by.is_empty() && seen.insert(by.to_string()) {
+                                related.push(serde_json::json!({
+                                    "id": by,
+                                    "memory_type": Value::Null,
+                                    "content": Value::Null,
+                                    "relation": "SUPERSEDES",
+                                    "direction": "outgoing",
+                                    "supersedes": id,
+                                }));
+                            }
+                        }
+                    }
+                }
+
+                let ast_summary = Self::ast_summary_for_file(conn, &safe_ns, &path_c)?;
+
+                Ok((related, ast_summary))
+            })
+            .await?;
+
+        Ok((related_memories, ast_summary))
+    }
+
+    /// Render one lbug row cell as a String, tolerating non-string cells.
+    fn cell_string(value: &lbug::Value) -> String {
+        match value {
+            lbug::Value::String(s) => s.clone(),
+            _ => format!("{}", value),
+        }
+    }
+
+    /// Parse one lbug row cell holding a JSON metadata string into a `Value`.
+    fn cell_metadata(value: &lbug::Value) -> Value {
+        let raw = Self::cell_string(value);
+        if raw.trim().is_empty() {
+            return Value::Null;
+        }
+        serde_json::from_str(&raw).unwrap_or(Value::Null)
+    }
+
+    /// Compact AST neighborhood for the file at `path`: its symbol nodes, the
+    /// symbols that depend on it (callers) and it depends on (callees), its
+    /// declared imports, the files that import it (importers), and the size of
+    /// the combined blast radius.
+    fn ast_summary_for_file(
+        conn: &Connection,
+        safe_ns: &str,
+        path: &str,
+    ) -> Result<Value> {
+        let safe_path = escape_ladybug_string(path);
+
+        // Symbol nodes of the file: symbol locations are `path#kind:name@hash`.
+        let mut symbols: Vec<Value> = Vec::new();
+        let mut symbol_ids: HashSet<String> = HashSet::new();
+        {
+            let symbol_query = format!(
+                "MATCH (s:Memory) WHERE s.namespace = '{safe_ns}' AND s.location STARTS WITH '{safe_path}#' RETURN s.id, s.content, s.memory_type"
+            );
+            let mut res = conn.query(&symbol_query)?;
+            while let Some(row) = res.next() {
+                let id = Self::cell_string(&row[0]);
+                if symbol_ids.insert(id.clone()) {
+                    symbols.push(serde_json::json!({
+                        "id": id,
+                        "memory_type": Self::cell_string(&row[2]),
+                        "content": Self::cell_string(&row[1]),
+                    }));
+                }
+            }
+        }
+
+        // The file node itself: carries `metadata.imports`.
+        let mut imports: Vec<Value> = Vec::new();
+        let mut importers: Vec<Value> = Vec::new();
+        let mut file_ids: Vec<String> = Vec::new();
+        {
+            let file_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.location = '{safe_path}' RETURN m.id, m.metadata"
+            );
+            let mut res = conn.query(&file_query)?;
+            while let Some(row) = res.next() {
+                let id = Self::cell_string(&row[0]);
+                file_ids.push(id);
+                if let Some(arr) = Self::cell_metadata(&row[1]).get("imports").and_then(|v| v.as_array()) {
+                    for entry in arr {
+                        imports.push(serde_json::json!({ "path": entry }));
+                    }
+                }
+            }
+        }
+        let _file_ids = file_ids; // reserved for caller-side filtering; kept for symmetry
+
+        // Callers / callees: DEPENDS_ON edges incident to the file's symbols.
+        let mut callers: Vec<Value> = Vec::new();
+        let mut callees: Vec<Value> = Vec::new();
+        let mut caller_ids: HashSet<String> = HashSet::new();
+        let mut callee_ids: HashSet<String> = HashSet::new();
+        if !symbol_ids.is_empty() {
+            let sym_list = symbol_ids
+                .iter()
+                .map(|id| format!("'{}'", escape_ladybug_string(id)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Callee: a file symbol DEPENDS_ON it.
+            {
+                let callee_query = format!(
+                    "MATCH (s:Memory)-[:DEPENDS_ON]->(t:Memory) WHERE s.id IN [{sym_list}] RETURN t.id, t.content, t.memory_type"
+                );
+                let mut res = conn.query(&callee_query)?;
+                while let Some(row) = res.next() {
+                    let id = Self::cell_string(&row[0]);
+                    if callee_ids.insert(id.clone()) {
+                        callees.push(serde_json::json!({
+                            "id": id,
+                            "memory_type": Self::cell_string(&row[2]),
+                            "content": Self::cell_string(&row[1]),
+                        }));
+                    }
+                }
+            }
+            // Caller: something DEPENDS_ON a file symbol.
+            {
+                let caller_query = format!(
+                    "MATCH (c:Memory)-[:DEPENDS_ON]->(s:Memory) WHERE s.id IN [{sym_list}] RETURN c.id, c.content, c.memory_type"
+                );
+                let mut res = conn.query(&caller_query)?;
+                while let Some(row) = res.next() {
+                    let id = Self::cell_string(&row[0]);
+                    if caller_ids.insert(id.clone()) {
+                        callers.push(serde_json::json!({
+                            "id": id,
+                            "memory_type": Self::cell_string(&row[2]),
+                            "content": Self::cell_string(&row[1]),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Importers: other file nodes whose metadata.imports names this path.
+        {
+            let importer_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.memory_type = 'file' RETURN m.id, m.location, m.metadata"
+            );
+            let mut res = conn.query(&importer_query)?;
+            while let Some(row) = res.next() {
+                let location = Self::cell_string(&row[1]);
+                if location == path {
+                    continue; // the file itself is not its own importer
+                }
+                if let Some(arr) = Self::cell_metadata(&row[2]).get("imports").and_then(|v| v.as_array()) {
+                    if arr.iter().any(|e| e.as_str() == Some(path)) {
+                        importers.push(serde_json::json!({
+                            "id": Self::cell_string(&row[0]),
+                            "memory_type": "file",
+                            "content": location,
+                            "path": location,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let blast_radius_count = symbols.len()
+            + callers.len()
+            + callees.len()
+            + imports.len()
+            + importers.len();
+
+        Ok(serde_json::json!({
+            "symbols": symbols,
+            "callers": callers,
+            "callees": callees,
+            "imports": imports,
+            "importers": importers,
+            "blast_radius_count": blast_radius_count,
+        }))
+    }
 }
 
 /// IntakeStore implementation for LadybugStore (PQTH durable intake ledger).
@@ -12502,6 +12765,163 @@ eurostrata\src\daemon.rs",
             Some("https://neurostrata.io/concepts/authentication")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ast_neighborhood_for_file` bundles 1-hop `DEPENDS_ON`/`RELATES_TO`
+    /// neighbors (both directions) plus `SUPERSEDES` targets into
+    /// `related_memories`, and a compact AST neighborhood
+    /// (`symbols`/`callers`/`callees`/`imports`/`importers`/`blast_radius_count`)
+    /// into `ast_summary` (Enhancement 4).
+    #[tokio::test]
+    async fn ast_neighborhood_for_file_bundles_related_and_ast_summary() {
+        let dir = std::env::temp_dir().join(format!("ast-nb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let seed = |id: &str, location: &str, memory_type: &str, metadata: &str| {
+            format!(
+                "CREATE (m:Memory {{id: '{}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: '{}', agent_name: 'a', location: '{}', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]}})",
+                escape_ladybug_string(id),
+                memory_type,
+                escape_ladybug_string(location),
+                escape_ladybug_string(metadata)
+            )
+        };
+        let edge = |rel: &str, a: &str, b: &str| {
+            format!(
+                "MERGE (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) MERGE (a)-[r:{} {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)",
+                escape_ladybug_string(a),
+                escape_ladybug_string(b),
+                rel
+            )
+        };
+
+        let rows = [
+            seed("mem-rule-a", "src/lib.rs", "rule", r#"{"superseded_by": "mem-rule-c"}"#),
+            seed("mem-rule-b", "src/lib.rs", "fact", "{}"),
+            seed("mem-file", "src/lib.rs", "file", r#"{"imports": ["pkg/other.rs", "src/lib.rs"]}"#),
+            seed("mem-sym-foo", "src/lib.rs#function:foo@1", "symbol", "{}"),
+            seed("mem-sym-bar", "src/lib.rs#function:bar@2", "symbol", "{}"),
+            seed("mem-sym-x", "other.rs#function:x@3", "symbol", "{}"),
+            seed("mem-rule-c", "src/lib.rs", "rule", "{}"),
+        ];
+        for row in rows {
+            store
+                .with_conn(move |conn| {
+                    conn.query(&row)?;
+                    Ok(())
+                })
+                .await
+                .expect("seed node");
+        }
+        for (rel, a, b) in [
+            ("DEPENDS_ON", "mem-rule-a", "mem-sym-foo"),
+            ("DEPENDS_ON", "mem-sym-foo", "mem-sym-bar"),
+            ("DEPENDS_ON", "mem-sym-x", "mem-sym-foo"),
+            ("RELATES_TO", "mem-rule-b", "mem-sym-bar"),
+            ("RELATES_TO", "mem-sym-x", "mem-rule-b"),
+        ] {
+            store
+                .with_conn(move |conn| {
+                    conn.query(&edge(rel, a, b))?;
+                    Ok(())
+                })
+                .await
+                .expect("seed edge");
+        }
+
+        let (related, summary) = store
+            .ast_neighborhood_for_file(
+                "probe",
+                None,
+                "src/lib.rs",
+                &["mem-rule-a".to_string(), "mem-rule-b".to_string()],
+            )
+            .await
+            .expect("neighborhood summary");
+
+        // related_memories: 1-hop neighbors both directions + SUPERSEDES.
+        let related_ids: Vec<&str> = related
+            .iter()
+            .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert_eq!(related.len(), 4, "exactly four related memories: {related:?}");
+        assert!(related_ids.contains(&"mem-sym-foo"), "DEPENDS_ON outgoing: {related:?}");
+        assert!(related_ids.contains(&"mem-sym-bar"), "RELATES_TO outgoing: {related:?}");
+        assert!(related_ids.contains(&"mem-sym-x"), "RELATES_TO incoming: {related:?}");
+        assert!(related_ids.contains(&"mem-rule-c"), "SUPERSEDES target: {related:?}");
+        let dep_foo = related
+            .iter()
+            .find(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-sym-foo"))
+            .unwrap();
+        assert_eq!(
+            dep_foo.get("relation").and_then(|v| v.as_str()),
+            Some("DEPENDS_ON")
+        );
+        assert_eq!(
+            dep_foo.get("direction").and_then(|v| v.as_str()),
+            Some("outgoing")
+        );
+
+        // ast_summary.
+        let sym_ids: Vec<&str> = summary
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert_eq!(sym_ids.len(), 2, "two file symbols: {sym_ids:?}");
+        assert!(sym_ids.contains(&"mem-sym-foo"));
+        assert!(sym_ids.contains(&"mem-sym-bar"));
+
+        let caller_ids: Vec<&str> = summary
+            .get("callers")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert_eq!(caller_ids.len(), 3, "callers depend on file symbols: {caller_ids:?}");
+        assert!(caller_ids.contains(&"mem-rule-a"));
+        assert!(caller_ids.contains(&"mem-sym-foo"));
+        assert!(caller_ids.contains(&"mem-sym-x"));
+
+        let callee_ids: Vec<&str> = summary
+            .get("callees")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert_eq!(callee_ids.len(), 1, "callees are file symbols' targets: {callee_ids:?}");
+        assert!(callee_ids.contains(&"mem-sym-bar"));
+
+        let import_paths: Vec<&str> = summary
+            .get("imports")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.get("path").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert!(import_paths.contains(&"pkg/other.rs"));
+        assert!(import_paths.contains(&"src/lib.rs"));
+
+        let imp_ids: Vec<&str> = summary
+            .get("importers")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap())
+            .collect();
+        assert!(imp_ids.is_empty(), "no importers: {imp_ids:?}");
+
+        assert_eq!(
+            summary.get("blast_radius_count").and_then(|v| v.as_u64()),
+            Some(8),
+            "blast radius: {summary}"
+        );
     }
 }
 

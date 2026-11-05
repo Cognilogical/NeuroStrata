@@ -14,6 +14,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": false,
+    "baseUrl": ".",
+    "paths": { "../../core/dist/index.js": ["../core/dist/index.d.ts"] },
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true

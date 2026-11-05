@@ -22,7 +22,7 @@ import plugin, {
 } from "./dist/index.js";
 
 test("Plugin.define exports V2 setup and registers execute.before hook", async () => {
-  assert.equal(plugin.id, "neurostrata-opencode");
+  assert.equal(plugin.id, "neurostrata");
   assert.equal(typeof plugin.setup, "function");
 
   let registeredHook = null;
@@ -468,7 +468,7 @@ test("opencode thin wrapper re-exports core surface and builds its own plugin", 
   assert.equal(typeof plugin2.onTurnEnd, "function");
   assert.equal(typeof plugin2.fetchContextPlan, "function");
 
-  assert.equal(plugin.id, "neurostrata-opencode");
+  assert.equal(plugin.id, "neurostrata");
   assert.equal(plugin.name, "OpenCode");
   assert.equal(plugin.handleHookEvent, plugin.handleClaudeHookEvent);
 });
