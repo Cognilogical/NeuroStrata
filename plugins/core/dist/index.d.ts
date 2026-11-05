@@ -175,6 +175,7 @@ export declare function buildSubagentContextHeader(namespace: string, taskId: st
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string): boolean;
 export declare function extractRepoFilePaths(promptText: string): string[];
 export declare const cachedTaskInjection: Map<string, string | null>;
+export declare const cachedSubagentPromptByTask: Map<string, string | null>;
 /**
  * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
  * activeSessionId and cachedTaskInjection.

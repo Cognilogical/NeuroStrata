@@ -31,6 +31,7 @@ import {
   injectedMemoryIds,
   prefetchedPaths,
   cachedTaskInjection,
+  cachedSubagentPromptByTask,
   PREFETCH_LRU_CAP,
 } from "./dist/index.js";
 
@@ -608,6 +609,36 @@ describe("prefetchMemoriesForFile LRU + dedup", () => {
     resetClientForTesting();
     const out = await prefetchMemoriesForFile("ns", "src/foo.ts");
     assert.deepEqual(out, []);
+  });
+});
+
+describe("recordLocalSessionQuery ledger object format", () => {
+  it("writes { namespace, queries } object form, converting a legacy array, and preserves namespace", async () => {
+    const { server, url } = await createMockDaemonServer();
+    const ledgerPath = join(process.cwd(), ".NeuroStrata", "session_queries.json");
+    try {
+      // Start from a known legacy-array ledger (no namespace) so the written
+      // object form is deterministic regardless of prior test runs.
+      writeFileSync(ledgerPath, JSON.stringify([], null, 2));
+      resetClientForTesting();
+      const ctx = { config: { namespace: "ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await prefetchMemoriesForFile("ledger-ns", "src/ledger.ts");
+      const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      assert.equal(ledger.namespace, "ledger-ns", "ledger.namespace must be set");
+      const queries = Array.isArray(ledger) ? ledger : ledger.queries;
+      assert.ok(Array.isArray(queries), "queries must be an array");
+      assert.equal(queries.length, 1);
+      assert.equal(queries[0].tool, "neurostrata_memories_for_file");
+      assert.equal(queries[0].query, "src/ledger.ts");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("aliases cachedSubagentPromptByTask to cachedTaskInjection", () => {
+    assert.equal(cachedSubagentPromptByTask, cachedTaskInjection);
   });
 });
 

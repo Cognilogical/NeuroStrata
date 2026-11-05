@@ -503,12 +503,20 @@ pub async fn record_graph_query(
         }
     }
     if project_root.is_none() {
-        // Fall back to the process working directory when it anchors a git
-        // worktree or a .NeuroStrata directory, else to the daemon's resolved
-        // project root (PROJECT_ROOT_ENV or cwd).
+        // Walk up from the process working directory through parent directories
+        // looking for `.git` or `.NeuroStrata` (instead of only checking cwd
+        // directly), then fall back to the daemon's resolved project root.
         if let Ok(cwd) = std::env::current_dir() {
-            if cwd.join(".git").exists() || cwd.join(".NeuroStrata").exists() {
-                project_root = Some(cwd.to_string_lossy().to_string());
+            let mut cur = cwd;
+            loop {
+                if cur.join(".git").exists() || cur.join(".NeuroStrata").exists() {
+                    project_root = Some(cur.to_string_lossy().to_string());
+                    break;
+                }
+                match cur.parent() {
+                    Some(parent) => cur = parent.to_path_buf(),
+                    None => break,
+                }
             }
         }
         if project_root.is_none() {
@@ -2344,12 +2352,15 @@ if [ -z "$StagedFiles" ]; then
     StagedFiles=$(git diff --name-only | grep -v '^\.NeuroStrata/' | sort -u)
 fi
 
-# ── Check each staged file / top-level prefix against session_queries.json ──
+# ── Check each staged file / dir-prefix / top-level prefix against session_queries.json ──
 for file in $StagedFiles; do
+    dir_prefix=$(dirname "$file")
     top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
     matched=0
     if [ -f "$LEDGER" ]; then
         if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+            matched=1
+        elif [ -n "$dir_prefix" ] && grep -qF "\"$dir_prefix/\"" "$LEDGER" 2>/dev/null; then
             matched=1
         elif [ -n "$top_prefix" ] && grep -qF "\"$top_prefix\"" "$LEDGER" 2>/dev/null; then
             matched=1
@@ -2367,6 +2378,7 @@ if [ ! -f "$LEDGER" ]; then
     echo "{\"namespace\": \"$NAMESPACE\", \"queries\": []}" > "$LEDGER"
 fi
 for file in $StagedFiles; do
+    dir_prefix=$(dirname "$file")
     top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
     if [ -z "$top_prefix" ]; then
         top_prefix="$file"
@@ -2374,7 +2386,13 @@ for file in $StagedFiles; do
     TS=$(date +%s)
     ENTRY="{\"ts\": $TS, \"tool\": \"pre-commit\", \"query\": \"$file\", \"domains\": [\"$top_prefix\"], \"returned_ids\": [], \"governed_prefixes\": [\"$top_prefix\"]}"
     if ! grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
-        sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
+        if grep -q '"queries":[[:space:]]*\[\]' "$LEDGER" 2>/dev/null; then
+            # Empty "queries": [] -> replace with a single-entry pretty array.
+            sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
+        else
+            # Non-empty "queries": [ -> append after the opening bracket.
+            sed -i "s|\"queries\": \[|\"queries\": [\n    $ENTRY,|" "$LEDGER" 2>/dev/null || true
+        fi
     fi
 done
 

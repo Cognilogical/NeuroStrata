@@ -117,9 +117,21 @@ export function resolveConfig(pluginConfig: unknown = {}, cwd = process.cwd()): 
  * resolve(startDir) if none found.
  */
 export function findProjectRoot(startDir = process.cwd()): string {
+  // Pass 1: walk up looking for `.git` first; a `.git` anchors the project root.
   let current = resolve(startDir);
   while (true) {
-    if (existsSync(join(current, ".git")) || existsSync(join(current, ".NeuroStrata"))) {
+    if (existsSync(join(current, ".git"))) {
+      return current;
+    }
+    const next = dirname(current);
+    if (next === current) break;
+    current = next;
+  }
+  // Pass 2: only if no `.git` anywhere in the ancestor chain, walk up looking
+  // for `.NeuroStrata`. Otherwise fall back to resolve(startDir).
+  current = resolve(startDir);
+  while (true) {
+    if (existsSync(join(current, ".NeuroStrata"))) {
       return current;
     }
     const next = dirname(current);
@@ -135,25 +147,30 @@ export function findProjectRoot(startDir = process.cwd()): string {
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
 export function discoverProjectNamespace(startDir = process.cwd()): string {
-  const root = findProjectRoot(startDir);
-  const sessionQueriesPath = join(root, ".NeuroStrata", "session_queries.json");
-  try {
-    if (existsSync(sessionQueriesPath)) {
-      const content = readFileSync(sessionQueriesPath, "utf8");
-      const parsed = JSON.parse(content);
-      if (
-        parsed !== null &&
-        typeof parsed === "object" &&
-        typeof parsed.namespace === "string" &&
-        parsed.namespace.trim() !== ""
-      ) {
-        return parsed.namespace.trim();
+  let current = resolve(startDir);
+  while (true) {
+    const sessionQueriesPath = join(current, ".NeuroStrata", "session_queries.json");
+    try {
+      if (existsSync(sessionQueriesPath)) {
+        const content = readFileSync(sessionQueriesPath, "utf8");
+        const parsed = JSON.parse(content);
+        if (
+          parsed !== null &&
+          typeof parsed === "object" &&
+          typeof parsed.namespace === "string" &&
+          parsed.namespace.trim() !== ""
+        ) {
+          return parsed.namespace.trim();
+        }
       }
+    } catch {
+      // fall through to next ancestor
     }
-  } catch {
-    // fall through to basename fallback
+    const next = dirname(current);
+    if (next === current) break;
+    current = next;
   }
-  return basename(root) || "default";
+  return basename(findProjectRoot(startDir)) || "default";
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -615,19 +632,25 @@ function recordLocalSessionQuery(
   const topPrefix = query.split(/[\/\\]/)[0] || query;
   const entry = { ts: Math.floor(Date.now() / 1000), tool, query, governed_prefixes: [topPrefix] };
   const ledgerPath = join(findProjectRoot(), ".NeuroStrata", "session_queries.json");
-  let arr: unknown[] = [];
+  let parsed: unknown;
   try {
-    if (existsSync(ledgerPath)) {
-      const parsed = JSON.parse(readFileSync(ledgerPath, "utf8"));
-      if (Array.isArray(parsed)) arr = parsed;
-    }
+    parsed = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, "utf8")) : undefined;
   } catch {
-    arr = [];
+    parsed = undefined;
   }
-  arr.push(entry);
+  let out: Record<string, unknown>;
+  if (Array.isArray(parsed)) {
+    // Legacy top-level array: wrap it into the object form.
+    out = { namespace, queries: [...parsed, entry] };
+  } else if (parsed !== null && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).queries)) {
+    const obj = parsed as Record<string, unknown>;
+    out = { ...obj, namespace: (obj.namespace as string | undefined) || namespace, queries: [...(obj.queries as unknown[]), entry] };
+  } else {
+    out = { namespace, queries: [entry] };
+  }
   try {
     mkdirSync(dirname(ledgerPath), { recursive: true });
-    writeFileSync(ledgerPath, JSON.stringify(arr, null, 2));
+    writeFileSync(ledgerPath, JSON.stringify(out, null, 2));
   } catch {
     // best-effort; never break a file touch for a ledger write
   }
@@ -751,6 +774,7 @@ export function extractRepoFilePaths(promptText: string): string[] {
 
 // Cached daemon subagent prompt injections keyed by active task id.
 export const cachedTaskInjection: Map<string, string | null> = new Map();
+export const cachedSubagentPromptByTask = cachedTaskInjection;
 
 /**
  * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
@@ -878,14 +902,20 @@ function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string,
 }
 
 const executeAfterHandler = async (output: any): Promise<any> => {
-  const block = pendingRecallBlocks.shift() ?? (output && typeof output === "object" ? (output as Record<string, unknown>).neurostrataContext : undefined);
-  if (block && output && typeof output === "object") {
-    const out = output as Record<string, unknown>;
+  // The host may pass the output object directly, or a single `event` argument
+  // whose `.output` holds the real output. Resolve the target object.
+  let target = output;
+  if (target && typeof target === "object" && target.output !== undefined && typeof target.output === "object") {
+    target = target.output;
+  }
+  const block = pendingRecallBlocks.shift() ?? (target && typeof target === "object" ? (target as Record<string, unknown>).neurostrataContext : undefined);
+  if (block && target && typeof target === "object") {
+    const out = target as Record<string, unknown>;
     if (typeof out.output === "string") out.output = `${block}\n\n${out.output}`;
     else if (typeof out.content === "string") out.content = `${block}\n\n${out.content}`;
     out.additionalContext = block;
   }
-  return output;
+  return target ?? output;
 };
 
 const executeBeforeHandler = async (input: any): Promise<any> => {

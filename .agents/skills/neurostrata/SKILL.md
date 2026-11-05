@@ -50,6 +50,7 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
   - `neurostrata_search_memory` (`include_related: true`) — 4-stage hybrid retrieval (Tantivy BM25 + HNSW Vector → RRF → PPR Graph Expansion → FlashRank ONNX Reranking → Bi-Temporal Salience).
   - `neurostrata_sparql_query` (`namespace`, `query`) — W3C SPARQL 1.1 (`SELECT`, `ASK`, `CONSTRUCT`) over the OxiRS RDF quad store.
   - Every lookup increments `task.graph_queries_count` and records into `.NeuroStrata/session_queries.json`.
+- **Verifiable Graph-First predicate:** Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first.
 - **Subagent Prompt Propagation:** Subagents start with a blank context window. On session init, write the Graph-First rule into your active plan, and whenever you spawn ANY subagent (`subagent`, `Task`, `delegate_task`, `spawn_agent`), paste the `subagent_prompt_injection` block from `neurostrata_task_claim` into the subagent's prompt (the 6 harness plugins also prepend it automatically).
 
 ---

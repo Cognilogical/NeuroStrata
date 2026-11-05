@@ -409,12 +409,31 @@ fn sync_skills_and_agent_rules(
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if content.contains(SUBAGENT_RULE_MARKER) || content.contains("tools: false") {
-                continue;
-            }
-            let updated = format!("{}{}", content.trim_end(), SUBAGENT_GRAPH_FIRST_RULE_SNIPPET);
-            if std::fs::write(&path, updated).is_ok() {
-                patched_agents.push(path.to_string_lossy().to_string());
+            // Upgrade path: if an older agent .md still carries the unenforceable
+            // "unless the parent prompt states ..." bypass clause, replace that
+            // rule line with the verifiable Graph-First predicate.
+            let updated: Option<String> = if content.contains("unless the parent prompt states") {
+                let replaced = content
+                    .lines()
+                    .map(|line| {
+                        if line.contains("unless the parent prompt states") {
+                            SUBAGENT_GRAPH_FIRST_RULE_SNIPPET.trim_end()
+                        } else {
+                            line
+                        }
+                    })
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                if replaced != content { Some(replaced) } else { None }
+            } else if !content.contains(SUBAGENT_RULE_MARKER) && !content.contains("tools: false") {
+                Some(format!("{}{}", content.trim_end(), SUBAGENT_GRAPH_FIRST_RULE_SNIPPET))
+            } else {
+                None
+            };
+            if let Some(updated) = updated {
+                if std::fs::write(&path, updated).is_ok() {
+                    patched_agents.push(path.to_string_lossy().to_string());
+                }
             }
         }
     }
@@ -457,10 +476,47 @@ fn wire_harness_config(
                 let _ = std::fs::create_dir_all(&plugins_dir);
                 let _ = std::fs::write(&loader_path, loader);
 
-                // 2. Merge the relative loader path into .opencode/opencode.json ->
-                //    "plugins" (created if missing) and "plugin" (only if already
-                //    present), preserving every other key/entry.
+                // 2. Always create or merge .opencode/opencode.json -> "plugins",
+                //    preserving every other key/entry.
                 let loader_rel = "./.NeuroStrata/plugins/opencode/dist/index.js";
+                let oc_cfg = project_root.join(".opencode/opencode.json");
+                {
+                    let mut doc: Value = std::fs::read_to_string(&oc_cfg)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_else(|| json!({}));
+                    if let Some(obj) = doc.as_object_mut() {
+                        let entry = obj.get("plugins");
+                        let (is_array, already_in_array, key_absent) = {
+                            let e = entry;
+                            (
+                                e.map(|v| v.is_array()).unwrap_or(false),
+                                e.and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter().any(|v| {
+                                            v.as_str()
+                                                .map(|s| s == loader_rel)
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .unwrap_or(false),
+                                entry.is_none(),
+                            )
+                        };
+                        if is_array && !already_in_array {
+                            obj.get_mut("plugins")
+                                .and_then(|v| v.as_array_mut())
+                                .unwrap()
+                                .push(json!(loader_rel));
+                        } else if key_absent {
+                            obj.insert("plugins".to_string(), json!([loader_rel]));
+                        }
+                    }
+                    let _ = write_json_if_changed(&oc_cfg, &doc);
+                }
+
+                // 3. Root opencode.json: only update if it already exists; never
+                //    create a root opencode.json (the loader lives in .opencode/).
                 let root_cfg = project_root.join("opencode.json");
                 if root_cfg.exists() {
                     if let Ok(raw) = std::fs::read_to_string(&root_cfg) {
@@ -499,12 +555,6 @@ fn wire_harness_config(
                             let _ = write_json_if_changed(&root_cfg, &root_doc);
                         }
                     }
-                } else {
-                    // No opencode.json yet: create it registering the loader in "plugins".
-                    let _ = write_json_if_changed(
-                        &root_cfg,
-                        &serde_json::json!({ "plugins": [loader_rel] }),
-                    );
                 }
 
                 // 3. Keep writing .opencode/neurostrata-plugin.json (the historical
@@ -638,6 +688,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".opencode")).expect("create .opencode");
 
+        // Root opencode.json pre-exists with unrelated entries; it must be
+        // updated without clobbering them.
+        let root_cfg = tmp.path().join("opencode.json");
+        std::fs::write(
+            &root_cfg,
+            serde_json::to_string_pretty(&json!({ "plugins": ["./other.js"], "otherKey": "preserve" })).unwrap(),
+        )
+        .expect("write root opencode.json");
+
         let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("opencode"));
         assert_eq!(report["active_harness"], json!("opencode"));
 
@@ -661,16 +720,31 @@ mod tests {
             "loader re-exports all"
         );
 
-        // Root opencode.json registers the loader in "plugins".
-        let root_cfg = tmp.path().join("opencode.json");
-        assert!(root_cfg.exists());
+        // .opencode/opencode.json always created/merged with the loader in "plugins".
+        let oc_cfg = tmp.path().join(".opencode/opencode.json");
+        assert!(oc_cfg.exists(), ".opencode/opencode.json must be created");
+        let oc_doc: Value = serde_json::from_str(&std::fs::read_to_string(oc_cfg).expect("read .opencode/opencode.json"))
+            .expect("parse .opencode/opencode.json");
+        let oc_plugins = oc_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
+        assert!(
+            oc_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
+            ".opencode/opencode.json plugins contains loader path: {oc_plugins:?}"
+        );
+
+        // Root opencode.json updated, preserving existing keys/entries (not created when absent,
+        // never clobbered when present).
         let root_doc: Value = serde_json::from_str(&std::fs::read_to_string(root_cfg).expect("read opencode.json"))
             .expect("parse opencode.json");
-        let plugins = root_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
+        let root_plugins = root_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
         assert!(
-            plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
-            "plugins contains loader path: {plugins:?}"
+            root_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
+            "root opencode.json plugins contains loader path"
         );
+        assert!(
+            root_plugins.iter().any(|v| v.as_str() == Some("./other.js")),
+            "root opencode.json preserves existing plugins entries"
+        );
+        assert_eq!(root_doc.get("otherKey").and_then(|v| v.as_str()), Some("preserve"));
     }
 
     #[test]

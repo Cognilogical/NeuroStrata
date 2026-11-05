@@ -92,9 +92,22 @@ export function resolveConfig(pluginConfig = {}, cwd = process.cwd()) {
  * resolve(startDir) if none found.
  */
 export function findProjectRoot(startDir = process.cwd()) {
+    // Pass 1: walk up looking for `.git` first; a `.git` anchors the project root.
     let current = resolve(startDir);
     while (true) {
-        if (existsSync(join(current, ".git")) || existsSync(join(current, ".NeuroStrata"))) {
+        if (existsSync(join(current, ".git"))) {
+            return current;
+        }
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
+    }
+    // Pass 2: only if no `.git` anywhere in the ancestor chain, walk up looking
+    // for `.NeuroStrata`. Otherwise fall back to resolve(startDir).
+    current = resolve(startDir);
+    while (true) {
+        if (existsSync(join(current, ".NeuroStrata"))) {
             return current;
         }
         const next = dirname(current);
@@ -110,24 +123,30 @@ export function findProjectRoot(startDir = process.cwd()) {
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
 export function discoverProjectNamespace(startDir = process.cwd()) {
-    const root = findProjectRoot(startDir);
-    const sessionQueriesPath = join(root, ".NeuroStrata", "session_queries.json");
-    try {
-        if (existsSync(sessionQueriesPath)) {
-            const content = readFileSync(sessionQueriesPath, "utf8");
-            const parsed = JSON.parse(content);
-            if (parsed !== null &&
-                typeof parsed === "object" &&
-                typeof parsed.namespace === "string" &&
-                parsed.namespace.trim() !== "") {
-                return parsed.namespace.trim();
+    let current = resolve(startDir);
+    while (true) {
+        const sessionQueriesPath = join(current, ".NeuroStrata", "session_queries.json");
+        try {
+            if (existsSync(sessionQueriesPath)) {
+                const content = readFileSync(sessionQueriesPath, "utf8");
+                const parsed = JSON.parse(content);
+                if (parsed !== null &&
+                    typeof parsed === "object" &&
+                    typeof parsed.namespace === "string" &&
+                    parsed.namespace.trim() !== "") {
+                    return parsed.namespace.trim();
+                }
             }
         }
+        catch {
+            // fall through to next ancestor
+        }
+        const next = dirname(current);
+        if (next === current)
+            break;
+        current = next;
     }
-    catch {
-        // fall through to basename fallback
-    }
-    return basename(root) || "default";
+    return basename(findProjectRoot(startDir)) || "default";
 }
 // ──────────────────────────────────────────────────────────────────────
 // Credential
@@ -498,21 +517,28 @@ function recordLocalSessionQuery(namespace, tool, query, recordLedgerDir) {
     const topPrefix = query.split(/[\/\\]/)[0] || query;
     const entry = { ts: Math.floor(Date.now() / 1000), tool, query, governed_prefixes: [topPrefix] };
     const ledgerPath = join(findProjectRoot(), ".NeuroStrata", "session_queries.json");
-    let arr = [];
+    let parsed;
     try {
-        if (existsSync(ledgerPath)) {
-            const parsed = JSON.parse(readFileSync(ledgerPath, "utf8"));
-            if (Array.isArray(parsed))
-                arr = parsed;
-        }
+        parsed = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, "utf8")) : undefined;
     }
     catch {
-        arr = [];
+        parsed = undefined;
     }
-    arr.push(entry);
+    let out;
+    if (Array.isArray(parsed)) {
+        // Legacy top-level array: wrap it into the object form.
+        out = { namespace, queries: [...parsed, entry] };
+    }
+    else if (parsed !== null && typeof parsed === "object" && Array.isArray(parsed.queries)) {
+        const obj = parsed;
+        out = { ...obj, namespace: obj.namespace || namespace, queries: [...obj.queries, entry] };
+    }
+    else {
+        out = { namespace, queries: [entry] };
+    }
     try {
         mkdirSync(dirname(ledgerPath), { recursive: true });
-        writeFileSync(ledgerPath, JSON.stringify(arr, null, 2));
+        writeFileSync(ledgerPath, JSON.stringify(out, null, 2));
     }
     catch {
         // best-effort; never break a file touch for a ledger write
@@ -621,6 +647,7 @@ export function extractRepoFilePaths(promptText) {
 }
 // Cached daemon subagent prompt injections keyed by active task id.
 export const cachedTaskInjection = new Map();
+export const cachedSubagentPromptByTask = cachedTaskInjection;
 /**
  * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
  * activeSessionId and cachedTaskInjection.
@@ -733,16 +760,22 @@ function extractFilePath(args, altArgs) {
         (altArgs ? (asString(altArgs.file_path) ?? asString(altArgs.filePath) ?? asString(altArgs.path)) : undefined));
 }
 const executeAfterHandler = async (output) => {
-    const block = pendingRecallBlocks.shift() ?? (output && typeof output === "object" ? output.neurostrataContext : undefined);
-    if (block && output && typeof output === "object") {
-        const out = output;
+    // The host may pass the output object directly, or a single `event` argument
+    // whose `.output` holds the real output. Resolve the target object.
+    let target = output;
+    if (target && typeof target === "object" && target.output !== undefined && typeof target.output === "object") {
+        target = target.output;
+    }
+    const block = pendingRecallBlocks.shift() ?? (target && typeof target === "object" ? target.neurostrataContext : undefined);
+    if (block && target && typeof target === "object") {
+        const out = target;
         if (typeof out.output === "string")
             out.output = `${block}\n\n${out.output}`;
         else if (typeof out.content === "string")
             out.content = `${block}\n\n${out.content}`;
         out.additionalContext = block;
     }
-    return output;
+    return target ?? output;
 };
 const executeBeforeHandler = async (input) => {
     const toolName = input?.tool ?? input?.tool_name ?? "";

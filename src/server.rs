@@ -1969,6 +1969,7 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // The graph-read capability is optional per backend: only LadybugStore
     // implements it (spec §4.6). Anything else answers `unsupported` -- never
     // an empty list, which a caller would misread as "no rules govern this".
+    let store_for_record = Arc::clone(&store);
     let Some(store) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
     else {
@@ -1994,6 +1995,10 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         .await
     {
         Ok(hits) => {
+            // Direct invocations of handle_memories_for_file also record the
+            // touched file path in `.NeuroStrata/session_queries.json` and bump
+            // `graph_queries_count` on the active in_progress task.
+            let _ = crate::task::record_graph_query(&store_for_record, &namespace, "neurostrata_memories_for_file", path).await;
             let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
             let mut response = serde_json::json!({
                 "memories": hits,

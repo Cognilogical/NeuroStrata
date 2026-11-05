@@ -1,43 +1,69 @@
 #!/bin/bash
 # NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.
 #
-# Records the modules touched by this commit into `.NeuroStrata/session_queries.json`
+# Records the files/prefixes touched by this commit into `.NeuroStrata/session_queries.json`
 # and stamps `graph_queried` on the active in_progress task for the namespace.
-# If the commit touches files in a governed module (per memory `governs`/`refs`)
-# and the agent did NOT query NeuroStrata for that module, the hook emits a
-# warning (non-blocking) so the agent can verify against source before push.
+# Works across any repository layout (src/, pkg/, cmd/, apps/, packages/, scripts/, root files).
 #
 # Install with:  neurostrata-mcp hooks install
-# (git honors core.hooksPath; the hook text is one file, no drift.)
 
-NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-ROOT=$(git rev-parse --show-toplevel)
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 LEDGER="$ROOT/.NeuroStrata/session_queries.json"
-
-# ── Collect touched src/ modules from staged diff ────────────────────────────
-TouchedModules=$(git diff --name-only --cached | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
-if [ -z "$TouchedModules" ]; then
-    TouchedModules=$(git diff --name-only | grep '^src/' | sed 's|^src/\([^/]*\).*|\1|; s|\.rs$||' | sort -u)
+NAMESPACE=""
+if [ -f "$LEDGER" ]; then
+    NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+fi
+if [ -z "$NAMESPACE" ]; then
+    NAMESPACE=$(basename "$ROOT")
 fi
 
-# ── Check each touched module against governing memories ─────────────────────
-for module in $TouchedModules; do
-    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
-        echo "warning: module '$module' has no recorded NeuroStrata graph/memory lookup in this session" >&2
-        echo "  → call: neurostrata_memories_for_file or neurostrata_search_memory --namespace $NAMESPACE --query \"$module\"" >&2
+# ── Collect staged file paths (excluding .NeuroStrata/ internal files) ───────
+StagedFiles=$(git diff --name-only --cached | grep -v '^\.NeuroStrata/' | sort -u)
+if [ -z "$StagedFiles" ]; then
+    StagedFiles=$(git diff --name-only | grep -v '^\.NeuroStrata/' | sort -u)
+fi
+
+# ── Check each staged file / dir-prefix / top-level prefix against session_queries.json ──
+for file in $StagedFiles; do
+    dir_prefix=$(dirname "$file")
+    top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
+    matched=0
+    if [ -f "$LEDGER" ]; then
+        if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+            matched=1
+        elif [ -n "$dir_prefix" ] && grep -qF "\"$dir_prefix/\"" "$LEDGER" 2>/dev/null; then
+            matched=1
+        elif [ -n "$top_prefix" ] && grep -qF "\"$top_prefix\"" "$LEDGER" 2>/dev/null; then
+            matched=1
+        fi
+    fi
+    if [ "$matched" -eq 0 ]; then
+        echo "warning: file '$file' has no recorded NeuroStrata graph/memory lookup in this session" >&2
+        echo "  → call: neurostrata_memories_for_file --namespace $NAMESPACE --path \"$file\"" >&2
     fi
 done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
-    echo '{"namespace": "'"$NAMESPACE"'", "queries": []}' > "$LEDGER"
+    echo "{\"namespace\": \"$NAMESPACE\", \"queries\": []}" > "$LEDGER"
 fi
-for module in $TouchedModules; do
+for file in $StagedFiles; do
+    dir_prefix=$(dirname "$file")
+    top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
+    if [ -z "$top_prefix" ]; then
+        top_prefix="$file"
+    fi
     TS=$(date +%s)
-    ENTRY="{\"ts\": $TS, \"query\": \"$module\", \"domains\": [\"$module\"], \"returned_ids\": [], \"governed_prefixes\": [\"$module/\"]}"
-    if ! grep -q "\"$module\"\\|$module/" "$LEDGER" 2>/dev/null; then
-        sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
+    ENTRY="{\"ts\": $TS, \"tool\": \"pre-commit\", \"query\": \"$file\", \"domains\": [\"$top_prefix\"], \"returned_ids\": [], \"governed_prefixes\": [\"$top_prefix\"]}"
+    if ! grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+        if grep -q '"queries":[[:space:]]*\[\]' "$LEDGER" 2>/dev/null; then
+            # Empty "queries": [] -> replace with a single-entry pretty array.
+            sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
+        else
+            # Non-empty "queries": [ -> append after the opening bracket.
+            sed -i "s|\"queries\": \[|\"queries\": [\n    $ENTRY,|" "$LEDGER" 2>/dev/null || true
+        fi
     fi
 done
 
