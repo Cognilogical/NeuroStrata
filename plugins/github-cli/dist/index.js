@@ -454,10 +454,13 @@ export function inspectCodeModeExecution(code) {
     while ((match = callRe.exec(code)) !== null) {
         const tool = match[1];
         const argSlice = extractBalancedCallArgs(code, match.index + match[0].length);
-        const idMatch = argSlice.match(/(?:^|[^\w$])id\s*:\s*["']([^"']+)["']/);
-        const sessionMatch = argSlice.match(/(?:^|[^\w$])session_id\s*:\s*["']([^"']+)["']/);
-        const noteMatch = argSlice.match(/(?:^|[^\w$])note\s*:\s*["']([^"']*)["']/);
-        const pathMatch = argSlice.match(/(?:^|[^\w$])path\s*:\s*["']([^"']+)["']/);
+        // Keys may be bare identifiers (`id: "t1"`) or JSON-style quoted
+        // (`{"id":"t1"}`); the quoted form puts a quote between the key and the
+        // colon, so the key itself has to accept optional quotes.
+        const idMatch = argSlice.match(/(?:^|[^\w$])["']?id["']?\s*:\s*["']([^"']+)["']/);
+        const sessionMatch = argSlice.match(/(?:^|[^\w$])["']?session_id["']?\s*:\s*["']([^"']+)["']/);
+        const noteMatch = argSlice.match(/(?:^|[^\w$])["']?note["']?\s*:\s*["']([^"']*)["']/);
+        const pathMatch = argSlice.match(/(?:^|[^\w$])["']?path["']?\s*:\s*["']([^"']+)["']/);
         if (tool === "neurostrata_task_claim") {
             if (idMatch && sessionMatch) {
                 result.id = idMatch[1];
@@ -495,6 +498,13 @@ export const PREFETCH_LRU_CAP = 128;
 export const PREFETCH_MAX_CHARS = 2048;
 export const prefetchedPaths = new Map();
 export const injectedMemoryIds = new Set();
+/**
+ * Memory ids injected by a prefetch that has not been delivered yet. A denied
+ * edit never delivers its recall block, so the ids it consumed have to be
+ * given back -- otherwise the allowed retry finds the path and the memories
+ * already marked as delivered and returns no snippets at all.
+ */
+const pendingPrefetchDeliveries = new Map();
 function recordPrefetchedPath(key) {
     prefetchedPaths.set(key, Date.now());
     if (prefetchedPaths.size > PREFETCH_LRU_CAP) {
@@ -564,8 +574,11 @@ function recordLocalSessionQuery(namespace, tool, query, recordLedgerDir) {
     const shouldRecord = recordLedgerDir !== undefined || existsSync(join(rootDir, ".NeuroStrata"));
     if (!shouldRecord)
         return;
-    const topPrefix = query.split(/[\/\\]/)[0] || query;
-    const entry = { ts: Math.floor(Date.now() / 1000), tool, query, governed_prefixes: [topPrefix] };
+    // The governed prefix is the queried path itself. Widening it to the first
+    // path component would claim coverage of every sibling file under that
+    // directory, so the pre-commit hook would silence warnings for files that
+    // were never looked up.
+    const entry = { ts: Math.floor(Date.now() / 1000), tool, query, governed_prefixes: [query] };
     const ledgerPath = join(rootDir, ".NeuroStrata", "session_queries.json");
     let parsed;
     try {
@@ -708,19 +721,54 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
         const entries = parseRawFileRecallEntries(text, normalized);
         cacheSubagentFileRecall(key, entries);
         const out = [];
+        const added = [];
         for (const entry of entries) {
             if (entry.dedupKey) {
                 if (injectedMemoryIds.has(entry.dedupKey))
                     continue;
                 injectedMemoryIds.add(entry.dedupKey);
+                added.push(entry.dedupKey);
             }
             out.push(entry.snippet);
         }
+        pendingPrefetchDeliveries.set(key, added);
         return capSnippets(out);
     }
     catch {
         return [];
     }
+}
+/**
+ * Mark a prefetch as delivered: its memories were handed to the caller, so the
+ * dedup state stays and a later touch of the same file does not re-inject
+ * them.
+ */
+export function confirmPrefetchDelivery(namespace, filePath) {
+    const normalized = filePath.trim();
+    if (!normalized)
+        return;
+    pendingPrefetchDeliveries.delete(`${namespace}:${normalized}`);
+}
+/**
+ * Roll back the dedup state of a prefetch whose recall was never delivered
+ * (the guard denied the edit). The path is un-marked and the memory ids the
+ * prefetch consumed are returned, so the allowed retry still sees the
+ * governing rules.
+ */
+export function restorePrefetchDelivery(namespace, filePath) {
+    const normalized = filePath.trim();
+    if (!normalized)
+        return;
+    const key = `${namespace}:${normalized}`;
+    const added = pendingPrefetchDeliveries.get(key);
+    // Only a prefetch that is still pending was consumed but not delivered.
+    // A path whose recall was already delivered keeps its dedup state.
+    if (added === undefined)
+        return;
+    for (const id of added)
+        injectedMemoryIds.delete(id);
+    pendingPrefetchDeliveries.delete(key);
+    prefetchedPaths.delete(key);
 }
 async function recallMemoriesForSubagentFile(namespace, filePath, seenInPrompt) {
     const normalized = filePath.trim();
@@ -977,6 +1025,7 @@ export function resetState() {
     mutationsSinceNote = 0;
     cachedTaskInjection.clear();
     subagentFileRecallCache.clear();
+    pendingPrefetchDeliveries.clear();
 }
 export function resetClientForTesting() {
     mcpClient = undefined;
@@ -1216,6 +1265,8 @@ const executeBeforeHandler = async (input) => {
     if (snippets.length > 0 && !isMutatingTool(toolName)) {
         if (block)
             enqueuePendingRecall(block, asRecord(input), args);
+        if (filePath)
+            confirmPrefetchDelivery(config.namespace, filePath);
         return { additionalContext: block, neurostrataContext: block, snippets };
     }
     // Mutating tool guard (fail closed).
@@ -1255,6 +1306,11 @@ const executeBeforeHandler = async (input) => {
             }
             catch (err) {
                 const message = String(err);
+                // The recall block never reaches the caller on a rejection, so the
+                // prefetch dedup state is rolled back: an allowed retry must still
+                // see the governing rules.
+                if (filePath)
+                    restorePrefetchDelivery(config.namespace, filePath);
                 if (message.includes("Zero-Action Start violation:") || message.includes("Guard rejected"))
                     throw err;
                 throw new Error(`Guard validation unavailable (NeuroStrata core degraded): ${message}`);
@@ -1262,6 +1318,8 @@ const executeBeforeHandler = async (input) => {
         }
         mutationsSinceNote++;
     }
+    if (filePath)
+        confirmPrefetchDelivery(config.namespace, filePath);
     if (block) {
         enqueuePendingRecall(block, asRecord(input), args);
         return { additionalContext: block, neurostrataContext: block, snippets };
@@ -1407,9 +1465,11 @@ export async function handleHookEvent(event) {
         }
         // File-touch tools: prefetch governing memories, build recall block.
         let recallBlock;
+        let recalledFilePath;
         if (isFileTouchTool(toolNameRaw)) {
             const filePath = extractFilePath(toolInput, undefined, toolInputRaw);
             if (filePath) {
+                recalledFilePath = filePath;
                 try {
                     const snippets = await prefetchMemoriesForFile(config.namespace, filePath);
                     if (snippets.length > 0)
@@ -1420,6 +1480,23 @@ export async function handleHookEvent(event) {
                 }
             }
         }
+        // A denial never delivers the recall block, so the prefetch dedup state
+        // has to be rolled back: an allowed retry must still see the governing
+        // rules. The block is attached to the denial as well, so the agent reads
+        // the rules that blocked it.
+        const denyWithRecall = (reason) => {
+            if (recalledFilePath)
+                restorePrefetchDelivery(config.namespace, recalledFilePath);
+            return {
+                ...(recallBlock ? { systemMessage: recallBlock } : {}),
+                hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "deny",
+                    permissionDecisionReason: reason,
+                    ...(recallBlock ? { additionalContext: recallBlock } : {}),
+                },
+            };
+        };
         // Mutating tools: resolve active task from daemon if unset, run guard_validate,
         // deny on reject or on guard-unavailable errors.
         if (isMutatingTool(toolNameRaw)) {
@@ -1456,26 +1533,22 @@ export async function handleHookEvent(event) {
                     const result = parseGuardValidate(text);
                     if (result.verdict === "reject") {
                         const reason = result.reasons.join("; ") || result.constraints.join("; ") || result.bucket;
-                        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+                        return denyWithRecall(reason);
                     }
                 }
                 catch (err) {
                     const message = String(err);
                     if (message.includes("Zero-Action Start violation:") ||
                         message.includes("Guard rejected")) {
-                        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: message } };
+                        return denyWithRecall(message);
                     }
-                    return {
-                        hookSpecificOutput: {
-                            hookEventName: "PreToolUse",
-                            permissionDecision: "deny",
-                            permissionDecisionReason: `Guard unavailable: ${message}`,
-                        },
-                    };
+                    return denyWithRecall(`Guard unavailable: ${message}`);
                 }
             }
             mutationsSinceNote++;
         }
+        if (recalledFilePath)
+            confirmPrefetchDelivery(config.namespace, recalledFilePath);
         return {
             continue: true,
             ...(recallBlock ? { systemMessage: recallBlock } : {}),

@@ -126,7 +126,10 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
           }
           if (name === "neurostrata_guard_validate") {
             counters.guardValidate++;
-            if (guardReject) {
+            // `guardReject` may be a boolean or a getter, so a test can flip the
+            // verdict between two calls against the same mock daemon.
+            const reject = typeof guardReject === "function" ? guardReject() : guardReject;
+            if (reject) {
               respond({ content: [{ type: "text", text: JSON.stringify({ verdict: { bucket: "DeterministicReject", reasons: ["claim a task first"] }, rule_ids_triggered: [] }) }] });
               return;
             }
@@ -1564,6 +1567,151 @@ describe("round-8: Codex apply_patch extraction, decoded ledger matching, and ba
       assert.equal(queries.filter((q) => q === "src/café.rs" || q === "src/quote\"file.rs").length, 2, "existing decoded paths must not be duplicated");
     } finally {
       rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// round-9: quoted JSON keys, verbatim governed prefix, denied-edit recall
+// rollback, and stdout flush before exit
+// ──────────────────────────────────────────────────────────────────────
+
+describe("round-9: quoted JSON keys in Code Mode inspection", () => {
+  it("tracks a claim whose keys are JSON-style quoted", () => {
+    const out = inspectCodeModeExecution('neurostrata_task_claim({"id":"t1","session_id":"s1"})');
+    assert.equal(out.taskClaimed, true, "quoted-key claim must be tracked");
+    assert.equal(out.id, "t1");
+    assert.equal(out.sessionId, "s1");
+  });
+
+  it("captures a quoted note and a quoted id on task_update", () => {
+    const out = inspectCodeModeExecution('neurostrata_task_update({"id":"t1","note":"breath"})');
+    assert.equal(out.taskUpdated, true);
+    assert.equal(out.id, "t1");
+    assert.equal(out.note, "breath");
+  });
+
+  it("extracts a quoted path from memories_for_file", () => {
+    const out = inspectCodeModeExecution('neurostrata_memories_for_file({"namespace":"ns","path":"src/a.rs"})');
+    assert.deepEqual(out.queriedFiles, ["src/a.rs"]);
+  });
+
+  it("keeps bare identifier keys working", () => {
+    const out = inspectCodeModeExecution('neurostrata_task_claim({ id: "t2", session_id: "s2" })');
+    assert.equal(out.taskClaimed, true);
+    assert.equal(out.id, "t2");
+    assert.equal(out.sessionId, "s2");
+  });
+
+  it("does not confuse a quoted key with an identifier suffix", () => {
+    const out = inspectCodeModeExecution('neurostrata_task_claim({"user_id":"u1","id":"t3","session_id":"s3"})');
+    assert.equal(out.id, "t3", "user_id must not be matched as id");
+    assert.equal(out.sessionId, "s3");
+  });
+});
+
+describe("round-9: governed_prefixes records the queried path verbatim", () => {
+  it("records the full queried path, not its first component", async () => {
+    const { server, url } = await createMockDaemonServer();
+    const tmpProjectDir = mkdtempSync(join(tmpdir(), "ns-ledger-r9-"));
+    const ledgerDir = join(tmpProjectDir, ".NeuroStrata");
+    const ledgerPath = join(ledgerDir, "session_queries.json");
+    try {
+      mkdirSync(ledgerDir, { recursive: true });
+      resetClientForTesting();
+      const ctx = { config: { namespace: "r9-ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await prefetchMemoriesForFile("r9-ledger-ns", "src/auth/login.go", { recordLedgerDir: tmpProjectDir });
+      const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      const queries = Array.isArray(ledger) ? ledger : ledger.queries;
+      assert.equal(queries.length, 1);
+      assert.deepEqual(
+        queries[0].governed_prefixes,
+        ["src/auth/login.go"],
+        "governed prefix must be the queried path itself",
+      );
+      assert.equal(
+        queries[0].governed_prefixes.includes("src"),
+        false,
+        "widening to the first path component would silence sibling-file warnings",
+      );
+    } finally {
+      server.close();
+      resetModuleState();
+      rmSync(tmpProjectDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("round-9: denied edit restores prefetch dedup state", () => {
+  it("the allowed retry still receives the governing memories", async () => {
+    let reject = true;
+    const { server, url, counters } = await createMockDaemonServer({ guardReject: () => reject });
+    try {
+      resetClientForTesting();
+      await initialize({
+        config: { namespace: "r9-deny-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 500 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+
+      const denied = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "write",
+        tool_input: { file_path: "src/foo.ts", content: "x" },
+      });
+      assert.equal(denied.hookSpecificOutput.permissionDecision, "deny");
+      assert.ok(
+        String(denied.systemMessage ?? "").includes("[NeuroStrata Governing Memories for src/foo.ts]"),
+        "a denial must carry the governing rules it enforced",
+      );
+
+      reject = false;
+      const allowed = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "write",
+        tool_input: { file_path: "src/foo.ts", content: "x" },
+      });
+      assert.equal(allowed.hookSpecificOutput.permissionDecision, "allow");
+      assert.ok(
+        String(allowed.systemMessage ?? "").includes("[NeuroStrata Governing Memories for src/foo.ts]"),
+        "the retry must still receive the governing memories",
+      );
+      assert.ok(counters.memoriesForFile >= 2, "the retry must re-query the daemon");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("round-9: CLI hook runners flush stdout before exiting", () => {
+  it("awaits the stdout write before process.exit(0)", () => {
+    const sources = [
+      "../claude/cli-hook.mjs",
+      "../codex/cli-hook.mjs",
+      "../github-cli/cli-hook.mjs",
+      "../opencode/cli-hook.mjs",
+      "../../src/task/harness_plugins.rs",
+    ];
+    for (const rel of sources) {
+      const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+      const marker = "await writeStdout(JSON.stringify(out));";
+      const idx = src.indexOf(marker);
+      assert.ok(idx !== -1, `${rel}: missing awaited stdout write`);
+      assert.ok(
+        !src.includes("process.stdout.write(JSON.stringify(out))"),
+        `${rel}: un-awaited stdout write still present`,
+      );
+      const after = src.slice(idx + marker.length);
+      assert.ok(
+        /^\s*process\.exit\(0\);/.test(after),
+        `${rel}: process.exit(0) must directly follow the awaited write`,
+      );
+      assert.ok(
+        src.includes("const writeStdout = (text) =>"),
+        `${rel}: writeStdout helper missing`,
+      );
     }
   });
 });

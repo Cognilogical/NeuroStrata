@@ -173,6 +173,19 @@ export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
     recordLedgerDir?: string;
 }): Promise<string[]>;
+/**
+ * Mark a prefetch as delivered: its memories were handed to the caller, so the
+ * dedup state stays and a later touch of the same file does not re-inject
+ * them.
+ */
+export declare function confirmPrefetchDelivery(namespace: string, filePath: string): void;
+/**
+ * Roll back the dedup state of a prefetch whose recall was never delivered
+ * (the guard denied the edit). The path is un-marked and the memory ids the
+ * prefetch consumed are returned, so the allowed retry still sees the
+ * governing rules.
+ */
+export declare function restorePrefetchDelivery(namespace: string, filePath: string): void;
 export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string): string;
