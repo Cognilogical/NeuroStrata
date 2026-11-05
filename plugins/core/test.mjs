@@ -1,7 +1,8 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { readFileSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, rmSync, mkdtempSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   resolveConfig,
@@ -156,7 +157,11 @@ function resetModuleState() {
   pendingRecallBlocks.length = 0;
 }
 
+const checkoutLedgerPath = join(process.cwd(), ".NeuroStrata", "session_queries.json");
+let savedCheckoutLedger = null;
+
 beforeEach(() => {
+  savedCheckoutLedger = existsSync(checkoutLedgerPath) ? readFileSync(checkoutLedgerPath, "utf8") : null;
   resetModuleState();
   delete process.env.NEUROSTRATA_NAMESPACE;
 });
@@ -164,6 +169,10 @@ beforeEach(() => {
 afterEach(() => {
   resetModuleState();
   delete process.env.NEUROSTRATA_NAMESPACE;
+  if (savedCheckoutLedger !== null) {
+    mkdirSync(join(process.cwd(), ".NeuroStrata"), { recursive: true });
+    writeFileSync(checkoutLedgerPath, savedCheckoutLedger);
+  }
 });
 
 // ──────────────────────────────────────────────────────────────────────
@@ -617,15 +626,18 @@ describe("prefetchMemoriesForFile LRU + dedup", () => {
 describe("recordLocalSessionQuery ledger object format", () => {
   it("writes { namespace, queries } object form, converting a legacy array, and preserves namespace", async () => {
     const { server, url } = await createMockDaemonServer();
-    const ledgerPath = join(process.cwd(), ".NeuroStrata", "session_queries.json");
+    const tmpProjectDir = mkdtempSync(join(tmpdir(), "ns-ledger-test-"));
+    const ledgerDir = join(tmpProjectDir, ".NeuroStrata");
+    const ledgerPath = join(ledgerDir, "session_queries.json");
     try {
-      // Start from a known legacy-array ledger (no namespace) so the written
-      // object form is deterministic regardless of prior test runs.
+      mkdirSync(ledgerDir, { recursive: true });
+      // Start from a known legacy-array ledger (no namespace) in a temporary project root
+      // so the repository checkout's real session ledger is never overwritten.
       writeFileSync(ledgerPath, JSON.stringify([], null, 2));
       resetClientForTesting();
       const ctx = { config: { namespace: "ledger-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
       await initialize(ctx);
-      await prefetchMemoriesForFile("ledger-ns", "src/ledger.ts");
+      await prefetchMemoriesForFile("ledger-ns", "src/ledger.ts", { recordLedgerDir: tmpProjectDir });
       const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
       assert.equal(ledger.namespace, "ledger-ns", "ledger.namespace must be set");
       const queries = Array.isArray(ledger) ? ledger : ledger.queries;
@@ -636,6 +648,7 @@ describe("recordLocalSessionQuery ledger object format", () => {
     } finally {
       server.close();
       resetModuleState();
+      rmSync(tmpProjectDir, { recursive: true, force: true });
     }
   });
 
@@ -884,6 +897,108 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
     } finally {
       rmSync(repoDir, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+
+  it("discoverProjectNamespace stops at findProjectRoot and does not inherit parent workspace namespace", () => {
+    const parentWs = mkdtempSync(join(tmpdir(), "ns-parent-ws-"));
+    try {
+      mkdirSync(join(parentWs, ".NeuroStrata"), { recursive: true });
+      writeFileSync(
+        join(parentWs, ".NeuroStrata", "session_queries.json"),
+        JSON.stringify({ namespace: "parent-workspace-ns", queries: [] }),
+      );
+      const childRepo = join(parentWs, "child-repo");
+      const childSubdir = join(childRepo, "src", "nested");
+      mkdirSync(join(childRepo, ".git"), { recursive: true });
+      mkdirSync(childSubdir, { recursive: true });
+
+      assert.equal(discoverProjectNamespace(childSubdir), "child-repo");
+    } finally {
+      rmSync(parentWs, { recursive: true, force: true });
+    }
+  });
+
+  it("inspectCodeModeExecution does not match session_id suffix as id", () => {
+    const res = inspectCodeModeExecution(
+      `await tools.neurostrata.neurostrata_task_update({ session_id: "ses-only-123", note: "checkpoint" });`,
+    );
+    assert.equal(res.id, undefined);
+    assert.equal(res.sessionId, "ses-only-123");
+    assert.equal(res.note, "checkpoint");
+  });
+
+  it("enrichAndInjectSubagentPrompt resolves daemon injection on cache miss after native claim and preserves file recall across parent and children", async () => {
+    const { server, url, counters } = await createMockDaemonServer({
+      returnTask: [
+        {
+          id: "task-claimed-native",
+          session_id: "sess-1",
+          status: "in_progress",
+          subagent_prompt_injection: "### Native claimed daemon injection",
+        },
+      ],
+    });
+    try {
+      let beforeExecFn = null;
+      await initialize({
+        config: {
+          namespace: "round3-ns",
+          endpoint: url,
+          bearerToken: "tok",
+          strictMode: true,
+          requestTimeoutMs: 500,
+        },
+        hooks: {
+          beforeToolExec: async (fn) => {
+            beforeExecFn = fn;
+          },
+        },
+      });
+
+      // 1. Claim task via native tool call through beforeToolExec (cachedTaskInjection is not yet populated)
+      await beforeExecFn({
+        name: "neurostrata_task_claim",
+        args: { id: "task-claimed-native", session_id: "sess-1" },
+      });
+      assert.equal(getTrackingState().activeTaskId, "task-claimed-native");
+      assert.equal(cachedTaskInjection.has("task-claimed-native"), false);
+
+      // 2. Parent reads src/shared.rs via beforeToolExec -> receives file-touch recall block
+      const readRes = await beforeExecFn({
+        name: "read",
+        args: { path: "src/shared.rs" },
+      });
+      assert.ok(
+        readRes?.additionalContext?.includes("mem-rule-1"),
+        "beforeToolExec routes read through file-touch recall",
+      );
+
+      // 3. First child subagent mentions src/shared.rs -> gets both daemon injection AND src/shared.rs memories
+      const child1 = { prompt: "Inspect src/shared.rs" };
+      await beforeExecFn({ name: "subagent", input: child1 });
+      assert.ok(
+        child1.prompt.includes("### Native claimed daemon injection"),
+        "fetches and injects daemon prompt injection on cache miss",
+      );
+      assert.ok(
+        child1.prompt.includes("mem-rule-1"),
+        "child1 receives file memories even after parent already prefetched src/shared.rs",
+      );
+
+      // 4. Second child subagent also mentions src/shared.rs + src/other.rs -> still gets memories without duplicate mem-rule-1 in same prompt
+      const child2 = { prompt: "Update src/shared.rs and src/other.rs" };
+      await beforeExecFn({ name: "subagent", input: child2 });
+      const ruleMatches = child2.prompt.match(/mem-rule-1/g) || [];
+      assert.equal(ruleMatches.length, 1, "child2 receives mem-rule-1 once (deduped within child prompt)");
+
+      // 5. Mutating tool via beforeToolExec runs guard_validate
+      const guardBefore = counters.guardValidate;
+      await beforeExecFn({ name: "write", args: { path: "src/shared.rs", content: "x" } });
+      assert.equal(counters.guardValidate, guardBefore + 1, "beforeToolExec enforces guard_validate on mutating tools");
+    } finally {
+      server.close();
+      resetModuleState();
     }
   });
 });

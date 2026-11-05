@@ -123,6 +123,7 @@ export function findProjectRoot(startDir = process.cwd()) {
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
 export function discoverProjectNamespace(startDir = process.cwd()) {
+    const root = findProjectRoot(startDir);
     let current = resolve(startDir);
     while (true) {
         const sessionQueriesPath = join(current, ".NeuroStrata", "session_queries.json");
@@ -141,12 +142,14 @@ export function discoverProjectNamespace(startDir = process.cwd()) {
         catch {
             // fall through to next ancestor
         }
+        if (current === root)
+            break;
         const next = dirname(current);
         if (next === current)
             break;
         current = next;
     }
-    return basename(findProjectRoot(startDir)) || "default";
+    return basename(root) || "default";
 }
 // ──────────────────────────────────────────────────────────────────────
 // Credential
@@ -417,10 +420,10 @@ export function inspectCodeModeExecution(code) {
     const hasUpdate = /neurostrata_task_update\b/.test(code);
     const hasComplete = /neurostrata_task_complete\b/.test(code);
     const hasMemories = /neurostrata_memories_for_file\b/.test(code);
-    const idMatch = code.match(/id\s*:\s*["']([^"']+)["']/);
-    const sessionMatch = code.match(/session_id\s*:\s*["']([^"']+)["']/);
-    const noteMatch = code.match(/note\s*:\s*["']([^"']*)["']/);
-    const pathMatch = code.match(/path\s*:\s*["']([^"']+)["']/);
+    const idMatch = code.match(/(?:^|[^\w$])id\s*:\s*["']([^"']+)["']/);
+    const sessionMatch = code.match(/(?:^|[^\w$])session_id\s*:\s*["']([^"']+)["']/);
+    const noteMatch = code.match(/(?:^|[^\w$])note\s*:\s*["']([^"']*)["']/);
+    const pathMatch = code.match(/(?:^|[^\w$])path\s*:\s*["']([^"']+)["']/);
     if (hasClaim && idMatch && sessionMatch) {
         result.id = idMatch[1];
         result.sessionId = sessionMatch[1];
@@ -511,12 +514,13 @@ function capSnippets(snippets) {
  * exists on disk, so unit tests do not dirty random directories unless requested.
  */
 function recordLocalSessionQuery(namespace, tool, query, recordLedgerDir) {
-    const shouldRecord = recordLedgerDir !== undefined || existsSync(join(findProjectRoot(), ".NeuroStrata"));
+    const rootDir = recordLedgerDir ? findProjectRoot(recordLedgerDir) : findProjectRoot();
+    const shouldRecord = recordLedgerDir !== undefined || existsSync(join(rootDir, ".NeuroStrata"));
     if (!shouldRecord)
         return;
     const topPrefix = query.split(/[\/\\]/)[0] || query;
     const entry = { ts: Math.floor(Date.now() / 1000), tool, query, governed_prefixes: [topPrefix] };
-    const ledgerPath = join(findProjectRoot(), ".NeuroStrata", "session_queries.json");
+    const ledgerPath = join(rootDir, ".NeuroStrata", "session_queries.json");
     let parsed;
     try {
         parsed = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, "utf8")) : undefined;
@@ -543,6 +547,46 @@ function recordLocalSessionQuery(namespace, tool, query, recordLedgerDir) {
     catch {
         // best-effort; never break a file touch for a ledger write
     }
+}
+const subagentFileRecallCache = new Map();
+function cacheSubagentFileRecall(key, entries) {
+    subagentFileRecallCache.delete(key);
+    subagentFileRecallCache.set(key, entries);
+    if (subagentFileRecallCache.size > PREFETCH_LRU_CAP) {
+        const oldest = subagentFileRecallCache.keys().next().value;
+        if (oldest !== undefined)
+            subagentFileRecallCache.delete(oldest);
+    }
+}
+function parseRawFileRecallEntries(text, normalized) {
+    const entries = [];
+    let body = {};
+    try {
+        body = asRecord(JSON.parse(text));
+    }
+    catch {
+        body = {};
+    }
+    for (const hit of parseFileMemoryHits(text)) {
+        entries.push({
+            dedupKey: `${hit.id}:${hit.valid_from}`,
+            snippet: formatFileMemorySnippet(hit),
+        });
+    }
+    let astDetail = "";
+    if (Array.isArray(body.related_memories) && body.related_memories.length > 0) {
+        astDetail = `related_memories=${body.related_memories.length}`;
+    }
+    if (body.ast_summary && typeof body.ast_summary === "object") {
+        const keys = Object.keys(body.ast_summary).filter((k) => k === "callers" || k === "importers" || k === "blast_radius");
+        if (keys.length > 0) {
+            astDetail += astDetail ? ` | ast_summary={${keys.join(",")}}` : `ast_summary={${keys.join(",")}}`;
+        }
+    }
+    if (astDetail) {
+        entries.push({ snippet: `[NeuroStrata AST ${normalized}] ${astDetail}` });
+    }
+    return entries;
 }
 /**
  * Recall governing memories for a touched file. LRU path dedup (no re-query within the
@@ -572,39 +616,64 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
         catch {
             // ledger is best-effort
         }
+        const entries = parseRawFileRecallEntries(text, normalized);
+        cacheSubagentFileRecall(key, entries);
         const out = [];
-        let body = {};
-        try {
-            body = asRecord(JSON.parse(text));
-        }
-        catch {
-            body = {};
-        }
-        for (const hit of parseFileMemoryHits(text)) {
-            const dedupKey = `${hit.id}:${hit.valid_from}`;
-            if (injectedMemoryIds.has(dedupKey))
-                continue;
-            injectedMemoryIds.add(dedupKey);
-            out.push(formatFileMemorySnippet(hit));
-        }
-        // Enhancement 4-style AST / related-memory compact line when present.
-        let astDetail = "";
-        if (Array.isArray(body.related_memories) && body.related_memories.length > 0) {
-            astDetail = `related_memories=${body.related_memories.length}`;
-        }
-        if (body.ast_summary && typeof body.ast_summary === "object") {
-            const keys = Object.keys(body.ast_summary).filter((k) => k === "callers" || k === "importers" || k === "blast_radius");
-            if (keys.length > 0) {
-                astDetail += astDetail ? ` | ast_summary={${keys.join(",")}}` : `ast_summary={${keys.join(",")}}`;
+        for (const entry of entries) {
+            if (entry.dedupKey) {
+                if (injectedMemoryIds.has(entry.dedupKey))
+                    continue;
+                injectedMemoryIds.add(entry.dedupKey);
             }
+            out.push(entry.snippet);
         }
-        if (astDetail)
-            out.push(`[NeuroStrata AST ${normalized}] ${astDetail}`);
         return capSnippets(out);
     }
     catch {
         return [];
     }
+}
+async function recallMemoriesForSubagentFile(namespace, filePath, seenInPrompt) {
+    const normalized = filePath.trim();
+    if (normalized === "")
+        return [];
+    const key = `${namespace}:${normalized}`;
+    let entries = subagentFileRecallCache.get(key);
+    if (!entries) {
+        if (!mcpClient)
+            return [];
+        try {
+            const text = await mcpClient.callTool("neurostrata_memories_for_file", {
+                namespace,
+                path: normalized,
+                limit: 5,
+            });
+            try {
+                recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized);
+            }
+            catch {
+                // ledger is best-effort
+            }
+            entries = parseRawFileRecallEntries(text, normalized);
+            cacheSubagentFileRecall(key, entries);
+        }
+        catch {
+            return [];
+        }
+    }
+    else {
+        cacheSubagentFileRecall(key, entries);
+    }
+    const out = [];
+    for (const entry of entries) {
+        if (entry.dedupKey) {
+            if (seenInPrompt.has(entry.dedupKey))
+                continue;
+            seenInPrompt.add(entry.dedupKey);
+        }
+        out.push(entry.snippet);
+    }
+    return capSnippets(out);
 }
 export function formatFileTouchRecallBlock(filePath, snippets) {
     return `[NeuroStrata Governing Memories for ${filePath}]\n${snippets.join("\n")}`;
@@ -652,7 +721,7 @@ export const cachedSubagentPromptByTask = cachedTaskInjection;
  * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
  * activeSessionId and cachedTaskInjection.
  */
-export async function resolveActiveTaskFromDaemon(namespace) {
+export async function resolveActiveTaskFromDaemon(namespace, preferredTaskId) {
     if (!mcpClient) {
         return { taskId: activeTaskId, sessionId: activeSessionId, promptInjection: null };
     }
@@ -668,13 +737,24 @@ export async function resolveActiveTaskFromDaemon(namespace) {
         const tasks = Array.isArray(body.tasks) ? body.tasks : Array.isArray(body.items) ? body.items : [];
         let target = null;
         for (const item of tasks) {
-            if (typeof item === "object" && item !== null && asString(item.status) === "in_progress") {
-                target = item;
+            if (typeof item !== "object" || item === null)
+                continue;
+            const rec = item;
+            const recId = asString(rec.id);
+            if (recId) {
+                cachedTaskInjection.set(recId, asString(rec.subagent_prompt_injection) ?? null);
+            }
+            if (preferredTaskId && recId === preferredTaskId) {
+                target = rec;
                 break;
             }
+            if (!target && asString(rec.status) === "in_progress") {
+                target = rec;
+            }
         }
-        if (!target && tasks.length > 0)
+        if (!target && tasks.length > 0 && typeof tasks[0] === "object" && tasks[0] !== null) {
             target = tasks[0];
+        }
         if (target) {
             const taskId = asString(target.id);
             const sessionId = asString(target.session_id) ??
@@ -682,11 +762,23 @@ export async function resolveActiveTaskFromDaemon(namespace) {
                 null;
             const promptInjection = asString(target.subagent_prompt_injection) ?? null;
             if (taskId) {
-                activeTaskId = taskId;
-                activeSessionId = sessionId;
+                if (!preferredTaskId || taskId === preferredTaskId) {
+                    activeTaskId = taskId;
+                    activeSessionId = sessionId;
+                }
                 cachedTaskInjection.set(taskId, promptInjection);
             }
-            return { taskId: taskId ?? null, sessionId: sessionId, promptInjection };
+            if (preferredTaskId && !cachedTaskInjection.has(preferredTaskId)) {
+                cachedTaskInjection.set(preferredTaskId, promptInjection);
+            }
+            return {
+                taskId: preferredTaskId ?? taskId ?? null,
+                sessionId: sessionId ?? activeSessionId,
+                promptInjection: preferredTaskId ? (cachedTaskInjection.get(preferredTaskId) ?? promptInjection) : promptInjection,
+            };
+        }
+        if (preferredTaskId && !cachedTaskInjection.has(preferredTaskId)) {
+            cachedTaskInjection.set(preferredTaskId, null);
         }
     }
     catch {
@@ -710,6 +802,10 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
         effectiveTaskId = resolved.taskId;
         injection = resolved.promptInjection;
     }
+    else if (!cachedTaskInjection.has(effectiveTaskId)) {
+        const resolved = await resolveActiveTaskFromDaemon(namespace, effectiveTaskId);
+        injection = cachedTaskInjection.get(effectiveTaskId) ?? resolved.promptInjection ?? null;
+    }
     else {
         injection = cachedTaskInjection.get(effectiveTaskId) ?? null;
     }
@@ -717,9 +813,10 @@ export async function enrichAndInjectSubagentPrompt(target, namespace, taskId) {
     if (injection)
         extraLines.push(injection);
     const files = extractRepoFilePaths(target.prompt).slice(0, 5);
+    const seenInPrompt = new Set();
     for (const fp of files) {
         try {
-            const snippets = await prefetchMemoriesForFile(namespace, fp);
+            const snippets = await recallMemoriesForSubagentFile(namespace, fp, seenInPrompt);
             extraLines.push(...snippets);
         }
         catch {
@@ -754,9 +851,14 @@ function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
         mutationsSinceNote = 0;
     }
     if (toolName === "neurostrata_task_complete") {
+        if (activeTaskId)
+            cachedTaskInjection.delete(activeTaskId);
         activeTaskId = null;
     }
     else if (taskId) {
+        if (toolName === "neurostrata_task_claim") {
+            cachedTaskInjection.delete(taskId);
+        }
         activeTaskId = taskId;
     }
 }
@@ -767,6 +869,8 @@ export function resetState() {
     activeSessionId = null;
     activeTaskId = null;
     mutationsSinceNote = 0;
+    cachedTaskInjection.clear();
+    subagentFileRecallCache.clear();
 }
 export function resetClientForTesting() {
     mcpClient = undefined;
@@ -816,30 +920,26 @@ const executeAfterHandler = async (output) => {
     return target ?? output;
 };
 const executeBeforeHandler = async (input) => {
-    const toolName = input?.tool ?? input?.tool_name ?? "";
-    const args = firstRecord(input?.input, input?.args);
+    const toolName = input?.tool ?? input?.tool_name ?? input?.name ?? input?.action ?? input?.command ?? "";
+    const args = firstRecord(input?.input, input?.args, input);
     const altArgs = asRecord(input?.args);
-    // Enhancement 1: resolve active task from daemon before subagent injection & mutating guard.
-    if (!activeTaskId) {
-        try {
-            await resolveActiveTaskFromDaemon(config.namespace);
-        }
-        catch {
-            // fail-soft
-        }
-    }
     // Bug 3: OpenCode V2 Code Mode execution inspection.
     if (isCodeExecTool(toolName)) {
-        const code = String(input?.input?.code ?? input?.args?.code ?? "");
+        const code = String(input?.input?.code ?? input?.args?.code ?? input?.code ?? "");
         const inspection = inspectCodeModeExecution(code);
-        if (inspection.id)
+        if (inspection.id) {
+            cachedTaskInjection.delete(inspection.id);
             activeTaskId = inspection.id;
+        }
         if (inspection.sessionId)
             activeSessionId = inspection.sessionId;
         if (inspection.id || inspection.note !== undefined)
             mutationsSinceNote = 0;
-        if (inspection.taskCompleted)
+        if (inspection.taskCompleted) {
+            if (activeTaskId)
+                cachedTaskInjection.delete(activeTaskId);
             activeTaskId = null;
+        }
         for (const fp of inspection.queriedFiles) {
             try {
                 await prefetchMemoriesForFile(config.namespace, fp);
@@ -851,19 +951,33 @@ const executeBeforeHandler = async (input) => {
     }
     // Track native task mutation tools (claim/update/complete).
     trackNativeTaskToolCall(toolName, firstRecord(args, altArgs), asRecord(input));
+    // Enhancement 1: resolve active task from daemon before subagent injection & mutating guard.
+    if (!activeTaskId && (isSubagentTool(toolName) || isMutatingTool(toolName))) {
+        try {
+            await resolveActiveTaskFromDaemon(config.namespace);
+        }
+        catch {
+            // fail-soft
+        }
+    }
     // Enhancement 2 & 3: subagent tool prompt enrichment.
     if (isSubagentTool(toolName)) {
-        const target = input?.input && typeof input.input === "object"
-            ? input.input
-            : input?.args && typeof input.args === "object"
-                ? input.args
-                : {};
-        if (target && typeof target === "object") {
+        const targets = [];
+        if (input?.input && typeof input.input === "object") {
+            targets.push(input.input);
+        }
+        if (input?.args && typeof input.args === "object") {
+            targets.push(input.args);
+        }
+        if (targets.length === 0 && input && typeof input === "object") {
+            targets.push(input);
+        }
+        for (const target of targets) {
             try {
                 await enrichAndInjectSubagentPrompt(target, config.namespace, activeTaskId);
             }
             catch {
-                // enrichment never blocks a tool call
+                injectSubagentPrompt(target, config.namespace, activeTaskId);
             }
         }
     }
@@ -897,7 +1011,7 @@ const executeBeforeHandler = async (input) => {
         if (config.strictMode) {
             const call = {
                 name: toolName,
-                args: firstRecord(input?.input, input?.args),
+                args: firstRecord(input?.input, input?.args, input),
                 session_id: asString(input?.session_id) ?? asString(input?.sessionID) ?? activeSessionId ?? undefined,
             };
             const payload = JSON.stringify(call.args);
@@ -949,6 +1063,8 @@ export async function initialize(ctx) {
     config = resolveConfig(ctx?.config ?? ctx?.pluginConfig ?? {});
     const token = config.bearerToken ?? loadDaemonToken(config.tokenFile);
     mcpClient = new NeuroStrataMCPClient({ endpoint: config.endpoint, token, timeoutMs: config.requestTimeoutMs });
+    cachedTaskInjection.clear();
+    subagentFileRecallCache.clear();
     setStatus({
         state: "uninitialized",
         endpoint: config.endpoint,
@@ -965,39 +1081,6 @@ export async function initialize(ctx) {
             await ctx.hooks[name](handler);
         }
     };
-    // Alternative hook handler for beforeToolExec, beforeToolCall, beforeCommand (used by Codex / GitHub CLI hosts):
-    const altBeforeHook = async (input) => {
-        const toolName = input?.tool ?? input?.tool_name ?? input?.name ?? input?.action ?? input?.command ?? "";
-        if (isSubagentTool(toolName)) {
-            if (!activeTaskId) {
-                try {
-                    await resolveActiveTaskFromDaemon(config.namespace);
-                }
-                catch {
-                    // fail-soft
-                }
-            }
-            const targets = [];
-            if (input?.input && typeof input.input === "object") {
-                targets.push(input.input);
-            }
-            if (input?.args && typeof input.args === "object") {
-                targets.push(input.args);
-            }
-            if (targets.length === 0 && input && typeof input === "object") {
-                targets.push(input);
-            }
-            for (const target of targets) {
-                try {
-                    await enrichAndInjectSubagentPrompt(target, config.namespace, activeTaskId);
-                }
-                catch {
-                    injectSubagentPrompt(target, config.namespace, activeTaskId);
-                }
-            }
-        }
-        return input;
-    };
     // Register execute.after FIRST, execute.before SECOND (tests overwrite registeredHook
     // on each ctx.tool.hook call and expect execute.before as the last registered hook).
     await registerHook("execute.after", executeAfterHandler);
@@ -1009,13 +1092,13 @@ export async function initialize(ctx) {
     // Fix 2: Register beforeToolExec, beforeToolCall, beforeCommand, and onTurnEnd hooks
     // (used by Codex / GitHub CLI hosts that route tool calls through these hook names).
     if (ctx?.hooks?.beforeToolExec && typeof ctx.hooks.beforeToolExec === "function") {
-        await ctx.hooks.beforeToolExec(altBeforeHook);
+        await ctx.hooks.beforeToolExec(executeBeforeHandler);
     }
     if (ctx?.hooks?.beforeToolCall && typeof ctx.hooks.beforeToolCall === "function") {
-        await ctx.hooks.beforeToolCall(altBeforeHook);
+        await ctx.hooks.beforeToolCall(executeBeforeHandler);
     }
     if (ctx?.hooks?.beforeCommand && typeof ctx.hooks.beforeCommand === "function") {
-        await ctx.hooks.beforeCommand(altBeforeHook);
+        await ctx.hooks.beforeCommand(executeBeforeHandler);
     }
     if (ctx?.hooks?.onTurnEnd && typeof ctx.hooks.onTurnEnd === "function") {
         await ctx.hooks.onTurnEnd(onTurnEnd);
@@ -1066,14 +1149,27 @@ export async function handleHookEvent(event) {
         if (isCodeExecTool(toolNameRaw)) {
             const code = String(toolInput.code ?? asRecord(toolInput.input)?.code ?? "");
             const inspection = inspectCodeModeExecution(code);
-            if (inspection.id)
+            if (inspection.id) {
+                cachedTaskInjection.delete(inspection.id);
                 activeTaskId = inspection.id;
+            }
             if (inspection.sessionId)
                 activeSessionId = inspection.sessionId;
             if (inspection.id || inspection.note !== undefined)
                 mutationsSinceNote = 0;
-            if (inspection.taskCompleted)
+            if (inspection.taskCompleted) {
+                if (activeTaskId)
+                    cachedTaskInjection.delete(activeTaskId);
                 activeTaskId = null;
+            }
+            for (const fp of inspection.queriedFiles) {
+                try {
+                    await prefetchMemoriesForFile(config.namespace, fp);
+                }
+                catch {
+                    // prefetch never blocks execution
+                }
+            }
         }
         // Subagent tools: enrich & inject subagent prompt, return allow + updatedInput.
         if (isSubagentTool(toolNameRaw)) {

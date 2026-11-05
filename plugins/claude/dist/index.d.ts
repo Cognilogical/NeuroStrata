@@ -180,7 +180,7 @@ export declare const cachedSubagentPromptByTask: Map<string, string | null>;
  * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
  * activeSessionId and cachedTaskInjection.
  */
-export declare function resolveActiveTaskFromDaemon(namespace: string): Promise<{
+export declare function resolveActiveTaskFromDaemon(namespace: string, preferredTaskId?: string | null): Promise<{
     taskId: string | null;
     sessionId: string | null;
     promptInjection: string | null;

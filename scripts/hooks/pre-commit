@@ -114,7 +114,23 @@ for file in "${StagedFiles[@]}"; do
         ' 2>/dev/null || true
     else
         TMP=$(mktemp)
-        awk -v ns="$NAMESPACE" -v file="$file" -v ts="$TS" '
+        awk '
+          function json_escape(s,    i, n, c, out) {
+            out = ""
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+              c = substr(s, i, 1)
+              if (c == "\\") out = out "\\\\"
+              else if (c == "\"") out = out "\\\""
+              else if (c == "\t") out = out "\\t"
+              else if (c == "\r") out = out "\\r"
+              else if (c == "\n") out = out "\\n"
+              else if (c == "\f") out = out "\\f"
+              else if (c == "\b") out = out "\\b"
+              else out = out c
+            }
+            return out
+          }
           function print_entry(comma) {
             print "    {"
             print "      \"ts\": " ts ","
@@ -130,8 +146,9 @@ for file in "${StagedFiles[@]}"; do
             }
           }
           BEGIN {
-            gsub(/\\/, "\\\\", file)
-            gsub(/"/, "\\\"", file)
+            ns = json_escape(ENVIRON["NAMESPACE"])
+            file = json_escape(ENVIRON["FILE"])
+            ts = ENVIRON["TS"] + 0
             found = 0
             inserted = 0
             pending_open = 0
