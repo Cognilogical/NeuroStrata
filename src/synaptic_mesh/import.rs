@@ -483,8 +483,9 @@ pub async fn apply_changed(
     // path-namespace parity and id == file-stem — do not transfer).
     // The dedup skip here is keyed on the path-derived `(namespace,
     // file-stem)` pair collected before validation, and content is NOT
-    // compared: a bundle record under a key whose `.json` candidate was
-    // applied OR ignored inherits that route's disposition for the pass
+    // compared: a bundle record under a key whose `.json` candidate
+    // reached any disposition in that route — applied, ignored,
+    // skipped, or conflicted — inherits that disposition for the pass
     // and is not separately evaluated or reported. Rejections of
     // decoded records — including an unserved namespace, which the
     // validation step now refuses — land in `report.ignored` like any
@@ -2936,8 +2937,8 @@ mod tests {
     /// and skipped wholesale, with no report entry and nothing
     /// applied. Enforcement on this route is therefore the decode
     /// aggregate cap; the validator-level per-record check on the
-    /// serialized form (the test above) covers records the decode
-    /// does admit.
+    /// serialized form (the test above) pins the measure at the
+    /// validation layer, for any path that reaches it.
     #[tokio::test]
     async fn bundle_with_over_cap_record_is_not_applied_end_to_end() {
         let id = Uuid::new_v4();
