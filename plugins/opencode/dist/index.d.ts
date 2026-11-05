@@ -145,6 +145,7 @@ export interface CodeModeInspection {
     taskClaimed?: boolean;
     taskUpdated?: boolean;
     taskCompleted?: boolean;
+    memoryMutated?: boolean;
     queriedFiles: string[];
 }
 /**

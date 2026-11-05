@@ -34,18 +34,48 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
     done < <(git diff --name-only -z 2>/dev/null)
 fi
 
+# ── Path normalization for ledger matching ─────────────────────────────────
+# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`), but the
+# ledger may have recorded `"$ROOT/$file"` (absolute), `"./$file"` (dot-slash),
+# or the bare `"$file"`. Match all three spellings.
+normalize_rel_path() {
+    local p="$1"
+    p="${p#"$ROOT"/}"
+    while [ "${p#./}" != "$p" ]; do
+        p="${p#./}"
+    done
+    p="${p%/}"
+    printf '%s' "$p"
+}
+
+ledger_has_file() {
+    local rel="$1"
+    grep -qF "\"$rel\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"./$rel\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$ROOT/$rel\"" "$LEDGER" 2>/dev/null
+}
+
+ledger_has_dir() {
+    local rel_dir="${1%/}"
+    grep -qF "\"$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"./$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$ROOT/$rel_dir/\"" "$LEDGER" 2>/dev/null
+}
+
 # ── Check each staged file / ancestor dir-prefix against session_queries.json ──
-for file in "${StagedFiles[@]}"; do
+for raw_file in "${StagedFiles[@]}"; do
+    file=$(normalize_rel_path "$raw_file")
+    [ -z "$file" ] && continue
     matched=0
     if [ -f "$LEDGER" ]; then
-        if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+        if ledger_has_file "$file"; then
             matched=1
         else
             # Walk ancestor directories of $file; only match if the exact
             # ancestor path was recorded in $LEDGER (not widened to top-level).
             anc=$(dirname "$file")
             while [ "$anc" != "." ] && [ "$anc" != "/" ] && [ -n "$anc" ]; do
-                if grep -qF "\"$anc/\"" "$LEDGER" 2>/dev/null; then
+                if ledger_has_dir "$anc"; then
                     matched=1
                     break
                 fi
@@ -64,8 +94,10 @@ mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
-for file in "${StagedFiles[@]}"; do
-    if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+for raw_file in "${StagedFiles[@]}"; do
+    file=$(normalize_rel_path "$raw_file")
+    [ -z "$file" ] && continue
+    if ledger_has_file "$file"; then
         continue
     fi
     TS=$(date +%s)

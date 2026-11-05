@@ -1135,3 +1135,234 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
     }
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────
+// Round-6 PR review regression tests
+// ──────────────────────────────────────────────────────────────────────
+
+describe("round-6: task_update title invalidation, AST summary formatting, dev script, pre-commit matching", () => {
+  it("native neurostrata_task_update with title invalidates cachedTaskInjection so next subagent call re-fetches", async () => {
+    const { server, url, counters } = await createMockDaemonServer({
+      returnTask: [
+        {
+          id: "task-update-title",
+          session_id: "sess-1",
+          status: "in_progress",
+          subagent_prompt_injection: "### Original daemon injection",
+        },
+      ],
+    });
+    try {
+      resetClientForTesting();
+      const ctx = {
+        config: { namespace: "r6-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 500 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      };
+      await initialize(ctx);
+
+      // Prime the cache via resolveActiveTaskFromDaemon
+      await resolveActiveTaskFromDaemon("r6-ns");
+      assert.equal(cachedTaskInjection.get("task-update-title"), "### Original daemon injection");
+
+      // Execute native task_update with title (should invalidate cache)
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "neurostrata_task_update",
+        tool_input: { id: "task-update-title", title: "New Title" },
+      });
+
+      // Cache should be invalidated for this task id
+      assert.equal(cachedTaskInjection.has("task-update-title"), false, "title update must invalidate cachedTaskInjection");
+
+      // Next enrichAndInjectSubagentPrompt should re-fetch from daemon
+      const { server: server2, url: url2, counters: counters2 } = await createMockDaemonServer({
+        returnTask: [
+          {
+            id: "task-update-title",
+            session_id: "sess-1",
+            status: "in_progress",
+            subagent_prompt_injection: "### Updated daemon injection",
+          },
+        ],
+      });
+      try {
+        resetClientForTesting();
+        const ctx2 = {
+          config: { namespace: "r6-ns", endpoint: url2, bearerToken: "tok", strictMode: true, requestTimeoutMs: 500 },
+          tool: { hook: async () => {} },
+          hooks: {},
+        };
+        await initialize(ctx2);
+
+        // Provide task id so enrich uses cachedTaskInjection
+        const target = { prompt: "Do something" };
+        await enrichAndInjectSubagentPrompt(target, "r6-ns", "task-update-title");
+        // Should have used the new injection since cache was invalidated
+        assert.ok(target.prompt.includes("### Updated daemon injection"), "next subagent call re-fetches updated prompt");
+      } finally {
+        server2.close();
+        resetModuleState();
+      }
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("prefetchMemoriesForFile formats callers, importers, blast_radius_count into [NeuroStrata AST ...] snippet", async () => {
+    const { server, url } = await createMockDaemonServer();
+    try {
+      const ctx = {
+        config: { namespace: "ast-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      };
+      await initialize(ctx);
+
+      // Override the mock to return ast_summary with callers, importers, blast_radius_count
+      // We need to create a custom mock for this test
+      const astTestServer = await new Promise((resolve) => {
+        const s = http.createServer((req, res) => {
+          if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+          let body = "";
+          req.on("data", (c) => { body += c; });
+          req.on("end", () => {
+            const payload = JSON.parse(body);
+            const id = payload.id ?? 0;
+            const params = payload.params ?? {};
+            const name = params.name ?? params.arguments?.name;
+            if (name === "neurostrata_memories_for_file") {
+              const astResponse = {
+                jsonrpc: "2.0",
+                id,
+                result: {
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify({
+                        hits: [
+                          { id: "mem-rule-1", valid_from: "2026-01-01T00:00:00Z", memory_type: "rule", content: "Always claim a task before editing." }
+                        ],
+                        ast_summary: {
+                          callers: ["fnA@src/a.rs", "fnB@src/b.rs"],
+                          importers: ["modC@src/c.rs"],
+                          blast_radius_count: 42,
+                          blast_radius: ["fnX@src/x.rs"],
+                          symbols: ["symbol1", "symbol2"],
+                          callees: ["callee1"],
+                          imports: ["import1"]
+                        }
+                      }),
+                    },
+                  ],
+                },
+              };
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(astResponse));
+              return;
+            }
+            if (payload.method === "tools/list") {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ tools: [{ name: "neurostrata_memories_for_file" }, { name: "neurostrata_task_list" }, { name: "neurostrata_guard_validate" }] }));
+              return;
+            }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: "Unknown tool" } }));
+          });
+        });
+        s.listen(0, () => {
+          const addr = s.address();
+          resolve({ server: s, url: `http://127.0.0.1:${addr.port}/mcp` });
+        });
+      });
+
+      resetClientForTesting();
+      const astCtx = { config: { namespace: "ast-ns", endpoint: astTestServer.url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(astCtx);
+
+      const snippets = await prefetchMemoriesForFile("ast-ns", "src/test.rs");
+      assert.ok(snippets.length > 0, "should return snippets");
+      const astSnippet = snippets.find((s) => s.startsWith("[NeuroStrata AST src/test.rs]"));
+      assert.ok(astSnippet, "should have AST summary snippet");
+      assert.ok(astSnippet.includes("callers=[fnA@src/a.rs,fnB@src/b.rs]"), "should format callers");
+      assert.ok(astSnippet.includes("importers=[modC@src/c.rs]"), "should format importers");
+      assert.ok(astSnippet.includes("blast_radius_count=42"), "should format blast_radius_count");
+      assert.ok(astSnippet.includes("symbols=[symbol1,symbol2]"), "should format symbols");
+      assert.ok(astSnippet.includes("callees=[callee1]"), "should format callees");
+      assert.ok(astSnippet.includes("imports=[import1]"), "should format imports");
+      assert.ok(astSnippet.includes("blast_radius=[fnX@src/x.rs]"), "should format blast_radius");
+
+      astTestServer.server.close();
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("plugins/*/package.json scripts.dev uses tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs --watch", async () => {
+    const pkgFiles = [
+      "plugins/opencode/package.json",
+      "plugins/claude/package.json",
+      "plugins/codex/package.json",
+      "plugins/github-cli/package.json",
+    ];
+    const expectedDev = 'tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs --watch';
+    for (const f of pkgFiles) {
+      const content = readFileSync(join(process.cwd(), f), "utf8");
+      const pkg = JSON.parse(content);
+      assert.equal(pkg.scripts.dev, expectedDev, `${f} must have correct dev script`);
+    }
+  });
+
+  it("pre-commit ledger matching handles ./<path> and $ROOT/<path> without warning", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r6-"));
+    const binDir = mkdtempSync(join(tmpdir(), "ns-precommit-bin-"));
+    try {
+      for (const cmd of ["bash", "sh", "git", "grep", "sed", "awk", "date", "mkdir", "printf", "mktemp", "mv", "rm", "dirname", "basename", "head", "pwd"]) {
+        for (const prefix of ["/usr/bin", "/bin"]) {
+          try { symlinkSync(join(prefix, cmd), join(binDir, cmd)); break; } catch {}
+        }
+      }
+
+      execFileSync("git", ["init", "-q"], { cwd: repoDir });
+      mkdirSync(join(repoDir, "src"), { recursive: true });
+      writeFileSync(join(repoDir, "src", "test.rs"), "fn a() {}\n");
+      execFileSync("git", ["add", "src/test.rs"], { cwd: repoDir });
+
+      const hookPath = join(repoDir, "pre-commit-test.sh");
+      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      chmodSync(hookPath, 0o755);
+
+      // Run 1: populate ledger with bare path
+      execFileSync(hookPath, [], { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
+
+      let ledgerPath = join(repoDir, ".NeuroStrata", "session_queries.json");
+      let ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      assert.equal(ledger.queries.length, 1);
+      assert.equal(ledger.queries[0].query, "src/test.rs");
+
+      // Run 2: manually inject $ROOT/path and ./path into ledger, then verify no warning on next run
+      // We simulate a ledger that already has entries with different path formats
+      ledger.queries.push({ ts: Date.now(), tool: "pre-commit", query: "./src/test.rs", domains: ["./src/test.rs"], returned_ids: [], governed_prefixes: ["./src/test.rs"] });
+      ledger.queries.push({ ts: Date.now(), tool: "pre-commit", query: "$ROOT/src/test.rs", domains: ["$ROOT/src/test.rs"], returned_ids: [], governed_prefixes: ["$ROOT/src/test.rs"] });
+      writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2));
+
+      // Stage another file and run - should not warn about src/test.rs (already in ledger in any format)
+      writeFileSync(join(repoDir, "src", "another.rs"), "fn b() {}\n");
+      execFileSync("git", ["add", "src/another.rs"], { cwd: repoDir });
+      execFileSync(hookPath, [], { cwd: repoDir, env: { PATH: binDir, HOME: repoDir } });
+
+      // Should not have warning for src/test.rs
+      ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      assert.equal(ledger.queries.length, 4, "should have 4 queries total (src/test.rs once, ./src/test.rs, $ROOT/src/test.rs, src/another.rs)");
+    } finally {
+      const { rmSync } = await import("node:fs");
+      rmSync(repoDir, { recursive: true, force: true });
+      rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+});

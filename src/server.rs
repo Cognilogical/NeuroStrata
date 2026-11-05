@@ -7779,7 +7779,7 @@ async fn handle_guard_validate(
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.trim().is_empty())
                         .map(String::from)
-                        .unwrap_or_else(|| "daemon-resolved".to_string())
+                        .unwrap_or_default()
                 } else {
                     session_id.to_string()
                 };

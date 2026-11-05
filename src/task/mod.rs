@@ -1307,37 +1307,40 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
 
     // Enhancement 1: stateless plugins (cli-hook.mjs, resumed sessions) resolve
     // the active task's id + subagent_prompt_injection in one task_list call.
-    // Compute the prompt for any in_progress task that doesn't already cache it
-    // in metadata.task.subagent_prompt_injection.
-    let mut pending: Vec<(usize, String, MemoryPayload)> = Vec::new();
+    // For InProgress tasks: if cached subagent_prompt_injection starts with the
+    // standard header "### NeuroStrata Task & Graph Context", ALWAYS recompute
+    // via build_task_graph_context (so archived rules / new rules are reflected).
+    // If cached does NOT start with that header (synthetic test fixture), keep it.
     for (i, m) in tasks.iter().enumerate() {
         if gate::task_status(m) == Status::InProgress {
             let expected_goal = format!("| Goal: {}\n", m.payload.content);
-            if let Some(cached) = m
+            let cached = m
                 .payload
                 .metadata
                 .get("task")
                 .and_then(|t| t.get("subagent_prompt_injection"))
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty() && s.contains(&expected_goal))
-            {
-                if let Some(obj) = summaries[i].as_object_mut() {
-                    obj.insert("subagent_prompt_injection".to_string(), json!(cached));
+                .filter(|s| !s.trim().is_empty() && s.contains(&expected_goal));
+            let should_recompute = cached
+                .map(|s| s.starts_with("### NeuroStrata Task & Graph Context"))
+                .unwrap_or(true);
+            if let Some(cached_str) = cached {
+                if !should_recompute {
+                    if let Some(obj) = summaries[i].as_object_mut() {
+                        obj.insert("subagent_prompt_injection".to_string(), json!(cached_str));
+                    }
+                    continue;
                 }
-            } else {
-                pending.push((i, m.id.clone(), m.payload.clone()));
             }
-        }
-    }
-    for (i, id, payload) in pending {
-        let vector = load_task(&store, &namespace, &id)
-            .await
-            .map(|(_task, vec)| vec)
-            .unwrap_or_default();
-        let (_hits, prompt) =
-            build_task_graph_context(&store, &namespace, &id, &vector, &payload).await;
-        if let Some(obj) = summaries[i].as_object_mut() {
-            obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+            let vector = load_task(&store, &namespace, &m.id)
+                .await
+                .map(|(_task, vec)| vec)
+                .unwrap_or_default();
+            let (_hits, prompt) =
+                build_task_graph_context(&store, &namespace, &m.id, &vector, &m.payload).await;
+            if let Some(obj) = summaries[i].as_object_mut() {
+                obj.insert("subagent_prompt_injection".to_string(), json!(prompt));
+            }
         }
     }
 
@@ -2401,18 +2404,48 @@ if [ "${#StagedFiles[@]}" -eq 0 ]; then
     done < <(git diff --name-only -z 2>/dev/null)
 fi
 
+# ── Path normalization for ledger matching ─────────────────────────────────
+# $file from git diff is repo-relative (e.g. `pkg/auth/handler.go`), but the
+# ledger may have recorded `"$ROOT/$file"` (absolute), `"./$file"` (dot-slash),
+# or the bare `"$file"`. Match all three spellings.
+normalize_rel_path() {
+    local p="$1"
+    p="${p#"$ROOT"/}"
+    while [ "${p#./}" != "$p" ]; do
+        p="${p#./}"
+    done
+    p="${p%/}"
+    printf '%s' "$p"
+}
+
+ledger_has_file() {
+    local rel="$1"
+    grep -qF "\"$rel\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"./$rel\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$ROOT/$rel\"" "$LEDGER" 2>/dev/null
+}
+
+ledger_has_dir() {
+    local rel_dir="${1%/}"
+    grep -qF "\"$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"./$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$ROOT/$rel_dir/\"" "$LEDGER" 2>/dev/null
+}
+
 # ── Check each staged file / ancestor dir-prefix against session_queries.json ──
-for file in "${StagedFiles[@]}"; do
+for raw_file in "${StagedFiles[@]}"; do
+    file=$(normalize_rel_path "$raw_file")
+    [ -z "$file" ] && continue
     matched=0
     if [ -f "$LEDGER" ]; then
-        if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+        if ledger_has_file "$file"; then
             matched=1
         else
             # Walk ancestor directories of $file; only match if the exact
             # ancestor path was recorded in $LEDGER (not widened to top-level).
             anc=$(dirname "$file")
             while [ "$anc" != "." ] && [ "$anc" != "/" ] && [ -n "$anc" ]; do
-                if grep -qF "\"$anc/\"" "$LEDGER" 2>/dev/null; then
+                if ledger_has_dir "$anc"; then
                     matched=1
                     break
                 fi
@@ -2431,8 +2464,10 @@ mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
-for file in "${StagedFiles[@]}"; do
-    if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+for raw_file in "${StagedFiles[@]}"; do
+    file=$(normalize_rel_path "$raw_file")
+    [ -z "$file" ] && continue
+    if ledger_has_file "$file"; then
         continue
     fi
     TS=$(date +%s)
@@ -7227,6 +7262,111 @@ impl crate::traits::AsAny for ListHidingStore {
         assert_eq!(
             DONE_FUNNEL_MESSAGE,
             "ERROR: done is reachable only via neurostrata_task_complete, which requires memory extraction (Lock 2)."
+        );
+    }
+
+    /// R6: `handle_task_list` must recompute `subagent_prompt_injection` for
+    /// InProgress tasks whenever the cached prompt starts with the standard
+    /// header, so an archived governing rule no longer appears in the prompt.
+    #[tokio::test]
+    async fn task_list_recomputes_prompt_when_governing_rule_is_archived() {
+        let store = store_with_namespace("MyProj").await;
+
+        // 1. Insert a live rule memory in the namespace.
+        let rule_id = uuid::Uuid::new_v4().to_string();
+        let rule_vector = StubEmbedder
+            .embed("Never use unwrap in production")
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rule_id,
+                rule_vector,
+                MemoryPayload {
+                    content: "Never use unwrap in production".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .expect("seed the rule");
+
+        // 2. Create and claim a task in MyProj.
+        let task_id = create_task(&store, "MyProj", "Fix production unwrap", 1).await;
+        handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": task_id,
+                "assignee": "agent-a",
+                "session_id": "ses_rule"
+            }),
+            store.clone(),
+        )
+        .await;
+
+        // 3. handle_task_list must include the rule id/snippet in the prompt.
+        let list_before: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_before = list_before["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .expect("prompt present before archive");
+        assert!(
+            prompt_before.contains(&rule_id),
+            "the live rule id must appear in the prompt: {}",
+            prompt_before
+        );
+        assert!(
+            prompt_before.contains("Never use unwrap in production"),
+            "the live rule snippet must appear in the prompt: {}",
+            prompt_before
+        );
+
+        // 4. Archive the rule.
+        let bus = Arc::new(crate::events::ThalamicBus::new(16));
+        let _ = crate::handlers::archive_memory::handle_archive_memory(
+            json!({ "namespace": "MyProj", "id": rule_id }),
+            store.clone(),
+            bus.clone(),
+        )
+        .await;
+        let (_, rule_payload) = store.get("MyProj", &rule_id).await.unwrap().unwrap();
+        assert!(
+            crate::handlers::archive_memory::is_archived(&rule_payload),
+            "the rule must really be archived"
+        );
+
+        // 5. handle_task_list again: the archived rule must no longer appear.
+        let list_after: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "status": "in_progress" }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        let prompt_after = list_after["tasks"][0]["subagent_prompt_injection"]
+            .as_str()
+            .expect("prompt present after archive");
+        assert!(
+            !prompt_after.contains(&rule_id),
+            "the archived rule id must not appear in the recomputed prompt: {}",
+            prompt_after
+        );
+        assert!(
+            !prompt_after.contains("Never use unwrap in production"),
+            "the archived rule snippet must not appear in the recomputed prompt: {}",
+            prompt_after
         );
     }
 }

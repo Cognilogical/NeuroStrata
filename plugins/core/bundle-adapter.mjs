@@ -1,26 +1,31 @@
 #!/usr/bin/env node
 /**
  * bundle-adapter.mjs — Inlines @neurostrata/plugin-core into each harness adapter's dist/.
- *
+ * 
  * Usage (from adapter directory, e.g., plugins/opencode):
  *   node ../core/bundle-adapter.mjs
- *
+ * 
  * Reads:
  *   ../core/dist/index.js
  *   ../core/dist/index.d.ts
  *   ./index.ts
- *
+ * 
  * Writes:
  *   ./dist/index.js   (core JS + plugin export)
  *   ./dist/index.d.ts (core .d.ts + plugin declare)
+ * 
+ * Supports --watch mode: watches core/index.ts and adapter/index.ts for changes,
+ * recompiles with tsc and re-bundles the adapter when either file changes.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, watch } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = resolve(__dirname, "..");
+const coreDir = resolve(rootDir, "core");
 
 function stripCoreFooter(content) {
   const withoutDefaultDecl = content.replace(
@@ -73,15 +78,16 @@ function extractPluginLines(indexTsPath) {
   return pluginLines.join("\n").trim();
 }
 
-function main() {
+// New: bundleAdapter function that encapsulates the core bundling logic
+function bundleAdapter(adapterDir) {
   // Determine adapter directory: process.argv[2] or process.cwd()
-  const adapterDir = resolve(process.argv[2] || process.cwd());
-
+  const adapterDirResolved = resolve(adapterDir || process.cwd());
+  
   // Paths
   const coreDistJs = resolve(rootDir, "core/dist/index.js");
   const coreDistDts = resolve(rootDir, "core/dist/index.d.ts");
-  const adapterIndexTs = join(adapterDir, "index.ts");
-  const adapterDistDir = join(adapterDir, "dist");
+  const adapterIndexTs = join(adapterDirResolved, "index.ts");
+  const adapterDistDir = join(adapterDirResolved, "dist");
   const adapterDistJs = join(adapterDistDir, "index.js");
   const adapterDistDts = join(adapterDistDir, "index.d.ts");
 
@@ -106,6 +112,45 @@ export default plugin;`;
   const bundledDts = `${coreDts}\n${pluginDeclare}\n`;
   writeFileSync(adapterDistDts, bundledDts, "utf8");
   console.log(`[bundle] wrote ${adapterDistDts}`);
+}
+
+// Main function with watch support
+function main() {
+  const args = process.argv.slice(2);
+  const watchMode = args.includes("--watch") || args.includes("-w");
+  const dirArg = args.find((a) => !a.startsWith("-"));
+  const adapterDir = resolve(dirArg || process.cwd());
+
+  // Call bundleAdapter once at startup
+  bundleAdapter(adapterDir);
+
+  if (watchMode) {
+    // Watch core/index.ts and adapter/index.ts for changes
+    const coreWatchPath = resolve(rootDir, "core/index.ts");
+    const adapterWatchPath = join(adapterDir, "index.ts");
+
+    // Watch core/index.ts
+    watch(coreWatchPath, { persistent: true }, () => {
+      try {
+        execFileSync("tsc", ["--project", resolve(rootDir, "core/tsconfig.json")], { stdio: "inherit" });
+        bundleAdapter(adapterDir);
+      } catch (err) {
+        console.error(`[bundle watch] error: ${err.message}`);
+      }
+    });
+
+    // Watch adapter/index.ts
+    watch(adapterWatchPath, { persistent: true }, () => {
+      try {
+        execFileSync("tsc", ["--project", resolve(rootDir, "core/tsconfig.json")], { stdio: "inherit" });
+        bundleAdapter(adapterDir);
+      } catch (err) {
+        console.error(`[bundle watch] error: ${err.message}`);
+      }
+    });
+
+    console.log(`[bundle] watching for changes...`);
+  }
 }
 
 main();

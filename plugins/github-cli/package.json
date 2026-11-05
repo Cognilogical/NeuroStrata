@@ -5,6 +5,7 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs",
+    "dev": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test": "node --test test.mjs"
   },

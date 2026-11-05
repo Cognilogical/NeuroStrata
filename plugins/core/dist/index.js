@@ -449,7 +449,7 @@ function extractBalancedCallArgs(code, startAfterOpenParen) {
  */
 export function inspectCodeModeExecution(code) {
     const result = { queriedFiles: [] };
-    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file))\b(?:\s*["']\s*\])?\s*\(/g;
+    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
     let match;
     while ((match = callRe.exec(code)) !== null) {
         const tool = match[1];
@@ -481,6 +481,9 @@ export function inspectCodeModeExecution(code) {
         else if (tool === "neurostrata_memories_for_file") {
             if (pathMatch)
                 result.queriedFiles.push(pathMatch[1]);
+        }
+        else if (tool === "neurostrata_archive_memory" || tool === "neurostrata_add_memory" || tool === "neurostrata_update_memory") {
+            result.memoryMutated = true;
         }
     }
     return result;
@@ -601,6 +604,28 @@ function cacheSubagentFileRecall(key, entries) {
             subagentFileRecallCache.delete(oldest);
     }
 }
+function formatAstEntryList(val, maxItems = 5) {
+    if (!Array.isArray(val))
+        return "[]";
+    const arr = val.map((item) => {
+        if (typeof item === "string")
+            return item;
+        if (typeof item === "object" && item !== null) {
+            const rec = item;
+            const symbol_name = asString(rec.symbol_name);
+            const name = asString(rec.name);
+            const file_path = asString(rec.file_path) ?? asString(rec.path);
+            const id = asString(rec.id);
+            if (symbol_name && file_path)
+                return `${symbol_name}@${file_path}`;
+            return symbol_name ?? name ?? file_path ?? id ?? String(item);
+        }
+        return String(item);
+    });
+    const capped = arr.slice(0, maxItems);
+    const suffix = arr.length > maxItems ? `,+${arr.length - maxItems}` : "";
+    return `[${capped.join(",")}${suffix}]`;
+}
 function parseRawFileRecallEntries(text, normalized) {
     const entries = [];
     let body = {};
@@ -618,12 +643,33 @@ function parseRawFileRecallEntries(text, normalized) {
     }
     let astDetail = "";
     if (Array.isArray(body.related_memories) && body.related_memories.length > 0) {
-        astDetail = `related_memories=${body.related_memories.length}`;
+        astDetail = `related_memories=${body.related_memories.length}(${formatAstEntryList(body.related_memories, 5)})`;
     }
     if (body.ast_summary && typeof body.ast_summary === "object") {
-        const keys = Object.keys(body.ast_summary).filter((k) => k === "callers" || k === "importers" || k === "blast_radius");
-        if (keys.length > 0) {
-            astDetail += astDetail ? ` | ast_summary={${keys.join(",")}}` : `ast_summary={${keys.join(",")}}`;
+        const ast = body.ast_summary;
+        const parts = [];
+        if (typeof ast.blast_radius_count === "number") {
+            parts.push(`blast_radius_count=${ast.blast_radius_count}`);
+        }
+        if (ast.blast_radius !== undefined) {
+            if (Array.isArray(ast.blast_radius)) {
+                parts.push(`blast_radius=${formatAstEntryList(ast.blast_radius, 5)}`);
+            }
+            else if (typeof ast.blast_radius === "number" || typeof ast.blast_radius === "string") {
+                parts.push(`blast_radius=${String(ast.blast_radius)}`);
+            }
+        }
+        for (const key of ["symbols", "callers", "callees", "imports", "importers"]) {
+            const val = ast[key];
+            if (Array.isArray(val) && val.length > 0) {
+                parts.push(`${key}=${formatAstEntryList(val, 5)}`);
+            }
+            else if (val !== undefined && !Array.isArray(val)) {
+                parts.push(`${key}=${String(val)}`);
+            }
+        }
+        if (parts.length > 0) {
+            astDetail += astDetail ? ` | ast_summary={${parts.join(", ")}}` : `ast_summary={${parts.join(", ")}}`;
         }
     }
     if (astDetail) {
@@ -879,8 +925,13 @@ const TASK_MUTATION_TOOLS = new Set([
     "neurostrata_task_update",
     "neurostrata_task_complete",
 ]);
+const MEMORY_MUTATION_TOOLS = new Set([
+    "neurostrata_archive_memory",
+    "neurostrata_add_memory",
+    "neurostrata_update_memory",
+]);
 function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
-    if (!TASK_MUTATION_TOOLS.has(toolName))
+    if (!TASK_MUTATION_TOOLS.has(toolName) && !MEMORY_MUTATION_TOOLS.has(toolName))
         return;
     const sessionId = asString(payloadArgs.session_id) ??
         asString(outerInput?.session_id) ??
@@ -893,14 +944,24 @@ function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
         payloadArgs.note !== undefined) {
         mutationsSinceNote = 0;
     }
+    if (MEMORY_MUTATION_TOOLS.has(toolName)) {
+        cachedTaskInjection.clear();
+        prefetchedPaths.clear();
+        injectedMemoryIds.clear();
+        subagentFileRecallCache.clear();
+    }
     if (toolName === "neurostrata_task_complete") {
         if (activeTaskId)
             cachedTaskInjection.delete(activeTaskId);
         activeTaskId = null;
     }
     else if (taskId) {
-        if (toolName === "neurostrata_task_claim") {
+        if (toolName === "neurostrata_task_claim" ||
+            toolName === "neurostrata_task_update" ||
+            payloadArgs.title !== undefined) {
             cachedTaskInjection.delete(taskId);
+            if (activeTaskId)
+                cachedTaskInjection.delete(activeTaskId);
         }
         activeTaskId = taskId;
     }
@@ -1074,6 +1135,12 @@ const executeBeforeHandler = async (input) => {
                 cachedTaskInjection.delete(activeTaskId);
             activeTaskId = null;
         }
+        if (inspection.memoryMutated) {
+            cachedTaskInjection.clear();
+            prefetchedPaths.clear();
+            injectedMemoryIds.clear();
+            subagentFileRecallCache.clear();
+        }
         for (const fp of inspection.queriedFiles) {
             try {
                 await prefetchMemoriesForFile(config.namespace, fp);
@@ -1083,8 +1150,15 @@ const executeBeforeHandler = async (input) => {
             }
         }
     }
-    // Track native task mutation tools (claim/update/complete).
+    // Track native task mutation tools (claim/update/complete) and memory mutations.
     trackNativeTaskToolCall(toolName, firstRecord(args, altArgs), asRecord(input));
+    // Memory mutation tools (archive/add/update) invalidate all cached prompts and file recall.
+    if (MEMORY_MUTATION_TOOLS.has(toolName)) {
+        cachedTaskInjection.clear();
+        prefetchedPaths.clear();
+        injectedMemoryIds.clear();
+        subagentFileRecallCache.clear();
+    }
     // Enhancement 1: resolve active task from daemon before subagent injection & mutating guard.
     if (!activeTaskId && (isSubagentTool(toolName) || isMutatingTool(toolName))) {
         try {
@@ -1299,6 +1373,12 @@ export async function handleHookEvent(event) {
                 if (activeTaskId)
                     cachedTaskInjection.delete(activeTaskId);
                 activeTaskId = null;
+            }
+            if (inspection.memoryMutated) {
+                cachedTaskInjection.clear();
+                prefetchedPaths.clear();
+                injectedMemoryIds.clear();
+                subagentFileRecallCache.clear();
             }
             for (const fp of inspection.queriedFiles) {
                 try {
