@@ -475,8 +475,9 @@ pub async fn apply_changed(
     // routes call `pre_apply_gate` (validation, then epoch, then
     // signature) before `apply_one`, and the bundle validation is the
     // portable subset of `validate_record` (see `validate_bundle_record`
-    // — a bundle record has no file stem, so the id == file-stem check
-    // is the one check that does not transfer). A record already
+    // — a bundle record has no path and no file stem, so the two
+    // path-dependent checks — path-namespace parity and
+    // id == file-stem — do not transfer). A record already
     // presented as a `.json` candidate is applied exactly once through
     // that authoritative route, so its bundle copy is skipped here
     // without a second report entry; every other rejection — including
