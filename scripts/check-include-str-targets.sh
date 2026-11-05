@@ -31,7 +31,7 @@ while IFS= read -r target; do
     echo "::error::Missing include_str! target: $target (resolved: $resolved)"
     missing=$((missing + 1))
   fi
-done < <(grep -o 'include_str!\s*(\s*"[^"]*"' "$HARNESS_FILE" | sed -E 's/^[^"]*"//; s/"$//')
+done < <(grep -o 'include_str![[:space:]]*([[:space:]]*"[^"]*"' "$HARNESS_FILE" | sed -E 's/^[^"]*"//; s/"$//')
 
 if [ "$checked" -eq 0 ]; then
   echo "::error::No include_str! targets found in $HARNESS_FILE; guard is vacuous, refusing to pass."
