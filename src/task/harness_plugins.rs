@@ -130,6 +130,18 @@ fn normalize_harness_name(raw: &str) -> Option<&'static str> {
     }
 }
 
+/// Absolute path for writing into harness config that another program will
+/// execute. dunce, not std: `std::fs::canonicalize` returns Windows'
+/// extended-length form (`\\?\C:\...`), which a shell mangles to `C:\?\C:\...`
+/// and Node then cannot open, so every hook fails with MODULE_NOT_FOUND.
+/// dunce yields the plain form wherever one exists and is a no-op elsewhere.
+fn plain_abs_path(path: &Path) -> String {
+    dunce::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
 fn has_any_env(keys: &[&str]) -> bool {
     keys.iter()
         .any(|k| std::env::var_os(k).map(|v| !v.is_empty()).unwrap_or(false))
@@ -293,16 +305,8 @@ pub fn auto_install_detected_plugins(
             }
         }
 
-        let abs_dist = dist_index
-            .canonicalize()
-            .unwrap_or_else(|_| dist_index.clone())
-            .to_string_lossy()
-            .to_string();
-        let abs_runner = runner_path
-            .canonicalize()
-            .unwrap_or_else(|_| runner_path.clone())
-            .to_string_lossy()
-            .to_string();
+        let abs_dist = plain_abs_path(&dist_index);
+        let abs_runner = plain_abs_path(&runner_path);
 
         let wired_config = wire_harness_config(
             project_root,
@@ -675,6 +679,19 @@ mod tests {
         assert!(tmp.path().join(".claude/agents/NeuroStrata-Task.md").exists());
         let patched = std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
         assert!(patched.contains("subagent_prompt_injection"));
+    }
+
+    #[test]
+    fn wired_paths_never_use_the_windows_extended_length_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner");
+        assert!(!runner.starts_with(r"\\?\"), "verbatim path leaked: {runner}");
+        let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.local.json"))
+            .expect("settings.local.json");
+        assert!(!settings.contains(r"\\\\?\\"), "verbatim path in hook command");
     }
 
     #[test]
