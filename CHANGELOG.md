@@ -4,6 +4,14 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **The Nightly workflow had not built successfully since 2026-10-29.** Two independent causes, both confirmed against the run logs rather than guessed. (1) *Windows:* `nightly.yml` never received the vendored-OpenSSL configure step that `ci.yml` and `release.yml` carry — `Cargo.toml` declares `openssl` with the `vendored` feature, so `openssl-sys` builds OpenSSL from source and needs a Perl with the `Locale::Maketext::Simple` module; the Git-bundled Perl that wins `PATH` on the `windows-latest` image exits 2 during `Configure` with `Can't locate Locale/Maketext/Simple.pm in @INC`. `nightly.yml` now sets `OPENSSL_SRC_PERL` to the preinstalled Strawberry Perl and puts NASM on `PATH`, exactly as the other two workflows do. (2) *Linux:* the build failed on `include_str!` of `plugins/opencode/dist/index.js`, which is not tracked in git; that bundle is tracked as of the #52 merge, so the Linux job needed no change. Tracked as `neurostrata-dbcc` (ns-dbcc).
+
+---
+
 ## [1.16.0] - 2026-11-05
 
 ### Added
