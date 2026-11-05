@@ -1080,16 +1080,17 @@ function extractPatchPath(raw) {
     const m = raw.match(/(?:^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*|^---\s+a\/|^\+\+\+\s+b\/)([^\r\n]+)/m);
     return m?.[1]?.trim();
 }
-function extractFilePath(args, altArgs) {
+function extractFilePath(args, altArgs, rawPatch) {
     return (asString(args.file_path) ??
         asString(args.filePath) ??
         asString(args.path) ??
-        extractPatchPath(args.patchText ?? args.patch ?? args.diff) ??
+        extractPatchPath(args.patchText ?? args.patch ?? args.diff ?? args.input) ??
+        extractPatchPath(rawPatch) ??
         (altArgs
             ? (asString(altArgs.file_path) ??
                 asString(altArgs.filePath) ??
                 asString(altArgs.path) ??
-                extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff))
+                extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input))
             : undefined));
 }
 const executeAfterHandler = async (output, secondArg) => {
@@ -1195,7 +1196,7 @@ const executeBeforeHandler = async (input) => {
     let snippets = [];
     let filePath;
     if (isFileTouchTool(toolName)) {
-        filePath = extractFilePath(args, altArgs);
+        filePath = extractFilePath(args, altArgs, input?.input);
         if (filePath) {
             try {
                 snippets = await prefetchMemoriesForFile(config.namespace, filePath);
@@ -1354,7 +1355,8 @@ export async function handleHookEvent(event) {
     }
     const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
     const toolNameRaw = asString(event.tool_name) ?? asString(event.toolName) ?? "";
-    const toolInput = firstRecord(event.tool_input ?? event.input ?? event.args ?? {});
+    const toolInputRaw = event.tool_input ?? event.input ?? event.args ?? {};
+    const toolInput = firstRecord(toolInputRaw);
     if (hookEventName === "PreToolUse") {
         // Track native task mutation tools (claim/update/complete) for state bookkeeping.
         trackNativeTaskToolCall(toolNameRaw, firstRecord(toolInput), asRecord(event));
@@ -1406,7 +1408,7 @@ export async function handleHookEvent(event) {
         // File-touch tools: prefetch governing memories, build recall block.
         let recallBlock;
         if (isFileTouchTool(toolNameRaw)) {
-            const filePath = extractFilePath(toolInput);
+            const filePath = extractFilePath(toolInput, undefined, toolInputRaw);
             if (filePath) {
                 try {
                     const snippets = await prefetchMemoriesForFile(config.namespace, filePath);

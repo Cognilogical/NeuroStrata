@@ -49,7 +49,7 @@ function makeMockRpcResponse(id, resultObj, errorObj = null) {
 }
 
 function createMockDaemonServer({ returnTask = null, guardReject = false } = {}) {
-  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0 };
+  const counters = { memoriesForFile: 0, taskList: 0, guardValidate: 0, memoriesForFilePaths: [] };
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       if (req.method !== "POST") {
@@ -89,6 +89,8 @@ function createMockDaemonServer({ returnTask = null, guardReject = false } = {})
           }
           if (name === "neurostrata_memories_for_file") {
             counters.memoriesForFile++;
+            const args = params.arguments ?? {};
+            if (typeof args.path === "string") counters.memoriesForFilePaths.push(args.path);
             respond({
               content: [
                 {
@@ -1456,6 +1458,112 @@ describe("round-6: task_update title invalidation, AST summary formatting, dev s
       const { rmSync } = await import("node:fs");
       rmSync(repoDir, { recursive: true, force: true });
       rmSync(binDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("round-8: Codex apply_patch extraction, decoded ledger matching, and batched writes", () => {
+  it("executeBeforeHandler extracts *** Update File path from string input", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      let beforeExecFn = null;
+      await initialize({
+        config: { namespace: "r8-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 500 },
+        hooks: {
+          beforeToolExec: async (fn) => {
+            beforeExecFn = fn;
+          },
+        },
+      });
+      const patch = "*** Update File: src/codex.rs\n@@\n-a\n+b\n";
+      const result = await beforeExecFn({ tool: "apply_patch", input: patch });
+      assert.ok(counters.memoriesForFile >= 1, "memories_for_file must run for the patched file");
+      assert.ok(
+        counters.memoriesForFilePaths.includes("src/codex.rs"),
+        `patched path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+      );
+      const blob = JSON.stringify(result ?? {});
+      assert.ok(blob.includes("src/codex.rs"), "recall block must mention the patched file");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("handleHookEvent extracts patch path when event.input is a raw patch string", async () => {
+    const { server, url, counters } = await createMockDaemonServer();
+    try {
+      await initialize({
+        config: { namespace: "r8-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 500 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      });
+      const result = await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "apply_patch",
+        input: "*** Add File: src/new.rs\n+hello\n",
+      });
+      assert.ok(counters.memoriesForFile >= 1, "memories_for_file must run for the added file");
+      assert.ok(
+        counters.memoriesForFilePaths.includes("src/new.rs"),
+        `added path must be queried, got ${JSON.stringify(counters.memoriesForFilePaths)}`,
+      );
+      const blob = JSON.stringify(result ?? {});
+      assert.ok(blob.includes("src/new.rs"), "hook recall must mention the added file");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("pre-commit matches JSON-escaped unicode/quote paths and appends missing files in one write", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { mkdtempSync, symlinkSync, chmodSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const repoDir = mkdtempSync(join(tmpdir(), "ns-precommit-r8-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: repoDir });
+      mkdirSync(join(repoDir, "src"), { recursive: true });
+      writeFileSync(join(repoDir, "src", "café.rs"), "fn cafe() {}\n");
+      writeFileSync(join(repoDir, "src", "quote\"file.rs"), "fn q() {}\n");
+      writeFileSync(join(repoDir, "src", "a.rs"), "fn a() {}\n");
+      writeFileSync(join(repoDir, "src", "b.rs"), "fn b() {}\n");
+      execFileSync("git", ["add", "src/café.rs", "src/quote\"file.rs", "src/a.rs", "src/b.rs"], { cwd: repoDir });
+
+      const hookPath = join(repoDir, "pre-commit-test.sh");
+      writeFileSync(hookPath, readFileSync(new URL("../../scripts/hooks/pre-commit", import.meta.url), "utf8"));
+      chmodSync(hookPath, 0o755);
+
+      mkdirSync(join(repoDir, ".NeuroStrata"), { recursive: true });
+      const ledgerPath = join(repoDir, ".NeuroStrata", "session_queries.json");
+      writeFileSync(
+        ledgerPath,
+        JSON.stringify({
+          namespace: "r8",
+          queries: [
+            { ts: 1, tool: "pre-commit", query: "src/café.rs", domains: ["src/café.rs"], returned_ids: [], governed_prefixes: ["src/café.rs"] },
+            { ts: 1, tool: "pre-commit", query: "src/quote\"file.rs", domains: ["src/quote\"file.rs"], returned_ids: [], governed_prefixes: ["src/quote\"file.rs"] },
+          ],
+        }),
+      );
+      // Force unicode escapes like python json.dump(ensure_ascii=True)
+      const escaped = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      writeFileSync(ledgerPath, JSON.stringify(escaped).replace(/é/g, "\\u00e9"));
+
+      const { spawnSync } = await import("node:child_process");
+      const ran = spawnSync(hookPath, [], { cwd: repoDir, encoding: "utf8" });
+      const stderr = ran.stderr ?? "";
+      assert.equal(ran.status, 0, `pre-commit exited ${ran.status}: ${stderr}`);
+      assert.equal(stderr.includes("src/café.rs"), false, `decoded unicode path must not warn: ${stderr}`);
+      assert.equal(stderr.includes("quote"), false, `decoded quoted path must not warn: ${stderr}`);
+
+      const ledger = JSON.parse(readFileSync(ledgerPath, "utf8"));
+      const queries = ledger.queries.map((q) => q.query).sort();
+      assert.ok(queries.includes("src/a.rs"));
+      assert.ok(queries.includes("src/b.rs"));
+      assert.equal(queries.filter((q) => q === "src/café.rs" || q === "src/quote\"file.rs").length, 2, "existing decoded paths must not be duplicated");
+    } finally {
+      rmSync(repoDir, { recursive: true, force: true });
     }
   });
 });

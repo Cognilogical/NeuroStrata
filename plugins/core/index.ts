@@ -1243,17 +1243,18 @@ function extractPatchPath(raw: unknown): string | undefined {
   return m?.[1]?.trim();
 }
 
-function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string, unknown>): string | undefined {
+function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string, unknown>, rawPatch?: unknown): string | undefined {
   return (
     asString(args.file_path) ??
     asString(args.filePath) ??
     asString(args.path) ??
-    extractPatchPath(args.patchText ?? args.patch ?? args.diff) ??
+    extractPatchPath(args.patchText ?? args.patch ?? args.diff ?? args.input) ??
+    extractPatchPath(rawPatch) ??
     (altArgs
       ? (asString(altArgs.file_path) ??
          asString(altArgs.filePath) ??
          asString(altArgs.path) ??
-         extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff))
+         extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input))
       : undefined)
   );
 }
@@ -1363,7 +1364,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   let snippets: string[] = [];
   let filePath: string | undefined;
   if (isFileTouchTool(toolName)) {
-    filePath = extractFilePath(args, altArgs);
+    filePath = extractFilePath(args, altArgs, input?.input);
     if (filePath) {
       try {
         snippets = await prefetchMemoriesForFile(config.namespace, filePath);
@@ -1532,7 +1533,8 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
 
   const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? "PreToolUse";
   const toolNameRaw = asString(event.tool_name) ?? asString(event.toolName) ?? "";
-  const toolInput = firstRecord(event.tool_input ?? event.input ?? event.args ?? {});
+  const toolInputRaw = event.tool_input ?? event.input ?? event.args ?? {};
+  const toolInput = firstRecord(toolInputRaw);
 
   if (hookEventName === "PreToolUse") {
     // Track native task mutation tools (claim/update/complete) for state bookkeeping.
@@ -1585,7 +1587,7 @@ export async function handleHookEvent(event: Record<string, unknown>): Promise<R
     // File-touch tools: prefetch governing memories, build recall block.
     let recallBlock: string | undefined;
     if (isFileTouchTool(toolNameRaw)) {
-      const filePath = extractFilePath(toolInput);
+      const filePath = extractFilePath(toolInput, undefined, toolInputRaw);
       if (filePath) {
         try {
           const snippets = await prefetchMemoriesForFile(config.namespace, filePath);

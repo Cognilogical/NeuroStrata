@@ -2018,7 +2018,18 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                             .get("related_memories_truncated")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        response["related_memories"] = serde_json::Value::Array(related_memories);
+                        let excluded: std::collections::HashSet<&str> =
+                            exclude_ids.iter().map(String::as_str).collect();
+                        let filtered: Vec<serde_json::Value> = related_memories
+                            .into_iter()
+                            .filter(|m| {
+                                m.get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|id| !excluded.contains(id))
+                                    .unwrap_or(true)
+                            })
+                            .collect();
+                        response["related_memories"] = serde_json::Value::Array(filtered);
                         response["related_memories_truncated"] =
                             serde_json::Value::Bool(related_truncated);
                         response["ast_summary"] = ast_summary;
@@ -9163,6 +9174,69 @@ mod tests {
         let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(parsed.get("related_memories").is_none(), "related_memories omitted: {text}");
         assert!(parsed.get("ast_summary").is_none(), "ast_summary omitted: {text}");
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_filters_exclude_ids_from_related_memories() {
+        let (store, rule_id) = store_with_one_rule("probe").await;
+
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+        lb.with_conn(move |conn| {
+            // discover_candidates keeps only ids whose logical_path_of(id) == path.
+            // A stub id like 'mem-file' never matches, so the file node id must be
+            // the path itself. GOVERNS then yields the rule as a hit.
+            conn.query(
+                "CREATE (m:Memory {id: 'src/lib.rs', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: 'src/lib.rs', location_lines: '', metadata: '{\"imports\": [\"pkg/other.rs\"]}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'src/lib.rs'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            conn.query(
+                "CREATE (m:Memory {id: 'mem-related', namespace: 'probe', content: 'r', user_id: 'u', memory_type: 'fact', agent_name: 'a', location: 'src/other.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0]})"
+            )?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: 'mem-related'}}) MERGE (a)-[r:RELATES_TO {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file + related neighbor");
+
+        let related_ids = |text: &str| -> Vec<String> {
+            let parsed: Value = serde_json::from_str(text).expect("valid JSON");
+            parsed["related_memories"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        };
+
+        let without_exclude = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+            "include_ast_edges": true,
+        });
+        let text = handle_memories_for_file(without_exclude, store.clone()).await;
+        assert!(
+            related_ids(&text).iter().any(|id| id == "mem-related"),
+            "related_memories should contain mem-related when exclude_ids is empty: {text}"
+        );
+
+        let with_exclude = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+            "include_ast_edges": true,
+            "exclude_ids": ["mem-related"],
+        });
+        let text = handle_memories_for_file(with_exclude, store).await;
+        assert!(
+            related_ids(&text).iter().all(|id| id != "mem-related"),
+            "related_memories must omit excluded neighbor mem-related: {text}"
+        );
     }
 
     #[tokio::test]

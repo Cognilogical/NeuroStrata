@@ -2418,8 +2418,86 @@ normalize_rel_path() {
     printf '%s' "$p"
 }
 
+# Dump decoded, normalized ledger paths (one per line) using node or python3.
+# Empty if ledger missing or neither runtime is available.
+dump_ledger_paths() {
+    if [ ! -f "$LEDGER" ]; then
+        return 0
+    fi
+    export LEDGER ROOT
+    if command -v node >/dev/null 2>&1; then
+        node -e '
+          const fs = require("fs");
+          const ledger = process.env.LEDGER;
+          const root = process.env.ROOT || "";
+          let parsed;
+          try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
+          const queries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.queries) ? parsed.queries : []);
+          const out = new Set();
+          const norm = (p) => {
+            if (typeof p !== "string" || !p) return;
+            if (root && (p === root || p.startsWith(root + "/"))) p = p.slice(root.length).replace(/^\//, "");
+            while (p.startsWith("./")) p = p.slice(2);
+            if (p.endsWith("/")) p = p.slice(0, -1);
+            if (p) out.add(p);
+          };
+          for (const q of queries) {
+            if (!q || typeof q !== "object") continue;
+            norm(q.query);
+            for (const k of ["domains", "governed_prefixes"]) {
+              if (Array.isArray(q[k])) q[k].forEach(norm);
+            }
+          }
+          for (const p of out) process.stdout.write(p + "\n");
+        ' 2>/dev/null || true
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, os, sys
+ledger = os.environ["LEDGER"]
+root = os.environ.get("ROOT") or ""
+try:
+    with open(ledger) as f:
+        parsed = json.load(f)
+except Exception:
+    sys.exit(0)
+queries = parsed if isinstance(parsed, list) else (parsed.get("queries") if isinstance(parsed, dict) else [])
+if not isinstance(queries, list):
+    queries = []
+out = set()
+def norm(p):
+    if not isinstance(p, str) or not p:
+        return
+    if root and (p == root or p.startswith(root + "/")):
+        p = p[len(root):].lstrip("/")
+    while p.startswith("./"):
+        p = p[2:]
+    p = p.rstrip("/")
+    if p:
+        out.add(p)
+for q in queries:
+    if not isinstance(q, dict):
+        continue
+    norm(q.get("query"))
+    for k in ("domains", "governed_prefixes"):
+        v = q.get(k)
+        if isinstance(v, list):
+            for item in v:
+                norm(item)
+for p in out:
+    sys.stdout.write(p + "\n")
+' 2>/dev/null || true
+    fi
+}
+
+LEDGER_PATHS=$(dump_ledger_paths)
+
 ledger_has_file() {
     local rel="$1"
+    if [ -n "$LEDGER_PATHS" ]; then
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel"
+        return $?
+    fi
+    [ -f "$LEDGER" ] || return 1
     grep -qF "\"$rel\"" "$LEDGER" 2>/dev/null \
         || grep -qF "\"./$rel\"" "$LEDGER" 2>/dev/null \
         || grep -qF "\"$ROOT/$rel\"" "$LEDGER" 2>/dev/null
@@ -2427,9 +2505,15 @@ ledger_has_file() {
 
 ledger_has_dir() {
     local rel_dir="${1%/}"
+    if [ -n "$LEDGER_PATHS" ]; then
+        printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$rel_dir"
+        return $?
+    fi
+    [ -f "$LEDGER" ] || return 1
     grep -qF "\"$rel_dir/\"" "$LEDGER" 2>/dev/null \
         || grep -qF "\"./$rel_dir/\"" "$LEDGER" 2>/dev/null \
-        || grep -qF "\"$ROOT/$rel_dir/\"" "$LEDGER" 2>/dev/null
+        || grep -qF "\"$ROOT/$rel_dir/\"" "$LEDGER" 2>/dev/null \
+        || grep -qF "\"$rel_dir\"" "$LEDGER" 2>/dev/null
 }
 
 # ── Check each staged file / ancestor dir-prefix against session_queries.json ──
@@ -2464,24 +2548,32 @@ mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
+
+MissingFiles=()
 for raw_file in "${StagedFiles[@]}"; do
     file=$(normalize_rel_path "$raw_file")
     [ -z "$file" ] && continue
+    if [ -n "$LEDGER_PATHS" ]; then
+        if printf '%s\n' "$LEDGER_PATHS" | grep -qxF "$file"; then
+            continue
+        fi
+    fi
     if ledger_has_file "$file"; then
         continue
     fi
+    MissingFiles+=("$file")
+done
+
+if [ "${#MissingFiles[@]}" -gt 0 ]; then
     TS=$(date +%s)
-    # JSON-safe append: never interpolate $file into a sed replacement
-    # string (where & or | would corrupt the JSON). Prefer node, fall back
-    # to python3, then to an awk escape that reads ENVIRON["FILE"].
-    export LEDGER NAMESPACE FILE="$file" TS
+    export LEDGER NAMESPACE TS
     if command -v node >/dev/null 2>&1; then
-        node -e '
+        printf '%s\n' "${MissingFiles[@]}" | node -e '
           const fs = require("fs");
           const ledger = process.env.LEDGER;
           const ns = process.env.NAMESPACE;
-          const file = process.env.FILE;
           const ts = parseInt(process.env.TS, 10) || 0;
+          const files = fs.readFileSync(0, "utf8").split("\n").filter(Boolean);
           let doc = { namespace: ns, queries: [] };
           try {
             const raw = fs.readFileSync(ledger, "utf8");
@@ -2494,20 +2586,21 @@ for raw_file in "${StagedFiles[@]}"; do
           } catch {}
           if (typeof doc.namespace !== "string" || !doc.namespace) doc.namespace = ns;
           if (!Array.isArray(doc.queries)) doc.queries = [];
-          if (doc.queries.some((q) => q && typeof q === "object" && q.query === file)) {
-            fs.writeFileSync(ledger, JSON.stringify(doc, null, 2));
-            process.exit(0);
+          const have = new Set(doc.queries.filter((q) => q && typeof q === "object" && typeof q.query === "string").map((q) => q.query));
+          for (const file of files) {
+            if (have.has(file)) continue;
+            have.add(file);
+            doc.queries.push({ ts, tool: "pre-commit", query: file, domains: [file], returned_ids: [], governed_prefixes: [file] });
           }
-          doc.queries.push({ ts, tool: "pre-commit", query: file, domains: [file], returned_ids: [], governed_prefixes: [file] });
-          fs.writeFileSync(ledger, JSON.stringify(doc, null, 2));
+          fs.writeFileSync(ledger, JSON.stringify(doc, null, 2) + "\n");
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
-        python3 -c '
+        printf '%s\n' "${MissingFiles[@]}" | python3 -c '
 import json, os, sys
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
-file = os.environ["FILE"]
 ts = int(os.environ.get("TS", "0") or "0")
+files = [line.rstrip("\n") for line in sys.stdin if line.strip()]
 try:
     with open(ledger) as f:
         parsed = json.load(f)
@@ -2523,15 +2616,21 @@ if not isinstance(doc.get("namespace"), str) or not doc.get("namespace"):
     doc["namespace"] = ns
 if not isinstance(doc.get("queries"), list):
     doc["queries"] = []
-if any(isinstance(q, dict) and q.get("query") == file for q in doc["queries"]):
-    with open(ledger, "w") as f:
-        json.dump(doc, f, indent=2)
-    sys.exit(0)
-doc["queries"].append({"ts": ts, "tool": "pre-commit", "query": file, "domains": [file], "returned_ids": [], "governed_prefixes": [file]})
+have = {q.get("query") for q in doc["queries"] if isinstance(q, dict)}
+for file in files:
+    if file in have:
+        continue
+    have.add(file)
+    doc["queries"].append({"ts": ts, "tool": "pre-commit", "query": file, "domains": [file], "returned_ids": [], "governed_prefixes": [file]})
 with open(ledger, "w") as f:
-    json.dump(doc, f, indent=2)
+    json.dump(doc, f, indent=2, ensure_ascii=False)
+    f.write("\n")
 ' 2>/dev/null || true
     else
+        # awk fallback: still ONE invocation. Read missing files from a temp list.
+        FILELIST=$(mktemp)
+        printf '%s\n' "${MissingFiles[@]}" > "$FILELIST"
+        export FILELIST
         TMP=$(mktemp)
         awk '
           function json_escape(s,    i, n, c, out) {
@@ -2550,7 +2649,7 @@ with open(ledger, "w") as f:
             }
             return out
           }
-          function entry_str(comma,    s) {
+          function entry_str(file, comma,    s) {
             s = "    {\n"
             s = s "      \"ts\": " ts ",\n"
             s = s "      \"tool\": \"pre-commit\",\n"
@@ -2563,15 +2662,27 @@ with open(ledger, "w") as f:
           }
           BEGIN {
             ns = json_escape(ENVIRON["NAMESPACE"])
-            file = json_escape(ENVIRON["FILE"])
             ts = ENVIRON["TS"] + 0
+            nfiles = 0
+            while ((getline line < ENVIRON["FILELIST"]) > 0) {
+              if (line != "") {
+                nfiles++
+                files[nfiles] = json_escape(line)
+              }
+            }
+            close(ENVIRON["FILELIST"])
             doc = ""
           }
           {
             doc = (NR == 1 ? $0 : doc "\n" $0)
           }
           END {
-            has_file = (index(doc, "\"" file "\"") > 0)
+            nent = 0
+            for (i = 1; i <= nfiles; i++) {
+              if (index(doc, "\"" files[i] "\"") > 0) continue
+              nent++
+              newf[nent] = files[i]
+            }
             trimmed = doc
             sub(/^[[:space:]]+/, "", trimmed)
             sub(/[[:space:]]+$/, "", trimmed)
@@ -2582,19 +2693,19 @@ with open(ledger, "w") as f:
               print "{"
               print "  \"namespace\": \"" ns "\","
               print "  \"queries\": ["
-              if (has_file) {
+              if (nent == 0) {
                 if (inner != "") print inner
               } else if (inner == "") {
-                print entry_str(0)
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
               } else {
-                print entry_str(1)
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], 1)
                 print inner
               }
               print "  ]"
               print "}"
               exit
             }
-            if (has_file) {
+            if (nent == 0) {
               print doc
               exit
             }
@@ -2604,24 +2715,29 @@ with open(ledger, "w") as f:
               rest = substr(doc, open_idx + 1)
               if (match(rest, /^[[:space:]]*\]/)) {
                 close_part = substr(rest, RSTART + RLENGTH - 1)
-                print prefix "\n" entry_str(0) "\n  " close_part
+                print prefix
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
+                print "  " close_part
                 exit
               } else {
                 sub(/^[[:space:]]*\n?/, "", rest)
-                print prefix "\n" entry_str(1) "\n    " rest
+                print prefix
+                for (i = 1; i <= nent; i++) print entry_str(newf[i], 1)
+                print "    " rest
                 exit
               }
             }
             print "{"
             print "  \"namespace\": \"" ns "\","
             print "  \"queries\": ["
-            print entry_str(0)
+            for (i = 1; i <= nent; i++) print entry_str(newf[i], i < nent)
             print "  ]"
             print "}"
           }
         ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER" || rm -f "$TMP"
+        rm -f "$FILELIST"
     fi
-done
+fi
 
 exit 0
 "#;
