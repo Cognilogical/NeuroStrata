@@ -540,6 +540,12 @@ fn build_record(
 /// Test-only since the seal moved: [`apply_one`] signs with the keypair
 /// its gate already loaded and probe-signed with, so this path-loading
 /// wrapper has no non-test caller left.
+///
+/// The signature always covers the canonical-JSON payload — the whole
+/// record, with the RDF block included as one of its fields. The RDF
+/// payload (quads + `update_id` + epoch) covers only the lossy RDF
+/// projection, so it is no longer produced here; signatures in that
+/// legacy scheme remain verifiable on import, labelled as RDF-only.
 #[cfg(test)]
 pub fn sign_record(record: &mut MeshRecord, key_path: &Path) -> Result<(), String> {
     let (pkey, did, pubkey) = crate::did::load_or_generate_keypair(key_path)?;
@@ -560,17 +566,9 @@ fn sign_record_with_keypair(
     record.signer_did = Some(did.to_string());
     record.public_key = Some(hex::encode(pubkey));
     record.signature = None;
-    let payload = if let Some(ref rdf_block) = record.rdf {
-        crate::did::signing_payload(
-            &rdf_block.quads,
-            &record.update_id.to_string(),
-            record.origin_mesh_epoch,
-        )
-    } else {
-        let val = serde_json::to_value(&*record).map_err(|e| e.to_string())?;
-        crate::did::canonical_signing_bytes(&val)?
-    };
-    let sig = crate::did::sign(&payload, pkey)?;
+    let val = serde_json::to_value(&*record).map_err(|e| e.to_string())?;
+    let payload = crate::did::canonical_signing_bytes(&val)?;
+    let sig = crate::did::sign(&payload, &pkey)?;
     record.signature = Some(crate::did::encode_base64(&sig));
     Ok(())
 }
@@ -2030,6 +2028,75 @@ mod tests {
         assert_eq!(
             resigned, record,
             "the re-signed record is byte-identical in value"
+        );
+    }
+
+    /// Issue #45: `sign_record` signs the canonical-JSON (full-record)
+    /// payload even for a record that carries an RDF block — never the
+    /// RDF payload, which covers only the lossy projection (quads +
+    /// update_id + epoch). Before the fix an RDF-bearing record was
+    /// signed over the RDF payload, so both assertions below were
+    /// inverted.
+    #[test]
+    fn sign_record_signs_the_full_record_payload_for_rdf_bearing_records() {
+        let key_dir = scratch("sign-rdf-full-record");
+        let key_path = key_dir.join("signing.key");
+        let mut record = MeshRecord {
+            schema_version: MESH_RECORD_SCHEMA_VERSION.to_string(),
+            id: Uuid::now_v7(),
+            namespace: "ns".to_string(),
+            memory_type: "rule".to_string(),
+            lifecycle: Lifecycle {
+                state: LifecycleState::Active,
+                created_at: chrono::Utc::now(),
+                created_by: "node-author".to_string(),
+                superseded_by: None,
+                archived_at: None,
+                tombstoned_at: None,
+            },
+            content: json!({"text": "the memory text"}),
+            metadata: shareable_metadata(),
+            rdf: Some(RdfBlock {
+                schema: "neurostrata-rdf-record/v1".to_string(),
+                format: "n-quads".to_string(),
+                canonical_hash: String::new(),
+                quads: "<urn:neurostrata:memory:x> <urn:neurostrata:content> \
+                        \"the memory text\" .\n"
+                    .to_string(),
+            }),
+            relationships: vec![],
+            update_id: Uuid::now_v7(),
+            origin_mesh_epoch: 1,
+            trust: Trust::Untrusted,
+            signature: None,
+            signer_did: None,
+            public_key: None,
+            patch: None,
+        };
+        sign_record(&mut record, &key_path).expect("record signs");
+        let pubkey = hex::decode(record.public_key.as_ref().expect("public key is set"))
+            .expect("public key is hex");
+        let sig = crate::did::decode_base64(record.signature.as_ref().expect("signature is set"))
+            .expect("signature is base64");
+        // `canonical_signing_bytes` strips the signature field itself, so
+        // recomputing it over the signed record yields the signed bytes.
+        let json_payload = crate::did::canonical_signing_bytes(
+            &serde_json::to_value(&record).expect("the record canonicalizes"),
+        )
+        .expect("the canonical signing bytes are computable");
+        assert!(
+            crate::did::verify(&json_payload, &pubkey, &sig),
+            "the signature must verify over the canonical-JSON (full-record) payload"
+        );
+        let rdf_block = record.rdf.as_ref().expect("the record carries an RDF block");
+        let rdf_payload = crate::did::signing_payload(
+            &rdf_block.quads,
+            &record.update_id.to_string(),
+            record.origin_mesh_epoch,
+        );
+        assert!(
+            !crate::did::verify(&rdf_payload, &pubkey, &sig),
+            "the signature must NOT verify over the RDF-only payload"
         );
     }
 }
