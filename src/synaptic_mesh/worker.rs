@@ -1679,7 +1679,10 @@ mod tests {
             .unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
         let first = stored_record(&mesh, &id);
-        let first_rdf = first.rdf.clone().expect("the created record has an RDF block");
+        let first_rdf = first
+            .rdf
+            .clone()
+            .expect("the created record has an RDF block");
 
         // Migrate the mesh to epoch 2, then supersede the record with an
         // entry born in the new epoch: preservation pulls
@@ -1710,14 +1713,18 @@ mod tests {
         );
         // The RDF block really was rebuilt: it differs from the created
         // record's block and its quads carry the preserved created_at.
-        let rdf = record.rdf.clone().expect("the stored record has an RDF block");
+        let rdf = record
+            .rdf
+            .clone()
+            .expect("the stored record has an RDF block");
         assert_ne!(rdf.quads, first_rdf.quads, "the RDF block was rebuilt");
         assert_ne!(
             rdf.canonical_hash, first_rdf.canonical_hash,
             "the rebuilt block's canonical hash differs"
         );
-        let preserved_created_at =
-            DateTime::from_timestamp(1_700_000_000, 0).unwrap().to_rfc3339();
+        let preserved_created_at = DateTime::from_timestamp(1_700_000_000, 0)
+            .unwrap()
+            .to_rfc3339();
         assert!(
             rdf.quads.contains(&preserved_created_at),
             "the rebuilt quads carry the preserved created_at: {}",
@@ -1859,7 +1866,11 @@ mod tests {
             err.contains("signing failed"),
             "a corrupt key must fail the drain as a signing failure: {err}"
         );
-        assert_eq!(outbox.pending().unwrap().len(), 1, "the entry stays pending");
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "the entry stays pending"
+        );
         let path = mesh
             .root()
             .join("ns")
@@ -1938,7 +1949,11 @@ mod tests {
             err.contains("signing failed"),
             "an unsignable key must fail the drain as a signing failure: {err}"
         );
-        assert_eq!(outbox.pending().unwrap().len(), 1, "the entry stays pending");
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "the entry stays pending"
+        );
         let path = mesh
             .root()
             .join("ns")
@@ -2012,6 +2027,9 @@ mod tests {
             resigned.signature, record.signature,
             "re-signing the stored form reproduces the stored signature bytes"
         );
-        assert_eq!(resigned, record, "the re-signed record is byte-identical in value");
+        assert_eq!(
+            resigned, record,
+            "the re-signed record is byte-identical in value"
+        );
     }
 }
