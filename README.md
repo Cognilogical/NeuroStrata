@@ -60,6 +60,23 @@ When an orchestrator delegates to a subagent (`worker`, `checker`, `craftsman`, 
 All of that cognitive machinery lives inside **one self-managing binary**. There is no Docker Compose stack, no Python virtualenv to babysit, no YAML configuration labyrinth, and no manual database maintenance.
 
 ### 1. First-Time Install (Once Per Machine)
+
+> **Build the OpenCode plugin first.** `src/task/harness_plugins.rs` embeds
+> `plugins/opencode/dist/index.js` with `include_str!`, but that file is a
+> gitignored build artifact — it is absent from a fresh clone, so the Rust
+> build fails without this step. (Sibling plugins track their `dist/`
+> output; opencode is rebuilt instead, and CI does the same step before
+> `cargo build`.) Run, from the repository root:
+>
+> ```bash
+> cd plugins/opencode && npm install && npm run build
+> ```
+>
+> This step needs Node 22 (the plugin declares `engines >= 18`, and CI pins
+> Node 22 via `actions/setup-node`). Note the remainder honestly: a local
+> fresh clone still needs this manual step — only tracking `dist/index.js`
+> in git would remove it, and that is a separate, reviewer-gated fallback,
+> not this change.
 ```bash
 # 1. Build and install the single Rust binary (includes embedded LadybugDB + OxiRS + ONNX)
 scripts/build.sh
