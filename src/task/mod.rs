@@ -526,9 +526,21 @@ pub async fn record_graph_query(
             }
         }
     }
-    let top_prefix = if query_hint.contains('/') {
-        format!("{}/", query_hint.split('/').next().unwrap_or(query_hint))
+    let governed_prefix = if query_hint.ends_with('/')
+        || (project_root.is_some()
+            && std::path::Path::new(project_root.as_ref().unwrap()).join(query_hint).is_dir())
+    {
+        // Explicit directory coverage: preserve trailing slash without
+        // widening to the top-level directory.
+        format!("{}/", query_hint.trim_end_matches('/'))
+    } else if tool_name == "neurostrata_memories_for_file"
+        || query_hint.contains('/')
+        || query_hint.contains('.')
+    {
+        // Exact file coverage: preserve the queried path verbatim.
+        query_hint.to_string()
     } else {
+        // Bare module/domain keyword: widen to directory coverage.
         format!("{}/", query_hint)
     };
     if let Some(root) = project_root {
@@ -545,7 +557,7 @@ pub async fn record_graph_query(
                 "ts": now,
                 "tool": tool_name,
                 "query": query_hint,
-                "governed_prefixes": [top_prefix],
+                "governed_prefixes": [governed_prefix],
             }));
             if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
                 let _ = std::fs::write(&ledger_path, serialized);
@@ -685,14 +697,21 @@ pub async fn handle_task_create(
             let (hits_json, subagent_prompt) = build_task_graph_context(
                 &store, &namespace, &id, &vector, &payload,
             ).await;
-            // Persist the prompt injection on the task row so stateless
-            // callers (plugins, task_list) can fetch active task state +
-            // prompt injection in one call.
+            // Re-read the freshest row under the task claim lock so a
+            // concurrent create/update cannot be overwritten mid-context-build.
+            let claim_mutex = claim_lock(&id);
+            let _claim_guard = claim_mutex.lock().await;
+            if let Ok((mut latest_task, latest_vec)) = load_task(&store, &namespace, &id).await {
+                {
+                    let obj = task_obj_mut(&mut latest_task.payload);
+                    obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+                }
+                let _ = save_task(&store, &namespace, &id, latest_vec, latest_task.payload).await;
+            }
             {
                 let obj = task_obj_mut(&mut payload);
                 obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
             }
-            let _ = save_task(&store, &namespace, &id, vector.clone(), payload.clone()).await;
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
@@ -877,7 +896,18 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     // and the upsert. (The R7 best-effort re-read this replaces could only
     // ever fire for an out-of-process claim writer, and none exists — every
     // claim enters through this handler in the daemon process.)
+    //
+    // Build the graph context and stamp the prompt injection onto the row
+    // BEFORE the single save, while _claim_guard is still held, so a
+    // concurrent claim cannot observe a row without the injection.
 
+    let (hits_json, subagent_prompt) = build_task_graph_context(
+        &store, &namespace, &id, &vector, &task.payload,
+    ).await;
+    {
+        let obj = task_obj_mut(&mut task.payload);
+        obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
+    }
     if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
         return e;
     }
@@ -896,14 +926,6 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    let (hits_json, subagent_prompt) = build_task_graph_context(
-        &store, &namespace, &id, &vector, &task.payload,
-    ).await;
-    {
-        let obj = task_obj_mut(&mut task.payload);
-        obj.insert("subagent_prompt_injection".to_string(), json!(subagent_prompt));
-    }
-    let _ = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await;
     encode(&json!({
         "id": id,
         "namespace": namespace,
@@ -2352,18 +2374,23 @@ if [ -z "$StagedFiles" ]; then
     StagedFiles=$(git diff --name-only | grep -v '^\.NeuroStrata/' | sort -u)
 fi
 
-# ── Check each staged file / dir-prefix / top-level prefix against session_queries.json ──
+# ── Check each staged file / ancestor dir-prefix against session_queries.json ──
 for file in $StagedFiles; do
-    dir_prefix=$(dirname "$file")
-    top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
     matched=0
     if [ -f "$LEDGER" ]; then
         if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
             matched=1
-        elif [ -n "$dir_prefix" ] && grep -qF "\"$dir_prefix/\"" "$LEDGER" 2>/dev/null; then
-            matched=1
-        elif [ -n "$top_prefix" ] && grep -qF "\"$top_prefix\"" "$LEDGER" 2>/dev/null; then
-            matched=1
+        else
+            # Walk ancestor directories of $file; only match if the exact
+            # ancestor path was recorded in $LEDGER (not widened to top-level).
+            anc=$(dirname "$file")
+            while [ "$anc" != "." ] && [ "$anc" != "/" ] && [ -n "$anc" ]; do
+                if grep -qF "\"$anc/\"" "$LEDGER" 2>/dev/null; then
+                    matched=1
+                    break
+                fi
+                anc=$(dirname "$anc")
+            done
         fi
     fi
     if [ "$matched" -eq 0 ]; then
@@ -2375,24 +2402,115 @@ done
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
-    echo "{\"namespace\": \"$NAMESPACE\", \"queries\": []}" > "$LEDGER"
+    printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 fi
 for file in $StagedFiles; do
-    dir_prefix=$(dirname "$file")
-    top_prefix=$(echo "$file" | sed -n 's|^\([^/]*\)/.*|\1/|p')
-    if [ -z "$top_prefix" ]; then
-        top_prefix="$file"
+    if grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
+        continue
     fi
     TS=$(date +%s)
-    ENTRY="{\"ts\": $TS, \"tool\": \"pre-commit\", \"query\": \"$file\", \"domains\": [\"$top_prefix\"], \"returned_ids\": [], \"governed_prefixes\": [\"$top_prefix\"]}"
-    if ! grep -qF "\"$file\"" "$LEDGER" 2>/dev/null; then
-        if grep -q '"queries":[[:space:]]*\[\]' "$LEDGER" 2>/dev/null; then
-            # Empty "queries": [] -> replace with a single-entry pretty array.
-            sed -i "s|\"queries\": \\[\\]|\"queries\": [\n    $ENTRY\n  ]|" "$LEDGER" 2>/dev/null || true
-        else
-            # Non-empty "queries": [ -> append after the opening bracket.
-            sed -i "s|\"queries\": \[|\"queries\": [\n    $ENTRY,|" "$LEDGER" 2>/dev/null || true
-        fi
+    # JSON-safe append: never interpolate $file into a sed replacement
+    # string (where & or | would corrupt the JSON). Prefer node, fall back
+    # to python3, then to an awk escape that reads ENVIRON["FILE"].
+    export LEDGER NAMESPACE FILE="$file" TS
+    if command -v node >/dev/null 2>&1; then
+        node -e '
+          const fs = require("fs");
+          const ledger = process.env.LEDGER;
+          const ns = process.env.NAMESPACE;
+          const file = process.env.FILE;
+          const ts = parseInt(process.env.TS, 10) || 0;
+          let doc = { namespace: ns, queries: [] };
+          try {
+            const raw = fs.readFileSync(ledger, "utf8");
+            doc = JSON.parse(raw);
+          } catch {}
+          if (!Array.isArray(doc.queries)) doc.queries = [];
+          if (doc.queries.some((q) => q.query === file)) { process.exit(0); }
+          doc.queries.push({ ts, tool: "pre-commit", query: file, domains: [file], returned_ids: [], governed_prefixes: [file] });
+          fs.writeFileSync(ledger, JSON.stringify(doc, null, 2));
+        ' 2>/dev/null || true
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+          import json, os, sys
+          ledger = os.environ["LEDGER"]
+          ns = os.environ["NAMESPACE"]
+          file = os.environ["FILE"]
+          ts = int(os.environ.get("TS", "0") or "0")
+          try:
+            with open(ledger) as f:
+              doc = json.load(f)
+          except Exception:
+            doc = {}
+          if not isinstance(doc, dict):
+            doc = {}
+          if not isinstance(doc.get("queries"), list):
+            doc["queries"] = []
+          if any(isinstance(q, dict) and q.get("query") == file for q in doc["queries"]):
+            sys.exit(0)
+          doc["queries"].append({"ts": ts, "tool": "pre-commit", "query": file, "domains": [file], "returned_ids": [], "governed_prefixes": [file]})
+          with open(ledger, "w") as f:
+            json.dump(doc, f, indent=2)
+        ' 2>/dev/null || true
+    else
+        TMP=$(mktemp)
+        awk -v ns="$NAMESPACE" -v file="$file" -v ts="$TS" '
+          BEGIN {
+            gsub(/\\/, "\\\\", file)
+            gsub(/"/, "\\\"", file)
+            found = 0
+            inserted = 0
+          }
+          {
+            if ($0 ~ ("\"" file "\"")) found = 1
+            if (!inserted && !found && $0 ~ /"queries"[[:space:]]*:[[:space:]]*\[/) {
+              if ($0 ~ /\[[[:space:]]*\][[:space:]]*$/) {
+                sub(/\[[[:space:]]*\][[:space:]]*$/, "[", $0)
+                print $0
+                print "    {"
+                print "      \"ts\": " ts ","
+                print "      \"tool\": \"pre-commit\","
+                print "      \"query\": \"" file "\","
+                print "      \"domains\": [\"" file "\"],"
+                print "      \"returned_ids\": [],"
+                print "      \"governed_prefixes\": [\"" file "\"]"
+                print "    }"
+                print "  ]"
+                inserted = 1
+                next
+              } else {
+                print $0
+                print "    {"
+                print "      \"ts\": " ts ","
+                print "      \"tool\": \"pre-commit\","
+                print "      \"query\": \"" file "\","
+                print "      \"domains\": [\"" file "\"],"
+                print "      \"returned_ids\": [],"
+                print "      \"governed_prefixes\": [\"" file "\"]"
+                print "    }"
+                inserted = 1
+                next
+              }
+            }
+            print
+          }
+          END {
+            if (found) exit
+            if (!inserted) {
+              print "  \"queries\": ["
+              print "    {"
+              print "      \"ts\": " ts ","
+              print "      \"tool\": \"pre-commit\","
+              print "      \"query\": \"" file "\","
+              print "      \"domains\": [\"" file "\"],"
+              print "      \"returned_ids\": [],"
+              print "      \"governed_prefixes\": [\"" file "\"]"
+              print "    }"
+              print "  ]"
+              print "}"
+            }
+          }
+        ' "$LEDGER" > "$TMP" 2>/dev/null && mv "$TMP" "$LEDGER" || rm -f "$TMP"
     fi
 done
 

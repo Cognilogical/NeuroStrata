@@ -395,7 +395,7 @@ export const TOOL_CLASSIFICATION = {
     CODE_EXEC_TOOLS,
 };
 export function isFileTouchTool(name) {
-    return READ_FILE_TOOLS.has(name);
+    return READ_FILE_TOOLS.has(name) || MUTATING_FILE_TOOLS.has(name);
 }
 export function isMutatingTool(name) {
     return MUTATING_TOOLS.has(name);
@@ -753,11 +753,23 @@ export function getTrackingState() {
 // Bug 5: execute.before / execute.after recall delivery
 // ──────────────────────────────────────────────────────────────────────
 export const pendingRecallBlocks = [];
+function extractPatchPath(raw) {
+    if (typeof raw !== "string")
+        return undefined;
+    const m = raw.match(/(?:^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*|^---\s+a\/|^\+\+\+\s+b\/)([^\r\n]+)/m);
+    return m?.[1]?.trim();
+}
 function extractFilePath(args, altArgs) {
     return (asString(args.file_path) ??
         asString(args.filePath) ??
         asString(args.path) ??
-        (altArgs ? (asString(altArgs.file_path) ?? asString(altArgs.filePath) ?? asString(altArgs.path)) : undefined));
+        extractPatchPath(args.patchText ?? args.patch ?? args.diff) ??
+        (altArgs
+            ? (asString(altArgs.file_path) ??
+                asString(altArgs.filePath) ??
+                asString(altArgs.path) ??
+                extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff))
+            : undefined));
 }
 const executeAfterHandler = async (output) => {
     // The host may pass the output object directly, or a single `event` argument
@@ -934,7 +946,7 @@ export async function initialize(ctx) {
         await ctx.hooks.PreToolUse(async (event) => handleHookEvent(event));
     }
     await negotiateCapabilities();
-    console.info("[NeuroStrata] plugin initialized", {
+    console.error("[NeuroStrata] plugin initialized", {
         namespace: config.namespace,
         endpoint: config.endpoint,
         authenticated: status.authenticated,
@@ -950,12 +962,12 @@ async function negotiateCapabilities() {
         const missing = REQUIRED_TOOLS.filter((t) => !available.has(t));
         setStatus({ state: missing.length > 0 ? "degraded" : "ready", missingTools: missing, lastError: undefined });
         if (missing.length > 0) {
-            console.warn("NeuroStrata core does not expose the tools this shim needs", { missing });
+            console.error("NeuroStrata core does not expose the tools this shim needs", { missing });
         }
     }
     catch (err) {
         setStatus({ state: "unavailable", lastError: String(err) });
-        console.warn("NeuroStrata core is unreachable; the shim is degraded", { error: String(err) });
+        console.error("NeuroStrata core is unreachable; the shim is degraded", { error: String(err) });
     }
 }
 // ──────────────────────────────────────────────────────────────────────
@@ -1101,7 +1113,7 @@ export async function onTurnEnd(turn) {
     if (!config.intentDetection.injectReminder)
         return;
     const markerList = signals.map((s) => s.marker).join(", ");
-    console.info(`[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`);
+    console.error(`[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`);
 }
 export async function fetchContextPlan(opts) {
     if (!mcpClient)

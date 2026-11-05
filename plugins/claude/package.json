@@ -4,14 +4,10 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": [
-    "src",
-    "dist",
-    "README.md"
-  ],
+  "files": ["index.ts", "dist", "cli-hook.mjs", "README.md"],
   "scripts": {
-    "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "build": "tsc --project ../core/tsconfig.json && node ../core/bundle-adapter.mjs",
     "test": "node --test test.mjs"
   },
   "dependencies": {

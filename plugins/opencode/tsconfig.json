@@ -5,8 +5,8 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
     "types": ["node"],
+    "rootDir": "..",
     "outDir": "./dist",
-    "rootDir": ".",
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
@@ -16,9 +16,8 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": false,
-    "baseUrl": ".",
-    "paths": { "../../core/dist/index.js": ["../core/dist/index.d.ts"] }
+    "noEmit": true,
+    "paths": { "@neurostrata/plugin-core": ["./../core/index.ts"] }
   },
   "include": ["index.ts"],
   "exclude": ["node_modules", "dist"]

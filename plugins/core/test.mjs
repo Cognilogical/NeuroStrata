@@ -272,10 +272,12 @@ describe("TOOL_CLASSIFICATION sets", () => {
 });
 
 describe("is*Tool predicates", () => {
-  it("isFileTouchTool read/Read true, write false", () => {
+  it("isFileTouchTool read/Read/write/edit true, bash false", () => {
     assert.equal(isFileTouchTool("read"), true);
     assert.equal(isFileTouchTool("Read"), true);
-    assert.equal(isFileTouchTool("write"), false);
+    assert.equal(isFileTouchTool("write"), true);
+    assert.equal(isFileTouchTool("edit"), true);
+    assert.equal(isFileTouchTool("bash"), false);
   });
   it("isMutatingTool write/edit/bash true, read false", () => {
     assert.equal(isMutatingTool("write"), true);

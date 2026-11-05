@@ -2103,6 +2103,12 @@ fn is_archived(metadata: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Row-class predicates for filtering at the store seam.
+/// These are applied BEFORE the candidate budget is spent.
+fn is_registry_row(metadata: &Value) -> bool {
+    crate::registry::is_registry_row(metadata)
+}
+
 /// Delegates to the canonical predicate rather than re-deriving it: the
 /// conflict rule is stated once, in `synaptic_mesh::conflict`, so the read
 /// surfaces cannot drift into disagreeing about what "conflicting" means.
@@ -6356,7 +6362,7 @@ impl LadybugStore {
         let namespace = namespace.to_string();
         let path = crate::parser::ingest::normalize_node_path(path);
         let governing_ids = governing_ids.to_vec();
-        let _source = source.map(|s| s.to_string()); // pins the active generation, mirroring memories_for_file
+        let source_str = source.map(|s| s.to_string());
 
         let ns = namespace.clone();
         let path_c = path.clone();
@@ -6365,6 +6371,18 @@ impl LadybugStore {
         let (related_memories, ast_summary) = self
             .with_conn(move |conn| {
                 let safe_ns = escape_ladybug_string(&ns);
+                let now = chrono::Utc::now().timestamp();
+                let active_gens: std::collections::HashSet<u64> = match &source_str {
+                    Some(s) => {
+                        let g = active_generation_of_source(conn, &ns, &s);
+                        if g > 0 {
+                            [g].into_iter().collect()
+                        } else {
+                            std::collections::HashSet::new()
+                        }
+                    }
+                    None => active_generations_of(conn, &ns),
+                };
                 let mut related: Vec<Value> = Vec::new();
                 let mut seen: HashSet<String> = HashSet::new();
 
@@ -6383,17 +6401,26 @@ impl LadybugStore {
                     ] {
                         let query = match direction {
                             "outgoing" => format!(
-                                "MATCH (m:Memory)-[:{rel}]->(t:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                                "MATCH (m:Memory)-[:{rel}]->(t:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
                             ),
                             "incoming" => format!(
-                                "MATCH (t:Memory)-[:{rel}]->(m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                                "MATCH (t:Memory)-[:{rel}]->(m:Memory) WHERE m.id IN [{id_list}] AND m.namespace = '{safe_ns}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
                             ),
                             _ => unreachable!(),
                         };
                         let mut res = conn.query(&query)?;
                         while let Some(row) = res.next() {
                             let id = Self::cell_string(&row[0]);
+                            let metadata = Self::cell_metadata(&row[3]);
                             if !seen.insert(id.clone()) {
+                                continue;
+                            }
+                            if !is_active_id(&id, &active_gens)
+                                || is_registry_row(&metadata)
+                                || is_archived(&metadata)
+                                || is_retired_at(&metadata, now)
+                                || is_mesh_conflicting(&metadata)
+                            {
                                 continue;
                             }
                             related.push(serde_json::json!({
@@ -6402,7 +6429,7 @@ impl LadybugStore {
                                 "content": Self::cell_string(&row[1]),
                                 "relation": rel,
                                 "direction": direction,
-                                "metadata": Self::cell_metadata(&row[3]),
+                                "metadata": metadata,
                             }));
                         }
                     }
@@ -6414,25 +6441,46 @@ impl LadybugStore {
                     let mut res = conn.query(&query)?;
                     while let Some(row) = res.next() {
                         let id = Self::cell_string(&row[0]);
-                        if let Some(by) = Self::cell_metadata(&row[1])
+                        let metadata = Self::cell_metadata(&row[1]);
+                        if let Some(by) = metadata
                             .get("superseded_by")
                             .and_then(|v| v.as_str())
                         {
-                            if !by.is_empty() && seen.insert(by.to_string()) {
-                                related.push(serde_json::json!({
-                                    "id": by,
-                                    "memory_type": Value::Null,
-                                    "content": Value::Null,
-                                    "relation": "SUPERSEDES",
-                                    "direction": "outgoing",
-                                    "supersedes": id,
-                                }));
+                            if !by.is_empty()
+                                && !crate::registry::is_registry_row(&metadata)
+                                && is_active_id(&by, &active_gens)
+                                && !seen.contains(by)
+                            {
+                                let safe_by = escape_ladybug_string(by);
+                                let target_q = format!(
+                                    "MATCH (t:Memory) WHERE t.id = '{safe_by}' AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
+                                );
+                                let mut tres = conn.query(&target_q)?;
+                                if let Some(trow) = tres.next() {
+                                    let tid = Self::cell_string(&trow[0]);
+                                    let tmeta = Self::cell_metadata(&trow[3]);
+                                    if !is_archived(&tmeta)
+                                        && !is_retired_at(&tmeta, now)
+                                        && !is_mesh_conflicting(&tmeta)
+                                        && seen.insert(tid.clone())
+                                    {
+                                        related.push(serde_json::json!({
+                                            "id": tid,
+                                            "memory_type": Self::cell_string(&trow[2]),
+                                            "content": Self::cell_string(&trow[1]),
+                                            "relation": "SUPERSEDES",
+                                            "direction": "outgoing",
+                                            "supersedes": id,
+                                            "metadata": tmeta,
+                                        }));
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                let ast_summary = Self::ast_summary_for_file(conn, &safe_ns, &path_c)?;
+                let ast_summary = Self::ast_summary_for_file(conn, &safe_ns, &path_c, &active_gens, now)?;
 
                 Ok((related, ast_summary))
             })
@@ -6466,24 +6514,43 @@ impl LadybugStore {
         conn: &Connection,
         safe_ns: &str,
         path: &str,
+        active_gens: &std::collections::HashSet<u64>,
+        now: i64,
     ) -> Result<Value> {
         let safe_path = escape_ladybug_string(path);
+
+        // Helper closure for visibility filtering
+        let is_visible = |id: &str, meta: &Value| -> bool {
+            is_active_id(id, active_gens) && !crate::registry::is_registry_row(meta) && !is_archived(meta) && !is_retired_at(meta, now) && !is_mesh_conflicting(meta)
+        };
 
         // Symbol nodes of the file: symbol locations are `path#kind:name@hash`.
         let mut symbols: Vec<Value> = Vec::new();
         let mut symbol_ids: HashSet<String> = HashSet::new();
         {
             let symbol_query = format!(
-                "MATCH (s:Memory) WHERE s.namespace = '{safe_ns}' AND s.location STARTS WITH '{safe_path}#' RETURN s.id, s.content, s.memory_type"
+                "MATCH (s:Memory) WHERE s.namespace = '{safe_ns}' AND (s.location = '{safe_path}' OR s.location STARTS WITH '{safe_path}#') RETURN s.id, s.content, s.memory_type, s.location, s.metadata"
             );
             let mut res = conn.query(&symbol_query)?;
             while let Some(row) = res.next() {
                 let id = Self::cell_string(&row[0]);
-                if symbol_ids.insert(id.clone()) {
+                let content = Self::cell_string(&row[1]);
+                let memory_type = Self::cell_string(&row[2]);
+                let loc = Self::cell_string(&row[3]);
+                let meta = Self::cell_metadata(&row[4]);
+                if !is_visible(&id, &meta) {
+                    continue;
+                }
+                let logical = crate::parser::ingest::logical_path_of(&id);
+                let is_symbol_node = loc.starts_with(&format!("{path}#"))
+                    || logical.starts_with(&format!("{path}#"))
+                    || (loc == path && (memory_type == "symbol" || meta.get("symbol_name").is_some() || meta.get("ast_kind").is_some()));
+
+                if is_symbol_node && symbol_ids.insert(id.clone()) {
                     symbols.push(serde_json::json!({
                         "id": id,
-                        "memory_type": Self::cell_string(&row[2]),
-                        "content": Self::cell_string(&row[1]),
+                        "memory_type": memory_type,
+                        "content": content,
                     }));
                 }
             }
@@ -6500,21 +6567,26 @@ impl LadybugStore {
             let mut res = conn.query(&file_query)?;
             while let Some(row) = res.next() {
                 let id = Self::cell_string(&row[0]);
+                let meta = Self::cell_metadata(&row[1]);
+                if !is_visible(&id, &meta) || symbol_ids.contains(&id) {
+                    continue;
+                }
                 file_ids.push(id);
-                if let Some(arr) = Self::cell_metadata(&row[1]).get("imports").and_then(|v| v.as_array()) {
+                if let Some(arr) = meta.get("imports").and_then(|v| v.as_array()) {
                     for entry in arr {
                         imports.push(serde_json::json!({ "path": entry }));
                     }
                 }
             }
         }
-        let _file_ids = file_ids; // reserved for caller-side filtering; kept for symmetry
+        let _file_ids = file_ids.clone(); // reserved for caller-side filtering; kept for symmetry
 
         // Callers / callees: DEPENDS_ON edges incident to the file's symbols.
         let mut callers: Vec<Value> = Vec::new();
         let mut callees: Vec<Value> = Vec::new();
         let mut caller_ids: HashSet<String> = HashSet::new();
         let mut callee_ids: HashSet<String> = HashSet::new();
+        let mut importer_ids: HashSet<String> = HashSet::new();
         if !symbol_ids.is_empty() {
             let sym_list = symbol_ids
                 .iter()
@@ -6524,12 +6596,13 @@ impl LadybugStore {
             // Callee: a file symbol DEPENDS_ON it.
             {
                 let callee_query = format!(
-                    "MATCH (s:Memory)-[:DEPENDS_ON]->(t:Memory) WHERE s.id IN [{sym_list}] RETURN t.id, t.content, t.memory_type"
+                    "MATCH (s:Memory)-[:DEPENDS_ON]->(t:Memory) WHERE s.id IN [{sym_list}] AND t.namespace = '{safe_ns}' RETURN t.id, t.content, t.memory_type, t.metadata"
                 );
                 let mut res = conn.query(&callee_query)?;
                 while let Some(row) = res.next() {
                     let id = Self::cell_string(&row[0]);
-                    if callee_ids.insert(id.clone()) {
+                    let meta = Self::cell_metadata(&row[3]);
+                    if is_visible(&id, &meta) && callee_ids.insert(id.clone()) {
                         callees.push(serde_json::json!({
                             "id": id,
                             "memory_type": Self::cell_string(&row[2]),
@@ -6541,12 +6614,13 @@ impl LadybugStore {
             // Caller: something DEPENDS_ON a file symbol.
             {
                 let caller_query = format!(
-                    "MATCH (c:Memory)-[:DEPENDS_ON]->(s:Memory) WHERE s.id IN [{sym_list}] RETURN c.id, c.content, c.memory_type"
+                    "MATCH (c:Memory)-[:DEPENDS_ON]->(s:Memory) WHERE s.id IN [{sym_list}] AND c.namespace = '{safe_ns}' RETURN c.id, c.content, c.memory_type, c.metadata"
                 );
                 let mut res = conn.query(&caller_query)?;
                 while let Some(row) = res.next() {
                     let id = Self::cell_string(&row[0]);
-                    if caller_ids.insert(id.clone()) {
+                    let meta = Self::cell_metadata(&row[3]);
+                    if is_visible(&id, &meta) && caller_ids.insert(id.clone()) {
                         callers.push(serde_json::json!({
                             "id": id,
                             "memory_type": Self::cell_string(&row[2]),
@@ -6558,25 +6632,60 @@ impl LadybugStore {
         }
 
         // Importers: other file nodes whose metadata.imports names this path.
-        {
-            let importer_query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.memory_type = 'file' RETURN m.id, m.location, m.metadata"
+        let found_edge_importers = !file_ids.is_empty();
+        if found_edge_importers {
+            let file_list = file_ids
+                .iter()
+                .map(|id| format!("'{}'", escape_ladybug_string(id)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let edge_importer_query = format!(
+                "MATCH (m:Memory)-[:DEPENDS_ON]->(f:Memory) WHERE f.id IN [{file_list}] AND m.namespace = '{safe_ns}' RETURN m.id, m.location, m.memory_type, m.metadata"
             );
-            let mut res = conn.query(&importer_query)?;
+            let mut res = conn.query(&edge_importer_query)?;
             while let Some(row) = res.next() {
+                let id = Self::cell_string(&row[0]);
+                let meta = Self::cell_metadata(&row[3]);
+                if !is_visible(&id, &meta) {
+                    continue;
+                }
                 let location = Self::cell_string(&row[1]);
                 if location == path {
                     continue; // the file itself is not its own importer
                 }
-                if let Some(arr) = Self::cell_metadata(&row[2]).get("imports").and_then(|v| v.as_array()) {
-                    if arr.iter().any(|e| e.as_str() == Some(path)) {
-                        importers.push(serde_json::json!({
-                            "id": Self::cell_string(&row[0]),
-                            "memory_type": "file",
-                            "content": location,
-                            "path": location,
-                        }));
-                    }
+                let m_type = Self::cell_string(&row[2]);
+                if (m_type == "file" || meta.get("imports").is_some()) && importer_ids.insert(id.clone()) {
+                    importers.push(serde_json::json!({
+                        "id": id,
+                        "memory_type": m_type,
+                        "content": location,
+                        "path": location,
+                    }));
+                }
+            }
+        }
+        if importers.is_empty() {
+            let fallback_importer_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.metadata CONTAINS '{safe_path}' RETURN m.id, m.location, m.memory_type, m.metadata"
+            );
+            let mut res = conn.query(&fallback_importer_query)?;
+            while let Some(row) = res.next() {
+                let id = Self::cell_string(&row[0]);
+                let meta = Self::cell_metadata(&row[3]);
+                if !is_visible(&id, &meta) {
+                    continue;
+                }
+                let location = Self::cell_string(&row[1]);
+                if location == path {
+                    continue; // the file itself is not its own importer
+                }
+                if meta.get("imports").and_then(|v| v.as_array()).is_some_and(|arr| arr.iter().any(|e| e.as_str() == Some(path))) {
+                    importers.push(serde_json::json!({
+                        "id": id,
+                        "memory_type": Self::cell_string(&row[2]),
+                        "content": location,
+                        "path": location,
+                    }));
                 }
             }
         }

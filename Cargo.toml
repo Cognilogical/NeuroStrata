@@ -130,8 +130,6 @@ petgraph = { version = "0.8" }
 leiden-rs = { version = "0.8", default-features = false, features = ["petgraph"] }
 rand = { version = "0.10" }
 tantivy = { version = "0.27" }
-
-[target.'cfg(not(target_vendor = "apple"))'.dependencies]
 openssl = { version = "0.10.81", features = ["vendored"] }
 
 [build-dependencies]

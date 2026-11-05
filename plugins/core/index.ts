@@ -490,7 +490,7 @@ export const TOOL_CLASSIFICATION = {
 };
 
 export function isFileTouchTool(name: string): boolean {
-  return READ_FILE_TOOLS.has(name);
+  return READ_FILE_TOOLS.has(name) || MUTATING_FILE_TOOLS.has(name);
 }
 
 export function isMutatingTool(name: string): boolean {
@@ -892,12 +892,24 @@ export function getTrackingState() {
 
 export const pendingRecallBlocks: string[] = [];
 
+function extractPatchPath(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const m = raw.match(/(?:^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*|^---\s+a\/|^\+\+\+\s+b\/)([^\r\n]+)/m);
+  return m?.[1]?.trim();
+}
+
 function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string, unknown>): string | undefined {
   return (
     asString(args.file_path) ??
     asString(args.filePath) ??
     asString(args.path) ??
-    (altArgs ? (asString(altArgs.file_path) ?? asString(altArgs.filePath) ?? asString(altArgs.path)) : undefined)
+    extractPatchPath(args.patchText ?? args.patch ?? args.diff) ??
+    (altArgs
+      ? (asString(altArgs.file_path) ??
+         asString(altArgs.filePath) ??
+         asString(altArgs.path) ??
+         extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff))
+      : undefined)
   );
 }
 
@@ -1080,7 +1092,7 @@ export async function initialize(ctx: any): Promise<void> {
 
   await negotiateCapabilities();
 
-  console.info("[NeuroStrata] plugin initialized", {
+  console.error("[NeuroStrata] plugin initialized", {
     namespace: config.namespace,
     endpoint: config.endpoint,
     authenticated: status.authenticated,
@@ -1096,11 +1108,11 @@ async function negotiateCapabilities(): Promise<void> {
     const missing = REQUIRED_TOOLS.filter((t) => !available.has(t));
     setStatus({ state: missing.length > 0 ? "degraded" : "ready", missingTools: missing, lastError: undefined });
     if (missing.length > 0) {
-      console.warn("NeuroStrata core does not expose the tools this shim needs", { missing });
+      console.error("NeuroStrata core does not expose the tools this shim needs", { missing });
     }
   } catch (err) {
     setStatus({ state: "unavailable", lastError: String(err) });
-    console.warn("NeuroStrata core is unreachable; the shim is degraded", { error: String(err) });
+    console.error("NeuroStrata core is unreachable; the shim is degraded", { error: String(err) });
   }
 }
 
@@ -1248,7 +1260,7 @@ export async function onTurnEnd(turn: { role: "user" | "assistant"; content: str
   if (signals.length === 0) return;
   if (!config.intentDetection.injectReminder) return;
   const markerList = signals.map((s) => s.marker).join(", ");
-  console.info(
+  console.error(
     `[NeuroStrata] Task intent detected (${markerList}) but no neurostrata_task_create in this turn. Consider creating a task to track this work.`,
   );
 }

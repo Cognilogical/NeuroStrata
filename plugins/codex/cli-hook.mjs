@@ -3,6 +3,13 @@ import { readFileSync } from "node:fs";
 import plugin, { initialize, onTurnEnd } from "./dist/index.js";
 
 async function main() {
+  // Redirect all diagnostic logging to stderr so stdout carries only the
+  // JSON hook response (critical when this runner is invoked by a CLI hook
+  // whose stdout is parsed as structured output).
+  console.log = console.error;
+  console.info = console.error;
+  console.warn = console.error;
+
   let raw = "";
   try {
     raw = readFileSync(0, "utf8");

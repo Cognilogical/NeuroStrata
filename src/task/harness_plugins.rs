@@ -34,6 +34,13 @@ import { readFileSync } from "node:fs";
 import plugin, * as mod from "./dist/index.js";
 
 async function main() {
+  // Redirect all diagnostic logging to stderr so stdout carries only the
+  // JSON hook response (critical when this runner is invoked by a CLI hook
+  // whose stdout is parsed as structured output).
+  console.log = console.error;
+  console.info = console.error;
+  console.warn = console.error;
+
   let raw = "";
   try {
     raw = readFileSync(0, "utf8");
@@ -480,11 +487,26 @@ fn wire_harness_config(
                 //    preserving every other key/entry.
                 let loader_rel = "./.NeuroStrata/plugins/opencode/dist/index.js";
                 let oc_cfg = project_root.join(".opencode/opencode.json");
-                {
-                    let mut doc: Value = std::fs::read_to_string(&oc_cfg)
+                // Preserve the existing file on read/parse failure: only
+                // populate when the file is absent, or when it parses to a
+                // JSON object. A malformed or non-object existing file is left
+                // untouched (never overwritten with `{}`).
+                let mut doc: Value = json!({});
+                let mut write_doc = false;
+                if oc_cfg.exists() {
+                    if let Some(d) = std::fs::read_to_string(&oc_cfg)
                         .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_else(|| json!({}));
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    {
+                        if d.is_object() {
+                            doc = d;
+                            write_doc = true;
+                        }
+                    }
+                } else {
+                    write_doc = true;
+                }
+                if write_doc {
                     if let Some(obj) = doc.as_object_mut() {
                         let entry = obj.get("plugins");
                         let (is_array, already_in_array, key_absent) = {
@@ -577,27 +599,40 @@ fn wire_harness_config(
             if is_active || project_root.join(".claude").exists() {
                 let cfg_path = project_root.join(".claude/settings.local.json");
                 let cmd = format!("NEUROSTRATA_NAMESPACE={} node \"{}\"", namespace, abs_runner);
-                let mut doc: Value = std::fs::read_to_string(&cfg_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| json!({}));
-                if let Some(obj) = doc.as_object_mut() {
-                    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-                    if let Some(h_obj) = hooks.as_object_mut() {
-                        h_obj.entry("PreToolUse").or_insert_with(|| {
-                            json!([{
-                                "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
-                                "hooks": [{ "type": "command", "command": cmd }]
-                            }])
-                        });
-                        h_obj.entry("Stop").or_insert_with(|| {
-                            json!([{
-                                "hooks": [{ "type": "command", "command": cmd }]
-                            }])
-                        });
+                let mut doc: Value = json!({});
+                let mut write_doc = false;
+                if cfg_path.exists() {
+                    if let Some(d) = std::fs::read_to_string(&cfg_path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    {
+                        if d.is_object() {
+                            doc = d;
+                            write_doc = true;
+                        }
                     }
+                } else {
+                    write_doc = true;
                 }
-                return write_json_if_changed(&cfg_path, &doc);
+                if write_doc {
+                    if let Some(obj) = doc.as_object_mut() {
+                        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+                        if let Some(h_obj) = hooks.as_object_mut() {
+                            h_obj.entry("PreToolUse").or_insert_with(|| {
+                                json!([{
+                                    "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+                                    "hooks": [{ "type": "command", "command": cmd }]
+                                }])
+                            });
+                            h_obj.entry("Stop").or_insert_with(|| {
+                                json!([{
+                                    "hooks": [{ "type": "command", "command": cmd }]
+                                }])
+                            });
+                        }
+                    }
+                    return write_json_if_changed(&cfg_path, &doc);
+                }
             }
             None
         }

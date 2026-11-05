@@ -1,13 +1,13 @@
 /**
  * @neurostrata/claude-plugin — Thin harness adapter over @neurostrata/plugin-core.
  *
- * Re-exports the shared core implementation (compiled at ../core/dist/index.js)
+ * Re-exports the shared @neurostrata/plugin-core implementation (bundled into dist/index.js)
  * and builds one Claude Code plugin via `createHarnessPlugin`. All behavior lives
  * in core; this file contains zero logic.
  */
 
-export * from "../../core/dist/index.js";
-import { createHarnessPlugin } from "../../core/dist/index.js";
+export * from "@neurostrata/plugin-core";
+import { createHarnessPlugin } from "@neurostrata/plugin-core";
 
 export const plugin = createHarnessPlugin("neurostrata-claude", "Claude Code");
 export default plugin;

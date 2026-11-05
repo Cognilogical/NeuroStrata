@@ -1182,8 +1182,9 @@ async fn handle_get_graph(
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
     let requested = query.namespace.unwrap_or_else(|| "global".to_string());
     let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
-    let config = crate::config::Config::load()
-        .map_err(|e| { tracing::warn!("handle_get_graph Config::load failed: {e}"); axum::http::StatusCode::INTERNAL_SERVER_ERROR })?;
+    let project_contexts = crate::config::Config::load()
+        .map(|c| c.project_contexts)
+        .unwrap_or_default();
     let anchor_root = query.anchor_root.as_deref().map(Path::new);
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, query.source_id.as_deref());
@@ -1202,7 +1203,7 @@ async fn handle_get_graph(
         .export_graph(
             query.include_superseded.unwrap_or(false),
             query.include_archived.unwrap_or(false),
-            &config.project_contexts,
+            &project_contexts,
             anchor_override.as_ref(),
         )
         .await
@@ -1350,8 +1351,9 @@ async fn handle_export_graph(
     // decides whether this daemon may write there, BEFORE any use
     // (Task 2 re-file / J6 — this route postdates the original filing).
     let target = caller_path_refusal(&state, &req.target)?;
-    let config = crate::config::Config::load()
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let project_contexts = crate::config::Config::load()
+        .map(|c| c.project_contexts)
+        .unwrap_or_default();
     let anchor_root = req.anchor_root.as_deref().map(Path::new);
     let anchor_override =
         crate::source_context::scoped_anchor_override(anchor_root, req.source_id.as_deref());
@@ -1366,7 +1368,7 @@ async fn handle_export_graph(
         .vector_store
         .export_graph(
             !req.exclude_superseded.unwrap_or(false),
-            req.include_archived.unwrap_or(false),            &config.project_contexts,
+            req.include_archived.unwrap_or(false),            &project_contexts,
             anchor_override.as_ref(),
         )
         .await
