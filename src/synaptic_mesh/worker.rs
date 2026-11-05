@@ -248,17 +248,28 @@ fn apply_one(
     // ---- build + write ----
     let mut record = build_record(entry, id, superseded_by, node_id, epoch);
 
-    // Auto-sign if a local Ed25519 signing key exists.
+    // Auto-sign if a local Ed25519 signing key exists. Signing is the
+    // final seal on the stored form, so it happens AFTER lifecycle
+    // preservation and the RDF rebuild below — never before them: a
+    // signature taken here would cover bytes that are not what gets
+    // stored and exported, and receivers verifying the stored record
+    // would see a mismatch whenever preservation changed a signed field.
     let signing_key_path = std::env::var("NEUROSTRATA_MESH_SIGNING_KEY")
         .ok()
         .filter(|p| std::path::Path::new(p).exists())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| mesh.root().join(".neurostrata-mesh").join("signing.key"));
-    if signing_key_path.exists() {
-        // A signing failure with the key present is a real fault (corrupt
-        // or unreadable key); committing an unsigned record silently would
-        // downgrade the mesh's trust surface, so fail the drain.
-        if let Err(e) = sign_record(&mut record, &signing_key_path) {
+    let signing_key_present = signing_key_path.exists();
+    if signing_key_present {
+        // Signing doubles as an early failure gate, and that gate must
+        // keep its pre-reorder placement: validate key readability NOW,
+        // before `load_existing` and the `AlreadyApplied` early return,
+        // so a corrupt or unreadable key still fails the drain even when
+        // every entry would otherwise be consumed as already applied.
+        // A signing failure with the key present is a real fault;
+        // committing an unsigned record silently would downgrade the
+        // mesh's trust surface, so fail the drain.
+        if let Err(e) = crate::did::load_or_generate_keypair(&signing_key_path) {
             return Err(format!("SynapticMesh record signing failed: {e}"));
         }
     }
@@ -285,6 +296,15 @@ fn apply_one(
             if let Some(new_rdf) = rebuild_rdf_block(&record, existing_rdf) {
                 record.rdf = Some(new_rdf);
             }
+        }
+    }
+
+    // Seal the final stored form: every mutation above (lifecycle
+    // preservation, RDF rebuild) is already reflected in `record`, so the
+    // signature covers exactly what is written and exported below.
+    if signing_key_present {
+        if let Err(e) = sign_record(&mut record, &signing_key_path) {
+            return Err(format!("SynapticMesh record signing failed: {e}"));
         }
     }
 
@@ -722,6 +742,7 @@ fn load_existing(path: &Path) -> Result<Option<MeshRecord>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::synaptic_mesh::import::{verify_record_signature, SignatureDisposition};
     use crate::synaptic_mesh::outbox::outbox_dir_for;
     use std::process::Command;
 
@@ -1484,5 +1505,254 @@ mod tests {
 
         let loaded = &roundtrip[0];
         assert!(loaded.patch.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
+    }
+
+    // ---- issue #46: sign AFTER preservation + RDF rebuild -----------------
+    //
+    // The signature must cover the final stored form. Before the fix the
+    // record was signed first and mutated afterwards (lifecycle origin
+    // fields preserved from the existing record, RDF block rebuilt), so a
+    // receiver verifying the stored record — `verify_record_signature`,
+    // as the import routes call it — saw a mismatch whenever preservation
+    // actually changed a signed field.
+
+    /// Pre-create a valid Ed25519 signing key at the mesh's default
+    /// signing-key path and return that path.
+    fn signing_key(mesh: &MeshStorage) -> PathBuf {
+        let key_dir = mesh.root().join(".neurostrata-mesh");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("signing.key");
+        let _ = crate::did::load_or_generate_keypair(&key_path).unwrap();
+        key_path
+    }
+
+    /// Read back the stored record for `id` from the mesh checkout.
+    fn stored_record(mesh: &MeshStorage, id: &Uuid) -> MeshRecord {
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let text = std::fs::read_to_string(&path).expect("the record file must exist");
+        serde_json::from_str(&text).expect("the file parses as MeshRecord")
+    }
+
+    /// The receiver/import verification path, with the signers the import
+    /// routes pass (`mesh.manifest().signers`, empty for a fixture mesh).
+    fn assert_verified(mesh: &MeshStorage, record: &MeshRecord) {
+        assert_eq!(
+            verify_record_signature(record, &mesh.manifest().signers),
+            SignatureDisposition::Verified,
+            "the stored record must verify against its stored signature"
+        );
+    }
+
+    /// (a) A lifecycle transition preserves `created_at` / `created_by`
+    /// from the existing record — both signed fields — so the stored
+    /// record only verifies if it was signed after that preservation.
+    /// FAILS on the pre-fix order, passes after.
+    #[test]
+    fn a_preserved_lifecycle_record_verifies_against_its_stored_signature() {
+        let (mesh, outbox) = fixture("sign-after-preserve-lifecycle", None);
+        let _key_path = signing_key(&mesh);
+        let id = Uuid::now_v7();
+
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
+        drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_verified(&mesh, &stored_record(&mesh, &id));
+
+        // Archive the same record from a DIFFERENT author at a later
+        // timestamp: the freshly built record would carry the new
+        // `created_at` (the archive entry's ts) and `created_by`
+        // ("node-other"); preservation must overwrite both with the
+        // originals, changing the signed form after it is built.
+        let archive = OutboxEntry {
+            stable_op_id: Uuid::now_v7(),
+            op: OP_ARCHIVED.to_string(),
+            id: id.to_string(),
+            namespace: "ns".to_string(),
+            memory_type: "rule".to_string(),
+            content: "the memory text".to_string(),
+            metadata: json!({ "eligibility": "shareable", "archived_at": 1_700_000_100_i64 }),
+            superseded_by: None,
+            ts: 1_700_000_100,
+            epoch: 1,
+        };
+        outbox.append(&archive).unwrap();
+        drain_once(&outbox, &mesh, "node-other").unwrap();
+
+        let record = stored_record(&mesh, &id);
+        // Preservation really happened (the mutation the signature must
+        // cover), and the state transition landed.
+        assert_eq!(record.lifecycle.state, LifecycleState::Archived);
+        assert_eq!(
+            record.lifecycle.created_at,
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            "created_at is preserved from the existing record"
+        );
+        assert_eq!(
+            record.lifecycle.created_by, "node-author",
+            "created_by is preserved from the existing record"
+        );
+        assert_verified(&mesh, &record);
+    }
+
+    /// (b) A lifecycle transition whose existing record carries an RDF
+    /// block gets that block rebuilt from the post-mutation record (here
+    /// the preserved epoch and `created_at` feed the rebuilt quads, and
+    /// the epoch is itself a component of the signing payload). The
+    /// stored record only verifies if it was signed after the rebuild.
+    /// FAILS on the pre-fix order, passes after.
+    #[test]
+    fn a_record_with_a_rebuilt_rdf_block_verifies_against_its_stored_signature() {
+        let (mesh, outbox) = fixture("sign-after-rebuild-rdf", None);
+        let _key_path = signing_key(&mesh);
+        let id = Uuid::now_v7();
+        let successor = Uuid::now_v7();
+
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
+        drain_once(&outbox, &mesh, "node-author").unwrap();
+        let first = stored_record(&mesh, &id);
+        let first_rdf = first.rdf.clone().expect("the created record has an RDF block");
+
+        // Migrate the mesh to epoch 2, then supersede the record with an
+        // entry born in the new epoch: preservation pulls
+        // `origin_mesh_epoch` back to 1 and `created_at` back to the
+        // original, and the RDF block is rebuilt from that form.
+        let mesh = reopen_with_epoch(&mesh, 2);
+        let supersede = OutboxEntry {
+            stable_op_id: Uuid::now_v7(),
+            op: OP_SUPERSEDED.to_string(),
+            id: id.to_string(),
+            namespace: "ns".to_string(),
+            memory_type: "rule".to_string(),
+            content: "the memory text".to_string(),
+            metadata: shareable_metadata(),
+            superseded_by: Some(successor.to_string()),
+            ts: 1_700_000_100,
+            epoch: 2,
+        };
+        outbox.append(&supersede).unwrap();
+        drain_once(&outbox, &mesh, "node-author").unwrap();
+
+        let record = stored_record(&mesh, &id);
+        assert_eq!(record.lifecycle.state, LifecycleState::Superseded);
+        assert_eq!(record.lifecycle.superseded_by, Some(successor));
+        assert_eq!(
+            record.origin_mesh_epoch, 1,
+            "origin epoch is preserved from the existing record"
+        );
+        // The RDF block really was rebuilt: it differs from the created
+        // record's block and its quads carry the preserved created_at.
+        let rdf = record.rdf.clone().expect("the stored record has an RDF block");
+        assert_ne!(rdf.quads, first_rdf.quads, "the RDF block was rebuilt");
+        assert_ne!(
+            rdf.canonical_hash, first_rdf.canonical_hash,
+            "the rebuilt block's canonical hash differs"
+        );
+        let preserved_created_at =
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap().to_rfc3339();
+        assert!(
+            rdf.quads.contains(&preserved_created_at),
+            "the rebuilt quads carry the preserved created_at: {}",
+            rdf.quads
+        );
+        assert_verified(&mesh, &record);
+    }
+
+    /// (c) Regression test for the reorder's exact placement: key
+    /// readability is validated BEFORE `load_existing` / the
+    /// `AlreadyApplied` early return, so a corrupt signing key still
+    /// fails the drain — for a fresh entry, and for a drain whose only
+    /// entry is already applied. A literal reorder (sign only after the
+    /// existing-record block) would silently pass the second drain.
+    #[test]
+    fn a_corrupt_signing_key_still_fails_the_drain_after_the_reorder() {
+        let (mesh, outbox) = fixture("sign-corrupt-key", None);
+        let key_path = mesh.root().join(".neurostrata-mesh").join("signing.key");
+        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        std::fs::write(&key_path, b"not a PEM private key").unwrap();
+
+        let id = Uuid::now_v7();
+        let entry = created(&id.to_string(), shareable_metadata());
+        outbox.append(&entry).unwrap();
+
+        // A fresh entry with a corrupt key fails the drain and stays
+        // pending; no record file is written.
+        let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
+        assert!(
+            err.contains("signing failed"),
+            "a corrupt key must fail the drain as a signing failure: {err}"
+        );
+        assert_eq!(outbox.pending().unwrap().len(), 1, "the entry stays pending");
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        assert!(!path.exists(), "no record file for a failed drain");
+
+        // With a valid key the same entry applies and verifies.
+        std::fs::remove_file(&key_path).unwrap();
+        let _ = crate::did::load_or_generate_keypair(&key_path).unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 1);
+        assert_verified(&mesh, &stored_record(&mesh, &id));
+
+        // Corrupt the key again and replay the same entry (the crash
+        // between rename and mark-committed state): the stored file
+        // already carries this `update_id`, so the apply would return
+        // `AlreadyApplied` — but key validation runs first, so the
+        // drain still fails and the entry stays pending.
+        std::fs::write(&key_path, b"not a PEM private key").unwrap();
+        outbox.append(&entry).unwrap();
+        let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
+        assert!(
+            err.contains("signing failed"),
+            "a corrupt key must fail even an already-applied drain: {err}"
+        );
+        assert_eq!(
+            outbox.pending().unwrap().len(),
+            1,
+            "the already-applied entry stays pending when the key is corrupt"
+        );
+    }
+
+    /// (d) A fresh record with no existing counterpart undergoes no
+    /// preservation and no rebuild, so its signature path is unaffected
+    /// by the reorder: the stored record verifies, and re-signing the
+    /// stored form with the same key reproduces the stored signature
+    /// byte-for-byte (Ed25519 signing is deterministic), yielding a
+    /// record identical to the stored one.
+    #[test]
+    fn a_fresh_record_with_no_existing_counterpart_signs_exactly_as_before() {
+        let (mesh, outbox) = fixture("sign-fresh-unaffected", None);
+        let key_path = signing_key(&mesh);
+        let id = Uuid::now_v7();
+        outbox
+            .append(&created(&id.to_string(), shareable_metadata()))
+            .unwrap();
+
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(report.applied, 1);
+
+        let record = stored_record(&mesh, &id);
+        assert!(
+            record.signature.as_ref().map_or(false, |s| !s.is_empty()),
+            "the fresh record carries a non-empty signature"
+        );
+        assert_verified(&mesh, &record);
+
+        let mut resigned = record.clone();
+        sign_record(&mut resigned, &key_path).unwrap();
+        assert_eq!(
+            resigned.signature, record.signature,
+            "re-signing the stored form reproduces the stored signature bytes"
+        );
+        assert_eq!(resigned, record, "the re-signed record is byte-identical in value");
     }
 }
