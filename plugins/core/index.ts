@@ -555,7 +555,7 @@ function extractBalancedCallArgs(code: string, startAfterOpenParen: number): str
  */
 export function inspectCodeModeExecution(code: string): CodeModeInspection {
   const result: CodeModeInspection = { queriedFiles: [] };
-  const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
+  const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
   let match: RegExpExecArray | null;
   while ((match = callRe.exec(code)) !== null) {
     const tool = match[1];
@@ -581,7 +581,7 @@ export function inspectCodeModeExecution(code: string): CodeModeInspection {
       result.taskCompleted = true;
     } else if (tool === "neurostrata_memories_for_file") {
       if (pathMatch) result.queriedFiles.push(pathMatch[1]);
-    } else if (tool === "neurostrata_archive_memory" || tool === "neurostrata_add_memory" || tool === "neurostrata_update_memory") {
+    } else if (tool === "neurostrata_archive_memory" || tool === "neurostrata_add_memory" || tool === "neurostrata_supersede_memory" || tool === "neurostrata_update_memory") {
       result.memoryMutated = true;
     }
   }
@@ -1060,6 +1060,7 @@ const TASK_MUTATION_TOOLS = new Set([
 const MEMORY_MUTATION_TOOLS = new Set([
   "neurostrata_archive_memory",
   "neurostrata_add_memory",
+  "neurostrata_supersede_memory",
   "neurostrata_update_memory",
 ]);
 
@@ -1087,6 +1088,7 @@ function trackNativeTaskToolCall(
     prefetchedPaths.clear();
     injectedMemoryIds.clear();
     subagentFileRecallCache.clear();
+    return;
   }
   if (toolName === "neurostrata_task_complete") {
     if (activeTaskId) cachedTaskInjection.delete(activeTaskId);

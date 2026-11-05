@@ -449,7 +449,7 @@ function extractBalancedCallArgs(code, startAfterOpenParen) {
  */
 export function inspectCodeModeExecution(code) {
     const result = { queriedFiles: [] };
-    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
+    const callRe = /\b(neurostrata_(?:task_claim|task_update|task_complete|memories_for_file|archive_memory|add_memory|supersede_memory|update_memory))\b(?:\s*["']\s*\])?\s*\(/g;
     let match;
     while ((match = callRe.exec(code)) !== null) {
         const tool = match[1];
@@ -482,7 +482,7 @@ export function inspectCodeModeExecution(code) {
             if (pathMatch)
                 result.queriedFiles.push(pathMatch[1]);
         }
-        else if (tool === "neurostrata_archive_memory" || tool === "neurostrata_add_memory" || tool === "neurostrata_update_memory") {
+        else if (tool === "neurostrata_archive_memory" || tool === "neurostrata_add_memory" || tool === "neurostrata_supersede_memory" || tool === "neurostrata_update_memory") {
             result.memoryMutated = true;
         }
     }
@@ -928,6 +928,7 @@ const TASK_MUTATION_TOOLS = new Set([
 const MEMORY_MUTATION_TOOLS = new Set([
     "neurostrata_archive_memory",
     "neurostrata_add_memory",
+    "neurostrata_supersede_memory",
     "neurostrata_update_memory",
 ]);
 function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
@@ -949,6 +950,7 @@ function trackNativeTaskToolCall(toolName, payloadArgs, outerInput) {
         prefetchedPaths.clear();
         injectedMemoryIds.clear();
         subagentFileRecallCache.clear();
+        return;
     }
     if (toolName === "neurostrata_task_complete") {
         if (activeTaskId)

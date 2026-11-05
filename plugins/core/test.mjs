@@ -1137,11 +1137,104 @@ describe("native task tool tracking + hook registration + pre-commit awk fallbac
 });
 
 // ──────────────────────────────────────────────────────────────────────
-// Round-6 PR review regression tests
+// Round-7: memory mutation tools clear caches while preserving activeTaskId
 // ──────────────────────────────────────────────────────────────────────
 
-describe("round-6: task_update title invalidation, AST summary formatting, dev script, pre-commit matching", () => {
-  it("native neurostrata_task_update with title invalidates cachedTaskInjection so next subagent call re-fetches", async () => {
+describe("round-7: memory mutation tools clear caches while preserving activeTaskId", () => {
+  it("neurostrata_archive_memory clears cachedTaskInjection and preserves activeTaskId", async () => {
+    const { server, url } = await createMockDaemonServer({
+      returnTask: [{ id: "task-1", session_id: "sess-1", status: "in_progress", subagent_prompt_injection: "### Daemon injection for task-1" }],
+    });
+    try {
+      resetClientForTesting();
+      const ctx = {
+        config: { namespace: "r7-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 500 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      };
+      await initialize(ctx);
+
+      // Claim task via native tool call in handleHookEvent
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "neurostrata_task_claim",
+        tool_input: { id: "task-1", session_id: "sess-1" },
+      });
+      assert.equal(getTrackingState().activeTaskId, "task-1", "activeTaskId should be task-1 after claim");
+
+      // Prime the cache via resolveActiveTaskFromDaemon
+      await resolveActiveTaskFromDaemon("r7-ns");
+      assert.ok(cachedTaskInjection.has("task-1"), "cachedTaskInjection should have task-1");
+
+      // Call neurostrata_archive_memory with id: "mem-rule-1" (should NOT overwrite activeTaskId)
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "neurostrata_archive_memory",
+        tool_input: { id: "mem-rule-1" },
+      });
+
+      // activeTaskId should still be "task-1" (not overwritten by archive_memory's id)
+      assert.equal(getTrackingState().activeTaskId, "task-1", "activeTaskId must be preserved after archive_memory");
+
+      // cachedTaskInjection should be cleared
+      assert.equal(cachedTaskInjection.has("task-1"), false, "cachedTaskInjection must be cleared after archive_memory");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("neurostrata_supersede_memory clears cachedTaskInjection and preserves activeTaskId", async () => {
+    const { server, url } = await createMockDaemonServer({
+      returnTask: [{ id: "task-1", session_id: "sess-1", status: "in_progress", subagent_prompt_injection: "### Daemon injection for task-1" }],
+    });
+    try {
+      resetClientForTesting();
+      const ctx = {
+        config: { namespace: "r7-ns", endpoint: url, bearerToken: "tok", strictMode: true, requestTimeoutMs: 500 },
+        tool: { hook: async () => {} },
+        hooks: {},
+      };
+      await initialize(ctx);
+
+      // Claim task via native tool call in handleHookEvent
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "neurostrata_task_claim",
+        tool_input: { id: "task-1", session_id: "sess-1" },
+      });
+      assert.equal(getTrackingState().activeTaskId, "task-1", "activeTaskId should be task-1 after claim");
+
+      // Prime the cache via resolveActiveTaskFromDaemon
+      await resolveActiveTaskFromDaemon("r7-ns");
+      assert.ok(cachedTaskInjection.has("task-1"), "cachedTaskInjection should have task-1");
+
+      // Call neurostrata_supersede_memory with old_id: "mem-rule-1"
+      await handleHookEvent({
+        hook_event_name: "PreToolUse",
+        tool_name: "neurostrata_supersede_memory",
+        tool_input: { old_id: "mem-rule-1", content: "new rule" },
+      });
+
+      // activeTaskId should still be "task-1"
+      assert.equal(getTrackingState().activeTaskId, "task-1", "activeTaskId must be preserved after supersede_memory");
+
+      // cachedTaskInjection should be cleared
+      assert.equal(cachedTaskInjection.has("task-1"), false, "cachedTaskInjection must be cleared after supersede_memory");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("inspectCodeModeExecution sets memoryMutated: true on neurostrata_supersede_memory", () => {
+    const out = inspectCodeModeExecution('neurostrata_supersede_memory({ old_id: "mem-1", content: "v2" })');
+    assert.equal(out.memoryMutated, true, "inspectCodeModeExecution should set memoryMutated: true on neurostrata_supersede_memory");
+  });
+});
+
+describe("round-6: task_update title invalidation, AST summary formatting, dev scripts, and pre-commit path normalization", () => {
+  it("native neurostrata_task_update with title invalidates cachedTaskInjection", async () => {
     const { server, url, counters } = await createMockDaemonServer({
       returnTask: [
         {
