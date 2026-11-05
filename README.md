@@ -77,6 +77,9 @@ All of that cognitive machinery lives inside **one self-managing binary**. There
 > ```
 >
 > This step needs Node 18 or newer (the plugin declares `engines >= 18`).
+> The same applies to every other embedded plugin under `plugins/` — each one
+> ships a tracked `dist/` bundle that the Rust binary embeds.
+
 ```bash
 # 1. Build and install the single Rust binary (includes embedded LadybugDB + OxiRS + ONNX)
 scripts/build.sh
