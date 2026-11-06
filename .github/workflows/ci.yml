@@ -78,10 +78,10 @@ jobs:
       # bundle is present on a fresh checkout and no plugin build is needed
       # before the guard and the compile.
 
-      # Diagnostic only: names any missing include_str! target before
-      # cargo fails on it opaquely. Passing here is not acceptance — a
-      # persisting local dist/ would also pass; only a fresh-checkout CI
-      # run proves the bundle is tracked.
+      # Diagnostic only: fails in seconds, before cargo compiles, if
+      # any include_str! target is missing from the checkout. Passing
+      # here is not acceptance — a persisting local dist/ would also
+      # pass; only a fresh-checkout CI run proves the bundle is tracked.
       - name: Guard include_str targets
         shell: bash
         run: bash scripts/check-include-str-targets.sh
@@ -147,9 +147,10 @@ jobs:
       # fresh checkout, so no plugin build is needed here (see the build job
       # for the rationale).
 
-      # Diagnostic only, as in the build job: names any missing include_str!
-      # target before cargo fails on it opaquely. A local pass is not
-      # acceptance; only a fresh-checkout CI run proves the bundle is tracked.
+      # Diagnostic only, as in the build job: fails in seconds, before
+      # cargo compiles, if any include_str! target is missing from the
+      # checkout. A local pass is not acceptance; only a fresh-checkout
+      # CI run proves the bundle is tracked.
       - name: Guard include_str targets
         shell: bash
         run: bash scripts/check-include-str-targets.sh

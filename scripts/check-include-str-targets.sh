@@ -5,9 +5,10 @@
 #
 # Why: src/task/harness_plugins.rs embeds plugin bundles with include_str!.
 # The bundles are tracked in git, so they are present on a fresh checkout.
-# Without them, cargo fails with an include_str! error that does
-# not name the missing file at fault. This guard fails first, naming the
-# missing target(s) explicitly.
+# Without them, cargo fails with include_str! errors naming the
+# missing files — but only once compilation reaches this crate, after
+# its dependencies build. This guard fails first, in seconds, before
+# compilation begins, naming every missing target it extracts.
 #
 # Diagnostic only: passing here does NOT prove CI is green. A persisting
 # dist/ makes this pass regardless of whether CI ever built from a fresh
