@@ -79,6 +79,16 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024; // 1 MiB
 pub const MAX_RDF_QUADS_BYTES: usize = 512 * 1024; // 512 KiB
 pub const MAX_RDF_QUADS_COUNT: usize = 1000;
 
+/// RDF validation diagnostic carried out-of-band from validation to the
+/// pre-apply gate. This preserves signature verification over the record
+/// EXACTLY as it arrived (no metadata mutation before verify_record_signature),
+/// while still attaching the diagnostic to the applied record for audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdfDiagnostic {
+    pub violations: Vec<String>,
+    pub phase: String,
+}
+
 /// What one replay pass did.
 #[derive(Debug, Clone)]
 pub struct ApplyReport {
@@ -419,35 +429,16 @@ pub async fn apply_changed(
                 continue;
             }
         };
-        let mut record = match validate_record(&candidate, served, &raw) {
-            Ok(r) => r,
-            Err(reason) => {
-                report.ignored.push(format!("{rel}: {reason}"));
-                continue;
-            }
+        let mut record = match pre_apply_gate(
+            validate_record(&candidate, served, &raw),
+            manifest_epoch,
+            &mesh.manifest().signers,
+            &rel,
+            &mut report,
+        ) {
+            Some(r) => r,
+            None => continue,
         };
-        if let Err(reason) = epoch_gate(record.origin_mesh_epoch, manifest_epoch) {
-            report.ignored.push(format!("{rel}: {reason}"));
-            continue;
-        }
-        match verify_record_signature(&record, &mesh.manifest().signers) {
-            SignatureDisposition::Verified => {
-                report.verified_signed += 1;
-            }
-            SignatureDisposition::Unsigned => {
-                report.unsigned_accepted += 1;
-            }
-            SignatureDisposition::Invalid(reason) => {
-                report.signature_rejected += 1;
-                report.ignored.push(format!("{rel}: {reason}"));
-                continue;
-            }
-            SignatureDisposition::Unauthorized(reason) => {
-                report.unauthorized_signer += 1;
-                report.ignored.push(format!("{rel}: {reason}"));
-                continue;
-            }
-        }
         // RDF patch sidecar attachment: a sibling `<id>.rdfpatch` next to
         // the `.json` record is parsed (fail-soft) and attached AFTER
         // signature verification, so canonical signing bytes over the
@@ -490,36 +481,45 @@ pub async fn apply_changed(
 
     // Bundle-only records: everything `scan_bundles_and_patches` decoded
     // whose `(namespace, id)` did NOT arrive as a `.json` candidate this
-    // pass and whose namespace is served. Identical gates as the `.json`
-    // path — signature, then apply — so one decode, one apply, and the
-    // report counts the Disposition like any other candidate.
+    // pass. Identical gates as the `.json` path, by construction: both
+    // routes pass their validation result through `pre_apply_gate`
+    // (epoch gate, then signature, then disposition) before
+    // `apply_one` — each route evaluates its own validator first
+    // (`validate_record` on the `.json` route, `validate_bundle_record`
+    // here, both over `validate_parsed_record`) and passes the `Result`
+    // in — and the bundle validation is the portable subset of
+    // `validate_record` (see `validate_bundle_record` — a bundle record
+    // has no path and no file stem, so the two path-dependent checks —
+    // path-namespace parity and id == file-stem — do not transfer).
+    // The dedup skip here is keyed on the path-derived `(namespace,
+    // file-stem)` pair collected before validation, and content is NOT
+    // compared: a bundle record under a key whose `.json` candidate
+    // reached any disposition in that route — applied, ignored,
+    // skipped, or conflicted — inherits that disposition for the pass
+    // and is not separately evaluated or reported. Rejections of
+    // decoded records — including an unserved namespace, which the
+    // validation step now refuses — land in `report.ignored` like any
+    // other candidate, and the report counts the Disposition like any
+    // other candidate; a bundle that fails to decode at all (corrupt
+    // stream, malformed element, aggregate decompression cap) is
+    // logged and skipped wholesale by the scan — pre-existing
+    // behaviour, no report entry.
     for (bundle_path, record) in bundled_records {
         let id = record.id.to_string();
-        if !served.iter().any(|s| s == &record.namespace) {
-            continue;
-        }
         if json_candidate_ids.contains(&(record.namespace.clone(), id.clone())) {
             continue;
         }
-        let rel = bundle_path.display().to_string();
-        match verify_record_signature(&record, &mesh.manifest().signers) {
-            SignatureDisposition::Verified => {
-                report.verified_signed += 1;
-            }
-            SignatureDisposition::Unsigned => {
-                report.unsigned_accepted += 1;
-            }
-            SignatureDisposition::Invalid(reason) => {
-                report.signature_rejected += 1;
-                report.ignored.push(format!("{rel}: {reason}"));
-                continue;
-            }
-            SignatureDisposition::Unauthorized(reason) => {
-                report.unauthorized_signer += 1;
-                report.ignored.push(format!("{rel}: {reason}"));
-                continue;
-            }
-        }
+        let rel = format!("{} ({})", bundle_path.display(), record.id);
+        let record = match pre_apply_gate(
+            validate_bundle_record(record, served),
+            manifest_epoch,
+            &mesh.manifest().signers,
+            &rel,
+            &mut report,
+        ) {
+            Some(r) => r,
+            None => continue,
+        };
         match apply_one(
             root,
             &mesh_id,
@@ -780,15 +780,15 @@ fn has_exec_bit(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
-/// Parse + validate one record against the pinned contract: known schema
-/// version, served namespace parity with its path, shareable memory type,
-/// id/filename agreement, no runtime counter keys. `Ok(record)` is apt for
-/// apply; `Err(reason)` is an ignore entry.
+/// Parse + validate one `.json` record against the pinned contract: known
+/// schema version, served namespace parity with its path, shareable memory
+/// type, id/filename agreement, no runtime counter keys. `Ok((record, diagnostic))`
+/// is apt for apply; `Err(reason)` is an ignore entry.
 pub fn validate_record(
     candidate: &Candidate,
     served: &[String],
     raw: &str,
-) -> Result<MeshRecord, String> {
+) -> Result<(MeshRecord, Option<RdfDiagnostic>), String> {
     if raw.len() > MAX_RECORD_BYTES {
         return Err(format!(
             "record is {} bytes, over the {}-byte per-record cap (MAX_RECORD_BYTES)",
@@ -796,8 +796,50 @@ pub fn validate_record(
             MAX_RECORD_BYTES
         ));
     }
-    let mut record: MeshRecord =
+    let record: MeshRecord =
         serde_json::from_str(raw).map_err(|e| format!("unparseable MeshRecord ({e})"))?;
+    validate_parsed_record(record, served, Some(candidate))
+}
+
+/// Validate one bundle-carried record: the portable subset of
+/// [`validate_record`] — every check that does not need a file. A bundle
+/// record arrives as a deserialized [`MeshRecord`] with no path and no
+/// file stem, so the id == file-stem check (and the path-namespace parity
+/// check it rides with) cannot transfer; synthesising a stem from the
+/// record id would make that check tautological, so it is excluded, not
+/// faked. The per-record byte cap is enforced over the record's
+/// serialized JSON form, the bundle carrier's analogue of the raw
+/// `.json` bytes. Everything else — schema version, served-namespace
+/// parity, shareable memory type, runtime-counter-key rejection, the
+/// warn-and-apply canonical-RDF diagnostic, and the secret scan over
+/// content and metadata — is the shared [`validate_parsed_record`], so
+/// the two routes cannot drift apart.
+fn validate_bundle_record(
+    record: MeshRecord,
+    served: &[String],
+) -> Result<(MeshRecord, Option<RdfDiagnostic>), String> {
+    let serialized =
+        serde_json::to_string(&record).map_err(|e| format!("unparseable MeshRecord ({e})"))?;
+    if serialized.len() > MAX_RECORD_BYTES {
+        return Err(format!(
+            "record is {} bytes, over the {}-byte per-record cap (MAX_RECORD_BYTES)",
+            serialized.len(),
+            MAX_RECORD_BYTES
+        ));
+    }
+    validate_parsed_record(record, served, None)
+}
+
+/// The shared validation core for an already-parsed record. `candidate`
+/// is `Some` only on the `.json` route, where the record arrived as a
+/// file: those callers additionally get the path-namespace parity check
+/// and the id == file-stem check. `None` (the bundle route) runs every
+/// remaining check unchanged.
+fn validate_parsed_record(
+    record: MeshRecord,
+    served: &[String],
+    candidate: Option<&Candidate>,
+) -> Result<(MeshRecord, Option<RdfDiagnostic>), String> {
     if record.schema_version != MESH_RECORD_SCHEMA_VERSION {
         return Err(format!(
             "unknown schema_version {} (supported: {})",
@@ -811,11 +853,13 @@ pub fn validate_record(
             served.join(", ")
         ));
     }
-    if record.namespace != candidate.namespace {
-        return Err(format!(
-            "record namespace {} does not match its path namespace {}",
-            record.namespace, candidate.namespace
-        ));
+    if let Some(candidate) = candidate {
+        if record.namespace != candidate.namespace {
+            return Err(format!(
+                "record namespace {} does not match its path namespace {}",
+                record.namespace, candidate.namespace
+            ));
+        }
     }
     if !SHAREABLE_MEMORY_TYPES.contains(&record.memory_type.as_str()) {
         return Err(format!(
@@ -824,11 +868,13 @@ pub fn validate_record(
             SHAREABLE_MEMORY_TYPES.join(", ")
         ));
     }
-    if record.id.to_string() != candidate.file_stem {
-        return Err(format!(
-            "record id {} does not match its filename {}",
-            record.id, candidate.file_stem
-        ));
+    if let Some(candidate) = candidate {
+        if record.id.to_string() != candidate.file_stem {
+            return Err(format!(
+                "record id {} does not match its filename {}",
+                record.id, candidate.file_stem
+            ));
+        }
     }
     let whole =
         serde_json::to_value(&record).map_err(|e| format!("unparseable MeshRecord ({e})"))?;
@@ -842,21 +888,25 @@ pub fn validate_record(
     // If the record carries an rdf block, verify its canonical_hash,
     // predicate allowlist, and subject agreement. On violation, report it
     // as a diagnostic but do NOT refuse the record — Phase 1 accepts the
-    // valid JSON envelope and emits the violation for audit.
+    // valid JSON envelope and emits the violation for audit. The diagnostic
+    // is carried OUT OF BAND (not attached to `record.metadata`) so that
+    // signature verification over the canonical bytes runs over the record
+    // exactly as it arrived — no metadata mutation before verify_record_signature.
+    let mut diagnostic = None;
     if let Some(ref rdf_block) = record.rdf {
         if let Err(violations) = crate::rdf::dataset_canonical::validate_canonical_rdf(&record, rdf_block) {
             // Phase 1: emit diagnostic (spec §5.3 warn-first); record is still
-            // applied. The violation is tagged into metadata for audit.
+            // applied. The violation is carried out-of-band for later attachment.
             tracing::warn!(
                 target: "neurostrata::import::rdf",
                 "canonical RDF violation on {} (ns={}) — Phase 1 apply-with-diagnostic: {}",
                 record.id, record.namespace,
                 violations.join("; ")
             );
-            if let Some(obj) = record.metadata.as_object_mut() {
-                obj.insert("rdf_diagnostic_violations".to_string(), json!(violations));
-                obj.insert("rdf_diagnostic_phase".to_string(), json!("1"));
-            }
+            diagnostic = Some(RdfDiagnostic {
+                violations,
+                phase: "1".to_string(),
+            });
         }
     }
     // Secret scan (J15, import leg): the same scanner every local write
@@ -867,10 +917,22 @@ pub fn validate_record(
     // from the record's own metadata key names, which are
     // sender-controlled and could carry secret-shaped text of their
     // own into the operator-visible report (fix round, M-1).
+    // Scan metadata AS IT WOULD BE after diagnostic attachment, so secret
+    // scan coverage of diagnostic text is preserved.
+    let mut metadata_for_scan = record.metadata.clone();
+    if let Some(ref diag) = diagnostic {
+        if let Some(obj) = metadata_for_scan.as_object_mut() {
+            obj.insert(
+                "rdf_diagnostic_violations".to_string(),
+                json!(diag.violations),
+            );
+            obj.insert("rdf_diagnostic_phase".to_string(), json!(diag.phase));
+        }
+    }
     let content_scan_text = serde_json::to_string(&record.content)
         .map_err(|e| format!("unparseable MeshRecord content ({e})"))?;
     if let Some(rejection) =
-        crate::secrets::scan_entry_point(&content_scan_text, &record.metadata, "mesh_import")
+        crate::secrets::scan_entry_point(&content_scan_text, &metadata_for_scan, "mesh_import")
     {
         let surface = if rejection.location.starts_with("mesh_import.metadata") {
             "record metadata"
@@ -882,7 +944,7 @@ pub fn validate_record(
             rejection.category
         ));
     }
-    Ok(record)
+    Ok((record, diagnostic))
 }
 
 /// The epoch gate (spec §"Deletion & erasure" / §"Import validation"): a
@@ -907,6 +969,70 @@ pub fn epoch_gate(candidate_epoch: u32, manifest_epoch: u32) -> Result<(), Strin
             "future-epoch record (origin_mesh_epoch {candidate_epoch} > manifest epoch {manifest_epoch}); refused, not understood"
         )),
     }
+}
+
+/// The ONE pre-apply gate both record-entry routes pass through, in the
+/// `.json` path's original order: validation (the caller's
+/// `validate_record` / `validate_bundle_record` result), then
+/// [`epoch_gate`], then `verify_record_signature`. No record reaches
+/// `apply_one` without returning `Some` from here.
+///
+/// `Some(record)` = every gate passed; the signature counters for the
+/// record have been recorded on `report`. `None` = rejected: the
+/// rejection has already been recorded on `report` (an `ignored` entry
+/// under `rel`, plus the signature counters when the signature stage was
+/// reached), the record is NOT applied, and the caller must not count
+/// it as applied.
+fn pre_apply_gate(
+    validated: Result<(MeshRecord, Option<RdfDiagnostic>), String>,
+    manifest_epoch: u32,
+    signers: &[super::manifest::SignerEntry],
+    rel: &str,
+    report: &mut ApplyReport,
+) -> Option<MeshRecord> {
+    let (mut record, rdf_diagnostic) = match validated {
+        Ok((r, d)) => (r, d),
+        Err(reason) => {
+            report.ignored.push(format!("{rel}: {reason}"));
+            return None;
+        }
+    };
+
+    if let Err(reason) = epoch_gate(record.origin_mesh_epoch, manifest_epoch) {
+        report.ignored.push(format!("{rel}: {reason}"));
+        return None;
+    }
+    match verify_record_signature(&record, signers) {
+        SignatureDisposition::Verified => {
+            report.verified_signed += 1;
+        }
+        SignatureDisposition::Unsigned => {
+            report.unsigned_accepted += 1;
+        }
+        SignatureDisposition::Invalid(reason) => {
+            report.signature_rejected += 1;
+            report.ignored.push(format!("{rel}: {reason}"));
+            return None;
+        }
+        SignatureDisposition::Unauthorized(reason) => {
+            report.unauthorized_signer += 1;
+            report.ignored.push(format!("{rel}: {reason}"));
+            return None;
+        }
+    }
+    // Attach the RDF diagnostic AFTER signature verification, so the
+    // canonical signing bytes used for verification are over the record
+    // EXACTLY as it arrived — no metadata mutation beforehand.
+    if let Some(diag) = rdf_diagnostic {
+        if let Some(obj) = record.metadata.as_object_mut() {
+            obj.insert(
+                "rdf_diagnostic_violations".to_string(),
+                json!(diag.violations),
+            );
+            obj.insert("rdf_diagnostic_phase".to_string(), json!(diag.phase));
+        }
+    }
+    Some(record)
 }
 
 /// Does this JSON anywhere (objects recursively) carry a runtime counter
@@ -2470,6 +2596,27 @@ mod tests {
         MeshStorage::open(mesh.root()).unwrap()
     }
 
+    /// Rewrite the on-disk manifest to carry `signers` as its signer
+    /// allowlist, commit it, and reopen the mesh so its cached manifest
+    /// reflects the allowlist — the signer analogue of
+    /// `reopen_with_epoch`.
+    fn reopen_with_signers(
+        mesh: &MeshStorage,
+        signers: Vec<super::super::manifest::SignerEntry>,
+    ) -> MeshStorage {
+        let mut manifest = mesh.manifest().clone();
+        manifest.signers = signers;
+        let json = serde_json::to_string_pretty(&manifest).unwrap();
+        std::fs::write(
+            mesh.root().join(super::super::storage::MANIFEST_FILE_NAME),
+            format!("{json}\n"),
+        )
+        .unwrap();
+        mesh.commit_all("signer allowlist", "node-import-test")
+            .unwrap();
+        MeshStorage::open(mesh.root()).unwrap()
+    }
+
     fn lifecycle_json(state: &str, archived_at: Option<chrono::DateTime<chrono::Utc>>) -> Value {
         json!({
             "state": state,
@@ -2613,6 +2760,660 @@ mod tests {
             .unwrap()
             .expect("row applied from bundle");
         assert_eq!(payload.content, "shares via bundle only");
+    }
+
+    // ---- issue #43: bundle gate parity -----------------------------------
+    //
+    // A bundle-only record must pass the same pre-apply gate as a `.json`
+    // candidate (validation, then epoch, then signature) before it is
+    // applied. The tests below exercise behaviour on both routes, never
+    // the id == file-stem check: bundle records have no file stem.
+
+    fn bundle_record(value: Value) -> MeshRecord {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// Replay one record carried ONLY inside a `.bundle.zst` (committed
+    /// like any mesh content) into a fresh store. `manifest_epoch`
+    /// migrates the mesh manifest to that epoch before the bundle lands.
+    async fn run_bundle_route(
+        tag: &str,
+        record: MeshRecord,
+        manifest_epoch: Option<u32>,
+    ) -> (ApplyReport, std::sync::Arc<dyn VectorStore>) {
+        run_bundle_route_with_signers(tag, record, manifest_epoch, Vec::new()).await
+    }
+
+    /// `run_bundle_route` with the mesh manifest's signer allowlist
+    /// populated: the replay then verifies signatures against a
+    /// NON-empty `manifest.signers`, so a `Verified` disposition is
+    /// trusted verification, not just self-consistent crypto.
+    async fn run_bundle_route_with_signers(
+        tag: &str,
+        record: MeshRecord,
+        manifest_epoch: Option<u32>,
+        signers: Vec<super::super::manifest::SignerEntry>,
+    ) -> (ApplyReport, std::sync::Arc<dyn VectorStore>) {
+        let (_base, mesh) = mesh_with_commit(tag);
+        let mesh = match manifest_epoch {
+            Some(epoch) => reopen_with_epoch(&mesh, epoch),
+            None => mesh,
+        };
+        let mesh = if signers.is_empty() {
+            mesh
+        } else {
+            reopen_with_signers(&mesh, signers)
+        };
+        crate::synaptic_mesh::worker::write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "test",
+            &[record],
+        )
+        .expect("bundle writes");
+        mesh.commit_all("bundle artifact", "node-peer-1").unwrap();
+        let store = fresh_store(tag).await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("bundle-route replay completes");
+        (report, store)
+    }
+
+    /// Replay the same record as a committed `.json` candidate into a
+    /// fresh store — the other half of every parity assertion.
+    async fn run_json_route(
+        tag: &str,
+        value: &Value,
+        manifest_epoch: Option<u32>,
+    ) -> (ApplyReport, std::sync::Arc<dyn VectorStore>) {
+        let (_base, mesh) = mesh_with_commit(tag);
+        let mesh = match manifest_epoch {
+            Some(epoch) => reopen_with_epoch(&mesh, epoch),
+            None => mesh,
+        };
+        let id = value["id"].as_str().expect("record value carries an id");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            id,
+            &serde_json::to_string(value).unwrap(),
+        );
+        let store = fresh_store(tag).await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("json-route replay completes");
+        (report, store)
+    }
+
+    /// The ignore reasons of a report, stripped of the route-specific
+    /// source prefix (`<rel path>: ` on the `.json` route,
+    /// `<bundle path> (<record id>): ` on the bundle route) so reasons
+    /// can be compared across routes.
+    fn ignore_reasons(report: &ApplyReport) -> Vec<String> {
+        report
+            .ignored
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once(": ")
+                    .map(|(_, reason)| reason.to_string())
+                    .unwrap_or_else(|| entry.clone())
+            })
+            .collect()
+    }
+
+    /// A bundle-only record with an unknown schema version is rejected
+    /// by validation and never applied — the `.json` route's refusal,
+    /// now on the bundle route too. Validation precedes signature
+    /// accounting, so neither signature counter moves.
+    #[tokio::test]
+    async fn bundle_only_record_with_unknown_schema_version_is_rejected_and_not_applied() {
+        let id = Uuid::new_v4();
+        let value = record_value(
+            "synaptic-mesh-record/v99",
+            id,
+            "probe",
+            "rule",
+            "active",
+            None,
+            json!({"text": "from the future"}),
+        );
+        let (report, store) = run_bundle_route("bundle-schema", bundle_record(value), None).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.unsigned_accepted, 0, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("synaptic-mesh-record/v99"),
+            "the unknown version is named: {joined}"
+        );
+        assert!(
+            joined.contains("synaptic-mesh-record/v1"),
+            "the supported version is named: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// A bundle-only record carrying a detectable secret is refused by
+    /// the secret scan inside validation, named in the report, and
+    /// never applied.
+    #[tokio::test]
+    async fn bundle_only_record_with_secret_is_rejected_and_not_applied() {
+        let id = Uuid::new_v4();
+        let pat = format!("ghp_{}", "A".repeat(36));
+        let value = simple_rule(id, &format!("use this token: {pat}"));
+        let (report, store) = run_bundle_route("bundle-secret", bundle_record(value), None).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.unsigned_accepted, 0, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("secret scan"),
+            "the refusal names the scan: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// A bundle-only record carrying a runtime procedure counter is
+    /// refused by validation and never applied: counters are strictly
+    /// local and never travel, on either route. The refusal's report
+    /// entry names the record (the bundle route's `rel` carries the
+    /// record id).
+    #[tokio::test]
+    async fn bundle_only_record_with_runtime_counter_is_rejected_and_not_applied() {
+        let id = Uuid::new_v4();
+        let mut value = simple_rule(id, "carries a local counter");
+        value["metadata"]["remaining_fires"] = json!(3);
+        let (report, store) = run_bundle_route("bundle-counter", bundle_record(value), None).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.unsigned_accepted, 0, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("runtime procedure counters"),
+            "the refusal names the counters: {joined}"
+        );
+        assert!(
+            joined.contains(&id.to_string()),
+            "the entry identifies the record: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// The per-record byte cap is part of the portable validation
+    /// subset: a bundle record whose serialized form exceeds
+    /// `MAX_RECORD_BYTES` is refused by the bundle validator with the
+    /// same reason the `.json` route gives an oversized file. (The
+    /// route-level consequence of an over-cap payload — wholesale
+    /// decode refusal, nothing applied — is covered end-to-end by
+    /// `bundle_with_over_cap_record_is_not_applied_end_to_end` below.)
+    #[test]
+    fn bundle_validation_rejects_record_over_per_record_cap() {
+        let id = Uuid::new_v4();
+        let big_text = "x".repeat(MAX_RECORD_BYTES + 1);
+        let record = bundle_record(simple_rule(id, &big_text));
+        let err = validate_bundle_record(record, &["probe".to_string()])
+            .expect_err("an over-cap bundle record must be refused");
+        assert!(
+            err.contains("per-record cap"),
+            "the reason names the cap: {err}"
+        );
+        assert!(
+            err.contains(&MAX_RECORD_BYTES.to_string()),
+            "the cap value is named: {err}"
+        );
+    }
+
+    /// Over-cap, end-to-end: the real bundle writer carries a record
+    /// whose serialized form exceeds `MAX_RECORD_BYTES` without
+    /// refusing (`write_compressed_bundle` serializes and compresses
+    /// with no size check), so the bundle CAN be constructed — but its
+    /// decompressed payload (the one-element record array) exceeds
+    /// the aggregate decode cap (`DEFAULT_MESH_MAX_DECOMPRESSED_BYTES`,
+    /// also 1 MiB), so the scan cannot decode it at all: it is logged
+    /// and skipped wholesale, with no report entry and nothing
+    /// applied. Enforcement on this route is therefore the decode
+    /// aggregate cap; the validator-level per-record check on the
+    /// serialized form (the test above) pins the measure at the
+    /// validation layer, for any path that reaches it.
+    #[tokio::test]
+    async fn bundle_with_over_cap_record_is_not_applied_end_to_end() {
+        let id = Uuid::new_v4();
+        let big_text = "x".repeat(MAX_RECORD_BYTES + 1);
+        let record = bundle_record(simple_rule(id, &big_text));
+        let (report, store) = run_bundle_route("bundle-over-cap", record, None).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert!(
+            report.ignored.is_empty(),
+            "an undecodable bundle leaves no report entry: {report:?}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// A bundle-only record born in an older epoch is rejected by the
+    /// epoch gate specifically: the refusal names both epochs, no
+    /// signature counter moves (the epoch gate precedes signature
+    /// verification), and the record is not quietly counted as a
+    /// replay skip either.
+    #[tokio::test]
+    async fn bundle_only_record_with_old_epoch_is_rejected_by_epoch_gate() {
+        let id = Uuid::new_v4();
+        // Born in epoch 1; the mesh manifest migrates to epoch 2.
+        let value = simple_rule(id, "published before the purge");
+        let (report, store) =
+            run_bundle_route("bundle-epoch-old", bundle_record(value), Some(2)).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert_eq!(
+            report.skipped_update_id, 0,
+            "an epoch refusal is not a replay skip: {report:?}"
+        );
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.unsigned_accepted, 0, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("old-epoch"),
+            "the refusal names the old epoch: {joined}"
+        );
+        assert!(
+            joined.contains("origin_mesh_epoch 1") && joined.contains("manifest epoch 2"),
+            "both epochs are named: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// A bundle-only record in a namespace this node does not serve is
+    /// reported in `ignored`, not silently dropped: the validation
+    /// step's served-namespace refusal replaces the bundle loop's old
+    /// silent `continue`.
+    #[tokio::test]
+    async fn bundle_only_record_in_unserved_namespace_is_reported_not_silently_dropped() {
+        let id = Uuid::new_v4();
+        let value = record_value(
+            "synaptic-mesh-record/v1",
+            id,
+            "elsewhere",
+            "rule",
+            "active",
+            None,
+            json!({"text": "belongs to another team"}),
+        );
+        let (report, store) = run_bundle_route("bundle-unserved", bundle_record(value), None).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("elsewhere") && joined.contains("is not served"),
+            "the unserved refusal is named: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// The legitimate replay path stays open: a valid, signed
+    /// bundle-only record passes the unified gate, counts as verified,
+    /// and lands in the store. The fixture manifest's signer allowlist
+    /// is populated with the test key's entry (DID + public key, as
+    /// `SignerEntry` requires), so verification runs against a
+    /// NON-empty `manifest.signers`: `verified_signed == 1` here is
+    /// trusted verification — a signer absent from the allowlist
+    /// would be refused as unauthorized, not verified.
+    #[tokio::test]
+    async fn valid_signed_bundle_only_record_still_applies() {
+        let id = Uuid::new_v4();
+        let mut record = bundle_record(simple_rule(id, "signed bundle record"));
+        let key_dir = scratch("bundle-signed-key");
+        let key_path = key_dir.join("signing.key");
+        crate::synaptic_mesh::worker::sign_record(&mut record, &key_path).expect("record signs");
+        let signers = vec![super::super::manifest::SignerEntry {
+            did: record
+                .signer_did
+                .clone()
+                .expect("a signed record carries a signer DID"),
+            public_key: record
+                .public_key
+                .clone()
+                .expect("a signed record carries a public key"),
+            role: "signer".to_string(),
+        }];
+        let (report, store) =
+            run_bundle_route_with_signers("bundle-signed", record, None, signers).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert_eq!(report.verified_signed, 1, "report: {report:?}");
+        assert_eq!(report.unsigned_accepted, 0, "report: {report:?}");
+        assert_eq!(report.unauthorized_signer, 0, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied from signed bundle");
+        assert_eq!(payload.content, "signed bundle record");
+    }
+
+    /// A bundle-only record that is SIGNED over the canonical-JSON
+    /// payload and carries an RDF block with a Phase-1 violation (empty
+    /// `rdf.quads`) is still APPLIED: the RDF diagnostic is attached
+    /// AFTER signature verification, so the signature is checked over the
+    /// record exactly as it arrived.
+    ///
+    /// Before the deferral the diagnostic was inserted into
+    /// `record.metadata` before `verify_record_signature`. The canonical
+    /// JSON signing bytes cover `metadata`, so the valid signature no
+    /// longer matched and the whole record was ignored — a signed record
+    /// that arrived with a warn-worthy RDF block could never be applied.
+    ///
+    /// The record is signed over the canonical-JSON payload on purpose:
+    /// that is the payload whose bytes include `metadata`, and therefore
+    /// the one the diagnostic mutation could break. (A record signed over
+    /// the RDF payload — `{quads}\n{update_id}\n{origin_mesh_epoch}` —
+    /// would verify either way, because that payload carries no
+    /// metadata.)
+    #[tokio::test]
+    async fn bundle_only_signed_record_with_rdf_diagnostic_is_still_applied() {
+        let id = Uuid::new_v4();
+        let mut record = bundle_record(simple_rule(id, "signed bundle record with rdf diagnostic"));
+        // An RDF block that trips a Phase-1 canonical-RDF violation.
+        record.rdf = Some(RdfBlock {
+            schema: "neurostrata-rdf-record/v1".to_string(),
+            format: "n-quads".to_string(),
+            canonical_hash: String::new(),
+            quads: String::new(),
+        });
+        let key_dir = scratch("bundle-rdf-diagnostic-key");
+        let key_path = key_dir.join("signing.key");
+        let (pkey, did, pubkey) =
+            crate::did::load_or_generate_keypair(&key_path).expect("the scratch signing key loads");
+        // Sign over the canonical-JSON bytes of the record AS IT ARRIVED:
+        // the signer DID and public key are part of those bytes, the
+        // signature field is not (it is stripped before canonicalizing),
+        // and the Phase-1 diagnostic is not in them yet.
+        record.signer_did = Some(did.clone());
+        record.public_key = Some(hex::encode(&pubkey));
+        let payload = crate::did::canonical_signing_bytes(
+            &serde_json::to_value(&record).expect("the record canonicalizes"),
+        )
+        .expect("the canonical signing bytes are computable");
+        let sig = crate::did::sign(&payload, &pkey).expect("the record signs");
+        record.signature = Some(crate::did::encode_base64(&sig));
+        let signers = vec![super::super::manifest::SignerEntry {
+            did: record
+                .signer_did
+                .clone()
+                .expect("a signed record carries a signer DID"),
+            public_key: record
+                .public_key
+                .clone()
+                .expect("a signed record carries a public key"),
+            role: "signer".to_string(),
+        }];
+        let (report, store) =
+            run_bundle_route_with_signers("bundle-rdf-diagnostic", record, None, signers).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert_eq!(report.verified_signed, 1, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 0, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied from signed bundle");
+        assert_eq!(
+            payload
+                .metadata
+                .get("rdf_diagnostic_phase")
+                .and_then(|v| v.as_str()),
+            Some("1"),
+            "the applied record still carries the Phase-1 diagnostic: {:?}",
+            payload.metadata
+        );
+        let violations = payload
+            .metadata
+            .get("rdf_diagnostic_violations")
+            .and_then(|v| v.as_array())
+            .expect("the applied record still carries the diagnostic violations");
+        assert!(
+            !violations.is_empty(),
+            "the diagnostic names at least one violation"
+        );
+    }
+
+    /// A bundle record signed with a scratch key and then tampered
+    /// with (a signed field mutated after signing) is rejected on the
+    /// bundle route by signature verification: not applied,
+    /// `signature_rejected` moves, and an ignored entry exists. This
+    /// is the route-level guard against a verification stub that
+    /// always answers Verified.
+    #[tokio::test]
+    async fn bundle_only_record_with_tampered_signature_is_rejected_and_not_applied() {
+        let id = Uuid::new_v4();
+        let mut record = bundle_record(simple_rule(id, "signed bundle record"));
+        let key_dir = scratch("bundle-tampered-key");
+        let key_path = key_dir.join("signing.key");
+        crate::synaptic_mesh::worker::sign_record(&mut record, &key_path).expect("record signs");
+        record.content = json!({"text": "tampered after signing"});
+        let (report, store) = run_bundle_route("bundle-tampered", record, None).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.unsigned_accepted, 0, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 1, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("signature verification failed"),
+            "the refusal names the failed verification: {joined}"
+        );
+        assert!(
+            joined.contains(&id.to_string()),
+            "the entry identifies the record: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// Behavioural equivalence: the same record is accepted or rejected
+    /// identically — same applied count, same applied ids, same ignore
+    /// reasons, same signature/disposition counters, same store
+    /// outcome — on the `.json` route and the bundle-only route, across
+    /// a valid record and four portable validation failures (including
+    /// a secret on the METADATA surface, not just in content), plus
+    /// the epoch gate under a migrated manifest. Every case also
+    /// carries an ABSOLUTE expectation, so a change that breaks BOTH
+    /// routes the same way still fails this test. A future change to
+    /// one route's gate that diverges from the other fails it too.
+    #[tokio::test]
+    async fn bundle_and_json_routes_accept_and_reject_identically() {
+        let valid_id = Uuid::new_v4();
+        let schema_id = Uuid::new_v4();
+        let secret_id = Uuid::new_v4();
+        let metadata_secret_id = Uuid::new_v4();
+        let structural_id = Uuid::new_v4();
+        let pat = format!("ghp_{}", "B".repeat(36));
+        let pat_meta = format!("ghp_{}", "C".repeat(36));
+        let mut metadata_secret =
+            simple_rule(metadata_secret_id, "clean content, secret in metadata");
+        metadata_secret["metadata"]["note"] = json!(format!("use this token: {pat_meta}"));
+        let cases: Vec<(&str, Value, usize)> = vec![
+            ("valid", simple_rule(valid_id, "applies on both routes"), 1),
+            (
+                "unknown-schema",
+                record_value(
+                    "synaptic-mesh-record/v99",
+                    schema_id,
+                    "probe",
+                    "rule",
+                    "active",
+                    None,
+                    json!({"text": "from the future"}),
+                ),
+                0,
+            ),
+            (
+                "secret",
+                simple_rule(secret_id, &format!("use this token: {pat}")),
+                0,
+            ),
+            ("secret-in-metadata", metadata_secret, 0),
+            (
+                "non-shareable-type",
+                record_value(
+                    "synaptic-mesh-record/v1",
+                    structural_id,
+                    "probe",
+                    "structural",
+                    "active",
+                    None,
+                    json!({"text": "project-local, never travels"}),
+                ),
+                0,
+            ),
+        ];
+        for (name, value, expected_applied) in cases {
+            let (json_report, json_store) =
+                run_json_route(&format!("equiv-json-{name}"), &value, None).await;
+            let (bundle_report, bundle_store) = run_bundle_route(
+                &format!("equiv-bundle-{name}"),
+                bundle_record(value.clone()),
+                None,
+            )
+            .await;
+            assert_eq!(
+                json_report.applied, expected_applied,
+                "{name}: json applied is not the absolute expectation: {json_report:?}"
+            );
+            assert_eq!(
+                bundle_report.applied, expected_applied,
+                "{name}: bundle applied is not the absolute expectation: {bundle_report:?}"
+            );
+            if expected_applied == 0 {
+                assert!(
+                    !json_report.ignored.is_empty(),
+                    "{name}: json route must report the rejection: {json_report:?}"
+                );
+                assert!(
+                    !bundle_report.ignored.is_empty(),
+                    "{name}: bundle route must report the rejection: {bundle_report:?}"
+                );
+            }
+            assert_eq!(
+                json_report.applied, bundle_report.applied,
+                "{name}: applied counts diverge (json {json_report:?} vs bundle {bundle_report:?})"
+            );
+            assert_eq!(
+                json_report.applied_ids, bundle_report.applied_ids,
+                "{name}: applied ids diverge"
+            );
+            assert_eq!(
+                json_report.verified_signed, bundle_report.verified_signed,
+                "{name}: verified_signed diverges"
+            );
+            assert_eq!(
+                json_report.unsigned_accepted, bundle_report.unsigned_accepted,
+                "{name}: unsigned_accepted diverges"
+            );
+            assert_eq!(
+                json_report.signature_rejected, bundle_report.signature_rejected,
+                "{name}: signature_rejected diverges"
+            );
+            assert_eq!(
+                json_report.skipped_update_id, bundle_report.skipped_update_id,
+                "{name}: skipped_update_id diverges"
+            );
+            assert_eq!(
+                ignore_reasons(&json_report),
+                ignore_reasons(&bundle_report),
+                "{name}: ignore reasons diverge (json {:?} vs bundle {:?})",
+                json_report.ignored,
+                bundle_report.ignored
+            );
+            assert_eq!(
+                row_count(&json_store, "probe").await,
+                row_count(&bundle_store, "probe").await,
+                "{name}: store outcomes diverge"
+            );
+        }
+
+        // Epoch parity under a migrated manifest (epoch 2, records born
+        // in epoch 1): both routes refuse with the epoch gate's reason.
+        let epoch_id = Uuid::new_v4();
+        let epoch_value = simple_rule(epoch_id, "born before the migration");
+        let (json_report, _) = run_json_route("equiv-json-epoch", &epoch_value, Some(2)).await;
+        let (bundle_report, _) =
+            run_bundle_route("equiv-bundle-epoch", bundle_record(epoch_value), Some(2)).await;
+        assert_eq!(json_report.applied, 0, "json report: {json_report:?}");
+        assert_eq!(bundle_report.applied, 0, "bundle report: {bundle_report:?}");
+        assert!(
+            !json_report.ignored.is_empty(),
+            "json route must report the epoch refusal: {json_report:?}"
+        );
+        assert!(
+            !bundle_report.ignored.is_empty(),
+            "bundle route must report the epoch refusal: {bundle_report:?}"
+        );
+        assert_eq!(
+            json_report.verified_signed, bundle_report.verified_signed,
+            "epoch: verified_signed diverges"
+        );
+        assert_eq!(
+            json_report.unsigned_accepted, bundle_report.unsigned_accepted,
+            "epoch: unsigned_accepted diverges"
+        );
+        assert_eq!(
+            json_report.signature_rejected, bundle_report.signature_rejected,
+            "epoch: signature_rejected diverges"
+        );
+        assert_eq!(
+            json_report.skipped_update_id, bundle_report.skipped_update_id,
+            "epoch: skipped_update_id diverges"
+        );
+        assert_eq!(
+            ignore_reasons(&json_report),
+            ignore_reasons(&bundle_report),
+            "epoch refusals diverge (json {:?} vs bundle {:?})",
+            json_report.ignored,
+            bundle_report.ignored
+        );
+        let bundle_reasons = ignore_reasons(&bundle_report).join(" | ");
+        assert!(
+            bundle_reasons.contains("old-epoch"),
+            "the bundle refusal is the epoch gate's: {bundle_reasons}"
+        );
     }
 
     // ---- contract tests ----------------------------------------------------
