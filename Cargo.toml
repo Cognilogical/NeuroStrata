@@ -75,6 +75,9 @@ tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 regex = "1.13"
+# Pinned exactly (=1.0.138), not a range: added in b674faa ("complete
+# memory architecture migration from LanceDB to Kuzu"), whose commit
+# message records that the pin resolved Kuzu C++ FFI linker errors.
 cxx = "=1.0.138"
 lbug = "0.20.4"
 axum = "0.8"
@@ -103,6 +106,7 @@ hex = "0.4"
 openssl = { version = "0.10.81", features = ["vendored"] }
 
 [build-dependencies]
+# Same exact pin as `cxx` above — see the comment there for its origin.
 cxx-build = "=1.0.138"
 
 [features]

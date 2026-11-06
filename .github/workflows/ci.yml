@@ -116,6 +116,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Version sync check
+        shell: bash
+        run: python3 tools/check_version_sync.py
+
       - name: Toolchain versions
         shell: bash
         run: |

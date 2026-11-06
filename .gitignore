@@ -29,6 +29,9 @@ target/
 # runs with HOME unset.
 .cache/
 
+# Python bytecode caches (tools/*.py checks and their tests)
+__pycache__/
+
 # Cygwin/MSYS crash dumps
 *.stackdump
 
