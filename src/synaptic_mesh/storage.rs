@@ -280,14 +280,27 @@ impl MeshStorage {
     /// ignore rule a written bundle would be staged by a later drain —
     /// and, until then, it would trip the import dirty gate as an
     /// untracked path. A tracked bundle would also be re-scanned on
-    /// every import pass. The rule is root-anchored (`/bundles`) so
-    /// same-named directories deeper in the tree — e.g. a namespace
-    /// named `bundles` — are untouched; with no trailing slash it also
-    /// matches the bundle path in whatever form it takes (directory,
-    /// regular file, or symlink). Idempotent: existing lines are never
-    /// duplicated or rewritten.
+    /// every import pass. The rule is artifact-scoped
+    /// (`/bundles/*.bundle.zst`): `write_compressed_bundle` writes
+    /// exactly `<name>.bundle.zst` directly into `bundles/` — the
+    /// drain passes `drain-<millis>` as the name — via a plain
+    /// `std::fs::write`, with no staging file and no rename, so that
+    /// suffix is the whole artifact set in-flight and at rest (a
+    /// partial write still carries it). Only those files are ignored.
+    /// Namespaces are root-level directories
+    /// (`<root>/<namespace>/{memories,procedures}/<id>.json`; see
+    /// `record_path` in `worker.rs`), so a namespace literally named
+    /// `bundles` keeps its `memories/`/`procedures/` records stageable
+    /// and publishing normally — the previous directory-level rule
+    /// (`/bundles`) silently swallowed them: `commit_all` reported
+    /// them committed while its `git add -A` never staged them. The
+    /// trade: a stray non-artifact file placed directly in `bundles/`
+    /// is no longer ignore-covered, so it shows in
+    /// `git status --porcelain` and pauses the import dirty gate
+    /// loudly instead of being hidden. Idempotent: existing lines are
+    /// never duplicated or rewritten.
     fn ensure_bundles_ignored(&self) -> Result<()> {
-        self.ensure_ignored_lines(&["/bundles"])
+        self.ensure_ignored_lines(&["/bundles/*.bundle.zst"])
     }
 
     /// Append any of `wanted` missing from the checkout's `.gitignore`.
@@ -322,7 +335,7 @@ impl MeshStorage {
         }
         // The header names the artifact class this call is keeping local;
         // both rule sets share the "never publish" rationale.
-        if wanted.contains(&"/bundles") {
+        if wanted.contains(&"/bundles/*.bundle.zst") {
             text.push_str(
                 "# Drain bundles are local-only artifacts — never publish to the mesh history.\n",
             );
