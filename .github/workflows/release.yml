@@ -4,6 +4,14 @@ name: Release
 # The rolling build lives in nightly.yml and targets its own tag, so the two
 # never write to the same release.
 #
+# Releases are produced ONLY by pushing a v* tag (or by re-running that
+# tag's run). Manual dispatch (workflow_dispatch) was removed: the
+# build-provenance attestation derives from the workflow run's ref, so a
+# dispatched run would build the requested tag's tree while its signed
+# provenance names the dispatch ref (Codex P2 on PR #24). On a tag push the
+# run's ref IS the tag, so the provenance names the built source by
+# construction.
+#
 # Each target builds on its own native runner. This dependency tree makes
 # cross-compilation impractical: openssl is vendored (built from source),
 # cxx/cxx-build needs a C++ toolchain, and fastembed links the ONNX runtime.
@@ -12,12 +20,6 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Existing tag to build and attach assets to (e.g. v1.3.1)'
-        required: true
-        type: string
 
 # Least privilege by default (J17): the workflow as a whole can only read.
 # The one job that publishes -- `release` -- re-grants contents: write for
@@ -65,14 +67,15 @@ jobs:
             archive: neurostrata-mcp-windows-amd64.zip
 
     steps:
-      # The same expression the publish job uses for TAG, so the commit built
-      # and the tag published to cannot disagree. Without an explicit ref, a
-      # workflow_dispatch run builds whatever branch it was launched from and
-      # then attaches those binaries to the requested tag.
+      # On a tag push, github.ref_name IS the tag -- the same expression the
+      # publish job uses for TAG, so the commit built and the tag published
+      # to cannot disagree. The explicit ref also documents that the
+      # checkout is the tag, never a dispatch ref (manual dispatch was
+      # removed -- see the header comment).
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: ${{ github.ref_name }}
 
       - name: Toolchain versions
         shell: bash
@@ -184,7 +187,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then

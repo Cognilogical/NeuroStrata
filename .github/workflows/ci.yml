@@ -194,6 +194,21 @@ jobs:
             echo "::error::release.yml top-level permissions must default to contents: read."
             exit 1
           fi
+          # These two assertions pin the PR #24 P2 fix: release.yml is
+          # tag-push only because the build-provenance attestation derives
+          # from the workflow run's ref, so a dispatched run would sign
+          # provenance naming the dispatch ref rather than the built tag.
+          # A future sync that reintroduces a dispatch trigger or dispatch
+          # inputs must fail this gate loudly.
+          trig="$(awk '/^on:/{f=1} /^permissions:/{f=0} f' .github/workflows/release.yml | grep -v '^[[:space:]]*#')"
+          if printf '%s\n' "$trig" | grep -q 'workflow_dispatch'; then
+            echo "::error::release.yml must not declare a workflow_dispatch trigger; releases are tag-push only (attested provenance derives from the run ref, not the checkout)."
+            exit 1
+          fi
+          if grep -v '^[[:space:]]*#' .github/workflows/release.yml | grep -q 'inputs\.'; then
+            echo "::error::release.yml must not reference the inputs context; there are no dispatch inputs — the published tag is github.ref_name."
+            exit 1
+          fi
           if grep -hE '^[[:space:]]*uses:' .github/workflows/*.yml | grep -vE '^[[:space:]]*uses:[[:space:]]*[^[:space:]@]+@[0-9a-f]{40}([[:space:]]|$)'; then
             echo "::error::Every action in every workflow must be pinned to a full commit SHA (tag in a trailing comment)."
             exit 1
