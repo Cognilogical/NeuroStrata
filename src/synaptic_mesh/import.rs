@@ -1654,6 +1654,13 @@ async fn apply_effective(
     head_signature: &str,
     signature_disposition: &SignatureDisposition,
 ) -> Disposition {
+    // 54-B: only an as-candidate apply stores the record the candidate's
+    // signature was verified over. An archived combination stores a
+    // (content, state) pair that was never the subject of that
+    // verification — the local row's content forced to Archived, or the
+    // candidate's content with its signed Active state forced to
+    // Archived — so combination rows earn no verified stamps below.
+    let stored_is_signed_candidate = matches!(shape, ApplyShape::AsCandidate);
     let (text, state, superseded_by, archived_at, tombstoned_at) = match shape {
         ApplyShape::AsCandidate => (
             content_text(record),
@@ -1756,8 +1763,14 @@ async fn apply_effective(
     // recorded, not on the mere presence of a signature: a signature that
     // verified over the canonical-JSON payload covers the whole record,
     // while one that verified only over the RDF payload covers just that
-    // lossy projection — the two earn different stamps.
-    if record.signature.is_some() {
+    // lossy projection — the two earn different stamps. The stamp also
+    // requires the stored row to BE the signed candidate
+    // (`stored_is_signed_candidate`): an archived-combination row stores
+    // a (content, state) pair the signature never covered, so it earns
+    // no verified stamp in either branch — neither
+    // `signature_verified`/`verified_signer_did` nor
+    // `rdf_signature_verified`/`rdf_verified_signer_did`.
+    if stored_is_signed_candidate && record.signature.is_some() {
         if let Some(ref did) = record.signer_did {
             if let Some(obj) = mesh_prov.as_object_mut() {
                 match signature_disposition {
@@ -3976,6 +3989,208 @@ mod tests {
         assert!(
             full_prov.get("rdf_verified_signer_did").is_none(),
             "no RDF-specific signer key on a full-record signature: {full_prov}"
+        );
+    }
+
+    // ---- finding 54-B: combination rows earn no verified stamps --------
+    //
+    // `MergeDecision::ApplyCombination` materialises a row that is NOT
+    // the signed candidate: the stored (content, state) pair was never
+    // the subject of the candidate's signature verification, in either
+    // sub-shape. The candidate's `signature_disposition` therefore must
+    // not stamp the combination row verified — for either signature
+    // branch. The gate counters still record that the CANDIDATE
+    // verified; only the stored row's provenance stamps are withheld.
+
+    /// 54-B, local-Active sub-shape: pass 1 applies an Active record
+    /// (content C_local); pass 2's candidate is Archived with DIFFERENT
+    /// content C_cand, signed with the production full-record signer
+    /// (canonical-JSON payload, disposition `Verified`). The
+    /// combination stores the LOCAL row's content forced to Archived —
+    /// text present in neither of the candidate's signed payloads — so
+    /// the stored provenance must carry NO `signature_verified` and NO
+    /// `verified_signer_did`, even though the gate counted the
+    /// candidate as verified_signed.
+    #[tokio::test]
+    async fn archived_combination_from_local_active_row_earns_no_verified_stamp() {
+        let id = Uuid::new_v4();
+        // Build and sign the pass-2 candidate first, so its signer can
+        // populate the manifest allowlist before either pass runs.
+        let mut candidate = rdf_bearing_record(id, "candidate archived edit");
+        candidate.lifecycle.state = LifecycleState::Archived;
+        candidate.lifecycle.archived_at = Some(chrono::Utc::now());
+        let key_dir = scratch("combo-local-active-key");
+        let key_path = key_dir.join("signing.key");
+        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path)
+            .expect("record signs");
+        let signers = vec![signer_entry_for(&candidate)];
+
+        let (_base, mesh) = mesh_with_commit("combo-local-active");
+        let mesh = reopen_with_signers(&mesh, signers);
+        let store = fresh_store("combo-local-active").await;
+        let served = ["probe".to_string()];
+
+        // Pass 1: the local row lands Active with the local content.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&simple_rule(id, "local active content")).unwrap(),
+        );
+        let first = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 1 applies");
+        assert_eq!(first.applied, 1, "pass 1 report: {first:?}");
+        let (_, local) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the local row was applied");
+        assert_eq!(local.content, "local active content");
+
+        // Pass 2: the signed Archived candidate with different content
+        // replays against the SAME store and lands as a combination.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
+        );
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 2 applies");
+        assert_eq!(second.applied, 1, "pass 2 report: {second:?}");
+        assert!(
+            !second.combinations.is_empty(),
+            "the combination is reported: {second:?}"
+        );
+        assert_eq!(
+            second.verified_signed, 1,
+            "the candidate itself verified at the gate: {second:?}"
+        );
+        assert!(second.ignored.is_empty(), "pass 2 report: {second:?}");
+
+        // The stored row is the combination: LOCAL content, Archived.
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the combination row was applied");
+        assert_eq!(payload.content, "local active content");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("lifecycle_state"),
+            Some(&json!("archived")),
+            "the combination row is stored archived: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("signature_verified").is_none(),
+            "no full-record stamp on a combination row: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp on a combination row: {mesh_prov}"
+        );
+    }
+
+    /// 54-B, local-Archived sub-shape: pass 1 applies an Archived
+    /// record; pass 2's candidate is Active with edited content, signed
+    /// with the legacy RDF signer (disposition `VerifiedRdfOnly`). The
+    /// combination stores the CANDIDATE's content but forced to
+    /// Archived, while the candidate signed Active — the signed
+    /// (content, state) pair was never stored — so the stored
+    /// provenance must carry NO `rdf_signature_verified` and NO
+    /// `rdf_verified_signer_did`, even though the gate counted the
+    /// candidate as rdf_only_verified.
+    #[tokio::test]
+    async fn archived_combination_from_local_archived_row_earns_no_rdf_verified_stamp() {
+        let id = Uuid::new_v4();
+        // Build and sign the pass-2 candidate first, so its signer can
+        // populate the manifest allowlist before either pass runs.
+        let mut candidate = rdf_bearing_record(id, "candidate active edit");
+        let key_dir = scratch("combo-local-archived-key");
+        let key_path = key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut candidate, &key_path);
+        let signers = vec![signer_entry_for(&candidate)];
+
+        let (_base, mesh) = mesh_with_commit("combo-local-archived");
+        let mesh = reopen_with_signers(&mesh, signers);
+        let store = fresh_store("combo-local-archived").await;
+        let served = ["probe".to_string()];
+
+        // Pass 1: the local row lands Archived.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&record_with_state(
+                id,
+                "archived",
+                None,
+                "local archived content",
+            ))
+            .unwrap(),
+        );
+        let first = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 1 applies");
+        assert_eq!(first.applied, 1, "pass 1 report: {first:?}");
+        let (_, local) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the local row was applied");
+        assert_eq!(local.content, "local archived content");
+
+        // Pass 2: the legacy RDF-signed Active candidate with edited
+        // content replays against the SAME store and lands as a
+        // combination.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
+        );
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 2 applies");
+        assert_eq!(second.applied, 1, "pass 2 report: {second:?}");
+        assert!(
+            !second.combinations.is_empty(),
+            "the combination is reported: {second:?}"
+        );
+        assert_eq!(
+            second.rdf_only_verified, 1,
+            "the candidate itself verified RDF-only at the gate: {second:?}"
+        );
+        assert_eq!(second.verified_signed, 0, "pass 2 report: {second:?}");
+        assert!(second.ignored.is_empty(), "pass 2 report: {second:?}");
+
+        // The stored row is the combination: the CANDIDATE's content,
+        // but Archived — not the Active state the candidate signed.
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the combination row was applied");
+        assert_eq!(payload.content, "candidate active edit");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("lifecycle_state"),
+            Some(&json!("archived")),
+            "the combination row is stored archived: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("rdf_signature_verified").is_none(),
+            "no RDF-only stamp on a combination row: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("rdf_verified_signer_did").is_none(),
+            "no RDF-branch signer stamp on a combination row: {mesh_prov}"
         );
     }
 
