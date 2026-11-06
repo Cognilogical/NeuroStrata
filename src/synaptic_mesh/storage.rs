@@ -703,29 +703,38 @@ mod tests {
         let base = scratch("bundles-ignored");
         let mesh = init_under(&base);
 
+        // Whether `git check-ignore` does NOT accept `path`: the raw
+        // command, because `git_out` asserts success (exit 0 = ignored).
+        let not_ignored = |path: &str| {
+            !Command::new("git")
+                .args(["check-ignore", "--quiet", path])
+                .current_dir(mesh.root())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        };
+
         let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
         assert!(
-            gitignore.lines().any(|l| l.trim() == "/bundles"),
-            ".gitignore must carry the /bundles pattern, got: {gitignore:?}"
+            gitignore.lines().any(|l| l.trim() == "/bundles/*.bundle.zst"),
+            ".gitignore must carry the /bundles/*.bundle.zst pattern, got: {gitignore:?}"
         );
         assert_eq!(
             git_out(mesh.root(), &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]),
             "",
-            "check-ignore must flag a drain bundle"
+            "check-ignore must flag a drain bundle artifact"
         );
-        assert_eq!(
-            git_out(mesh.root(), &["check-ignore", "--quiet", "bundles"]),
-            "",
-            "check-ignore must flag the bare bundle path as a file"
-        );
-        let nested = Command::new("git")
-            .args(["check-ignore", "--quiet", "probe/bundles/inner.txt"])
-            .current_dir(mesh.root())
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .unwrap();
+        // Deliberately REVERSED from the directory-level rule: the bare
+        // `bundles` path is no longer ignore-covered. Under `/bundles`
+        // this assertion demanded the opposite (see the P2 fix commit).
         assert!(
-            !nested.status.success(),
+            not_ignored("bundles"),
+            "check-ignore must NOT flag the bare bundles path"
+        );
+        assert!(
+            not_ignored("probe/bundles/inner.txt"),
             "check-ignore must NOT flag a nested same-named path"
         );
 
@@ -734,6 +743,62 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(),
             gitignore
+        );
+    }
+
+    /// Discriminating oracle for the artifact-scoped rule: a root-level
+    /// namespace literally named `bundles` publishes its records
+    /// normally, while a drain bundle artifact beside them stays
+    /// local-only. Under the old directory-level rule (`/bundles`) the
+    /// `git add -A` inside `commit_all` never staged the records, so
+    /// the `ls-files` assertions below fail there (verified against a
+    /// scratch repo carrying the old pattern).
+    #[test]
+    fn a_namespace_named_bundles_still_publishes_its_records() {
+        let base = scratch("bundles-namespace");
+        let mesh = init_under(&base);
+
+        let memories = mesh.root().join("bundles").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        std::fs::write(memories.join("m1.json"), r#"{"id":"m1"}"#).unwrap();
+        let procedures = mesh.root().join("bundles").join("procedures");
+        std::fs::create_dir_all(&procedures).unwrap();
+        std::fs::write(procedures.join("p1.json"), r#"{"id":"p1"}"#).unwrap();
+        // The artifact the rule exists for, in the same directory.
+        std::fs::write(
+            mesh.root().join("bundles").join("drain-1.bundle.zst"),
+            b"bundle bytes",
+        )
+        .unwrap();
+
+        for rel in ["bundles/memories/m1.json", "bundles/procedures/p1.json"] {
+            let out = Command::new("git")
+                .args(["check-ignore", "--quiet", rel])
+                .current_dir(mesh.root())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert!(
+                !out.status.success(),
+                "check-ignore must NOT flag the bundles-namespace record {rel}"
+            );
+        }
+
+        assert!(
+            mesh.commit_all("bundles namespace records", "node-abc123")
+                .unwrap(),
+            "commit_all must report a commit for the namespace records"
+        );
+        let tracked = git_out(mesh.root(), &["ls-files"]);
+        for rel in ["bundles/memories/m1.json", "bundles/procedures/p1.json"] {
+            assert!(
+                tracked.lines().any(|l| l == rel),
+                "{rel} must be tracked, ls-files: {tracked}"
+            );
+        }
+        assert!(
+            !tracked.lines().any(|l| l.ends_with(".bundle.zst")),
+            "no bundle artifact may be tracked, ls-files: {tracked}"
         );
     }
 }
