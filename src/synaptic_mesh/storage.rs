@@ -292,8 +292,8 @@ impl MeshStorage {
     /// `record_path` in `worker.rs`), so a namespace literally named
     /// `bundles` keeps its `memories/`/`procedures/` records stageable
     /// and publishing normally — the previous directory-level rule
-    /// (`/bundles`) silently swallowed them: `commit_all` reported
-    /// them committed while its `git add -A` never staged them. The
+    /// (`/bundles`) silently swallowed them: the drain marked them
+    /// committed while `commit_all`'s `git add -A` never staged them. The
     /// trade: a stray non-artifact file placed directly in `bundles/`
     /// is no longer ignore-covered, so it shows in
     /// `git status --porcelain` and pauses the import dirty gate
