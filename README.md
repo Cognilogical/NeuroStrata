@@ -60,6 +60,26 @@ When an orchestrator delegates to a subagent (`worker`, `checker`, `craftsman`, 
 All of that cognitive machinery lives inside **one self-managing binary**. There is no Docker Compose stack, no Python virtualenv to babysit, no YAML configuration labyrinth, and no manual database maintenance.
 
 ### 1. First-Time Install (Once Per Machine)
+
+> **No plugin build step needed for a fresh checkout.** `src/task/harness_plugins.rs`
+> embeds `plugins/opencode/dist/index.js` with `include_str!`, and that bundle is
+> tracked in the repository, so it is present on a fresh clone and the Rust build
+> compiles without any manual step. The CI include-str guard runs before the first
+> compiling step to assert the bundle exists.
+
+> **Rebuilding the OpenCode plugin.** If you edit plugin sources under
+> `plugins/opencode/`, you must rebuild the bundle and commit it before the change
+> ships — the Rust binary embeds the committed `dist/index.js`, not the source.
+> From the repository root:
+>
+> ```bash
+> (cd plugins/opencode && npm install && npm run build)
+> ```
+>
+> This step needs Node 18 or newer (the plugin declares `engines >= 18`).
+> The same applies to every other embedded plugin under `plugins/` — each one
+> ships a tracked `dist/` bundle that the Rust binary embeds.
+
 ```bash
 # 1. Build and install the single Rust binary (includes embedded LadybugDB + Tantivy + FastEmbed ONNX)
 scripts/build.sh
