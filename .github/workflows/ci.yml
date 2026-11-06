@@ -42,7 +42,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Toolchain versions
         shell: bash
@@ -109,12 +109,31 @@ jobs:
   # The build job proves compilation; this proves behavior. Single test
   # thread because the suite's per-test temp databases exhaust the mmap
   # budget when run in parallel (intermittent "Mmap for size ... failed").
+  # The matrix matches the build job's (J16): tests are behavior, not
+  # backlog. The suite had only ever run on Ubuntu before this matrix
+  # existed, and the first 3-OS run exposed pre-existing platform
+  # failures on the other two legs -- the exact failures, with their
+  # causes, are recorded in .github/quality-baseline.md. Those legs run
+  # and report but do not gate until the failures are fixed (they are
+  # bugs with their own follow-ups, not backlog); the Ubuntu leg is the
+  # hard gate it has always been. Remove a leg's `report-only` flag when
+  # its recorded failures reach zero.
   test:
-    name: test (ubuntu)
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})${{ matrix.report-only && ' (report-only)' || '' }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.report-only == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+            report-only: true
+          - os: macos-15
+            report-only: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Version sync check
         shell: bash
@@ -134,6 +153,183 @@ jobs:
             exit 1
           }
 
+      # Same vendored-OpenSSL constraint as the build job: the test build
+      # compiles lbug too. (Same as the Configure step in the build job.)
+      - name: Configure vendored OpenSSL build (Windows)
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo "OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe" >> "$GITHUB_ENV"
+          echo "C:/Program Files/NASM" >> "$GITHUB_PATH"
+
       - name: Test
         shell: bash
         run: cargo test --locked -- --test-threads=1
+
+  # Task 15a's scripted assertion for the release governance (J17),
+  # grep-level by design: release.yml must not grant contents: write at
+  # the top level (only its release job may), and every action in every
+  # workflow must be pinned to a full commit SHA. It is its own job -- a
+  # HARD gate, no continue-on-error -- because a governance regression
+  # must fail the run; riding in a report-only job (it originally sat in
+  # `fmt`) buries the signal inside a job that is expected to be red.
+  # Checkout and a shell are all it needs; no toolchain.
+  release-governance:
+    name: release governance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Release governance assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          top="$(awk '/^permissions:/{f=1} /^jobs:/{f=0} f' .github/workflows/release.yml)"
+          if printf '%s\n' "$top" | grep -q 'contents: *write'; then
+            echo "::error::release.yml grants contents: write at the top level; only the release job may."
+            exit 1
+          fi
+          if ! printf '%s\n' "$top" | grep -q 'contents: *read'; then
+            echo "::error::release.yml top-level permissions must default to contents: read."
+            exit 1
+          fi
+          if grep -hE '^[[:space:]]*uses:' .github/workflows/*.yml | grep -vE '^[[:space:]]*uses:[[:space:]]*[^[:space:]@]+@[0-9a-f]{40}([[:space:]]|$)'; then
+            echo "::error::Every action in every workflow must be pinned to a full commit SHA (tag in a trailing comment)."
+            exit 1
+          fi
+          echo "release governance assertions passed"
+
+  # Quality gates (J16). These four jobs are REPORT-ONLY: each records the
+  # pre-existing backlog in .github/quality-baseline.md and reports against
+  # it; none of them blocks a merge. The backlog itself is Task 15b's to
+  # burn down, upstream, module by module -- a tree-wide cleanup sweep is
+  # never landed from a fork. Promotion of a job from report-only to
+  # required happens only when its baseline count reaches zero.
+  fmt:
+    name: fmt (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The tree uses no toolchain action (the images provide Rust), so the
+      # component is added the same way here.
+      - name: Add rustfmt component
+        shell: bash
+        run: rustup component add rustfmt
+
+      - name: cargo fmt --check
+        shell: bash
+        run: cargo fmt --check
+
+  clippy:
+    name: clippy (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Add clippy component
+        shell: bash
+        run: rustup component add clippy
+
+      # Clippy compiles the dependency graph, so lbug's build script runs
+      # and needs CMake, exactly as in the build/test jobs.
+      - name: Verify build prerequisites
+        shell: bash
+        run: |
+          cmake --version || {
+            echo "::error::CMake is required to build lbug (LadybugDB) but was not found on this runner."
+            exit 1
+          }
+
+      - name: cargo clippy
+        shell: bash
+        run: cargo clippy --locked -- -D warnings
+
+  audit:
+    name: audit (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The maintained RustSec action, so no audit tooling is added to the
+      # repository's own dependency tree.
+      - name: cargo audit
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: deny (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The maintained cargo-deny action, for the same reason as audit.
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+
+  # The GUI compiles in CI for the first time (J16). src-tauri is a
+  # standalone crate (its own Cargo.lock, no workspace), and its build
+  # script expects the web-ui build output to already exist:
+  # tauri.conf.json sets frontendDist to ../web-ui/dist, and vite's default
+  # outDir is dist, so building web-ui in place lands the files exactly
+  # where the configured path points.
+  #
+  # REPORT-ONLY for now, and the reason is a bug, not backlog: the first
+  # run failed in the web-ui build on a tracked symlink that is broken on
+  # every clean checkout (web-ui/public/graph.json ->
+  # ../../.NeuroStrata/graph/graph.json, a generated directory that does
+  # not exist in a fresh clone; vite stats it and dies with ENOENT). The
+  # finding is recorded in .github/quality-baseline.md. When that bug is
+  # fixed this flag comes off and the job becomes the required gate it
+  # was meant to be -- a GUI that does not compile is a bug, not style.
+  gui:
+    name: gui (tauri build) (report-only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      # Tauri v2's Linux prerequisites. Without them the webkit2gtk-sys
+      # build script fails on a stock ubuntu-latest runner before any Rust
+      # compiles.
+      - name: Install Tauri prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Build web-ui (frontendDist)
+        working-directory: web-ui
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+
+      # --features custom-protocol because a plain cargo build otherwise
+      # produces the dev shape (see the feature's comment in
+      # src-tauri/Cargo.toml): the production shape is the one that embeds
+      # frontendDist, and it is the one worth compiling in CI.
+      - name: Build the Tauri app
+        working-directory: src-tauri
+        shell: bash
+        run: cargo build --locked --features custom-protocol
