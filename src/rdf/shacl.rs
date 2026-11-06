@@ -221,18 +221,21 @@ pub fn validate_memory(payload: &MemoryPayload) -> Vec<ShaclViolation> {
     // Required fields per memory_type (F18).
     match payload.memory_type.as_str() {
         "rule" => {
-            if let Some(source) = payload.metadata.get("source") {
-                let blank = source.as_str().map(|s| s.trim().is_empty()).unwrap_or(true);
-                if blank {
-                    out.push(ShaclViolation {
-                        field: "metadata.source".to_string(),
-                        why: "source must be non-blank for a rule".to_string(),
-                    });
-                }
-            } else {
+            // A rule carries provenance only if `has_source` reports true: a
+            // non-empty string OR a non-empty object. Blank/whitespace string,
+            // empty object {}, and other scalar types read as unsourced, so we
+            // delegate to crate::traits::has_source rather than re-implementing
+            // the rule — the task gate and search ranker already share this
+            // predicate, so any future drift between them begins here.
+            let sourced = crate::traits::has_source(&payload.metadata);
+            if !sourced {
                 out.push(ShaclViolation {
                     field: "metadata.source".to_string(),
-                    why: "source is required for a rule".to_string(),
+                    why: if payload.metadata.get("source").is_none() {
+                        "source is required for a rule".to_string()
+                    } else {
+                        "source must be non-blank for a rule".to_string()
+                    },
                 });
             }
             if let Some(enf) = payload.metadata.get("enforcement") {
@@ -429,6 +432,101 @@ mod tests {
     fn endpoint_contains_task_task_and_rejects_invalid() {
         assert!(endpoint_role_allowed("CONTAINS", "task", "task"), "task contains task should be valid");
         assert!(!endpoint_role_allowed("CONTAINS", "rule", "fact"), "rule contains fact should be invalid");
+    }
+
+    #[test]
+    fn rule_source_nonempty_object_is_sourced() {
+        let payload = MemoryPayload {
+            content: "x".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: serde_json::json!({ "source": { "kind": "release-run", "ref": "v1.16.0" } }),
+        };
+        let v = validate_memory(&payload);
+        assert!(v.iter().all(|vi| vi.field != "metadata.source"), "object source must be sourced: {:?}", v);
+    }
+
+    #[test]
+    fn rule_source_empty_object_is_blank() {
+        let payload = MemoryPayload {
+            content: "x".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: serde_json::json!({ "source": {} }),
+        };
+        let v = validate_memory(&payload);
+        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")), "empty object source is blank: {:?}", v);
+    }
+
+    #[test]
+    fn rule_source_whitespace_string_is_blank() {
+        let payload = MemoryPayload {
+            content: "x".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: serde_json::json!({ "source": "   " }),
+        };
+        let v = validate_memory(&payload);
+        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")), "whitespace string is blank: {:?}", v);
+    }
+
+    #[test]
+    fn rule_source_nonempty_string_is_sourced() {
+        let payload = MemoryPayload {
+            content: "x".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: serde_json::json!({ "source": "owner 2026-10-08" }),
+        };
+        let v = validate_memory(&payload);
+        assert!(v.iter().all(|vi| vi.field != "metadata.source"), "string source must be sourced: {:?}", v);
+    }
+
+    #[test]
+    fn rule_source_missing_is_required() {
+        let payload = MemoryPayload {
+            content: "x".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: serde_json::json!({}),
+        };
+        let v = validate_memory(&payload);
+        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("source is required")), "missing source is required: {:?}", v);
+    }
+
+    #[test]
+    fn rule_source_null_is_present_but_unusable() {
+        // A key that is PRESENT but null is not the same as an absent key:
+        // the absent case says "required", the present-but-unusable case says
+        // "must be non-blank". Which message comes back tells the caller
+        // whether to supply a source or to fix the one it already supplied.
+        let payload = MemoryPayload {
+            content: "x".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: "".to_string(),
+            location_lines: "".to_string(),
+            metadata: serde_json::json!({ "source": null }),
+        };
+        let v = validate_memory(&payload);
+        assert!(v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("must be non-blank")), "a null source is present but unusable: {:?}", v);
+        assert!(!v.iter().any(|vi| vi.field == "metadata.source" && vi.why.contains("source is required")), "a present source is not a missing source: {:?}", v);
     }
 
     #[test]

@@ -872,6 +872,7 @@ mod tests {
         }
         for blank in [
             json!({ "source": null }),
+            json!({ "source": {} }),
             json!({ "source": "" }),
             json!({ "source": "  " }),
             json!({ "source": 42 }),

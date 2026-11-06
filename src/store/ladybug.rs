@@ -2445,8 +2445,18 @@ impl LadybugStore {
                 let mut dangling_changed = false;
                 // (a) rule source
                 if mtype == "rule" {
+                    // A source is usable provenance when it is a non-empty string
+                    // or a non-empty object -- `crate::traits::has_source` is the
+                    // canonical predicate for that, and the task gate and the
+                    // SHACL checker both ask it. Reading the field as a string
+                    // alone made an object source look blank, and this repair
+                    // would then OVERWRITE the structured origin with the row's
+                    // location: the repair destroyed the provenance it was
+                    // supposed to preserve. "N/A" stays a placeholder, not a
+                    // source, so it is still repaired.
                     let src = meta.get("source").and_then(|v| v.as_str()).unwrap_or("");
-                    if src.is_empty() || src.trim().is_empty() || src == "N/A" {
+                    let usable = crate::traits::has_source(&meta) && src != "N/A";
+                    if !usable {
                         let val = if !loc.is_empty() && loc != "N/A" { loc.clone() } else { "legacy-rule".to_string() };
                         if let Some(obj) = meta.as_object_mut() {
                             obj.insert("source".to_string(), serde_json::Value::String(val));
@@ -13158,6 +13168,39 @@ eurostrata\src\daemon.rs",
             warnings.iter().any(|w| w.get("field").and_then(|f| f.as_str()) == Some("metadata.source")),
             "expected metadata.source SHACL warning in shape_warnings: {:?}",
             warnings
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hygiene repair must not DESTROY a structured source. Reading
+    /// `metadata.source` as a string alone made an object source look blank,
+    /// and the repair then overwrote the provenance it was meant to preserve
+    /// with the row's location. `crate::traits::has_source` is the canonical
+    /// predicate for "this names its origin", so the repair asks it too.
+    #[tokio::test]
+    async fn repair_hygiene_keeps_an_object_valued_rule_source() {
+        let dir = std::env::temp_dir().join(format!("ns-repair-src-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+
+        let rule = retired_test_payload("rule", "agent", json!({
+            "source": { "kind": "release-run", "ref": "v1.16.0" },
+        }));
+        store.upsert("probe", "rule-object-source", v.clone(), rule).await.unwrap();
+
+        let (shape_fixes, _) = store.repair_namespace_hygiene("probe").await.unwrap();
+        assert_eq!(shape_fixes, 0, "an object source is provenance: nothing to repair");
+
+        let rows = store.list_memories("probe", None, None).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == "rule-object-source")
+            .expect("the row survives the repair");
+        assert_eq!(
+            row.payload.metadata.get("source"),
+            Some(&json!({ "kind": "release-run", "ref": "v1.16.0" })),
+            "the repair must not overwrite an object source with a string"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

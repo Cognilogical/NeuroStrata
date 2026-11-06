@@ -29,6 +29,18 @@ pub mod traits {
         pub location_lines: String,
         pub metadata: Value,
     }
+
+    /// Stand-in for src/traits.rs::has_source. Pinned against the shipped
+    /// semantics so a future edit to the local copy fails the drift guard.
+    pub fn has_source(metadata: &Value) -> bool {
+        metadata
+            .get("source")
+            .map(|s| {
+                s.as_str().is_some_and(|x| !x.trim().is_empty())
+                    || s.as_object().is_some_and(|o| !o.is_empty())
+            })
+            .unwrap_or(false)
+    }
 }
 
 // Import SHACL validation module directly from source (binary crate can't import crate::)
@@ -235,6 +247,85 @@ fn test_memory_shacl_valid_payload_no_violations() {
     
     let violations = validate_memory(&mp);
     assert!(violations.is_empty(), "Valid payload should have no violations, got: {:?}", violations);
+}
+
+/// Extracts the body of the function whose signature starts with `sig`.
+///
+/// Brace matching, not `rfind` over the remainder of the file: guessing the
+/// closing brace would swallow every later function, and any anchor checked
+/// against that region could be satisfied by unrelated code -- which is
+/// exactly the drift this guard exists to catch.
+fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+    let start = src
+        .find(sig)
+        .unwrap_or_else(|| panic!("signature {sig:?} not found"));
+    let rest = &src[start..];
+    let brace_open = rest
+        .find('{')
+        .unwrap_or_else(|| panic!("{sig:?} opens with '{{'"));
+    let mut depth = 0usize;
+    for (offset, ch) in rest[brace_open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[brace_open + 1..brace_open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("{sig:?} body closes with '}}'");
+}
+
+/// Whitespace-insensitive form of a function body, so two implementations
+/// that differ only in formatting compare equal.
+fn squashed(body: &str) -> String {
+    body.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Drift guard for the shipped `has_source` predicate in `src/traits.rs`.
+///
+/// Two things must hold, and both are checked against the real files on disk
+/// (same pattern as `local_memory_payload_matches_the_shipped_struct`):
+///
+/// 1. The shipped `has_source` still expresses the string-or-object
+///    provenance rule. The anchors are behavior-bearing expressions, not
+///    comments: a rewrite that drops the non-empty-object branch, drops the
+///    trim on a blank string, or flips the absent-key default breaks one of
+///    them and fails this test.
+/// 2. The stand-in this integration test exercises is the same code as the
+///    shipped predicate. Without this, the test would validate a copy that
+///    had already drifted away from the one `src/rdf/shacl.rs` delegates to
+///    in production.
+#[test]
+fn shipped_has_source_exists_and_preserves_provenance_semantics() {
+    let src = std::fs::read_to_string("src/traits.rs").expect("src/traits.rs readable");
+    let body = fn_body(&src, "pub fn has_source");
+
+    for anchor in [
+        "as_str().is_some_and",
+        "!x.trim().is_empty()",
+        "as_object().is_some_and",
+        "!o.is_empty()",
+        "unwrap_or(false)",
+    ] {
+        assert!(
+            body.contains(anchor),
+            "shipped has_source drifted: missing behavior-bearing token \"{anchor}\"\nactual body:\n{body}",
+        );
+    }
+
+    // The stand-in must be the shipped predicate, not a lookalike.
+    let test_src = std::fs::read_to_string("tests/shacl_validation_test.rs")
+        .expect("tests/shacl_validation_test.rs readable");
+    let stand_in = fn_body(&test_src, "pub fn has_source");
+    assert_eq!(
+        squashed(stand_in),
+        squashed(body),
+        "the has_source stand-in in this test drifted from the shipped predicate in src/traits.rs",
+    );
 }
 
 #[test]
