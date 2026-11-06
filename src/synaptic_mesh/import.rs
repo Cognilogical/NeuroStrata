@@ -1766,7 +1766,13 @@ async fn apply_effective(
                         obj.insert("signature_verified".to_string(), json!(true));
                     }
                     SignatureDisposition::VerifiedRdfOnly => {
-                        obj.insert("verified_signer_did".to_string(), json!(did));
+                        // 54-A: NOT `verified_signer_did` — rebac derives
+                        // the resource owner from that key and the owner
+                        // is always allowed, so it is owner-grade signer
+                        // attribution. An RDF-only signature attests only
+                        // to the lossy RDF payload, not the full record;
+                        // its signer provenance is RDF-branch only.
+                        obj.insert("rdf_verified_signer_did".to_string(), json!(did));
                         obj.insert("rdf_signature_verified".to_string(), json!(true));
                     }
                     _ => {}
@@ -3616,7 +3622,11 @@ mod tests {
     /// `signature_verified` key. Before the fix the two payload branches
     /// were OR-ed into one `Verified`, so this record counted as
     /// `verified_signed` and was stamped `signature_verified: true`
-    /// even though the added key was never signed.
+    /// even though the added key was never signed. Signer attribution
+    /// is likewise branch-aware (54-A): the signer is recorded under
+    /// the RDF-specific `rdf_verified_signer_did` key only, never
+    /// under the owner-grade `verified_signer_did` key that rebac
+    /// derives the resource owner from.
     #[tokio::test]
     async fn rdf_only_signature_with_json_tampered_outside_projection_is_not_fully_verified() {
         let id = Uuid::new_v4();
@@ -3658,10 +3668,14 @@ mod tests {
             mesh_prov.get("signature_verified").is_none(),
             "no full-record stamp for an RDF-only signature: {mesh_prov}"
         );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp for an RDF-only signature: {mesh_prov}"
+        );
         assert_eq!(
-            mesh_prov.get("verified_signer_did"),
+            mesh_prov.get("rdf_verified_signer_did"),
             Some(&json!(signer_did)),
-            "the signer is still recorded: {mesh_prov}"
+            "the signer is recorded under the RDF-specific key only: {mesh_prov}"
         );
     }
 
@@ -3773,10 +3787,14 @@ mod tests {
             mesh_prov.get("signature_verified").is_none(),
             "no full-record stamp for an RDF-only signature: {mesh_prov}"
         );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp for an RDF-only signature: {mesh_prov}"
+        );
         assert_eq!(
-            mesh_prov.get("verified_signer_did"),
+            mesh_prov.get("rdf_verified_signer_did"),
             Some(&json!(signer_did)),
-            "the signer is recorded: {mesh_prov}"
+            "the signer is recorded under the RDF-specific key only: {mesh_prov}"
         );
     }
 
@@ -3788,7 +3806,9 @@ mod tests {
     /// test would fail. Here the record arrives as a committed `.json`
     /// file: it applies, counts as RDF-only verified (never as fully
     /// verified), and its stored provenance carries
-    /// `rdf_signature_verified` with NO `signature_verified` key.
+    /// `rdf_signature_verified` with NO `signature_verified` key and
+    /// NO owner-grade `verified_signer_did` key — the signer is
+    /// recorded under `rdf_verified_signer_did` only (54-A).
     #[tokio::test]
     async fn legacy_rdf_only_signature_applies_as_rdf_verified_only_on_json_route() {
         let id = Uuid::new_v4();
@@ -3820,10 +3840,14 @@ mod tests {
             mesh_prov.get("signature_verified").is_none(),
             "no full-record stamp for an RDF-only signature: {mesh_prov}"
         );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp for an RDF-only signature: {mesh_prov}"
+        );
         assert_eq!(
-            mesh_prov.get("verified_signer_did"),
+            mesh_prov.get("rdf_verified_signer_did"),
             Some(&json!(signer_did)),
-            "the signer is recorded: {mesh_prov}"
+            "the signer is recorded under the RDF-specific key only: {mesh_prov}"
         );
     }
 
@@ -3870,6 +3894,88 @@ mod tests {
             row_count(&store, "probe").await,
             0,
             "nothing reached the store"
+        );
+    }
+
+    /// 54-A: an RDF-only verification must NOT stamp the owner-grade
+    /// `verified_signer_did` key — `rebac::extract_resource_owner`
+    /// derives the resource owner from `metadata.mesh.verified_signer_did`
+    /// and the owner is always allowed, so that key confers owner-grade
+    /// signer attribution. An RDF signature attests only to the lossy
+    /// RDF payload, not the full record, so its signer provenance is
+    /// carried under the RDF-specific `rdf_verified_signer_did` key
+    /// instead. A full-record verification (control) keeps stamping
+    /// `verified_signer_did` exactly as before.
+    #[tokio::test]
+    async fn rdf_only_verification_does_not_stamp_owner_grade_signer_did() {
+        // RDF-only branch: legacy RDF-signed, untampered.
+        let rdf_id = Uuid::new_v4();
+        let mut rdf_record = rdf_bearing_record(rdf_id, "rdf only signer attribution rule");
+        let rdf_key_dir = scratch("rdf-only-attribution-key");
+        let rdf_key_path = rdf_key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut rdf_record, &rdf_key_path);
+        let rdf_signer_did = rdf_record
+            .signer_did
+            .clone()
+            .expect("signed record has a DID");
+        let rdf_signers = vec![signer_entry_for(&rdf_record)];
+        let (rdf_report, rdf_store) = run_bundle_route_with_signers(
+            "rdf-only-attribution",
+            rdf_record,
+            None,
+            rdf_signers,
+        )
+        .await;
+        assert_eq!(rdf_report.applied, 1, "report: {rdf_report:?}");
+        assert_eq!(rdf_report.rdf_only_verified, 1, "report: {rdf_report:?}");
+        assert_eq!(rdf_report.verified_signed, 0, "report: {rdf_report:?}");
+        let rdf_prov = stored_mesh_provenance(&rdf_store, &rdf_id).await;
+        assert!(
+            rdf_prov.get("verified_signer_did").is_none(),
+            "RDF-only verification must not stamp owner-grade verified_signer_did: {rdf_prov}"
+        );
+        assert_eq!(
+            rdf_prov.get("rdf_verified_signer_did"),
+            Some(&json!(rdf_signer_did)),
+            "the RDF-branch signer is recorded under the RDF-specific key only: {rdf_prov}"
+        );
+        assert_eq!(
+            rdf_prov.get("rdf_signature_verified"),
+            Some(&json!(true)),
+            "the RDF-branch verification stamp is retained: {rdf_prov}"
+        );
+
+        // Control: full-record verification stamps verified_signer_did.
+        let full_id = Uuid::new_v4();
+        let mut full_record = rdf_bearing_record(full_id, "full record signer attribution rule");
+        let full_key_dir = scratch("full-attribution-key");
+        let full_key_path = full_key_dir.join("signing.key");
+        crate::synaptic_mesh::worker::sign_record(&mut full_record, &full_key_path)
+            .expect("record signs");
+        let full_signer_did = full_record
+            .signer_did
+            .clone()
+            .expect("signed record has a DID");
+        let full_signers = vec![signer_entry_for(&full_record)];
+        let (full_report, full_store) = run_bundle_route_with_signers(
+            "full-attribution",
+            full_record,
+            None,
+            full_signers,
+        )
+        .await;
+        assert_eq!(full_report.applied, 1, "report: {full_report:?}");
+        assert_eq!(full_report.verified_signed, 1, "report: {full_report:?}");
+        assert_eq!(full_report.rdf_only_verified, 0, "report: {full_report:?}");
+        let full_prov = stored_mesh_provenance(&full_store, &full_id).await;
+        assert_eq!(
+            full_prov.get("verified_signer_did"),
+            Some(&json!(full_signer_did)),
+            "full-record verification keeps the owner-grade signer stamp: {full_prov}"
+        );
+        assert!(
+            full_prov.get("rdf_verified_signer_did").is_none(),
+            "no RDF-specific signer key on a full-record signature: {full_prov}"
         );
     }
 
