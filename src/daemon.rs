@@ -877,6 +877,9 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
             for line in &report.quarantined_entries {
                 tracing::warn!(entry = %line, "mesh outbox entry quarantined (old epoch)");
             }
+            if let Some(err) = &report.bundle_error {
+                tracing::warn!(error = %err, "mesh compressed bundle write failed during drain");
+            }
         }
         Ok(_) => {}
         Err(e) => tracing::warn!("mesh drain failed: {e}"),

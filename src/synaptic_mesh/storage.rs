@@ -75,6 +75,7 @@ impl MeshStorage {
         // commit.
         let mesh = MeshStorage { root, manifest };
         mesh.ensure_signing_key_ignored()?;
+        mesh.ensure_bundles_ignored()?;
 
         Ok(mesh)
     }
@@ -198,6 +199,7 @@ impl MeshStorage {
     /// in the caller, never a fallback.
     pub fn commit_all(&self, message: &str, node_id: &str) -> Result<bool> {
         self.ensure_signing_key_ignored()?;
+        self.ensure_bundles_ignored()?;
         run_ok(&self.root, &["add", "-A"])?;
         let staged = run_ok(&self.root, &["status", "--porcelain"])?;
         if String::from_utf8_lossy(&staged.stdout).trim().is_empty() {
@@ -266,7 +268,31 @@ impl MeshStorage {
     /// different physical name through `NEUROSTRATA_MESH_SIGNING_KEY`.
     /// Idempotent: existing lines are never duplicated or rewritten.
     fn ensure_signing_key_ignored(&self) -> Result<()> {
-        let wanted = [".neurostrata-mesh/signing.key", "*.key"];
+        self.ensure_ignored_lines(&[".neurostrata-mesh/signing.key", "*.key"])
+    }
+
+    /// Keep drain bundles out of the published history.
+    ///
+    /// A drain's opt-in compressed bundle lands in `<mesh_root>/bundles/`
+    /// (see `worker.rs`) and is a local-only artifact: it is a lagging
+    /// duplicate replay source, never the drain's publication channel.
+    /// [`commit_all`] stages with `git add -A`, so without an explicit
+    /// ignore rule a written bundle would be staged by a later drain —
+    /// and, until then, it would trip the import dirty gate as an
+    /// untracked path. A tracked bundle would also be re-scanned on
+    /// every import pass. Idempotent: existing lines are never duplicated
+    /// or rewritten.
+    fn ensure_bundles_ignored(&self) -> Result<()> {
+        self.ensure_ignored_lines(&["bundles/"])
+    }
+
+    /// Append any of `wanted` missing from the checkout's `.gitignore`.
+    ///
+    /// Shared body of the ignore-rule wrappers above: reads the file,
+    /// appends only the missing lines under a header naming the artifact
+    /// class being kept local, and never rewrites existing lines.
+    /// Idempotent.
+    fn ensure_ignored_lines(&self, wanted: &[&str]) -> Result<()> {
         let path = self.root.join(".gitignore");
         let existing = match std::fs::read_to_string(&path) {
             Ok(content) => content,
@@ -290,7 +316,17 @@ impl MeshStorage {
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str("# Private Ed25519 signing material — never publish to the mesh history.\n");
+        // The header names the artifact class this call is keeping local;
+        // both rule sets share the "never publish" rationale.
+        if wanted.contains(&"bundles/") {
+            text.push_str(
+                "# Drain bundles are local-only artifacts — never publish to the mesh history.\n",
+            );
+        } else {
+            text.push_str(
+                "# Private Ed25519 signing material — never publish to the mesh history.\n",
+            );
+        }
         for entry in &missing {
             text.push_str(entry);
             text.push('\n');
