@@ -295,10 +295,18 @@ impl MeshStorage {
     /// (`/bundles`) silently swallowed them: the drain marked them
     /// committed while `commit_all`'s `git add -A` never staged them. The
     /// trade: a stray non-artifact file placed directly in `bundles/`
-    /// is no longer ignore-covered, so it shows in
-    /// `git status --porcelain` and pauses the import dirty gate
-    /// loudly instead of being hidden. Idempotent: existing lines are
-    /// never duplicated or rewritten.
+    /// — or at the `bundles` path itself, as a regular file or a
+    /// symlink — is no longer ignore-covered. It shows in
+    /// `git status --porcelain` and pauses the import dirty gate, but
+    /// only until the next committing drain: [`commit_all`] stages
+    /// with an unconditional `git add -A` and no drain-side gate
+    /// check, so that drain sweeps the stray into tracked,
+    /// peer-published mesh history (a file or symlink at `bundles`
+    /// is committed as `bundles`), after which porcelain is clean
+    /// again. Under the superseded directory-level rule the whole
+    /// `bundles` path was ignore-covered, so a stray stayed hidden
+    /// indefinitely. Idempotent: existing lines are never duplicated
+    /// or rewritten.
     fn ensure_bundles_ignored(&self) -> Result<()> {
         self.ensure_ignored_lines(&["/bundles/*.bundle.zst"])
     }
