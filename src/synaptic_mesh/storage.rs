@@ -280,10 +280,14 @@ impl MeshStorage {
     /// ignore rule a written bundle would be staged by a later drain —
     /// and, until then, it would trip the import dirty gate as an
     /// untracked path. A tracked bundle would also be re-scanned on
-    /// every import pass. Idempotent: existing lines are never duplicated
-    /// or rewritten.
+    /// every import pass. The rule is root-anchored (`/bundles`) so
+    /// same-named directories deeper in the tree — e.g. a namespace
+    /// named `bundles` — are untouched; with no trailing slash it also
+    /// matches the bundle path in whatever form it takes (directory,
+    /// regular file, or symlink). Idempotent: existing lines are never
+    /// duplicated or rewritten.
     fn ensure_bundles_ignored(&self) -> Result<()> {
-        self.ensure_ignored_lines(&["bundles/"])
+        self.ensure_ignored_lines(&["/bundles"])
     }
 
     /// Append any of `wanted` missing from the checkout's `.gitignore`.
@@ -318,7 +322,7 @@ impl MeshStorage {
         }
         // The header names the artifact class this call is keeping local;
         // both rule sets share the "never publish" rationale.
-        if wanted.contains(&"bundles/") {
+        if wanted.contains(&"/bundles") {
             text.push_str(
                 "# Drain bundles are local-only artifacts — never publish to the mesh history.\n",
             );
@@ -688,13 +692,28 @@ mod tests {
 
         let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
         assert!(
-            gitignore.lines().any(|l| l.trim() == "bundles/"),
-            ".gitignore must carry the bundles/ pattern, got: {gitignore:?}"
+            gitignore.lines().any(|l| l.trim() == "/bundles"),
+            ".gitignore must carry the /bundles pattern, got: {gitignore:?}"
         );
         assert_eq!(
             git_out(mesh.root(), &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]),
             "",
             "check-ignore must flag a drain bundle"
+        );
+        assert_eq!(
+            git_out(mesh.root(), &["check-ignore", "--quiet", "bundles"]),
+            "",
+            "check-ignore must flag the bare bundle path as a file"
+        );
+        let nested = Command::new("git")
+            .args(["check-ignore", "--quiet", "probe/bundles/inner.txt"])
+            .current_dir(mesh.root())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            !nested.status.success(),
+            "check-ignore must NOT flag a nested same-named path"
         );
 
         // Idempotent: a second pass never duplicates or rewrites the rule.
