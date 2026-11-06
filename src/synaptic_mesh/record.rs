@@ -66,7 +66,14 @@ pub struct MeshRecord {
     pub origin_mesh_epoch: u32,
     /// Local trust flag. Mirrors the spec's trust model.
     pub trust: super::manifest::Trust,
-    /// Optional Ed25519 signature over canonical N-Quads + update_id + origin_mesh_epoch.
+    /// Optional Ed25519 signature.
+    ///
+    /// Records signed by current code carry a signature over the
+    /// canonical-JSON payload — the whole record (see `sign_record` in
+    /// `worker.rs`). Records signed by older code may carry a signature
+    /// over the RDF payload (canonical N-Quads + update_id +
+    /// origin_mesh_epoch) instead, which import verifies as RDF-only
+    /// (see `verify_record_signature` in `import.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     /// Optional DID of the signing node (`did:key:z6Mk...` or `did:neurostrata:node:<id>`).
