@@ -680,4 +680,28 @@ mod tests {
         mesh.ensure_signing_key_ignored().unwrap();
         assert_eq!(std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(), before);
     }
+
+    #[test]
+    fn init_ignores_drain_bundles_and_never_duplicates_the_rule() {
+        let base = scratch("bundles-ignored");
+        let mesh = init_under(&base);
+
+        let gitignore = std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l.trim() == "bundles/"),
+            ".gitignore must carry the bundles/ pattern, got: {gitignore:?}"
+        );
+        assert_eq!(
+            git_out(mesh.root(), &["check-ignore", "--quiet", "bundles/drain-1.bundle.zst"]),
+            "",
+            "check-ignore must flag a drain bundle"
+        );
+
+        // Idempotent: a second pass never duplicates or rewrites the rule.
+        mesh.ensure_bundles_ignored().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mesh.root().join(".gitignore")).unwrap(),
+            gitignore
+        );
+    }
 }
