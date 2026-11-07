@@ -4,6 +4,20 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.17.0] - 2026-11-07
+
+### Added
+
+- **NeuroMesh near-real-time multi-agent cognitive mesh transport (`src/synaptic_mesh/`, `#63`).** Extends SynapticMesh with a pluggable `MeshTransport` trait (`src/synaptic_mesh/transport.rs`), a default pure-Rust P2P transport over `tokio::net` TCP + AES-256-GCM with `nsmesh1...` Ed25519 capability invite tokens (`src/synaptic_mesh/p2p.rs`), an optional `--features nats-mesh` TCP NATS wire-protocol adapter (`src/synaptic_mesh/nats.rs`), a single-writer durable `frames.wal` outbox and range replay cursor store (`src/synaptic_mesh/outbox.rs`, `src/synaptic_mesh/reactor.rs`), signed `MeshFrame` wire envelopes with 3-gate sovereignty checks (`src/synaptic_mesh/frame.rs`), and an active-context `AttentionFilter` (`src/synaptic_mesh/attention.rs`) that injects targeted `[NeuroMesh Δ]` notices into MCP `tools/call` responses only when a peer mutates a session's active working set (`src/server.rs`). Adds CLI subcommands `synaptic-mesh up`, `join-token`, `invite`, and `peers` (`src/synaptic_mesh/cli.rs`).
+- **Autonomous Memory Control Plane — Waves 1–5 (`plugins/core/`, `src/task/harness_plugins.rs`, `#62`).** Upgrades the zero-dependency harness plugin core (`@neurostrata/plugin-core`) across OpenCode, Claude Code, Codex, and GitHub Copilot CLI with global OpenCode config propagation, fixed V2 hook signatures (`chat.message`, `tool.execute.before`, `tool.execute.after`, `experimental.chat.system.transform`), automatic user-turn semantic recall and task-intent intake, structured failure and decision memory synthesis, and an automated multi-harness CI verification matrix.
+
+### Fixed
+
+- **SynapticMesh record signing, validation, and bundle safety (`#51`, `#53`, `#54`, `#55`, `#60`).** Signs mesh records after lifecycle preservation and RDF rebuild (`#51`), routes bundle-only records through `validate_record` and `epoch_gate` (`#53`), distinguishes RDF-only from full-record signature verification (`#54`), keeps drain bundles local-only while surfacing bundle write errors (`#55`), and refuses diff-pass rollback by stale tracked bundle records (`#60`).
+- **Cross-platform CI and test harness reliability (`#48`, `#56`, `#57`, `#59`, `#61`).** Fails fast at build time when an `include_str!` target is missing from checkout (`#48`), refreshes `Cargo.lock` to clear 9 RUSTSEC advisories (`#56`), gates Unix-only permission APIs in CLI and mesh import tests for Windows builds (`#57`, `#59`), and reads HTTP requests before responding in federation tests while raising the daemon probe budget (`#61`).
+
+---
+
 ## [1.16.1] - 2026-11-05
 
 ### Fixed
