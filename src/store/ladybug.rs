@@ -3567,7 +3567,7 @@ impl VectorStore for LadybugStore {
             }
 
             // PQTH: Intake candidates table (operational, not memory rows)
-            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, candidate_kind STRING, payload STRING, confidence DOUBLE, source_span STRING, extractor_fingerprint STRING, PRIMARY KEY (id))";
+            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, candidate_kind STRING, kind STRING, category STRING, provenance STRING, payload STRING, confidence DOUBLE, source_span STRING, extractor_fingerprint STRING, PRIMARY KEY (id))";
             if let Err(e) = conn.query(create_candidates_table) {
                 if format!("{e}").to_lowercase().contains("already exists") {
                     tracing::debug!("schema DDL query note: {e}");
@@ -3577,6 +3577,9 @@ impl VectorStore for LadybugStore {
             }
             for stmt in [
                 "ALTER TABLE IntakeCandidate ADD candidate_kind STRING",
+                "ALTER TABLE IntakeCandidate ADD kind STRING",
+                "ALTER TABLE IntakeCandidate ADD category STRING",
+                "ALTER TABLE IntakeCandidate ADD provenance STRING",
                 "ALTER TABLE IntakeCandidate ADD payload STRING",
                 "ALTER TABLE IntakeCandidate ADD confidence DOUBLE",
                 "ALTER TABLE IntakeCandidate ADD source_span STRING",
@@ -3587,7 +3590,7 @@ impl VectorStore for LadybugStore {
                 }
             }
             if let Err(e) = conn.query(
-                "MATCH (c:IntakeCandidate) WHERE c.candidate_kind IS NULL OR c.candidate_kind = '' SET c.candidate_kind = 'task', c.payload = '{}', c.source_span = '', c.extractor_fingerprint = ''",
+                "MATCH (c:IntakeCandidate) WHERE c.candidate_kind IS NULL OR c.candidate_kind = '' SET c.candidate_kind = 'task', c.kind = 'task_obligation', c.category = '', c.provenance = '', c.payload = '{}', c.confidence = 0.0, c.source_span = '', c.extractor_fingerprint = ''",
             ) {
                 tracing::debug!("IntakeCandidate backfill note: {e}");
             }
@@ -7530,12 +7533,22 @@ impl crate::traits::IntakeStore for LadybugStore {
                 );
                 let safe_fp = escape_ladybug_string(&cand.extractor_fingerprint.clone().unwrap_or_default());
                 let safe_conf = cand.confidence.unwrap_or(0.0);
+                let safe_cand_kind = escape_ladybug_string(&cand.kind);
+                let safe_category = cand.category.as_ref().map(|c| escape_ladybug_string(c)).unwrap_or_default();
+                let safe_provenance = escape_ladybug_string(
+                    &cand.provenance.as_ref().map(|p| serde_json::to_string(p).unwrap_or_else(|e| {
+                        tracing::warn!("failed to serialize intake candidate provenance: {e}");
+                        String::new()
+                    })).unwrap_or_default(),
+                );
 
                 let cand_query = format!(
-                    "MERGE (c:IntakeCandidate {{id: '{}' }})\n                     ON CREATE SET c.namespace = '{}', c.receipt_id = '{}', c.title = '{}',\n                         c.description = '{}', c.review_state = '{}', c.disposition = '{}',\n                         c.task_id = '{}', c.cas_version = {}, c.created_at = '{}', c.updated_at = '{}',\n                         c.candidate_kind = '{}', c.payload = '{}', c.confidence = {}, c.source_span = '{}', c.extractor_fingerprint = '{}'",
+                    "MERGE (c:IntakeCandidate {{id: '{}' }})\n                     ON CREATE SET c.namespace = '{}', c.receipt_id = '{}', c.title = '{}',\n                         c.description = '{}', c.review_state = '{}', c.disposition = '{}',\n                         c.task_id = '{}', c.cas_version = {}, c.created_at = '{}', c.updated_at = '{}',\n                         c.candidate_kind = '{}', c.kind = '{}', c.category = '{}', c.provenance = '{}',
+                         c.payload = '{}', c.confidence = {}, c.source_span = '{}', c.extractor_fingerprint = '{}'",
                     safe_cand_id, safe_ns, safe_receipt_id, safe_title, safe_desc,
                     safe_review_state, safe_disposition, safe_task_id, cand.cas_version,
-                    safe_created, safe_updated, safe_kind, safe_payload, safe_conf, safe_span, safe_fp
+                    safe_created, safe_updated, safe_kind, safe_cand_kind, safe_category, safe_provenance,
+                    safe_payload, safe_conf, safe_span, safe_fp
                 );
                 conn.query(&cand_query)?;
             }
@@ -7686,7 +7699,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 
             // Get paginated results
             let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint ORDER BY c.created_at DESC LIMIT {}",
+                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.kind, c.category, c.provenance, c.payload, c.confidence, c.source_span, c.extractor_fingerprint ORDER BY c.created_at DESC LIMIT {}",
                 where_clause,
                 offset.saturating_add(limit)
             );
@@ -7704,11 +7717,14 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let created_at: String = format!("{}", row[9]);
                 let updated_at: String = format!("{}", row[10]);
                 let candidate_kind: String = format!("{}", row[11]);
-                let payload_str: String = format!("{}", row[12]);
-                let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
-                let source_span_str: String = format!("{}", row[14]);
+                let kind: String = format!("{}", row[12]);
+                let category_str: String = format!("{}", row[13]);
+                let provenance_str: String = format!("{}", row[14]);
+                let payload_str: String = format!("{}", row[15]);
+                let confidence: Option<f64> = format!("{}", row[16]).parse().ok();
+                let source_span_str: String = format!("{}", row[17]);
                 let extractor_fingerprint: Option<String> = {
-                    let s = format!("{}", row[15]);
+                    let s = format!("{}", row[18]);
                     if s.is_empty() || s.eq_ignore_ascii_case("null") { None } else { Some(s) }
                 };
 
@@ -7724,6 +7740,7 @@ impl crate::traits::IntakeStore for LadybugStore {
                     "pending" => crate::task::intake::Disposition::Pending,
                     "created" => crate::task::intake::Disposition::Created,
                     "linked" => crate::task::intake::Disposition::Linked,
+                    "promoted" => crate::task::intake::Disposition::Promoted,
                     "dismissed" => crate::task::intake::Disposition::Dismissed,
                     _ => crate::task::intake::Disposition::Pending,
                 };
@@ -7741,9 +7758,12 @@ impl crate::traits::IntakeStore for LadybugStore {
                     created_at,
                     updated_at,
                     candidate_kind: if candidate_kind.is_empty() || candidate_kind.eq_ignore_ascii_case("null") { "task".to_string() } else { candidate_kind },
+                    kind: if kind.is_empty() || kind.eq_ignore_ascii_case("null") { "task_obligation".to_string() } else { kind },
+                    category: if category_str.is_empty() || category_str.eq_ignore_ascii_case("null") { None } else { Some(category_str) },
                     payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
                     confidence,
                     source_span: if source_span_str.is_empty() || source_span_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&source_span_str).ok() },
+                    provenance: if provenance_str.is_empty() || provenance_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&provenance_str).ok() },
                     extractor_fingerprint,
                 });
             }
@@ -7833,7 +7853,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 
             // Fetch updated candidate
             let fetch_query = format!(
-                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint",
+                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint, c.kind, c.category, c.provenance",
                 safe_cand_id, safe_ns
             );
             let mut fetch_result = conn.query(&fetch_query)?;
@@ -7858,6 +7878,9 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let s = format!("{}", row[15]);
                 if s.is_empty() || s.eq_ignore_ascii_case("null") { None } else { Some(s) }
             };
+            let kind_db: String = format!("{}", row[16]);
+            let category_db: String = format!("{}", row[17]);
+            let provenance_db: String = format!("{}", row[18]);
 
             let review_state = match review_state_str.as_str() {
                 "pending" => crate::task::intake::ReviewState::Pending,
@@ -7888,9 +7911,12 @@ impl crate::traits::IntakeStore for LadybugStore {
                 created_at,
                 updated_at,
                 candidate_kind: if candidate_kind.is_empty() || candidate_kind.eq_ignore_ascii_case("null") { "task".to_string() } else { candidate_kind },
+                kind: if kind_db.is_empty() || kind_db.eq_ignore_ascii_case("null") { "task_obligation".to_string() } else { kind_db },
+                category: if category_db.is_empty() || category_db.eq_ignore_ascii_case("null") { None } else { Some(category_db) },
                 payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
                 confidence,
                 source_span: if source_span_str.is_empty() || source_span_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&source_span_str).ok() },
+                provenance: if provenance_db.is_empty() || provenance_db.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&provenance_db).ok() },
                 extractor_fingerprint,
             };
 

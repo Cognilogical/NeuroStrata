@@ -40,6 +40,10 @@ import {
   extractToolName,
   currentSessionEpoch,
   incrementSessionEpoch,
+  extractTurnCandidates,
+  postTurnCandidates,
+  extractConceptualBridges,
+  persistConceptualBridges,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -730,6 +734,223 @@ describe("execute.before / execute.after recall delivery", () => {
     } finally {
       server.close();
       resetModuleState();
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Wave 4 Task 4.1: extractTurnCandidates + conceptual bridges persistence
+// ──────────────────────────────────────────────────────────────────────
+
+function makeTaskCandidatesMock({ error = false } = {}) {
+  const captured = [];
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+      let body = "";
+      req.on("data", (c) => body += c);
+      req.on("end", () => {
+        try {
+          const payload = JSON.parse(body);
+          const id = payload.id ?? 0;
+          const method = payload.method;
+          const respond = (resultObj, errorObj = null) => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id, ...(errorObj ? { error: errorObj } : { result: resultObj }) }));
+          };
+          if (method !== "tools/list" && method !== "tools/call") {
+            respond(null, { code: -32601, message: "Unknown method" }); return;
+          }
+          const params = payload.params ?? {};
+          const name = params.name ?? params.arguments?.name;
+          if (method === "tools/list") {
+            respond({ tools: [{ name: "neurostrata_task_candidates" }] }); return;
+          }
+          if (name === "neurostrata_task_candidates") {
+            captured.push(params.arguments ?? {});
+            if (error) respond(null, { code: -32603, message: "intake down" });
+            else respond({ content: [{ type: "text", text: JSON.stringify({ ok: true }) }] });
+            return;
+          }
+          respond(null, { code: -32601, message: "Unknown tool" });
+        } catch { res.writeHead(400); res.end(); }
+      });
+    });
+    server.listen(0, () => {
+      const addr = server.address();
+      resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, captured });
+    });
+  });
+}
+
+describe("extractTurnCandidates", () => {
+  it("extracts a TODO: marker as a task_obligation candidate with a provenance span", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "TODO: wire the candidates",
+      turn_id: "t1",
+      source_tool: "write",
+      channel: "comment",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "task_obligation");
+    assert.equal(c.title, "TODO: wire the candidates");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, false);
+    assert.equal(c.provenance.turn_id, "t1");
+    assert.equal(c.provenance.role, "user");
+    assert.equal(c.provenance.source_tool, "write");
+    assert.equal(c.provenance.channel, "comment");
+    assert.equal(c.provenance.evidence_quote, "TODO: wire the candidates");
+    assert.equal(c.provenance.quote, "TODO: wire the candidates");
+    assert.deepEqual(c.provenance.char_range, [0, 25]);
+    assert.equal(c.provenance.confidence, 0.9);
+  });
+
+  it("detects multiple markers and returns one candidate per marker", () => {
+    const cands = extractTurnCandidates({
+      role: "checker",
+      content: "TODO: first\nFIXME: second\nfollow-up: third",
+    });
+    assert.equal(cands.length, 3);
+    assert.equal(cands[0].title, "TODO: first");
+    assert.equal(cands[1].title, "FIXME: second");
+    assert.equal(cands[2].title, "follow-up: third");
+    for (const c of cands) {
+      assert.equal(c.kind, "task_obligation");
+      assert.equal(c.auto_commit, false);
+    }
+  });
+
+  it("returns an empty array when no intent markers are present", () => {
+    assert.deepEqual(extractTurnCandidates({ role: "user", content: "just a normal sentence" }), []);
+    assert.deepEqual(extractTurnCandidates({ role: "user", content: "" }), []);
+  });
+
+  it("char_range points at the marker position within the content", () => {
+    const cands = extractTurnCandidates({ role: "user", content: "prefix TODO: mid-fix" });
+    assert.equal(cands.length, 1);
+    assert.deepEqual(cands[0].provenance.char_range, [7, 20]);
+    assert.equal(cands[0].title, "TODO: mid-fix");
+  });
+
+  it("propagates parent_task_id into provenance when provided", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "TODO: x",
+      parent_task_id: "task-9",
+    });
+    assert.equal(cands[0].provenance.parent_task_id, "task-9");
+  });
+});
+
+describe("postTurnCandidates", () => {
+  it("posts each candidate to neurostrata_task_candidates record action", async () => {
+    const { server, url, captured } = await makeTaskCandidatesMock();
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await postTurnCandidates([
+        { kind: "task_obligation", title: "one", confidence: 0.9, auto_commit: false, provenance: { role: "user", turn_id: "t1" } },
+        { kind: "task_obligation", title: "two", confidence: 0.9, auto_commit: false, provenance: { role: "user", turn_id: "t2" } },
+      ], "tc-ns");
+      assert.equal(captured.length, 2);
+      for (const cap of captured) {
+        assert.equal(cap.action, "record");
+        assert.equal(cap.namespace, "tc-ns");
+        assert.equal(cap.kind, "task_obligation");
+        assert.equal(cap.auto_commit, false);
+      }
+      assert.equal(captured[0].title, "one");
+      assert.equal(captured[1].title, "two");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("fail-soft: does not throw when mcpClient is not set", async () => {
+    resetClientForTesting();
+    await assert.doesNotReject(
+      postTurnCandidates([{ kind: "task_obligation", title: "x", confidence: 0.9, auto_commit: false, provenance: {} }], "ns"),
+    );
+  });
+
+  it("fail-soft: does not throw when the daemon errors on task_candidates", async () => {
+    const { server, url } = await makeTaskCandidatesMock({ error: true });
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await assert.doesNotReject(
+        postTurnCandidates([{ kind: "task_obligation", title: "x", confidence: 0.9, auto_commit: false, provenance: {} }], "tc-ns"),
+      );
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("extractConceptualBridges", () => {
+  it("extracts bridges from hits carrying conceptual_bridges arrays", () => {
+    const hits = [
+      {
+        id: "seed-1",
+        conceptual_bridges: [
+          { source_id: "seed-1", via_id: "v1", target_id: "t1", target_domain: "d1", target_type: "rule", target_summary: "summary 1", path: "seed-1 -> v1 -> t1" },
+        ],
+      },
+      { id: "seed-2" }, // no bridges
+    ];
+    const bridges = extractConceptualBridges(hits);
+    assert.equal(bridges.length, 1);
+    assert.equal(bridges[0].path, "seed-1 -> v1 -> t1");
+    assert.equal(bridges[0].target_id, "t1");
+    assert.equal(bridges[0].target_type, "rule");
+  });
+
+  it("dedupes bridges by path across hits", () => {
+    const hits = [
+      { id: "a", conceptual_bridges: [{ path: "p1", source_id: "a", target_id: "t" }] },
+      { id: "b", conceptual_bridges: [{ path: "p1", source_id: "b", target_id: "t" }] },
+      { id: "c", conceptual_bridges: [{ path: "p2", source_id: "c", target_id: "t" }] },
+    ];
+    const bridges = extractConceptualBridges(hits);
+    assert.equal(bridges.length, 2);
+    assert.equal(bridges[0].path, "p1");
+    assert.equal(bridges[1].path, "p2");
+  });
+
+  it("returns empty array when no hit carries conceptual_bridges", () => {
+    assert.deepEqual(extractConceptualBridges([{ id: "a" }, { id: "b" }]), []);
+    assert.deepEqual(extractConceptualBridges([]), []);
+  });
+});
+
+describe("persistConceptualBridges", () => {
+  it("writes bridges into active_session.json under conceptual_bridges and merges existing fields", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-cb-persist-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({ namespace: "NeuroStrata", task_id: "task-1", status: "in_progress" }),
+    );
+    try {
+      const bridges = [
+        { source_id: "s1", via_id: "v1", target_id: "t1", target_domain: "d", target_type: "rule", target_summary: "sum", path: "s1 -> v1 -> t1" },
+      ];
+      persistConceptualBridges(tmpDir, bridges);
+      const active = JSON.parse(readFileSync(join(nsDir, "active_session.json"), "utf8"));
+      assert.equal(active.namespace, "NeuroStrata");
+      assert.equal(active.task_id, "task-1");
+      assert.equal(active.status, "in_progress");
+      assert.deepEqual(active.conceptual_bridges, bridges);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

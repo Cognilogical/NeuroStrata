@@ -136,6 +136,71 @@ export interface TaskIntentSignal {
 export declare const MARKERS: readonly [string, string][];
 export declare const NEGATION_PREFIXES: string[];
 export declare function detectTaskIntentsLocal(text: string): TaskIntentSignal[];
+export interface ProvenanceSpan {
+    turn_id?: string;
+    role?: string;
+    source_tool?: string;
+    channel?: string;
+    evidence_quote?: string;
+    quote?: string;
+    char_range?: [number, number];
+    parent_task_id?: string;
+    confidence?: number;
+}
+export interface Turn {
+    role: string;
+    content: string;
+    turn_id?: string;
+    source_tool?: string;
+    channel?: string;
+    parent_task_id?: string;
+}
+export interface TurnCandidate {
+    kind: "task_obligation" | "memory_candidate";
+    category?: "fact" | "decision" | "rule_candidate";
+    title: string;
+    description?: string;
+    confidence: number;
+    auto_commit: boolean;
+    provenance: ProvenanceSpan;
+}
+export interface ConceptualBridge {
+    source_id?: string;
+    via_id?: string;
+    target_id?: string;
+    target_domain?: string;
+    target_type?: string;
+    target_summary?: string;
+    path?: string;
+}
+/**
+ * Extract task-obligation candidates from a turn's content. Detects local
+ * task-intent markers (TODO:, FIXME:, follow-up:, ...) via
+ * `detectTaskIntentsLocal` and attaches a provenance span
+ * (turn_id, role, source_tool, channel, evidence_quote, quote, char_range,
+ * confidence) to each. Pure: no daemon interaction. Rule candidates are
+ * never produced here (rule candidates never auto-promote).
+ */
+export declare function extractTurnCandidates(turn: Turn): TurnCandidate[];
+/**
+ * Post turn candidates fail-soft to the intake ledger via
+ * `neurostrata_task_candidates` (`action: "record"`). Never throws: a missing
+ * MCP client or a daemon error is swallowed so a turn is never blocked by
+ * intake-ledger submission.
+ */
+export declare function postTurnCandidates(candidates: TurnCandidate[], namespace: string): Promise<void>;
+/**
+ * Extract de-duplicated conceptual bridges from `memories_for_file` hits.
+ * Each hit may carry a `conceptual_bridges` array (source -> via -> target
+ * 2-hop cross-domain paths). Bridges are de-duplicated by `path`.
+ */
+export declare function extractConceptualBridges(hits: unknown[]): ConceptualBridge[];
+/**
+ * Persist conceptual bridges into `.NeuroStrata/active_session.json` under
+ * the `conceptual_bridges` key, merging with any existing fields so the
+ * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
+ */
+export declare function persistConceptualBridges(projectRoot: string, bridges: ConceptualBridge[]): void;
 export declare const READ_FILE_TOOLS: Set<string>;
 export declare const MUTATING_FILE_TOOLS: Set<string>;
 export declare const SHELL_TOOLS: Set<string>;
@@ -188,6 +253,7 @@ export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
  */
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
     recordLedgerDir?: string;
+    projectRoot?: string;
 }): Promise<string[]>;
 /**
  * Mark a prefetch as delivered: its memories were handed to the caller, so the

@@ -408,6 +408,135 @@ export function detectTaskIntentsLocal(text) {
     }
     return out;
 }
+/**
+ * Extract task-obligation candidates from a turn's content. Detects local
+ * task-intent markers (TODO:, FIXME:, follow-up:, ...) via
+ * `detectTaskIntentsLocal` and attaches a provenance span
+ * (turn_id, role, source_tool, channel, evidence_quote, quote, char_range,
+ * confidence) to each. Pure: no daemon interaction. Rule candidates are
+ * never produced here (rule candidates never auto-promote).
+ */
+export function extractTurnCandidates(turn) {
+    const { content, role, turn_id, source_tool, channel, parent_task_id } = turn;
+    const signals = detectTaskIntentsLocal(content);
+    const out = [];
+    for (const signal of signals) {
+        // `signal.marker` is the lowercase canonical form; `signal.excerpt` is the
+        // verbatim content substring, so index off the excerpt to land the span at
+        // the actual (case-varying) marker text in `content`.
+        const idx = content.indexOf(signal.excerpt);
+        const start = idx === -1 ? 0 : idx;
+        const end = Math.min(content.length, start + signal.excerpt.length);
+        out.push({
+            kind: "task_obligation",
+            title: signal.excerpt,
+            confidence: 0.9,
+            auto_commit: false,
+            provenance: {
+                turn_id,
+                role,
+                source_tool,
+                channel,
+                evidence_quote: signal.excerpt,
+                quote: signal.excerpt,
+                char_range: [start, end],
+                parent_task_id,
+                confidence: 0.9,
+            },
+        });
+    }
+    return out;
+}
+/**
+ * Post turn candidates fail-soft to the intake ledger via
+ * `neurostrata_task_candidates` (`action: "record"`). Never throws: a missing
+ * MCP client or a daemon error is swallowed so a turn is never blocked by
+ * intake-ledger submission.
+ */
+export async function postTurnCandidates(candidates, namespace) {
+    if (!mcpClient || candidates.length === 0)
+        return;
+    for (const cand of candidates) {
+        try {
+            await mcpClient.callTool("neurostrata_task_candidates", {
+                namespace,
+                action: "record",
+                kind: cand.kind,
+                category: cand.category,
+                confidence: cand.confidence,
+                title: cand.title,
+                description: cand.description,
+                auto_commit: cand.auto_commit,
+                provenance: cand.provenance,
+            });
+        }
+        catch {
+            // fail-soft: intake-ledger submission never blocks a turn
+        }
+    }
+}
+/**
+ * Extract de-duplicated conceptual bridges from `memories_for_file` hits.
+ * Each hit may carry a `conceptual_bridges` array (source -> via -> target
+ * 2-hop cross-domain paths). Bridges are de-duplicated by `path`.
+ */
+export function extractConceptualBridges(hits) {
+    const out = [];
+    const seen = new Set();
+    for (const hit of hits) {
+        if (typeof hit !== "object" || hit === null)
+            continue;
+        const rec = hit;
+        const cbs = rec.conceptual_bridges;
+        if (!Array.isArray(cbs))
+            continue;
+        for (const cb of cbs) {
+            if (typeof cb !== "object" || cb === null)
+                continue;
+            const b = cb;
+            const path = asString(b.path);
+            if (!path || seen.has(path))
+                continue;
+            seen.add(path);
+            out.push({
+                source_id: asString(b.source_id),
+                via_id: asString(b.via_id),
+                target_id: asString(b.target_id),
+                target_domain: asString(b.target_domain),
+                target_type: asString(b.target_type),
+                target_summary: asString(b.target_summary),
+                path,
+            });
+        }
+    }
+    return out;
+}
+/**
+ * Persist conceptual bridges into `.NeuroStrata/active_session.json` under
+ * the `conceptual_bridges` key, merging with any existing fields so the
+ * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
+ */
+export function persistConceptualBridges(projectRoot, bridges) {
+    const nsDir = join(projectRoot, ".NeuroStrata");
+    const sessionPath = join(nsDir, "active_session.json");
+    let active = {};
+    if (existsSync(sessionPath)) {
+        try {
+            active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+        }
+        catch {
+            active = {};
+        }
+    }
+    active.conceptual_bridges = bridges;
+    try {
+        mkdirSync(nsDir, { recursive: true });
+        writeFileSync(sessionPath, JSON.stringify(active, null, 2));
+    }
+    catch {
+        // best-effort; bridge persistence never breaks a file touch
+    }
+}
 // ──────────────────────────────────────────────────────────────────────
 // Bug 3: canonical tool classification
 // ──────────────────────────────────────────────────────────────────────
@@ -782,6 +911,28 @@ export async function prefetchMemoriesForFile(namespace, filePath, opts) {
             limit: 5,
         });
         recordPrefetchedPath(key);
+        // Persist conceptual bridges from the hits into active_session.json so
+        // sessionContextHandler can inject them as [NeuroStrata Conceptual Bridges].
+        const projectRoot = opts?.projectRoot ?? opts?.recordLedgerDir;
+        if (projectRoot) {
+            try {
+                let hits = [];
+                try {
+                    const body = JSON.parse(text);
+                    hits = Array.isArray(body.hits) ? body.hits : [];
+                }
+                catch {
+                    hits = [];
+                }
+                const bridges = extractConceptualBridges(hits);
+                if (bridges.length > 0) {
+                    persistConceptualBridges(projectRoot, bridges);
+                }
+            }
+            catch {
+                // bridge persistence is best-effort
+            }
+        }
         try {
             recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized, opts?.recordLedgerDir);
         }
@@ -1453,6 +1604,19 @@ const executeAfterHandler = async (output, secondArg) => {
             event.output = combined;
         if (typeof event.content === "string")
             event.content = combined;
+    }
+    // Wave 4: extract task-intent obligations from the tool output text and
+    // post them fail-soft to the intake ledger (never blocks the tool output).
+    if (config.intentDetection.enabled && rawText) {
+        const candidates = extractTurnCandidates({
+            role: "assistant",
+            content: rawText,
+            turn_id: sessionId ?? undefined,
+            source_tool: toolName || undefined,
+        });
+        if (candidates.length > 0) {
+            await postTurnCandidates(candidates, config.namespace);
+        }
     }
     return target ?? output;
 };

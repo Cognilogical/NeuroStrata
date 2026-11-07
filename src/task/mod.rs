@@ -18,6 +18,7 @@ pub mod wiring;
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use crate::store::LadybugStore;
+use intake::undisposed_high_confidence_obligations;
 use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -2004,6 +2005,34 @@ pub async fn handle_task_complete(
                 .or(report.linked_existing_id.clone())
                 .filter(|s| !s.is_empty());
             inline_lesson = lesson_id;
+        }
+    }
+
+    // Lock 2 — Task Obligation: undisposed high-confidence obligations block
+    // completion until they are promoted (neurostrata_task_create) or dismissed
+    // (neurostrata_task_candidates action: "resolve").
+    let intake_store = store.as_intake_store();
+    if let Some(intake) = intake_store {
+        let obligations =
+            undisposed_high_confidence_obligations(&*intake, &namespace, None, None)
+                .await
+                .unwrap_or_default();
+        if !obligations.is_empty() {
+            let mut msg = format!(
+                "BLOCKED (Lock 2 — Task Obligation): task {} cannot complete: {} undisposed high-confidence task obligation(s) must be resolved before completion.\n",
+                id,
+                obligations.len()
+            );
+            for o in &obligations {
+                msg.push_str(&format!(
+                    "  - {}: {}\n    promote via: neurostrata_task_create | dismiss via: neurostrata_task_candidates action: \"resolve\" namespace: \"{}\" candidate_id: \"{}\" disposition: \"dismissed\"\n",
+                    o.id,
+                    o.title,
+                    namespace,
+                    o.id
+                ));
+            }
+            return Err(msg);
         }
     }
 
@@ -5778,6 +5807,130 @@ mod tests {
             status_of(&store, "MyProj", &id).await,
             Status::InProgress,
             "a blocked completion changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_blocked_by_undisposed_high_confidence_obligation() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let intake = store.as_intake_store().expect("intake store");
+        let prov = serde_json::json!({
+            "turn_id": "t1", "role": "user",
+            "evidence_quote": "fix the login bug", "confidence": 0.9
+        });
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: "MyProj".to_string(),
+                source_kind: crate::task::intake::SourceKind::Tool,
+                source_revision: "r1".to_string(),
+                source_digest: "d1".to_string(),
+                text: "obligation".to_string(),
+                title: Some("Fix login bug".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.9),
+                source_span: None,
+                provenance: Some(
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                ),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create obligation receipt");
+
+        let err = handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("undisposed obligation must block completion");
+
+        assert!(
+            err.starts_with("BLOCKED (Lock 2 — Task Obligation)"),
+            "wrong message: {err}"
+        );
+        assert!(err.contains("Fix login bug"), "names obligation title: {err}");
+        assert!(
+            err.contains("neurostrata_task_candidates action: \"resolve\""),
+            "names resolve action: {err}"
+        );
+        assert_eq!(
+            status_of(&store, "MyProj", &id).await,
+            Status::InProgress,
+            "a blocked completion changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_not_blocked_once_obligation_is_disposed() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let intake = store.as_intake_store().expect("intake store");
+        let prov = serde_json::json!({
+            "turn_id": "t1", "role": "user",
+            "evidence_quote": "fix it", "confidence": 0.9
+        });
+        let create = intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: "MyProj".to_string(),
+                source_kind: crate::task::intake::SourceKind::Tool,
+                source_revision: "r1".to_string(),
+                source_digest: "d1".to_string(),
+                text: "obligation".to_string(),
+                title: Some("Fix it".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.9),
+                source_span: None,
+                provenance: Some(
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                ),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create obligation receipt");
+        let cand_id = create.candidates[0].id.clone();
+
+        intake
+            .resolve_candidate(crate::task::intake::ResolveCandidateRequest {
+                namespace: "MyProj".to_string(),
+                candidate_id: cand_id,
+                disposition: crate::task::intake::Disposition::Dismissed,
+                task_id: None,
+                cas_version: 1,
+            })
+            .await
+            .expect("dismiss obligation");
+
+        // No obligation remains, so completion is refused only by Lock 2
+        // extraction (no memory extracted), not by the obligation gate.
+        let err = handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("completion still blocked by Lock 2 extraction");
+
+        assert!(
+            !err.starts_with("BLOCKED (Lock 2 — Task Obligation)"),
+            "disposed obligation must not block: {err}"
         );
     }
 
