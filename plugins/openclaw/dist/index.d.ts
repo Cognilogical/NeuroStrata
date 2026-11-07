@@ -1,126 +1,73 @@
 /**
- * NeuroStrata OpenClaw Plugin — Client Shim
+ * @neurostrata/plugin-core — Shared ESM implementation for all NeuroStrata harness adapters.
  *
- * Phase 0 of the agent-adoption plan repaired the wire contract this shim
- * speaks:
+ * Zero `require()` calls and zero external npm runtime dependencies. Only Node built-ins
+ * (node:fs, node:os, node:path) are imported. Every harness adapter (opencode, claude,
+ * codex, github-cli) is a thin wrapper that re-exports this module and builds one plugin
+ * via `createHarnessPlugin`.
  *
- * - The core dispatches on `tools/call` — never on a bare tool name — so
- *   every call goes through the real JSON-RPC method and the answer is
- *   unwrapped from `result.content[].text`.
- * - The daemon listens on `:34343` and requires the bearer token from
- *   `~/.config/neurostrata/daemon.token`; both are used on every request.
- * - `neurostrata_detect_task_intents` was a phantom: the core answers
- *   "Unknown tool". The call is gone and the lexical detector runs locally,
- *   mirroring `src/task/intent.rs`. Phase 0 writes nothing.
- * - The plugin context is captured inside `initialize`, so no handler
- *   reaches for a `ctx` that is not in scope.
- * - A degraded core is reported through `adapterStatus()` instead of being
- *   masked by a silent local fallback.
+ * Implements:
+ *  - Bug 2: findProjectRoot / discoverProjectNamespace / resolveConfig (never hardcodes "NeuroStrata")
+ *  - Bug 3: canonical TOOL_CLASSIFICATION + is*Tool predicates + OpenCode V2 Code Mode inspector
+ *  - Bug 4: handleHookEvent / handleClaudeHookEvent (PreToolUse guard + subagent + recall)
+ *  - Bug 5: prefetchMemoriesForFile + formatFileTouchRecallBlock + recordLocalSessionQuery + execute.after recall delivery
+ *  - Enhancement 1: resolveActiveTaskFromDaemon (daemon-backed active task/session state)
+ *  - Enhancement 2 & 3: buildSubagentContextHeader / injectSubagentPrompt / extractRepoFilePaths / enrichAndInjectSubagentPrompt
+ *  - Enhancement 5: shared core architecture across all harness plugins
  */
-export interface GuardValidateParams {
-    action_type: string;
-    payload: string;
-    cwd: string;
-    use_sandbox?: boolean;
-}
-export interface GuardValidateResult {
-    verdict: "pass" | "reject";
-    /** The core's own verdict bucket, kept so nothing is flattened away. */
-    bucket: string;
-    reasons: string[];
-    constraints: string[];
-    notes: string[];
-    rule_ids: string[];
-}
-export interface TaskIntentSignal {
-    marker: string;
-    excerpt: string;
-}
-export interface TaskCreateParams {
-    namespace: string;
-    title: string;
-    description?: string;
-    priority?: number;
-    labels?: string[];
-    blocked_by?: string[];
-    parent_id?: string;
-}
-export interface OpenClawPluginContext {
-    config: Record<string, unknown>;
-    logger: {
-        info: (msg: string, meta?: Record<string, unknown>) => void;
-        warn: (msg: string, meta?: Record<string, unknown>) => void;
-        error: (msg: string, meta?: Record<string, unknown>) => void;
-    };
-    hooks: {
-        beforeFileOp: (handler: FileOpHandler) => void;
-        onTurnEnd: (handler: TurnEndHandler) => void;
-    };
-    conversation: {
-        injectSystemMessage: (message: string) => void;
-    };
-}
-export type FileOpHandler = (op: FileOperation) => Promise<FileOpResult>;
-export type TurnEndHandler = (turn: ConversationTurn) => Promise<void>;
-export interface FileOperation {
-    type: "write" | "edit" | "delete" | "mkdir";
-    path: string;
-    content?: string;
-    oldContent?: string;
-    newContent?: string;
-}
-export interface FileOpResult {
-    allowed: boolean;
-    reason?: string;
-    guardVerdict?: GuardValidateResult;
-    /** True when the core could not answer and the shim is running degraded. */
-    degraded?: boolean;
-}
-export interface ConversationTurn {
-    role: "user" | "assistant" | "system";
-    content: string;
-}
-/** Where the daemon serves MCP. The setup default is 34343, not 8080. */
 export declare const DEFAULT_ENDPOINT = "http://127.0.0.1:34343/mcp";
-/** The daemon's bearer token, as the daemon itself lays it down. */
 export declare const DEFAULT_TOKEN_FILE = "daemon.token";
-/** The tools this shim needs from the core to do its job. */
 export declare const REQUIRED_TOOLS: string[];
 export interface PluginConfig {
     namespace: string;
-    /** The daemon's `/mcp` endpoint. */
     endpoint: string;
-    /** The bearer token, when the host config carries one explicitly. */
     bearerToken: string | null;
-    /** Where to read the daemon token from when the config carries none. */
     tokenFile: string | null;
     strictMode: boolean;
-    /** Upper bound on one MCP round trip. */
     requestTimeoutMs: number;
     intentDetection: {
         enabled: boolean;
         injectReminder: boolean;
     };
+    /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+    projectRoot?: string;
 }
+/** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
+export type ResolvedConfig = PluginConfig;
 /**
- * Merge the host config over the defaults.
- *
- * `guardEndpoint` is still honored: it is what older installs wrote, and
- * silently ignoring it would point the shim at the wrong port.
+ * Resolve `namespace` in strict priority order:
+ *  1. pluginConfig.namespace (non-empty trimmed string)
+ *  2. process.env.NEUROSTRATA_NAMESPACE (non-empty trimmed string)
+ *  3. discoverProjectNamespace(cwd)
+ * Never falls back to a hardcoded "NeuroStrata".
  */
-export declare function resolveConfig(raw: unknown): PluginConfig;
-/** The absolute path of the daemon token file. */
+export declare function resolveConfig(pluginConfig?: unknown, cwd?: string): PluginConfig;
+/**
+ * Walk up from resolve(startDir) to the filesystem root looking for `.git`
+ * (dir or file) or `.NeuroStrata`; return the directory containing it, or
+ * resolve(startDir) if none found.
+ */
+export declare function findProjectRoot(startDir?: string): string;
+/**
+ * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
+ *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
+ * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ */
+export declare function discoverProjectNamespace(startDir?: string): string;
+/**
+ * Resolve the project root from an OpenCode V2 host context, falling back
+ * through ctx fields to process.cwd(). Priority:
+ *   1. ctx.location.project.canonical
+ *   2. ctx.location.project.root
+ *   3. ctx.location.directory
+ *   4. ctx.projectDir
+ *   5. ctx.directory
+ *   6. ctx.cwd
+ *   7. process.cwd()
+ */
+export declare function resolveProjectRoot(ctx?: any): string;
 export declare function daemonTokenPath(tokenFile?: string | null): string;
-/**
- * Read the daemon's bearer token.
- *
- * Returns `null` when there is no readable token: the daemon generates one
- * on first start, so an absent file means "the daemon has never run", not
- * "authentication is optional". The caller must report that as degraded
- * rather than pretend the request is anonymous.
- */
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
-/** The request headers, with the bearer attached when there is one. */
 export declare function buildHeaders(token: string | null): Record<string, string>;
 export interface JsonRpcRequest {
     jsonrpc: "2.0";
@@ -144,19 +91,9 @@ export interface McpToolResult {
     }>;
     isError?: boolean;
 }
-/** Build the `tools/call` request the core actually answers. */
 export declare function buildToolCallRequest(id: number, name: string, args: unknown): JsonRpcRequest;
-/** Build the `tools/list` request used for capability negotiation. */
 export declare function buildToolsListRequest(id: number): JsonRpcRequest;
-/**
- * Unwrap `result.content[].text`.
- *
- * The core answers a tool call with a content array, not with the typed
- * result a tool would return. An answer with no text is a broken answer:
- * it is reported, never treated as an empty success.
- */
 export declare function extractToolText(result: unknown): string;
-/** The tool names from a `tools/list` answer. */
 export declare function extractToolNames(result: unknown): string[];
 export declare class NeuroStrataMCPClient {
     private readonly endpoint;
@@ -168,72 +105,193 @@ export declare class NeuroStrataMCPClient {
         token: string | null;
         timeoutMs: number;
     });
-    /** Call one tool and return its text content. */
     callTool(name: string, args: unknown): Promise<string>;
-    /** The names of the tools the core exposes. */
     listToolNames(): Promise<string[]>;
     private post;
 }
-/**
- * Read the guard's answer.
- *
- * The core prefixes the body with `namespace:` and `trace_id:` lines, so the
- * JSON body is what lies between the first `{` and the last `}`. The verdict
- * is tagged with `bucket`, not `type`.
- */
+export interface GuardValidateResult {
+    verdict: "pass" | "reject";
+    bucket: string;
+    reasons: string[];
+    constraints: string[];
+    notes: string[];
+    rule_ids: string[];
+}
 export declare function parseGuardValidate(text: string): GuardValidateResult;
 export type AdapterState = "uninitialized" | "ready" | "degraded" | "unavailable";
 export interface AdapterStatus {
     state: AdapterState;
     endpoint: string;
     namespace: string;
-    /** Whether a bearer token was found and attached. */
     authenticated: boolean;
-    /** Tools this shim needs that the core does not expose. */
     missingTools: string[];
     lastError?: string;
     updatedAt: string;
 }
-/** Reset the tracked session/task state (test hook). */
-export declare function resetState(): void;
-/** The adapter's current state. A degraded core is visible here. */
 export declare function adapterStatus(): AdapterStatus;
+export interface TaskIntentSignal {
+    marker: string;
+    excerpt: string;
+}
 export declare const MARKERS: readonly [string, string][];
 export declare const NEGATION_PREFIXES: string[];
 export declare function detectTaskIntentsLocal(text: string): TaskIntentSignal[];
-/** LRU cap: how many recently touched (`namespace:path`) keys are kept. */
-export declare const PREFETCH_LRU_CAP = 128;
-/** Output budget: one file-touch recall injects at most this many chars. */
-export declare const PREFETCH_MAX_CHARS = 2048;
+export declare const READ_FILE_TOOLS: Set<string>;
+export declare const MUTATING_FILE_TOOLS: Set<string>;
+export declare const SHELL_TOOLS: Set<string>;
+export declare const MUTATING_TOOLS: Set<string>;
+export declare const SUBAGENT_TOOLS: Set<string>;
+export declare const CODE_EXEC_TOOLS: Set<string>;
+export declare const TOOL_CLASSIFICATION: {
+    READ_FILE_TOOLS: Set<string>;
+    MUTATING_FILE_TOOLS: Set<string>;
+    SHELL_TOOLS: Set<string>;
+    MUTATING_TOOLS: Set<string>;
+    SUBAGENT_TOOLS: Set<string>;
+    CODE_EXEC_TOOLS: Set<string>;
+};
+export declare function isFileTouchTool(name: string): boolean;
+export declare function isMutatingTool(name: string): boolean;
+export declare function isSubagentTool(name: string): boolean;
+export declare function isCodeExecTool(name: string): boolean;
+export interface CodeModeInspection {
+    id?: string;
+    sessionId?: string;
+    note?: string;
+    taskClaimed?: boolean;
+    taskUpdated?: boolean;
+    taskCompleted?: boolean;
+    memoryMutated?: boolean;
+    queriedFiles: string[];
+}
 /**
- * Recently touched file paths, keyed `namespace:path`, in LRU order
- * (oldest first). Bounded so a long session cannot grow without bound.
+ * Inspect JS code strings passed to OpenCode V2 `execute` (Code Mode).
+ * Detects neurostrata_task_claim / _update / _complete / _memories_for_file
+ * calls in order and extracts id / session_id / note / path arguments from
+ * each matched call's own argument slice.
  */
+export declare function inspectCodeModeExecution(code: string): CodeModeInspection;
+export declare const PREFETCH_LRU_CAP = 128;
+export declare const PREFETCH_MAX_CHARS = 2048;
 export declare const prefetchedPaths: Map<string, number>;
-/** `(memory_id:valid_from)` keys already injected this session. */
 export declare const injectedMemoryIds: Set<string>;
-/** One governing memory as `memories_for_file` returns it. */
 export interface FileMemoryHit {
     id: string;
     valid_from: string;
     memory_type: string;
     content: string;
 }
-/**
- * Read the `memories_for_file` answer: the array arrives as `hits` or
- * `memories` between the first `{` and the last `}` of the content text.
- */
 export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
 /**
- * Recall governing memories when a file is touched (design §4.5).
- *
- * Each `namespace:path` key is prefetched at most once per LRU window;
- * each memory is injected at most once per `(id, valid_from)` key. Never
- * increments `access_count` — this is a read-only recall.
+ * Recall governing memories for a touched file. LRU path dedup (no re-query within the
+ * window) and injectedMemoryIds dedup (each memory injected once per session).
  */
-export declare function prefetchMemoriesForFile(namespace: string, filePath: string): Promise<string[]>;
+export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
+    recordLedgerDir?: string;
+}): Promise<string[]>;
+/**
+ * Mark a prefetch as delivered: its memories were handed to the caller, so the
+ * dedup state stays and a later touch of the same file does not re-inject
+ * them.
+ */
+export declare function confirmPrefetchDelivery(namespace: string, filePath: string): void;
+/**
+ * Roll back the dedup state of a prefetch whose recall was never delivered
+ * (the guard denied the edit). The path is un-marked and the memory ids the
+ * prefetch consumed are returned, so the allowed retry still sees the
+ * governing rules.
+ */
+export declare function restorePrefetchDelivery(namespace: string, filePath: string): void;
+export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
-export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
-export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
-export declare function initialize(ctx: OpenClawPluginContext): Promise<void>;
-//# sourceMappingURL=index.d.ts.map
+export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string): string;
+export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string): boolean;
+export declare function extractRepoFilePaths(promptText: string): string[];
+export declare const cachedTaskInjection: Map<string, string | null>;
+export declare const cachedSubagentPromptByTask: Map<string, string | null>;
+/**
+ * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
+ * activeSessionId and cachedTaskInjection.
+ */
+export declare function resolveActiveTaskFromDaemon(namespace: string, preferredTaskId?: string | null): Promise<{
+    taskId: string | null;
+    sessionId: string | null;
+    promptInjection: string | null;
+}>;
+/**
+ * Prefetch governing memories for repo file paths mentioned in a subagent prompt and
+ * inject the daemon's subagent_prompt_injection plus any recalled snippets into the
+ * target prompt. Idempotent.
+ */
+export declare function enrichAndInjectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId?: string | null): Promise<boolean>;
+export declare let activeSessionId: string | null;
+export declare let activeTaskId: string | null;
+export declare let mutationsSinceNote: number;
+export declare function resetState(): void;
+export declare function resetClientForTesting(): void;
+export declare function getTrackingState(): {
+    activeTaskId: string | null;
+    activeSessionId: string | null;
+    mutationsSinceNote: number;
+};
+export interface SessionEpochState {
+    epoch: number;
+    baselineInjectedEpoch: number;
+    seenFiles: Set<string>;
+}
+/** Current epoch for a session (starts at 0, incremented by compaction). */
+export declare function currentSessionEpoch(sessionId: string | null | undefined): number;
+/** Increment the epoch and clear seen files so the next context hook re-injects. */
+export declare function incrementSessionEpoch(sessionId: string | null | undefined): void;
+export declare function sessionSeenFiles(sessionId: string | null | undefined): Set<string>;
+export declare function resetSessionEpoch(sessionId: string | null | undefined): void;
+export declare function resetAllSessionEpochs(): void;
+/**
+ * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
+ * from the project root; when an active task exists and its baseline has not
+ * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
+ * Same-epoch repeat calls leave the event untouched.
+ */
+export declare function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void>;
+/**
+ * `session.hook("compaction")` handler. Increments the session epoch and
+ * clears seen files, so the very next context hook re-injects the active
+ * task / rules baseline.
+ */
+export declare function sessionCompactionHandler(event: any, config: ResolvedConfig): Promise<void>;
+export declare const pendingRecallBlocks: string[];
+export declare const pendingRecallByCall: Map<string, string>;
+/**
+ * Tool-name extraction for execute.after events. OpenCode V2 passes
+ * `event.name`; V1 / Claude / Hermes pass `event.tool` / `event.tool_name`.
+ * `event.toolName` is checked first.
+ */
+export declare function extractToolName(event: any): string;
+export declare function initialize(ctx: any): Promise<void>;
+export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
+export declare const handleClaudeHookEvent: typeof handleHookEvent;
+export declare function onTurnEnd(turn: {
+    role: "user" | "assistant";
+    content: string;
+}): Promise<void>;
+export declare function fetchContextPlan(opts: {
+    namespace: string;
+    query?: string;
+    file_path?: string;
+    max_items?: number;
+    max_bytes?: number;
+    format?: "json" | "text";
+}): Promise<string>;
+export declare function createHarnessPlugin(pluginId?: string, harnessName?: string): {
+    id: string;
+    name: string;
+    setup: typeof initialize;
+    initialize: typeof initialize;
+    handleHookEvent: typeof handleHookEvent;
+    handleClaudeHookEvent: typeof handleHookEvent;
+    onTurnEnd: typeof onTurnEnd;
+    fetchContextPlan: typeof fetchContextPlan;
+    adapterStatus: typeof adapterStatus;
+};
+export declare const plugin: ReturnType<typeof createHarnessPlugin>;
+export default plugin;

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   resolveConfig,
+  resolveProjectRoot,
   findProjectRoot,
   discoverProjectNamespace,
   inspectCodeModeExecution,
@@ -34,6 +35,11 @@ import {
   cachedTaskInjection,
   cachedSubagentPromptByTask,
   PREFETCH_LRU_CAP,
+  sessionContextHandler,
+  sessionCompactionHandler,
+  extractToolName,
+  currentSessionEpoch,
+  incrementSessionEpoch,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1736,6 +1742,243 @@ describe("round-9: CLI hook runners flush stdout before exiting", () => {
         src.includes("const writeStdout = (text) =>"),
         `${rel}: writeStdout helper missing`,
       );
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Task 1.1: OpenCode V2 project-root resolution, session epoch hooks,
+// and execute.after V2 result mutation
+// ──────────────────────────────────────────────────────────────────────
+
+describe("Task 1.1: resolveProjectRoot priority chain", () => {
+  it("ctx.location.project.canonical wins", () => {
+    assert.equal(
+      resolveProjectRoot({ location: { project: { canonical: "/canon", root: "/root" }, directory: "/dir" } }),
+      "/canon",
+    );
+  });
+
+  it("falls back to ctx.location.project.root", () => {
+    assert.equal(
+      resolveProjectRoot({ location: { project: { root: "/root" }, directory: "/dir" } }),
+      "/root",
+    );
+  });
+
+  it("falls back to ctx.location.directory", () => {
+    assert.equal(resolveProjectRoot({ location: { directory: "/dir" } }), "/dir");
+  });
+
+  it("falls back to ctx.projectDir", () => {
+    assert.equal(resolveProjectRoot({ projectDir: "/pdir" }), "/pdir");
+  });
+
+  it("falls back to ctx.directory", () => {
+    assert.equal(resolveProjectRoot({ directory: "/cdir" }), "/cdir");
+  });
+
+  it("falls back to ctx.cwd", () => {
+    assert.equal(resolveProjectRoot({ cwd: "/ccwd" }), "/ccwd");
+  });
+
+  it("falls back to process.cwd()", () => {
+    assert.equal(resolveProjectRoot({}), process.cwd());
+    assert.equal(resolveProjectRoot(undefined), process.cwd());
+  });
+});
+
+describe("Task 1.1: extractToolName", () => {
+  it("prefers toolName, then tool, then name", () => {
+    assert.equal(extractToolName({ toolName: "read" }), "read");
+    assert.equal(extractToolName({ tool: "write" }), "write");
+    assert.equal(extractToolName({ name: "edit" }), "edit");
+    assert.equal(extractToolName({ tool_name: "grep" }), "grep");
+    assert.equal(extractToolName({}), "");
+  });
+});
+
+describe("Task 1.1: sessionContextHandler / sessionCompactionHandler epoch behavior", () => {
+  it("injects active-task baseline once per epoch; compaction re-injects", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-ctx-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-core-1",
+        status: "in_progress",
+        session_id: "ses-core-1",
+        updated_at: new Date().toISOString(),
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: true, injectReminder: true },
+      };
+
+      const ev1 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev1, config);
+      assert.equal(currentSessionEpoch("ses-core-1"), 0);
+      assert.equal(typeof ev1.additionalContext, "string");
+      assert.ok(ev1.additionalContext.includes("[NeuroStrata Active Context]"));
+      assert.ok(ev1.additionalContext.includes("task-core-1"));
+      assert.ok(ev1.additionalContext.includes("[in_progress]"));
+
+      const ev2 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev2, config);
+      assert.equal(ev2.additionalContext, undefined);
+
+      await sessionCompactionHandler({ sessionID: "ses-core-1" }, config);
+      assert.equal(currentSessionEpoch("ses-core-1"), 1);
+
+      const ev3 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev3, config);
+      assert.ok(ev3.additionalContext.includes("[NeuroStrata Active Context]"));
+      assert.ok(ev3.additionalContext.includes("task-core-1"));
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+});
+
+describe("Task 1.1: execute.after V2 result mutation (via hook registration)", () => {
+  it("mutates event.result.content/output with task-intent nudge and JIT file recall", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-exec-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+        session: { hook: () => {} },
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "exec-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+      assert.equal(typeof afterHandler, "function");
+
+      const evt = {
+        name: "read",
+        callID: "call_read_1",
+        sessionID: "ses-exec-1",
+        args: { path: "src/server.rs" },
+        status: "completed",
+        result: {
+          content: "TODO: wire task candidate provenance in server.rs",
+          output: "TODO: wire task candidate provenance in server.rs",
+        },
+      };
+      await afterHandler(evt);
+      assert.match(evt.result.content, /TASK INTENT DETECTED/);
+      assert.match(evt.result.output, /TASK INTENT DETECTED/);
+      assert.ok(evt.result.content.includes("[NeuroStrata File Context — src/server.rs]"));
+      assert.equal(counters.memoriesForFile, 1, "file recall queried the daemon once");
+    } finally {
+      server.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("JIT file recall is deduplicated per session:epoch:path", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-dedup-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+        session: { hook: () => {} },
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "dedup-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+
+      const base = {
+        name: "read",
+        callID: "call_read_2",
+        sessionID: "ses-dedup-1",
+        args: { path: "src/server.rs" },
+        status: "completed",
+        result: { content: "read file contents here", output: "read file contents here" },
+      };
+      const evt1 = { ...base, result: { ...base.result } };
+      await afterHandler(evt1);
+      assert.ok(evt1.result.content.includes("[NeuroStrata File Context — src/server.rs]"));
+      assert.equal(evt1.result.content.includes("TASK INTENT DETECTED"), false);
+      const after1 = evt1.result.content;
+
+      const evt2 = { ...base, result: { ...base.result, content: after1 } };
+      await afterHandler(evt2);
+      assert.equal(evt2.result.content, after1, "second touch in same epoch adds no new block");
+      assert.equal(counters.memoriesForFile, 1, "daemon not re-queried for deduped path");
+    } finally {
+      server.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("non-file-touch tool gets task-intent nudge only, no file-context block", async () => {
+    const { server, url } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "bash-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+
+      const evt = {
+        name: "bash",
+        callID: "call_bash_1",
+        sessionID: "ses-bash-1",
+        args: {},
+        status: "completed",
+        result: { content: "follow-up: clean up the temp dir", output: "follow-up: clean up the temp dir" },
+      };
+      await afterHandler(evt);
+      assert.match(evt.result.content, /TASK INTENT DETECTED/);
+      assert.match(evt.result.output, /TASK INTENT DETECTED/);
+      assert.equal(evt.result.content.includes("[NeuroStrata File Context"), false);
+    } finally {
+      server.close();
+      resetClientForTesting();
+    }
+  });
+
+  it("legacy V1 event without result object does not crash and preserves output", async () => {
+    const { server, url } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "legacy-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+      const evt = {
+        name: "read",
+        output: "legacy output text",
+        content: "legacy content text",
+        additionalContext: "prior context",
+      };
+      await afterHandler(evt);
+      assert.equal(evt.output, "legacy output text");
+      assert.ok(evt.additionalContext.includes("prior context"));
+    } finally {
+      server.close();
+      resetClientForTesting();
     }
   });
 });
