@@ -569,10 +569,10 @@ async fn synthesize_conceptual_bridges(
             )
             .await
         {
-            // hop1_ids: the via nodes reached at depth 1 from this seed.
+            // hop1_ids: the via nodes reached from the seed (frontier depth 0).
             let mut hop1_ids: HashSet<String> = HashSet::new();
             for edge in &result.edges {
-                if edge.depth == 1 {
+                if edge.depth == 0 {
                     if edge.source != seed_id {
                         hop1_ids.insert(edge.source.clone());
                     }
@@ -585,8 +585,8 @@ async fn synthesize_conceptual_bridges(
                 if bridges.len() >= MAX_CONCEPTUAL_BRIDGES {
                     break;
                 }
-                // depth 2 edge: via -> target (seed -> via is depth 1).
-                if edge.depth != 2 {
+                // frontier depth 1 edge: via -> target (seed -> via has frontier depth 0).
+                if edge.depth != 1 {
                     continue;
                 }
                 let a = edge.source.as_str();
