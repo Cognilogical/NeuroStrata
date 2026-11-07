@@ -459,6 +459,19 @@ impl MeshReactor {
         self.tasks.lock().ok()?.get(task_id).cloned()
     }
 
+    /// Snapshot the underlying transport status (`active`, `connected_peers`, `frames_rejected`).
+    pub fn transport_status(&self) -> crate::synaptic_mesh::transport::TransportStatus {
+        self.transport.status()
+    }
+
+    /// Request missing frames from the underlying transport for `hello`.
+    pub async fn request_transport_catchup(
+        &self,
+        hello: SyncHello,
+    ) -> Result<Vec<MeshFrame>, crate::synaptic_mesh::transport::MeshTransportError> {
+        self.transport.request_catchup(hello).await
+    }
+
     /// Compute missing frames from `frames.wal` to satisfy a peer's [`SyncHello`] cursor map.
     pub fn handle_sync_hello(&self, hello: &SyncHello) -> anyhow::Result<Vec<MeshFrame>> {
         if hello.mesh_id != self.mesh_id {
@@ -772,15 +785,17 @@ mod tests {
             reactor_b.get_task_state("t-2").unwrap()["status"],
             "done"
         );
-        let catchup = reactor_a
-            .handle_sync_hello(&SyncHello {
-                node_id: did_b,
-                mesh_id: "m1".into(),
-                epoch: 1,
-                peer_cursors: BTreeMap::from([(did_a, 4)]),
-            })
-            .unwrap();
+        let hello = SyncHello {
+            node_id: did_b,
+            mesh_id: "m1".into(),
+            epoch: 1,
+            peer_cursors: BTreeMap::from([(did_a, 4)]),
+        };
+        let catchup = reactor_a.handle_sync_hello(&hello).unwrap();
         assert_eq!(catchup.len(), 2);
+        assert_eq!(reactor_a.transport_status().frames_rejected, 0);
+        let transport_catchup = reactor_a.request_transport_catchup(hello).await.unwrap();
+        assert_eq!(transport_catchup.len(), 2);
     }
 
     #[tokio::test]

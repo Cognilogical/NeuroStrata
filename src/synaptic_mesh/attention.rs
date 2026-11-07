@@ -5,9 +5,20 @@
 //! peer delta intersects the local session's active tasks, files, concepts, or twins.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use serde_json::Value;
 
 use crate::synaptic_mesh::frame::{MeshFrame, MeshPayloadKind, TaskMeshAction};
+
+static GLOBAL_ATTENTION_FILTER: OnceLock<Arc<AttentionFilter>> = OnceLock::new();
+
+/// Process-wide [`AttentionFilter`] shared between `MeshReactor` and MCP dispatch.
+pub fn global_attention_filter() -> Arc<AttentionFilter> {
+    GLOBAL_ATTENTION_FILTER
+        .get_or_init(|| Arc::new(AttentionFilter::new()))
+        .clone()
+}
 
 /// Active working set for one local MCP session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -139,6 +150,145 @@ impl AttentionFilter {
             Vec::new()
         }
     }
+
+    /// Incrementally record a local MCP tool call's working set (`task_id`, `file_path`,
+    /// `twin_id`, `concept_iri`) under `session_id` (or synthetic `ns:<namespace>` when
+    /// the tool schema omits `session_id`).
+    pub fn record_mcp_tool_call(&self, tool_name: &str, arguments: &Value) {
+        let Some(namespace) = arguments
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        let explicit_session = arguments
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        let Ok(mut map) = self.sessions.lock() else {
+            return;
+        };
+
+        let target_session_ids: Vec<String> = if let Some(sid) = explicit_session {
+            vec![sid.to_string()]
+        } else {
+            let existing: Vec<String> = map
+                .iter()
+                .filter(|(_, ws)| ws.namespace == namespace)
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            if existing.is_empty() {
+                vec![format!("ns:{namespace}")]
+            } else {
+                existing
+            }
+        };
+
+        for sid in target_session_ids {
+            let ws = map.entry(sid.clone()).or_insert_with(|| SessionWorkingSet {
+                session_id: sid,
+                namespace: namespace.to_string(),
+                ..Default::default()
+            });
+            ws.namespace = namespace.to_string();
+
+            if matches!(
+                tool_name,
+                "neurostrata_task_claim"
+                    | "neurostrata_task_update"
+                    | "neurostrata_task_create"
+                    | "neurostrata_task_complete"
+            ) {
+                if let Some(tid) = arguments
+                    .get("id")
+                    .or_else(|| arguments.get("task_id"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    ws.active_task_ids.insert(tid.to_string());
+                }
+            }
+
+            if let Some(fp) = arguments
+                .get("file_path")
+                .or_else(|| arguments.get("path"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                ws.file_targets.insert(fp.to_string());
+            }
+            if let Some(locs) = arguments.get("locations").and_then(|v| v.as_array()) {
+                for loc in locs {
+                    if let Some(p) = loc
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        ws.file_targets.insert(p.to_string());
+                    }
+                }
+            }
+
+            if let Some(twin_id) = arguments
+                .get("twin_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                ws.twin_ids.insert(twin_id.to_string());
+            }
+
+            if let Some(iri) = arguments
+                .get("concept_iri")
+                .or_else(|| arguments.get("iri"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                ws.concept_iris.insert(iri.to_string());
+            }
+        }
+    }
+
+    /// Drain queued `[NeuroMesh Δ]` notices matching an MCP call's `session_id` or `namespace`.
+    pub fn drain_notices_for_mcp_call(&self, arguments: &Value) -> Vec<String> {
+        let explicit_session = arguments
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let namespace = arguments
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+
+        let mut candidate_sessions: Vec<String> = Vec::new();
+        if let Some(sid) = explicit_session {
+            candidate_sessions.push(sid.to_string());
+        }
+        if let Some(ns) = namespace {
+            let synth = format!("ns:{ns}");
+            if !candidate_sessions.contains(&synth) {
+                candidate_sessions.push(synth);
+            }
+            if let Ok(map) = self.sessions.lock() {
+                for (sid, ws) in map.iter() {
+                    if ws.namespace == ns && !candidate_sessions.contains(sid) {
+                        candidate_sessions.push(sid.clone());
+                    }
+                }
+            }
+        }
+
+        let mut drained = Vec::new();
+        if let Ok(mut pending) = self.pending_notices.lock() {
+            for sid in candidate_sessions {
+                if let Some(lines) = pending.remove(&sid) {
+                    drained.extend(lines);
+                }
+            }
+        }
+        drained
+    }
 }
 
 fn short_did(did: &str) -> String {
@@ -215,5 +365,57 @@ mod tests {
         assert!(drained[0].contains("cooling-loop-1"));
         // Draining clears the queue
         assert!(filter.drain_session_notices("ses-active").is_empty());
+    }
+
+    #[test]
+    fn mcp_tool_call_tracks_working_set_and_drains_notices_by_namespace_or_session() {
+        let filter = AttentionFilter::new();
+        filter.record_mcp_tool_call(
+            "neurostrata_task_claim",
+            &serde_json::json!({
+                "namespace": "mesh-mcp-ns",
+                "id": "task-77",
+                "session_id": "ses-mcp-77"
+            }),
+        );
+        filter.record_mcp_tool_call(
+            "neurostrata_memories_for_file",
+            &serde_json::json!({
+                "namespace": "mesh-mcp-ns",
+                "file_path": "src/reactor.rs"
+            }),
+        );
+
+        let inbound = MeshFrame {
+            mesh_id: "m1".into(),
+            epoch: 1,
+            origin_node_id: "did:key:z6Mkp99998f2a".into(),
+            seq: 1,
+            lamport_ts: 500,
+            timestamp_ms: 1000,
+            namespace: "mesh-mcp-ns".into(),
+            visible_to: vec![],
+            kind: MeshPayloadKind::TaskDelta {
+                task_id: "task-77".into(),
+                action: TaskMeshAction::Updated,
+                task_json: serde_json::json!({"id": "task-77", "status": "in_progress"}),
+                extracted_memory_ids: vec![],
+            },
+            signature: "sig".into(),
+        };
+        assert_eq!(filter.evaluate_inbound_frame(&inbound).len(), 1);
+
+        // Even when the next MCP call only supplies `namespace` (no `session_id`),
+        // `drain_notices_for_mcp_call` drains the notice for the active session in that namespace.
+        let drained = filter.drain_notices_for_mcp_call(&serde_json::json!({
+            "namespace": "mesh-mcp-ns",
+            "query": "status"
+        }));
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].contains("[NeuroMesh Δ peer="));
+        assert!(drained[0].contains("task-77"));
+        assert!(filter
+            .drain_notices_for_mcp_call(&serde_json::json!({ "namespace": "mesh-mcp-ns" }))
+            .is_empty());
     }
 }

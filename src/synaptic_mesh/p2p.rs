@@ -148,7 +148,7 @@ impl P2pMeshTransport {
         loop {
             let mut len_buf = [0u8; 4];
             if stream.read_exact(&mut len_buf).await.is_err() {
-                return Ok(());
+                return Err(MeshTransportError::Closed);
             }
             let payload_len = u32::from_be_bytes(len_buf) as usize;
             if payload_len < GCM_NONCE_LEN + GCM_TAG_LEN
