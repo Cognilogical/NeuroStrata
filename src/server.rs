@@ -2,13 +2,17 @@ use uuid::Uuid;
 use crate::synaptic_mesh::record::{Lifecycle, LifecycleState, MESH_RECORD_SCHEMA_VERSION, RdfBlock};
 use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
 use serde::{Deserialize, Serialize};
-use serde_json::{self, Value};
+use serde_json::{self, json, Value};
 use std::sync::Arc;
 use std::cmp::Ordering;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
 use crate::guard::{BehavioralRule, GuardValidator, ValidateResponse};
+use crate::task::intake::{
+    CreateReceiptRequest, Disposition, ListCandidatesRequest, ProvenanceSpan, ResolveCandidateRequest,
+    ReviewState, SourceKind, undisposed_high_confidence_obligations,
+};
 
 #[derive(Deserialize)]
 pub struct JsonRpcRequest {
@@ -734,6 +738,31 @@ pub async fn process_mcp_request(
                         }
                     },
                     {
+                        "name": "neurostrata_task_candidates",
+                        "description": "Tiered obligation ledger for task candidates. `action: \"record\"` creates a candidate and, when `auto_commit` is true and `provenance.confidence >= 0.85`, auto-commits fact/decision memory_candidates into a linked Memory (`metadata.extracted_from=[task_id]`, `metadata.provenance`) and promotes the candidate; `rule_candidate`s are never auto-promoted and stay pending. `action: \"list\"` lists candidates. `action: \"resolve\"`/`\"dismiss\"` CAS-resolves a candidate.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "action": { "type": "string", "enum": ["record", "list", "resolve", "dismiss"], "description": "What to do with candidates. Defaults to list." },
+                                "kind": { "type": "string", "enum": ["task_obligation", "memory_candidate"], "description": "Tiered candidate kind for record. Defaults to task_obligation." },
+                                "category": { "type": "string", "enum": ["fact", "decision", "rule_candidate"], "description": "Category for record." },
+                                "provenance": { "type": "object", "description": "Provenance span {turn_id, role, source_tool, channel, evidence_quote, quote, char_range: [start, end], parent_task_id, confidence}." },
+                                "auto_commit": { "type": "boolean", "description": "When true and provenance.confidence >= 0.85, attempt tiered auto-commit." },
+                                "confidence": { "type": "number", "description": "Confidence score for the candidate." },
+                                "title": { "type": "string", "description": "Candidate title for record." },
+                                "description": { "type": "string", "description": "Candidate description for record." },
+                                "task_id": { "type": "string", "description": "Parent/active task id used for extracted_from linkage on auto-commit." },
+                                "candidate_id": { "type": "string", "description": "Candidate id for resolve/dismiss." },
+                                "disposition": { "type": "string", "enum": ["created", "linked", "dismissed", "promoted"], "description": "Resolution disposition for resolve/dismiss." },
+                                "cas_version": { "type": "integer", "description": "Expected cas_version for CAS resolution." },
+                                "limit": { "type": "integer", "description": "Max items to return for list. Default 50." },
+                                "offset": { "type": "integer", "description": "Pagination offset for list. Default 0." }
+                            },
+                            "required": ["namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_twin_get",
                         "description": "Retrieve the current or historical versioned state of a digital twin in a namespace.",
                         "inputSchema": {
@@ -1173,6 +1202,14 @@ pub async fn process_mcp_request(
                         "neurostrata_task_intake_resolve" => {
                             result_text = crate::task::intake::handle_intake_resolve(
                                 arguments,
+                                store.clone(),
+                            )
+                            .await;
+                        }
+                        "neurostrata_task_candidates" => {
+                            result_text = crate::server::handle_task_candidates(
+                                arguments,
+                                emb.clone(),
                                 store.clone(),
                             )
                             .await;
@@ -3367,6 +3404,333 @@ fn unmigrated_ids_notice(
     ))
 }
 
+/// Tiered obligation ledger for task candidates.
+///
+/// `record`: creates a candidate; when `auto_commit` is true and
+/// `provenance.confidence >= 0.85` and `kind == "memory_candidate"` with
+/// category `fact`/`decision`, auto-commits into a linked Memory
+/// (`metadata.extracted_from=[task_id]`, `metadata.provenance`) and promotes
+/// the candidate. `rule_candidate`s are never auto-promoted.
+/// `list`: lists candidates with filters and pagination.
+/// `resolve`/`dismiss`: CAS-resolves a candidate.
+pub async fn handle_task_candidates(
+    args: Value,
+    emb: Arc<dyn Embedder>,
+    store: Arc<dyn VectorStore>,
+) -> String {
+    let namespace = match args.get("namespace").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.to_string(),
+        _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
+    };
+
+    let action = match args.get("action").and_then(|v| v.as_str()) {
+        Some("list") | None => "list",
+        Some("record") => "record",
+        Some("resolve") => "resolve",
+        Some("dismiss") => "dismiss",
+        Some(a) => return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss)."),
+    };
+
+    let intake_store = store.as_intake_store();
+    let intake_store = match intake_store {
+        Some(s) => s,
+        None => return "ERROR: Intake requires LadybugStore backend.".to_string(),
+    };
+
+    match action {
+        "list" => {
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let offset = args.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let review_state = match args.get("review_state").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => match s {
+                    "pending" => Some(ReviewState::Pending),
+                    "in_review" => Some(ReviewState::InReview),
+                    "accepted" => Some(ReviewState::Accepted),
+                    "dismissed" => Some(ReviewState::Dismissed),
+                    _ => return format!("ERROR: Invalid review_state '{}'", s),
+                },
+                _ => None,
+            };
+            let disposition = match args.get("disposition").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => match s {
+                    "pending" => Some(Disposition::Pending),
+                    "created" => Some(Disposition::Created),
+                    "linked" => Some(Disposition::Linked),
+                    "promoted" => Some(Disposition::Promoted),
+                    "dismissed" => Some(Disposition::Dismissed),
+                    _ => return format!("ERROR: Invalid disposition '{}'", s),
+                },
+                _ => None,
+            };
+
+            match intake_store
+                .list_candidates(ListCandidatesRequest {
+                    namespace: namespace.clone(),
+                    review_state,
+                    disposition,
+                    limit,
+                    offset,
+                })
+                .await
+            {
+                Ok(response) => {
+                    let result = serde_json::json!({
+                        "namespace": response.namespace,
+                        "count": response.count,
+                        "total": response.total,
+                        "offset": response.offset,
+                        "limit": response.limit,
+                        "candidates": response.items,
+                    });
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|e| format!("ERROR: {}", e))
+                }
+                Err(e) => {
+                    if e.starts_with("ERROR:") {
+                        e
+                    } else {
+                        format!("ERROR: {e}")
+                    }
+                }
+            }
+        }
+        "record" => {
+            let kind = args
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("task_obligation")
+                .to_string();
+            let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let top_confidence = args.get("confidence").and_then(|v| v.as_f64());
+            let provenance = args
+                .get("provenance")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<ProvenanceSpan>(v).ok());
+            let provenance_confidence = provenance.as_ref().map(|p| p.confidence);
+            let source_span_confidence = args
+                .get("source_span")
+                .and_then(|v| v.as_object())
+                .and_then(|s| s.get("confidence"))
+                .and_then(|v| v.as_f64());
+            // Accept confidence from top-level, provenance, or source_span and
+            // take the max so the strongest signal wins; a candidate recorded
+            // with only provenance.confidence still persists with confidence
+            // >= 0.85 and is visible to the Lock 2 obligation gate.
+            let confidence = [top_confidence, provenance_confidence, source_span_confidence]
+                .into_iter()
+                .flatten()
+                .reduce(f64::max);
+            let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let auto_commit = args.get("auto_commit").and_then(|v| v.as_bool()).unwrap_or(false);
+            let provenance = args
+                .get("provenance")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<ProvenanceSpan>(v).ok());
+
+            let text = title.clone().or_else(|| description.clone()).unwrap_or_default();
+            if text.is_empty() {
+                return "ERROR: 'title' or 'description' is required for record.".to_string();
+            }
+
+            // Deterministic revision/digest so repeated records are idempotent.
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(namespace.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(text.as_bytes());
+            let digest = hasher.finalize();
+            let source_digest = format!(
+                "{:016x}",
+                u64::from_be_bytes(digest[..8].try_into().unwrap())
+            );
+
+            let request = CreateReceiptRequest {
+                namespace: namespace.clone(),
+                source_kind: SourceKind::Tool,
+                source_revision: text.clone(),
+                source_digest,
+                text,
+                title,
+                description,
+                candidate_kind: None,
+                kind: Some(kind.clone()),
+                category: category.clone(),
+                payload: None,
+                confidence,
+                source_span: None,
+                provenance: provenance.clone(),
+                extractor_fingerprint: Some("task_candidates-record-v1".to_string()),
+            };
+
+            match intake_store.create_receipt(request).await {
+                Ok(result) => {
+                    let candidates = result.candidates;
+                    let mut auto_committed: Vec<Value> = Vec::new();
+
+                    // Tiered auto-commit: memory_candidate fact/decision with
+                    // confidence >= 0.85 -> linked Memory + Promoted.
+                    // rule_candidate is never auto-promoted.
+                    if auto_commit
+                        && kind == "memory_candidate"
+                        && matches!(category.as_deref(), Some("fact") | Some("decision"))
+                        && confidence.map_or(false, |c| c >= 0.85)
+                        && task_id.is_some()
+                        && provenance
+                            .as_ref()
+                            .and_then(|p| p.role.as_deref())
+                            .is_none_or(|r| r == "user" || r == "checker")
+                    {
+                        let tid = task_id.as_deref().unwrap();
+                        for cand in &candidates {
+                            let mem_provenance = provenance
+                                .as_ref()
+                                .map(|p| serde_json::to_value(p).unwrap_or(Value::Null))
+                                .unwrap_or(Value::Null);
+                            let mut meta = serde_json::json!({
+                                "extracted_from": json!([tid]),
+                                "provenance": mem_provenance,
+                            });
+                            crate::server::stamp_new_memory(&mut meta);
+                            let memory_type = if category.as_deref() == Some("decision") {
+                                "decision"
+                            } else {
+                                "fact"
+                            };
+                            let payload = MemoryPayload {
+                                content: cand.title.clone(),
+                                user_id: "unknown".to_string(),
+                                memory_type: memory_type.to_string(),
+                                agent_name: Some("task_candidates-auto-commit".to_string()),
+                                location: String::new(),
+                                location_lines: String::new(),
+                                metadata: meta,
+                            };
+                            match embed_dedup_and_upsert(
+                                &store,
+                                &emb,
+                                &namespace,
+                                &payload,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    let resolve_req = ResolveCandidateRequest {
+                                        namespace: namespace.clone(),
+                                        candidate_id: cand.id.clone(),
+                                        disposition: Disposition::Promoted,
+                                        task_id: Some(tid.to_string()),
+                                        cas_version: cand.cas_version,
+                                    };
+                                    match intake_store.resolve_candidate(resolve_req).await {
+                                        Ok(resolved) => {
+                                            auto_committed.push(serde_json::json!({
+                                                "candidate_id": cand.id,
+                                                "disposition": resolved.candidate.disposition,
+                                                "memory_type": memory_type,
+                                                "extracted_from": tid,
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            auto_committed.push(serde_json::json!({
+                                                "candidate_id": cand.id,
+                                                "error": format!("promote failed: {e}"),
+                                            }));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    auto_committed.push(serde_json::json!({
+                                        "candidate_id": cand.id,
+                                        "error": format!("auto-commit memory write failed: {e}"),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+
+                    let response = serde_json::json!({
+                        "receipt": result.receipt,
+                        "candidates": candidates,
+                        "candidate_count": result.candidate_count,
+                        "auto_commit": auto_commit,
+                        "auto_committed": auto_committed,
+                    });
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
+                }
+                Err(e) => {
+                    if e.starts_with("ERROR:") {
+                        e
+                    } else {
+                        format!("ERROR: {e}")
+                    }
+                }
+            }
+        }
+        "resolve" | "dismiss" => {
+            let candidate_id = match args.get("candidate_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.trim().is_empty() => s.to_string(),
+                _ => return "ERROR: 'candidate_id' is required for resolve/dismiss.".to_string(),
+            };
+            let disposition = match args.get("disposition").and_then(|v| v.as_str()) {
+                Some("created") => Disposition::Created,
+                Some("linked") => Disposition::Linked,
+                Some("dismissed") => Disposition::Dismissed,
+                Some("promoted") => Disposition::Promoted,
+                _ => {
+                    if action == "dismiss" {
+                        Disposition::Dismissed
+                    } else {
+                        return "ERROR: 'disposition' must be 'created', 'linked', 'dismissed', or 'promoted'."
+                            .to_string();
+                    }
+                }
+            };
+            let task_id = args.get("task_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            if (disposition == Disposition::Created || disposition == Disposition::Linked)
+                && task_id.is_none()
+            {
+                return format!("ERROR: 'task_id' is required when disposition is '{}'.", disposition);
+            }
+            let cas_version = match args.get("cas_version").and_then(|v| v.as_u64()) {
+                Some(v) => v,
+                None => return "ERROR: 'cas_version' is required (u64).".to_string(),
+            };
+
+            let request = ResolveCandidateRequest {
+                namespace: namespace.clone(),
+                candidate_id,
+                disposition,
+                task_id,
+                cas_version,
+            };
+
+            match intake_store.resolve_candidate(request).await {
+                Ok(result) => {
+                    let response = serde_json::json!({
+                        "candidate": result.candidate,
+                        "task_created": result.task_created,
+                        "task_id": result.task_id,
+                    });
+                    serde_json::to_string_pretty(&response).unwrap_or_else(|e| format!("ERROR: {}", e))
+                }
+                Err(e) => {
+                    if e.starts_with("ERROR:") {
+                        e
+                    } else {
+                        format!("ERROR: {e}")
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
 async fn handle_get_snapshot(
     arguments: Value,
     store: Arc<dyn VectorStore>,
@@ -3962,6 +4326,38 @@ async fn handle_get_snapshot(
         section
     };
 
+    // Pending high-confidence task obligations surface on every snapshot so
+    // the operator sees what blocks Lock 2 completion (Wave 4 obligation ledger).
+    let intake_store = store.as_intake_store();
+    let pending_task_candidates = if let Some(intake) = intake_store {
+        match undisposed_high_confidence_obligations(&*intake, namespace, None, None).await {
+            Ok(obs) => {
+                if obs.is_empty() {
+                    String::new()
+                } else {
+                    let mut s = String::from("PENDING TASK OBLIGATIONS:");
+                    for o in &obs {
+                        s.push_str(&format!(
+                            "\n  - {}: {} (kind={} confidence={:?} role={:?})",
+                            o.id,
+                            o.title,
+                            o.kind,
+                            o.confidence,
+                            o.provenance
+                                .as_ref()
+                                .and_then(|p| p.role.as_deref())
+                                .unwrap_or("")
+                        ));
+                    }
+                    s
+                }
+            }
+            Err(e) => format!("ERROR: pending task obligations query failed: {e}"),
+        }
+    } else {
+        String::new()
+    };
+
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
@@ -3977,6 +4373,9 @@ async fn handle_get_snapshot(
     }
     parts.push(procedures.to_string());
     parts.push(registered_domains_line.to_string());
+    if !pending_task_candidates.is_empty() {
+        parts.push(pending_task_candidates);
+    }
     parts.push(domain_strap.to_string());
     parts.push(body.to_string());
     let snapshot = parts.join("\n");
@@ -11169,7 +11568,8 @@ mod tests {
                 "neurostrata_sparql_query",
                 "neurostrata_task_intake",
                 "neurostrata_task_intake_list",
-                "neurostrata_task_intake_resolve",
+            "neurostrata_task_intake_resolve",
+            "neurostrata_task_candidates",
                 "neurostrata_twin_get",
                 "neurostrata_twin_set",
                 "neurostrata_twin_diff",
@@ -13482,9 +13882,12 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
             title: Some(title),
             description: Some(desc.clone()),
             candidate_kind: Some(ck.to_string()),
+            kind: Some("task_obligation".to_string()),
+            category: None,
             payload: Some(serde_json::json!({"source":"distill","desc":desc})),
             confidence: Some(0.8),
             source_span: Some(serde_json::json!({"start": 0, "end": desc.len()})),
+            provenance: None,
             extractor_fingerprint: Some("session-distill-v1".to_string()),
         };
         match intake_store.create_receipt(request).await {

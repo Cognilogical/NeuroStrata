@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import plugin, {
   createHarnessPlugin,
   detectTaskIntentsLocal,
@@ -493,4 +496,132 @@ test("opencode default export handleHookEvent and handleClaudeHookEvent are alia
   assert.equal(out2.continue, true);
   assert.equal(out2.hookSpecificOutput.permissionDecision, "allow");
   assert.ok(target2.prompt.includes("### NeuroStrata Task & Graph Context"));
+});
+
+test("OpenCode V2 execute.after mutates event.result.content and registers session.hook context/compaction", async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "ns-oc2-v226-"));
+  const nsDir = join(tmpDir, ".NeuroStrata");
+  mkdirSync(nsDir, { recursive: true });
+  writeFileSync(
+    join(nsDir, "active_session.json"),
+    JSON.stringify({
+      namespace: "NeuroStrata",
+      task_id: "neurostrata-a1si",
+      status: "in_progress",
+      session_id: "ses_v226",
+      updated_at: new Date().toISOString(),
+    }),
+  );
+  writeFileSync(
+    join(nsDir, "PluginConfig.json"),
+    JSON.stringify({
+      guardMode: "warn",
+      enableSubagentContextPropagation: true,
+      daemonUrl: "http://127.0.0.1:59999",
+    }),
+  );
+
+  const sessionHooks = new Map();
+  const toolHooks = new Map();
+  const ctx = {
+    location: {
+      directory: tmpDir,
+      project: { root: tmpDir, canonical: tmpDir },
+    },
+    session: {
+      hook(name, fn) {
+        sessionHooks.set(name, fn);
+      },
+    },
+    tool: {
+      hook(name, fn) {
+        toolHooks.set(name, fn);
+      },
+    },
+  };
+
+  await plugin.initialize(ctx);
+  assert.equal(typeof sessionHooks.get("context"), "function");
+  assert.equal(typeof sessionHooks.get("compaction"), "function");
+  assert.equal(typeof toolHooks.get("execute.after"), "function");
+
+  const afterEvent = {
+    name: "read",
+    callID: "call_1",
+    args: { path: "src/server.rs" },
+    status: "completed",
+    result: {
+      content: "TODO: wire task candidate provenance in server.rs",
+      output: "TODO: wire task candidate provenance in server.rs",
+    },
+  };
+  await toolHooks.get("execute.after")(afterEvent);
+  assert.match(afterEvent.result.content, /TASK INTENT DETECTED/);
+  assert.match(afterEvent.result.output, /TASK INTENT DETECTED/);
+
+  const ctxEvent1 = { sessionID: "ses_v226", messages: [] };
+  await sessionHooks.get("context")(ctxEvent1);
+  assert.equal(typeof ctxEvent1.additionalContext, "string");
+  assert.match(ctxEvent1.additionalContext, /neurostrata-a1si/);
+
+  const ctxEvent2 = { sessionID: "ses_v226", messages: [] };
+  await sessionHooks.get("context")(ctxEvent2);
+  assert.equal(ctxEvent2.additionalContext, undefined);
+
+  await sessionHooks.get("compaction")({ sessionID: "ses_v226" });
+  const ctxEvent3 = { sessionID: "ses_v226", messages: [] };
+  await sessionHooks.get("context")(ctxEvent3);
+  assert.match(ctxEvent3.additionalContext, /neurostrata-a1si/);
+});
+
+test("OpenCode V2 execute.after preserves array content[0].text and appends TASK INTENT DETECTED", async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "ns-oc2-array-"));
+  const nsDir = join(tmpDir, ".NeuroStrata");
+  mkdirSync(nsDir, { recursive: true });
+  writeFileSync(
+    join(nsDir, "active_session.json"),
+    JSON.stringify({
+      namespace: "NeuroStrata",
+      task_id: "neurostrata-a1si",
+      status: "in_progress",
+      session_id: "ses_array",
+      updated_at: new Date().toISOString(),
+    }),
+  );
+
+  const toolHooks = new Map();
+  const ctx = {
+    location: {
+      directory: tmpDir,
+      project: { root: tmpDir, canonical: tmpDir },
+    },
+    session: {
+      hook() {},
+    },
+    tool: {
+      hook(name, fn) {
+        toolHooks.set(name, fn);
+      },
+    },
+  };
+
+  await plugin.initialize(ctx);
+  assert.equal(typeof toolHooks.get("execute.after"), "function");
+
+  const afterEvent = {
+    name: "read",
+    callID: "call_array_1",
+    args: { path: "src/server.rs" },
+    status: "completed",
+    result: {
+      content: [{ type: "text", text: "Read file src/server.rs\nTODO: wire candidate" }],
+      output: "Read file src/server.rs\nTODO: wire candidate",
+    },
+  };
+  await toolHooks.get("execute.after")(afterEvent);
+  assert.ok(Array.isArray(afterEvent.result.content), "result.content stays an array");
+  assert.equal(afterEvent.result.content[0].type, "text", "text item preserved");
+  assert.match(afterEvent.result.content[0].text, /Read file src\/server\.rs/, "original text kept");
+  assert.match(afterEvent.result.content[0].text, /TASK INTENT DETECTED/, "nudge appended to text");
+  assert.match(afterEvent.result.output, /TASK INTENT DETECTED/, "result.output also mutated");
 });

@@ -16,7 +16,9 @@ pub mod receipt;
 pub mod wiring;
 
 use crate::judgment::DeduplicationChecker;
-use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
+use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
+use crate::store::LadybugStore;
+use intake::undisposed_high_confidence_obligations;
 use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -387,6 +389,27 @@ async fn store_new_task(
     Ok((id, payload))
 }
 
+/// Memory types treated as normative (governing constraints) for reserved slots.
+const NORMATIVE_MEMORY_TYPES: &[&str] = &["rule", "fact", "decision", "procedure"];
+/// Memory types treated as structural evidence anchors.
+const STRUCTURAL_MEMORY_TYPES: &[&str] = &["code_ast", "doc_section"];
+/// Max normative memories reserved in `auto_retrieved_context`.
+const MAX_NORMATIVE_MEMORIES: usize = 4;
+/// Max structural anchors in `auto_retrieved_context`.
+const MAX_STRUCTURAL_ANCHORS: usize = 3;
+/// Max cross-domain conceptual bridges emitted per task context.
+const MAX_CONCEPTUAL_BRIDGES: usize = 2;
+/// Relations traversed when synthesising 2-hop conceptual bridges.
+const BRIDGE_RELATIONS: &[&str] = &["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
+
+fn is_normative_memory(memory_type: &str) -> bool {
+    NORMATIVE_MEMORY_TYPES.contains(&memory_type)
+}
+
+fn is_structural_memory(memory_type: &str) -> bool {
+    STRUCTURAL_MEMORY_TYPES.contains(&memory_type)
+}
+
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
 /// graph edges for a task, and format a ready-to-paste subagent prompt block.
 pub async fn build_task_graph_context(
@@ -427,6 +450,7 @@ pub async fn build_task_graph_context(
             "memory_type": r.payload.memory_type,
             "location": r.payload.location,
             "snippet": snippet,
+            "metadata": r.payload.metadata,
             "calls": calls,
             "imports": imports,
             "governs": governs,
@@ -442,14 +466,239 @@ pub async fn build_task_graph_context(
     } else {
         prompt_lines.join("\n")
     };
+
+    // Partition the retrieved items into reserved normative memories and structural anchors.
+    let normative_memories: Vec<Value> = hits_json
+        .iter()
+        .filter(|h| is_normative_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .take(MAX_NORMATIVE_MEMORIES)
+        .cloned()
+        .collect();
+    let structural_anchors: Vec<Value> = hits_json
+        .iter()
+        .filter(|h| is_structural_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .take(MAX_STRUCTURAL_ANCHORS)
+        .cloned()
+        .collect();
+
+    // Synthesise up to MAX_CONCEPTUAL_BRIDGES cross-domain 2-hop bridges from the
+    // retrieved seed memories to normative targets in a disjoint domain.
+    let conceptual_bridges = synthesize_conceptual_bridges(store, namespace, &hits_json).await;
+
+    let auto_retrieved_context = json!({
+        "query": payload.content,
+        "items": hits_json,
+        "related_edges": Value::Array(Vec::new()),
+        "normative_memories": normative_memories,
+        "structural_anchors": structural_anchors,
+        "conceptual_bridges": conceptual_bridges,
+    });
+
+    let bridges_prompt = conceptual_bridges
+        .as_array()
+        .map(|arr| {
+            if arr.is_empty() {
+                String::new()
+            } else {
+                let lines: Vec<String> = arr
+                    .iter()
+                    .filter_map(|b| {
+                        b.get("why_connected")
+                            .and_then(|v| v.as_str())
+                            .map(|s| format!("  - {s}"))
+                    })
+                    .collect();
+                format!("\n### Cross-Domain Bridges\n{}", lines.join("\n"))
+            }
+        })
+        .unwrap_or_default();
+
     let subagent_prompt = format!(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
-         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}\n\
+         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}\n\
          - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).",
-        namespace, task_id, payload.content, hits_block
+        namespace, task_id, payload.content, hits_block, bridges_prompt
     );
-    (Value::Array(hits_json), subagent_prompt)
+    (auto_retrieved_context, subagent_prompt)
+}
+
+/// Synthesise cross-domain conceptual bridges from retrieved seed memories.
+///
+/// For each seed item, traverses 2 hops (`seed -> via -> target`) through the
+/// graph and keeps up to `MAX_CONCEPTUAL_BRIDGES` targets whose memory type is
+/// normative and whose domain is disjoint from the seed's domain. Every bridge
+/// carries a concrete `why_connected` path explanation. Fail-soft: a traversal
+/// error yields no bridges for that seed rather than failing the whole context.
+async fn synthesize_conceptual_bridges(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    items: &[Value],
+) -> Value {
+    let mut bridges: Vec<Value> = Vec::new();
+    let mut seen_targets: HashSet<String> = HashSet::new();
+    // `related` lives on `GraphRead`, which only `LadybugStore` implements among
+    // the `VectorStore` implementors; other store types yield no bridges.
+    let Some(ladybug) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() else {
+        return Value::Array(Vec::new());
+    };
+    let relations: Vec<String> = BRIDGE_RELATIONS.iter().map(|s| s.to_string()).collect();
+    let policy = crate::graph_read::traversal::CrossNamespacePolicy::default();
+    for item in items {
+        if bridges.len() >= MAX_CONCEPTUAL_BRIDGES {
+            break;
+        }
+        let seed_id = match item.get("id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let seed_metadata = item.get("metadata").unwrap_or(&Value::Null);
+        let seed_location = item.get("location").and_then(|v| v.as_str()).unwrap_or("");
+        let seed_tokens = feature_tokens(seed_metadata, seed_location);
+        if let Ok(result) = ladybug
+            .related(
+                namespace,
+                &seed_id,
+                &relations,
+                crate::graph_read::related::Direction::Both,
+                2,
+                &[],
+                50,
+                None,
+                &policy,
+            )
+            .await
+        {
+            // hop1_ids: the via nodes reached from the seed (frontier depth 0).
+            let mut hop1_ids: HashSet<String> = HashSet::new();
+            for edge in &result.edges {
+                if edge.depth == 0 {
+                    if edge.source != seed_id {
+                        hop1_ids.insert(edge.source.clone());
+                    }
+                    if edge.target != seed_id {
+                        hop1_ids.insert(edge.target.clone());
+                    }
+                }
+            }
+            for edge in &result.edges {
+                if bridges.len() >= MAX_CONCEPTUAL_BRIDGES {
+                    break;
+                }
+                // frontier depth 1 edge: via -> target (seed -> via has frontier depth 0).
+                if edge.depth != 1 {
+                    continue;
+                }
+                let a = edge.source.as_str();
+                let b = edge.target.as_str();
+                // The via is whichever endpoint sits at hop 1; the target is the
+                // other endpoint (the edge may be stored in either orientation
+                // under Direction::Both, so do not assume edge.source is the via).
+                let (via_id, target_id) = if hop1_ids.contains(a) && b != seed_id && !hop1_ids.contains(b) {
+                    (a, b)
+                } else if hop1_ids.contains(b) && a != seed_id && !hop1_ids.contains(a) {
+                    (b, a)
+                } else {
+                    continue;
+                };
+                if seen_targets.contains(target_id) {
+                    continue;
+                }
+                let target_node = match result.nodes.iter().find(|n| n.id == target_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if !is_normative_memory(&target_node.memory_type) {
+                    continue;
+                }
+                // Fetch the target row so its full metadata (domain, tags,
+                // governs, location) is available for token extraction.
+                let target_metadata = if let Ok(Some((_, payload))) =
+                    ladybug.get(namespace, target_id).await
+                {
+                    payload.metadata
+                } else {
+                    Value::Null
+                };
+                let target_location = target_metadata
+                    .get("location")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut target_tokens: HashSet<String> = HashSet::new();
+                if let Some(domain) = &target_node.domain {
+                    target_tokens.insert(domain.clone());
+                }
+                for t in crate::domain::domain_keys(&target_metadata) {
+                    target_tokens.insert(t);
+                }
+                target_tokens.extend(feature_tokens(&target_metadata, target_location));
+                // Cross-domain filter: require jaccard < 0.35 when the target
+                // carries any tokens; an empty target token set is not a filter.
+                if !target_tokens.is_empty() {
+                    let sim = jaccard_similarity(&seed_tokens, &target_tokens);
+                    if sim >= 0.35 {
+                        continue;
+                    }
+                }
+                seen_targets.insert(target_id.to_string());
+                let why_connected =
+                    format!("{} -> {} -> {}", seed_id, via_id, target_id);
+                bridges.push(json!({
+                    "id": target_node.id,
+                    "memory_type": target_node.memory_type,
+                    "content": target_node.snippet,
+                    "why_connected": why_connected,
+                }));
+            }
+        }
+    }
+    Value::Array(bridges)
+}
+
+/// Build the feature token set for a memory from its domain slugs, tags, and
+/// top-level path prefixes of its `location` and `governs` entries.
+pub(crate) fn feature_tokens(metadata: &Value, location: &str) -> HashSet<String> {
+    let mut tokens: HashSet<String> = HashSet::new();
+    for d in crate::domain::domain_keys(metadata) {
+        tokens.insert(d);
+    }
+    if let Some(tags) = metadata.get("tags").and_then(|v| v.as_array()) {
+        for tag in tags {
+            if let Some(s) = tag.as_str() {
+                tokens.insert(s.to_string());
+            }
+        }
+    }
+    let add_prefix = |tokens: &mut HashSet<String>, path: &str| {
+        let prefix: String = path.split('/').take(2).collect::<Vec<_>>().join("/");
+        if !prefix.is_empty() {
+            tokens.insert(prefix);
+        }
+    };
+    add_prefix(&mut tokens, location);
+    if let Some(gov) = metadata.get("governs").and_then(|v| v.as_array()) {
+        for g in gov {
+            if let Some(s) = g.as_str() {
+                add_prefix(&mut tokens, s);
+            }
+        }
+    }
+    tokens
+}
+
+/// Jaccard similarity between two token sets: `|a ∩ b| / |a ∪ b|`. Returns
+/// `0.0` when either set is empty.
+pub(crate) fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.union(b).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 /// Record a graph or memory lookup against any active `in_progress` task in
@@ -1502,6 +1751,36 @@ pub async fn handle_task_complete(
             }
         }
     }
+    // Lock 2 — Task Obligation: undisposed high-confidence obligations block
+    // completion until they are promoted (neurostrata_task_create) or dismissed
+    // (neurostrata_task_candidates action: "resolve"). Placed BEFORE any memory
+    // extraction/upsert side effects (Path 1/2/3) so a refusal leaves no
+    // orphan memory row behind.
+    let intake_store = store.as_intake_store();
+    if let Some(intake) = intake_store {
+        let obligations =
+            undisposed_high_confidence_obligations(&*intake, &namespace, None, Some(id.as_str()))
+                .await
+                .unwrap_or_default();
+        if !obligations.is_empty() {
+            let mut msg = format!(
+                "BLOCKED (Lock 2 — Task Obligation): task {} cannot complete: {} undisposed high-confidence task obligation(s) must be resolved before completion.\n",
+                id,
+                obligations.len()
+            );
+            for o in &obligations {
+                msg.push_str(&format!(
+                    "  - {}: {}\n    promote via: neurostrata_task_create | dismiss via: neurostrata_task_candidates action: \"resolve\" namespace: \"{}\" candidate_id: \"{}\" disposition: \"dismissed\"\n",
+                    o.id,
+                    o.title,
+                    namespace,
+                    o.id
+                ));
+            }
+            return Err(msg);
+        }
+    }
+
     let actor = task
         .task_field("assignee")
         .and_then(|v| v.as_str())
@@ -4032,6 +4311,7 @@ pub async fn import_beads(
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
+    use crate::store::LadybugStore;
 
     /// R5: an "installed" hook must carry the executable bit, so fixtures
     /// asserting `hook_installed: true` install it the way the installer does.
@@ -5529,6 +5809,130 @@ mod tests {
             status_of(&store, "MyProj", &id).await,
             Status::InProgress,
             "a blocked completion changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_blocked_by_undisposed_high_confidence_obligation() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let intake = store.as_intake_store().expect("intake store");
+        let prov = serde_json::json!({
+            "turn_id": "t1", "role": "user",
+            "evidence_quote": "fix the login bug", "confidence": 0.9
+        });
+        intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: "MyProj".to_string(),
+                source_kind: crate::task::intake::SourceKind::Tool,
+                source_revision: "r1".to_string(),
+                source_digest: "d1".to_string(),
+                text: "obligation".to_string(),
+                title: Some("Fix login bug".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.9),
+                source_span: None,
+                provenance: Some(
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                ),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create obligation receipt");
+
+        let err = handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("undisposed obligation must block completion");
+
+        assert!(
+            err.starts_with("BLOCKED (Lock 2 — Task Obligation)"),
+            "wrong message: {err}"
+        );
+        assert!(err.contains("Fix login bug"), "names obligation title: {err}");
+        assert!(
+            err.contains("neurostrata_task_candidates action: \"resolve\""),
+            "names resolve action: {err}"
+        );
+        assert_eq!(
+            status_of(&store, "MyProj", &id).await,
+            Status::InProgress,
+            "a blocked completion changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_complete_not_blocked_once_obligation_is_disposed() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        let intake = store.as_intake_store().expect("intake store");
+        let prov = serde_json::json!({
+            "turn_id": "t1", "role": "user",
+            "evidence_quote": "fix it", "confidence": 0.9
+        });
+        let create = intake
+            .create_receipt(crate::task::intake::CreateReceiptRequest {
+                namespace: "MyProj".to_string(),
+                source_kind: crate::task::intake::SourceKind::Tool,
+                source_revision: "r1".to_string(),
+                source_digest: "d1".to_string(),
+                text: "obligation".to_string(),
+                title: Some("Fix it".to_string()),
+                description: None,
+                candidate_kind: None,
+                kind: Some("task_obligation".to_string()),
+                category: None,
+                payload: None,
+                confidence: Some(0.9),
+                source_span: None,
+                provenance: Some(
+                    serde_json::from_value::<crate::task::intake::ProvenanceSpan>(prov).unwrap()
+                ),
+                extractor_fingerprint: None,
+            })
+            .await
+            .expect("create obligation receipt");
+        let cand_id = create.candidates[0].id.clone();
+
+        intake
+            .resolve_candidate(crate::task::intake::ResolveCandidateRequest {
+                namespace: "MyProj".to_string(),
+                candidate_id: cand_id,
+                disposition: crate::task::intake::Disposition::Dismissed,
+                task_id: None,
+                cas_version: 1,
+            })
+            .await
+            .expect("dismiss obligation");
+
+        // No obligation remains, so completion is refused only by Lock 2
+        // extraction (no memory extracted), not by the obligation gate.
+        let err = handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("completion still blocked by Lock 2 extraction");
+
+        assert!(
+            !err.starts_with("BLOCKED (Lock 2 — Task Obligation)"),
+            "disposed obligation must not block: {err}"
         );
     }
 
@@ -7484,5 +7888,169 @@ impl crate::traits::AsAny for ListHidingStore {
             "the archived rule snippet must not appear in the recomputed prompt: {}",
             prompt_after
         );
+    }
+
+    /// Wave 3 / Task 3.1: `build_task_graph_context` partitions retrieved items into
+    /// reserved `normative_memories` and `structural_anchors`, synthesises 2-hop
+    /// cross-domain `conceptual_bridges`, and emits a `Cross-Domain Bridges`
+    /// section in the subagent prompt when bridges are present.
+    #[tokio::test]
+    async fn task_graph_context_partitions_normative_structural_and_conceptual_bridges() {
+        let store = store_with_namespace("probe").await;
+
+        // M1: normative rule governing src/server.rs (backend domain).
+        let m1_id = "mem-rule-m1".to_string();
+        store
+            .upsert(
+                "probe",
+                &m1_id,
+                vec![0.0f32; 4],
+                MemoryPayload {
+                    content: "Daemon caller path check required on ingest".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "src/server.rs".to_string(),
+                    location_lines: String::new(),
+                    metadata: json!({"domain": "backend", "governs": ["src/server.rs"], "source": "owner 2026-11-07"}),
+                },
+            )
+            .await
+            .expect("seed M1 rule");
+
+        // File B: plugins/core/index.ts (frontend domain), structural anchor.
+        let file_b_id = "mem-file-b".to_string();
+        store
+            .upsert(
+                "probe",
+                &file_b_id,
+                vec![0.0f32; 4],
+                MemoryPayload {
+                    content: "bundled harness adapter".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    agent_name: None,
+                    location: "plugins/core/index.ts".to_string(),
+                    location_lines: String::new(),
+                    metadata: json!({"domain": "frontend"}),
+                },
+            )
+            .await
+            .expect("seed file B");
+
+        // Intermediate via node (frontend domain).
+        let via_id = "mem-via".to_string();
+        store
+            .upsert(
+                "probe",
+                &via_id,
+                vec![0.0f32; 4],
+                MemoryPayload {
+                    content: "adapter entry point".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    agent_name: None,
+                    location: "plugins/core/index.ts#fn:main".to_string(),
+                    location_lines: String::new(),
+                    metadata: json!({"domain": "frontend"}),
+                },
+            )
+            .await
+            .expect("seed via node");
+
+        // 2-hop path: file-b ->(DEPENDS_ON)-> via ->(RELATES_TO)-> M1.
+        let edge = |rel: &str, a: &str, b: &str| {
+            format!(
+                "MERGE (a:Memory {{id: '{a}'}}), (b:Memory {{id: '{b}'}}) MERGE (a)-[r:{rel} {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            )
+        };
+        let ladybug = VectorStore::as_any(&*store)
+            .downcast_ref::<LadybugStore>()
+            .expect("test store is a LadybugStore");
+        for (rel, a, b) in [
+            ("DEPENDS_ON", "mem-file-b", "mem-via"),
+            ("RELATES_TO", "mem-via", "mem-rule-m1"),
+        ] {
+            ladybug
+                .with_conn(move |conn| {
+                    conn.query(&edge(rel, a, b))?;
+                    Ok(())
+                })
+                .await
+                .expect("seed bridge edge");
+        }
+
+        let payload = MemoryPayload {
+            content: "review the harness adapter and its governing rule".to_string(),
+            user_id: "owner".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let (ctx, prompt) =
+            build_task_graph_context(&store, "probe", "task-1", &vec![0.0f32; 4], &payload).await;
+
+        let obj = ctx.as_object().expect("auto_retrieved_context is an object");
+        for key in [
+            "query",
+            "items",
+            "related_edges",
+            "normative_memories",
+            "structural_anchors",
+            "conceptual_bridges",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "auto_retrieved_context missing `{key}`: {obj:?}"
+            );
+        }
+
+        let nm = obj
+            .get("normative_memories")
+            .and_then(|v| v.as_array())
+            .expect("normative_memories is an array");
+        assert!(
+            nm.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-rule-m1")),
+            "M1 rule must be in normative_memories: {nm:?}"
+        );
+        assert!(
+            nm.len() <= MAX_NORMATIVE_MEMORIES,
+            "normative_memories within cap: {nm:?}"
+        );
+
+        let sa = obj
+            .get("structural_anchors")
+            .and_then(|v| v.as_array())
+            .expect("structural_anchors is an array");
+        assert!(
+            sa.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-file-b")),
+            "file B must be in structural_anchors: {sa:?}"
+        );
+        assert!(sa.len() <= MAX_STRUCTURAL_ANCHORS, "structural_anchors within cap: {sa:?}");
+
+        let cb = obj
+            .get("conceptual_bridges")
+            .and_then(|v| v.as_array())
+            .expect("conceptual_bridges is an array");
+        assert!(!cb.is_empty(), "conceptual_bridges should be non-empty: {cb:?}");
+        assert!(cb.len() <= MAX_CONCEPTUAL_BRIDGES, "conceptual_bridges within cap: {cb:?}");
+        let bridge = cb.first().expect("at least one bridge");
+        assert_eq!(
+            bridge.get("id").and_then(|v| v.as_str()),
+            Some("mem-rule-m1"),
+            "bridge target must be M1: {bridge:?}"
+        );
+        assert!(
+            bridge.get("why_connected").and_then(|v| v.as_str()).is_some(),
+            "bridge carries why_connected: {bridge:?}"
+        );
+
+        assert!(
+            prompt.contains("### Cross-Domain Bridges"),
+            "prompt has Cross-Domain Bridges section: {prompt}"
+        );
+        assert!(prompt.contains("mem-rule-m1"), "prompt references M1: {prompt}");
     }
 }

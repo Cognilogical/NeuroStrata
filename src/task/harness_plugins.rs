@@ -177,6 +177,7 @@ pub fn detect_harnesses(
     }
 
     if project_root.join(".opencode").exists()
+        || project_root.join(".NeuroStrata/plugins/opencode").exists()
         || project_root.join("opencode.json").exists()
         || home.as_ref().map(|h| h.join(".config/opencode").exists() || h.join(".local/share/opencode").exists()).unwrap_or(false)
     {
@@ -491,101 +492,51 @@ fn wire_harness_config(
                 let _ = std::fs::create_dir_all(&plugins_dir);
                 let _ = std::fs::write(&loader_path, loader);
 
-                // 2. Always create or merge .opencode/opencode.json -> "plugins",
-                //    preserving every other key/entry.
-                let loader_rel = "./.NeuroStrata/plugins/opencode/dist/index.js";
+                // 2. Never insert the plugin path into opencode.json. If
+                //    `.opencode/opencode.json` exists, strip any legacy
+                //    file-path entries from "plugins"; if "plugins" becomes
+                //    empty, remove the key entirely. Clean configs are left
+                //    untouched (never created, never populated with the plugin path).
                 let oc_cfg = project_root.join(".opencode/opencode.json");
-                // Preserve the existing file on read/parse failure: only
-                // populate when the file is absent, or when it parses to a
-                // JSON object. A malformed or non-object existing file is left
-                // untouched (never overwritten with `{}`).
-                let mut doc: Value = json!({});
-                let mut write_doc = false;
                 if oc_cfg.exists() {
-                    if let Some(d) = std::fs::read_to_string(&oc_cfg)
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    {
-                        if d.is_object() {
-                            doc = d;
-                            write_doc = true;
-                        }
-                    }
-                } else {
-                    write_doc = true;
-                }
-                if write_doc {
-                    if let Some(obj) = doc.as_object_mut() {
-                        let entry = obj.get("plugins");
-                        let (is_array, already_in_array, key_absent) = {
-                            let e = entry;
-                            (
-                                e.map(|v| v.is_array()).unwrap_or(false),
-                                e.and_then(|v| v.as_array())
-                                    .map(|arr| {
-                                        arr.iter().any(|v| {
-                                            v.as_str()
-                                                .map(|s| s == loader_rel)
-                                                .unwrap_or(false)
-                                        })
-                                    })
-                                    .unwrap_or(false),
-                                entry.is_none(),
-                            )
-                        };
-                        if is_array && !already_in_array {
-                            obj.get_mut("plugins")
-                                .and_then(|v| v.as_array_mut())
-                                .unwrap()
-                                .push(json!(loader_rel));
-                        } else if key_absent {
-                            obj.insert("plugins".to_string(), json!([loader_rel]));
-                        }
-                    }
-                    let _ = write_json_if_changed(&oc_cfg, &doc);
-                }
-
-                // 3. Root opencode.json: only update if it already exists; never
-                //    create a root opencode.json (the loader lives in .opencode/).
-                let root_cfg = project_root.join("opencode.json");
-                if root_cfg.exists() {
-                    if let Ok(raw) = std::fs::read_to_string(&root_cfg) {
-                        if let Ok(mut root_doc) = serde_json::from_str::<Value>(&raw) {
-                            if let Some(obj) = root_doc.as_object_mut() {
-                                for key in ["plugins", "plugin"] {
-                                    let create_if_missing = key == "plugins";
-                                    // Inspect immutably first so no borrow is outstanding when we mutate.
-                                    let (is_array, already_in_array, key_absent) = {
-                                        let entry = obj.get(key);
-                                        (
-                                            entry.map(|v| v.is_array()).unwrap_or(false),
-                                            entry
-                                                .and_then(|v| v.as_array())
-                                                .map(|arr| {
-                                                    arr.iter().any(|v| {
-                                                        v.as_str()
-                                                            .map(|s| s == loader_rel)
-                                                            .unwrap_or(false)
-                                                    })
-                                                })
-                                                .unwrap_or(false),
-                                            entry.is_none(),
-                                        )
-                                    };
-                                    if is_array && !already_in_array {
-                                        obj.get_mut(key)
-                                            .and_then(|v| v.as_array_mut())
-                                            .unwrap()
-                                            .push(json!(loader_rel));
-                                    } else if create_if_missing && key_absent {
-                                        obj.insert(key.to_string(), json!([loader_rel]));
+                    if let Ok(raw) = std::fs::read_to_string(&oc_cfg) {
+                        if let Ok(mut doc) = serde_json::from_str::<Value>(&raw) {
+                            if let Some(obj) = doc.as_object_mut() {
+                                let mut changed = false;
+                                let mut remove_plugins = false;
+                                if let Some(plugins) =
+                                    obj.get_mut("plugins").and_then(|v| v.as_array_mut())
+                                {
+                                    let before = plugins.len();
+                                    plugins.retain(|v| {
+                                        v.as_str()
+                                            .map(|s| {
+                                                s != "./.NeuroStrata/plugins/opencode/dist/index.js"
+                                                    && s != ".NeuroStrata/plugins/opencode/dist/index.js"
+                                            })
+                                            .unwrap_or(true)
+                                    });
+                                    if plugins.len() != before {
+                                        changed = true;
+                                    }
+                                    if plugins.is_empty() {
+                                        remove_plugins = true;
                                     }
                                 }
+                                if remove_plugins {
+                                    obj.remove("plugins");
+                                    changed = true;
+                                }
+                                if changed {
+                                    let _ = write_json_if_changed(&oc_cfg, &doc);
+                                }
                             }
-                            let _ = write_json_if_changed(&root_cfg, &root_doc);
                         }
                     }
                 }
+
+                // Root opencode.json is intentionally never written here: the
+                // plugin path is never inserted into opencode.json.
 
                 // 3. Keep writing .opencode/neurostrata-plugin.json (the historical
                 //    plugin registration) unchanged.
@@ -763,31 +714,82 @@ mod tests {
             "loader re-exports all"
         );
 
-        // .opencode/opencode.json always created/merged with the loader in "plugins".
+        // `.opencode/opencode.json` is never created or populated with the plugin path.
         let oc_cfg = tmp.path().join(".opencode/opencode.json");
-        assert!(oc_cfg.exists(), ".opencode/opencode.json must be created");
-        let oc_doc: Value = serde_json::from_str(&std::fs::read_to_string(oc_cfg).expect("read .opencode/opencode.json"))
-            .expect("parse .opencode/opencode.json");
-        let oc_plugins = oc_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
-        assert!(
-            oc_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
-            ".opencode/opencode.json plugins contains loader path: {oc_plugins:?}"
-        );
+        let oc_untouched = if oc_cfg.exists() {
+            match std::fs::read_to_string(&oc_cfg)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            {
+                Some(doc) => doc
+                    .get("plugins")
+                    .and_then(|p| p.as_array())
+                    .map(|arr| {
+                        !arr.iter().any(|v| {
+                            v.as_str()
+                                == Some("./.NeuroStrata/plugins/opencode/dist/index.js")
+                        })
+                    })
+                    .unwrap_or(true),
+                None => true,
+            }
+        } else {
+            true
+        };
+        assert!(oc_untouched, ".opencode/opencode.json must not contain the loader path");
 
-        // Root opencode.json updated, preserving existing keys/entries (not created when absent,
-        // never clobbered when present).
+        // Root opencode.json is never written: existing entries preserved, loader path never inserted.
         let root_doc: Value = serde_json::from_str(&std::fs::read_to_string(root_cfg).expect("read opencode.json"))
             .expect("parse opencode.json");
         let root_plugins = root_doc.get("plugins").and_then(|v| v.as_array()).expect("plugins array");
-        assert!(
-            root_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")),
-            "root opencode.json plugins contains loader path"
-        );
-        assert!(
-            root_plugins.iter().any(|v| v.as_str() == Some("./other.js")),
-            "root opencode.json preserves existing plugins entries"
-        );
+        assert_eq!(root_plugins.len(), 1, "root opencode.json plugins: {root_plugins:?}");
+        assert_eq!(root_plugins[0].as_str(), Some("./other.js"));
+        assert!(!root_plugins.iter().any(|v| v.as_str() == Some("./.NeuroStrata/plugins/opencode/dist/index.js")));
         assert_eq!(root_doc.get("otherKey").and_then(|v| v.as_str()), Some("preserve"));
+    }
+
+    #[test]
+    fn opencode_wire_harness_config_removes_invalid_file_plugin_entry_and_installs_autoload_shim() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let opencode_dir = root.join(".opencode");
+        std::fs::create_dir_all(&opencode_dir).expect("mkdir .opencode");
+        std::fs::write(
+            opencode_dir.join("opencode.json"),
+            r#"{
+  "plugins": [
+    "./.NeuroStrata/plugins/opencode/dist/index.js",
+    "custom-plugin-dir"
+  ]
+}"#,
+        )
+        .expect("seed opencode.json");
+
+        let wired = wire_harness_config(
+            root,
+            "TestProj",
+            "opencode",
+            true,
+            "./.NeuroStrata/plugins/opencode/dist/index.js",
+            "./.NeuroStrata/plugins/opencode/cli-hook.mjs",
+        );
+        assert!(wired.is_some(), "loader should be wired for opencode");
+        assert!(
+            root.join(".opencode/plugins/neurostrata.js").is_file(),
+            "autoload shim written at .opencode/plugins/neurostrata.js"
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(opencode_dir.join("opencode.json")).expect("read opencode.json"),
+        )
+        .expect("valid json");
+        // Invalid file-path entry stripped; valid entry preserved.
+        let plugins = parsed
+            .get("plugins")
+            .and_then(|v| v.as_array())
+            .expect("plugins array preserved for remaining entry");
+        assert_eq!(plugins.len(), 1, "plugins: {plugins:?}");
+        assert_eq!(plugins[0].as_str(), Some("custom-plugin-dir"));
     }
 
     #[test]

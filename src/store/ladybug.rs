@@ -1,12 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use lbug::{Connection, Database, SystemConfig};
 
+use crate::parser::ingest::split_scoped_id;
 use crate::traits::{
     DomainMatchMode, DomainSearchOutcome, GraphMatchKind, GraphRead, MemoryHit, MemoryPayload,
     RelocateOutcome, SearchResult, VectorStore,
@@ -179,6 +180,12 @@ async fn search_inner(
             );
             let now = chrono::Utc::now().timestamp();
 
+            // Active generations for this namespace, resolved per source so a
+            // row is validated against the source that owns it (not just any
+            // active generation in the namespace). Read once per search.
+            let (by_source, active_set, max_code_gen) =
+                active_generations_by_source_of(conn, &namespace);
+
             // LadybugDB (the embedder) has no OFFSET, so we over-fetch with a larger LIMIT and
             // filter/trim in Rust. The multiplier bounds cost: at most
             // FETCH_MULTIPLIER * limit rows are scanned from the engine.
@@ -297,6 +304,10 @@ async fn search_inner(
             let result_count = result.get_num_tuples() as usize;
             let mut all_primaries = Vec::new();
             let mut filtered_primaries = Vec::new();
+            let mut normative_count: usize = 0;
+            // Dedup by bare_id across generations: keep the highest generation
+            // for each logical id. Maps bare_id -> (generation, index in all_primaries).
+            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
 
             for row in result {
                 let id: String = format!("{}", row[0]);
@@ -343,6 +354,20 @@ async fn search_inner(
                         .iter()
                         .any(|k| domain_keys.contains(k))
                 };
+
+                // Active-generation filter (Wave 2.1): drop rows from superseded
+                // ingest generations or other namespaces before they consume a
+                // candidate slot. Unscoped normative rows always pass.
+                let kept_id = is_active_scoped_row(
+                    &id,
+                    &namespace,
+                    &memory_type,
+                    &metadata_val,
+                    &by_source,
+                    &active_set,
+                    max_code_gen,
+                );
+                let Some(_kept_id) = kept_id else { continue };
 
                 // Usage boost: ln(1+n) gives a real gain even at n=1, and the
                 // cap at half distance preserves semantic ranking order.
@@ -406,36 +431,85 @@ async fn search_inner(
                     }]),
                 };
 
-                // Every accepted row goes to all_primaries
-                all_primaries.push(sr.clone());
-
-                // Only domain-matching rows go to filtered_primaries
-                if domain_match {
-                    filtered_primaries.push(sr);
-                }
+                // Dedup by bare_id across generations: keep the highest
+                // generation for each logical id. Unscoped rows (bare_id_of
+                // returns None) are never deduped.
+                let is_normative_primary =
+                    NORMATIVE_MEMORY_TYPES.contains(&sr.payload.memory_type.as_str())
+                        && boosted_distance <= MAX_NORMATIVE_DISTANCE;
+                if let Some(bare) = bare_id_of(&id) {
+                    let gen = split_scoped_id(&id)
+                        .map(|(_, g, _)| g as u64)
+                        .unwrap_or(0);
+                    match best_by_bare.get(&bare) {
+                        Some(&(existing_gen, idx)) if gen > existing_gen => {
+                            // Supersede the lower-generation entry in place.
+                            all_primaries[idx] = sr.clone();
+                            if domain_match {
+                                if let Some(pos) = filtered_primaries.iter().position(|r: &SearchResult| {
+                                    bare_id_of(&r.id).as_deref() == Some(bare.as_str())
+                                }) {
+                                    filtered_primaries[pos] = sr;
+                                } else {
+                                    filtered_primaries.push(sr);
+                                }
+                            }
+                            best_by_bare.insert(bare, (gen, idx));
+                        }
+                        Some(_) => {
+                            // Existing entry has higher or equal gen; skip.
+                            continue;
+                        }
+                        None => {
+                            let idx = all_primaries.len();
+                            best_by_bare.insert(bare, (gen, idx));
+                            all_primaries.push(sr.clone());
+                            if domain_match {
+                                filtered_primaries.push(sr);
+                            }
+                            if is_normative_primary && (domain_keys.is_empty() || domain_match) {
+                                normative_count += 1;
+                            }
+                        }
+                    }
+                } else {
+                    all_primaries.push(sr.clone());
+                    if domain_match {
+                        filtered_primaries.push(sr);
+                    }
+                    if is_normative_primary && (domain_keys.is_empty() || domain_match) {
+                        normative_count += 1;
+                    }
+                };
 
                 // Stop condition counts filtered_primaries when filter is active,
                 // otherwise counts all_primaries (which is the same as filtered when empty).
+                // Normative rows ranked beyond the limit still need to enter
+                // `all_primaries` / `filtered_primaries` so the slot reservation
+                // below can promote them: only break early once the reserved
+                // normative slots are satisfied or the candidate list is exhausted.
                 let stop_count = if domain_keys.is_empty() {
                     all_primaries.len()
                 } else {
                     filtered_primaries.len()
                 };
-                if stop_count >= limit {
+                if stop_count >= limit && (limit < 3 || normative_count >= normative_slot_limit(limit)) {
                     break;
                 }
             }
 
-            // Determine chosen set and mode.
+            // Determine chosen set and mode, reserving normative slots within `limit`
+            // so structural (code_ast/doc_section) primaries cannot crowd out
+            // normative rules/facts/decisions/procedures before graph expansion.
             let (chosen_primaries, mode) = if domain_keys.is_empty() {
                 // No filter asked for: all rows go to both lists, mode is Vector
-                (all_primaries, DomainMatchMode::Vector)
+                (reserve_normative_slots(all_primaries, limit), DomainMatchMode::Vector)
             } else if filtered_primaries.is_empty() && !all_primaries.is_empty() {
                 // Filter would empty the candidates: skip it, use unfiltered, mode is Vector
-                (all_primaries.into_iter().take(limit).collect(), DomainMatchMode::Vector)
+                (reserve_normative_slots(all_primaries, limit), DomainMatchMode::Vector)
             } else {
                 // Filter applied successfully
-                (filtered_primaries, DomainMatchMode::Domain)
+                (reserve_normative_slots(filtered_primaries, limit), DomainMatchMode::Domain)
             };
 
             let mut all_primaries_with_exact: Vec<SearchResult> = exact_matches.clone();
@@ -1019,7 +1093,7 @@ let incomplete = result_count >= fetch_limit;
                         std::cmp::Ordering::Equal => a.id.cmp(&b.id),
                     }
                 });
-                results = hybrid_results.into_iter().take(limit).collect();
+                results = reserve_normative_slots(hybrid_results, limit);
             }
 
             Ok(DomainSearchOutcome { results, mode, incomplete })
@@ -1862,6 +1936,160 @@ fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections
         Err(e) => { tracing::warn!("active_generations_of query failed: {e}"); }
     }
     gens
+}
+
+/// The active generation per source plus the namespace-wide active set and the
+/// max active generation among non-`"docs"` sources.
+///
+/// Unlike `active_generations_of` (a flat `HashSet` across all `source_key`
+/// rows), this keeps the `source_key -> active_gen` mapping so a row can be
+/// validated against the source that actually owns it. Two worktrees of one
+/// namespace ingest at different times, so `IngestGeneration` holds multiple
+/// rows per namespace (e.g. `source_key = "docs" -> 3`, `source_key = "dirA" ->
+/// 5`); a `doc_section` row must match *its* source's active generation, not
+/// just any active generation in the namespace.
+pub(crate) fn active_generations_by_source_of(
+    conn: &Connection,
+    namespace: &str,
+) -> (
+    HashMap<String, i64>,
+    std::collections::HashSet<i64>,
+    Option<i64>,
+) {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.source_key, g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut by_source = HashMap::new();
+    let mut active_set = std::collections::HashSet::new();
+    let mut max_non_doc: Option<i64> = None;
+    match conn.query(&query) {
+        Ok(rows) => {
+            for row in rows {
+                let source_key = format!("{}", row[0]);
+                let gen = match format!("{}", row[1]).parse::<i64>() {
+                    Ok(g) if g > 0 => g,
+                    _ => continue,
+                };
+                by_source.insert(source_key.clone(), gen);
+                active_set.insert(gen);
+                if source_key != "docs" {
+                    max_non_doc = Some(max_non_doc.unwrap_or(0).max(gen));
+                }
+            }
+        }
+        Err(e) => { tracing::warn!("active_generations_by_source_of query failed: {e}"); }
+    }
+    (by_source, active_set, max_non_doc)
+}
+
+/// Row filter for generation-scoped reads (`search_inner`, `list`, SPARQL
+/// projection). Returns `Some(full_id)` when the row is reachable and `None`
+/// when it belongs to a superseded generation or another namespace.
+///
+/// - Unscoped rows (`split_scoped_id == None`) — normative `rule`/`fact`/
+///   `decision`/`procedure` and legacy AST ids — are always kept.
+/// - Scoped rows are kept only against their owning source's active
+///   generation; `doc_section` rows fall back to the namespace's `docs`
+///   pointer (or any active doc generation when no pointer exists).
+/// - Deduplication of equal `bare_id` across active generations (keep highest
+///   `gen`) is the caller's job; this predicate is stateless per row.
+pub(crate) fn is_active_scoped_row(
+    id: &str,
+    namespace: &str,
+    memory_type: &str,
+    metadata: &Value,
+    by_source: &HashMap<String, i64>,
+    active_set: &std::collections::HashSet<i64>,
+    _max_non_doc_gen: Option<i64>,
+) -> Option<String> {
+    let Some((scoped_ns, gen, _bare_id)) = split_scoped_id(id) else {
+        // Unscoped (normative or legacy): always reachable.
+        return Some(id.to_string());
+    };
+    if scoped_ns != namespace {
+        return None;
+    }
+    let gen_i = gen as i64;
+    if by_source.is_empty() && active_set.is_empty() {
+        // No generation table entries yet: nothing is superseded.
+        return Some(id.to_string());
+    }
+    let keep = if let Some(source_key) = metadata.get("source_key").and_then(|v| v.as_str()) {
+        // Explicit source pointer: the row must equal that source's active gen.
+        by_source.get(source_key).is_some_and(|&active| active == gen_i)
+    } else if memory_type == "doc_section" {
+        // `doc_section` rows without an explicit `source_key`: match the docs
+        // pointer when present, otherwise any active doc generation.
+        if let Some(&docs_gen) = by_source.get("docs") {
+            docs_gen == gen_i
+        } else {
+            active_set.contains(&gen_i)
+        }
+    } else if by_source.is_empty() {
+        active_set.contains(&gen_i)
+    } else {
+        by_source.iter().any(|(k, &g)| k != "docs" && g == gen_i)
+    };
+    if keep { Some(id.to_string()) } else { None }
+}
+
+/// Normative memory types that the recall path reserves result slots for.
+/// Stated once here so the search ranker and the task gate can agree on the
+/// same predicate (see the FEATURE-4 provenance contract in `src/traits.rs`).
+const NORMATIVE_MEMORY_TYPES: [&str; 4] = ["rule", "fact", "decision", "procedure"];
+
+/// Relevance floor (similarity) below which a normative candidate is eligible
+/// for a reserved search slot. Scores are distances (lower = better, [0.0, 1.0]
+/// normalized in hybrid / cosine-L2 in default mode), so the similarity floor
+/// maps to a maximum distance of `MAX_NORMATIVE_DISTANCE`.
+const NORMATIVE_RELEVANCE_FLOOR: f32 = 0.20;
+const MAX_NORMATIVE_DISTANCE: f32 = 1.0 - NORMATIVE_RELEVANCE_FLOOR;
+
+/// Maximum normative slots reserved in a search result, capped at half the
+/// limit rounded up so structural evidence always keeps at least half the slots.
+fn normative_slot_limit(limit: usize) -> usize {
+    usize::min(3, limit.div_ceil(2))
+}
+
+/// Reserve up to `normative_slot_limit(limit)` slots for normative memories
+/// (`rule`/`fact`/`decision`/`procedure`) that pass `MAX_NORMATIVE_DISTANCE`,
+/// filling remaining slots up to `limit` from `non_normative` (and any leftover
+/// normative candidates when `non_normative` has fewer than `remaining` items).
+fn reserve_normative_slots(candidates: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+    if limit < 3 {
+        return candidates.into_iter().take(limit).collect();
+    }
+    let normative_limit = normative_slot_limit(limit);
+    let mut normative: Vec<SearchResult> = Vec::new();
+    let mut non_normative: Vec<SearchResult> = Vec::new();
+    for r in candidates {
+        let is_normative = NORMATIVE_MEMORY_TYPES.contains(&r.payload.memory_type.as_str())
+            && r.score <= MAX_NORMATIVE_DISTANCE;
+        if is_normative {
+            normative.push(r);
+        } else {
+            non_normative.push(r);
+        }
+    }
+    let mut reserved: Vec<SearchResult> = Vec::new();
+    let mut normative_iter = normative.into_iter();
+    for r in normative_iter.by_ref().take(normative_limit) {
+        reserved.push(r);
+    }
+    let remaining = limit.saturating_sub(reserved.len());
+    reserved.extend(non_normative.into_iter().take(remaining));
+    if reserved.len() < limit {
+        let extra = limit - reserved.len();
+        reserved.extend(normative_iter.take(extra));
+    }
+    reserved
+}
+
+/// The bare (logical) id inside a generation-scoped id, or `None` for unscoped
+/// rows. Used to deduplicate the same logical target across generations.
+fn bare_id_of(id: &str) -> Option<String> {
+    split_scoped_id(id).map(|(_, _, bare)| bare)
 }
 
 /// The active `(namespace, generation)` pairs across every namespace, for the
@@ -3339,7 +3567,7 @@ impl VectorStore for LadybugStore {
             }
 
             // PQTH: Intake candidates table (operational, not memory rows)
-            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, candidate_kind STRING, payload STRING, confidence DOUBLE, source_span STRING, extractor_fingerprint STRING, PRIMARY KEY (id))";
+            let create_candidates_table = "CREATE NODE TABLE IntakeCandidate (id STRING, namespace STRING, receipt_id STRING, title STRING, description STRING, review_state STRING, disposition STRING, task_id STRING, cas_version INT64, created_at STRING, updated_at STRING, candidate_kind STRING, kind STRING, category STRING, provenance STRING, payload STRING, confidence DOUBLE, source_span STRING, extractor_fingerprint STRING, PRIMARY KEY (id))";
             if let Err(e) = conn.query(create_candidates_table) {
                 if format!("{e}").to_lowercase().contains("already exists") {
                     tracing::debug!("schema DDL query note: {e}");
@@ -3349,6 +3577,9 @@ impl VectorStore for LadybugStore {
             }
             for stmt in [
                 "ALTER TABLE IntakeCandidate ADD candidate_kind STRING",
+                "ALTER TABLE IntakeCandidate ADD kind STRING",
+                "ALTER TABLE IntakeCandidate ADD category STRING",
+                "ALTER TABLE IntakeCandidate ADD provenance STRING",
                 "ALTER TABLE IntakeCandidate ADD payload STRING",
                 "ALTER TABLE IntakeCandidate ADD confidence DOUBLE",
                 "ALTER TABLE IntakeCandidate ADD source_span STRING",
@@ -3359,7 +3590,7 @@ impl VectorStore for LadybugStore {
                 }
             }
             if let Err(e) = conn.query(
-                "MATCH (c:IntakeCandidate) WHERE c.candidate_kind IS NULL OR c.candidate_kind = '' SET c.candidate_kind = 'task', c.payload = '{}', c.source_span = '', c.extractor_fingerprint = ''",
+                "MATCH (c:IntakeCandidate) WHERE c.candidate_kind IS NULL OR c.candidate_kind = '' SET c.candidate_kind = 'task', c.kind = 'task_obligation', c.category = '', c.provenance = '', c.payload = '{}', c.confidence = 0.0, c.source_span = '', c.extractor_fingerprint = ''",
             ) {
                 tracing::debug!("IntakeCandidate backfill note: {e}");
             }
@@ -5056,13 +5287,13 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
-            // The active generations for this namespace, read once so every
-            // generation-scoped row can be checked against them below. A row
-            // from a superseded generation is dropped; a row that is not
-            // generation-scoped (a rule, fact, task, or legacy id) is always
-            // kept, so the full-DB diagnostic callers keep seeing everything
-            // they always did.
-            let active_gens = active_generations_of(conn, &namespace);
+            // The active generations for this namespace, resolved per source so a
+            // row is validated against the source that owns it (not just any
+            // active generation in the namespace). Read once per search.
+            let (by_source, active_set, max_code_gen) =
+                active_generations_by_source_of(conn, &namespace);
+
+            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
 
             // Build WHERE clause with optional filters (R15: push into Cypher).
             let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
@@ -5081,11 +5312,6 @@ impl VectorStore for LadybugStore {
 
             for row in result {
                 let id: String = format!("{}", row[0]);
-                if let Some((_, gen, _)) = crate::parser::ingest::split_scoped_id(&id) {
-                    if !active_gens.contains(&gen) {
-                        continue; // superseded generation: not reachable
-                    }
-                }
                 let content: String = format!("{}", row[1]);
                 let uid: String = format!("{}", row[2]);
                 let memory_type: String = format!("{}", row[3]);
@@ -5104,8 +5330,22 @@ impl VectorStore for LadybugStore {
                     }
                 };
 
-                results.push(SearchResult {
-                    id,
+                // Wave 2.1 row filter: same generation-scoped reachability the
+                // search path applies, so diagnostics never see superseded rows.
+                if is_active_scoped_row(
+                    &id,
+                    &namespace,
+                    &memory_type,
+                    &metadata_val,
+                    &by_source,
+                    &active_set,
+                    max_code_gen,
+                ).is_none() {
+                    continue;
+                }
+
+                let sr = SearchResult {
+                    id: id.clone(),
                     score: 0.0,
                     payload: MemoryPayload {
                         content,
@@ -5117,7 +5357,33 @@ impl VectorStore for LadybugStore {
                         metadata: metadata_val,
                     },
                     evidence: None,
-                });
+                };
+
+                // Dedup by bare_id across generations: keep the highest
+                // generation for each logical id. Unscoped rows (bare_id_of
+                // returns None) are never deduped.
+                if let Some(bare) = bare_id_of(&id) {
+                    let gen = split_scoped_id(&id)
+                        .map(|(_, g, _)| g as u64)
+                        .unwrap_or(0);
+                    match best_by_bare.get(&bare) {
+                        Some(&(existing_gen, idx)) if gen > existing_gen => {
+                            results[idx] = sr.clone();
+                            best_by_bare.insert(bare, (gen, idx));
+                        }
+                        Some(_) => {
+                            // existing entry has higher or equal gen; skip.
+                            continue;
+                        }
+                        None => {
+                            let idx = results.len();
+                            best_by_bare.insert(bare, (gen, idx));
+                            results.push(sr);
+                        }
+                    }
+                } else {
+                    results.push(sr);
+                }
             }
 
             Ok(results)
@@ -5628,6 +5894,7 @@ fn edge_hits_from_rows(
             access_count,
             explanation: format!("{} {}", edge_name, target_id),
             metadata,
+            conceptual_bridges: Vec::new(),
         });
     }
     Ok(hits)
@@ -5874,6 +6141,7 @@ fn add_metadata_fallback_conn(
                     access_count,
                     explanation: format!("declares governs {}", normalized),
                     metadata,
+                    conceptual_bridges: Vec::new(),
                 });
                 break;
             }
@@ -5981,6 +6249,125 @@ impl GraphRead for LadybugStore {
         dedup_hits(&mut hits);
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
         hits.truncate(limit);
+
+        // Populate conceptual_bridges: for each seed hit, find up to 2
+        // 2-hop cross-domain bridges via 1-hop via nodes whose domain
+        // is disjoint from the seed's domain. Target must be normative.
+        for hit in hits.iter_mut() {
+            let mut bridges: Vec<crate::graph_read::memories_for_file::ConceptualBridge> =
+                Vec::with_capacity(2);
+            let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if let Ok(related) = self.related(
+                &namespace,
+                &hit.id,
+                &relations_vec,
+                crate::graph_read::related::Direction::Both,
+                1,
+                &[],
+                50,
+                None,
+                &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+            )
+            .await
+            {
+                let via_ids: Vec<&str> = related
+                    .nodes
+                    .iter()
+                    .filter(|n| n.id != hit.id)
+                    .map(|n| n.id.as_str())
+                    .collect();
+                for via_id in &via_ids {
+                    if bridges.len() >= 2 { break; }
+                    let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    if let Ok(related2) = self.related(
+                        &namespace,
+                        via_id,
+                        &relations_vec,
+                        crate::graph_read::related::Direction::Both,
+                        1,
+                        &[],
+                        50,
+                        None,
+                        &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                    )
+                    .await
+                    {
+                        for target_node in &related2.nodes {
+                            if bridges.len() >= 2 { break; }
+                            if target_node.id == hit.id || target_node.id == *via_id { continue; }
+                            if seen_targets.contains(&target_node.id) {
+                                continue;
+                            }
+                            if let Ok(Some((_, target_payload))) =
+                                self.get(&namespace, &target_node.id).await
+                            {
+                                let is_normative = matches!(
+                                    target_payload.memory_type.as_str(),
+                                    "rule" | "fact" | "decision" | "procedure"
+                                );
+                                if !is_normative {
+                                    continue;
+                                }
+                                // Cross-domain token sets for the jaccard < 0.35 filter.
+                                let target_domain =
+                                    crate::domain::domain_keys(&target_payload.metadata);
+                                let mut target_tokens: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                for d in &target_domain {
+                                    target_tokens.insert(d.clone());
+                                }
+                                target_tokens.extend(crate::task::feature_tokens(
+                                    &target_payload.metadata,
+                                    &target_payload.location,
+                                ));
+                                let mut seed_tokens: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                seed_tokens.extend(crate::task::feature_tokens(&hit.metadata, ""));
+                                if !target_tokens.is_empty() {
+                                    let sim = crate::task::jaccard_similarity(&seed_tokens, &target_tokens);
+                                    if sim >= 0.35 {
+                                        continue;
+                                    }
+                                }
+                                seen_targets.insert(target_node.id.clone());
+                                let target_type = target_payload.memory_type.clone();
+                                let target_summary =
+                                    if target_payload.content.chars().count() > 160 {
+                                        target_payload
+                                            .content
+                                            .chars()
+                                            .take(160)
+                                            .collect::<String>()
+                                    } else {
+                                        target_payload.content.clone()
+                                    };
+                                bridges.push(crate::graph_read::memories_for_file::ConceptualBridge {
+                                    source_id: hit.id.clone(),
+                                    via_id: via_id.to_string(),
+                                    target_id: target_node.id.clone(),
+                                    target_domain: target_domain
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    target_type,
+                                    target_summary,
+                                    path: format!("{} -> {} -> {}", hit.id, via_id, target_node.id),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            hit.conceptual_bridges = bridges;
+        }
+
         Ok(hits)
     }
 
@@ -7146,12 +7533,22 @@ impl crate::traits::IntakeStore for LadybugStore {
                 );
                 let safe_fp = escape_ladybug_string(&cand.extractor_fingerprint.clone().unwrap_or_default());
                 let safe_conf = cand.confidence.unwrap_or(0.0);
+                let safe_cand_kind = escape_ladybug_string(&cand.kind);
+                let safe_category = cand.category.as_ref().map(|c| escape_ladybug_string(c)).unwrap_or_default();
+                let safe_provenance = escape_ladybug_string(
+                    &cand.provenance.as_ref().map(|p| serde_json::to_string(p).unwrap_or_else(|e| {
+                        tracing::warn!("failed to serialize intake candidate provenance: {e}");
+                        String::new()
+                    })).unwrap_or_default(),
+                );
 
                 let cand_query = format!(
-                    "MERGE (c:IntakeCandidate {{id: '{}' }})\n                     ON CREATE SET c.namespace = '{}', c.receipt_id = '{}', c.title = '{}',\n                         c.description = '{}', c.review_state = '{}', c.disposition = '{}',\n                         c.task_id = '{}', c.cas_version = {}, c.created_at = '{}', c.updated_at = '{}',\n                         c.candidate_kind = '{}', c.payload = '{}', c.confidence = {}, c.source_span = '{}', c.extractor_fingerprint = '{}'",
+                    "MERGE (c:IntakeCandidate {{id: '{}' }})\n                     ON CREATE SET c.namespace = '{}', c.receipt_id = '{}', c.title = '{}',\n                         c.description = '{}', c.review_state = '{}', c.disposition = '{}',\n                         c.task_id = '{}', c.cas_version = {}, c.created_at = '{}', c.updated_at = '{}',\n                         c.candidate_kind = '{}', c.kind = '{}', c.category = '{}', c.provenance = '{}',
+                         c.payload = '{}', c.confidence = {}, c.source_span = '{}', c.extractor_fingerprint = '{}'",
                     safe_cand_id, safe_ns, safe_receipt_id, safe_title, safe_desc,
                     safe_review_state, safe_disposition, safe_task_id, cand.cas_version,
-                    safe_created, safe_updated, safe_kind, safe_payload, safe_conf, safe_span, safe_fp
+                    safe_created, safe_updated, safe_kind, safe_cand_kind, safe_category, safe_provenance,
+                    safe_payload, safe_conf, safe_span, safe_fp
                 );
                 conn.query(&cand_query)?;
             }
@@ -7302,7 +7699,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 
             // Get paginated results
             let query = format!(
-                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint ORDER BY c.created_at DESC LIMIT {}",
+                "MATCH (c:IntakeCandidate) WHERE {} RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.kind, c.category, c.provenance, c.payload, c.confidence, c.source_span, c.extractor_fingerprint ORDER BY c.created_at DESC LIMIT {}",
                 where_clause,
                 offset.saturating_add(limit)
             );
@@ -7320,11 +7717,14 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let created_at: String = format!("{}", row[9]);
                 let updated_at: String = format!("{}", row[10]);
                 let candidate_kind: String = format!("{}", row[11]);
-                let payload_str: String = format!("{}", row[12]);
-                let confidence: Option<f64> = format!("{}", row[13]).parse().ok();
-                let source_span_str: String = format!("{}", row[14]);
+                let kind: String = format!("{}", row[12]);
+                let category_str: String = format!("{}", row[13]);
+                let provenance_str: String = format!("{}", row[14]);
+                let payload_str: String = format!("{}", row[15]);
+                let confidence: Option<f64> = format!("{}", row[16]).parse().ok();
+                let source_span_str: String = format!("{}", row[17]);
                 let extractor_fingerprint: Option<String> = {
-                    let s = format!("{}", row[15]);
+                    let s = format!("{}", row[18]);
                     if s.is_empty() || s.eq_ignore_ascii_case("null") { None } else { Some(s) }
                 };
 
@@ -7340,6 +7740,7 @@ impl crate::traits::IntakeStore for LadybugStore {
                     "pending" => crate::task::intake::Disposition::Pending,
                     "created" => crate::task::intake::Disposition::Created,
                     "linked" => crate::task::intake::Disposition::Linked,
+                    "promoted" => crate::task::intake::Disposition::Promoted,
                     "dismissed" => crate::task::intake::Disposition::Dismissed,
                     _ => crate::task::intake::Disposition::Pending,
                 };
@@ -7357,9 +7758,12 @@ impl crate::traits::IntakeStore for LadybugStore {
                     created_at,
                     updated_at,
                     candidate_kind: if candidate_kind.is_empty() || candidate_kind.eq_ignore_ascii_case("null") { "task".to_string() } else { candidate_kind },
+                    kind: if kind.is_empty() || kind.eq_ignore_ascii_case("null") { "task_obligation".to_string() } else { kind },
+                    category: if category_str.is_empty() || category_str.eq_ignore_ascii_case("null") { None } else { Some(category_str) },
                     payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
                     confidence,
                     source_span: if source_span_str.is_empty() || source_span_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&source_span_str).ok() },
+                    provenance: if provenance_str.is_empty() || provenance_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&provenance_str).ok() },
                     extractor_fingerprint,
                 });
             }
@@ -7449,7 +7853,7 @@ impl crate::traits::IntakeStore for LadybugStore {
 
             // Fetch updated candidate
             let fetch_query = format!(
-                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint",
+                "MATCH (c:IntakeCandidate) WHERE c.id = '{}' AND c.namespace = '{}' RETURN c.id, c.namespace, c.receipt_id, c.title, c.description, c.review_state, c.disposition, c.task_id, c.cas_version, c.created_at, c.updated_at, c.candidate_kind, c.payload, c.confidence, c.source_span, c.extractor_fingerprint, c.kind, c.category, c.provenance",
                 safe_cand_id, safe_ns
             );
             let mut fetch_result = conn.query(&fetch_query)?;
@@ -7474,6 +7878,9 @@ impl crate::traits::IntakeStore for LadybugStore {
                 let s = format!("{}", row[15]);
                 if s.is_empty() || s.eq_ignore_ascii_case("null") { None } else { Some(s) }
             };
+            let kind_db: String = format!("{}", row[16]);
+            let category_db: String = format!("{}", row[17]);
+            let provenance_db: String = format!("{}", row[18]);
 
             let review_state = match review_state_str.as_str() {
                 "pending" => crate::task::intake::ReviewState::Pending,
@@ -7487,6 +7894,7 @@ impl crate::traits::IntakeStore for LadybugStore {
                 "pending" => crate::task::intake::Disposition::Pending,
                 "created" => crate::task::intake::Disposition::Created,
                 "linked" => crate::task::intake::Disposition::Linked,
+                "promoted" => crate::task::intake::Disposition::Promoted,
                 "dismissed" => crate::task::intake::Disposition::Dismissed,
                 _ => crate::task::intake::Disposition::Pending,
             };
@@ -7504,9 +7912,12 @@ impl crate::traits::IntakeStore for LadybugStore {
                 created_at,
                 updated_at,
                 candidate_kind: if candidate_kind.is_empty() || candidate_kind.eq_ignore_ascii_case("null") { "task".to_string() } else { candidate_kind },
+                kind: if kind_db.is_empty() || kind_db.eq_ignore_ascii_case("null") { "task_obligation".to_string() } else { kind_db },
+                category: if category_db.is_empty() || category_db.eq_ignore_ascii_case("null") { None } else { Some(category_db) },
                 payload: serde_json::from_str(&payload_str).unwrap_or(serde_json::Value::Null),
                 confidence,
                 source_span: if source_span_str.is_empty() || source_span_str.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&source_span_str).ok() },
+                provenance: if provenance_db.is_empty() || provenance_db.eq_ignore_ascii_case("null") { None } else { serde_json::from_str(&provenance_db).ok() },
                 extractor_fingerprint,
             };
 
@@ -9352,6 +9763,184 @@ eurostrata\src\daemon.rs",
         assert!(
             !exported_ids.iter().any(|id| id == &gen1_id),
             "the superseded generation is not exported"
+        );
+    }
+
+    /// Wave 2.1 TDD: search excludes rows from superseded ingest generations
+    /// while preserving unscoped normative memories (rule/fact/decision/procedure)
+    /// and deduping by bare_id across generations (keep highest gen).
+    #[tokio::test]
+    async fn search_excludes_inactive_ingest_generations_and_preserves_normative_memories() {
+        let store = retired_test_store().await;
+        let zero = vec![0.0f32; 4];
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+
+        // Generation 1 for source-a: a code_ast row that will be superseded.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen1_id,
+                zero.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
+
+        // Generation 2 for source-a: same bare_id, supersedes generation 1.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen2_id,
+                zero.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 2)
+            .await
+            .unwrap();
+
+        // Unscoped normative memories (always reachable, no generation scope).
+        store
+            .upsert(
+                "probe",
+                "normative-rule",
+                query_vec.clone(),
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "normative-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        // Search with limit >= 3 to trigger normative slot reservation.
+        let results = store
+            .search("probe", query_vec.clone(), 5, false, false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+
+        // Active generation (gen 2) scoped row is present.
+        assert!(
+            ids.contains(&gen2_id.as_str()),
+            "active generation row {gen2_id} should be in search results"
+        );
+        // Superseded generation (gen 1) scoped row is excluded.
+        assert!(
+            !ids.contains(&gen1_id.as_str()),
+            "superseded generation row {gen1_id} should NOT be in search results"
+        );
+        // Unscoped normative memories are preserved.
+        assert!(
+            ids.contains(&"normative-rule"),
+            "normative rule should be in search results"
+        );
+        assert!(
+            ids.contains(&"normative-fact"),
+            "normative fact should be in search results"
+        );
+        // Dedup by bare_id: only one version of src/a.rs appears.
+        let a_rs_count = ids.iter().filter(|id| id.ends_with("src/a.rs")).count();
+        assert_eq!(
+            a_rs_count,
+            1,
+            "exactly one generation of src/a.rs should appear (dedup by bare_id)"
+        );
+
+        // Normative slot reservation: the top 2 results are normative memories even if
+        // extra active code_ast/doc_section rows match closer in raw vector distance.
+        assert!(
+            matches!(results[0].payload.memory_type.as_str(), "rule" | "fact"),
+            "slot 0 reserved for normative memory, got {}",
+            results[0].payload.memory_type
+        );
+        assert!(
+            matches!(results[1].payload.memory_type.as_str(), "rule" | "fact"),
+            "slot 1 reserved for normative memory, got {}",
+            results[1].payload.memory_type
+        );
+
+        // Multi-source isolation in list() and search(): publish docs at gen 3 while
+        // code_ast (source-a) stays at gen 2. A stale code_ast without source_key at
+        // gen 3 must NOT pass simply because docs is at gen 3.
+        let _ = store.begin_generation("probe", "docs").await.unwrap();
+        store.publish_generation("probe", "docs", 3).await.unwrap();
+        let stale_code_gen3 = crate::parser::ingest::generation_scoped_id("probe", 3, "src/stale.rs");
+        store
+            .upsert(
+                "probe",
+                &stale_code_gen3,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        let listed = store.list("probe", None, None).await.unwrap();
+        let listed_ids: Vec<&str> = listed.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            listed_ids.contains(&gen2_id.as_str()),
+            "list() keeps active code_ast generation 2"
+        );
+        assert!(
+            !listed_ids.contains(&gen1_id.as_str()),
+            "list() drops superseded generation 1"
+        );
+        assert!(
+            !listed_ids.contains(&stale_code_gen3.as_str()),
+            "list() drops code_ast without source_key whose gen (3) only matches docs, not max_code_gen (2)"
+        );
+
+        // Multi-source: source-b publishes generation 4. A code_ast row at gen 2
+        // without source_key must NOT be dropped (it matches source-a's active gen
+        // 2), and a code_ast row at gen 4 without source_key must be retained
+        // (it matches source-b's active gen 4). Both must survive list().
+        assert_eq!(store.begin_generation("probe", "source-b").await.unwrap(), 4);
+        let gen2_no_source_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/no-source-a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen2_no_source_id,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        let gen4_no_source_id = crate::parser::ingest::generation_scoped_id("probe", 4, "src/no-source-b.rs");
+        store
+            .upsert(
+                "probe",
+                &gen4_no_source_id,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store.publish_generation("probe", "source-b", 4).await.unwrap();
+        let listed2 = store.list("probe", None, None).await.unwrap();
+        let listed2_ids: Vec<&str> = listed2.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            listed2_ids.contains(&gen2_no_source_id.as_str()),
+            "list() retains code_ast without source_key at gen 2 (matches source-a active gen 2)"
+        );
+        assert!(
+            listed2_ids.contains(&gen4_no_source_id.as_str()),
+            "list() retains code_ast without source_key at gen 4 (matches source-b active gen 4)"
         );
     }
 

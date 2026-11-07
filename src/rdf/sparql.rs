@@ -13,6 +13,10 @@ use spargebra::SparqlParser;
 use spareval::QueryEvaluator;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 
+use std::collections::{HashMap, HashSet};
+use crate::parser::ingest::split_scoped_id;
+use crate::store::ladybug::active_generations_by_source_of;
+
 /// Configuration for SPARQL query execution.
 #[derive(Debug, Clone)]
 pub struct SparqlConfig {
@@ -91,6 +95,20 @@ pub async fn project_sparql_dataset_with_meta_async(
     let mut dataset = Dataset::new();
     let mut meta_map = std::collections::HashMap::new();
 
+    // Active generations per source for this namespace, used to filter
+    // superseded ingest-generation rows and deduplicate by bare_id.
+    // `with_conn` requires a 'static closure, so the namespace is copied in.
+    let ns_owned = namespace.to_string();
+    let (by_source, active_set, _max_code_gen) = store
+        .with_conn(move |conn| {
+            Ok(active_generations_by_source_of(conn, &ns_owned))
+        })
+        .await
+        .unwrap_or_else(|_err| {
+            tracing::warn!("active_generations_by_source_of query failed for '{namespace}'");
+            (HashMap::new(), HashSet::new(), None)
+        });
+
     let memories = store
         .list_memories(namespace, None, None)
         .await
@@ -100,20 +118,62 @@ pub async fn project_sparql_dataset_with_meta_async(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    for m in &memories {
-        if !include_retired && is_retired_at(&m.payload.metadata, now) {
-            continue;
-        }
-        if !include_archived && is_archived(&m.payload.metadata) {
-            continue;
-        }
-        if is_mesh_conflicting(&m.payload.metadata) {
-            continue;
-        }
-        if crate::registry::is_registry_row(&m.payload.metadata) {
-            continue;
-        }
+    // A memory reaches the projection only when it clears every row-level
+    // filter: active generation, not retired/archived/mesh-conflicting, and
+    // not a registry row.
+    let passes = |m: &crate::traits::SearchResult| -> bool {
+        crate::store::ladybug::is_active_scoped_row(
+            &m.id,
+            namespace,
+            &m.payload.memory_type,
+            &m.payload.metadata,
+            &by_source,
+            &active_set,
+            _max_code_gen,
+        ).is_some()
+        && (include_retired || !is_retired_at(&m.payload.metadata, now))
+        && (include_archived || !is_archived(&m.payload.metadata))
+        && !is_mesh_conflicting(&m.payload.metadata)
+        && !crate::registry::is_registry_row(&m.payload.metadata)
+    };
 
+    // Best active generation per bare_id among passing rows (dedup key: keep
+    // the highest generation for each logical id).
+    let mut best_by_bare: HashMap<String, u64> = HashMap::new();
+    for m in &memories {
+        if !passes(m) {
+            continue;
+        }
+        if let Some((_, gen, bare)) = split_scoped_id(&m.id) {
+            best_by_bare
+                .entry(bare.to_string())
+                .and_modify(|g| {
+                    if gen > *g {
+                        *g = gen;
+                    }
+                })
+                .or_insert(gen);
+        }
+    }
+
+    // Keep each passing row that is either unscoped or the highest-generation
+    // version of its bare_id. Input order is preserved.
+    let mut kept_memories: Vec<&crate::traits::SearchResult> = Vec::new();
+    for m in &memories {
+        if !passes(m) {
+            continue;
+        }
+        match split_scoped_id(&m.id) {
+            Some((_, gen, bare)) => {
+                if best_by_bare.get(&bare).is_some_and(|&g| gen == g) {
+                    kept_memories.push(m);
+                }
+            }
+            None => kept_memories.push(m),
+        }
+    }
+
+    for m in kept_memories {
         let payload = m.payload.clone();
         meta_map.insert(format!("urn:neurostrata:memory:{}", m.id), m.payload.metadata.clone());
         meta_map.insert(m.id.clone(), m.payload.metadata.clone());
@@ -127,13 +187,10 @@ pub async fn project_sparql_dataset_with_meta_async(
         );
         for q in qs {
             dataset.insert(&q);
-            // Union-default-graph semantics (§5.2): also insert default-graph copy
-            dataset.insert(&oxrdf::Quad::new(
-                q.subject.clone(),
-                q.predicate.clone(),
-                q.object.clone(),
-                oxrdf::GraphName::DefaultGraph,
-            ));
+            // Default-graph union semantics are handled by
+            // `set_default_graph_as_union()` on the prepared query
+            // (see execute_sparql_query_with_config); quads live only
+            // in their named graph here.
         }
     }
 
@@ -379,7 +436,12 @@ pub async fn execute_sparql_query_with_config(
             cancel_token.cancel();
         }
     });
-    let prepared = evaluator.prepare(&query);
+    let mut prepared = evaluator.prepare(&query);
+    // Default-graph union semantics: a query over the default graph sees every
+    // projected quad regardless of which named graph it lives in. Quads are
+    // inserted once (in their named graph) by project_sparql_dataset_with_meta_async,
+    // and the union handles the default graph — no double insert.
+    prepared.dataset_mut().set_default_graph_as_union();
     let results = match prepared.execute(&dataset) {
         Ok(r) => r,
         Err(e) => {
@@ -669,5 +731,108 @@ mod tests {
         } else {
             panic!("expected solutions");
         }
+    }
+
+    #[tokio::test]
+    async fn test_project_sparql_dataset_filters_inactive_generations_and_dedupes() {
+        use crate::traits::{MemoryPayload, VectorStore};
+
+        let tmp = std::env::temp_dir().join(format!("ns-sparql-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        store.init("probe").await.unwrap();
+
+        let zero = vec![0.0f32; 4];
+        let scoped = |memory_type: &str| MemoryPayload {
+            content: format!("content {memory_type}"),
+            user_id: "u1".to_string(),
+            memory_type: memory_type.to_string(),
+            agent_name: None,
+            location: "src/a.rs".to_string(),
+            location_lines: "1".to_string(),
+            metadata: serde_json::json!({"source_key": "source-a"}),
+        };
+
+        // Generation 1 for source-a: superseded by generation 2.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
+        store
+            .upsert("probe", &gen1_id, zero.clone(), scoped("code_ast"))
+            .await
+            .unwrap();
+        store.publish_generation("probe", "source-a", 1).await.unwrap();
+
+        // Generation 2 for source-a: same bare_id, now active.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
+        store
+            .upsert("probe", &gen2_id, zero.clone(), scoped("code_ast"))
+            .await
+            .unwrap();
+        store.publish_generation("probe", "source-a", 2).await.unwrap();
+
+        // Unscoped normative row: reachable regardless of generations.
+        store
+            .upsert(
+                "probe",
+                "normative-rule",
+                vec![0.5, 0.0, 0.0, 0.0],
+                MemoryPayload {
+                    content: "a rule".to_string(),
+                    user_id: "u1".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "src/rules.rs".to_string(),
+                    location_lines: "1".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (dataset, _meta_map) = project_sparql_dataset_with_meta_async(
+            "probe", false, false, &store,
+        )
+        .await
+        .expect("projection succeeds");
+
+        let mut gen1_quads = 0usize;
+        let mut gen2_quads = 0usize;
+        let mut rule_quads = 0usize;
+        let mut default_graph_quads = 0usize;
+        for q in &dataset {
+            let subj = match &q.subject {
+                oxrdf::NamedOrBlankNodeRef::NamedNode(n) => Some(n.as_str().to_string()),
+                _ => None,
+            };
+            let Some(subj) = subj else { continue };
+            if subj == format!("urn:neurostrata:memory:{gen1_id}") {
+                gen1_quads += 1;
+            }
+            if subj == format!("urn:neurostrata:memory:{gen2_id}") {
+                gen2_quads += 1;
+            }
+            if subj == "urn:neurostrata:memory:normative-rule" {
+                rule_quads += 1;
+            }
+            if q.graph_name.is_default_graph() {
+                default_graph_quads += 1;
+            }
+        }
+
+        // Superseded generation is filtered out; active generation projects.
+        assert_eq!(gen1_quads, 0, "superseded generation {gen1_id} must not project");
+        assert!(gen2_quads > 0, "active generation {gen2_id} must project");
+        assert!(rule_quads > 0, "unscoped normative rule must project");
+
+        // Dedup by bare_id: exactly one generation of src/a.rs is present.
+        // No double insert: nothing lands in the default graph (union applied
+        // at query time) and each memory projects its quads exactly once.
+        assert_eq!(default_graph_quads, 0, "no quad inserted into the default graph");
+        assert_eq!(
+            dataset.len(),
+            gen2_quads + rule_quads,
+            "each memory projects once; no duplication"
+        );
     }
 }

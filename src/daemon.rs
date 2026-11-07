@@ -964,6 +964,17 @@ pub(crate) async fn start_daemon_on(
     // pull triggers (spec §Triggers): fail-soft, timeout-capped spawns.
     wire_mesh_publish(&bus, vector_store.clone(), embedder.clone());
 
+    // Auto-install detected CLI/terminal harness plugins fail-soft at startup
+    // over the startup root and every configured project context directory, so
+    // existing workspaces are upgraded immediately on daemon boot.
+    let startup_root = resolve_project_root();
+    let _ = crate::task::harness_plugins::auto_install_detected_plugins(&startup_root, "", None);
+    if let Ok(cfg) = crate::config::Config::load() {
+        for dir in cfg.project_contexts.values() {
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(dir, "", None);
+        }
+    }
+
     // Kept here as well as in the state, because stopping has to wait for it.
     let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
     let fingerprint = exe_fingerprint();
@@ -975,7 +986,7 @@ pub(crate) async fn start_daemon_on(
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
         deduplication_checker,
         guard_validator,
-        startup_root: resolve_project_root(),
+        startup_root: startup_root.clone(),
         allowed_external_dirs: load_allowed_external_dirs(),
         build: BuildInfo {
             version: env!("CARGO_PKG_VERSION"),

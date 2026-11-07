@@ -40,7 +40,12 @@ export interface PluginConfig {
   strictMode: boolean;
   requestTimeoutMs: number;
   intentDetection: { enabled: boolean; injectReminder: boolean };
+  /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+  projectRoot?: string;
 }
+
+/** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
+export type ResolvedConfig = PluginConfig;
 
 const DEFAULT_CONFIG: PluginConfig = {
   namespace: "NeuroStrata",
@@ -173,6 +178,79 @@ export function discoverProjectNamespace(startDir = process.cwd()): string {
     current = next;
   }
   return basename(root) || "default";
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// OpenCode V2 project-root & namespace resolution
+// ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve the project root from an OpenCode V2 host context, falling back
+ * through ctx fields to process.cwd(). Priority:
+ *   1. ctx.location.project.canonical
+ *   2. ctx.location.project.root
+ *   3. ctx.location.directory
+ *   4. ctx.projectDir
+ *   5. ctx.directory
+ *   6. ctx.cwd
+ *   7. process.cwd()
+ */
+export function resolveProjectRoot(ctx?: any): string {
+  const c = ctx ?? {};
+  return (
+    asString(c?.location?.project?.canonical) ??
+    asString(c?.location?.project?.root) ??
+    asString(c?.location?.directory) ??
+    asString(c?.projectDir) ??
+    asString(c?.directory) ??
+    asString(c?.cwd) ??
+    process.cwd()
+  );
+}
+
+/**
+ * Load an optional plugin config from <projectRoot>/.NeuroStrata/
+ * (neurostrata-plugin.json, then PluginConfig.json). Missing or malformed
+ * files are a no-op; the host-supplied ctx.config always wins the merge.
+ */
+function loadPluginConfigFromDisk(projectRoot: string): Record<string, unknown> {
+  for (const file of ["neurostrata-plugin.json", "PluginConfig.json"]) {
+    const p = join(projectRoot, ".NeuroStrata", file);
+    if (existsSync(p)) {
+      try {
+        return asRecord(JSON.parse(readFileSync(p, "utf8")));
+      } catch {
+        // ignore malformed / unreadable config files
+      }
+    }
+  }
+  return {};
+}
+
+/** Effective project root for reading .NeuroStrata state files. */
+function effectiveProjectRoot(config: ResolvedConfig): string {
+  return config.projectRoot ?? resolveProjectRoot();
+}
+
+/**
+ * Make a touched-file path relative to the project root when it lives under
+ * it, so the injected `[NeuroStrata File Context — <relPath>]` block is
+ * stable and short. Falls back to the raw path otherwise.
+ */
+function pathRelativeToProjectRoot(filePath: string, config: ResolvedConfig): string {
+  const root = effectiveProjectRoot(config);
+  try {
+    // Resolve a relative filePath against the project root (not process.cwd())
+    // so the startsWith check below is meaningful when cwd != projectRoot.
+    const resolved = resolve(root, filePath);
+    const rootWithSep = root.endsWith("/") ? root : root + "/";
+    if (resolved === root || resolved.startsWith(rootWithSep)) {
+      return resolved.slice(root.length).replace(/^\/+/, "");
+    }
+  } catch {
+    // fall through to the raw path
+  }
+  return filePath;
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -427,6 +505,225 @@ export function detectTaskIntentsLocal(text: string): TaskIntentSignal[] {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Wave 4 Task 4.1: turn-candidate extraction + conceptual bridge persistence
+// ──────────────────────────────────────────────────────────────────────
+
+export interface ProvenanceSpan {
+  turn_id?: string;
+  role?: string;
+  source_tool?: string;
+  channel?: string;
+  evidence_quote?: string;
+  quote?: string;
+  char_range?: [number, number];
+  parent_task_id?: string;
+  confidence?: number;
+}
+
+export interface Turn {
+  role: string;
+  content: string;
+  turn_id?: string;
+  source_tool?: string;
+  channel?: string;
+  parent_task_id?: string;
+}
+
+export interface TurnCandidate {
+  kind: "task_obligation" | "memory_candidate";
+  category?: "fact" | "decision" | "rule_candidate";
+  title: string;
+  description?: string;
+  confidence: number;
+  auto_commit: boolean;
+  provenance: ProvenanceSpan;
+}
+
+export interface ConceptualBridge {
+  source_id?: string;
+  via_id?: string;
+  target_id?: string;
+  target_domain?: string;
+  target_type?: string;
+  target_summary?: string;
+  path?: string;
+}
+
+/**
+ * Extract task-obligation candidates from a turn's content. Detects local
+ * task-intent markers (TODO:, FIXME:, follow-up:, ...) via
+ * `detectTaskIntentsLocal` and attaches a provenance span
+ * (turn_id, role, source_tool, channel, evidence_quote, quote, char_range,
+ * confidence) to each. Pure: no daemon interaction. Rule candidates are
+ * never produced here (rule candidates never auto-promote).
+ */
+export function extractTurnCandidates(turn: Turn): TurnCandidate[] {
+  const { content, role, turn_id, source_tool, channel, parent_task_id } = turn;
+  const signals = detectTaskIntentsLocal(content);
+  const out: TurnCandidate[] = [];
+  for (const signal of signals) {
+    // Guard: never indexOf an empty excerpt.
+    if (signal.excerpt.length === 0) continue;
+    // `signal.marker` is the lowercase canonical form; `signal.excerpt` is the
+    // verbatim content substring, so index off the excerpt to land the span at
+    // the actual (case-varying) marker text in `content`.
+    const idx = content.indexOf(signal.excerpt);
+    const start = idx === -1 ? 0 : idx;
+    const end = Math.min(content.length, start + signal.excerpt.length);
+    out.push({
+      kind: "task_obligation",
+      title: signal.excerpt,
+      confidence: 0.9,
+      auto_commit: false,
+      provenance: {
+        turn_id,
+        role,
+        source_tool,
+        channel,
+        evidence_quote: signal.excerpt,
+        quote: signal.excerpt,
+        char_range: [start, end],
+        parent_task_id,
+        confidence: 0.9,
+      },
+    });
+  }
+  // Decision / fact markers: explicit DECISION:/FACT:/Architectural decision:/
+  // We decided to: claims emitted as memory_candidate candidates with
+  // ProvenanceSpan so the intake Lock 2 gate can see them.
+  const DF_MARKERS = /\b(?:DECISION|FACT|Architectural decision|We decided to)\s*:\s*([^\n.]{8,200})/gi;
+  for (const m of content.matchAll(DF_MARKERS)) {
+    const marker = m[0].split(":")[0].trim();
+    const category = /^(?:DECISION|Architectural decision|We decided to)$/i.test(marker)
+      ? "decision"
+      : "fact";
+    const excerpt = m[1];
+    const start = m.index + m[0].indexOf(excerpt);
+    const end = start + excerpt.length;
+    out.push({
+      kind: "memory_candidate",
+      category,
+      title: excerpt,
+      confidence: 0.9,
+      auto_commit: role === "user" || role === "checker",
+      provenance: {
+        turn_id,
+        role,
+        source_tool,
+        channel,
+        evidence_quote: excerpt,
+        quote: excerpt,
+        char_range: [start, end],
+        parent_task_id,
+        confidence: 0.9,
+      },
+    });
+  }
+  return out;
+}
+
+/**
+ * Post turn candidates fail-soft to the intake ledger via
+ * `neurostrata_task_candidates` (`action: "record"`). Never throws: a missing
+ * MCP client or a daemon error is swallowed so a turn is never blocked by
+ * intake-ledger submission.
+ */
+export async function postTurnCandidates(
+  candidates: TurnCandidate[],
+  namespace: string,
+): Promise<void> {
+  if (!mcpClient || candidates.length === 0) return;
+  for (const cand of candidates) {
+    try {
+      await mcpClient.callTool("neurostrata_task_candidates", {
+        namespace,
+        action: "record",
+        kind: cand.kind,
+        category: cand.category,
+        confidence: cand.confidence,
+        title: cand.title,
+        description: cand.description,
+        auto_commit: cand.auto_commit,
+        task_id: cand.provenance?.parent_task_id ?? activeTaskId,
+        provenance: cand.provenance,
+      });
+    } catch {
+      // fail-soft: intake-ledger submission never blocks a turn
+    }
+  }
+}
+
+/**
+ * Extract de-duplicated conceptual bridges from `memories_for_file` hits.
+ * Each hit may carry a `conceptual_bridges` array (source -> via -> target
+ * 2-hop cross-domain paths). Bridges are de-duplicated by `path`.
+ */
+export function extractConceptualBridges(hits: unknown[]): ConceptualBridge[] {
+  const out: ConceptualBridge[] = [];
+  const seen = new Set<string>();
+  for (const hit of hits) {
+    if (typeof hit !== "object" || hit === null) continue;
+    const rec = hit as Record<string, unknown>;
+    const cbs = rec.conceptual_bridges;
+    if (!Array.isArray(cbs)) continue;
+    for (const cb of cbs) {
+      if (typeof cb !== "object" || cb === null) continue;
+      const b = cb as Record<string, unknown>;
+      const path = asString(b.path);
+      if (!path || seen.has(path)) continue;
+      seen.add(path);
+      out.push({
+        source_id: asString(b.source_id),
+        via_id: asString(b.via_id),
+        target_id: asString(b.target_id),
+        target_domain: asString(b.target_domain),
+        target_type: asString(b.target_type),
+        target_summary: asString(b.target_summary),
+        path,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Persist conceptual bridges into `.NeuroStrata/active_session.json` under
+ * the `conceptual_bridges` key, merging with any existing fields so the
+ * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
+ */
+export function persistConceptualBridges(
+  projectRoot: string,
+  bridges: ConceptualBridge[],
+): void {
+  const nsDir = join(projectRoot, ".NeuroStrata");
+  const sessionPath = join(nsDir, "active_session.json");
+  let active: Record<string, unknown> = {};
+  if (existsSync(sessionPath)) {
+    try {
+      active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+    } catch {
+      active = {};
+    }
+  }
+  const existing = Array.isArray(active.conceptual_bridges)
+    ? (active.conceptual_bridges as ConceptualBridge[])
+    : [];
+  const byId = new Map<string, ConceptualBridge>();
+  let seq = 0;
+  const keyOf = (b: ConceptualBridge) =>
+    b.target_id ?? b.source_id ?? b.via_id ?? `bridge:${seq++}`;
+  for (const b of existing) byId.set(keyOf(b), b);
+  for (const b of bridges) byId.set(keyOf(b), b); // newer wins on dup id
+  active.conceptual_bridges = Array.from(byId.values()).slice(0, 4);
+  try {
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(sessionPath, JSON.stringify(active, null, 2));
+  } catch {
+    // best-effort; bridge persistence never breaks a file touch
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Bug 3: canonical tool classification
 // ──────────────────────────────────────────────────────────────────────
 
@@ -434,6 +731,11 @@ export const READ_FILE_TOOLS = new Set([
   "read",
   "Read",
   "read_file",
+  "grep",
+  "Grep",
+  "glob",
+  "Glob",
+  "mcp_glob",
   "view",
   "cat",
 ]);
@@ -809,7 +1111,7 @@ function parseRawFileRecallEntries(text: string, normalized: string): RawFileRec
 export async function prefetchMemoriesForFile(
   namespace: string,
   filePath: string,
-  opts?: { recordLedgerDir?: string },
+  opts?: { recordLedgerDir?: string; projectRoot?: string },
 ): Promise<string[]> {
   const normalized = filePath.trim();
   if (normalized === "") return [];
@@ -826,6 +1128,30 @@ export async function prefetchMemoriesForFile(
       limit: 5,
     });
     recordPrefetchedPath(key);
+    // Persist conceptual bridges from the hits into active_session.json so
+    // sessionContextHandler can inject them as [NeuroStrata Conceptual Bridges].
+    const projectRoot = opts?.projectRoot ?? opts?.recordLedgerDir;
+    if (projectRoot) {
+      try {
+        let hits: unknown[] = [];
+        let topBridges: unknown[] = [];
+        try {
+          const body = JSON.parse(text);
+          hits = Array.isArray(body.memories ?? body.hits) ? (body.memories ?? body.hits) : [];
+          if (Array.isArray(body.conceptual_bridges)) {
+            topBridges = body.conceptual_bridges;
+          }
+        } catch {
+          hits = [];
+        }
+        const bridges = [...extractConceptualBridges(hits), ...(topBridges as ConceptualBridge[])];
+        if (bridges.length > 0) {
+          persistConceptualBridges(projectRoot, bridges);
+        }
+      } catch {
+        // bridge persistence is best-effort
+      }
+    }
     try {
       recordLocalSessionQuery(namespace, "neurostrata_memories_for_file", normalized, opts?.recordLedgerDir);
     } catch {
@@ -1164,6 +1490,9 @@ export function resetState(): void {
   cachedTaskInjection.clear();
   subagentFileRecallCache.clear();
   pendingPrefetchDeliveries.clear();
+  prefetchedPaths.clear();
+  injectedMemoryIds.clear();
+  resetAllSessionEpochs();
 }
 
 export function resetClientForTesting(): void {
@@ -1173,6 +1502,124 @@ export function resetClientForTesting(): void {
 
 export function getTrackingState() {
   return { activeTaskId, activeSessionId, mutationsSinceNote };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Epoch-tracked session hooks (context / compaction)
+// ──────────────────────────────────────────────────────────────────────
+
+export interface SessionEpochState {
+  epoch: number;
+  baselineInjectedEpoch: number;
+  seenFiles: Set<string>;
+}
+
+const sessionEpochs = new Map<string, SessionEpochState>();
+
+function sessionEpochState(sessionId: string | null | undefined): SessionEpochState {
+  const sid = sessionId ?? "__default__";
+  let state = sessionEpochs.get(sid);
+  if (!state) {
+    state = { epoch: 0, baselineInjectedEpoch: -1, seenFiles: new Set() };
+    sessionEpochs.set(sid, state);
+  }
+  return state;
+}
+
+/** Current epoch for a session (starts at 0, incremented by compaction). */
+export function currentSessionEpoch(sessionId: string | null | undefined): number {
+  return sessionEpochState(sessionId).epoch;
+}
+
+/** Increment the epoch and clear seen files so the next context hook re-injects. */
+export function incrementSessionEpoch(sessionId: string | null | undefined): void {
+  const st = sessionEpochState(sessionId);
+  st.epoch += 1;
+  st.seenFiles.clear();
+  st.baselineInjectedEpoch = -1;
+}
+
+export function sessionSeenFiles(sessionId: string | null | undefined): Set<string> {
+  return sessionEpochState(sessionId).seenFiles;
+}
+
+export function resetSessionEpoch(sessionId: string | null | undefined): void {
+  sessionEpochs.delete(sessionId ?? "__default__");
+}
+
+export function resetAllSessionEpochs(): void {
+  sessionEpochs.clear();
+}
+
+/**
+ * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
+ * from the project root; when an active task exists and its baseline has not
+ * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
+ * Same-epoch repeat calls leave the event untouched.
+ */
+export async function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void> {
+  const sessionId = asString(event?.sessionID ?? event?.session_id);
+  const st = sessionEpochState(sessionId);
+  const projectRoot = effectiveProjectRoot(config);
+
+  let active: Record<string, unknown> | null = null;
+  const sessionPath = join(projectRoot, ".NeuroStrata", "active_session.json");
+  if (existsSync(sessionPath)) {
+    try {
+      active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+    } catch {
+      active = null;
+    }
+  }
+
+  const taskId = asString(active?.task_id);
+  if (!active || !taskId) return; // no active task: nothing to baseline-inject
+
+  if (st.baselineInjectedEpoch !== st.epoch) {
+    st.baselineInjectedEpoch = st.epoch;
+    const ns = asString(active.namespace) ?? config.namespace;
+    const status = asString(active.status) ?? "";
+    const message =
+      `[NeuroStrata Active Context] Namespace: ${ns} | Active Task: ${taskId} [${status}]`;
+    let extra = "";
+    const injection = asString(active.subagent_prompt_injection);
+    if (injection) extra += `\n${injection.trim()}`;
+    const bridges = active.conceptual_bridges;
+    if (bridges !== undefined && bridges !== null && Array.isArray(bridges)) {
+      const formatted = bridges
+        .map((b) => {
+          if (typeof b === "string") return b;
+          const bridge = b as Record<string, unknown>;
+          const type = bridge.memory_type ?? bridge.target_type ?? "memory";
+          const id = bridge.id ?? bridge.target_id;
+          const content = bridge.content ?? bridge.target_summary ?? "";
+          const why = bridge.why_connected ?? bridge.path ?? "";
+          return `[${type}] ${id}: ${content} (${why})`;
+        })
+        .join("; ");
+      extra += `\n[NeuroStrata Conceptual Bridges] ${formatted}`;
+    }
+    const full = message + extra;
+    if (typeof event.additionalContext === "string") {
+      event.additionalContext += `\n${full}`;
+    } else {
+      event.additionalContext = full;
+    }
+    if (Array.isArray(event?.context)) {
+      event.context.push(full);
+    }
+  }
+  // Same epoch: leave event.additionalContext untouched.
+}
+
+/**
+ * `session.hook("compaction")` handler. Increments the session epoch and
+ * clears seen files, so the very next context hook re-injects the active
+ * task / rules baseline.
+ */
+export async function sessionCompactionHandler(event: any, config: ResolvedConfig): Promise<void> {
+  const sessionId = asString(event?.sessionID ?? event?.session_id);
+  incrementSessionEpoch(sessionId);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1307,6 +1754,52 @@ function extractFilePath(args: Record<string, unknown>, altArgs?: Record<string,
   );
 }
 
+/**
+ * Tool-name extraction for execute.after events. OpenCode V2 passes
+ * `event.name`; V1 / Claude / Hermes pass `event.tool` / `event.tool_name`.
+ * `event.toolName` is checked first.
+ */
+export function extractToolName(event: any): string {
+  return (
+    asString(event?.toolName) ??
+    asString(event?.tool) ??
+    asString(event?.name) ??
+    asString(event?.tool_name) ??
+    asString(event?.action) ??
+    asString(event?.command) ??
+    ""
+  );
+}
+
+/** Native NeuroStrata control-plane tools: never nudge on these. */
+const NEUROSTRATA_NATIVE_TOOLS = new Set([
+  "neurostrata_task_claim",
+  "neurostrata_task_update",
+  "neurostrata_task_complete",
+  "neurostrata_add_memory",
+  "neurostrata_archive_memory",
+  "neurostrata_supersede_memory",
+  "neurostrata_update_memory",
+  "neurostrata_guard_validate",
+  "neurostrata_memories_for_file",
+]);
+
+/**
+ * Read the active task_id from `.NeuroStrata/active_session.json` so the
+ * plugin can forward it as parent_task_id on candidate submission, reaching
+ * the server-side auto-commit gate (task_id.is_some()) from the live hook.
+ */
+function readActiveTaskId(projectRoot: string): string | null {
+  const sessionPath = join(projectRoot, ".NeuroStrata", "active_session.json");
+  if (!existsSync(sessionPath)) return null;
+  try {
+    const active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+    return asString(active?.task_id ?? active?.active_task_id) || null;
+  } catch {
+    return null;
+  }
+}
+
 const executeAfterHandler = async (output: any, secondArg?: any): Promise<any> => {
   // The host may pass (input, output) or a single `output`/`event` argument
   // whose `.output` holds the real output. Resolve metadata and target object.
@@ -1317,16 +1810,148 @@ const executeAfterHandler = async (output: any, secondArg?: any): Promise<any> =
     target = target.output;
   }
   const targetRec = asRecord(target);
-  const block =
+  const event = target;
+
+  const toolName = extractToolName(event);
+
+  // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
+  // Read raw tool text in priority order. OpenCode v2.2.6 delivers
+  // `event.result.content` as an array of content parts `[{ type: "text", text: ... }]`.
+  const rawText =
+    typeof event?.result?.content === "string"
+      ? event.result.content
+      : Array.isArray(event?.result?.content)
+        ? (event.result.content as any[])
+            .filter((p: any) => p && p.type === "text" && typeof p.text === "string")
+            .map((p: any) => p.text)
+            .join("\n")
+        : typeof event?.result?.output === "string"
+          ? event.result.output
+          : typeof event?.output === "string"
+            ? event.output
+            : typeof event?.result === "string"
+              ? event.result
+              : typeof event?.response === "string"
+                ? event.response
+                : typeof event?.content === "string"
+                  ? event.content
+                  : "";
+
+  const sessionId = asString(event?.sessionID ?? event?.session_id);
+  const epoch = currentSessionEpoch(sessionId);
+
+  const suffixParts: string[] = [];
+
+  // 1. Pending recall block delivered by execute.before (legacy V1 / Claude / Hermes).
+  const pendingBlock =
     consumePendingRecall(meta, targetRec) ??
     (targetRec ? (targetRec.neurostrataContext as string | undefined) : undefined) ??
     (meta ? (meta.neurostrataContext as string | undefined) : undefined);
-  if (block && target && typeof target === "object") {
-    const out = target as Record<string, unknown>;
-    if (typeof out.output === "string") out.output = `${block}\n\n${out.output}`;
-    else if (typeof out.content === "string") out.content = `${block}\n\n${out.content}`;
-    out.additionalContext = block;
+  if (pendingBlock) suffixParts.push(pendingBlock);
+
+  // 2. Task-intent nudge on non-NeuroStrata-native tools.
+  if (toolName !== "" && !NEUROSTRATA_NATIVE_TOOLS.has(toolName) && config.intentDetection.injectReminder) {
+    const signals = detectTaskIntentsLocal(rawText);
+    if (signals.length > 0) {
+      const markerList = signals.map((s) => s.marker).join(", ");
+      suffixParts.push(
+        `[NeuroStrata Plugin — TASK INTENT DETECTED]\nDetected intent markers: ${markerList} — consider creating a task to track this work.`,
+      );
+    }
   }
+
+  // 3. JIT file-touch recall (deduplicated per sessionId:epoch:normalizedPath).
+  if (toolName !== "" && isFileTouchTool(toolName)) {
+    const filePath =
+      event?.args?.path ??
+      event?.args?.filePath ??
+      event?.input?.path ??
+      event?.toolInput?.path;
+    if (filePath) {
+      const fp = String(filePath);
+      const normalizedPath = pathRelativeToProjectRoot(fp, config);
+      const dedupKey = `${sessionId ?? "__no_session__"}:${epoch}:${normalizedPath}`;
+      const seen = sessionSeenFiles(sessionId);
+      if (!seen.has(dedupKey)) {
+        let snippets: string[] = [];
+        try {
+          snippets = await prefetchMemoriesForFile(config.namespace, fp, {
+            recordLedgerDir: config.projectRoot,
+          });
+          // Only mark the path as seen once the prefetch has actually run;
+          // a failed/empty prefetch leaves the path unmarked so a retry
+          // re-queries the governing memories.
+          seen.add(dedupKey);
+        } catch {
+          snippets = [];
+        }
+        if (snippets.length > 0) {
+          confirmPrefetchDelivery(config.namespace, fp);
+          suffixParts.push(
+            `[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join("\n")}`,
+          );
+        }
+      }
+    }
+  }
+
+  const legacyPrefix = pendingBlock ? `${pendingBlock}\n\n` : "";
+  const newSuffix = suffixParts.slice(pendingBlock ? 1 : 0).join("\n\n");
+  const combined = rawText
+    ? `${legacyPrefix}${rawText}${newSuffix ? "\n\n" + newSuffix : ""}`
+    : `${legacyPrefix}${newSuffix}`;
+
+  // Only mutate the event when there is actually something to prepend or
+  // append; otherwise leave event.result.content / output / content untouched
+  // (preserving the tool's original output, including V2 content arrays).
+  const hasAnything = !!pendingBlock || newSuffix !== "";
+  if (hasAnything && event && typeof event === "object") {
+    // OpenCode V2: mutate event.result.content in-place (and result.output).
+    if (event.result && typeof event.result === "object") {
+      if (Array.isArray(event.result.content)) {
+        const nonText = (event.result.content as any[]).filter(
+          (p: any) => p && p.type !== "text",
+        );
+        event.result.content = [...nonText, { type: "text", text: combined }];
+      } else {
+        event.result.content = combined;
+      }
+      if (typeof event.result.output === "string") event.result.output = combined;
+    }
+    // Preserve legacy top-level fields for V1 / Claude / Hermes harnesses.
+    if (newSuffix !== "") {
+      if (typeof event.additionalContext === "string") {
+        event.additionalContext +=
+          (event.additionalContext.length ? "\n" : "") + newSuffix;
+        if (pendingBlock && !event.additionalContext.includes(pendingBlock)) {
+          event.additionalContext = `${pendingBlock}\n\n${event.additionalContext}`;
+        }
+      } else {
+        event.additionalContext = suffixParts.join("\n\n");
+      }
+    } else if (pendingBlock && typeof event.additionalContext === "string") {
+      event.additionalContext = pendingBlock;
+    }
+    if (typeof event.output === "string") event.output = combined;
+    if (typeof event.content === "string") event.content = combined;
+  }
+
+  // Wave 4: extract task-intent obligations from the tool output text and
+  // post them fail-soft to the intake ledger (never blocks the tool output).
+  if (config.intentDetection.enabled && rawText) {
+    const activeTaskId = readActiveTaskId(effectiveProjectRoot(config));
+    const candidates = extractTurnCandidates({
+      role: "assistant",
+      content: rawText,
+      turn_id: sessionId ?? undefined,
+      source_tool: toolName || undefined,
+      parent_task_id: activeTaskId ?? undefined,
+    });
+    if (candidates.length > 0) {
+      await postTurnCandidates(candidates, config.namespace);
+    }
+  }
+
   return target ?? output;
 };
 
@@ -1498,7 +2123,12 @@ let initializeResolveGuard = false;
 
 export async function initialize(ctx: any): Promise<void> {
   pluginCtx = ctx;
-  config = resolveConfig(ctx?.config ?? ctx?.pluginConfig ?? {});
+  const projectRoot = resolveProjectRoot(ctx);
+  const diskConfig = loadPluginConfigFromDisk(projectRoot);
+  const inputConfig = asRecord(ctx?.config ?? ctx?.pluginConfig ?? {});
+  // Host-supplied ctx.config wins over discovered disk config.
+  config = resolveConfig({ ...diskConfig, ...inputConfig }, projectRoot);
+  config.projectRoot = projectRoot;
   const token = config.bearerToken ?? loadDaemonToken(config.tokenFile);
   mcpClient = new NeuroStrataMCPClient({ endpoint: config.endpoint, token, timeoutMs: config.requestTimeoutMs });
   cachedTaskInjection.clear();
@@ -1525,6 +2155,13 @@ export async function initialize(ctx: any): Promise<void> {
   // on each ctx.tool.hook call and expect execute.before as the last registered hook).
   await registerHook("execute.after", executeAfterHandler);
   await registerHook("execute.before", executeBeforeHandler);
+
+  // OpenCode V2 session hooks: context injects the active-task baseline once per
+  // epoch; compaction bumps the epoch so the next context hook re-injects it.
+  if (typeof ctx?.session?.hook === "function") {
+    ctx.session.hook("context", (event: any) => sessionContextHandler(event, config));
+    ctx.session.hook("compaction", (event: any) => sessionCompactionHandler(event, config));
+  }
 
   // Claude Code style hook events.
   if (ctx?.hooks?.PreToolUse && typeof ctx.hooks.PreToolUse === "function") {

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   resolveConfig,
+  resolveProjectRoot,
   findProjectRoot,
   discoverProjectNamespace,
   inspectCodeModeExecution,
@@ -34,6 +35,15 @@ import {
   cachedTaskInjection,
   cachedSubagentPromptByTask,
   PREFETCH_LRU_CAP,
+  sessionContextHandler,
+  sessionCompactionHandler,
+  extractToolName,
+  currentSessionEpoch,
+  incrementSessionEpoch,
+  extractTurnCandidates,
+  postTurnCandidates,
+  extractConceptualBridges,
+  persistConceptualBridges,
 } from "./dist/index.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -724,6 +734,337 @@ describe("execute.before / execute.after recall delivery", () => {
     } finally {
       server.close();
       resetModuleState();
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Wave 4 Task 4.1: extractTurnCandidates + conceptual bridges persistence
+// ──────────────────────────────────────────────────────────────────────
+
+function makeTaskCandidatesMock({ error = false } = {}) {
+  const captured = [];
+  return new Promise((resolve) => {
+    const server = http.createServer((req, res) => {
+      if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+      let body = "";
+      req.on("data", (c) => body += c);
+      req.on("end", () => {
+        try {
+          const payload = JSON.parse(body);
+          const id = payload.id ?? 0;
+          const method = payload.method;
+          const respond = (resultObj, errorObj = null) => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ jsonrpc: "2.0", id, ...(errorObj ? { error: errorObj } : { result: resultObj }) }));
+          };
+          if (method !== "tools/list" && method !== "tools/call") {
+            respond(null, { code: -32601, message: "Unknown method" }); return;
+          }
+          const params = payload.params ?? {};
+          const name = params.name ?? params.arguments?.name;
+          if (method === "tools/list") {
+            respond({ tools: [{ name: "neurostrata_task_candidates" }] }); return;
+          }
+          if (name === "neurostrata_task_candidates") {
+            captured.push(params.arguments ?? {});
+            if (error) respond(null, { code: -32603, message: "intake down" });
+            else respond({ content: [{ type: "text", text: JSON.stringify({ ok: true }) }] });
+            return;
+          }
+          respond(null, { code: -32601, message: "Unknown tool" });
+        } catch { res.writeHead(400); res.end(); }
+      });
+    });
+    server.listen(0, () => {
+      const addr = server.address();
+      resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, captured });
+    });
+  });
+}
+
+describe("extractTurnCandidates", () => {
+  it("extracts a TODO: marker as a task_obligation candidate with a provenance span", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "TODO: wire the candidates",
+      turn_id: "t1",
+      source_tool: "write",
+      channel: "comment",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "task_obligation");
+    assert.equal(c.title, "TODO: wire the candidates");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, false);
+    assert.equal(c.provenance.turn_id, "t1");
+    assert.equal(c.provenance.role, "user");
+    assert.equal(c.provenance.source_tool, "write");
+    assert.equal(c.provenance.channel, "comment");
+    assert.equal(c.provenance.evidence_quote, "TODO: wire the candidates");
+    assert.equal(c.provenance.quote, "TODO: wire the candidates");
+    assert.deepEqual(c.provenance.char_range, [0, 25]);
+    assert.equal(c.provenance.confidence, 0.9);
+  });
+
+  it("detects multiple markers and returns one candidate per marker", () => {
+    const cands = extractTurnCandidates({
+      role: "checker",
+      content: "TODO: first\nFIXME: second\nfollow-up: third",
+    });
+    assert.equal(cands.length, 3);
+    assert.equal(cands[0].title, "TODO: first");
+    assert.equal(cands[1].title, "FIXME: second");
+    assert.equal(cands[2].title, "follow-up: third");
+    for (const c of cands) {
+      assert.equal(c.kind, "task_obligation");
+      assert.equal(c.auto_commit, false);
+    }
+  });
+
+  it("returns an empty array when no intent markers are present", () => {
+    assert.deepEqual(extractTurnCandidates({ role: "user", content: "just a normal sentence" }), []);
+    assert.deepEqual(extractTurnCandidates({ role: "user", content: "" }), []);
+  });
+
+  it("char_range points at the marker position within the content", () => {
+    const cands = extractTurnCandidates({ role: "user", content: "prefix TODO: mid-fix" });
+    assert.equal(cands.length, 1);
+    assert.deepEqual(cands[0].provenance.char_range, [7, 20]);
+    assert.equal(cands[0].title, "TODO: mid-fix");
+  });
+
+  it("propagates parent_task_id into provenance when provided", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "TODO: x",
+      parent_task_id: "task-9",
+    });
+    assert.equal(cands[0].provenance.parent_task_id, "task-9");
+  });
+
+  it("extracts DECISION: marker as memory_candidate decision with ProvenanceSpan", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "DECISION: use Rust for the intake layer",
+      turn_id: "t1",
+      source_tool: "write",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "memory_candidate");
+    assert.equal(c.category, "decision");
+    assert.equal(c.title, "use Rust for the intake layer");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, true);
+    assert.equal(c.provenance.confidence, 0.9);
+    assert.equal(c.provenance.evidence_quote, "use Rust for the intake layer");
+    assert.ok(c.provenance.char_range[0] >= 0);
+    assert.ok(c.provenance.char_range[1] > c.provenance.char_range[0]);
+  });
+
+  it("extracts FACT: marker as memory_candidate fact with ProvenanceSpan", () => {
+    const cands = extractTurnCandidates({
+      role: "checker",
+      content: "FACT: the gate requires memory extraction before completion",
+      turn_id: "t2",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "memory_candidate");
+    assert.equal(c.category, "fact");
+    assert.equal(c.title, "the gate requires memory extraction before completion");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, true);
+    assert.equal(c.provenance.confidence, 0.9);
+  });
+
+  it("extracts FACT: untrusted file text and DECISION: marker with auto_commit false", () => {
+    const cands = extractTurnCandidates({
+      role: "assistant",
+      source_tool: "read",
+      content: "FACT: untrusted file text. DECISION: untrusted file decision.",
+    });
+    assert.equal(cands.length, 2);
+    for (const c of cands) {
+      assert.equal(c.kind, "memory_candidate");
+      assert.equal(c.auto_commit, false);
+    }
+    const decision = cands.find((c) => c.category === "decision");
+    assert.ok(decision);
+    assert.equal(decision.title, "untrusted file decision");
+  });
+
+  it("extracts Architectural decision: and We decided to: as decision", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content:
+        "Architectural decision: centralize provenance in IntakeCandidate. We decided to: cap bridges at 4.",
+    });
+    const decisions = cands.filter((c) => c.category === "decision");
+    assert.equal(decisions.length, 2);
+    for (const c of decisions) {
+      assert.equal(c.kind, "memory_candidate");
+      assert.equal(c.confidence, 0.9);
+    }
+  });
+
+  it("skips empty-excerpt signals (no indexOf on empty string)", () => {
+    const cands = extractTurnCandidates({ role: "user", content: "TODO:" });
+    // "TODO:" has no trailing text; the marker regex may yield empty excerpt.
+    assert.ok(Array.isArray(cands));
+  });
+});
+
+describe("postTurnCandidates", () => {
+  it("posts each candidate to neurostrata_task_candidates record action", async () => {
+    const { server, url, captured } = await makeTaskCandidatesMock();
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await postTurnCandidates([
+        { kind: "task_obligation", title: "one", confidence: 0.9, auto_commit: false, provenance: { role: "user", turn_id: "t1" } },
+        { kind: "task_obligation", title: "two", confidence: 0.9, auto_commit: false, provenance: { role: "user", turn_id: "t2" } },
+      ], "tc-ns");
+      assert.equal(captured.length, 2);
+      for (const cap of captured) {
+        assert.equal(cap.action, "record");
+        assert.equal(cap.namespace, "tc-ns");
+        assert.equal(cap.kind, "task_obligation");
+        assert.equal(cap.auto_commit, false);
+      }
+      assert.equal(captured[0].title, "one");
+      assert.equal(captured[1].title, "two");
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+
+  it("fail-soft: does not throw when mcpClient is not set", async () => {
+    resetClientForTesting();
+    await assert.doesNotReject(
+      postTurnCandidates([{ kind: "task_obligation", title: "x", confidence: 0.9, auto_commit: false, provenance: {} }], "ns"),
+    );
+  });
+
+  it("fail-soft: does not throw when the daemon errors on task_candidates", async () => {
+    const { server, url } = await makeTaskCandidatesMock({ error: true });
+    try {
+      resetClientForTesting();
+      const ctx = { config: { namespace: "tc-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 }, tool: { hook: async () => {} }, hooks: {} };
+      await initialize(ctx);
+      await assert.doesNotReject(
+        postTurnCandidates([{ kind: "task_obligation", title: "x", confidence: 0.9, auto_commit: false, provenance: {} }], "tc-ns"),
+      );
+    } finally {
+      server.close();
+      resetModuleState();
+    }
+  });
+});
+
+describe("extractConceptualBridges", () => {
+  it("extracts bridges from hits carrying conceptual_bridges arrays", () => {
+    const hits = [
+      {
+        id: "seed-1",
+        conceptual_bridges: [
+          { source_id: "seed-1", via_id: "v1", target_id: "t1", target_domain: "d1", target_type: "rule", target_summary: "summary 1", path: "seed-1 -> v1 -> t1" },
+        ],
+      },
+      { id: "seed-2" }, // no bridges
+    ];
+    const bridges = extractConceptualBridges(hits);
+    assert.equal(bridges.length, 1);
+    assert.equal(bridges[0].path, "seed-1 -> v1 -> t1");
+    assert.equal(bridges[0].target_id, "t1");
+    assert.equal(bridges[0].target_type, "rule");
+  });
+
+  it("dedupes bridges by path across hits", () => {
+    const hits = [
+      { id: "a", conceptual_bridges: [{ path: "p1", source_id: "a", target_id: "t" }] },
+      { id: "b", conceptual_bridges: [{ path: "p1", source_id: "b", target_id: "t" }] },
+      { id: "c", conceptual_bridges: [{ path: "p2", source_id: "c", target_id: "t" }] },
+    ];
+    const bridges = extractConceptualBridges(hits);
+    assert.equal(bridges.length, 2);
+    assert.equal(bridges[0].path, "p1");
+    assert.equal(bridges[1].path, "p2");
+  });
+
+  it("returns empty array when no hit carries conceptual_bridges", () => {
+    assert.deepEqual(extractConceptualBridges([{ id: "a" }, { id: "b" }]), []);
+    assert.deepEqual(extractConceptualBridges([]), []);
+  });
+});
+
+describe("persistConceptualBridges", () => {
+  it("writes bridges into active_session.json under conceptual_bridges and merges existing fields", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-cb-persist-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({ namespace: "NeuroStrata", task_id: "task-1", status: "in_progress" }),
+    );
+    try {
+      const bridges = [
+        { source_id: "s1", via_id: "v1", target_id: "t1", target_domain: "d", target_type: "rule", target_summary: "sum", path: "s1 -> v1 -> t1" },
+      ];
+      persistConceptualBridges(tmpDir, bridges);
+      const active = JSON.parse(readFileSync(join(nsDir, "active_session.json"), "utf8"));
+      assert.equal(active.namespace, "NeuroStrata");
+      assert.equal(active.task_id, "task-1");
+      assert.equal(active.status, "in_progress");
+      assert.deepEqual(active.conceptual_bridges, bridges);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("merges new bridges with existing by id dedup and caps at 4 instead of overwriting", () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-cb-merge-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-1",
+        conceptual_bridges: [
+          { source_id: "s1", target_id: "t1", target_type: "rule", target_summary: "old 1", path: "s1 -> t1" },
+          { source_id: "s2", target_id: "t2", target_type: "fact", target_summary: "old 2", path: "s2 -> t2" },
+        ],
+      }),
+    );
+    try {
+      const newBridges = [
+        { source_id: "s1", target_id: "t1", target_type: "rule", target_summary: "new 1 (updated)", path: "s1 -> t1" }, // dup id t1
+        { source_id: "s3", target_id: "t3", target_type: "rule", target_summary: "new 3", path: "s3 -> t3" }, // new
+        { source_id: "s4", target_id: "t4", target_type: "fact", target_summary: "new 4", path: "s4 -> t4" }, // new
+        { source_id: "s5", target_id: "t5", target_type: "rule", target_summary: "new 5", path: "s5 -> t5" }, // new -> would be 5th, capped out
+        { source_id: "s6", target_id: "t6", target_type: "fact", target_summary: "new 6", path: "s6 -> t6" }, // capped out
+      ];
+      persistConceptualBridges(tmpDir, newBridges);
+      const active = JSON.parse(readFileSync(join(nsDir, "active_session.json"), "utf8"));
+      const bridges = active.conceptual_bridges;
+      assert.ok(Array.isArray(bridges));
+      assert.equal(bridges.length, 4, "capped at 4");
+      // t1 should be the updated version (newer wins on dup id)
+      const t1 = bridges.find((b) => b.target_id === "t1");
+      assert.ok(t1, "t1 retained after dedup merge");
+      assert.equal(t1.target_summary, "new 1 (updated)", "newer wins on duplicate id");
+      // t2 (existing, not re-sent) should still be present
+      assert.ok(bridges.some((b) => b.target_id === "t2"), "existing t2 preserved");
+      // t5 and t6 should be absent (cap 4)
+      assert.ok(!bridges.some((b) => b.target_id === "t5"), "t5 capped out");
+      assert.ok(!bridges.some((b) => b.target_id === "t6"), "t6 capped out");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -1736,6 +2077,312 @@ describe("round-9: CLI hook runners flush stdout before exiting", () => {
         src.includes("const writeStdout = (text) =>"),
         `${rel}: writeStdout helper missing`,
       );
+    }
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────
+// Task 1.1: OpenCode V2 project-root resolution, session epoch hooks,
+// and execute.after V2 result mutation
+// ──────────────────────────────────────────────────────────────────────
+
+describe("Task 1.1: resolveProjectRoot priority chain", () => {
+  it("ctx.location.project.canonical wins", () => {
+    assert.equal(
+      resolveProjectRoot({ location: { project: { canonical: "/canon", root: "/root" }, directory: "/dir" } }),
+      "/canon",
+    );
+  });
+
+  it("falls back to ctx.location.project.root", () => {
+    assert.equal(
+      resolveProjectRoot({ location: { project: { root: "/root" }, directory: "/dir" } }),
+      "/root",
+    );
+  });
+
+  it("falls back to ctx.location.directory", () => {
+    assert.equal(resolveProjectRoot({ location: { directory: "/dir" } }), "/dir");
+  });
+
+  it("falls back to ctx.projectDir", () => {
+    assert.equal(resolveProjectRoot({ projectDir: "/pdir" }), "/pdir");
+  });
+
+  it("falls back to ctx.directory", () => {
+    assert.equal(resolveProjectRoot({ directory: "/cdir" }), "/cdir");
+  });
+
+  it("falls back to ctx.cwd", () => {
+    assert.equal(resolveProjectRoot({ cwd: "/ccwd" }), "/ccwd");
+  });
+
+  it("falls back to process.cwd()", () => {
+    assert.equal(resolveProjectRoot({}), process.cwd());
+    assert.equal(resolveProjectRoot(undefined), process.cwd());
+  });
+});
+
+describe("Task 1.1: extractToolName", () => {
+  it("prefers toolName, then tool, then name", () => {
+    assert.equal(extractToolName({ toolName: "read" }), "read");
+    assert.equal(extractToolName({ tool: "write" }), "write");
+    assert.equal(extractToolName({ name: "edit" }), "edit");
+    assert.equal(extractToolName({ tool_name: "grep" }), "grep");
+    assert.equal(extractToolName({}), "");
+  });
+});
+
+describe("Task 1.1: sessionContextHandler / sessionCompactionHandler epoch behavior", () => {
+  it("injects active-task baseline once per epoch; compaction re-injects", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-ctx-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-core-1",
+        status: "in_progress",
+        session_id: "ses-core-1",
+        updated_at: new Date().toISOString(),
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: true, injectReminder: true },
+      };
+
+      const ev1 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev1, config);
+      assert.equal(currentSessionEpoch("ses-core-1"), 0);
+      assert.equal(typeof ev1.additionalContext, "string");
+      assert.ok(ev1.additionalContext.includes("[NeuroStrata Active Context]"));
+      assert.ok(ev1.additionalContext.includes("task-core-1"));
+      assert.ok(ev1.additionalContext.includes("[in_progress]"));
+
+      const ev2 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev2, config);
+      assert.equal(ev2.additionalContext, undefined);
+
+      await sessionCompactionHandler({ sessionID: "ses-core-1" }, config);
+      assert.equal(currentSessionEpoch("ses-core-1"), 1);
+
+      const ev3 = { sessionID: "ses-core-1" };
+      await sessionContextHandler(ev3, config);
+      assert.ok(ev3.additionalContext.includes("[NeuroStrata Active Context]"));
+      assert.ok(ev3.additionalContext.includes("task-core-1"));
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+});
+
+describe("sessionContextHandler bridge formatting (no [object Object])", () => {
+  it("formats each bridge object cleanly instead of String(b)", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-bridge-fmt-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-bridge-1",
+        status: "in_progress",
+        session_id: "ses-bridge-1",
+        conceptual_bridges: [
+          {
+            target_id: "t1",
+            target_type: "rule",
+            target_summary: "always claim first",
+            path: "src/a.rs",
+          },
+          "a plain string bridge",
+          { source_id: "s3", target_id: "t3", target_type: "fact", target_summary: "gate blocks" },
+        ],
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const ev = { sessionID: "ses-bridge-1" };
+      await sessionContextHandler(ev, config);
+      const ctx = ev.additionalContext ?? "";
+      assert.ok(ctx.includes("[NeuroStrata Conceptual Bridges]"), "bridges section present");
+      assert.ok(!ctx.includes("[object Object]"), "no [object Object] in bridge formatting");
+      assert.ok(ctx.includes("[rule] t1: always claim first (src/a.rs)"), "object bridge formatted cleanly");
+      assert.ok(ctx.includes("a plain string bridge"), "string bridge passed through");
+      assert.ok(ctx.includes("[fact] t3: gate blocks"), "object with source_id falls back to target_type");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("omits bridges section when conceptual_bridges is absent", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-bridge-none-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({ namespace: "NeuroStrata", task_id: "task-nb", status: "in_progress" }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const ev = { sessionID: "ses-nb" };
+      await sessionContextHandler(ev, config);
+      const ctx = ev.additionalContext ?? "";
+      assert.ok(!ctx.includes("[NeuroStrata Conceptual Bridges]"), "no bridges section when absent");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+});
+
+describe("Task 1.1: execute.after V2 result mutation (via hook registration)", () => {
+  it("mutates event.result.content/output with task-intent nudge and JIT file recall", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-exec-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+        session: { hook: () => {} },
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "exec-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+      assert.equal(typeof afterHandler, "function");
+
+      const evt = {
+        name: "read",
+        callID: "call_read_1",
+        sessionID: "ses-exec-1",
+        args: { path: "src/server.rs" },
+        status: "completed",
+        result: {
+          content: "TODO: wire task candidate provenance in server.rs",
+          output: "TODO: wire task candidate provenance in server.rs",
+        },
+      };
+      await afterHandler(evt);
+      assert.match(evt.result.content, /TASK INTENT DETECTED/);
+      assert.match(evt.result.output, /TASK INTENT DETECTED/);
+      assert.ok(evt.result.content.includes("[NeuroStrata File Context — src/server.rs]"));
+      assert.equal(counters.memoriesForFile, 1, "file recall queried the daemon once");
+    } finally {
+      server.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("JIT file recall is deduplicated per session:epoch:path", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-dedup-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    const { server, url, counters } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+        session: { hook: () => {} },
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "dedup-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+
+      const base = {
+        name: "read",
+        callID: "call_read_2",
+        sessionID: "ses-dedup-1",
+        args: { path: "src/server.rs" },
+        status: "completed",
+        result: { content: "read file contents here", output: "read file contents here" },
+      };
+      const evt1 = { ...base, result: { ...base.result } };
+      await afterHandler(evt1);
+      assert.ok(evt1.result.content.includes("[NeuroStrata File Context — src/server.rs]"));
+      assert.equal(evt1.result.content.includes("TASK INTENT DETECTED"), false);
+      const after1 = evt1.result.content;
+
+      const evt2 = { ...base, result: { ...base.result, content: after1 } };
+      await afterHandler(evt2);
+      assert.equal(evt2.result.content, after1, "second touch in same epoch adds no new block");
+      assert.equal(counters.memoriesForFile, 1, "daemon not re-queried for deduped path");
+    } finally {
+      server.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("non-file-touch tool gets task-intent nudge only, no file-context block", async () => {
+    const { server, url } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "bash-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+
+      const evt = {
+        name: "bash",
+        callID: "call_bash_1",
+        sessionID: "ses-bash-1",
+        args: {},
+        status: "completed",
+        result: { content: "follow-up: clean up the temp dir", output: "follow-up: clean up the temp dir" },
+      };
+      await afterHandler(evt);
+      assert.match(evt.result.content, /TASK INTENT DETECTED/);
+      assert.match(evt.result.output, /TASK INTENT DETECTED/);
+      assert.equal(evt.result.content.includes("[NeuroStrata File Context"), false);
+    } finally {
+      server.close();
+      resetClientForTesting();
+    }
+  });
+
+  it("legacy V1 event without result object does not crash and preserves output", async () => {
+    const { server, url } = await createMockDaemonServer();
+    let afterHandler = null;
+    try {
+      const ctx = {
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "legacy-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      };
+      await initialize(ctx);
+      const evt = {
+        name: "read",
+        output: "legacy output text",
+        content: "legacy content text",
+        additionalContext: "prior context",
+      };
+      await afterHandler(evt);
+      assert.equal(evt.output, "legacy output text");
+      assert.ok(evt.additionalContext.includes("prior context"));
+    } finally {
+      server.close();
+      resetClientForTesting();
     }
   });
 });

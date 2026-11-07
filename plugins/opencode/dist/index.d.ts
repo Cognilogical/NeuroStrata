@@ -29,7 +29,11 @@ export interface PluginConfig {
         enabled: boolean;
         injectReminder: boolean;
     };
+    /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+    projectRoot?: string;
 }
+/** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
+export type ResolvedConfig = PluginConfig;
 /**
  * Resolve `namespace` in strict priority order:
  *  1. pluginConfig.namespace (non-empty trimmed string)
@@ -50,6 +54,18 @@ export declare function findProjectRoot(startDir?: string): string;
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
 export declare function discoverProjectNamespace(startDir?: string): string;
+/**
+ * Resolve the project root from an OpenCode V2 host context, falling back
+ * through ctx fields to process.cwd(). Priority:
+ *   1. ctx.location.project.canonical
+ *   2. ctx.location.project.root
+ *   3. ctx.location.directory
+ *   4. ctx.projectDir
+ *   5. ctx.directory
+ *   6. ctx.cwd
+ *   7. process.cwd()
+ */
+export declare function resolveProjectRoot(ctx?: any): string;
 export declare function daemonTokenPath(tokenFile?: string | null): string;
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
 export declare function buildHeaders(token: string | null): Record<string, string>;
@@ -120,6 +136,71 @@ export interface TaskIntentSignal {
 export declare const MARKERS: readonly [string, string][];
 export declare const NEGATION_PREFIXES: string[];
 export declare function detectTaskIntentsLocal(text: string): TaskIntentSignal[];
+export interface ProvenanceSpan {
+    turn_id?: string;
+    role?: string;
+    source_tool?: string;
+    channel?: string;
+    evidence_quote?: string;
+    quote?: string;
+    char_range?: [number, number];
+    parent_task_id?: string;
+    confidence?: number;
+}
+export interface Turn {
+    role: string;
+    content: string;
+    turn_id?: string;
+    source_tool?: string;
+    channel?: string;
+    parent_task_id?: string;
+}
+export interface TurnCandidate {
+    kind: "task_obligation" | "memory_candidate";
+    category?: "fact" | "decision" | "rule_candidate";
+    title: string;
+    description?: string;
+    confidence: number;
+    auto_commit: boolean;
+    provenance: ProvenanceSpan;
+}
+export interface ConceptualBridge {
+    source_id?: string;
+    via_id?: string;
+    target_id?: string;
+    target_domain?: string;
+    target_type?: string;
+    target_summary?: string;
+    path?: string;
+}
+/**
+ * Extract task-obligation candidates from a turn's content. Detects local
+ * task-intent markers (TODO:, FIXME:, follow-up:, ...) via
+ * `detectTaskIntentsLocal` and attaches a provenance span
+ * (turn_id, role, source_tool, channel, evidence_quote, quote, char_range,
+ * confidence) to each. Pure: no daemon interaction. Rule candidates are
+ * never produced here (rule candidates never auto-promote).
+ */
+export declare function extractTurnCandidates(turn: Turn): TurnCandidate[];
+/**
+ * Post turn candidates fail-soft to the intake ledger via
+ * `neurostrata_task_candidates` (`action: "record"`). Never throws: a missing
+ * MCP client or a daemon error is swallowed so a turn is never blocked by
+ * intake-ledger submission.
+ */
+export declare function postTurnCandidates(candidates: TurnCandidate[], namespace: string): Promise<void>;
+/**
+ * Extract de-duplicated conceptual bridges from `memories_for_file` hits.
+ * Each hit may carry a `conceptual_bridges` array (source -> via -> target
+ * 2-hop cross-domain paths). Bridges are de-duplicated by `path`.
+ */
+export declare function extractConceptualBridges(hits: unknown[]): ConceptualBridge[];
+/**
+ * Persist conceptual bridges into `.NeuroStrata/active_session.json` under
+ * the `conceptual_bridges` key, merging with any existing fields so the
+ * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
+ */
+export declare function persistConceptualBridges(projectRoot: string, bridges: ConceptualBridge[]): void;
 export declare const READ_FILE_TOOLS: Set<string>;
 export declare const MUTATING_FILE_TOOLS: Set<string>;
 export declare const SHELL_TOOLS: Set<string>;
@@ -172,6 +253,7 @@ export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
  */
 export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
     recordLedgerDir?: string;
+    projectRoot?: string;
 }): Promise<string[]>;
 /**
  * Mark a prefetch as delivered: its memories were handed to the caller, so the
@@ -218,8 +300,39 @@ export declare function getTrackingState(): {
     activeSessionId: string | null;
     mutationsSinceNote: number;
 };
+export interface SessionEpochState {
+    epoch: number;
+    baselineInjectedEpoch: number;
+    seenFiles: Set<string>;
+}
+/** Current epoch for a session (starts at 0, incremented by compaction). */
+export declare function currentSessionEpoch(sessionId: string | null | undefined): number;
+/** Increment the epoch and clear seen files so the next context hook re-injects. */
+export declare function incrementSessionEpoch(sessionId: string | null | undefined): void;
+export declare function sessionSeenFiles(sessionId: string | null | undefined): Set<string>;
+export declare function resetSessionEpoch(sessionId: string | null | undefined): void;
+export declare function resetAllSessionEpochs(): void;
+/**
+ * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
+ * from the project root; when an active task exists and its baseline has not
+ * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
+ * Same-epoch repeat calls leave the event untouched.
+ */
+export declare function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void>;
+/**
+ * `session.hook("compaction")` handler. Increments the session epoch and
+ * clears seen files, so the very next context hook re-injects the active
+ * task / rules baseline.
+ */
+export declare function sessionCompactionHandler(event: any, config: ResolvedConfig): Promise<void>;
 export declare const pendingRecallBlocks: string[];
 export declare const pendingRecallByCall: Map<string, string>;
+/**
+ * Tool-name extraction for execute.after events. OpenCode V2 passes
+ * `event.name`; V1 / Claude / Hermes pass `event.tool` / `event.tool_name`.
+ * `event.toolName` is checked first.
+ */
+export declare function extractToolName(event: any): string;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;
