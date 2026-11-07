@@ -2493,21 +2493,7 @@ impl crate::traits::AsAny for RecordingStore {
 
         // Wait for the listener to answer at all; a daemon that could not
         // bind fails its own join below rather than hanging here.
-        let mut serving = false;
-        for _ in 0..500 {
-            if client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                serving = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(serving, "daemon never started serving on {addr}");
+        wait_for_serving(&client, &addr).await;
 
         // The authenticated client is built only AFTER the daemon answers:
         // the daemon creates daemon.token during startup, and reading the
@@ -2561,6 +2547,30 @@ impl crate::traits::AsAny for RecordingStore {
         daemon.await.unwrap().unwrap();
     }
 
+    /// Wait until the daemon on `addr` answers `GET /health`, or panic.
+    /// The budget is ~20 s (2000 x 10 ms): debug startup on a slow machine
+    /// takes longer than the old 5 s budget, dominated by `exe_fingerprint`
+    /// hashing the ~700 MB debug test binary before bind. A genuinely
+    /// wedged daemon fails here instead of hanging.
+    async fn wait_for_serving(client: &reqwest::Client, addr: &str) {
+        let base = format!("http://{addr}");
+        let mut serving = false;
+        for _ in 0..2000 {
+            if client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                serving = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(serving, "daemon never started serving on {addr}");
+    }
+
     /// The daemon on an ephemeral port, and a client that has waited until it
     /// answers. An ephemeral port because the machine's live daemon owns
     /// 34343, and the full production startup sequence so the routes under test
@@ -2587,21 +2597,7 @@ impl crate::traits::AsAny for RecordingStore {
 
         // Wait for the listener to answer at all; a daemon that could not bind
         // fails its own join below rather than hanging here.
-        let mut serving = false;
-        for _ in 0..500 {
-            if client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                serving = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(serving, "daemon never started serving on {addr}");
+        wait_for_serving(&client, &addr).await;
 
         // The authenticated client is built only AFTER the daemon answers:
         // the daemon creates daemon.token during startup, and reading the
@@ -3105,21 +3101,7 @@ impl crate::traits::AsAny for RecordingStore {
         ));
         let base = format!("http://{addr}");
         let bare = reqwest::Client::new();
-        let mut serving = false;
-        for _ in 0..500 {
-            if bare
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false)
-            {
-                serving = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(serving, "daemon never started serving on {addr}");
+        wait_for_serving(&bare, &addr).await;
         std::env::remove_var(PROJECT_ROOT_ENV);
         let home = dirs::home_dir().unwrap_or_default();
         let token_dir = home.join(".config").join("neurostrata");
