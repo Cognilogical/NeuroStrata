@@ -119,9 +119,16 @@ impl P2pMeshTransport {
             return Err(MeshTransportError::FrameTooLarge(plain.len()));
         }
         let mut nonce = [0u8; GCM_NONCE_LEN];
-        let seq_n = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
-        nonce[..4].copy_from_slice(&(self.local_addr.port() as u32).to_be_bytes());
-        nonce[4..12].copy_from_slice(&seq_n.to_be_bytes());
+        openssl::rand::rand_bytes(&mut nonce)
+            .map_err(|e| MeshTransportError::Auth(format!("CSPRNG nonce failure: {e}")))?;
+        let sender_digest = openssl::sha::sha256(frame.origin_node_id.as_bytes());
+        for i in 0..4 {
+            nonce[i] ^= sender_digest[i];
+        }
+        let seq_n = self.nonce_counter.fetch_add(1, Ordering::Relaxed).to_be_bytes();
+        for i in 0..8 {
+            nonce[4 + i] ^= seq_n[i];
+        }
 
         let mut tag = [0u8; GCM_TAG_LEN];
         let cipher = Cipher::aes_256_gcm();
@@ -297,6 +304,16 @@ impl MeshTransport for P2pMeshTransport {
             frames_rejected: self.frames_rejected.load(Ordering::Relaxed),
         }
     }
+
+    fn register_peer_endpoint(&self, endpoint: &str) {
+        if !endpoint.trim().is_empty() && endpoint != self.local_addr.to_string() {
+            if let Ok(mut peers) = self.peer_addrs.lock() {
+                if !peers.iter().any(|p| p == endpoint) {
+                    peers.push(endpoint.to_string());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +362,7 @@ mod tests {
                 mesh_id: "m-test".into(),
                 epoch: 1,
                 peer_cursors: BTreeMap::new(),
+                endpoint: None,
             }),
             signature: String::new(),
         };
@@ -399,5 +417,14 @@ mod tests {
                 .unwrap(),
             LeaseVerdict::Acquired(ref h) if h.holder_node_id == "did:key:z6MkZZZ"
         ));
+
+        // Nonce uniqueness across instances with same counter state
+        let pkt_a = node_a.encrypt_wire_packet(&frame).unwrap();
+        let pkt_b = node_b.encrypt_wire_packet(&frame).unwrap();
+        assert_ne!(
+            &pkt_a[4..4 + GCM_NONCE_LEN],
+            &pkt_b[4..4 + GCM_NONCE_LEN],
+            "96-bit AES-GCM nonces must be unique across instances and calls"
+        );
     }
 }

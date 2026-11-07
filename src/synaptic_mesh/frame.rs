@@ -28,11 +28,12 @@ pub const FORBIDDEN_PROCEDURE_COUNTER_KEYS: &[&str] = &[
 ];
 
 /// Memory types permitted to cross NeuroMesh when `eligibility == "shareable"`.
+/// Tasks (`"task"`), `"structural"` AST nodes, embeddings, and private records
+/// are strictly node-local and never cross `MeshTransport`.
 pub const PERMITTED_MESH_MEMORY_TYPES: &[&str] = &[
     "rule",
     "fact",
     "procedure",
-    "task",
     "digital_twin",
     "digital_twin_schema",
 ];
@@ -145,6 +146,8 @@ pub struct SyncHello {
     pub mesh_id: String,
     pub epoch: u64,
     pub peer_cursors: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 /// Tri-Strata + World State payload variants carried inside a [`MeshFrame`].
@@ -309,6 +312,34 @@ pub fn validate_egress_candidate(
     Ok(())
 }
 
+/// Recursively inspect a JSON tree for any forbidden node-local procedure runtime counter key.
+pub fn find_forbidden_procedure_counter(value: &serde_json::Value) -> Option<&'static str> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for &key in FORBIDDEN_PROCEDURE_COUNTER_KEYS {
+                if map.contains_key(key) {
+                    return Some(key);
+                }
+            }
+            for child in map.values() {
+                if let Some(found) = find_forbidden_procedure_counter(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                if let Some(found) = find_forbidden_procedure_counter(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Wire-level envelope verification (size, `mesh_id`, `epoch`, Ed25519 signature,
 /// absence of forbidden procedure runtime counters, and finite `TwinDelta` numbers).
 pub fn validate_wire_envelope(
@@ -339,14 +370,12 @@ pub fn validate_wire_envelope(
     match &frame.kind {
         MeshPayloadKind::CognitiveDelta { record, .. } => {
             validate_egress_candidate(&record.memory_type, &record.metadata)?;
-            for key in FORBIDDEN_PROCEDURE_COUNTER_KEYS {
-                if record.metadata.get(*key).is_some()
-                    || record.content.get(*key).is_some()
-                {
-                    return Err(SovereigntyGateError::ForbiddenRuntimeCounter(
-                        (*key).to_string(),
-                    ));
-                }
+            if let Some(key) = find_forbidden_procedure_counter(&record.metadata)
+                .or_else(|| find_forbidden_procedure_counter(&record.content))
+            {
+                return Err(SovereigntyGateError::ForbiddenRuntimeCounter(
+                    key.to_string(),
+                ));
             }
         }
         MeshPayloadKind::TwinDelta {
@@ -358,9 +387,12 @@ pub fn validate_wire_envelope(
                 }
             }
         }
-        MeshPayloadKind::TaskDelta { .. }
-        | MeshPayloadKind::TaskLeaseDelta { .. }
-        | MeshPayloadKind::SyncHello(_) => {}
+        MeshPayloadKind::TaskDelta { .. } => {
+            return Err(SovereigntyGateError::ForbiddenMemoryType(
+                "task".to_string(),
+            ));
+        }
+        MeshPayloadKind::TaskLeaseDelta { .. } | MeshPayloadKind::SyncHello(_) => {}
     }
 
     Ok(())
@@ -432,6 +464,10 @@ mod tests {
         assert!(matches!(
             validate_egress_candidate("structural", &structural_meta),
             Err(SovereigntyGateError::ForbiddenMemoryType(_))
+        ));
+        assert!(matches!(
+            validate_egress_candidate("task", &structural_meta),
+            Err(SovereigntyGateError::ForbiddenMemoryType(ref t)) if t == "task"
         ));
 
         let mut proc_meta = serde_json::json!({
@@ -535,7 +571,7 @@ mod tests {
         };
         let mut leaky_frame = frame.clone();
         leaky_frame.kind = MeshPayloadKind::CognitiveDelta {
-            record: leaky_rec,
+            record: leaky_rec.clone(),
             rdf_patch: String::new(),
             concept_iris: vec![],
             file_targets: vec![],
@@ -544,6 +580,39 @@ mod tests {
         assert!(matches!(
             validate_ingress_frame(&leaky_frame, "mesh-1", 2, &did),
             Err(SovereigntyGateError::ForbiddenRuntimeCounter(ref k)) if k == "remaining_fires"
+        ));
+
+        // Deeply nested procedure runtime counter inside content or metadata is also rejected
+        let mut nested_leaky_rec = leaky_rec;
+        nested_leaky_rec.metadata = serde_json::json!({
+            "eligibility": "shareable",
+            "nested": [{ "inner": { "performance_count": 9 } }]
+        });
+        let mut nested_leaky_frame = frame.clone();
+        nested_leaky_frame.kind = MeshPayloadKind::CognitiveDelta {
+            record: nested_leaky_rec,
+            rdf_patch: String::new(),
+            concept_iris: vec![],
+            file_targets: vec![],
+        };
+        nested_leaky_frame.sign_frame(&pkey).unwrap();
+        assert!(matches!(
+            validate_ingress_frame(&nested_leaky_frame, "mesh-1", 2, &did),
+            Err(SovereigntyGateError::ForbiddenRuntimeCounter(ref k)) if k == "performance_count"
+        ));
+
+        // TaskDelta is rejected on wire/ingress
+        let mut task_frame = frame.clone();
+        task_frame.kind = MeshPayloadKind::TaskDelta {
+            task_id: "t-1".into(),
+            action: TaskMeshAction::Created,
+            task_json: serde_json::json!({"id": "t-1"}),
+            extracted_memory_ids: vec![],
+        };
+        task_frame.sign_frame(&pkey).unwrap();
+        assert!(matches!(
+            validate_ingress_frame(&task_frame, "mesh-1", 2, &did),
+            Err(SovereigntyGateError::ForbiddenMemoryType(ref t)) if t == "task"
         ));
 
         // Forged payload after signing

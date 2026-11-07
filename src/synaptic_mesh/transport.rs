@@ -86,4 +86,7 @@ pub trait MeshTransport: Send + Sync {
 
     /// Snapshot transport counters for `mesh status` (explicit-zero honest).
     fn status(&self) -> TransportStatus;
+
+    /// Register a peer endpoint discovered via handshake (`SyncHello`).
+    fn register_peer_endpoint(&self, _endpoint: &str) {}
 }

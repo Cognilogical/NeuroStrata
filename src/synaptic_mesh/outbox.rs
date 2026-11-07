@@ -599,6 +599,7 @@ mod tests {
                         mesh_id: "m1".into(),
                         epoch: 1,
                         peer_cursors: std::collections::BTreeMap::new(),
+                        endpoint: None,
                     },
                 ),
                 signature: String::new(),

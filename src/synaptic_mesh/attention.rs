@@ -264,12 +264,9 @@ impl AttentionFilter {
         let mut candidate_sessions: Vec<String> = Vec::new();
         if let Some(sid) = explicit_session {
             candidate_sessions.push(sid.to_string());
-        }
-        if let Some(ns) = namespace {
+        } else if let Some(ns) = namespace {
             let synth = format!("ns:{ns}");
-            if !candidate_sessions.contains(&synth) {
-                candidate_sessions.push(synth);
-            }
+            candidate_sessions.push(synth);
             if let Ok(map) = self.sessions.lock() {
                 for (sid, ws) in map.iter() {
                     if ws.namespace == ns && !candidate_sessions.contains(sid) {
@@ -417,5 +414,54 @@ mod tests {
         assert!(filter
             .drain_notices_for_mcp_call(&serde_json::json!({ "namespace": "mesh-mcp-ns" }))
             .is_empty());
+
+        // When two explicit sessions share a namespace, a request with session_id="ses-B"
+        // must NOT drain session_id="ses-A"'s targeted notices.
+        filter.record_mcp_tool_call(
+            "neurostrata_task_claim",
+            &serde_json::json!({
+                "namespace": "shared-ns",
+                "id": "task-A",
+                "session_id": "ses-A"
+            }),
+        );
+        filter.record_mcp_tool_call(
+            "neurostrata_task_claim",
+            &serde_json::json!({
+                "namespace": "shared-ns",
+                "id": "task-B",
+                "session_id": "ses-B"
+            }),
+        );
+        let inbound_a = MeshFrame {
+            namespace: "shared-ns".into(),
+            kind: MeshPayloadKind::TaskLeaseDelta {
+                lease: crate::synaptic_mesh::frame::TaskLease {
+                    task_id: "task-A".into(),
+                    holder_node_id: "did:key:z6Mkp99998f2a".into(),
+                    session_id: "peer-ses".into(),
+                    lamport_ts: 501,
+                    ttl_ms: 60_000,
+                    expires_at_ms: 99_999,
+                },
+            },
+            ..inbound
+        };
+        assert_eq!(filter.evaluate_inbound_frame(&inbound_a).len(), 1);
+        assert!(
+            filter
+                .drain_notices_for_mcp_call(&serde_json::json!({
+                    "namespace": "shared-ns",
+                    "session_id": "ses-B"
+                }))
+                .is_empty(),
+            "session B must not steal session A's notice"
+        );
+        let drained_a = filter.drain_notices_for_mcp_call(&serde_json::json!({
+            "namespace": "shared-ns",
+            "session_id": "ses-A"
+        }));
+        assert_eq!(drained_a.len(), 1);
+        assert!(drained_a[0].contains("task-A"));
     }
 }

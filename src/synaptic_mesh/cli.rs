@@ -8,6 +8,7 @@
 
 use super::storage_api::StorageApi;
 use clap::Subcommand;
+use std::path::{Path, PathBuf};
 
 /// `neurostrata-mcp synaptic-mesh <cmd>` (alias: `mesh`).
 #[derive(Subcommand, Debug, Clone, PartialEq)]
@@ -149,8 +150,11 @@ pub fn handle_synaptic_mesh_command(
         // state, and hands back the manual fix.
         SynapticMeshCommands::Recover => super::mesh_service::recover_report(&ctx.project_root),
         SynapticMeshCommands::Up { name, bind } => {
+            if let Err(e) = std::fs::create_dir_all(&ctx.base_root) {
+                return format!("error: failed to create base root: {e}");
+            }
             let key_path = ctx.base_root.join("node_ed25519.pem");
-            let (privkey, _did, _) = match crate::did::load_or_generate_keypair(&key_path) {
+            let (privkey, did, _) = match crate::did::load_or_generate_keypair(&key_path) {
                 Ok(k) => k,
                 Err(e) => return format!("error: failed to load or generate node keypair: {e}"),
             };
@@ -160,14 +164,42 @@ pub fn handle_synaptic_mesh_command(
                 Err(e) => return format!("error: {e}"),
             };
             let mut psk = [0u8; 32];
-            if openssl::rand::rand_bytes(&mut psk).is_err() {
-                psk = [0x42u8; 32];
+            if let Err(e) = openssl::rand::rand_bytes(&mut psk) {
+                return format!("error: CSPRNG failure generating mesh PSK: {e}");
             }
+            let outbox = match super::outbox::Outbox::open(&ctx.base_root.join("neuromesh.outbox"))
+            {
+                Ok(o) => std::sync::Arc::new(o),
+                Err(e) => return format!("error: failed to open neuromesh outbox: {e}"),
+            };
+            let bind_str = bind.clone();
+            let mesh_id_cl = mesh_id.clone();
+            let did_cl = did.clone();
+            let privkey_cl = privkey.clone();
+            let conflicts_dir = ctx.base_root.join("neuromesh.conflicts");
+            let node_res = run_on_mesh_runtime(async move {
+                start_active_mesh_node(
+                    &bind_str,
+                    mesh_id_cl,
+                    1,
+                    psk,
+                    did_cl,
+                    privkey_cl,
+                    outbox,
+                    conflicts_dir,
+                )
+                .await
+            });
+            let active_node = match node_res {
+                Ok(n) => n,
+                Err(e) => return format!("error: failed to start neuromesh transport: {e}"),
+            };
+            let bound_endpoint = active_node.bind_addr.to_string();
             let token = match super::frame::InviteToken::issue(
                 &mesh_id,
                 1,
                 &psk,
-                vec![bind.clone()],
+                vec![bound_endpoint.clone()],
                 &privkey,
             )
             .and_then(|t| t.encode())
@@ -175,24 +207,210 @@ pub fn handle_synaptic_mesh_command(
                 Ok(t) => t,
                 Err(e) => return format!("error: failed to issue invite token: {e}"),
             };
-            format!("neuromesh up: {mesh_id} | bind: {bind} | token: {token}")
+            if let Ok(mut map) = active_mesh_nodes().lock() {
+                map.insert(ctx.base_root.clone(), active_node);
+            }
+            format!("neuromesh up: {mesh_id} | bind: {bound_endpoint} | token: {token}")
         }
         SynapticMeshCommands::JoinToken { token } => {
-            match super::frame::InviteToken::decode_and_verify(token) {
-                Ok(inv) => format!(
-                    "joined neuromesh: {} (issuer: {}, seeds: {})",
-                    inv.mesh_id,
-                    inv.issuer_did,
-                    inv.seed_endpoints.len()
-                ),
-                Err(e) => format!("error: invalid invite token: {e}"),
+            let inv = match super::frame::InviteToken::decode_and_verify(token) {
+                Ok(inv) => inv,
+                Err(e) => return format!("error: invalid invite token: {e}"),
+            };
+            let psk = match inv.psk_bytes() {
+                Ok(b) => b,
+                Err(e) => return format!("error: invalid invite token PSK: {e}"),
+            };
+            if inv.seed_endpoints.is_empty() {
+                return "error: invite token contains no seed endpoints".to_string();
+            }
+            if let Err(e) = std::fs::create_dir_all(&ctx.base_root) {
+                return format!("error: failed to create base root: {e}");
+            }
+            let key_path = ctx.base_root.join("node_ed25519.pem");
+            let (privkey, did, _) = match crate::did::load_or_generate_keypair(&key_path) {
+                Ok(k) => k,
+                Err(e) => return format!("error: failed to load or generate node keypair: {e}"),
+            };
+            let outbox = match super::outbox::Outbox::open(&ctx.base_root.join("neuromesh.outbox"))
+            {
+                Ok(o) => std::sync::Arc::new(o),
+                Err(e) => return format!("error: failed to open neuromesh outbox: {e}"),
+            };
+            let mesh_id = inv.mesh_id.clone();
+            let epoch = inv.epoch;
+            let seeds = inv.seed_endpoints.clone();
+            let conflicts_dir = ctx.base_root.join("neuromesh.conflicts");
+            let join_res = run_on_mesh_runtime(async move {
+                let node = start_active_mesh_node(
+                    "127.0.0.1:0",
+                    mesh_id.clone(),
+                    epoch,
+                    psk,
+                    did.clone(),
+                    privkey,
+                    outbox.clone(),
+                    conflicts_dir,
+                )
+                .await?;
+                let mut connected = 0usize;
+                let mut last_err = String::new();
+                for seed in &seeds {
+                    match node.transport.connect_peer(seed).await {
+                        Ok(()) => connected += 1,
+                        Err(e) => last_err = e.to_string(),
+                    }
+                }
+                if connected == 0 {
+                    return Err(format!(
+                        "failed to connect to any seed endpoint ({last_err})"
+                    ));
+                }
+                let cursors = outbox.all_peer_cursors().unwrap_or_default();
+                let hello = super::frame::SyncHello {
+                    node_id: did,
+                    mesh_id,
+                    epoch,
+                    peer_cursors: cursors,
+                    endpoint: Some(node.bind_addr.to_string()),
+                };
+                node.reactor
+                    .publish_payload(
+                        "default",
+                        vec![],
+                        super::frame::MeshPayloadKind::SyncHello(hello),
+                    )
+                    .await
+                    .map_err(|e| format!("failed to publish SyncHello handshake: {e}"))?;
+                Ok(node)
+            });
+            match join_res {
+                Ok(active_node) => {
+                    let bind_addr = active_node.bind_addr;
+                    if let Ok(mut map) = active_mesh_nodes().lock() {
+                        map.insert(ctx.base_root.clone(), active_node);
+                    }
+                    format!(
+                        "joined neuromesh: {} (issuer: {}, seeds: {}, bind: {})",
+                        inv.mesh_id,
+                        inv.issuer_did,
+                        inv.seed_endpoints.len(),
+                        bind_addr
+                    )
+                }
+                Err(e) => format!("error: {e}"),
             }
         }
         SynapticMeshCommands::Peers => {
-            let status = super::transport::TransportStatus::default();
+            let status = get_active_mesh_node(&ctx.base_root)
+                .map(|n| n.reactor.transport_status())
+                .unwrap_or_default();
             status.format_status_line(&ctx.node_id)
         }
     }
+}
+
+/// Retained live NeuroMesh P2P transport + reactor runtime for a `base_root`.
+pub struct ActiveMeshNode {
+    pub mesh_id: String,
+    pub epoch: u64,
+    pub node_did: String,
+    pub bind_addr: std::net::SocketAddr,
+    pub transport: std::sync::Arc<super::p2p::P2pMeshTransport>,
+    pub reactor: std::sync::Arc<super::reactor::MeshReactor>,
+    pub outbox: std::sync::Arc<super::outbox::Outbox>,
+}
+
+fn mesh_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("neuromesh-rt")
+            .build()
+            .expect("failed to build neuromesh background runtime")
+    })
+}
+
+fn active_mesh_nodes(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, std::sync::Arc<ActiveMeshNode>>>
+{
+    static NODES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<PathBuf, std::sync::Arc<ActiveMeshNode>>>,
+    > = std::sync::OnceLock::new();
+    NODES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Look up the retained live [`ActiveMeshNode`] for `base_root`, if started via `Up` or `JoinToken`.
+pub fn get_active_mesh_node(base_root: &Path) -> Option<std::sync::Arc<ActiveMeshNode>> {
+    active_mesh_nodes()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(base_root).cloned())
+}
+
+fn run_on_mesh_runtime<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    mesh_runtime().spawn(async move {
+        let out = fut.await;
+        let _ = tx.send(out);
+    });
+    rx.recv().expect("neuromesh runtime task failed")
+}
+
+async fn start_active_mesh_node(
+    bind: &str,
+    mesh_id: String,
+    epoch: u64,
+    psk: [u8; 32],
+    did: String,
+    privkey: openssl::pkey::PKey<openssl::pkey::Private>,
+    outbox: std::sync::Arc<super::outbox::Outbox>,
+    conflicts_dir: PathBuf,
+) -> Result<std::sync::Arc<ActiveMeshNode>, String> {
+    use super::transport::MeshTransport;
+    let transport = super::p2p::P2pMeshTransport::bind(
+        bind,
+        mesh_id.clone(),
+        epoch,
+        psk,
+        outbox.clone(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let bind_addr = transport.local_addr();
+    let mut rx = transport.subscribe().await.map_err(|e| e.to_string())?;
+    let reactor = std::sync::Arc::new(super::reactor::MeshReactor::new(
+        mesh_id.clone(),
+        epoch,
+        did.clone(),
+        privkey,
+        outbox.clone(),
+        transport.clone(),
+        super::attention::global_attention_filter(),
+        conflicts_dir,
+    ));
+    let reactor_loop = reactor.clone();
+    tokio::spawn(async move {
+        while let Ok(frame) = rx.recv().await {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let _ = reactor_loop.apply_inbound_frame(frame, now_ms).await;
+        }
+    });
+    Ok(std::sync::Arc::new(ActiveMeshNode {
+        mesh_id,
+        epoch,
+        node_did: did,
+        bind_addr,
+        transport,
+        reactor,
+        outbox,
+    }))
 }
 
 /// Map a storage outcome to a one-line reply. An `Err` beginning with the
@@ -642,23 +860,35 @@ mod tests {
     #[test]
     fn mesh_up_and_join_token_roundtrip_and_explicit_zero_status() {
         let tmp = tempfile::tempdir().unwrap();
-        let ctx = MeshContext {
-            project_root: tmp.path().join("proj"),
-            base_root: tmp.path().join("base"),
-            node_id: "node-1".into(),
+        let ctx_a = MeshContext {
+            project_root: tmp.path().join("proj-a"),
+            base_root: tmp.path().join("base-a"),
+            node_id: "node-a".into(),
         };
-        std::fs::create_dir_all(&ctx.project_root).unwrap();
+        let ctx_b = MeshContext {
+            project_root: tmp.path().join("proj-b"),
+            base_root: tmp.path().join("base-b"),
+            node_id: "node-b".into(),
+        };
+        std::fs::create_dir_all(&ctx_a.project_root).unwrap();
+        std::fs::create_dir_all(&ctx_b.project_root).unwrap();
         let mut fake = MockMesh {
             mesh_id: "swarm-1".into(),
             ..Default::default()
         };
 
+        // Explicit-zero status before any transport is started
+        let initial_peers =
+            handle_synaptic_mesh_command(&SynapticMeshCommands::Peers, &ctx_b, &mut fake);
+        assert!(initial_peers.contains("peers_connected: 0"));
+
+        // Node A brings up mesh on an ephemeral local port
         let up_out = handle_synaptic_mesh_command(
             &SynapticMeshCommands::Up {
                 name: "swarm".into(),
-                bind: "127.0.0.1:34345".into(),
+                bind: "127.0.0.1:0".into(),
             },
-            &ctx,
+            &ctx_a,
             &mut fake,
         );
         assert!(
@@ -672,15 +902,89 @@ mod tests {
             .unwrap()
             .to_string();
 
+        // Node B joins using Node A's invite token and connects to Node A's live listener
         let join_out = handle_synaptic_mesh_command(
             &SynapticMeshCommands::JoinToken { token },
-            &ctx,
+            &ctx_b,
             &mut fake,
         );
-        assert!(join_out.contains("joined neuromesh"));
+        assert!(join_out.contains("joined neuromesh"), "got: {join_out}");
 
-        let peers_out =
-            handle_synaptic_mesh_command(&SynapticMeshCommands::Peers, &ctx, &mut fake);
-        assert!(peers_out.contains("peers_connected: 0"));
+        let peers_b = handle_synaptic_mesh_command(&SynapticMeshCommands::Peers, &ctx_b, &mut fake);
+        assert!(
+            peers_b.contains("peers_connected: 1"),
+            "Node B must report 1 connected peer: {peers_b}"
+        );
+
+        // Node A and Node B retained runtimes exchange frames end-to-end
+        let node_a = get_active_mesh_node(&ctx_a.base_root).expect("Node A retained");
+        let node_b = get_active_mesh_node(&ctx_b.base_root).expect("Node B retained");
+        assert_eq!(node_a.mesh_id, "swarm-1");
+        assert_eq!(node_a.epoch, 1);
+        assert!(node_a.node_did.starts_with("did:key:"));
+        assert!(node_b.outbox.max_seq_for(&node_b.node_did).unwrap() >= 1);
+        run_on_mesh_runtime(async move {
+            for _ in 0..20 {
+                if node_a.reactor.transport_status().peers_connected >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(node_a.reactor.transport_status().peers_connected, 1);
+
+            node_a
+                .reactor
+                .publish_payload(
+                    "default",
+                    vec![],
+                    crate::synaptic_mesh::frame::MeshPayloadKind::TwinDelta {
+                        twin_id: "cli-twin-1".into(),
+                        version: 1,
+                        source: "cli-test".into(),
+                        rdf_patch: String::new(),
+                        changed_variables: std::collections::BTreeMap::from([(
+                            "temp".into(),
+                            42.5,
+                        )]),
+                    },
+                )
+                .await
+                .unwrap();
+
+            for _ in 0..30 {
+                if node_b.reactor.get_twin_state("cli-twin-1").is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let (ver, vars) = node_b
+                .reactor
+                .get_twin_state("cli-twin-1")
+                .expect("Node B received TwinDelta from Node A");
+            assert_eq!(ver, 1);
+            assert_eq!(vars.get("temp"), Some(&42.5));
+        });
+
+        // Joining with a token pointing at an unreachable seed fails instead of reporting joined
+        let (pkey, _, _) = crate::did::generate_keypair().unwrap();
+        let dead_token = crate::synaptic_mesh::frame::InviteToken::issue(
+            "dead-mesh",
+            1,
+            &[0x11u8; 32],
+            vec!["127.0.0.1:1".into()],
+            &pkey,
+        )
+        .unwrap()
+        .encode()
+        .unwrap();
+        let dead_join = handle_synaptic_mesh_command(
+            &SynapticMeshCommands::JoinToken { token: dead_token },
+            &ctx_b,
+            &mut fake,
+        );
+        assert!(
+            dead_join.starts_with("error:"),
+            "unreachable seed must fail join: {dead_join}"
+        );
     }
 }

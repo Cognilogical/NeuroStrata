@@ -167,20 +167,10 @@ impl MeshReactor {
                     }
                 }
             }
-            MeshPayloadKind::TaskDelta { task_json, .. } => {
-                if let Some(elig) = task_json
-                    .get("metadata")
-                    .and_then(|m| m.get("eligibility"))
-                    .and_then(|v| v.as_str())
-                {
-                    if elig != "shareable" {
-                        return Err(ReactorApplyError::Sovereignty(
-                            SovereigntyGateError::NotShareable(format!(
-                                "task eligibility is '{elig}', required 'shareable'"
-                            )),
-                        ));
-                    }
-                }
+            MeshPayloadKind::TaskDelta { .. } => {
+                return Err(ReactorApplyError::Sovereignty(
+                    SovereigntyGateError::ForbiddenMemoryType("task".to_string()),
+                ));
             }
             MeshPayloadKind::TaskLeaseDelta { .. } | MeshPayloadKind::SyncHello(_) => {}
         }
@@ -258,9 +248,8 @@ impl MeshReactor {
 
         let origin = frame.origin_node_id.clone();
         let seq = frame.seq;
-        let primary_res = self.apply_single_verified_frame(frame, now_ms).await;
+        let outcome = self.apply_single_verified_frame(frame, now_ms).await?;
         self.advance_contiguous_seq(&origin, seq)?;
-        let outcome = primary_res?;
 
         // Drain any buffered contiguous follow-up frames for this origin
         loop {
@@ -282,8 +271,22 @@ impl MeshReactor {
                 break;
             };
             let b_seq = buffered.seq;
-            let _ = self.apply_single_verified_frame(buffered, now_ms).await;
-            self.advance_contiguous_seq(&origin, b_seq)?;
+            match self
+                .apply_single_verified_frame(buffered.clone(), now_ms)
+                .await
+            {
+                Ok(_) => {
+                    self.advance_contiguous_seq(&origin, b_seq)?;
+                }
+                Err(_) => {
+                    if let Ok(mut buf) = self.reorder_buffer.lock() {
+                        buf.entry(origin.clone())
+                            .or_default()
+                            .insert(b_seq, buffered);
+                    }
+                    break;
+                }
+            }
         }
 
         Ok(outcome)
@@ -414,7 +417,17 @@ impl MeshReactor {
                 }
                 ReactorApplyOutcome::Applied
             }
-            MeshPayloadKind::SyncHello(_) => ReactorApplyOutcome::Applied,
+            MeshPayloadKind::SyncHello(hello) => {
+                if let Some(ep) = &hello.endpoint {
+                    self.transport.register_peer_endpoint(ep);
+                }
+                if let Ok(catchup) = self.handle_sync_hello(hello) {
+                    for missing_frame in catchup {
+                        let _ = self.transport.publish(&missing_frame).await;
+                    }
+                }
+                ReactorApplyOutcome::Applied
+            }
         };
 
         self.commit_accepted_frame(&frame, key)?;
@@ -630,26 +643,8 @@ mod tests {
             public_key: None,
             patch: None,
         };
-        let frame_priv = reactor_a
-            .publish_payload(
-                "ns",
-                vec![],
-                MeshPayloadKind::CognitiveDelta {
-                    record: rec.clone(),
-                    rdf_patch: String::new(),
-                    concept_iris: vec![],
-                    file_targets: vec![],
-                },
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            reactor_b.apply_inbound_frame(frame_priv, 1000).await,
-            Err(ReactorApplyError::PrivateCollision(_))
-        ));
-
-        // 2. Remote TaskDelta Completed without Lock-2 extracted memory -> rejected
-        let frame_bad_done = reactor_a
+        // 1. Egress TaskDelta is rejected per repository sovereignty boundary
+        let task_egress = reactor_a
             .publish_payload(
                 "ns",
                 vec![],
@@ -660,14 +655,16 @@ mod tests {
                     extracted_memory_ids: vec![],
                 },
             )
-            .await
-            .unwrap();
+            .await;
         assert!(matches!(
-            reactor_b.apply_inbound_frame(frame_bad_done, 1000).await,
-            Err(ReactorApplyError::Lock2Violation(_))
+            task_egress,
+            Err(ReactorApplyError::Sovereignty(
+                SovereigntyGateError::ForbiddenMemoryType(ref t)
+            )) if t == "task"
         ));
+        assert!(reactor_b.get_task_state("t-1").is_none());
 
-        // 3. Concurrent TwinDelta updates merge per-variable by (lamport_ts, origin_node_id)
+        // 2. Concurrent TwinDelta updates merge per-variable by (lamport_ts, origin_node_id)
         let f_twin_a = reactor_a
             .publish_payload(
                 "ns",
@@ -713,10 +710,11 @@ mod tests {
         let (_, merged) = reactor_b.get_twin_state("reactor-1").unwrap();
         assert_eq!(merged.get("temp"), Some(&100.0));
         assert_eq!(merged.get("flow"), Some(&12.0));
-        // f_twin_a had higher lamport_ts (3 vs 1), so pressure = 2.0 wins deterministically
-        assert_eq!(merged.get("pressure"), Some(&2.0));
+        // On equal lamport_ts (1 vs 1), deterministic DID tie-breaker selects the winner
+        let expected_pressure = if did_a > did_b { 2.0 } else { 5.5 };
+        assert_eq!(merged.get("pressure"), Some(&expected_pressure));
 
-        // 4. Concurrent shareable rule divergence preserves both variants in conflict overlay
+        // 3. Concurrent shareable rule divergence preserves both variants in conflict overlay
         let shared_id = Uuid::new_v4();
         let mut rec_v1 = rec.clone();
         rec_v1.id = shared_id;
@@ -763,33 +761,59 @@ mod tests {
             }
         );
 
-        // 5. Valid TaskDelta with Lock-2 memory applies and SyncHello replays missing frames
-        let frame_ok_done = reactor_a
+        // 4. Rejected PrivateCollision frame at seq=4 does NOT advance contiguous cursor past 3
+        let frame_priv = reactor_a
             .publish_payload(
                 "ns",
                 vec![],
-                MeshPayloadKind::TaskDelta {
-                    task_id: "t-2".into(),
-                    action: TaskMeshAction::Completed,
-                    task_json: serde_json::json!({ "id": "t-2", "status": "done" }),
-                    extracted_memory_ids: vec!["mem-1".into()],
+                MeshPayloadKind::CognitiveDelta {
+                    record: rec.clone(),
+                    rdf_patch: String::new(),
+                    concept_iris: vec![],
+                    file_targets: vec![],
                 },
             )
             .await
             .unwrap();
+        assert_eq!(frame_priv.seq, 4);
+        assert!(matches!(
+            reactor_b.apply_inbound_frame(frame_priv, 1000).await,
+            Err(ReactorApplyError::PrivateCollision(_))
+        ));
+
+        // Frame at seq=5 is held as BufferedOutOfOrder because seq=4 did not advance cursor
+        let frame_seq5 = reactor_a
+            .publish_payload(
+                "ns",
+                vec![],
+                MeshPayloadKind::TwinDelta {
+                    twin_id: "reactor-2".into(),
+                    version: 1,
+                    source: "sensor".into(),
+                    rdf_patch: String::new(),
+                    changed_variables: BTreeMap::from([("rpm".into(), 1200.0)]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(frame_seq5.seq, 5);
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_ok_done, 1000).await.unwrap(),
-            ReactorApplyOutcome::Applied
+            reactor_b
+                .apply_inbound_frame(frame_seq5, 1000)
+                .await
+                .unwrap(),
+            ReactorApplyOutcome::BufferedOutOfOrder {
+                expected_seq: 4,
+                got_seq: 5
+            }
         );
-        assert_eq!(
-            reactor_b.get_task_state("t-2").unwrap()["status"],
-            "done"
-        );
+
         let hello = SyncHello {
             node_id: did_b,
             mesh_id: "m1".into(),
             epoch: 1,
-            peer_cursors: BTreeMap::from([(did_a, 4)]),
+            peer_cursors: BTreeMap::from([(did_a, 3)]),
+            endpoint: None,
         };
         let catchup = reactor_a.handle_sync_hello(&hello).unwrap();
         assert_eq!(catchup.len(), 2);
@@ -856,7 +880,7 @@ mod tests {
             ))
         ));
 
-        // 2. Egress TaskDelta with private eligibility is rejected before sequencing
+        // 2. Egress TaskDelta is rejected before sequencing
         let priv_task_res = reactor_a
             .publish_payload(
                 "ns",
@@ -876,8 +900,8 @@ mod tests {
         assert!(matches!(
             priv_task_res,
             Err(ReactorApplyError::Sovereignty(
-                SovereigntyGateError::NotShareable(_)
-            ))
+                SovereigntyGateError::ForbiddenMemoryType(ref t)
+            )) if t == "task"
         ));
 
         // 3. Out-of-order gap buffering: seq 1 and seq 2 published by A; B receives seq 2 first
@@ -885,15 +909,12 @@ mod tests {
             .publish_payload(
                 "ns",
                 vec![],
-                MeshPayloadKind::TaskDelta {
-                    task_id: "t-gap".into(),
-                    action: TaskMeshAction::Created,
-                    task_json: serde_json::json!({
-                        "id": "t-gap",
-                        "status": "open",
-                        "notes": ["note-a"]
-                    }),
-                    extracted_memory_ids: vec![],
+                MeshPayloadKind::TwinDelta {
+                    twin_id: "t-gap".into(),
+                    version: 1,
+                    source: "sensor".into(),
+                    rdf_patch: String::new(),
+                    changed_variables: BTreeMap::from([("v1".into(), 10.0)]),
                 },
             )
             .await
@@ -902,15 +923,12 @@ mod tests {
             .publish_payload(
                 "ns",
                 vec![],
-                MeshPayloadKind::TaskDelta {
-                    task_id: "t-gap".into(),
-                    action: TaskMeshAction::Updated,
-                    task_json: serde_json::json!({
-                        "id": "t-gap",
-                        "status": "in_progress",
-                        "notes": ["note-b"]
-                    }),
-                    extracted_memory_ids: vec![],
+                MeshPayloadKind::TwinDelta {
+                    twin_id: "t-gap".into(),
+                    version: 2,
+                    source: "sensor".into(),
+                    rdf_patch: String::new(),
+                    changed_variables: BTreeMap::from([("v2".into(), 20.0)]),
                 },
             )
             .await
@@ -923,15 +941,15 @@ mod tests {
                 got_seq: 2
             }
         );
-        // Applying f1 applies f1 AND drains buffered f2, unioning notes
+        // Applying f1 applies f1 AND drains buffered f2
         assert_eq!(
             reactor_b.apply_inbound_frame(f1.clone(), 1000).await.unwrap(),
             ReactorApplyOutcome::Applied
         );
-        let merged_task = reactor_b.get_task_state("t-gap").unwrap();
-        assert_eq!(merged_task["status"], "in_progress");
-        let notes = merged_task["notes"].as_array().unwrap();
-        assert_eq!(notes.len(), 2);
+        let (ver, vars) = reactor_b.get_twin_state("t-gap").unwrap();
+        assert_eq!(ver, 2);
+        assert_eq!(vars.get("v1"), Some(&10.0));
+        assert_eq!(vars.get("v2"), Some(&20.0));
 
         // 4. Restarted reactor seeds seen_frames from outbox and deduplicates f1
         let reactor_b_restarted = MeshReactor::new(
@@ -959,6 +977,7 @@ mod tests {
                 mesh_id: "wrong-mesh".into(),
                 epoch: 1,
                 peer_cursors: BTreeMap::new(),
+                endpoint: None,
             })
             .is_err());
     }

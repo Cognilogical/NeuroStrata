@@ -13802,11 +13802,15 @@ async fn process_mcp_request_injects_and_drains_neuromesh_delta_notices() {
         timestamp_ms: 1000,
         namespace: ns.clone(),
         visible_to: vec![],
-        kind: crate::synaptic_mesh::frame::MeshPayloadKind::TaskDelta {
-            task_id: "task-mesh-1".into(),
-            action: crate::synaptic_mesh::frame::TaskMeshAction::Completed,
-            task_json: serde_json::json!({"id": "task-mesh-1", "status": "done"}),
-            extracted_memory_ids: vec!["mem-1".into()],
+        kind: crate::synaptic_mesh::frame::MeshPayloadKind::TaskLeaseDelta {
+            lease: crate::synaptic_mesh::frame::TaskLease {
+                task_id: "task-mesh-1".into(),
+                holder_node_id: "did:key:z6MkpPeerNode9999".into(),
+                session_id: "peer-ses".into(),
+                lamport_ts: 777,
+                ttl_ms: 60_000,
+                expires_at_ms: 99_999,
+            },
         },
         signature: "sig".into(),
     };
