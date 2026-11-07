@@ -9,6 +9,7 @@
 //! enforcement, so a peer's tombstones and shared records arrive without
 //! clobbering local history.
 
+pub mod attention;
 pub mod cli;
 pub mod conflict;
 pub mod federation;
