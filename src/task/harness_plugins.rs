@@ -177,6 +177,7 @@ pub fn detect_harnesses(
     }
 
     if project_root.join(".opencode").exists()
+        || project_root.join(".NeuroStrata/plugins/opencode").exists()
         || project_root.join("opencode.json").exists()
         || home.as_ref().map(|h| h.join(".config/opencode").exists() || h.join(".local/share/opencode").exists()).unwrap_or(false)
     {

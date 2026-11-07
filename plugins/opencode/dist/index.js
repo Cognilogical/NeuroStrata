@@ -501,6 +501,7 @@ export async function postTurnCandidates(candidates, namespace) {
                 title: cand.title,
                 description: cand.description,
                 auto_commit: cand.auto_commit,
+                task_id: cand.provenance?.parent_task_id ?? activeTaskId,
                 provenance: cand.provenance,
             });
         }
@@ -590,6 +591,9 @@ export const READ_FILE_TOOLS = new Set([
     "read_file",
     "grep",
     "Grep",
+    "glob",
+    "Glob",
+    "mcp_glob",
     "view",
     "cat",
 ]);
@@ -1540,6 +1544,23 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
     "neurostrata_guard_validate",
     "neurostrata_memories_for_file",
 ]);
+/**
+ * Read the active task_id from `.NeuroStrata/active_session.json` so the
+ * plugin can forward it as parent_task_id on candidate submission, reaching
+ * the server-side auto-commit gate (task_id.is_some()) from the live hook.
+ */
+function readActiveTaskId(projectRoot) {
+    const sessionPath = join(projectRoot, ".NeuroStrata", "active_session.json");
+    if (!existsSync(sessionPath))
+        return null;
+    try {
+        const active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+        return asString(active?.task_id ?? active?.active_task_id) || null;
+    }
+    catch {
+        return null;
+    }
+}
 const executeAfterHandler = async (output, secondArg) => {
     // The host may pass (input, output) or a single `output`/`event` argument
     // whose `.output` holds the real output. Resolve metadata and target object.
@@ -1668,11 +1689,13 @@ const executeAfterHandler = async (output, secondArg) => {
     // Wave 4: extract task-intent obligations from the tool output text and
     // post them fail-soft to the intake ledger (never blocks the tool output).
     if (config.intentDetection.enabled && rawText) {
+        const activeTaskId = readActiveTaskId(effectiveProjectRoot(config));
         const candidates = extractTurnCandidates({
             role: "assistant",
             content: rawText,
             turn_id: sessionId ?? undefined,
             source_tool: toolName || undefined,
+            parent_task_id: activeTaskId ?? undefined,
         });
         if (candidates.length > 0) {
             await postTurnCandidates(candidates, config.namespace);
