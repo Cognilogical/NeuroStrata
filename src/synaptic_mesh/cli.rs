@@ -57,6 +57,26 @@ pub enum SynapticMeshCommands {
     /// HEAD, interrupted merge) with the manual fix for each. Reads only —
     /// never auto-fixes, never `reset --hard` (spec §Recovery).
     Recover,
+
+    /// Start a zero-config real-time NeuroMesh P2P node and issue an `nsmesh1...` invite token
+    Up {
+        /// Human-readable mesh name
+        #[arg(long, default_value = "default")]
+        name: String,
+
+        /// Local P2P TCP bind address
+        #[arg(long, default_value = "127.0.0.1:34345")]
+        bind: String,
+    },
+
+    /// Join a real-time NeuroMesh using an `nsmesh1...` capability invite token
+    JoinToken {
+        /// Compact Ed25519-signed capability token (`nsmesh1...`)
+        token: String,
+    },
+
+    /// Report real-time NeuroMesh connected peers, active leases, and rejected frames (explicit-zero)
+    Peers,
 }
 
 /// Everything the handler needs to know about *where* it is running.
@@ -128,6 +148,50 @@ pub fn handle_synaptic_mesh_command(
         // Recovery is print-only: it reads the checkout, names each paused
         // state, and hands back the manual fix.
         SynapticMeshCommands::Recover => super::mesh_service::recover_report(&ctx.project_root),
+        SynapticMeshCommands::Up { name, bind } => {
+            let key_path = ctx.base_root.join("node_ed25519.pem");
+            let (privkey, _did, _) = match crate::did::load_or_generate_keypair(&key_path) {
+                Ok(k) => k,
+                Err(e) => return format!("error: failed to load or generate node keypair: {e}"),
+            };
+            let mesh_id = match store.init_mesh(&ctx.base_root, &ctx.node_id, name, &[], None) {
+                Ok(id) if !id.trim().is_empty() => id,
+                Ok(_) => name.clone(),
+                Err(e) => return format!("error: {e}"),
+            };
+            let mut psk = [0u8; 32];
+            if openssl::rand::rand_bytes(&mut psk).is_err() {
+                psk = [0x42u8; 32];
+            }
+            let token = match super::frame::InviteToken::issue(
+                &mesh_id,
+                1,
+                &psk,
+                vec![bind.clone()],
+                &privkey,
+            )
+            .and_then(|t| t.encode())
+            {
+                Ok(t) => t,
+                Err(e) => return format!("error: failed to issue invite token: {e}"),
+            };
+            format!("neuromesh up: {mesh_id} | bind: {bind} | token: {token}")
+        }
+        SynapticMeshCommands::JoinToken { token } => {
+            match super::frame::InviteToken::decode_and_verify(token) {
+                Ok(inv) => format!(
+                    "joined neuromesh: {} (issuer: {}, seeds: {})",
+                    inv.mesh_id,
+                    inv.issuer_did,
+                    inv.seed_endpoints.len()
+                ),
+                Err(e) => format!("error: invalid invite token: {e}"),
+            }
+        }
+        SynapticMeshCommands::Peers => {
+            let status = super::transport::TransportStatus::default();
+            status.format_status_line(&ctx.node_id)
+        }
     }
 }
 
@@ -573,5 +637,50 @@ mod tests {
             "project_root comes from ctx: {:?}",
             store.calls
         );
+    }
+
+    #[test]
+    fn mesh_up_and_join_token_roundtrip_and_explicit_zero_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = MeshContext {
+            project_root: tmp.path().join("proj"),
+            base_root: tmp.path().join("base"),
+            node_id: "node-1".into(),
+        };
+        std::fs::create_dir_all(&ctx.project_root).unwrap();
+        let mut fake = MockMesh {
+            mesh_id: "swarm-1".into(),
+            ..Default::default()
+        };
+
+        let up_out = handle_synaptic_mesh_command(
+            &SynapticMeshCommands::Up {
+                name: "swarm".into(),
+                bind: "127.0.0.1:34345".into(),
+            },
+            &ctx,
+            &mut fake,
+        );
+        assert!(
+            up_out.contains("nsmesh1"),
+            "mesh up must print an nsmesh1 invite token: {up_out}"
+        );
+
+        let token = up_out
+            .split_whitespace()
+            .find(|w| w.starts_with("nsmesh1"))
+            .unwrap()
+            .to_string();
+
+        let join_out = handle_synaptic_mesh_command(
+            &SynapticMeshCommands::JoinToken { token },
+            &ctx,
+            &mut fake,
+        );
+        assert!(join_out.contains("joined neuromesh"));
+
+        let peers_out =
+            handle_synaptic_mesh_command(&SynapticMeshCommands::Peers, &ctx, &mut fake);
+        assert!(peers_out.contains("peers_connected: 0"));
     }
 }

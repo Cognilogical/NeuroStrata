@@ -137,6 +137,7 @@ cxx-build = "=1.0.138"
 
 [features]
 default = []
+nats-mesh = []
 
 
 [[test]]

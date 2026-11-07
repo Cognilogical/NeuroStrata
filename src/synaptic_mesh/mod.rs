@@ -17,6 +17,8 @@ pub mod frame;
 pub mod import;
 pub mod manifest;
 pub mod mesh_service;
+#[cfg(feature = "nats-mesh")]
+pub mod nats;
 pub mod outbox;
 pub mod p2p;
 pub mod reactor;
