@@ -1295,6 +1295,137 @@ mod tests {
         );
     }
 
+    /// T19: the auto-spawned daemon's stderr goes to daemon.log via the
+    /// `daemon_stderr()` seam, while stdin/stdout stay null (Spec §5.2's
+    /// contract -- the fix plus both non-defects, in one pin). The pin is
+    /// structural, in the file's `include_str!("main.rs")` idiom: the
+    /// spawn region runs from `let exe = std::env::current_exe()` through
+    /// `.spawn()?`.
+    #[test]
+    fn daemon_spawn_stdio_contract_is_pinned() {
+        let source = include_str!("main.rs");
+        // The leading newline + spawn indentation keeps this search from
+        // matching this test's own literals.
+        let spawn_start = source
+            .find("\n            let exe = std::env::current_exe()")
+            .expect("the auto-spawn block exists");
+        let spawn_end = source[spawn_start..]
+            .find(".spawn()?")
+            .map(|offset| spawn_start + offset + ".spawn()?".len())
+            .expect("the auto-spawn block ends in .spawn()?");
+        let spawn = &source[spawn_start..spawn_end];
+        assert!(
+            spawn.contains("daemon_stderr()"),
+            "the spawn must route stderr through daemon_stderr():\n{spawn}"
+        );
+        assert!(
+            spawn.contains(".stdin(std::process::Stdio::null())"),
+            "the spawn's stdin must stay null:\n{spawn}"
+        );
+        assert!(
+            spawn.contains(".stdout(std::process::Stdio::null())"),
+            "the spawn's stdout must stay null:\n{spawn}"
+        );
+        assert!(
+            !spawn.contains(".stderr(std::process::Stdio::null())"),
+            "the spawn's stderr must not be discarded to null:\n{spawn}"
+        );
+    }
+
+    /// Std-only tempdir for the seam tests (Cargo.toml carries no
+    /// dev-dependencies): a pid/test-name-unique subdir of the system
+    /// temp dir, removed by the caller afterwards.
+    fn daemon_seam_tempdir(test_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neurostrata-daemon-seam-{}-{}",
+            std::process::id(),
+            test_name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the seam test tempdir can be created");
+        dir
+    }
+
+    /// T19, Gate 0 Home β: the elected log home is the watchdog's
+    /// data-home file -- the home resolves to
+    /// `<home>/.local/share/neurostrata/daemon.log`, asserted
+    /// component by component. The fixture home is absolute on the
+    /// host platform: a bare `/home/op` is rooted but not absolute
+    /// on Windows (no drive or UNC prefix), and the expected path
+    /// is derived by the same joins the resolver performs, so the
+    /// elected join is pinned on every platform (PR #27, Codex P2).
+    #[test]
+    fn daemon_log_path_matches_the_elected_home() {
+        #[cfg(windows)]
+        let home = std::path::Path::new(r"C:\Users\op");
+        #[cfg(not(windows))]
+        let home = std::path::Path::new("/home/op");
+        let path = daemon_log_path_for(home);
+        assert!(path.is_absolute(), "{path:?}");
+        let normal_names = |path: &std::path::Path| -> Vec<String> {
+            path.components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(name) => {
+                        Some(name.to_string_lossy().into_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut expected_names = normal_names(home);
+        expected_names.extend(
+            [".local", "share", "neurostrata", "daemon.log"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(normal_names(&path), expected_names);
+        assert_eq!(
+            path,
+            home.join(".local")
+                .join("share")
+                .join("neurostrata")
+                .join("daemon.log")
+        );
+    }
+
+    /// T19: under a fresh home the elected construction is genuinely
+    /// nested with its parents absent; `daemon_stderr_for` creates
+    /// them, opens the log, and returns the `Log` variant.
+    #[test]
+    fn daemon_stderr_opens_a_log_under_a_fresh_home() {
+        let home = daemon_seam_tempdir("fresh-home");
+        let path = daemon_log_path_for(&home);
+        assert!(
+            !path.parent().expect("the log path has a parent").exists(),
+            "the log's parent directories must start absent"
+        );
+        let stderr = daemon_stderr_for(&path);
+        assert!(
+            matches!(stderr, DaemonStderr::Log(_)),
+            "a fresh home must yield the Log variant"
+        );
+        assert!(path.exists(), "the log file must exist: {path:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T19 (DD-3′): when the log cannot be opened -- here a regular
+    /// file sits where a parent directory must be created --
+    /// `daemon_stderr_for` returns `Null` and does not panic.
+    #[test]
+    fn daemon_stderr_falls_back_to_null_when_the_log_cannot_open() {
+        let home = daemon_seam_tempdir("blocked-home");
+        std::fs::write(home.join(".local"), b"not a directory")
+            .expect("the blocking regular file can be placed");
+        let path = daemon_log_path_for(&home);
+        let stderr = daemon_stderr_for(&path);
+        assert!(
+            matches!(stderr, DaemonStderr::Null),
+            "an unopenable log must yield the Null variant"
+        );
+        assert!(!path.exists(), "no log file can exist: {path:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Task 4 (idle unload), Spec GT-7: status never loads, reloads, or
     /// touches the embedding session and never resets the idle clock.
     /// The pin is structural, as with the profile pin above: neither
@@ -4010,6 +4141,87 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(run())
 }
 
+/// The elected daemon log path for a given home (T19, Gate 0 Home β):
+/// `<home>/.local/share/neurostrata/daemon.log`.
+fn daemon_log_path_for(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".local")
+        .join("share")
+        .join("neurostrata")
+        .join("daemon.log")
+}
+
+/// Where an auto-spawned daemon child's stderr is sent (T19).
+///
+/// The home's basis is `dirs::home_dir()`: on this system the resulting
+/// path is byte-identical to the watchdog's `DAEMON_LOG`
+/// (`$HOME/.local/share/neurostrata/daemon.log`,
+/// `watchdog-backup.sh:47`), so watchdog-started and auto-spawned
+/// daemon lifetimes log to one file. This deliberately does NOT follow
+/// `XDG_DATA_HOME`, matching the watchdog's own ignoring of it.
+///
+/// There is no CWD fallback: when the home directory cannot be
+/// resolved this returns `None`, and `daemon_stderr()` falls back to
+/// discarding the child's stderr rather than inventing a path in the
+/// process's working directory.
+fn daemon_log_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|home| daemon_log_path_for(&home))
+}
+
+/// Where the auto-spawned daemon child's stderr goes: the daemon log
+/// file, or nowhere. The decision is an enum (not a `Stdio`) because
+/// `std::process::Stdio` offers no introspection for tests to match on.
+enum DaemonStderr {
+    Log(std::fs::File),
+    Null,
+}
+
+/// Resolve the daemon child's stderr target (T19, DD-3′/DD-4′).
+fn daemon_stderr() -> DaemonStderr {
+    match daemon_log_path() {
+        Some(path) => daemon_stderr_for(&path),
+        None => {
+            eprintln!(
+                "cannot resolve a home directory for the daemon log; \
+                 the daemon's stderr will be discarded"
+            );
+            DaemonStderr::Null
+        }
+    }
+}
+
+/// Open `path` (append + create, parent directories created) as the
+/// daemon child's stderr target.
+///
+/// On any failure the path and error are printed to this process's own
+/// stderr and the child gets `DaemonStderr::Null`. That is not a
+/// mitigation: on open failure the child's whole-life stderr blindness
+/// persists in full, and this note is best-effort -- it sits on the
+/// proxy parent's stderr, a channel expected to be unread in
+/// editor-launched deployments (DD-3′).
+fn daemon_stderr_for(path: &std::path::Path) -> DaemonStderr {
+    let created = match path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent),
+        None => Ok(()),
+    };
+    let opened = created.and_then(|()| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    });
+    match opened {
+        Ok(file) => DaemonStderr::Log(file),
+        Err(e) => {
+            eprintln!(
+                "cannot open the daemon log {} ({}); the daemon's stderr will be discarded",
+                path.display(),
+                e
+            );
+            DaemonStderr::Null
+        }
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
@@ -4086,11 +4298,15 @@ async fn run() -> anyhow::Result<()> {
             // Spawn the daemon as a detached process
             let exe = std::env::current_exe()
                 .unwrap_or_else(|_| std::path::PathBuf::from("neurostrata-mcp"));
+            let stderr = daemon_stderr();
             std::process::Command::new(exe)
                 .arg("daemon")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .stderr(match stderr {
+                    DaemonStderr::Log(file) => std::process::Stdio::from(file),
+                    DaemonStderr::Null => std::process::Stdio::null(),
+                })
                 .spawn()?;
 
             eprintln!(
