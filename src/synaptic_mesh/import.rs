@@ -2384,15 +2384,53 @@ pub fn read_compressed_bundle(bundle_path: &Path) -> Result<Vec<MeshRecord>, Str
 /// artifact, paired with its bundle path so the replay pass can report the
 /// source. The caller deduplicates against the `.json` candidate tree — a
 /// bundle is a replay candidate, not a debug log.
+///
+/// Trackedness barrier (bug #44, untracked/ignored limb): only a bundle
+/// that is TRACKED in the mesh checkout (`git ls-files` under `bundles/`)
+/// is decoded. A git-ignored or untracked bundle is local-only — drain
+/// bundles are exactly that (storage installs `/bundles/*.bundle.zst`) —
+/// and is invisible to the import dirty gate, so replaying it would let a
+/// stale local file silently roll a live row back on a quiet pass. If the
+/// `git ls-files` probe itself fails, NO bundle is decoded: the dirty
+/// gate and `tracked_paths` both refuse to trust the disk when git
+/// errors, and this fail-soft scan's analogue of that refusal is to
+/// decode nothing from `bundles/` (the `.json` replay is unaffected).
 fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)> {
     let mut bundled_records: Vec<(PathBuf, MeshRecord)> = Vec::new();
     let bundles_dir = mesh_root.join("bundles");
     if bundles_dir.is_dir() {
+        // One `git ls-files` for the whole `bundles/` tree, `-z` +
+        // exact relative-path comparison (mirrors `tracked_paths`).
+        let tracked_bundles: std::collections::HashSet<PathBuf> =
+            match run_ok(mesh_root, &["ls-files", "-z", "--", "bundles/"]) {
+                Ok(out) => split_nul(&out.stdout)
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        "mesh bundle scan at {}: git ls-files failed ({e:#}) — \
+                         decoding no bundles this pass (fail-closed)",
+                        bundles_dir.display()
+                    );
+                    std::collections::HashSet::new()
+                }
+            };
         if let Ok(entries) = std::fs::read_dir(&bundles_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("zst") {
                     if path.to_string_lossy().ends_with(".bundle.zst") {
+                        // Local-only (git-ignored or untracked) bundles
+                        // never replay; tracked bundles are the transport.
+                        let rel = path.strip_prefix(mesh_root).unwrap_or(&path);
+                        if !tracked_bundles.contains(rel) {
+                            tracing::debug!(
+                                "mesh bundle {} is local-only (not tracked) — skipped",
+                                path.display()
+                            );
+                            continue;
+                        }
                         match read_compressed_bundle(&path) {
                             Ok(records) => {
                                 tracing::debug!(
@@ -2823,9 +2861,13 @@ mod tests {
                 .exists(),
             "fixture sanity: the record has NO `.json` sibling"
         );
-        // The bundle artifact must be committed like any mesh content:
-        // an untracked file would trip the dirty-checkout guard.
+        // The bundle artifact must be TRACKED mesh content for replay:
+        // a plain `commit_all` leaves it untracked because storage's
+        // `/bundles/*.bundle.zst` rule git-ignores it (local-only), so
+        // the fixture commits the bootstrap files, then force-tracks
+        // the bundle — the legitimate transport route.
         mesh.commit_all("bundle artifact", "node-peer-1").unwrap();
+        force_track_bundle(&mesh, "bundles/test.bundle.zst");
         let store = fresh_store("bundle-only").await;
 
         let report =
@@ -2852,6 +2894,163 @@ mod tests {
         assert_eq!(payload.content, "shares via bundle only");
     }
 
+    // ---- bug #44 (untracked/ignored limb): local-only bundles ------------
+    //
+    // A bundle file that is git-ignored or untracked in the mesh checkout
+    // is local-only (drain bundles are exactly that: storage installs
+    // `/bundles/*.bundle.zst`). It must never be replayed: it is invisible
+    // to the dirty gate (ignored files do not show in porcelain) and no
+    // revision order is compared, so a stale local bundle would silently
+    // roll a live row back on a quiet import pass. A TRACKED bundle is
+    // the legitimate transport route and must keep replaying.
+
+    /// Run one git subcommand in a test-fixture checkout; return stdout.
+    fn git_fixture(root: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git runs in fixture");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    /// Force-track a bundle artifact (`git add -f` + commit): the
+    /// `/bundles/*.bundle.zst` ignore rule installed by storage makes a
+    /// plain `commit_all` / `git add -A` leave every bundle untracked, so
+    /// a fixture that means "this bundle travelled through git" must say
+    /// so explicitly.
+    fn force_track_bundle(mesh: &MeshStorage, rel: &str) {
+        git_fixture(mesh.root(), &["add", "-f", "--", rel]);
+        git_fixture(
+            mesh.root(),
+            &[
+                "-c",
+                "user.name=node-peer-1",
+                "-c",
+                "user.email=node-peer-1@synaptic-mesh.local",
+                "commit",
+                "-m",
+                "tracked bundle artifact",
+                "--",
+                rel,
+            ],
+        );
+        let tracked = git_fixture(mesh.root(), &["ls-files", "--", "bundles/"]);
+        assert!(
+            tracked.lines().any(|l| l == rel),
+            "fixture sanity: {rel} must be tracked, ls-files: {tracked}"
+        );
+    }
+
+    /// RED for #44's ignored limb: a record advances to a newer revision
+    /// through the committed `.json` route; a stale bundle holding the
+    /// older revision then sits in `bundles/` as a git-ignored local-only
+    /// file. A quiet import pass (cursor already at HEAD, no committed
+    /// change) must keep the newer live row — on the unfixed tree the
+    /// bundle scan replays the stale bundle and the row rolls back.
+    #[tokio::test]
+    async fn ignored_stale_bundle_does_not_roll_back_newer_live_row() {
+        let (_base, mesh) = mesh_with_commit("ignored-stale-bundle");
+        let id = Uuid::new_v4();
+        // Newer revision, applied/live via the committed `.json` route.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&simple_rule(id, "newer revision")).unwrap(),
+        );
+        let store = fresh_store("ignored-stale-bundle").await;
+        let served = ["probe".to_string()];
+        let first = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
+            .await
+            .expect("first pass applies the newer revision");
+        assert_eq!(first.applied, 1, "report: {first:?}");
+
+        // Stale older revision, carried ONLY by a local-only bundle:
+        // written the way a drain writes it, never force-tracked.
+        let stale: MeshRecord =
+            serde_json::from_value(simple_rule(id, "older stale revision")).unwrap();
+        crate::synaptic_mesh::worker::write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "stale",
+            &[stale],
+        )
+        .expect("bundle writes");
+        // Fixture sanity: the bundle is git-ignored (the real
+        // `/bundles/*.bundle.zst` rule storage installs) and untracked.
+        let check = std::process::Command::new("git")
+            .args(["check-ignore", "--quiet", "bundles/stale.bundle.zst"])
+            .current_dir(mesh.root())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git check-ignore runs");
+        assert!(
+            check.status.success(),
+            "fixture sanity: bundles/stale.bundle.zst must be git-ignored"
+        );
+        let tracked = git_fixture(mesh.root(), &["ls-files", "--", "bundles/"]);
+        assert!(
+            !tracked.contains("stale.bundle.zst"),
+            "fixture sanity: stale bundle must be untracked, ls-files: {tracked}"
+        );
+
+        // Quiet pass: no new commits, cursor already at HEAD.
+        let second = apply_changed(&mesh, &served.to_vec(), store.clone(), emb())
+            .await
+            .expect("quiet pass completes");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("live row still present");
+        assert_eq!(
+            payload.content, "newer revision",
+            "local-only stale bundle must not roll back the live row; report: {second:?}"
+        );
+        assert_eq!(second.applied, 0, "report: {second:?}");
+    }
+
+    /// Control: the same bundle shape, properly TRACKED (force-added and
+    /// committed), carrying a new record, must still replay. This passes
+    /// both before and after the local-only barrier lands.
+    #[tokio::test]
+    async fn tracked_bundle_carrying_new_record_still_replays() {
+        let (_base, mesh) = mesh_with_commit("tracked-bundle-control");
+        let id = Uuid::new_v4();
+        let record: MeshRecord =
+            serde_json::from_value(simple_rule(id, "tracked bundle record")).unwrap();
+        crate::synaptic_mesh::worker::write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "tracked",
+            &[record],
+        )
+        .expect("bundle writes");
+        // Commit the mesh bootstrap files first (a plain `commit_all`
+        // leaves the ignored bundle itself untracked), then force-track
+        // the bundle on top so the checkout is clean and the bundle is
+        // genuinely tracked content.
+        mesh.commit_all("bootstrap", "node-peer-1").unwrap();
+        force_track_bundle(&mesh, "bundles/tracked.bundle.zst");
+        let store = fresh_store("tracked-bundle-control").await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("tracked bundle replay completes");
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row applied from tracked bundle");
+        assert_eq!(payload.content, "tracked bundle record");
+    }
+
     // ---- issue #43: bundle gate parity -----------------------------------
     //
     // A bundle-only record must pass the same pre-apply gate as a `.json`
@@ -2863,8 +3062,11 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
-    /// Replay one record carried ONLY inside a `.bundle.zst` (committed
-    /// like any mesh content) into a fresh store. `manifest_epoch`
+    /// Replay one record carried ONLY inside a `.bundle.zst`
+    /// (force-tracked mesh content — see `force_track_bundle`: a plain
+    /// commit leaves an ignored bundle untracked and local-only, and
+    /// local-only bundles never replay) into a fresh store.
+    /// `manifest_epoch`
     /// migrates the mesh manifest to that epoch before the bundle lands.
     async fn run_bundle_route(
         tag: &str,
@@ -2901,6 +3103,7 @@ mod tests {
         )
         .expect("bundle writes");
         mesh.commit_all("bundle artifact", "node-peer-1").unwrap();
+        force_track_bundle(&mesh, "bundles/test.bundle.zst");
         let store = fresh_store(tag).await;
         let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
             .await
