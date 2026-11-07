@@ -468,6 +468,7 @@ pub async fn apply_changed(
             import_trust,
             head_signature,
             &signature_disposition,
+            false,
         )
         .await
         {
@@ -542,6 +543,7 @@ pub async fn apply_changed(
             import_trust,
             head_signature,
             &signature_disposition,
+            true,
         )
         .await
         {
@@ -1092,6 +1094,21 @@ pub fn mesh_update_id_of(metadata: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The unix-millisecond timestamp encoded in a UUIDv7 id's timestamp
+/// prefix, or `None` for any other UUID version. This is the revision
+/// ordering signal for the tracked-stale-bundle guard (issue #44, Gate
+/// G2 option (a)): v7 ids are minted per accepted change, so their
+/// prefixes order revisions — but only v7 ids carry a timestamp at all,
+/// so every non-v7 id (on either side) leaves the guard inert.
+fn update_id_v7_millis(id: &Uuid) -> Option<u64> {
+    if id.get_version() != Some(uuid::Version::SortRand) {
+        return None;
+    }
+    let (secs, subsec_nanos) = id.get_timestamp()?.to_unix();
+    secs.checked_mul(1_000)?
+        .checked_add(u64::from(subsec_nanos / 1_000_000))
+}
+
 /// What one candidate's apply did.
 #[derive(Debug, Clone, PartialEq)]
 enum Disposition {
@@ -1491,6 +1508,10 @@ async fn apply_one(
     import_trust: Trust,
     head_signature: &str,
     signature_disposition: &SignatureDisposition,
+    // Route flag for the tracked-stale-bundle guard (issue #44): `true`
+    // only for records that arrived through the bundle-only loop, never
+    // for `.json` candidates.
+    from_bundle: bool,
 ) -> Disposition {
     let id = record.id.to_string();
     let namespace = record.namespace.clone();
@@ -1517,13 +1538,46 @@ async fn apply_one(
                 ));
             }
             // Mesh-owned row at another revision: gate the transition.
-            Some(_) => {
+            Some(accepted) => {
                 let Some((local_state, local_superseded_by)) = local_mesh_state(&payload.metadata)
                 else {
                     return Disposition::Ignored(format!(
                         "mesh row {id} has unreadable lifecycle provenance"
                     ));
                 };
+                // Tracked-stale-bundle guard (issue #44, Gate G2 option
+                // (a)): a bundle-only candidate on a DIFF pass whose
+                // UUIDv7 update_id predates the accepted revision would
+                // otherwise pass `classify_merge` as a plain forward edit
+                // and silently roll the live row back. The guard is
+                // deliberately narrow — bundle route only, diff pass
+                // only (full-tree passes stay concurrent/conflicted),
+                // both sides live and in the SAME state (transitions and
+                // combinations are untouched), content actually
+                // differing, and both update_ids UUIDv7 with the
+                // candidate STRICTLY older (millisecond comparison;
+                // ties and any non-v7 id leave it inert).
+                if from_bundle && !concurrent {
+                    let both_live_same_state = matches!(
+                        local_state,
+                        LifecycleState::Active | LifecycleState::Archived
+                    ) && record.lifecycle.state == local_state;
+                    if both_live_same_state && payload.content != content_text(&record) {
+                        let accepted_v7 = Uuid::parse_str(&accepted)
+                            .ok()
+                            .and_then(|u| update_id_v7_millis(&u));
+                        let candidate_v7 = update_id_v7_millis(&record.update_id);
+                        if let (Some(accepted_ts), Some(candidate_ts)) = (accepted_v7, candidate_v7)
+                        {
+                            if candidate_ts < accepted_ts {
+                                return Disposition::Ignored(format!(
+                                    "{id}: stale bundle revision refused — candidate update_id {} predates accepted {accepted}",
+                                    record.update_id
+                                ));
+                            }
+                        }
+                    }
+                }
                 match classify_merge(
                     local_state,
                     local_superseded_by,
@@ -3049,6 +3103,374 @@ mod tests {
             .unwrap()
             .expect("row applied from tracked bundle");
         assert_eq!(payload.content, "tracked bundle record");
+    }
+
+    // ---- bug #44 (tracked limb): stale tracked bundle revision guard ----
+    //
+    // A TRACKED bundle is legitimate transport (see the barrier above),
+    // so it replays — but on a diff pass a bundle-only record whose
+    // UUIDv7 `update_id` predates the accepted revision of a live row in
+    // the same lifecycle state must not roll that row back. The ordering
+    // signal is the v7 timestamp prefix (Gate G2 option (a)).
+
+    /// Millisecond timestamps for deterministic v7 update_ids.
+    const REV_OLD_MILLIS: u64 = 1_700_000_000_000;
+    const REV_NEW_MILLIS: u64 = 1_700_000_120_000;
+
+    /// A deterministic UUIDv7 whose timestamp prefix is `millis`; `fill`
+    /// varies the counter/random tail so distinct ids can share a millis
+    /// value (the tie case).
+    fn v7_update_id(millis: u64, fill: u8) -> Uuid {
+        uuid::Builder::from_unix_timestamp_millis(millis, &[fill; 10]).into_uuid()
+    }
+
+    /// A record JSON with an explicit lifecycle state and `update_id`
+    /// (the `record_value` analogue with the revision under test control).
+    fn revision_value(id: Uuid, state: &str, text: &str, update_id: Uuid) -> Value {
+        let archived_at = if state == "archived" {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        };
+        let mut value = record_value(
+            "synaptic-mesh-record/v1",
+            id,
+            "probe",
+            "rule",
+            state,
+            archived_at,
+            json!({"text": text}),
+        );
+        value["update_id"] = json!(update_id.to_string());
+        value
+    }
+
+    /// Pass 1 applies `local` through the committed `.json` route; the
+    /// candidate then arrives ONLY inside a force-tracked bundle and is
+    /// presented on a second pass. `full_tree` drops the cursor (and
+    /// withdraws the `.json` carrier, so the bundle copy is not deduped
+    /// against its `.json` sibling) to make that pass a full-tree
+    /// reconciliation; otherwise it is a diff pass.
+    async fn tracked_bundle_second_pass(
+        tag: &str,
+        local: &Value,
+        candidate: MeshRecord,
+        full_tree: bool,
+    ) -> (ApplyReport, std::sync::Arc<dyn VectorStore>) {
+        let (_base, mesh) = mesh_with_commit(tag);
+        let id = local["id"].as_str().expect("local record id").to_string();
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id,
+            &serde_json::to_string(local).unwrap(),
+        );
+        let store = fresh_store(tag).await;
+        let served = ["probe".to_string()];
+        let first = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("first pass applies the local revision");
+        assert_eq!(first.applied, 1, "first report: {first:?}");
+        crate::synaptic_mesh::worker::write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "rev",
+            &[candidate],
+        )
+        .expect("bundle writes");
+        mesh.commit_all("bundle artifact", "node-peer-1").unwrap();
+        force_track_bundle(&mesh, "bundles/rev.bundle.zst");
+        if full_tree {
+            std::fs::remove_file(
+                mesh.root()
+                    .join("probe")
+                    .join("memories")
+                    .join(format!("{id}.json")),
+            )
+            .unwrap();
+            mesh.commit_all("withdraw json carrier", "node-peer-1")
+                .unwrap();
+            std::fs::remove_file(cursor_file(mesh.root())).unwrap();
+        }
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("second pass completes");
+        assert_eq!(second.full_tree, full_tree, "pass shape: {second:?}");
+        (second, store)
+    }
+
+    /// The v7-millis helper: deterministic v7 ids report
+    /// `Version::SortRand` and round-trip their millis; a v4 id yields
+    /// `None`; two v7 ids at the same millis extract EQUAL timestamps
+    /// (the tie the guard treats as inert).
+    #[test]
+    fn update_id_v7_millis_extracts_v7_timestamps_only() {
+        let old = v7_update_id(REV_OLD_MILLIS, 0x11);
+        assert_eq!(
+            old.get_version(),
+            Some(uuid::Version::SortRand),
+            "fixture sanity: the constructed id is UUIDv7"
+        );
+        assert_eq!(update_id_v7_millis(&old), Some(REV_OLD_MILLIS));
+        assert_eq!(
+            update_id_v7_millis(&v7_update_id(REV_NEW_MILLIS, 0x12)),
+            Some(REV_NEW_MILLIS)
+        );
+        assert_eq!(
+            update_id_v7_millis(&Uuid::new_v4()),
+            None,
+            "v4 has no timestamp prefix"
+        );
+        assert_eq!(
+            update_id_v7_millis(&v7_update_id(REV_NEW_MILLIS, 0x13)),
+            update_id_v7_millis(&v7_update_id(REV_NEW_MILLIS, 0x14)),
+            "same-millis v7 ids tie"
+        );
+    }
+
+    async fn stored_content(store: &std::sync::Arc<dyn VectorStore>, id: Uuid) -> String {
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row present");
+        payload.content
+    }
+
+    /// RED repro (tracked twin of
+    /// `ignored_stale_bundle_does_not_roll_back_newer_live_row`): the
+    /// bundle is force-tracked/committed in the mesh history, the local
+    /// row sits at a NEWER v7 revision, and the bundle carries the same
+    /// record at an OLDER v7 revision, same live state, older content.
+    /// On the unguarded tree the diff pass applies the bundle record and
+    /// the row rolls back.
+    #[tokio::test]
+    async fn tracked_stale_bundle_does_not_roll_back_newer_live_row() {
+        let id = Uuid::new_v4();
+        let local = revision_value(
+            id,
+            "active",
+            "newer revision",
+            v7_update_id(REV_NEW_MILLIS, 0xA1),
+        );
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "active",
+            "older stale revision",
+            v7_update_id(REV_OLD_MILLIS, 0xA2),
+        ))
+        .unwrap();
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-stale-bundle", &local, candidate, false).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(
+            !report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert!(
+            report
+                .ignored
+                .iter()
+                .any(|e| e.contains("stale bundle revision")),
+            "the stale-revision refusal is reported: {report:?}"
+        );
+        assert_eq!(
+            stored_content(&store, id).await,
+            "newer revision",
+            "tracked stale bundle must not roll back the live row; report: {report:?}"
+        );
+    }
+
+    /// Control: the same shape with a NEWER bundle revision applies.
+    #[tokio::test]
+    async fn tracked_bundle_with_newer_revision_still_applies() {
+        let id = Uuid::new_v4();
+        let local = revision_value(
+            id,
+            "active",
+            "older revision",
+            v7_update_id(REV_OLD_MILLIS, 0xB1),
+        );
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "active",
+            "newer revision",
+            v7_update_id(REV_NEW_MILLIS, 0xB2),
+        ))
+        .unwrap();
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-newer-bundle", &local, candidate, false).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert_eq!(stored_content(&store, id).await, "newer revision");
+    }
+
+    /// Control: the stale-bundle input on a FULL-TREE pass is a
+    /// concurrent conflict, not the stale-revision refusal (the guard is
+    /// inert when `concurrent`).
+    #[tokio::test]
+    async fn tracked_stale_bundle_on_full_tree_pass_conflicts_not_stale_refused() {
+        let id = Uuid::new_v4();
+        let local = revision_value(
+            id,
+            "active",
+            "newer revision",
+            v7_update_id(REV_NEW_MILLIS, 0xC1),
+        );
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "active",
+            "older stale revision",
+            v7_update_id(REV_OLD_MILLIS, 0xC2),
+        ))
+        .unwrap();
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-stale-full-tree", &local, candidate, true).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert_eq!(report.conflicted, 1, "report: {report:?}");
+        assert!(
+            report.conflicted_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert!(
+            !report
+                .ignored
+                .iter()
+                .any(|e| e.contains("stale bundle revision")),
+            "no stale refusal on a full-tree pass: {report:?}"
+        );
+        assert_eq!(stored_content(&store, id).await, "newer revision");
+    }
+
+    /// Control: a bundle candidate whose `update_id` EQUALS the accepted
+    /// revision is Skipped (the pre-existing equal-revision skip), never
+    /// the stale refusal.
+    #[tokio::test]
+    async fn tracked_bundle_with_equal_update_id_is_skipped() {
+        let id = Uuid::new_v4();
+        let accepted = v7_update_id(REV_NEW_MILLIS, 0xD1);
+        let local = revision_value(id, "active", "accepted revision", accepted);
+        let candidate: MeshRecord =
+            serde_json::from_value(revision_value(id, "active", "other content", accepted))
+                .unwrap();
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-equal-bundle", &local, candidate, false).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert_eq!(report.skipped_update_id, 1, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        assert_eq!(stored_content(&store, id).await, "accepted revision");
+    }
+
+    /// Control (Gate G2 Test C negative): a NEWER archive transition
+    /// arriving bundle-only on a diff pass still applies — state
+    /// transitions are out of the guard's scope.
+    #[tokio::test]
+    async fn tracked_bundle_newer_archive_transition_still_applies() {
+        let id = Uuid::new_v4();
+        let local = revision_value(
+            id,
+            "active",
+            "shared content",
+            v7_update_id(REV_OLD_MILLIS, 0xE1),
+        );
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "archived",
+            "shared content",
+            v7_update_id(REV_NEW_MILLIS, 0xE2),
+        ))
+        .unwrap();
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-archive-bundle", &local, candidate, false).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            !report
+                .ignored
+                .iter()
+                .any(|e| e.contains("stale bundle revision")),
+            "report: {report:?}"
+        );
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(
+            payload.metadata["mesh"]["lifecycle_state"],
+            json!("archived"),
+            "the archive transition landed: {:?}",
+            payload.metadata
+        );
+    }
+
+    /// Boundary: v7 timestamp TIES are inert — a bundle candidate at the
+    /// same millis as the accepted revision (different tail) applies
+    /// exactly as it does today.
+    #[tokio::test]
+    async fn tracked_bundle_with_tied_v7_timestamp_still_applies() {
+        let id = Uuid::new_v4();
+        let accepted = v7_update_id(REV_NEW_MILLIS, 0xF1);
+        let candidate_id = v7_update_id(REV_NEW_MILLIS, 0xF2);
+        assert_ne!(accepted, candidate_id, "tie needs distinct update_ids");
+        let local = revision_value(id, "active", "local tied revision", accepted);
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "active",
+            "candidate tied revision",
+            candidate_id,
+        ))
+        .unwrap();
+        let (report, store) =
+            tracked_bundle_second_pass("tracked-tied-bundle", &local, candidate, false).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert_eq!(stored_content(&store, id).await, "candidate tied revision");
+    }
+
+    /// Boundary (the disclosed v7-only scope): a stale-content candidate
+    /// whose `update_id` is NOT v7 — or whose accepted revision is not
+    /// v7 — is not refused; it behaves exactly as today (applies).
+    #[tokio::test]
+    async fn stale_bundle_with_non_v7_update_id_is_not_refused() {
+        // Candidate side non-v7.
+        let id = Uuid::new_v4();
+        let local = revision_value(
+            id,
+            "active",
+            "newer revision",
+            v7_update_id(REV_NEW_MILLIS, 0x91),
+        );
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "active",
+            "v4 candidate revision",
+            Uuid::new_v4(),
+        ))
+        .unwrap();
+        let (report, store) =
+            tracked_bundle_second_pass("nonv7-candidate-bundle", &local, candidate, false).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            !report
+                .ignored
+                .iter()
+                .any(|e| e.contains("stale bundle revision")),
+            "report: {report:?}"
+        );
+        assert_eq!(stored_content(&store, id).await, "v4 candidate revision");
+
+        // Accepted side non-v7.
+        let id2 = Uuid::new_v4();
+        let local2 = revision_value(id2, "active", "local v4 revision", Uuid::new_v4());
+        let candidate2: MeshRecord = serde_json::from_value(revision_value(
+            id2,
+            "active",
+            "v7 candidate revision",
+            v7_update_id(REV_OLD_MILLIS, 0x92),
+        ))
+        .unwrap();
+        let (report2, store2) =
+            tracked_bundle_second_pass("nonv7-accepted-bundle", &local2, candidate2, false).await;
+        assert_eq!(report2.applied, 1, "report: {report2:?}");
+        assert_eq!(stored_content(&store2, id2).await, "v7 candidate revision");
     }
 
     // ---- issue #43: bundle gate parity -----------------------------------
