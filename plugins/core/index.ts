@@ -605,7 +605,7 @@ export function extractTurnCandidates(turn: Turn): TurnCandidate[] {
       category,
       title: excerpt,
       confidence: 0.9,
-      auto_commit: false,
+      auto_commit: true,
       provenance: {
         turn_id,
         role,

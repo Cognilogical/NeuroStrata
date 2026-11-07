@@ -3511,10 +3511,14 @@ pub async fn handle_task_candidates(
                 .and_then(|v| v.as_object())
                 .and_then(|s| s.get("confidence"))
                 .and_then(|v| v.as_f64());
-            // Accept confidence from top-level, provenance, or source_span so a
-            // candidate recorded with only provenance.confidence still persists
-            // with confidence >= 0.85 and is visible to the Lock 2 obligation gate.
-            let confidence = top_confidence.or(provenance_confidence).or(source_span_confidence);
+            // Accept confidence from top-level, provenance, or source_span and
+            // take the max so the strongest signal wins; a candidate recorded
+            // with only provenance.confidence still persists with confidence
+            // >= 0.85 and is visible to the Lock 2 obligation gate.
+            let confidence = [top_confidence, provenance_confidence, source_span_confidence]
+                .into_iter()
+                .flatten()
+                .reduce(f64::max);
             let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
             let description = args
                 .get("description")

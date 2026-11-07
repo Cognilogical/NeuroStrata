@@ -857,7 +857,7 @@ describe("extractTurnCandidates", () => {
     assert.equal(c.category, "decision");
     assert.equal(c.title, "use Rust for the intake layer");
     assert.equal(c.confidence, 0.9);
-    assert.equal(c.auto_commit, false);
+    assert.equal(c.auto_commit, true);
     assert.equal(c.provenance.confidence, 0.9);
     assert.equal(c.provenance.evidence_quote, "use Rust for the intake layer");
     assert.ok(c.provenance.char_range[0] >= 0);
@@ -876,6 +876,7 @@ describe("extractTurnCandidates", () => {
     assert.equal(c.category, "fact");
     assert.equal(c.title, "the gate requires memory extraction before completion");
     assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, true);
     assert.equal(c.provenance.confidence, 0.9);
   });
 
