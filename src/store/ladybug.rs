@@ -1,12 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use lbug::{Connection, Database, SystemConfig};
 
+use crate::parser::ingest::split_scoped_id;
 use crate::traits::{
     DomainMatchMode, DomainSearchOutcome, GraphMatchKind, GraphRead, MemoryHit, MemoryPayload,
     RelocateOutcome, SearchResult, VectorStore,
@@ -179,6 +180,12 @@ async fn search_inner(
             );
             let now = chrono::Utc::now().timestamp();
 
+            // Active generations for this namespace, resolved per source so a
+            // row is validated against the source that owns it (not just any
+            // active generation in the namespace). Read once per search.
+            let (by_source, active_set, max_code_gen) =
+                active_generations_by_source_of(conn, &namespace);
+
             // LadybugDB (the embedder) has no OFFSET, so we over-fetch with a larger LIMIT and
             // filter/trim in Rust. The multiplier bounds cost: at most
             // FETCH_MULTIPLIER * limit rows are scanned from the engine.
@@ -297,6 +304,9 @@ async fn search_inner(
             let result_count = result.get_num_tuples() as usize;
             let mut all_primaries = Vec::new();
             let mut filtered_primaries = Vec::new();
+            // Dedup by bare_id across generations: keep the highest generation
+            // for each logical id. Maps bare_id -> (generation, index in all_primaries).
+            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
 
             for row in result {
                 let id: String = format!("{}", row[0]);
@@ -343,6 +353,20 @@ async fn search_inner(
                         .iter()
                         .any(|k| domain_keys.contains(k))
                 };
+
+                // Active-generation filter (Wave 2.1): drop rows from superseded
+                // ingest generations or other namespaces before they consume a
+                // candidate slot. Unscoped normative rows always pass.
+                let kept_id = is_active_scoped_row(
+                    &id,
+                    &namespace,
+                    &memory_type,
+                    &metadata_val,
+                    &by_source,
+                    &active_set,
+                    max_code_gen,
+                );
+                let Some(_kept_id) = kept_id else { continue };
 
                 // Usage boost: ln(1+n) gives a real gain even at n=1, and the
                 // cap at half distance preserves semantic ranking order.
@@ -406,13 +430,43 @@ async fn search_inner(
                     }]),
                 };
 
-                // Every accepted row goes to all_primaries
-                all_primaries.push(sr.clone());
-
-                // Only domain-matching rows go to filtered_primaries
-                if domain_match {
-                    filtered_primaries.push(sr);
-                }
+                // Dedup by bare_id across generations: keep the highest
+                // generation for each logical id. Unscoped rows (bare_id_of
+                // returns None) are never deduped.
+                if let Some(bare) = bare_id_of(&id) {
+                    let gen = split_scoped_id(&id)
+                        .map(|(_, g, _)| g as u64)
+                        .unwrap_or(0);
+                    match best_by_bare.get(&bare) {
+                        Some(&(existing_gen, idx)) if gen > existing_gen => {
+                            // Supersede the lower-generation entry in place.
+                            all_primaries[idx] = sr.clone();
+                            best_by_bare.insert(bare, (gen, idx));
+                            if domain_match {
+                                if let Some(pos) = filtered_primaries.iter().position(|r: &SearchResult| r.id.as_str() == id.as_str()) {
+                                    filtered_primaries[pos] = sr;
+                                }
+                            }
+                        }
+                        Some(_) => {
+                            // Existing entry has higher or equal gen; skip.
+                            continue;
+                        }
+                        None => {
+                            let idx = all_primaries.len();
+                            best_by_bare.insert(bare, (gen, idx));
+                            all_primaries.push(sr.clone());
+                            if domain_match {
+                                filtered_primaries.push(sr);
+                            }
+                        }
+                    }
+                } else {
+                    all_primaries.push(sr.clone());
+                    if domain_match {
+                        filtered_primaries.push(sr);
+                    }
+                };
 
                 // Stop condition counts filtered_primaries when filter is active,
                 // otherwise counts all_primaries (which is the same as filtered when empty).
@@ -1020,6 +1074,31 @@ let incomplete = result_count >= fetch_limit;
                     }
                 });
                 results = hybrid_results.into_iter().take(limit).collect();
+
+                // Normative slot reservation (Wave 2.1): within the hybrid
+                // limit, reserve up to normative_slot_limit(limit) slots for
+                // normative memories (rule/fact/decision/procedure) that clear
+                // the relevance floor. Scores are distances (lower = better),
+                // so the floor is a maximum score.
+                if limit >= 3 {
+                    let normative_limit = normative_slot_limit(limit);
+                    let mut normative: Vec<SearchResult> = Vec::new();
+                    let mut non_normative: Vec<SearchResult> = Vec::new();
+                    for r in results {
+                        let is_normative = NORMATIVE_MEMORY_TYPES.contains(&r.payload.memory_type.as_str())
+                            && r.score <= NORMATIVE_RELEVANCE_FLOOR;
+                        if is_normative {
+                            normative.push(r);
+                        } else {
+                            non_normative.push(r);
+                        }
+                    }
+                    let mut reserved: Vec<SearchResult> = Vec::new();
+                    reserved.extend(normative.into_iter().take(normative_limit));
+                    let remaining = limit.saturating_sub(reserved.len());
+                    reserved.extend(non_normative.into_iter().take(remaining));
+                    results = reserved;
+                }
             }
 
             Ok(DomainSearchOutcome { results, mode, incomplete })
@@ -1862,6 +1941,128 @@ fn active_generations_of(conn: &Connection, namespace: &str) -> std::collections
         Err(e) => { tracing::warn!("active_generations_of query failed: {e}"); }
     }
     gens
+}
+
+/// The active generation per source plus the namespace-wide active set and the
+/// max active generation among non-`"docs"` sources.
+///
+/// Unlike `active_generations_of` (a flat `HashSet` across all `source_key`
+/// rows), this keeps the `source_key -> active_gen` mapping so a row can be
+/// validated against the source that actually owns it. Two worktrees of one
+/// namespace ingest at different times, so `IngestGeneration` holds multiple
+/// rows per namespace (e.g. `source_key = "docs" -> 3`, `source_key = "dirA" ->
+/// 5`); a `doc_section` row must match *its* source's active generation, not
+/// just any active generation in the namespace.
+pub(crate) fn active_generations_by_source_of(
+    conn: &Connection,
+    namespace: &str,
+) -> (
+    HashMap<String, i64>,
+    std::collections::HashSet<i64>,
+    Option<i64>,
+) {
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation > 0 RETURN g.source_key, g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut by_source = HashMap::new();
+    let mut active_set = std::collections::HashSet::new();
+    let mut max_non_doc: Option<i64> = None;
+    match conn.query(&query) {
+        Ok(rows) => {
+            for row in rows {
+                let source_key = format!("{}", row[0]);
+                let gen = match format!("{}", row[1]).parse::<i64>() {
+                    Ok(g) if g > 0 => g,
+                    _ => continue,
+                };
+                by_source.insert(source_key.clone(), gen);
+                active_set.insert(gen);
+                if source_key != "docs" {
+                    max_non_doc = Some(max_non_doc.unwrap_or(0).max(gen));
+                }
+            }
+        }
+        Err(e) => { tracing::warn!("active_generations_by_source_of query failed: {e}"); }
+    }
+    (by_source, active_set, max_non_doc)
+}
+
+/// Row filter for generation-scoped reads (`search_inner`, `list`, SPARQL
+/// projection). Returns `Some(full_id)` when the row is reachable and `None`
+/// when it belongs to a superseded generation or another namespace.
+///
+/// - Unscoped rows (`split_scoped_id == None`) — normative `rule`/`fact`/
+///   `decision`/`procedure` and legacy AST ids — are always kept.
+/// - Scoped rows are kept only against their owning source's active
+///   generation; `doc_section` rows fall back to the namespace's `docs`
+///   pointer (or any active doc generation when no pointer exists).
+/// - Deduplication of equal `bare_id` across active generations (keep highest
+///   `gen`) is the caller's job; this predicate is stateless per row.
+pub(crate) fn is_active_scoped_row(
+    id: &str,
+    namespace: &str,
+    memory_type: &str,
+    metadata: &Value,
+    by_source: &HashMap<String, i64>,
+    active_set: &std::collections::HashSet<i64>,
+    max_non_doc_gen: Option<i64>,
+) -> Option<String> {
+    let Some((scoped_ns, gen, _bare_id)) = split_scoped_id(id) else {
+        // Unscoped (normative or legacy): always reachable.
+        return Some(id.to_string());
+    };
+    if scoped_ns != namespace {
+        return None;
+    }
+    let gen_i = gen as i64;
+    if by_source.is_empty() && active_set.is_empty() {
+        // No generation table entries yet: nothing is superseded.
+        return Some(id.to_string());
+    }
+    let keep = if let Some(source_key) = metadata.get("source_key").and_then(|v| v.as_str()) {
+        // Explicit source pointer: the row must equal that source's active gen.
+        by_source.get(source_key).is_some_and(|&active| active == gen_i)
+    } else if memory_type == "doc_section" {
+        // `doc_section` rows without an explicit `source_key`: match the docs
+        // pointer when present, otherwise any active doc generation.
+        if let Some(&docs_gen) = by_source.get("docs") {
+            docs_gen == gen_i
+        } else {
+            active_set.contains(&gen_i)
+        }
+    } else {
+        // `code_ast` and other scoped rows without an explicit `source_key`:
+        // active when the namespace has a single source pointer or any known
+        // non-docs generation (dedup by bare_id keeps the highest gen).
+        if by_source.len() == 1 || max_non_doc_gen.is_some() {
+            active_set.contains(&gen_i)
+        } else {
+            true
+        }
+    };
+    if keep { Some(id.to_string()) } else { None }
+}
+
+/// Normative memory types that the recall path reserves result slots for.
+/// Stated once here so the search ranker and the task gate can agree on the
+/// same predicate (see the FEATURE-4 provenance contract in `src/traits.rs`).
+const NORMATIVE_MEMORY_TYPES: [&str; 4] = ["rule", "fact", "decision", "procedure"];
+
+/// Relevance floor (distance) below which a normative candidate is eligible
+/// for a reserved search slot. Scores are distances (lower = better).
+const NORMATIVE_RELEVANCE_FLOOR: f32 = 0.20;
+
+/// Maximum normative slots reserved in a search result, capped at half the
+/// limit rounded up so structural evidence always keeps at least half the slots.
+fn normative_slot_limit(limit: usize) -> usize {
+    usize::min(3, limit.div_ceil(2))
+}
+
+/// The bare (logical) id inside a generation-scoped id, or `None` for unscoped
+/// rows. Used to deduplicate the same logical target across generations.
+fn bare_id_of(id: &str) -> Option<String> {
+    split_scoped_id(id).map(|(_, _, bare)| bare)
 }
 
 /// The active `(namespace, generation)` pairs across every namespace, for the
@@ -9352,6 +9553,104 @@ eurostrata\src\daemon.rs",
         assert!(
             !exported_ids.iter().any(|id| id == &gen1_id),
             "the superseded generation is not exported"
+        );
+    }
+
+    /// Wave 2.1 TDD: search excludes rows from superseded ingest generations
+    /// while preserving unscoped normative memories (rule/fact/decision/procedure)
+    /// and deduping by bare_id across generations (keep highest gen).
+    #[tokio::test]
+    async fn search_excludes_inactive_ingest_generations_and_preserves_normative_memories() {
+        let store = retired_test_store().await;
+        let zero = vec![0.0f32; 4];
+        let query_vec = vec![1.1, 0.0, 0.0, 0.0];
+
+        // Generation 1 for source-a: a code_ast row that will be superseded.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 1);
+        let gen1_id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen1_id,
+                zero.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 1)
+            .await
+            .unwrap();
+
+        // Generation 2 for source-a: same bare_id, supersedes generation 1.
+        assert_eq!(store.begin_generation("probe", "source-a").await.unwrap(), 2);
+        let gen2_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen2_id,
+                zero.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({ "source_key": "source-a" })),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("probe", "source-a", 2)
+            .await
+            .unwrap();
+
+        // Unscoped normative memories (always reachable, no generation scope).
+        store
+            .upsert(
+                "probe",
+                "normative-rule",
+                query_vec.clone(),
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "normative-fact",
+                query_vec.clone(),
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        // Search with limit >= 3 to trigger normative slot reservation.
+        let results = store
+            .search("probe", query_vec, 5, false, false)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+
+        // Active generation (gen 2) scoped row is present.
+        assert!(
+            ids.contains(&gen2_id.as_str()),
+            "active generation row {gen2_id} should be in search results"
+        );
+        // Superseded generation (gen 1) scoped row is excluded.
+        assert!(
+            !ids.contains(&gen1_id.as_str()),
+            "superseded generation row {gen1_id} should NOT be in search results"
+        );
+        // Unscoped normative memories are preserved.
+        assert!(
+            ids.contains(&"normative-rule"),
+            "normative rule should be in search results"
+        );
+        assert!(
+            ids.contains(&"normative-fact"),
+            "normative fact should be in search results"
+        );
+        // Dedup by bare_id: only one version of src/a.rs appears.
+        let a_rs_count = ids.iter().filter(|id| id.ends_with("src/a.rs")).count();
+        assert_eq!(
+            a_rs_count,
+            1,
+            "exactly one generation of src/a.rs should appear (dedup by bare_id)"
         );
     }
 

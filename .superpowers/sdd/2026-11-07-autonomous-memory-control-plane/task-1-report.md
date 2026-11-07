@@ -45,3 +45,46 @@
 - `plugins/opencode/test.mjs` (V2 test added + fs/os/path imports)
 - `plugins/core/dist/*`, `plugins/*/dist/*` (rebuilt/bundled adapters)
 - `.superpowers/sdd/2026-11-07-autonomous-memory-control-plane/task-1-report.md` (this report)
+
+---
+
+# Fix Round 1/5 — Wave 1 (Task 1.2 + OpenCode V2 array content + dist restore)
+
+## Status: DONE (committed 3721c36, not pushed)
+
+## Scope
+- `plugins/core/index.ts`:
+  - `executeAfterHandler`: `event.result.content` handled as OpenCode V2 array `[{type:"text",text}]` — text parts extracted via `Array.isArray` filter/map/join; non-text items preserved; text item replaced/set to `{type:"text",text:combined}`.
+  - Only mutates `event.result.content`/`event.output`/`event.content`/`event.additionalContext` when `pendingBlock` (truthy) or `newSuffix` non-empty — no stray `\n` on empty suffix; `pendingBlock !== ""` (always-true for `undefined`) replaced with `!!pendingBlock`, fixing pre-existing `event.additionalContext = undefined` failure in the legacy V1 test.
+  - `READ_FILE_TOOLS`: added `"grep"`/`"Grep"`.
+  - `NEUROSTRATA_NATIVE_TOOLS`: added `"neurostrata_guard_validate"`/`"neurostrata_memories_for_file"`.
+  - JIT recall: `seen.add(dedupKey)` moved inside `try` after `prefetchMemoriesForFile` returns; `confirmPrefetchDelivery(namespace, fp)` called when snippets non-empty.
+  - `resetState()`: clears `prefetchedPaths` and `injectedMemoryIds`.
+  - `pathRelativeToProjectRoot`: resolves relative paths against `effectiveProjectRoot(config)` instead of `process.cwd()`.
+- `plugins/opencode/test.mjs`: added unit test verifying V2 `execute.after` with `result.content: [{type:"text",text:"Read file src/server.rs\nTODO: wire candidate"}]` preserves the original text AND appends `TASK INTENT DETECTED` inside `content[0].text` (plus `result.output`).
+- Restored `plugins/openclaw/dist/` + `plugins/hermes/dist/` from `f61336d` (self-contained, not re-bundled). Re-bundled only 4 thin adapters: opencode, claude, codex, github-cli. Copied opencode dist to `.NeuroStrata/plugins/opencode/dist/`.
+- `src/task/harness_plugins.rs` (Task 1.2):
+  - `wire_harness_config` OpenCode always writes `.opencode/plugins/neurostrata.js` loader; never inserts plugin path into opencode.json; strips invalid entries `"./.NeuroStrata/plugins/opencode/dist/index.js"` / `".NeuroStrata/plugins/opencode/dist/index.js"` from opencode.json `plugins`; removes `plugins` key when empty; clean configs left untouched.
+  - Added unit test `opencode_wire_harness_config_removes_invalid_file_plugin_entry_and_installs_autoload_shim` (seeds opencode.json with invalid + valid plugin entries, asserts loader written + invalid stripped + valid preserved).
+  - Updated existing `auto_install_detected_plugins_writes_core_and_opencode_loader` to assert opencode.json is NOT created/populated with the loader path and root opencode.json is never written.
+- `src/daemon.rs` (Task 1.2): startup calls `auto_install_detected_plugins` fail-soft over `startup_root` and every dir in `Config::load().project_contexts.values()`; reuses computed `startup_root` in `AppState`.
+
+## Verification
+- `cargo test --bin neurostrata-mcp task::harness_plugins`: **4 pass / 0 fail** (includes new unit test + updated existing tests).
+- All 7 node plugin suites: **151 pass / 0 fail** (core 86, opencode 15, openclaw 6, claude 11, hermes 11, codex 11, github-cli 11).
+- `tsc` clean for `plugins/core`.
+
+## Files Changed
+- `plugins/core/index.ts` (implementation)
+- `plugins/opencode/test.mjs` (V2 array-content unit test)
+- `plugins/core/dist/*`, `plugins/opencode/dist/*`, `plugins/claude/dist/*`, `plugins/codex/dist/*`, `plugins/github-cli/dist/*` (rebuilt/bundled thin adapters)
+- `plugins/openclaw/dist/*`, `plugins/hermes/dist/*` (restored self-contained from f61336d)
+- `.NeuroStrata/plugins/opencode/dist/` (opencode dist copy)
+- `src/task/harness_plugins.rs` (Task 1.2 wire_harness_config + unit test)
+- `src/daemon.rs` (Task 1.2 startup auto-install)
+- `.superpowers/sdd/2026-11-07-autonomous-memory-control-plane/task-1-report.md` (this report)
+
+## Task State
+- `kenton-ui0c` (namespace `kenton`): left `in_progress` (not completed).
+- `neurostrata-a1si` (namespace `NeuroStrata`): left `in_progress`, untouched (not completed).
+- Commit `3721c36` on `opencode/v116-autonomous-memory-control-plane` (not pushed).
