@@ -9,17 +9,24 @@
 //! enforcement, so a peer's tombstones and shared records arrive without
 //! clobbering local history.
 
+pub mod attention;
 pub mod cli;
 pub mod conflict;
 pub mod federation;
+pub mod frame;
 pub mod import;
 pub mod manifest;
 pub mod mesh_service;
+#[cfg(feature = "nats-mesh")]
+pub mod nats;
 pub mod outbox;
+pub mod p2p;
+pub mod reactor;
 pub mod record;
 pub mod storage;
 pub mod storage_api;
 pub mod tools;
+pub mod transport;
 pub mod worker;
 
 #[cfg(test)]

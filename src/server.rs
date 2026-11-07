@@ -1046,6 +1046,9 @@ pub async fn process_mcp_request(
                         .cloned()
                         .unwrap_or(serde_json::json!({}));
 
+                    crate::synaptic_mesh::attention::global_attention_filter()
+                        .record_mcp_tool_call(name, &arguments);
+
                     match name {
                         "neurostrata_list_namespaces" => {
                             result_text = crate::handlers::memory::handle_list_namespaces(store.clone()).await;
@@ -1402,10 +1405,35 @@ pub async fn process_mcp_request(
             if let Some(err) = error_response {
                 return err;
             }
-            let result = serde_json::json!({
-                "content": [
+            let drained_notices = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("arguments"))
+                .map(|args| {
+                    crate::synaptic_mesh::attention::global_attention_filter()
+                        .drain_notices_for_mcp_call(args)
+                })
+                .unwrap_or_default();
+            let content = if drained_notices.is_empty() {
+                serde_json::json!([
                     { "type": "text", "text": result_text }
-                ]
+                ])
+            } else {
+                let notice_block = drained_notices.join("\n");
+                if serde_json::from_str::<Value>(&result_text).is_ok() {
+                    serde_json::json!([
+                        { "type": "text", "text": result_text },
+                        { "type": "text", "text": notice_block }
+                    ])
+                } else {
+                    result_text = format!("{result_text}\n\n{notice_block}");
+                    serde_json::json!([
+                        { "type": "text", "text": result_text }
+                    ])
+                }
+            };
+            let result = serde_json::json!({
+                "content": content
             });
             serde_json::to_value(JsonRpcResponse::success(id.clone(), result)).unwrap_or_else(|e| {
                 serde_json::json!({
@@ -13723,6 +13751,132 @@ async fn test_handle_search_memory_applies_search_filters() {
     assert!(!text.contains(&id_fact), "stale fact should be excluded: {text}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn process_mcp_request_injects_and_drains_neuromesh_delta_notices() {
+    let ns = format!("ns-neuromesh-mcp-{}", uuid::Uuid::new_v4());
+    let (store, _) = store_with_one_rule(&ns).await;
+    let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+    let (bus, _) = recording_bus();
+
+    // 1. First MCP tool call touches `src/synaptic_mesh/reactor.rs` in namespace `ns`.
+    let req1 = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(101)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_memories_for_file",
+            "arguments": {
+                "namespace": ns,
+                "file_path": "src/synaptic_mesh/reactor.rs"
+            }
+        })),
+    };
+    let _ = process_mcp_request(
+        req1,
+        Arc::new(StubEmbedder),
+        store.clone(),
+        ingests.clone(),
+        None,
+        bus.clone(),
+    )
+    .await;
+
+    // 2. Peer frame arrives touching `task-mesh-1` after session also claims `task-mesh-1`,
+    //    or touching `src/synaptic_mesh/reactor.rs` via a twin/task in `ns`.
+    crate::synaptic_mesh::attention::global_attention_filter().record_mcp_tool_call(
+        "neurostrata_task_claim",
+        &serde_json::json!({
+            "namespace": ns,
+            "id": "task-mesh-1",
+            "session_id": "ses-mcp-e2e"
+        }),
+    );
+    let inbound = crate::synaptic_mesh::frame::MeshFrame {
+        mesh_id: "m-e2e".into(),
+        epoch: 1,
+        origin_node_id: "did:key:z6MkpPeerNode9999".into(),
+        seq: 1,
+        lamport_ts: 777,
+        timestamp_ms: 1000,
+        namespace: ns.clone(),
+        visible_to: vec![],
+        kind: crate::synaptic_mesh::frame::MeshPayloadKind::TaskLeaseDelta {
+            lease: crate::synaptic_mesh::frame::TaskLease {
+                task_id: "task-mesh-1".into(),
+                holder_node_id: "did:key:z6MkpPeerNode9999".into(),
+                session_id: "peer-ses".into(),
+                lamport_ts: 777,
+                ttl_ms: 60_000,
+                expires_at_ms: 99_999,
+            },
+        },
+        signature: "sig".into(),
+    };
+    let hits = crate::synaptic_mesh::attention::global_attention_filter()
+        .evaluate_inbound_frame(&inbound);
+    assert_eq!(hits.len(), 1);
+
+    // 3. Next MCP tool call in `ns` receives the `[NeuroMesh Δ ...]` interrupt at the end of its text.
+    let req2 = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(102)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_search_memory",
+            "arguments": {
+                "namespace": ns,
+                "query": "rule"
+            }
+        })),
+    };
+    let resp2 = process_mcp_request(
+        req2,
+        Arc::new(StubEmbedder),
+        store.clone(),
+        ingests.clone(),
+        None,
+        bus.clone(),
+    )
+    .await;
+    let text2 = resp2["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text response");
+    assert!(
+        text2.contains("[NeuroMesh Δ peer=") && text2.contains("lamport=777]") && text2.contains("task-mesh-1"),
+        "expected [NeuroMesh Δ] notice in MCP response, got: {text2}"
+    );
+
+    // 4. Subsequent MCP tool call has drained the notice and does not repeat it.
+    let req3 = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(103)),
+        method: "tools/call".to_string(),
+        params: Some(serde_json::json!({
+            "name": "neurostrata_search_memory",
+            "arguments": {
+                "namespace": ns,
+                "query": "rule"
+            }
+        })),
+    };
+    let resp3 = process_mcp_request(
+        req3,
+        Arc::new(StubEmbedder),
+        store,
+        ingests,
+        None,
+        bus,
+    )
+    .await;
+    let text3 = resp3["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text response");
+    assert!(
+        !text3.contains("[NeuroMesh Δ"),
+        "drained notice must not repeat on subsequent call: {text3}"
+    );
 }
 
 }
