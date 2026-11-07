@@ -100,6 +100,9 @@ use uuid::Uuid;
 /// The WAL file inside the outbox directory.
 pub const OUTBOX_FILE_NAME: &str = "outbox.wal";
 
+/// The signed MeshFrame log file inside the outbox directory for cursor catch-up.
+pub const FRAME_WAL_FILE_NAME: &str = "frames.wal";
+
 /// Op tags. The WAL is internal, so the op is a string field rather than a
 /// tagged enum: it survives a format reader that predates a new op, and the
 /// worker matches these constants (an unknown op is skipped, not a crash).
@@ -306,6 +309,91 @@ impl Outbox {
         std::fs::rename(&tmp, &wal).map_err(|e| format!("outbox compaction rename failed: {e}"))?;
         Ok(())
     }
+
+    /// Append a signed [`MeshFrame`](super::frame::MeshFrame) to `frames.wal`
+    /// with `sync_all`, returning `frame.seq`.
+    pub fn append_frame(&self, frame: &super::frame::MeshFrame) -> anyhow::Result<u64> {
+        let _guard = OUTBOX_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("outbox lock poisoned"))?;
+        let mut line = serde_json::to_string(frame)?;
+        line.push('\n');
+        let wal = self.dir.join(FRAME_WAL_FILE_NAME);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&wal)?;
+        file.write_all(line.as_bytes())?;
+        file.sync_all()?;
+        Ok(frame.seq)
+    }
+
+    fn read_all_frames(&self) -> anyhow::Result<Vec<super::frame::MeshFrame>> {
+        let wal = self.dir.join(FRAME_WAL_FILE_NAME);
+        let bytes = match std::fs::read(&wal) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let mut segments: Vec<&str> = text.split('\n').collect();
+        segments.pop();
+        let mut frames = Vec::with_capacity(segments.len());
+        for line in segments {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(frame) = serde_json::from_str::<super::frame::MeshFrame>(line) {
+                frames.push(frame);
+            }
+        }
+        Ok(frames)
+    }
+
+    /// Replay frames originating from `origin_node_id` with `seq` in
+    /// `from_seq_inclusive..=to_seq_inclusive`, sorted by `seq` ASC and deduplicated.
+    pub fn replay_frames_range(
+        &self,
+        origin_node_id: &str,
+        from_seq_inclusive: u64,
+        to_seq_inclusive: u64,
+    ) -> anyhow::Result<Vec<super::frame::MeshFrame>> {
+        let mut by_seq = std::collections::BTreeMap::new();
+        for f in self.read_all_frames()? {
+            if f.origin_node_id == origin_node_id
+                && f.seq >= from_seq_inclusive
+                && f.seq <= to_seq_inclusive
+            {
+                by_seq.entry(f.seq).or_insert(f);
+            }
+        }
+        Ok(by_seq.into_values().collect())
+    }
+
+    /// Return the highest `seq` recorded for `origin_node_id` in `frames.wal` (`0` if none).
+    pub fn max_seq_for(&self, origin_node_id: &str) -> anyhow::Result<u64> {
+        let max = self
+            .read_all_frames()?
+            .into_iter()
+            .filter(|f| f.origin_node_id == origin_node_id)
+            .map(|f| f.seq)
+            .max()
+            .unwrap_or(0);
+        Ok(max)
+    }
+
+    /// Return the highest recorded `seq` per `origin_node_id` across `frames.wal`.
+    pub fn all_peer_cursors(&self) -> anyhow::Result<std::collections::BTreeMap<String, u64>> {
+        let mut cursors = std::collections::BTreeMap::new();
+        for f in self.read_all_frames()? {
+            let entry = cursors.entry(f.origin_node_id).or_insert(0);
+            if f.seq > *entry {
+                *entry = f.seq;
+            }
+        }
+        Ok(cursors)
+    }
 }
 
 #[cfg(test)]
@@ -487,5 +575,42 @@ mod tests {
         ] {
             assert!(!is_shareable_memory_type(t), "{t} is NOT shareable");
         }
+    }
+
+    #[test]
+    fn frame_wal_appends_tracks_cursors_and_replays_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox = Outbox::open(&tmp.path().join("mesh.outbox")).unwrap();
+        let (pkey, did, _) = crate::did::generate_keypair().unwrap();
+
+        for seq in 1..=5u64 {
+            let mut f = crate::synaptic_mesh::frame::MeshFrame {
+                mesh_id: "m1".into(),
+                epoch: 1,
+                origin_node_id: did.clone(),
+                seq,
+                lamport_ts: seq * 10,
+                timestamp_ms: 1_700_000_000_000 + (seq as i64),
+                namespace: "ns".into(),
+                visible_to: vec![],
+                kind: crate::synaptic_mesh::frame::MeshPayloadKind::SyncHello(
+                    crate::synaptic_mesh::frame::SyncHello {
+                        node_id: did.clone(),
+                        mesh_id: "m1".into(),
+                        epoch: 1,
+                        peer_cursors: std::collections::BTreeMap::new(),
+                    },
+                ),
+                signature: String::new(),
+            };
+            f.sign_frame(&pkey).unwrap();
+            outbox.append_frame(&f).unwrap();
+        }
+
+        assert_eq!(outbox.max_seq_for(&did).unwrap(), 5);
+        let slice = outbox.replay_frames_range(&did, 2, 4).unwrap();
+        let seqs: Vec<u64> = slice.iter().map(|f| f.seq).collect();
+        assert_eq!(seqs, vec![2, 3, 4]);
+        assert_eq!(outbox.all_peer_cursors().unwrap().get(&did), Some(&5));
     }
 }
