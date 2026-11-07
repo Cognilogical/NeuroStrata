@@ -3473,6 +3473,174 @@ mod tests {
         assert_eq!(stored_content(&store2, id2).await, "v7 candidate revision");
     }
 
+    /// Scope negative (cross-state): the guard requires BOTH sides live
+    /// in the SAME state, so an OLDER v7 bundle candidate in a DIFFERENT
+    /// live state than the accepted row must NOT be stale-refused — it
+    /// falls through to `classify_merge`, where Active (local) vs
+    /// Archived (candidate) with changed content is the `archive + edit`
+    /// combination. The combination's semantics apply: the edited
+    /// content — here the LOCAL row's, since the local side is the
+    /// Active one (see the `ApplyCombination` arm in `apply_one`) — is
+    /// kept, and the stored row is Archived.
+    #[tokio::test]
+    async fn tracked_stale_cross_state_bundle_still_combines() {
+        let id = Uuid::new_v4();
+        let local = revision_value(
+            id,
+            "active",
+            "newer revision",
+            v7_update_id(REV_NEW_MILLIS, 0x17),
+        );
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "archived",
+            "candidate archived edit",
+            v7_update_id(REV_OLD_MILLIS, 0x18),
+        ))
+        .unwrap();
+        let (report, store) = tracked_bundle_second_pass(
+            "tracked-stale-cross-state",
+            &local,
+            candidate,
+            false,
+        )
+        .await;
+        assert!(
+            !report
+                .ignored
+                .iter()
+                .any(|e| e.contains("stale bundle revision")),
+            "cross-state candidate must not be stale-refused: {report:?}"
+        );
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert!(
+            report
+                .combinations
+                .iter()
+                .any(|e| e.contains("archive + edit")),
+            "the candidate reached the combination machinery: {report:?}"
+        );
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("row present");
+        assert_eq!(
+            payload.metadata["mesh"]["lifecycle_state"],
+            json!("archived"),
+            "the combination stored the row archived: {:?}",
+            payload.metadata
+        );
+        assert_eq!(
+            payload.content, "newer revision",
+            "combination semantics: the Active (local) side's edited \
+             content is kept, not the candidate's; report: {report:?}"
+        );
+    }
+
+    /// Scope negative (private-row precedence): the private-memory guard
+    /// in `apply_one` answers BEFORE the stale-bundle guard is ever
+    /// consulted (a private row has no mesh `update_id`, so the stale
+    /// guard's `Some(accepted)` branch is unreachable for it). The
+    /// candidate below is shaped exactly as a stale candidate would be
+    /// against a mesh-owned Active row at the newer revision — live
+    /// Active state, changed content, an OLDER v7 `update_id` — and it
+    /// arrives via the bundle route on a diff pass, the only route/pass
+    /// where the stale guard can fire. The report must carry the
+    /// private-memory refusal and NOT the stale refusal, and the private
+    /// row must be untouched.
+    #[tokio::test]
+    async fn tracked_stale_bundle_against_private_row_reports_private_not_stale() {
+        let (_base, mesh) = mesh_with_commit("tracked-stale-private");
+        // Commit the mesh bootstrap files so the checkout is clean for
+        // the passes below (a plain `commit_all` leaves no record yet).
+        mesh.commit_all("bootstrap", "node-peer-1").unwrap();
+        let id = Uuid::new_v4();
+        let store = fresh_store("tracked-stale-private").await;
+        // Seed the private row: no mesh provenance at all (mirrors
+        // `private_row_with_same_id_is_never_stomped`).
+        store.init("probe").await.unwrap();
+        store
+            .upsert(
+                "probe",
+                &id.to_string(),
+                emb().embed("my private note").await.unwrap(),
+                MemoryPayload {
+                    content: "my private note".to_string(),
+                    user_id: "me".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"source": "hand-written"}),
+                },
+            )
+            .await
+            .unwrap();
+        // Prime the cursor with a pass over the still record-less mesh,
+        // so the bundle presentation below is a DIFF pass (the stale
+        // guard is inert on full-tree passes, which would make the
+        // precedence claim vacuous).
+        let served = ["probe".to_string()];
+        let priming = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("priming pass completes");
+        assert_eq!(priming.applied, 0, "priming report: {priming:?}");
+
+        let candidate: MeshRecord = serde_json::from_value(revision_value(
+            id,
+            "active",
+            "older stale revision",
+            v7_update_id(REV_OLD_MILLIS, 0x19),
+        ))
+        .unwrap();
+        crate::synaptic_mesh::worker::write_compressed_bundle(
+            &mesh.root().join("bundles"),
+            "priv",
+            &[candidate],
+        )
+        .expect("bundle writes");
+        mesh.commit_all("bundle artifact", "node-peer-1").unwrap();
+        force_track_bundle(&mesh, "bundles/priv.bundle.zst");
+
+        let report = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("bundle presentation pass completes");
+        assert!(
+            !report.full_tree,
+            "the presentation must be a diff pass: {report:?}"
+        );
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(
+            report
+                .ignored
+                .iter()
+                .any(|e| e.contains("private memory owns id")),
+            "the private-memory refusal is reported: {report:?}"
+        );
+        assert!(
+            !report
+                .ignored
+                .iter()
+                .any(|e| e.contains("stale bundle revision")),
+            "the stale refusal must not pre-empt the private guard: {report:?}"
+        );
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("private row still present");
+        assert_eq!(payload.content, "my private note", "content preserved");
+        assert!(
+            payload.metadata.get("mesh").is_none(),
+            "no provenance was injected into a private row"
+        );
+    }
+
     // ---- issue #43: bundle gate parity -----------------------------------
     //
     // A bundle-only record must pass the same pre-apply gate as a `.json`
