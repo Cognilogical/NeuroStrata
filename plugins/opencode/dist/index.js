@@ -206,7 +206,9 @@ function effectiveProjectRoot(config) {
 function pathRelativeToProjectRoot(filePath, config) {
     const root = effectiveProjectRoot(config);
     try {
-        const resolved = resolve(filePath);
+        // Resolve a relative filePath against the project root (not process.cwd())
+        // so the startsWith check below is meaningful when cwd != projectRoot.
+        const resolved = resolve(root, filePath);
         const rootWithSep = root.endsWith("/") ? root : root + "/";
         if (resolved === root || resolved.startsWith(rootWithSep)) {
             return resolved.slice(root.length).replace(/^\/+/, "");
@@ -413,6 +415,8 @@ export const READ_FILE_TOOLS = new Set([
     "read",
     "Read",
     "read_file",
+    "grep",
+    "Grep",
     "view",
     "cat",
 ]);
@@ -1092,6 +1096,8 @@ export function resetState() {
     cachedTaskInjection.clear();
     subagentFileRecallCache.clear();
     pendingPrefetchDeliveries.clear();
+    prefetchedPaths.clear();
+    injectedMemoryIds.clear();
     resetAllSessionEpochs();
 }
 export function resetClientForTesting() {
@@ -1320,6 +1326,8 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
     "neurostrata_archive_memory",
     "neurostrata_supersede_memory",
     "neurostrata_update_memory",
+    "neurostrata_guard_validate",
+    "neurostrata_memories_for_file",
 ]);
 const executeAfterHandler = async (output, secondArg) => {
     // The host may pass (input, output) or a single `output`/`event` argument
@@ -1334,20 +1342,26 @@ const executeAfterHandler = async (output, secondArg) => {
     const event = target;
     const toolName = extractToolName(event);
     // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
-    // Read raw tool text in priority order.
+    // Read raw tool text in priority order. OpenCode v2.2.6 delivers
+    // `event.result.content` as an array of content parts `[{ type: "text", text: ... }]`.
     const rawText = typeof event?.result?.content === "string"
         ? event.result.content
-        : typeof event?.result?.output === "string"
-            ? event.result.output
-            : typeof event?.output === "string"
-                ? event.output
-                : typeof event?.result === "string"
-                    ? event.result
-                    : typeof event?.response === "string"
-                        ? event.response
-                        : typeof event?.content === "string"
-                            ? event.content
-                            : "";
+        : Array.isArray(event?.result?.content)
+            ? event.result.content
+                .filter((p) => p && p.type === "text" && typeof p.text === "string")
+                .map((p) => p.text)
+                .join("\n")
+            : typeof event?.result?.output === "string"
+                ? event.result.output
+                : typeof event?.output === "string"
+                    ? event.output
+                    : typeof event?.result === "string"
+                        ? event.result
+                        : typeof event?.response === "string"
+                            ? event.response
+                            : typeof event?.content === "string"
+                                ? event.content
+                                : "";
     const sessionId = asString(event?.sessionID ?? event?.session_id);
     const epoch = currentSessionEpoch(sessionId);
     const suffixParts = [];
@@ -1377,17 +1391,21 @@ const executeAfterHandler = async (output, secondArg) => {
             const dedupKey = `${sessionId ?? "__no_session__"}:${epoch}:${normalizedPath}`;
             const seen = sessionSeenFiles(sessionId);
             if (!seen.has(dedupKey)) {
-                seen.add(dedupKey);
                 let snippets = [];
                 try {
                     snippets = await prefetchMemoriesForFile(config.namespace, fp, {
                         recordLedgerDir: config.projectRoot,
                     });
+                    // Only mark the path as seen once the prefetch has actually run;
+                    // a failed/empty prefetch leaves the path unmarked so a retry
+                    // re-queries the governing memories.
+                    seen.add(dedupKey);
                 }
                 catch {
                     snippets = [];
                 }
                 if (snippets.length > 0) {
+                    confirmPrefetchDelivery(config.namespace, fp);
                     suffixParts.push(`[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join("\n")}`);
                 }
             }
@@ -1398,22 +1416,38 @@ const executeAfterHandler = async (output, secondArg) => {
     const combined = rawText
         ? `${legacyPrefix}${rawText}${newSuffix ? "\n\n" + newSuffix : ""}`
         : `${legacyPrefix}${newSuffix}`;
-    if (combined && event && typeof event === "object") {
+    // Only mutate the event when there is actually something to prepend or
+    // append; otherwise leave event.result.content / output / content untouched
+    // (preserving the tool's original output, including V2 content arrays).
+    const hasAnything = !!pendingBlock || newSuffix !== "";
+    if (hasAnything && event && typeof event === "object") {
         // OpenCode V2: mutate event.result.content in-place (and result.output).
         if (event.result && typeof event.result === "object") {
-            event.result.content = combined;
+            if (Array.isArray(event.result.content)) {
+                const nonText = event.result.content.filter((p) => p && p.type !== "text");
+                event.result.content = [...nonText, { type: "text", text: combined }];
+            }
+            else {
+                event.result.content = combined;
+            }
             if (typeof event.result.output === "string")
                 event.result.output = combined;
         }
         // Preserve legacy top-level fields for V1 / Claude / Hermes harnesses.
-        if (typeof event.additionalContext === "string") {
-            event.additionalContext += (event.additionalContext.length ? "\n" : "") + newSuffix;
-            if (pendingBlock && !event.additionalContext.includes(pendingBlock)) {
-                event.additionalContext = `${pendingBlock}\n\n${event.additionalContext}`;
+        if (newSuffix !== "") {
+            if (typeof event.additionalContext === "string") {
+                event.additionalContext +=
+                    (event.additionalContext.length ? "\n" : "") + newSuffix;
+                if (pendingBlock && !event.additionalContext.includes(pendingBlock)) {
+                    event.additionalContext = `${pendingBlock}\n\n${event.additionalContext}`;
+                }
+            }
+            else {
+                event.additionalContext = suffixParts.join("\n\n");
             }
         }
-        else {
-            event.additionalContext = suffixParts.join("\n\n");
+        else if (pendingBlock && typeof event.additionalContext === "string") {
+            event.additionalContext = pendingBlock;
         }
         if (typeof event.output === "string")
             event.output = combined;

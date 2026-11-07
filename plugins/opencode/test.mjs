@@ -573,3 +573,55 @@ test("OpenCode V2 execute.after mutates event.result.content and registers sessi
   await sessionHooks.get("context")(ctxEvent3);
   assert.match(ctxEvent3.additionalContext, /neurostrata-a1si/);
 });
+
+test("OpenCode V2 execute.after preserves array content[0].text and appends TASK INTENT DETECTED", async () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), "ns-oc2-array-"));
+  const nsDir = join(tmpDir, ".NeuroStrata");
+  mkdirSync(nsDir, { recursive: true });
+  writeFileSync(
+    join(nsDir, "active_session.json"),
+    JSON.stringify({
+      namespace: "NeuroStrata",
+      task_id: "neurostrata-a1si",
+      status: "in_progress",
+      session_id: "ses_array",
+      updated_at: new Date().toISOString(),
+    }),
+  );
+
+  const toolHooks = new Map();
+  const ctx = {
+    location: {
+      directory: tmpDir,
+      project: { root: tmpDir, canonical: tmpDir },
+    },
+    session: {
+      hook() {},
+    },
+    tool: {
+      hook(name, fn) {
+        toolHooks.set(name, fn);
+      },
+    },
+  };
+
+  await plugin.initialize(ctx);
+  assert.equal(typeof toolHooks.get("execute.after"), "function");
+
+  const afterEvent = {
+    name: "read",
+    callID: "call_array_1",
+    args: { path: "src/server.rs" },
+    status: "completed",
+    result: {
+      content: [{ type: "text", text: "Read file src/server.rs\nTODO: wire candidate" }],
+      output: "Read file src/server.rs\nTODO: wire candidate",
+    },
+  };
+  await toolHooks.get("execute.after")(afterEvent);
+  assert.ok(Array.isArray(afterEvent.result.content), "result.content stays an array");
+  assert.equal(afterEvent.result.content[0].type, "text", "text item preserved");
+  assert.match(afterEvent.result.content[0].text, /Read file src\/server\.rs/, "original text kept");
+  assert.match(afterEvent.result.content[0].text, /TASK INTENT DETECTED/, "nudge appended to text");
+  assert.match(afterEvent.result.output, /TASK INTENT DETECTED/, "result.output also mutated");
+});
