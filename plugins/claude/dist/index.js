@@ -152,6 +152,72 @@ export function discoverProjectNamespace(startDir = process.cwd()) {
     return basename(root) || "default";
 }
 // ──────────────────────────────────────────────────────────────────────
+// OpenCode V2 project-root & namespace resolution
+// ──────────────────────────────────────────────────────────────────────
+/**
+ * Resolve the project root from an OpenCode V2 host context, falling back
+ * through ctx fields to process.cwd(). Priority:
+ *   1. ctx.location.project.canonical
+ *   2. ctx.location.project.root
+ *   3. ctx.location.directory
+ *   4. ctx.projectDir
+ *   5. ctx.directory
+ *   6. ctx.cwd
+ *   7. process.cwd()
+ */
+export function resolveProjectRoot(ctx) {
+    const c = ctx ?? {};
+    return (asString(c?.location?.project?.canonical) ??
+        asString(c?.location?.project?.root) ??
+        asString(c?.location?.directory) ??
+        asString(c?.projectDir) ??
+        asString(c?.directory) ??
+        asString(c?.cwd) ??
+        process.cwd());
+}
+/**
+ * Load an optional plugin config from <projectRoot>/.NeuroStrata/
+ * (neurostrata-plugin.json, then PluginConfig.json). Missing or malformed
+ * files are a no-op; the host-supplied ctx.config always wins the merge.
+ */
+function loadPluginConfigFromDisk(projectRoot) {
+    for (const file of ["neurostrata-plugin.json", "PluginConfig.json"]) {
+        const p = join(projectRoot, ".NeuroStrata", file);
+        if (existsSync(p)) {
+            try {
+                return asRecord(JSON.parse(readFileSync(p, "utf8")));
+            }
+            catch {
+                // ignore malformed / unreadable config files
+            }
+        }
+    }
+    return {};
+}
+/** Effective project root for reading .NeuroStrata state files. */
+function effectiveProjectRoot(config) {
+    return config.projectRoot ?? resolveProjectRoot();
+}
+/**
+ * Make a touched-file path relative to the project root when it lives under
+ * it, so the injected `[NeuroStrata File Context — <relPath>]` block is
+ * stable and short. Falls back to the raw path otherwise.
+ */
+function pathRelativeToProjectRoot(filePath, config) {
+    const root = effectiveProjectRoot(config);
+    try {
+        const resolved = resolve(filePath);
+        const rootWithSep = root.endsWith("/") ? root : root + "/";
+        if (resolved === root || resolved.startsWith(rootWithSep)) {
+            return resolved.slice(root.length).replace(/^\/+/, "");
+        }
+    }
+    catch {
+        // fall through to the raw path
+    }
+    return filePath;
+}
+// ──────────────────────────────────────────────────────────────────────
 // Credential
 // ──────────────────────────────────────────────────────────────────────
 export function daemonTokenPath(tokenFile) {
@@ -1026,6 +1092,7 @@ export function resetState() {
     cachedTaskInjection.clear();
     subagentFileRecallCache.clear();
     pendingPrefetchDeliveries.clear();
+    resetAllSessionEpochs();
 }
 export function resetClientForTesting() {
     mcpClient = undefined;
@@ -1033,6 +1100,94 @@ export function resetClientForTesting() {
 }
 export function getTrackingState() {
     return { activeTaskId, activeSessionId, mutationsSinceNote };
+}
+const sessionEpochs = new Map();
+function sessionEpochState(sessionId) {
+    const sid = sessionId ?? "__default__";
+    let state = sessionEpochs.get(sid);
+    if (!state) {
+        state = { epoch: 0, baselineInjectedEpoch: -1, seenFiles: new Set() };
+        sessionEpochs.set(sid, state);
+    }
+    return state;
+}
+/** Current epoch for a session (starts at 0, incremented by compaction). */
+export function currentSessionEpoch(sessionId) {
+    return sessionEpochState(sessionId).epoch;
+}
+/** Increment the epoch and clear seen files so the next context hook re-injects. */
+export function incrementSessionEpoch(sessionId) {
+    const st = sessionEpochState(sessionId);
+    st.epoch += 1;
+    st.seenFiles.clear();
+    st.baselineInjectedEpoch = -1;
+}
+export function sessionSeenFiles(sessionId) {
+    return sessionEpochState(sessionId).seenFiles;
+}
+export function resetSessionEpoch(sessionId) {
+    sessionEpochs.delete(sessionId ?? "__default__");
+}
+export function resetAllSessionEpochs() {
+    sessionEpochs.clear();
+}
+/**
+ * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
+ * from the project root; when an active task exists and its baseline has not
+ * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
+ * Same-epoch repeat calls leave the event untouched.
+ */
+export async function sessionContextHandler(event, config) {
+    const sessionId = asString(event?.sessionID ?? event?.session_id);
+    const st = sessionEpochState(sessionId);
+    const projectRoot = effectiveProjectRoot(config);
+    let active = null;
+    const sessionPath = join(projectRoot, ".NeuroStrata", "active_session.json");
+    if (existsSync(sessionPath)) {
+        try {
+            active = asRecord(JSON.parse(readFileSync(sessionPath, "utf8")));
+        }
+        catch {
+            active = null;
+        }
+    }
+    const taskId = asString(active?.task_id);
+    if (!active || !taskId)
+        return; // no active task: nothing to baseline-inject
+    if (st.baselineInjectedEpoch !== st.epoch) {
+        st.baselineInjectedEpoch = st.epoch;
+        const ns = asString(active.namespace) ?? config.namespace;
+        const status = asString(active.status) ?? "";
+        const message = `[NeuroStrata Active Context] Namespace: ${ns} | Active Task: ${taskId} [${status}]`;
+        let extra = "";
+        const injection = asString(active.subagent_prompt_injection);
+        if (injection)
+            extra += `\n${injection.trim()}`;
+        const bridges = active.conceptual_bridges;
+        if (bridges !== undefined && bridges !== null) {
+            extra += `\n[NeuroStrata Conceptual Bridges] ${String(bridges)}`;
+        }
+        const full = message + extra;
+        if (typeof event.additionalContext === "string") {
+            event.additionalContext += `\n${full}`;
+        }
+        else {
+            event.additionalContext = full;
+        }
+        if (Array.isArray(event?.context)) {
+            event.context.push(full);
+        }
+    }
+    // Same epoch: leave event.additionalContext untouched.
+}
+/**
+ * `session.hook("compaction")` handler. Increments the session epoch and
+ * clears seen files, so the very next context hook re-injects the active
+ * task / rules baseline.
+ */
+export async function sessionCompactionHandler(event, config) {
+    const sessionId = asString(event?.sessionID ?? event?.session_id);
+    incrementSessionEpoch(sessionId);
 }
 // ──────────────────────────────────────────────────────────────────────
 // Bug 5: execute.before / execute.after recall delivery
@@ -1142,6 +1297,30 @@ function extractFilePath(args, altArgs, rawPatch) {
                 extractPatchPath(altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input))
             : undefined));
 }
+/**
+ * Tool-name extraction for execute.after events. OpenCode V2 passes
+ * `event.name`; V1 / Claude / Hermes pass `event.tool` / `event.tool_name`.
+ * `event.toolName` is checked first.
+ */
+export function extractToolName(event) {
+    return (asString(event?.toolName) ??
+        asString(event?.tool) ??
+        asString(event?.name) ??
+        asString(event?.tool_name) ??
+        asString(event?.action) ??
+        asString(event?.command) ??
+        "");
+}
+/** Native NeuroStrata control-plane tools: never nudge on these. */
+const NEUROSTRATA_NATIVE_TOOLS = new Set([
+    "neurostrata_task_claim",
+    "neurostrata_task_update",
+    "neurostrata_task_complete",
+    "neurostrata_add_memory",
+    "neurostrata_archive_memory",
+    "neurostrata_supersede_memory",
+    "neurostrata_update_memory",
+]);
 const executeAfterHandler = async (output, secondArg) => {
     // The host may pass (input, output) or a single `output`/`event` argument
     // whose `.output` holds the real output. Resolve metadata and target object.
@@ -1152,16 +1331,94 @@ const executeAfterHandler = async (output, secondArg) => {
         target = target.output;
     }
     const targetRec = asRecord(target);
-    const block = consumePendingRecall(meta, targetRec) ??
+    const event = target;
+    const toolName = extractToolName(event);
+    // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
+    // Read raw tool text in priority order.
+    const rawText = typeof event?.result?.content === "string"
+        ? event.result.content
+        : typeof event?.result?.output === "string"
+            ? event.result.output
+            : typeof event?.output === "string"
+                ? event.output
+                : typeof event?.result === "string"
+                    ? event.result
+                    : typeof event?.response === "string"
+                        ? event.response
+                        : typeof event?.content === "string"
+                            ? event.content
+                            : "";
+    const sessionId = asString(event?.sessionID ?? event?.session_id);
+    const epoch = currentSessionEpoch(sessionId);
+    const suffixParts = [];
+    // 1. Pending recall block delivered by execute.before (legacy V1 / Claude / Hermes).
+    const pendingBlock = consumePendingRecall(meta, targetRec) ??
         (targetRec ? targetRec.neurostrataContext : undefined) ??
         (meta ? meta.neurostrataContext : undefined);
-    if (block && target && typeof target === "object") {
-        const out = target;
-        if (typeof out.output === "string")
-            out.output = `${block}\n\n${out.output}`;
-        else if (typeof out.content === "string")
-            out.content = `${block}\n\n${out.content}`;
-        out.additionalContext = block;
+    if (pendingBlock)
+        suffixParts.push(pendingBlock);
+    // 2. Task-intent nudge on non-NeuroStrata-native tools.
+    if (toolName !== "" && !NEUROSTRATA_NATIVE_TOOLS.has(toolName) && config.intentDetection.injectReminder) {
+        const signals = detectTaskIntentsLocal(rawText);
+        if (signals.length > 0) {
+            const markerList = signals.map((s) => s.marker).join(", ");
+            suffixParts.push(`[NeuroStrata Plugin — TASK INTENT DETECTED]\nDetected intent markers: ${markerList} — consider creating a task to track this work.`);
+        }
+    }
+    // 3. JIT file-touch recall (deduplicated per sessionId:epoch:normalizedPath).
+    if (toolName !== "" && isFileTouchTool(toolName)) {
+        const filePath = event?.args?.path ??
+            event?.args?.filePath ??
+            event?.input?.path ??
+            event?.toolInput?.path;
+        if (filePath) {
+            const fp = String(filePath);
+            const normalizedPath = pathRelativeToProjectRoot(fp, config);
+            const dedupKey = `${sessionId ?? "__no_session__"}:${epoch}:${normalizedPath}`;
+            const seen = sessionSeenFiles(sessionId);
+            if (!seen.has(dedupKey)) {
+                seen.add(dedupKey);
+                let snippets = [];
+                try {
+                    snippets = await prefetchMemoriesForFile(config.namespace, fp, {
+                        recordLedgerDir: config.projectRoot,
+                    });
+                }
+                catch {
+                    snippets = [];
+                }
+                if (snippets.length > 0) {
+                    suffixParts.push(`[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join("\n")}`);
+                }
+            }
+        }
+    }
+    const legacyPrefix = pendingBlock ? `${pendingBlock}\n\n` : "";
+    const newSuffix = suffixParts.slice(pendingBlock ? 1 : 0).join("\n\n");
+    const combined = rawText
+        ? `${legacyPrefix}${rawText}${newSuffix ? "\n\n" + newSuffix : ""}`
+        : `${legacyPrefix}${newSuffix}`;
+    if (combined && event && typeof event === "object") {
+        // OpenCode V2: mutate event.result.content in-place (and result.output).
+        if (event.result && typeof event.result === "object") {
+            event.result.content = combined;
+            if (typeof event.result.output === "string")
+                event.result.output = combined;
+        }
+        // Preserve legacy top-level fields for V1 / Claude / Hermes harnesses.
+        if (typeof event.additionalContext === "string") {
+            event.additionalContext += (event.additionalContext.length ? "\n" : "") + newSuffix;
+            if (pendingBlock && !event.additionalContext.includes(pendingBlock)) {
+                event.additionalContext = `${pendingBlock}\n\n${event.additionalContext}`;
+            }
+        }
+        else {
+            event.additionalContext = suffixParts.join("\n\n");
+        }
+        if (typeof event.output === "string")
+            event.output = combined;
+        if (typeof event.content === "string")
+            event.content = combined;
     }
     return target ?? output;
 };
@@ -1332,7 +1589,12 @@ const executeBeforeHandler = async (input) => {
 let initializeResolveGuard = false;
 export async function initialize(ctx) {
     pluginCtx = ctx;
-    config = resolveConfig(ctx?.config ?? ctx?.pluginConfig ?? {});
+    const projectRoot = resolveProjectRoot(ctx);
+    const diskConfig = loadPluginConfigFromDisk(projectRoot);
+    const inputConfig = asRecord(ctx?.config ?? ctx?.pluginConfig ?? {});
+    // Host-supplied ctx.config wins over discovered disk config.
+    config = resolveConfig({ ...diskConfig, ...inputConfig }, projectRoot);
+    config.projectRoot = projectRoot;
     const token = config.bearerToken ?? loadDaemonToken(config.tokenFile);
     mcpClient = new NeuroStrataMCPClient({ endpoint: config.endpoint, token, timeoutMs: config.requestTimeoutMs });
     cachedTaskInjection.clear();
@@ -1357,6 +1619,12 @@ export async function initialize(ctx) {
     // on each ctx.tool.hook call and expect execute.before as the last registered hook).
     await registerHook("execute.after", executeAfterHandler);
     await registerHook("execute.before", executeBeforeHandler);
+    // OpenCode V2 session hooks: context injects the active-task baseline once per
+    // epoch; compaction bumps the epoch so the next context hook re-injects it.
+    if (typeof ctx?.session?.hook === "function") {
+        ctx.session.hook("context", (event) => sessionContextHandler(event, config));
+        ctx.session.hook("compaction", (event) => sessionCompactionHandler(event, config));
+    }
     // Claude Code style hook events.
     if (ctx?.hooks?.PreToolUse && typeof ctx.hooks.PreToolUse === "function") {
         await ctx.hooks.PreToolUse(async (event) => handleHookEvent(event));

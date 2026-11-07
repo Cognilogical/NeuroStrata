@@ -29,7 +29,11 @@ export interface PluginConfig {
         enabled: boolean;
         injectReminder: boolean;
     };
+    /** Resolved project root directory (set in initialize from ctx.location / cwd). */
+    projectRoot?: string;
 }
+/** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
+export type ResolvedConfig = PluginConfig;
 /**
  * Resolve `namespace` in strict priority order:
  *  1. pluginConfig.namespace (non-empty trimmed string)
@@ -50,6 +54,18 @@ export declare function findProjectRoot(startDir?: string): string;
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
 export declare function discoverProjectNamespace(startDir?: string): string;
+/**
+ * Resolve the project root from an OpenCode V2 host context, falling back
+ * through ctx fields to process.cwd(). Priority:
+ *   1. ctx.location.project.canonical
+ *   2. ctx.location.project.root
+ *   3. ctx.location.directory
+ *   4. ctx.projectDir
+ *   5. ctx.directory
+ *   6. ctx.cwd
+ *   7. process.cwd()
+ */
+export declare function resolveProjectRoot(ctx?: any): string;
 export declare function daemonTokenPath(tokenFile?: string | null): string;
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
 export declare function buildHeaders(token: string | null): Record<string, string>;
@@ -218,8 +234,39 @@ export declare function getTrackingState(): {
     activeSessionId: string | null;
     mutationsSinceNote: number;
 };
+export interface SessionEpochState {
+    epoch: number;
+    baselineInjectedEpoch: number;
+    seenFiles: Set<string>;
+}
+/** Current epoch for a session (starts at 0, incremented by compaction). */
+export declare function currentSessionEpoch(sessionId: string | null | undefined): number;
+/** Increment the epoch and clear seen files so the next context hook re-injects. */
+export declare function incrementSessionEpoch(sessionId: string | null | undefined): void;
+export declare function sessionSeenFiles(sessionId: string | null | undefined): Set<string>;
+export declare function resetSessionEpoch(sessionId: string | null | undefined): void;
+export declare function resetAllSessionEpochs(): void;
+/**
+ * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
+ * from the project root; when an active task exists and its baseline has not
+ * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
+ * Same-epoch repeat calls leave the event untouched.
+ */
+export declare function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void>;
+/**
+ * `session.hook("compaction")` handler. Increments the session epoch and
+ * clears seen files, so the very next context hook re-injects the active
+ * task / rules baseline.
+ */
+export declare function sessionCompactionHandler(event: any, config: ResolvedConfig): Promise<void>;
 export declare const pendingRecallBlocks: string[];
 export declare const pendingRecallByCall: Map<string, string>;
+/**
+ * Tool-name extraction for execute.after events. OpenCode V2 passes
+ * `event.name`; V1 / Claude / Hermes pass `event.tool` / `event.tool_name`.
+ * `event.toolName` is checked first.
+ */
+export declare function extractToolName(event: any): string;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;
