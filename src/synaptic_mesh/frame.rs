@@ -267,12 +267,23 @@ impl std::fmt::Display for SovereigntyGateError {
 
 impl std::error::Error for SovereigntyGateError {}
 
-/// Strip node-local procedural runtime counters before a procedure definition is shared.
+/// Strip node-local procedural runtime counters recursively before a record is shared.
 pub fn strip_procedure_runtime_counters(metadata: &mut serde_json::Value) {
-    if let Some(obj) = metadata.as_object_mut() {
-        for key in FORBIDDEN_PROCEDURE_COUNTER_KEYS {
-            obj.remove(*key);
+    match metadata {
+        serde_json::Value::Object(obj) => {
+            for key in FORBIDDEN_PROCEDURE_COUNTER_KEYS {
+                obj.remove(*key);
+            }
+            for child in obj.values_mut() {
+                strip_procedure_runtime_counters(child);
+            }
         }
+        serde_json::Value::Array(arr) => {
+            for child in arr {
+                strip_procedure_runtime_counters(child);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -298,13 +309,12 @@ pub fn validate_egress_candidate(
     Ok(())
 }
 
-/// Ingress Gate: verify frame size, `mesh_id`, `epoch`, Ed25519 signature, ReBAC `visible_to`,
-/// absence of forbidden procedure runtime counters, and finite `TwinDelta` numbers.
-pub fn validate_ingress_frame(
+/// Wire-level envelope verification (size, `mesh_id`, `epoch`, Ed25519 signature,
+/// absence of forbidden procedure runtime counters, and finite `TwinDelta` numbers).
+pub fn validate_wire_envelope(
     frame: &MeshFrame,
     expected_mesh_id: &str,
     expected_epoch: u64,
-    local_did: &str,
 ) -> Result<(), SovereigntyGateError> {
     let encoded_len = serde_json::to_vec(frame)
         .map(|v| v.len())
@@ -325,12 +335,6 @@ pub fn validate_ingress_frame(
         });
     }
     frame.verify_signature()?;
-
-    if !frame.visible_to.is_empty() && !frame.visible_to.iter().any(|did| did == local_did) {
-        return Err(SovereigntyGateError::UnauthorizedRecipient(
-            local_did.to_string(),
-        ));
-    }
 
     match &frame.kind {
         MeshPayloadKind::CognitiveDelta { record, .. } => {
@@ -357,6 +361,24 @@ pub fn validate_ingress_frame(
         MeshPayloadKind::TaskDelta { .. }
         | MeshPayloadKind::TaskLeaseDelta { .. }
         | MeshPayloadKind::SyncHello(_) => {}
+    }
+
+    Ok(())
+}
+
+/// Ingress Gate: verify wire envelope plus recipient ReBAC `visible_to`.
+pub fn validate_ingress_frame(
+    frame: &MeshFrame,
+    expected_mesh_id: &str,
+    expected_epoch: u64,
+    local_did: &str,
+) -> Result<(), SovereigntyGateError> {
+    validate_wire_envelope(frame, expected_mesh_id, expected_epoch)?;
+
+    if !frame.visible_to.is_empty() && !frame.visible_to.iter().any(|did| did == local_did) {
+        return Err(SovereigntyGateError::UnauthorizedRecipient(
+            local_did.to_string(),
+        ));
     }
 
     Ok(())

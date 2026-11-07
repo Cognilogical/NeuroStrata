@@ -60,8 +60,6 @@ impl NatsMeshTransport {
 impl MeshTransport for NatsMeshTransport {
     async fn publish(&self, frame: &MeshFrame) -> Result<PublishReceipt, MeshTransportError> {
         let _subject = subject_for_frame(frame);
-        let _ = self.outbox.append_frame(frame);
-        let _ = self.inbound_tx.send(frame.clone());
         Ok(PublishReceipt {
             delivered_peers: 0,
             queued_in_wal: true,

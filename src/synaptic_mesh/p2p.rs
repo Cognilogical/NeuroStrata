@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
 use crate::synaptic_mesh::frame::{
-    validate_ingress_frame, MeshFrame, SyncHello, TaskLease, MAX_MESH_FRAME_BYTES,
+    validate_wire_envelope, MeshFrame, SyncHello, TaskLease, MAX_MESH_FRAME_BYTES,
 };
 use crate::synaptic_mesh::outbox::Outbox;
 use crate::synaptic_mesh::transport::{
@@ -145,68 +145,67 @@ impl P2pMeshTransport {
     }
 
     async fn handle_inbound_stream(&self, stream: &mut TcpStream) -> Result<(), MeshTransportError> {
-        let mut len_buf = [0u8; 4];
-        if stream.read_exact(&mut len_buf).await.is_err() {
-            return Ok(());
-        }
-        let payload_len = u32::from_be_bytes(len_buf) as usize;
-        if payload_len < GCM_NONCE_LEN + GCM_TAG_LEN
-            || payload_len > MAX_MESH_FRAME_BYTES + GCM_NONCE_LEN + GCM_TAG_LEN
-        {
-            self.record_rejected_frame();
-            return Err(MeshTransportError::FrameTooLarge(payload_len));
-        }
-        let mut body = vec![0u8; payload_len];
-        stream
-            .read_exact(&mut body)
-            .await
-            .map_err(|e| MeshTransportError::Io(e.to_string()))?;
-
-        let nonce = &body[..GCM_NONCE_LEN];
-        let tag = &body[GCM_NONCE_LEN..GCM_NONCE_LEN + GCM_TAG_LEN];
-        let ciphertext = &body[GCM_NONCE_LEN + GCM_TAG_LEN..];
-
-        let cipher = Cipher::aes_256_gcm();
-        let plain = match decrypt_aead(
-            cipher,
-            &self.mesh_psk,
-            Some(nonce),
-            self.mesh_id.as_bytes(),
-            ciphertext,
-            tag,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                self.record_rejected_frame();
-                return Err(MeshTransportError::Auth(format!("AEAD decrypt failed: {e}")));
+        loop {
+            let mut len_buf = [0u8; 4];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                return Ok(());
             }
-        };
-
-        let frame: MeshFrame = match serde_json::from_slice(&plain) {
-            Ok(f) => f,
-            Err(e) => {
+            let payload_len = u32::from_be_bytes(len_buf) as usize;
+            if payload_len < GCM_NONCE_LEN + GCM_TAG_LEN
+                || payload_len > MAX_MESH_FRAME_BYTES + GCM_NONCE_LEN + GCM_TAG_LEN
+            {
                 self.record_rejected_frame();
-                return Err(MeshTransportError::Auth(format!("invalid MeshFrame json: {e}")));
+                return Err(MeshTransportError::FrameTooLarge(payload_len));
             }
-        };
+            let mut body = vec![0u8; payload_len];
+            stream
+                .read_exact(&mut body)
+                .await
+                .map_err(|e| MeshTransportError::Io(e.to_string()))?;
 
-        if let Err(e) =
-            validate_ingress_frame(&frame, &self.mesh_id, self.epoch, &frame.origin_node_id)
-        {
-            self.record_rejected_frame();
-            return Err(MeshTransportError::Auth(e.to_string()));
+            let nonce = &body[..GCM_NONCE_LEN];
+            let tag = &body[GCM_NONCE_LEN..GCM_NONCE_LEN + GCM_TAG_LEN];
+            let ciphertext = &body[GCM_NONCE_LEN + GCM_TAG_LEN..];
+
+            let cipher = Cipher::aes_256_gcm();
+            let plain = match decrypt_aead(
+                cipher,
+                &self.mesh_psk,
+                Some(nonce),
+                self.mesh_id.as_bytes(),
+                ciphertext,
+                tag,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.record_rejected_frame();
+                    return Err(MeshTransportError::Auth(format!("AEAD decrypt failed: {e}")));
+                }
+            };
+
+            let frame: MeshFrame = match serde_json::from_slice(&plain) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.record_rejected_frame();
+                    return Err(MeshTransportError::Auth(format!(
+                        "invalid MeshFrame json: {e}"
+                    )));
+                }
+            };
+
+            if let Err(e) = validate_wire_envelope(&frame, &self.mesh_id, self.epoch) {
+                self.record_rejected_frame();
+                return Err(MeshTransportError::Auth(e.to_string()));
+            }
+
+            let _ = self.inbound_tx.send(frame);
         }
-
-        let _ = self.outbox.append_frame(&frame);
-        let _ = self.inbound_tx.send(frame);
-        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl MeshTransport for P2pMeshTransport {
     async fn publish(&self, frame: &MeshFrame) -> Result<PublishReceipt, MeshTransportError> {
-        let _ = self.outbox.append_frame(frame);
         let packet = self.encrypt_wire_packet(frame)?;
         let peers = self
             .peer_addrs

@@ -71,6 +71,8 @@ struct TwinMirrorState {
     vars: BTreeMap<String, TwinVarCell>,
 }
 
+const MAX_REORDER_BUFFER_PER_PEER: usize = 64;
+
 /// Coordinates outbound frame signing/publishing and inbound per-stratum state merges.
 pub struct MeshReactor {
     mesh_id: String,
@@ -84,6 +86,8 @@ pub struct MeshReactor {
     next_seq: AtomicU64,
     lamport_clock: AtomicU64,
     seen_frames: Mutex<BTreeSet<(String, u64)>>,
+    last_contiguous_seq: Mutex<BTreeMap<String, u64>>,
+    reorder_buffer: Mutex<BTreeMap<String, BTreeMap<u64, MeshFrame>>>,
     local_private_ids: Mutex<BTreeSet<String>>,
     cognitive_records: Mutex<BTreeMap<String, MeshRecord>>,
     tasks: Mutex<BTreeMap<String, serde_json::Value>>,
@@ -103,6 +107,13 @@ impl MeshReactor {
         conflicts_dir: PathBuf,
     ) -> Self {
         let initial_seq = outbox.max_seq_for(&local_did).unwrap_or(0);
+        let initial_cursors = outbox.all_peer_cursors().unwrap_or_default();
+        let mut initial_seen = BTreeSet::new();
+        for (peer, &max_s) in &initial_cursors {
+            for s in 1..=max_s {
+                initial_seen.insert((peer.clone(), s));
+            }
+        }
         Self {
             mesh_id,
             epoch,
@@ -114,7 +125,9 @@ impl MeshReactor {
             conflicts_dir,
             next_seq: AtomicU64::new(initial_seq),
             lamport_clock: AtomicU64::new(initial_seq),
-            seen_frames: Mutex::new(BTreeSet::new()),
+            seen_frames: Mutex::new(initial_seen),
+            last_contiguous_seq: Mutex::new(initial_cursors),
+            reorder_buffer: Mutex::new(BTreeMap::new()),
             local_private_ids: Mutex::new(BTreeSet::new()),
             cognitive_records: Mutex::new(BTreeMap::new()),
             tasks: Mutex::new(BTreeMap::new()),
@@ -136,13 +149,40 @@ impl MeshReactor {
         visible_to: Vec<String>,
         mut kind: MeshPayloadKind,
     ) -> Result<MeshFrame, ReactorApplyError> {
-        if let MeshPayloadKind::CognitiveDelta { ref mut record, .. } = kind {
-            if record.memory_type == "procedure" {
+        match &mut kind {
+            MeshPayloadKind::CognitiveDelta { record, .. } => {
                 strip_procedure_runtime_counters(&mut record.metadata);
                 strip_procedure_runtime_counters(&mut record.content);
+                validate_egress_candidate(&record.memory_type, &record.metadata)
+                    .map_err(ReactorApplyError::Sovereignty)?;
             }
-            validate_egress_candidate(&record.memory_type, &record.metadata)
-                .map_err(ReactorApplyError::Sovereignty)?;
+            MeshPayloadKind::TwinDelta {
+                changed_variables, ..
+            } => {
+                for (k, v) in changed_variables.iter() {
+                    if !v.is_finite() {
+                        return Err(ReactorApplyError::Sovereignty(
+                            SovereigntyGateError::NonFiniteTwinValue(k.clone()),
+                        ));
+                    }
+                }
+            }
+            MeshPayloadKind::TaskDelta { task_json, .. } => {
+                if let Some(elig) = task_json
+                    .get("metadata")
+                    .and_then(|m| m.get("eligibility"))
+                    .and_then(|v| v.as_str())
+                {
+                    if elig != "shareable" {
+                        return Err(ReactorApplyError::Sovereignty(
+                            SovereigntyGateError::NotShareable(format!(
+                                "task eligibility is '{elig}', required 'shareable'"
+                            )),
+                        ));
+                    }
+                }
+            }
+            MeshPayloadKind::TaskLeaseDelta { .. } | MeshPayloadKind::SyncHello(_) => {}
         }
 
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -192,6 +232,81 @@ impl MeshReactor {
             return Ok(ReactorApplyOutcome::NoOpDuplicate);
         }
 
+        // Check per-origin sequence continuity; buffer out-of-order frames
+        let expected_seq = self
+            .last_contiguous_seq
+            .lock()
+            .map_err(|_| ReactorApplyError::Storage("last_contiguous_seq lock".into()))?
+            .get(&frame.origin_node_id)
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        if frame.seq > expected_seq {
+            let mut buf = self
+                .reorder_buffer
+                .lock()
+                .map_err(|_| ReactorApplyError::Storage("reorder_buffer lock".into()))?;
+            let peer_buf = buf.entry(frame.origin_node_id.clone()).or_default();
+            if peer_buf.len() < MAX_REORDER_BUFFER_PER_PEER {
+                peer_buf.insert(frame.seq, frame.clone());
+            }
+            return Ok(ReactorApplyOutcome::BufferedOutOfOrder {
+                expected_seq,
+                got_seq: frame.seq,
+            });
+        }
+
+        let origin = frame.origin_node_id.clone();
+        let seq = frame.seq;
+        let primary_res = self.apply_single_verified_frame(frame, now_ms).await;
+        self.advance_contiguous_seq(&origin, seq)?;
+        let outcome = primary_res?;
+
+        // Drain any buffered contiguous follow-up frames for this origin
+        loop {
+            let next_expected = self
+                .last_contiguous_seq
+                .lock()
+                .map_err(|_| ReactorApplyError::Storage("last_contiguous_seq lock".into()))?
+                .get(&origin)
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            let next_frame = self
+                .reorder_buffer
+                .lock()
+                .map_err(|_| ReactorApplyError::Storage("reorder_buffer lock".into()))?
+                .get_mut(&origin)
+                .and_then(|m| m.remove(&next_expected));
+            let Some(buffered) = next_frame else {
+                break;
+            };
+            let b_seq = buffered.seq;
+            let _ = self.apply_single_verified_frame(buffered, now_ms).await;
+            self.advance_contiguous_seq(&origin, b_seq)?;
+        }
+
+        Ok(outcome)
+    }
+
+    fn advance_contiguous_seq(&self, origin: &str, seq: u64) -> Result<(), ReactorApplyError> {
+        let mut map = self
+            .last_contiguous_seq
+            .lock()
+            .map_err(|_| ReactorApplyError::Storage("last_contiguous_seq lock".into()))?;
+        let entry = map.entry(origin.to_string()).or_insert(0);
+        if seq > *entry {
+            *entry = seq;
+        }
+        Ok(())
+    }
+
+    async fn apply_single_verified_frame(
+        &self,
+        frame: MeshFrame,
+        now_ms: i64,
+    ) -> Result<ReactorApplyOutcome, ReactorApplyError> {
+        let key = (frame.origin_node_id.clone(), frame.seq);
         let outcome = match &frame.kind {
             MeshPayloadKind::CognitiveDelta { record, .. } => {
                 let rec_id = record.id.to_string();
@@ -346,6 +461,20 @@ impl MeshReactor {
 
     /// Compute missing frames from `frames.wal` to satisfy a peer's [`SyncHello`] cursor map.
     pub fn handle_sync_hello(&self, hello: &SyncHello) -> anyhow::Result<Vec<MeshFrame>> {
+        if hello.mesh_id != self.mesh_id {
+            anyhow::bail!(
+                "SyncHello mesh_id mismatch: expected {}, got {}",
+                self.mesh_id,
+                hello.mesh_id
+            );
+        }
+        if hello.epoch != self.epoch {
+            anyhow::bail!(
+                "SyncHello epoch mismatch: expected {}, got {}",
+                self.epoch,
+                hello.epoch
+            );
+        }
         let local_cursors = self.outbox.all_peer_cursors()?;
         let mut replay = Vec::new();
         for (origin, &max_seq) in &local_cursors {
@@ -387,6 +516,20 @@ fn merge_task_json(existing: &serde_json::Value, incoming: &serde_json::Value) -
                 "status".to_string(),
                 serde_json::Value::String(old_status.to_string()),
             );
+        }
+    }
+    if let (Some(old_notes), Some(new_notes)) = (
+        existing.get("notes").and_then(|v| v.as_array()),
+        incoming.get("notes").and_then(|v| v.as_array()),
+    ) {
+        let mut union_notes = old_notes.clone();
+        for n in new_notes {
+            if !union_notes.contains(n) {
+                union_notes.push(n.clone());
+            }
+        }
+        if let Some(obj) = merged.as_object_mut() {
+            obj.insert("notes".to_string(), serde_json::Value::Array(union_notes));
         }
     }
     merged
@@ -638,5 +781,170 @@ mod tests {
             })
             .unwrap();
         assert_eq!(catchup.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reactor_fixes_egress_validation_wal_dedup_gap_buffering_notes_and_hello_check() {
+        let psk = [0x66u8; 32];
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox_a = Arc::new(Outbox::open(&tmp.path().join("a2.outbox")).unwrap());
+        let outbox_b = Arc::new(Outbox::open(&tmp.path().join("b2.outbox")).unwrap());
+        let trans_a = P2pMeshTransport::bind("127.0.0.1:0", "m1".into(), 1, psk, outbox_a.clone())
+            .await
+            .unwrap();
+        let trans_b = P2pMeshTransport::bind("127.0.0.1:0", "m1".into(), 1, psk, outbox_b.clone())
+            .await
+            .unwrap();
+
+        let (pkey_a, did_a, _) = generate_keypair().unwrap();
+        let (pkey_b, did_b, _) = generate_keypair().unwrap();
+
+        let reactor_a = MeshReactor::new(
+            "m1".into(),
+            1,
+            did_a.clone(),
+            pkey_a,
+            outbox_a.clone(),
+            trans_a,
+            Arc::new(AttentionFilter::new()),
+            tmp.path().join("a2.conflicts"),
+        );
+        let reactor_b = MeshReactor::new(
+            "m1".into(),
+            1,
+            did_b.clone(),
+            pkey_b.clone(),
+            outbox_b.clone(),
+            trans_b.clone(),
+            Arc::new(AttentionFilter::new()),
+            tmp.path().join("b2.conflicts"),
+        );
+
+        // 1. Egress TwinDelta with NaN is rejected before sequencing
+        let nan_res = reactor_a
+            .publish_payload(
+                "ns",
+                vec![],
+                MeshPayloadKind::TwinDelta {
+                    twin_id: "t1".into(),
+                    version: 1,
+                    source: "sensor".into(),
+                    rdf_patch: String::new(),
+                    changed_variables: BTreeMap::from([("temp".into(), f64::NAN)]),
+                },
+            )
+            .await;
+        assert!(matches!(
+            nan_res,
+            Err(ReactorApplyError::Sovereignty(
+                SovereigntyGateError::NonFiniteTwinValue(_)
+            ))
+        ));
+
+        // 2. Egress TaskDelta with private eligibility is rejected before sequencing
+        let priv_task_res = reactor_a
+            .publish_payload(
+                "ns",
+                vec![],
+                MeshPayloadKind::TaskDelta {
+                    task_id: "t-priv".into(),
+                    action: TaskMeshAction::Created,
+                    task_json: serde_json::json!({
+                        "id": "t-priv",
+                        "status": "open",
+                        "metadata": { "eligibility": "private" }
+                    }),
+                    extracted_memory_ids: vec![],
+                },
+            )
+            .await;
+        assert!(matches!(
+            priv_task_res,
+            Err(ReactorApplyError::Sovereignty(
+                SovereigntyGateError::NotShareable(_)
+            ))
+        ));
+
+        // 3. Out-of-order gap buffering: seq 1 and seq 2 published by A; B receives seq 2 first
+        let f1 = reactor_a
+            .publish_payload(
+                "ns",
+                vec![],
+                MeshPayloadKind::TaskDelta {
+                    task_id: "t-gap".into(),
+                    action: TaskMeshAction::Created,
+                    task_json: serde_json::json!({
+                        "id": "t-gap",
+                        "status": "open",
+                        "notes": ["note-a"]
+                    }),
+                    extracted_memory_ids: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let f2 = reactor_a
+            .publish_payload(
+                "ns",
+                vec![],
+                MeshPayloadKind::TaskDelta {
+                    task_id: "t-gap".into(),
+                    action: TaskMeshAction::Updated,
+                    task_json: serde_json::json!({
+                        "id": "t-gap",
+                        "status": "in_progress",
+                        "notes": ["note-b"]
+                    }),
+                    extracted_memory_ids: vec![],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reactor_b.apply_inbound_frame(f2, 1000).await.unwrap(),
+            ReactorApplyOutcome::BufferedOutOfOrder {
+                expected_seq: 1,
+                got_seq: 2
+            }
+        );
+        // Applying f1 applies f1 AND drains buffered f2, unioning notes
+        assert_eq!(
+            reactor_b.apply_inbound_frame(f1.clone(), 1000).await.unwrap(),
+            ReactorApplyOutcome::Applied
+        );
+        let merged_task = reactor_b.get_task_state("t-gap").unwrap();
+        assert_eq!(merged_task["status"], "in_progress");
+        let notes = merged_task["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+
+        // 4. Restarted reactor seeds seen_frames from outbox and deduplicates f1
+        let reactor_b_restarted = MeshReactor::new(
+            "m1".into(),
+            1,
+            did_b.clone(),
+            pkey_b,
+            outbox_b,
+            trans_b,
+            Arc::new(AttentionFilter::new()),
+            tmp.path().join("b2.conflicts"),
+        );
+        assert_eq!(
+            reactor_b_restarted
+                .apply_inbound_frame(f1, 1000)
+                .await
+                .unwrap(),
+            ReactorApplyOutcome::NoOpDuplicate
+        );
+
+        // 5. handle_sync_hello rejects wrong mesh_id or epoch
+        assert!(reactor_a
+            .handle_sync_hello(&SyncHello {
+                node_id: did_b,
+                mesh_id: "wrong-mesh".into(),
+                epoch: 1,
+                peer_cursors: BTreeMap::new(),
+            })
+            .is_err());
     }
 }
