@@ -1599,6 +1599,7 @@ mod tests {
     /// hook gets the executable bit; on Windows, git runs the hook via the
     /// filename (`.git/hooks/<name>` without an extension, executed through
     /// Git Bash) rather than POSIX permissions, so the helper is a no-op.
+    #[cfg(unix)]
     #[test]
     fn set_hook_executable_marks_the_file_executable_on_unix() {
         use std::os::unix::fs::PermissionsExt;
