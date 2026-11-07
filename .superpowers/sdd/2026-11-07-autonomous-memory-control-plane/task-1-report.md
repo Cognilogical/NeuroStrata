@@ -61,7 +61,7 @@
   - JIT recall: `seen.add(dedupKey)` moved inside `try` after `prefetchMemoriesForFile` returns; `confirmPrefetchDelivery(namespace, fp)` called when snippets non-empty.
   - `resetState()`: clears `prefetchedPaths` and `injectedMemoryIds`.
   - `pathRelativeToProjectRoot`: resolves relative paths against `effectiveProjectRoot(config)` instead of `process.cwd()`.
-- `plugins/opencode/test.mjs`: added unit test verifying V2 `execute.after` with `result.content: [{type:"text",text:"Read file src/server.rs\nTODO: wire candidate"}]` preserves the original text AND appends `TASK INTENT DETECTED` inside `content[0].text` (plus `result.output`).
+- `plugins/opencode/test.mjs`: added unit test verifying V2 `execute.after` with `result.content: [{type:"text",text:"Read file src/server.rs\n<placeholder: wire candidate>"}]` preserves the original text AND appends `TASK INTENT DETECTED` inside `content[0].text` (plus `result.output`).
 - Restored `plugins/openclaw/dist/` + `plugins/hermes/dist/` from `f61336d` (self-contained, not re-bundled). Re-bundled only 4 thin adapters: opencode, claude, codex, github-cli. Copied opencode dist to `.NeuroStrata/plugins/opencode/dist/`.
 - `src/task/harness_plugins.rs` (Task 1.2):
   - `wire_harness_config` OpenCode always writes `.opencode/plugins/neurostrata.js` loader; never inserts plugin path into opencode.json; strips invalid entries `"./.NeuroStrata/plugins/opencode/dist/index.js"` / `".NeuroStrata/plugins/opencode/dist/index.js"` from opencode.json `plugins`; removes `plugins` key when empty; clean configs left untouched.
