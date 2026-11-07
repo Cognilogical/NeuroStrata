@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod mesh_service;
 pub mod outbox;
 pub mod p2p;
+pub mod reactor;
 pub mod record;
 pub mod storage;
 pub mod storage_api;
