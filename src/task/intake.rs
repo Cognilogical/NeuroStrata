@@ -66,7 +66,7 @@ pub fn category_to_kind(category: &Option<String>) -> CandidateKind {
 /// confident the extractor is. A superset union of the prompt schema
 /// (`channel`, `quote`, `char_range`, `parent_task_id`) and the brief schema
 /// (`source_tool`, `evidence_quote`, `confidence`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvenanceSpan {
     pub turn_id: Option<String>,
     pub role: Option<String>,
@@ -515,7 +515,19 @@ pub async fn undisposed_high_confidence_obligations(
         .items
         .into_iter()
         .filter(|c| c.kind == "task_obligation")
-        .filter(|c| c.confidence.unwrap_or(0.0) >= 0.85)
+        .filter(|c| {
+            c.confidence.unwrap_or(0.0) >= 0.85
+                || c
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|p| p.confidence >= 0.85)
+                || c
+                    .source_span
+                    .as_ref()
+                    .and_then(|s| s.get("confidence"))
+                    .and_then(|v| v.as_f64())
+                    .is_some_and(|conf| conf >= 0.85)
+        })
         .filter(|c| {
             c.provenance
                 .as_ref()

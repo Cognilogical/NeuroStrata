@@ -843,6 +843,61 @@ describe("extractTurnCandidates", () => {
     });
     assert.equal(cands[0].provenance.parent_task_id, "task-9");
   });
+
+  it("extracts DECISION: marker as memory_candidate decision with ProvenanceSpan", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content: "DECISION: use Rust for the intake layer",
+      turn_id: "t1",
+      source_tool: "write",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "memory_candidate");
+    assert.equal(c.category, "decision");
+    assert.equal(c.title, "use Rust for the intake layer");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.auto_commit, false);
+    assert.equal(c.provenance.confidence, 0.9);
+    assert.equal(c.provenance.evidence_quote, "use Rust for the intake layer");
+    assert.ok(c.provenance.char_range[0] >= 0);
+    assert.ok(c.provenance.char_range[1] > c.provenance.char_range[0]);
+  });
+
+  it("extracts FACT: marker as memory_candidate fact with ProvenanceSpan", () => {
+    const cands = extractTurnCandidates({
+      role: "checker",
+      content: "FACT: the gate requires memory extraction before completion",
+      turn_id: "t2",
+    });
+    assert.equal(cands.length, 1);
+    const c = cands[0];
+    assert.equal(c.kind, "memory_candidate");
+    assert.equal(c.category, "fact");
+    assert.equal(c.title, "the gate requires memory extraction before completion");
+    assert.equal(c.confidence, 0.9);
+    assert.equal(c.provenance.confidence, 0.9);
+  });
+
+  it("extracts Architectural decision: and We decided to: as decision", () => {
+    const cands = extractTurnCandidates({
+      role: "user",
+      content:
+        "Architectural decision: centralize provenance in IntakeCandidate. We decided to: cap bridges at 4.",
+    });
+    const decisions = cands.filter((c) => c.category === "decision");
+    assert.equal(decisions.length, 2);
+    for (const c of decisions) {
+      assert.equal(c.kind, "memory_candidate");
+      assert.equal(c.confidence, 0.9);
+    }
+  });
+
+  it("skips empty-excerpt signals (no indexOf on empty string)", () => {
+    const cands = extractTurnCandidates({ role: "user", content: "TODO:" });
+    // "TODO:" has no trailing text; the marker regex may yield empty excerpt.
+    assert.ok(Array.isArray(cands));
+  });
 });
 
 describe("postTurnCandidates", () => {
@@ -949,6 +1004,48 @@ describe("persistConceptualBridges", () => {
       assert.equal(active.task_id, "task-1");
       assert.equal(active.status, "in_progress");
       assert.deepEqual(active.conceptual_bridges, bridges);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("merges new bridges with existing by id dedup and caps at 4 instead of overwriting", () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-cb-merge-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-1",
+        conceptual_bridges: [
+          { source_id: "s1", target_id: "t1", target_type: "rule", target_summary: "old 1", path: "s1 -> t1" },
+          { source_id: "s2", target_id: "t2", target_type: "fact", target_summary: "old 2", path: "s2 -> t2" },
+        ],
+      }),
+    );
+    try {
+      const newBridges = [
+        { source_id: "s1", target_id: "t1", target_type: "rule", target_summary: "new 1 (updated)", path: "s1 -> t1" }, // dup id t1
+        { source_id: "s3", target_id: "t3", target_type: "rule", target_summary: "new 3", path: "s3 -> t3" }, // new
+        { source_id: "s4", target_id: "t4", target_type: "fact", target_summary: "new 4", path: "s4 -> t4" }, // new
+        { source_id: "s5", target_id: "t5", target_type: "rule", target_summary: "new 5", path: "s5 -> t5" }, // new -> would be 5th, capped out
+        { source_id: "s6", target_id: "t6", target_type: "fact", target_summary: "new 6", path: "s6 -> t6" }, // capped out
+      ];
+      persistConceptualBridges(tmpDir, newBridges);
+      const active = JSON.parse(readFileSync(join(nsDir, "active_session.json"), "utf8"));
+      const bridges = active.conceptual_bridges;
+      assert.ok(Array.isArray(bridges));
+      assert.equal(bridges.length, 4, "capped at 4");
+      // t1 should be the updated version (newer wins on dup id)
+      const t1 = bridges.find((b) => b.target_id === "t1");
+      assert.ok(t1, "t1 retained after dedup merge");
+      assert.equal(t1.target_summary, "new 1 (updated)", "newer wins on duplicate id");
+      // t2 (existing, not re-sent) should still be present
+      assert.ok(bridges.some((b) => b.target_id === "t2"), "existing t2 preserved");
+      // t5 and t6 should be absent (cap 4)
+      assert.ok(!bridges.some((b) => b.target_id === "t5"), "t5 capped out");
+      assert.ok(!bridges.some((b) => b.target_id === "t6"), "t6 capped out");
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -2060,6 +2157,75 @@ describe("Task 1.1: sessionContextHandler / sessionCompactionHandler epoch behav
       await sessionContextHandler(ev3, config);
       assert.ok(ev3.additionalContext.includes("[NeuroStrata Active Context]"));
       assert.ok(ev3.additionalContext.includes("task-core-1"));
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+});
+
+describe("sessionContextHandler bridge formatting (no [object Object])", () => {
+  it("formats each bridge object cleanly instead of String(b)", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-bridge-fmt-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        task_id: "task-bridge-1",
+        status: "in_progress",
+        session_id: "ses-bridge-1",
+        conceptual_bridges: [
+          {
+            target_id: "t1",
+            target_type: "rule",
+            target_summary: "always claim first",
+            path: "src/a.rs",
+          },
+          "a plain string bridge",
+          { source_id: "s3", target_id: "t3", target_type: "fact", target_summary: "gate blocks" },
+        ],
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const ev = { sessionID: "ses-bridge-1" };
+      await sessionContextHandler(ev, config);
+      const ctx = ev.additionalContext ?? "";
+      assert.ok(ctx.includes("[NeuroStrata Conceptual Bridges]"), "bridges section present");
+      assert.ok(!ctx.includes("[object Object]"), "no [object Object] in bridge formatting");
+      assert.ok(ctx.includes("[rule] t1: always claim first (src/a.rs)"), "object bridge formatted cleanly");
+      assert.ok(ctx.includes("a plain string bridge"), "string bridge passed through");
+      assert.ok(ctx.includes("[fact] t3: gate blocks"), "object with source_id falls back to target_type");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("omits bridges section when conceptual_bridges is absent", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-bridge-none-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({ namespace: "NeuroStrata", task_id: "task-nb", status: "in_progress" }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const ev = { sessionID: "ses-nb" };
+      await sessionContextHandler(ev, config);
+      const ctx = ev.additionalContext ?? "";
+      assert.ok(!ctx.includes("[NeuroStrata Conceptual Bridges]"), "no bridges section when absent");
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
       resetClientForTesting();

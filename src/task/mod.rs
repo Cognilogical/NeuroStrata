@@ -1751,6 +1751,36 @@ pub async fn handle_task_complete(
             }
         }
     }
+    // Lock 2 — Task Obligation: undisposed high-confidence obligations block
+    // completion until they are promoted (neurostrata_task_create) or dismissed
+    // (neurostrata_task_candidates action: "resolve"). Placed BEFORE any memory
+    // extraction/upsert side effects (Path 1/2/3) so a refusal leaves no
+    // orphan memory row behind.
+    let intake_store = store.as_intake_store();
+    if let Some(intake) = intake_store {
+        let obligations =
+            undisposed_high_confidence_obligations(&*intake, &namespace, None, None)
+                .await
+                .unwrap_or_default();
+        if !obligations.is_empty() {
+            let mut msg = format!(
+                "BLOCKED (Lock 2 — Task Obligation): task {} cannot complete: {} undisposed high-confidence task obligation(s) must be resolved before completion.\n",
+                id,
+                obligations.len()
+            );
+            for o in &obligations {
+                msg.push_str(&format!(
+                    "  - {}: {}\n    promote via: neurostrata_task_create | dismiss via: neurostrata_task_candidates action: \"resolve\" namespace: \"{}\" candidate_id: \"{}\" disposition: \"dismissed\"\n",
+                    o.id,
+                    o.title,
+                    namespace,
+                    o.id
+                ));
+            }
+            return Err(msg);
+        }
+    }
+
     let actor = task
         .task_field("assignee")
         .and_then(|v| v.as_str())
@@ -2005,34 +2035,6 @@ pub async fn handle_task_complete(
                 .or(report.linked_existing_id.clone())
                 .filter(|s| !s.is_empty());
             inline_lesson = lesson_id;
-        }
-    }
-
-    // Lock 2 — Task Obligation: undisposed high-confidence obligations block
-    // completion until they are promoted (neurostrata_task_create) or dismissed
-    // (neurostrata_task_candidates action: "resolve").
-    let intake_store = store.as_intake_store();
-    if let Some(intake) = intake_store {
-        let obligations =
-            undisposed_high_confidence_obligations(&*intake, &namespace, None, None)
-                .await
-                .unwrap_or_default();
-        if !obligations.is_empty() {
-            let mut msg = format!(
-                "BLOCKED (Lock 2 — Task Obligation): task {} cannot complete: {} undisposed high-confidence task obligation(s) must be resolved before completion.\n",
-                id,
-                obligations.len()
-            );
-            for o in &obligations {
-                msg.push_str(&format!(
-                    "  - {}: {}\n    promote via: neurostrata_task_create | dismiss via: neurostrata_task_candidates action: \"resolve\" namespace: \"{}\" candidate_id: \"{}\" disposition: \"dismissed\"\n",
-                    o.id,
-                    o.title,
-                    namespace,
-                    o.id
-                ));
-            }
-            return Err(msg);
         }
     }
 

@@ -3500,7 +3500,21 @@ pub async fn handle_task_candidates(
                 .unwrap_or("task_obligation")
                 .to_string();
             let category = args.get("category").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let confidence = args.get("confidence").and_then(|v| v.as_f64());
+            let top_confidence = args.get("confidence").and_then(|v| v.as_f64());
+            let provenance = args
+                .get("provenance")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<ProvenanceSpan>(v).ok());
+            let provenance_confidence = provenance.as_ref().map(|p| p.confidence);
+            let source_span_confidence = args
+                .get("source_span")
+                .and_then(|v| v.as_object())
+                .and_then(|s| s.get("confidence"))
+                .and_then(|v| v.as_f64());
+            // Accept confidence from top-level, provenance, or source_span so a
+            // candidate recorded with only provenance.confidence still persists
+            // with confidence >= 0.85 and is visible to the Lock 2 obligation gate.
+            let confidence = top_confidence.or(provenance_confidence).or(source_span_confidence);
             let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
             let description = args
                 .get("description")

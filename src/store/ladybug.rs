@@ -7894,6 +7894,7 @@ impl crate::traits::IntakeStore for LadybugStore {
                 "pending" => crate::task::intake::Disposition::Pending,
                 "created" => crate::task::intake::Disposition::Created,
                 "linked" => crate::task::intake::Disposition::Linked,
+                "promoted" => crate::task::intake::Disposition::Promoted,
                 "dismissed" => crate::task::intake::Disposition::Dismissed,
                 _ => crate::task::intake::Disposition::Pending,
             };

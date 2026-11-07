@@ -562,6 +562,8 @@ export function extractTurnCandidates(turn: Turn): TurnCandidate[] {
   const signals = detectTaskIntentsLocal(content);
   const out: TurnCandidate[] = [];
   for (const signal of signals) {
+    // Guard: never indexOf an empty excerpt.
+    if (signal.excerpt.length === 0) continue;
     // `signal.marker` is the lowercase canonical form; `signal.excerpt` is the
     // verbatim content substring, so index off the excerpt to land the span at
     // the actual (case-varying) marker text in `content`.
@@ -580,6 +582,37 @@ export function extractTurnCandidates(turn: Turn): TurnCandidate[] {
         channel,
         evidence_quote: signal.excerpt,
         quote: signal.excerpt,
+        char_range: [start, end],
+        parent_task_id,
+        confidence: 0.9,
+      },
+    });
+  }
+  // Decision / fact markers: explicit DECISION:/FACT:/Architectural decision:/
+  // We decided to: claims emitted as memory_candidate candidates with
+  // ProvenanceSpan so the intake Lock 2 gate can see them.
+  const DF_MARKERS = /\b(?:DECISION|FACT|Architectural decision|We decided to)\s*:\s*([^\n.]{8,200})/gi;
+  for (const m of content.matchAll(DF_MARKERS)) {
+    const marker = m[0].split(":")[0].trim();
+    const category = /^(?:DECISION|Architectural decision|We decided to)$/i.test(marker)
+      ? "decision"
+      : "fact";
+    const excerpt = m[1];
+    const start = m.index + m[0].indexOf(excerpt);
+    const end = start + excerpt.length;
+    out.push({
+      kind: "memory_candidate",
+      category,
+      title: excerpt,
+      confidence: 0.9,
+      auto_commit: false,
+      provenance: {
+        turn_id,
+        role,
+        source_tool,
+        channel,
+        evidence_quote: excerpt,
+        quote: excerpt,
         char_range: [start, end],
         parent_task_id,
         confidence: 0.9,
@@ -671,7 +704,16 @@ export function persistConceptualBridges(
       active = {};
     }
   }
-  active.conceptual_bridges = bridges;
+  const existing = Array.isArray(active.conceptual_bridges)
+    ? (active.conceptual_bridges as ConceptualBridge[])
+    : [];
+  const byId = new Map<string, ConceptualBridge>();
+  let seq = 0;
+  const keyOf = (b: ConceptualBridge) =>
+    b.target_id ?? b.source_id ?? b.via_id ?? `bridge:${seq++}`;
+  for (const b of existing) byId.set(keyOf(b), b);
+  for (const b of bridges) byId.set(keyOf(b), b); // newer wins on dup id
+  active.conceptual_bridges = Array.from(byId.values()).slice(0, 4);
   try {
     mkdirSync(nsDir, { recursive: true });
     writeFileSync(sessionPath, JSON.stringify(active, null, 2));
@@ -1088,13 +1130,17 @@ export async function prefetchMemoriesForFile(
     if (projectRoot) {
       try {
         let hits: unknown[] = [];
+        let topBridges: unknown[] = [];
         try {
           const body = JSON.parse(text);
-          hits = Array.isArray(body.hits) ? body.hits : [];
+          hits = Array.isArray(body.memories ?? body.hits) ? (body.memories ?? body.hits) : [];
+          if (Array.isArray(body.conceptual_bridges)) {
+            topBridges = body.conceptual_bridges;
+          }
         } catch {
           hits = [];
         }
-        const bridges = extractConceptualBridges(hits);
+        const bridges = [...extractConceptualBridges(hits), ...(topBridges as ConceptualBridge[])];
         if (bridges.length > 0) {
           persistConceptualBridges(projectRoot, bridges);
         }
@@ -1535,8 +1581,19 @@ export async function sessionContextHandler(event: any, config: ResolvedConfig):
     const injection = asString(active.subagent_prompt_injection);
     if (injection) extra += `\n${injection.trim()}`;
     const bridges = active.conceptual_bridges;
-    if (bridges !== undefined && bridges !== null) {
-      extra += `\n[NeuroStrata Conceptual Bridges] ${String(bridges)}`;
+    if (bridges !== undefined && bridges !== null && Array.isArray(bridges)) {
+      const formatted = bridges
+        .map((b) => {
+          if (typeof b === "string") return b;
+          const bridge = b as Record<string, unknown>;
+          const type = bridge.memory_type ?? bridge.target_type ?? "memory";
+          const id = bridge.id ?? bridge.target_id;
+          const content = bridge.content ?? bridge.target_summary ?? "";
+          const why = bridge.why_connected ?? bridge.path ?? "";
+          return `[${type}] ${id}: ${content} (${why})`;
+        })
+        .join("; ");
+      extra += `\n[NeuroStrata Conceptual Bridges] ${formatted}`;
     }
     const full = message + extra;
     if (typeof event.additionalContext === "string") {
