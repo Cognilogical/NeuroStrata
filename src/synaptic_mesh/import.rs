@@ -123,6 +123,12 @@ pub struct ApplyReport {
     pub combinations: Vec<String>,
     /// Records whose Ed25519 signature verified cleanly.
     pub verified_signed: usize,
+    /// Records whose Ed25519 signature verified ONLY over the RDF
+    /// payload (the legacy signing scheme): the RDF block is a lossy
+    /// projection of the record, so these records applied without
+    /// full-record verification and are counted apart from
+    /// `verified_signed`.
+    pub rdf_only_verified: usize,
     /// Records accepted without a signature (warn-first Phase 1).
     pub unsigned_accepted: usize,
     /// Records rejected due to an invalid Ed25519 signature or DID/pubkey mismatch.
@@ -274,6 +280,7 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
         out.push_str(" (full-tree reconciliation — no usable accepted-head cursor)");
     }
     if report.verified_signed > 0
+        || report.rdf_only_verified > 0
         || report.signature_rejected > 0
         || report.unauthorized_signer > 0
     {
@@ -281,6 +288,9 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
             ", signed {} / signature-rejected {} / unauthorized {}",
             report.verified_signed, report.signature_rejected, report.unauthorized_signer
         ));
+        if report.rdf_only_verified > 0 {
+            out.push_str(&format!(", rdf-only-signed {}", report.rdf_only_verified));
+        }
     }
     let head_len = report.head.len().min(7);
     if head_len > 0 {
@@ -367,6 +377,7 @@ pub async fn apply_changed(
         conflicted_ids: Vec::new(),
         combinations: Vec::new(),
         verified_signed: 0,
+        rdf_only_verified: 0,
         unsigned_accepted: 0,
         signature_rejected: 0,
         unauthorized_signer: 0,
@@ -429,7 +440,7 @@ pub async fn apply_changed(
                 continue;
             }
         };
-        let mut record = match pre_apply_gate(
+        let (mut record, signature_disposition) = match pre_apply_gate(
             validate_record(&candidate, served, &raw),
             manifest_epoch,
             &mesh.manifest().signers,
@@ -456,6 +467,7 @@ pub async fn apply_changed(
             concurrent,
             import_trust,
             head_signature,
+            &signature_disposition,
         )
         .await
         {
@@ -510,7 +522,7 @@ pub async fn apply_changed(
             continue;
         }
         let rel = format!("{} ({})", bundle_path.display(), record.id);
-        let record = match pre_apply_gate(
+        let (record, signature_disposition) = match pre_apply_gate(
             validate_bundle_record(record, served),
             manifest_epoch,
             &mesh.manifest().signers,
@@ -529,6 +541,7 @@ pub async fn apply_changed(
             concurrent,
             import_trust,
             head_signature,
+            &signature_disposition,
         )
         .await
         {
@@ -977,19 +990,22 @@ pub fn epoch_gate(candidate_epoch: u32, manifest_epoch: u32) -> Result<(), Strin
 /// [`epoch_gate`], then `verify_record_signature`. No record reaches
 /// `apply_one` without returning `Some` from here.
 ///
-/// `Some(record)` = every gate passed; the signature counters for the
-/// record have been recorded on `report`. `None` = rejected: the
-/// rejection has already been recorded on `report` (an `ignored` entry
-/// under `rel`, plus the signature counters when the signature stage was
-/// reached), the record is NOT applied, and the caller must not count
-/// it as applied.
+/// `Some((record, disposition))` = every gate passed; the signature
+/// counters for the record have been recorded on `report`, and the
+/// [`SignatureDisposition`] is returned alongside the record so
+/// `apply_one` can stamp the stored provenance with the verification
+/// outcome that actually occurred. `None` = rejected: the rejection has
+/// already been recorded on `report` (an `ignored` entry under `rel`,
+/// plus the signature counters when the signature stage was reached),
+/// the record is NOT applied, and the caller must not count it as
+/// applied.
 fn pre_apply_gate(
     validated: Result<(MeshRecord, Option<RdfDiagnostic>), String>,
     manifest_epoch: u32,
     signers: &[super::manifest::SignerEntry],
     rel: &str,
     report: &mut ApplyReport,
-) -> Option<MeshRecord> {
+) -> Option<(MeshRecord, SignatureDisposition)> {
     let (mut record, rdf_diagnostic) = match validated {
         Ok((r, d)) => (r, d),
         Err(reason) => {
@@ -1002,12 +1018,18 @@ fn pre_apply_gate(
         report.ignored.push(format!("{rel}: {reason}"));
         return None;
     }
-    match verify_record_signature(&record, signers) {
+    let disposition = match verify_record_signature(&record, signers) {
         SignatureDisposition::Verified => {
             report.verified_signed += 1;
+            SignatureDisposition::Verified
+        }
+        SignatureDisposition::VerifiedRdfOnly => {
+            report.rdf_only_verified += 1;
+            SignatureDisposition::VerifiedRdfOnly
         }
         SignatureDisposition::Unsigned => {
             report.unsigned_accepted += 1;
+            SignatureDisposition::Unsigned
         }
         SignatureDisposition::Invalid(reason) => {
             report.signature_rejected += 1;
@@ -1019,7 +1041,7 @@ fn pre_apply_gate(
             report.ignored.push(format!("{rel}: {reason}"));
             return None;
         }
-    }
+    };
     // Attach the RDF diagnostic AFTER signature verification, so the
     // canonical signing bytes used for verification are over the record
     // EXACTLY as it arrived — no metadata mutation beforehand.
@@ -1032,7 +1054,7 @@ fn pre_apply_gate(
             obj.insert("rdf_diagnostic_phase".to_string(), json!(diag.phase));
         }
     }
-    Some(record)
+    Some((record, disposition))
 }
 
 /// Does this JSON anywhere (objects recursively) carry a runtime counter
@@ -1455,6 +1477,10 @@ fn load_record_patch(record_path: &Path) -> Option<crate::streaming::Stream> {
 /// `import_trust` is the manifest's imported-procedures policy (the
 /// stamp source for applied procedures); `head_signature` is the HEAD
 /// commit's signature state, recorded in provenance only.
+/// `signature_disposition` is the outcome `pre_apply_gate` recorded for
+/// this record's signature; it keys the provenance stamp in
+/// `apply_effective`, so a signature that verified only over the RDF
+/// projection is never stamped as full-record verified.
 async fn apply_one(
     root: &Path,
     mesh_id: &str,
@@ -1464,6 +1490,7 @@ async fn apply_one(
     concurrent: bool,
     import_trust: Trust,
     head_signature: &str,
+    signature_disposition: &SignatureDisposition,
 ) -> Disposition {
     let id = record.id.to_string();
     let namespace = record.namespace.clone();
@@ -1548,6 +1575,7 @@ async fn apply_one(
                             emb,
                             import_trust,
                             head_signature,
+                            signature_disposition,
                         )
                         .await;
                     }
@@ -1571,6 +1599,7 @@ async fn apply_one(
                             ApplyShape::ArchivedCombination { edited },
                             Some(import_trust),
                             head_signature,
+                            signature_disposition,
                         )
                         .await
                         {
@@ -1597,6 +1626,7 @@ async fn apply_one(
         ApplyShape::AsCandidate,
         Some(import_trust),
         head_signature,
+        signature_disposition,
     )
     .await
 }
@@ -1622,7 +1652,15 @@ async fn apply_effective(
     shape: ApplyShape,
     trust_stamp: Option<Trust>,
     head_signature: &str,
+    signature_disposition: &SignatureDisposition,
 ) -> Disposition {
+    // 54-B: only an as-candidate apply stores the record the candidate's
+    // signature was verified over. An archived combination stores a
+    // (content, state) pair that was never the subject of that
+    // verification — the local row's content forced to Archived, or the
+    // candidate's content with its signed Active state forced to
+    // Archived — so combination rows earn no verified stamps below.
+    let stored_is_signed_candidate = matches!(shape, ApplyShape::AsCandidate);
     let (text, state, superseded_by, archived_at, tombstoned_at) = match shape {
         ApplyShape::AsCandidate => (
             content_text(record),
@@ -1721,11 +1759,37 @@ async fn apply_effective(
         superseded_by,
         head_signature,
     );
-    if record.signature.is_some() {
+    // The provenance stamp is keyed on the disposition the gate actually
+    // recorded, not on the mere presence of a signature: a signature that
+    // verified over the canonical-JSON payload covers the whole record,
+    // while one that verified only over the RDF payload covers just that
+    // lossy projection — the two earn different stamps. The stamp also
+    // requires the stored row to BE the signed candidate
+    // (`stored_is_signed_candidate`): an archived-combination row stores
+    // a (content, state) pair the signature never covered, so it earns
+    // no verified stamp in either branch — neither
+    // `signature_verified`/`verified_signer_did` nor
+    // `rdf_signature_verified`/`rdf_verified_signer_did`.
+    if stored_is_signed_candidate && record.signature.is_some() {
         if let Some(ref did) = record.signer_did {
             if let Some(obj) = mesh_prov.as_object_mut() {
-                obj.insert("verified_signer_did".to_string(), json!(did));
-                obj.insert("signature_verified".to_string(), json!(true));
+                match signature_disposition {
+                    SignatureDisposition::Verified => {
+                        obj.insert("verified_signer_did".to_string(), json!(did));
+                        obj.insert("signature_verified".to_string(), json!(true));
+                    }
+                    SignatureDisposition::VerifiedRdfOnly => {
+                        // 54-A: NOT `verified_signer_did` — rebac derives
+                        // the resource owner from that key and the owner
+                        // is always allowed, so it is owner-grade signer
+                        // attribution. An RDF-only signature attests only
+                        // to the lossy RDF payload, not the full record;
+                        // its signer provenance is RDF-branch only.
+                        obj.insert("rdf_verified_signer_did".to_string(), json!(did));
+                        obj.insert("rdf_signature_verified".to_string(), json!(true));
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -1890,6 +1954,7 @@ async fn preserve_superseded_edit(
     emb: std::sync::Arc<dyn Embedder>,
     import_trust: Trust,
     head_signature: &str,
+    signature_disposition: &SignatureDisposition,
 ) -> Disposition {
     // Which side holds the edit, and must the incoming supersession apply?
     // `source_metadata` is the metadata the new record inherits from the
@@ -1934,6 +1999,7 @@ async fn preserve_superseded_edit(
             ApplyShape::AsCandidate,
             Some(import_trust),
             head_signature,
+            signature_disposition,
         )
         .await
         {
@@ -1958,6 +2024,8 @@ async fn preserve_superseded_edit(
     // already set the preserved record's stamp from `import_trust`
     // (untrusted by default, the manifest policy when overridden) —
     // stamping again here would only repeat the funnel's own decision.
+    // The preserved record is built unsigned, so its signature
+    // disposition is `Unsigned` and it earns no verification stamp.
     apply_effective(
         root,
         mesh_id,
@@ -1969,6 +2037,7 @@ async fn preserve_superseded_edit(
         ApplyShape::AsCandidate,
         None,
         head_signature,
+        &SignatureDisposition::Unsigned,
     )
     .await
 }
@@ -2169,7 +2238,16 @@ fn preserved_edit_record(
 /// Outcome of Ed25519 signature verification on a [`MeshRecord`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignatureDisposition {
+    /// The signature verified over the canonical-JSON payload, which
+    /// covers the whole record.
     Verified,
+    /// The signature verified ONLY over the RDF payload (the legacy
+    /// signing scheme): it covers the stored quads plus `update_id` and
+    /// epoch, and nothing else — the RDF block is a lossy projection of
+    /// the record, so the JSON fields outside the projection were never
+    /// signed. The record still applies, but it must not be counted or
+    /// stamped as full-record verified.
+    VerifiedRdfOnly,
     Unsigned,
     Invalid(String),
     Unauthorized(String),
@@ -2240,16 +2318,22 @@ pub fn verify_record_signature(
         }
     };
 
-    let verified = payload_rdf
+    // The two payload branches are tracked separately: they do not cover
+    // the same bytes. The canonical-JSON payload covers the whole record
+    // (the RDF block included, as one of its fields); the RDF payload
+    // covers only the stored quads plus `update_id` and epoch — a lossy
+    // projection. OR-ing them into one outcome would let an RDF-only
+    // signature earn full-record trust for JSON fields it never covered.
+    let verified_rdf = payload_rdf
         .as_ref()
         .map(|p| crate::did::verify(p, &pub_bytes, &sig_bytes))
-        .unwrap_or(false)
-        || payload_json
-            .as_ref()
-            .map(|p| crate::did::verify(p, &pub_bytes, &sig_bytes))
-            .unwrap_or(false);
+        .unwrap_or(false);
+    let verified_json = payload_json
+        .as_ref()
+        .map(|p| crate::did::verify(p, &pub_bytes, &sig_bytes))
+        .unwrap_or(false);
 
-    if !verified {
+    if !verified_rdf && !verified_json {
         return SignatureDisposition::Invalid("Ed25519 signature verification failed".to_string());
     }
 
@@ -2263,7 +2347,13 @@ pub fn verify_record_signature(
         ));
     }
 
-    SignatureDisposition::Verified
+    // If both branches somehow verify, the JSON branch wins: it is the
+    // one that covers the full record.
+    if verified_json {
+        SignatureDisposition::Verified
+    } else {
+        SignatureDisposition::VerifiedRdfOnly
+    }
 }
 
 /// Decompress a zstd-compressed mesh record bundle with bounded output size.
@@ -3413,6 +3503,739 @@ mod tests {
         assert!(
             bundle_reasons.contains("old-epoch"),
             "the bundle refusal is the epoch gate's: {bundle_reasons}"
+        );
+    }
+
+    // ---- issue #45: RDF-only signatures are not full-record verified -----
+    //
+    // The RDF block is a lossy projection of the record. A signature over
+    // the RDF payload (`{quads}\n{update_id}\n{epoch}` — the legacy
+    // scheme production `sign_record` used for RDF-bearing records)
+    // therefore covers none of the JSON fields outside the projection,
+    // and must not earn the full-record `Verified` disposition, its
+    // report counter, or its `signature_verified` provenance stamp. The
+    // record still applies (legacy imports keep working); it is counted
+    // and stamped as what it is. A signature over the canonical-JSON
+    // payload covers the whole record and keeps the full outcome.
+
+    /// Minimal stand-in quads for the fixtures below — NOT a faithful
+    /// builder projection. The verifier consumes the stored quads
+    /// string verbatim, and canonical reconstruction is the RDF
+    /// diagnostic's concern (warn-only, attached after verification),
+    /// so a single minimal quad suffices for disposition/stamp
+    /// assertions.
+    fn rdf_quads_for(id: Uuid, text: &str) -> String {
+        format!("<urn:neurostrata:memory:{id}> <urn:neurostrata:content> \"{text}\" .\n")
+    }
+
+    /// A bundle-carried record with an RDF block attached.
+    fn rdf_bearing_record(id: Uuid, text: &str) -> MeshRecord {
+        let mut record = bundle_record(simple_rule(id, text));
+        record.rdf = Some(RdfBlock {
+            schema: "neurostrata-rdf-record/v1".to_string(),
+            format: "n-quads".to_string(),
+            canonical_hash: String::new(),
+            quads: rdf_quads_for(id, text),
+        });
+        record
+    }
+
+    /// Sign a record the LEGACY way: directly over the RDF payload with
+    /// the keypair at `key_path`. Production `sign_record` no longer
+    /// produces these signatures — that is precisely the legacy
+    /// simulation: a record signed by an older peer.
+    fn sign_record_legacy_rdf(record: &mut MeshRecord, key_path: &Path) {
+        let (pkey, did, pubkey) =
+            crate::did::load_or_generate_keypair(key_path).expect("the scratch signing key loads");
+        record.signer_did = Some(did);
+        record.public_key = Some(hex::encode(&pubkey));
+        let rdf_block = record
+            .rdf
+            .as_ref()
+            .expect("legacy RDF signing needs an RDF block");
+        let payload = crate::did::signing_payload(
+            &rdf_block.quads,
+            &record.update_id.to_string(),
+            record.origin_mesh_epoch,
+        );
+        let sig = crate::did::sign(&payload, &pkey).expect("the record signs");
+        record.signature = Some(crate::did::encode_base64(&sig));
+    }
+
+    /// The manifest allowlist entry for a signed record's key, as the
+    /// #43 fixtures build it.
+    fn signer_entry_for(record: &MeshRecord) -> super::super::manifest::SignerEntry {
+        super::super::manifest::SignerEntry {
+            did: record
+                .signer_did
+                .clone()
+                .expect("a signed record carries a signer DID"),
+            public_key: record
+                .public_key
+                .clone()
+                .expect("a signed record carries a public key"),
+            role: "signer".to_string(),
+        }
+    }
+
+    /// Replay one record as a committed `.json` candidate with the
+    /// mesh manifest's signer allowlist populated — the `.json`-route
+    /// analogue of `run_bundle_route_with_signers`, mirroring
+    /// `run_json_route`'s harness (a committed record file whose stem
+    /// is the record id).
+    async fn run_json_route_with_signers(
+        tag: &str,
+        record: MeshRecord,
+        signers: Vec<super::super::manifest::SignerEntry>,
+    ) -> (ApplyReport, std::sync::Arc<dyn VectorStore>) {
+        let (_base, mesh) = mesh_with_commit(tag);
+        let mesh = if signers.is_empty() {
+            mesh
+        } else {
+            reopen_with_signers(&mesh, signers)
+        };
+        let id = record.id.to_string();
+        let value = serde_json::to_value(&record).expect("the record serializes");
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id,
+            &serde_json::to_string(&value).unwrap(),
+        );
+        let store = fresh_store(tag).await;
+        let report = apply_changed(&mesh, &["probe".to_string()], store.clone(), emb())
+            .await
+            .expect("json-route replay completes");
+        (report, store)
+    }
+
+    /// The stored `metadata.mesh` provenance object of an applied row.
+    async fn stored_mesh_provenance(
+        store: &std::sync::Arc<dyn VectorStore>,
+        id: &Uuid,
+    ) -> Value {
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the row was applied");
+        payload
+            .metadata
+            .get("mesh")
+            .cloned()
+            .expect("the applied row carries mesh provenance")
+    }
+
+    /// T1: a legacy RDF-signed record whose JSON surface is tampered
+    /// AFTER signing — a metadata key outside the RDF projection is
+    /// added — still applies (the RDF branch verifies), but it is
+    /// counted as RDF-only verified, NOT as fully verified, and its
+    /// stored provenance carries `rdf_signature_verified` without the
+    /// `signature_verified` key. Before the fix the two payload branches
+    /// were OR-ed into one `Verified`, so this record counted as
+    /// `verified_signed` and was stamped `signature_verified: true`
+    /// even though the added key was never signed. Signer attribution
+    /// is likewise branch-aware (54-A): the signer is recorded under
+    /// the RDF-specific `rdf_verified_signer_did` key only, never
+    /// under the owner-grade `verified_signer_did` key that rebac
+    /// derives the resource owner from.
+    #[tokio::test]
+    async fn rdf_only_signature_with_json_tampered_outside_projection_is_not_fully_verified() {
+        let id = Uuid::new_v4();
+        let mut record = rdf_bearing_record(id, "legacy signed rule");
+        let key_dir = scratch("rdf-only-tampered-key");
+        let key_path = key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut record, &key_path);
+        let signer_did = record.signer_did.clone().expect("signed record has a DID");
+        let signers = vec![signer_entry_for(&record)];
+        // Tamper OUTSIDE the projection: a metadata key the RDF builder
+        // never projects. The quads, update_id and epoch are untouched,
+        // so the RDF payload still verifies; the canonical-JSON payload
+        // covers `metadata`, so the JSON branch fails.
+        if let Some(obj) = record.metadata.as_object_mut() {
+            obj.insert(
+                "unprojected_note".to_string(),
+                json!("added after signing"),
+            );
+        }
+        let (report, store) =
+            run_bundle_route_with_signers("rdf-only-tampered", record, None, signers).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert_eq!(report.rdf_only_verified, 1, "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 0, "report: {report:?}");
+        assert_eq!(report.unauthorized_signer, 0, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("rdf_signature_verified"),
+            Some(&json!(true)),
+            "the stamp names the RDF-only verification: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("signature_verified").is_none(),
+            "no full-record stamp for an RDF-only signature: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp for an RDF-only signature: {mesh_prov}"
+        );
+        assert_eq!(
+            mesh_prov.get("rdf_verified_signer_did"),
+            Some(&json!(signer_did)),
+            "the signer is recorded under the RDF-specific key only: {mesh_prov}"
+        );
+    }
+
+    /// T2 (control): a legacy RDF-signed record whose content is altered
+    /// after signing — with its RDF projection altered to match, as a
+    /// tampered record on the wire would carry — fails BOTH payload
+    /// branches and is rejected: not applied, `signature_rejected`
+    /// moves. (Altering the JSON content alone, leaving the quads as
+    /// signed, is T1's case, not this one: the RDF payload is computed
+    /// from the stored quads, so a projection-covered change must touch
+    /// the quads to reach it.)
+    #[tokio::test]
+    async fn rdf_signature_with_projection_covered_field_tampered_is_rejected() {
+        let id = Uuid::new_v4();
+        let mut record = rdf_bearing_record(id, "signed content");
+        let key_dir = scratch("rdf-tampered-key");
+        let key_path = key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut record, &key_path);
+        record.content = json!({"text": "tampered content"});
+        if let Some(rdf_block) = record.rdf.as_mut() {
+            rdf_block.quads = rdf_quads_for(id, "tampered content");
+        }
+        let (report, store) = run_bundle_route("rdf-tampered", record, None).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.rdf_only_verified, 0, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 1, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("signature verification failed"),
+            "the refusal names the failed verification: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// T3: an RDF-bearing record signed by production `sign_record`
+    /// verifies over the canonical-JSON payload — the whole record,
+    /// RDF block included — so it counts as fully verified and earns
+    /// the full stamp, with no RDF-only marker.
+    #[tokio::test]
+    async fn rdf_bearing_record_with_full_record_signature_is_fully_verified() {
+        let id = Uuid::new_v4();
+        let mut record = rdf_bearing_record(id, "full record signed rule");
+        let key_dir = scratch("rdf-full-json-key");
+        let key_path = key_dir.join("signing.key");
+        crate::synaptic_mesh::worker::sign_record(&mut record, &key_path).expect("record signs");
+        let signer_did = record.signer_did.clone().expect("signed record has a DID");
+        let signers = vec![signer_entry_for(&record)];
+        let (report, store) =
+            run_bundle_route_with_signers("rdf-full-json", record, None, signers).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert_eq!(report.verified_signed, 1, "report: {report:?}");
+        assert_eq!(report.rdf_only_verified, 0, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 0, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("signature_verified"),
+            Some(&json!(true)),
+            "the full-record stamp: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("rdf_signature_verified").is_none(),
+            "no RDF-only marker on a full-record signature: {mesh_prov}"
+        );
+        assert_eq!(
+            mesh_prov.get("verified_signer_did"),
+            Some(&json!(signer_did)),
+            "the signer is recorded: {mesh_prov}"
+        );
+    }
+
+    /// T4: an untampered legacy RDF-signed record still applies — the
+    /// legacy scheme keeps working — but it is counted and stamped as
+    /// RDF-only verified, never as fully verified.
+    #[tokio::test]
+    async fn legacy_rdf_only_signature_applies_as_rdf_verified_only() {
+        let id = Uuid::new_v4();
+        let mut record = rdf_bearing_record(id, "untampered legacy rule");
+        let key_dir = scratch("rdf-only-untampered-key");
+        let key_path = key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut record, &key_path);
+        let signer_did = record.signer_did.clone().expect("signed record has a DID");
+        let signers = vec![signer_entry_for(&record)];
+        let (report, store) =
+            run_bundle_route_with_signers("rdf-only-untampered", record, None, signers).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert_eq!(report.rdf_only_verified, 1, "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 0, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("rdf_signature_verified"),
+            Some(&json!(true)),
+            "the stamp names the RDF-only verification: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("signature_verified").is_none(),
+            "no full-record stamp for an RDF-only signature: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp for an RDF-only signature: {mesh_prov}"
+        );
+        assert_eq!(
+            mesh_prov.get("rdf_verified_signer_did"),
+            Some(&json!(signer_did)),
+            "the signer is recorded under the RDF-specific key only: {mesh_prov}"
+        );
+    }
+
+    /// T5: the same legacy RDF-only outcome on the `.json` route. Every
+    /// other #45 test rides the bundle route, so the `.json` call site
+    /// in `apply_changed` could drop or mis-thread its disposition —
+    /// counting the record without passing the disposition to
+    /// `apply_one`, or passing full-record `Verified` instead — and no
+    /// test would fail. Here the record arrives as a committed `.json`
+    /// file: it applies, counts as RDF-only verified (never as fully
+    /// verified), and its stored provenance carries
+    /// `rdf_signature_verified` with NO `signature_verified` key and
+    /// NO owner-grade `verified_signer_did` key — the signer is
+    /// recorded under `rdf_verified_signer_did` only (54-A).
+    #[tokio::test]
+    async fn legacy_rdf_only_signature_applies_as_rdf_verified_only_on_json_route() {
+        let id = Uuid::new_v4();
+        let mut record = rdf_bearing_record(id, "untampered legacy rule via json");
+        let key_dir = scratch("rdf-only-json-key");
+        let key_path = key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut record, &key_path);
+        let signer_did = record.signer_did.clone().expect("signed record has a DID");
+        let signers = vec![signer_entry_for(&record)];
+        let (report, store) =
+            run_json_route_with_signers("rdf-only-json", record, signers).await;
+        assert_eq!(report.applied, 1, "report: {report:?}");
+        assert!(
+            report.applied_ids.contains(&id.to_string()),
+            "report: {report:?}"
+        );
+        assert_eq!(report.rdf_only_verified, 1, "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 0, "report: {report:?}");
+        assert_eq!(report.unauthorized_signer, 0, "report: {report:?}");
+        assert!(report.ignored.is_empty(), "report: {report:?}");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("rdf_signature_verified"),
+            Some(&json!(true)),
+            "the stamp names the RDF-only verification: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("signature_verified").is_none(),
+            "no full-record stamp for an RDF-only signature: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp for an RDF-only signature: {mesh_prov}"
+        );
+        assert_eq!(
+            mesh_prov.get("rdf_verified_signer_did"),
+            Some(&json!(signer_did)),
+            "the signer is recorded under the RDF-specific key only: {mesh_prov}"
+        );
+    }
+
+    /// T6: a legacy RDF-only-signed record whose signer is NOT in a
+    /// non-empty manifest allowlist is refused as unauthorized — the
+    /// allowlist holds a DIFFERENT signer, built the same way as the
+    /// applying fixtures' allowlists. The record is not applied and
+    /// neither verification counter moves: the allowlist check runs
+    /// before the verified branches are split, so an RDF-only
+    /// verification cannot bypass it (a `VerifiedRdfOnly` returned
+    /// ahead of the allowlist check would apply this record and count
+    /// it as RDF-only verified instead).
+    #[tokio::test]
+    async fn rdf_only_signature_from_unauthorized_signer_is_rejected() {
+        let id = Uuid::new_v4();
+        let mut record = rdf_bearing_record(id, "legacy rule from an unlisted signer");
+        let key_dir = scratch("rdf-only-unauth-key");
+        let key_path = key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut record, &key_path);
+        // The allowlist names a different signer: a second legacy-signed
+        // record signed with a second key, as the applying fixtures
+        // build their entries — its entry is well-formed, it is simply
+        // not this record's signer.
+        let mut other = rdf_bearing_record(Uuid::new_v4(), "the listed signer");
+        let other_key_dir = scratch("rdf-only-unauth-other-key");
+        let other_key_path = other_key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut other, &other_key_path);
+        let signers = vec![signer_entry_for(&other)];
+        let (report, store) =
+            run_bundle_route_with_signers("rdf-only-unauth", record, None, signers).await;
+        assert_eq!(report.applied, 0, "report: {report:?}");
+        assert!(report.applied_ids.is_empty(), "report: {report:?}");
+        assert_eq!(report.unauthorized_signer, 1, "report: {report:?}");
+        assert_eq!(report.rdf_only_verified, 0, "report: {report:?}");
+        assert_eq!(report.verified_signed, 0, "report: {report:?}");
+        assert_eq!(report.signature_rejected, 0, "report: {report:?}");
+        assert_eq!(report.ignored.len(), 1, "report: {report:?}");
+        let joined = report.ignored.join(" | ");
+        assert!(
+            joined.contains("not in manifest.signers allowlist"),
+            "the refusal names the allowlist: {joined}"
+        );
+        assert_eq!(
+            row_count(&store, "probe").await,
+            0,
+            "nothing reached the store"
+        );
+    }
+
+    /// 54-A: an RDF-only verification must NOT stamp the owner-grade
+    /// `verified_signer_did` key — `rebac::extract_resource_owner`
+    /// derives the resource owner from `metadata.mesh.verified_signer_did`
+    /// and the owner is always allowed, so that key confers owner-grade
+    /// signer attribution. An RDF signature attests only to the lossy
+    /// RDF payload, not the full record, so its signer provenance is
+    /// carried under the RDF-specific `rdf_verified_signer_did` key
+    /// instead. A full-record verification (control) keeps stamping
+    /// `verified_signer_did` exactly as before.
+    #[tokio::test]
+    async fn rdf_only_verification_does_not_stamp_owner_grade_signer_did() {
+        // RDF-only branch: legacy RDF-signed, untampered.
+        let rdf_id = Uuid::new_v4();
+        let mut rdf_record = rdf_bearing_record(rdf_id, "rdf only signer attribution rule");
+        let rdf_key_dir = scratch("rdf-only-attribution-key");
+        let rdf_key_path = rdf_key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut rdf_record, &rdf_key_path);
+        let rdf_signer_did = rdf_record
+            .signer_did
+            .clone()
+            .expect("signed record has a DID");
+        let rdf_signers = vec![signer_entry_for(&rdf_record)];
+        let (rdf_report, rdf_store) = run_bundle_route_with_signers(
+            "rdf-only-attribution",
+            rdf_record,
+            None,
+            rdf_signers,
+        )
+        .await;
+        assert_eq!(rdf_report.applied, 1, "report: {rdf_report:?}");
+        assert_eq!(rdf_report.rdf_only_verified, 1, "report: {rdf_report:?}");
+        assert_eq!(rdf_report.verified_signed, 0, "report: {rdf_report:?}");
+        let rdf_prov = stored_mesh_provenance(&rdf_store, &rdf_id).await;
+        assert!(
+            rdf_prov.get("verified_signer_did").is_none(),
+            "RDF-only verification must not stamp owner-grade verified_signer_did: {rdf_prov}"
+        );
+        assert_eq!(
+            rdf_prov.get("rdf_verified_signer_did"),
+            Some(&json!(rdf_signer_did)),
+            "the RDF-branch signer is recorded under the RDF-specific key only: {rdf_prov}"
+        );
+        assert_eq!(
+            rdf_prov.get("rdf_signature_verified"),
+            Some(&json!(true)),
+            "the RDF-branch verification stamp is retained: {rdf_prov}"
+        );
+
+        // Control: full-record verification stamps verified_signer_did.
+        let full_id = Uuid::new_v4();
+        let mut full_record = rdf_bearing_record(full_id, "full record signer attribution rule");
+        let full_key_dir = scratch("full-attribution-key");
+        let full_key_path = full_key_dir.join("signing.key");
+        crate::synaptic_mesh::worker::sign_record(&mut full_record, &full_key_path)
+            .expect("record signs");
+        let full_signer_did = full_record
+            .signer_did
+            .clone()
+            .expect("signed record has a DID");
+        let full_signers = vec![signer_entry_for(&full_record)];
+        let (full_report, full_store) = run_bundle_route_with_signers(
+            "full-attribution",
+            full_record,
+            None,
+            full_signers,
+        )
+        .await;
+        assert_eq!(full_report.applied, 1, "report: {full_report:?}");
+        assert_eq!(full_report.verified_signed, 1, "report: {full_report:?}");
+        assert_eq!(full_report.rdf_only_verified, 0, "report: {full_report:?}");
+        let full_prov = stored_mesh_provenance(&full_store, &full_id).await;
+        assert_eq!(
+            full_prov.get("verified_signer_did"),
+            Some(&json!(full_signer_did)),
+            "full-record verification keeps the owner-grade signer stamp: {full_prov}"
+        );
+        assert!(
+            full_prov.get("rdf_verified_signer_did").is_none(),
+            "no RDF-specific signer key on a full-record signature: {full_prov}"
+        );
+    }
+
+    // ---- finding 54-B: combination rows earn no verified stamps --------
+    //
+    // `MergeDecision::ApplyCombination` materialises a row that is NOT
+    // the signed candidate: the stored (content, state) pair was never
+    // the subject of the candidate's signature verification, in either
+    // sub-shape. The candidate's `signature_disposition` therefore must
+    // not stamp the combination row verified — for either signature
+    // branch. The gate counters still record that the CANDIDATE
+    // verified; only the stored row's provenance stamps are withheld.
+
+    /// 54-B, local-Active sub-shape: pass 1 applies an Active record
+    /// (content C_local); pass 2's candidate is Archived with DIFFERENT
+    /// content C_cand, signed with the production full-record signer
+    /// (canonical-JSON payload, disposition `Verified`). The
+    /// combination stores the LOCAL row's content forced to Archived —
+    /// text present in neither of the candidate's signed payloads — so
+    /// the stored provenance must carry NO `signature_verified` and NO
+    /// `verified_signer_did`, even though the gate counted the
+    /// candidate as verified_signed.
+    #[tokio::test]
+    async fn archived_combination_from_local_active_row_earns_no_verified_stamp() {
+        let id = Uuid::new_v4();
+        // Build and sign the pass-2 candidate first, so its signer can
+        // populate the manifest allowlist before either pass runs.
+        let mut candidate = rdf_bearing_record(id, "candidate archived edit");
+        candidate.lifecycle.state = LifecycleState::Archived;
+        candidate.lifecycle.archived_at = Some(chrono::Utc::now());
+        let key_dir = scratch("combo-local-active-key");
+        let key_path = key_dir.join("signing.key");
+        crate::synaptic_mesh::worker::sign_record(&mut candidate, &key_path)
+            .expect("record signs");
+        let signers = vec![signer_entry_for(&candidate)];
+
+        let (_base, mesh) = mesh_with_commit("combo-local-active");
+        let mesh = reopen_with_signers(&mesh, signers);
+        let store = fresh_store("combo-local-active").await;
+        let served = ["probe".to_string()];
+
+        // Pass 1: the local row lands Active with the local content.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&simple_rule(id, "local active content")).unwrap(),
+        );
+        let first = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 1 applies");
+        assert_eq!(first.applied, 1, "pass 1 report: {first:?}");
+        let (_, local) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the local row was applied");
+        assert_eq!(local.content, "local active content");
+
+        // Pass 2: the signed Archived candidate with different content
+        // replays against the SAME store and lands as a combination.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
+        );
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 2 applies");
+        assert_eq!(second.applied, 1, "pass 2 report: {second:?}");
+        assert!(
+            !second.combinations.is_empty(),
+            "the combination is reported: {second:?}"
+        );
+        assert_eq!(
+            second.verified_signed, 1,
+            "the candidate itself verified at the gate: {second:?}"
+        );
+        assert!(second.ignored.is_empty(), "pass 2 report: {second:?}");
+
+        // The stored row is the combination: LOCAL content, Archived.
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the combination row was applied");
+        assert_eq!(payload.content, "local active content");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("lifecycle_state"),
+            Some(&json!("archived")),
+            "the combination row is stored archived: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("signature_verified").is_none(),
+            "no full-record stamp on a combination row: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("verified_signer_did").is_none(),
+            "no owner-grade signer stamp on a combination row: {mesh_prov}"
+        );
+    }
+
+    /// 54-B, local-Archived sub-shape: pass 1 applies an Archived
+    /// record; pass 2's candidate is Active with edited content, signed
+    /// with the legacy RDF signer (disposition `VerifiedRdfOnly`). The
+    /// combination stores the CANDIDATE's content but forced to
+    /// Archived, while the candidate signed Active — the signed
+    /// (content, state) pair was never stored — so the stored
+    /// provenance must carry NO `rdf_signature_verified` and NO
+    /// `rdf_verified_signer_did`, even though the gate counted the
+    /// candidate as rdf_only_verified.
+    #[tokio::test]
+    async fn archived_combination_from_local_archived_row_earns_no_rdf_verified_stamp() {
+        let id = Uuid::new_v4();
+        // Build and sign the pass-2 candidate first, so its signer can
+        // populate the manifest allowlist before either pass runs.
+        let mut candidate = rdf_bearing_record(id, "candidate active edit");
+        let key_dir = scratch("combo-local-archived-key");
+        let key_path = key_dir.join("signing.key");
+        sign_record_legacy_rdf(&mut candidate, &key_path);
+        let signers = vec![signer_entry_for(&candidate)];
+
+        let (_base, mesh) = mesh_with_commit("combo-local-archived");
+        let mesh = reopen_with_signers(&mesh, signers);
+        let store = fresh_store("combo-local-archived").await;
+        let served = ["probe".to_string()];
+
+        // Pass 1: the local row lands Archived.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&record_with_state(
+                id,
+                "archived",
+                None,
+                "local archived content",
+            ))
+            .unwrap(),
+        );
+        let first = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 1 applies");
+        assert_eq!(first.applied, 1, "pass 1 report: {first:?}");
+        let (_, local) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the local row was applied");
+        assert_eq!(local.content, "local archived content");
+
+        // Pass 2: the legacy RDF-signed Active candidate with edited
+        // content replays against the SAME store and lands as a
+        // combination.
+        commit_record_json(
+            &mesh,
+            "probe",
+            "memories",
+            &id.to_string(),
+            &serde_json::to_string(&serde_json::to_value(&candidate).unwrap()).unwrap(),
+        );
+        let second = apply_changed(&mesh, &served, store.clone(), emb())
+            .await
+            .expect("pass 2 applies");
+        assert_eq!(second.applied, 1, "pass 2 report: {second:?}");
+        assert!(
+            !second.combinations.is_empty(),
+            "the combination is reported: {second:?}"
+        );
+        assert_eq!(
+            second.rdf_only_verified, 1,
+            "the candidate itself verified RDF-only at the gate: {second:?}"
+        );
+        assert_eq!(second.verified_signed, 0, "pass 2 report: {second:?}");
+        assert!(second.ignored.is_empty(), "pass 2 report: {second:?}");
+
+        // The stored row is the combination: the CANDIDATE's content,
+        // but Archived — not the Active state the candidate signed.
+        let (_, payload) = store
+            .get("probe", &id.to_string())
+            .await
+            .unwrap()
+            .expect("the combination row was applied");
+        assert_eq!(payload.content, "candidate active edit");
+        let mesh_prov = stored_mesh_provenance(&store, &id).await;
+        assert_eq!(
+            mesh_prov.get("lifecycle_state"),
+            Some(&json!("archived")),
+            "the combination row is stored archived: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("rdf_signature_verified").is_none(),
+            "no RDF-only stamp on a combination row: {mesh_prov}"
+        );
+        assert!(
+            mesh_prov.get("rdf_verified_signer_did").is_none(),
+            "no RDF-branch signer stamp on a combination row: {mesh_prov}"
+        );
+    }
+
+    /// T7: `format_apply_report` renders the RDF-only segment only
+    /// when the counter is non-zero, and renders byte-identically to
+    /// the pre-change format when it is zero. The zero-case expectation
+    /// is the full string the base implementation (0564d108) produces
+    /// for this same minimal report: with every signature counter at
+    /// zero it appends no signed segment at all, and head, ids,
+    /// conflicts and combinations are all empty here, so nothing else
+    /// is appended either.
+    #[test]
+    fn format_apply_report_rdf_only_segment_is_additive() {
+        fn minimal_report(rdf_only_verified: usize) -> ApplyReport {
+            ApplyReport {
+                applied: 1,
+                skipped_update_id: 0,
+                ignored: Vec::new(),
+                full_tree: false,
+                head: String::new(),
+                applied_ids: Vec::new(),
+                conflicted: 0,
+                conflicted_ids: Vec::new(),
+                combinations: Vec::new(),
+                verified_signed: 0,
+                rdf_only_verified,
+                unsigned_accepted: 0,
+                signature_rejected: 0,
+                unauthorized_signer: 0,
+            }
+        }
+        let with_rdf = format_apply_report("format-test", &minimal_report(1));
+        assert!(
+            with_rdf.contains("rdf-only-signed 1"),
+            "the RDF-only segment is rendered: {with_rdf}"
+        );
+        assert_eq!(
+            with_rdf,
+            "pulled mesh format-test: applied 1, skipped 0, ignored 0, \
+             signed 0 / signature-rejected 0 / unauthorized 0, rdf-only-signed 1"
+        );
+        let without_rdf = format_apply_report("format-test", &minimal_report(0));
+        assert_eq!(
+            without_rdf,
+            "pulled mesh format-test: applied 1, skipped 0, ignored 0"
         );
     }
 
@@ -4687,6 +5510,7 @@ mod tests {
             emb(),
             Trust::Untrusted,
             "unsigned",
+            &SignatureDisposition::Unsigned,
         )
         .await;
         assert!(
@@ -4823,6 +5647,7 @@ mod tests {
             emb(),
             Trust::Untrusted,
             "unsigned",
+            &SignatureDisposition::Unsigned,
         )
         .await;
         assert!(
@@ -4925,6 +5750,7 @@ mod tests {
             emb(),
             Trust::Trusted,
             "unsigned",
+            &SignatureDisposition::Unsigned,
         )
         .await;
         assert!(
