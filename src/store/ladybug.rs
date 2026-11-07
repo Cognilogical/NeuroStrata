@@ -304,6 +304,7 @@ async fn search_inner(
             let result_count = result.get_num_tuples() as usize;
             let mut all_primaries = Vec::new();
             let mut filtered_primaries = Vec::new();
+            let mut normative_count: usize = 0;
             // Dedup by bare_id across generations: keep the highest generation
             // for each logical id. Maps bare_id -> (generation, index in all_primaries).
             let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
@@ -433,6 +434,9 @@ async fn search_inner(
                 // Dedup by bare_id across generations: keep the highest
                 // generation for each logical id. Unscoped rows (bare_id_of
                 // returns None) are never deduped.
+                let is_normative_primary =
+                    NORMATIVE_MEMORY_TYPES.contains(&sr.payload.memory_type.as_str())
+                        && boosted_distance <= MAX_NORMATIVE_DISTANCE;
                 if let Some(bare) = bare_id_of(&id) {
                     let gen = split_scoped_id(&id)
                         .map(|(_, g, _)| g as u64)
@@ -441,12 +445,16 @@ async fn search_inner(
                         Some(&(existing_gen, idx)) if gen > existing_gen => {
                             // Supersede the lower-generation entry in place.
                             all_primaries[idx] = sr.clone();
-                            best_by_bare.insert(bare, (gen, idx));
                             if domain_match {
-                                if let Some(pos) = filtered_primaries.iter().position(|r: &SearchResult| r.id.as_str() == id.as_str()) {
+                                if let Some(pos) = filtered_primaries.iter().position(|r: &SearchResult| {
+                                    bare_id_of(&r.id).as_deref() == Some(bare.as_str())
+                                }) {
                                     filtered_primaries[pos] = sr;
+                                } else {
+                                    filtered_primaries.push(sr);
                                 }
                             }
+                            best_by_bare.insert(bare, (gen, idx));
                         }
                         Some(_) => {
                             // Existing entry has higher or equal gen; skip.
@@ -459,6 +467,9 @@ async fn search_inner(
                             if domain_match {
                                 filtered_primaries.push(sr);
                             }
+                            if is_normative_primary && (domain_keys.is_empty() || domain_match) {
+                                normative_count += 1;
+                            }
                         }
                     }
                 } else {
@@ -466,30 +477,39 @@ async fn search_inner(
                     if domain_match {
                         filtered_primaries.push(sr);
                     }
+                    if is_normative_primary && (domain_keys.is_empty() || domain_match) {
+                        normative_count += 1;
+                    }
                 };
 
                 // Stop condition counts filtered_primaries when filter is active,
                 // otherwise counts all_primaries (which is the same as filtered when empty).
+                // Normative rows ranked beyond the limit still need to enter
+                // `all_primaries` / `filtered_primaries` so the slot reservation
+                // below can promote them: only break early once the reserved
+                // normative slots are satisfied or the candidate list is exhausted.
                 let stop_count = if domain_keys.is_empty() {
                     all_primaries.len()
                 } else {
                     filtered_primaries.len()
                 };
-                if stop_count >= limit {
+                if stop_count >= limit && (limit < 3 || normative_count >= normative_slot_limit(limit)) {
                     break;
                 }
             }
 
-            // Determine chosen set and mode.
+            // Determine chosen set and mode, reserving normative slots within `limit`
+            // so structural (code_ast/doc_section) primaries cannot crowd out
+            // normative rules/facts/decisions/procedures before graph expansion.
             let (chosen_primaries, mode) = if domain_keys.is_empty() {
                 // No filter asked for: all rows go to both lists, mode is Vector
-                (all_primaries, DomainMatchMode::Vector)
+                (reserve_normative_slots(all_primaries, limit), DomainMatchMode::Vector)
             } else if filtered_primaries.is_empty() && !all_primaries.is_empty() {
                 // Filter would empty the candidates: skip it, use unfiltered, mode is Vector
-                (all_primaries.into_iter().take(limit).collect(), DomainMatchMode::Vector)
+                (reserve_normative_slots(all_primaries, limit), DomainMatchMode::Vector)
             } else {
                 // Filter applied successfully
-                (filtered_primaries, DomainMatchMode::Domain)
+                (reserve_normative_slots(filtered_primaries, limit), DomainMatchMode::Domain)
             };
 
             let mut all_primaries_with_exact: Vec<SearchResult> = exact_matches.clone();
@@ -1073,32 +1093,7 @@ let incomplete = result_count >= fetch_limit;
                         std::cmp::Ordering::Equal => a.id.cmp(&b.id),
                     }
                 });
-                results = hybrid_results.into_iter().take(limit).collect();
-
-                // Normative slot reservation (Wave 2.1): within the hybrid
-                // limit, reserve up to normative_slot_limit(limit) slots for
-                // normative memories (rule/fact/decision/procedure) that clear
-                // the relevance floor. Scores are distances (lower = better),
-                // so the floor is a maximum score.
-                if limit >= 3 {
-                    let normative_limit = normative_slot_limit(limit);
-                    let mut normative: Vec<SearchResult> = Vec::new();
-                    let mut non_normative: Vec<SearchResult> = Vec::new();
-                    for r in results {
-                        let is_normative = NORMATIVE_MEMORY_TYPES.contains(&r.payload.memory_type.as_str())
-                            && r.score <= NORMATIVE_RELEVANCE_FLOOR;
-                        if is_normative {
-                            normative.push(r);
-                        } else {
-                            non_normative.push(r);
-                        }
-                    }
-                    let mut reserved: Vec<SearchResult> = Vec::new();
-                    reserved.extend(normative.into_iter().take(normative_limit));
-                    let remaining = limit.saturating_sub(reserved.len());
-                    reserved.extend(non_normative.into_iter().take(remaining));
-                    results = reserved;
-                }
+                results = reserve_normative_slots(hybrid_results, limit);
             }
 
             Ok(DomainSearchOutcome { results, mode, incomplete })
@@ -2031,15 +2026,10 @@ pub(crate) fn is_active_scoped_row(
         } else {
             active_set.contains(&gen_i)
         }
+    } else if by_source.is_empty() {
+        active_set.contains(&gen_i)
     } else {
-        // `code_ast` and other scoped rows without an explicit `source_key`:
-        // active when the namespace has a single source pointer or any known
-        // non-docs generation (dedup by bare_id keeps the highest gen).
-        if by_source.len() == 1 || max_non_doc_gen.is_some() {
-            active_set.contains(&gen_i)
-        } else {
-            true
-        }
+        max_non_doc_gen == Some(gen_i)
     };
     if keep { Some(id.to_string()) } else { None }
 }
@@ -2049,14 +2039,51 @@ pub(crate) fn is_active_scoped_row(
 /// same predicate (see the FEATURE-4 provenance contract in `src/traits.rs`).
 const NORMATIVE_MEMORY_TYPES: [&str; 4] = ["rule", "fact", "decision", "procedure"];
 
-/// Relevance floor (distance) below which a normative candidate is eligible
-/// for a reserved search slot. Scores are distances (lower = better).
+/// Relevance floor (similarity) below which a normative candidate is eligible
+/// for a reserved search slot. Scores are distances (lower = better, [0.0, 1.0]
+/// normalized in hybrid / cosine-L2 in default mode), so the similarity floor
+/// maps to a maximum distance of `MAX_NORMATIVE_DISTANCE`.
 const NORMATIVE_RELEVANCE_FLOOR: f32 = 0.20;
+const MAX_NORMATIVE_DISTANCE: f32 = 1.0 - NORMATIVE_RELEVANCE_FLOOR;
 
 /// Maximum normative slots reserved in a search result, capped at half the
 /// limit rounded up so structural evidence always keeps at least half the slots.
 fn normative_slot_limit(limit: usize) -> usize {
     usize::min(3, limit.div_ceil(2))
+}
+
+/// Reserve up to `normative_slot_limit(limit)` slots for normative memories
+/// (`rule`/`fact`/`decision`/`procedure`) that pass `MAX_NORMATIVE_DISTANCE`,
+/// filling remaining slots up to `limit` from `non_normative` (and any leftover
+/// normative candidates when `non_normative` has fewer than `remaining` items).
+fn reserve_normative_slots(candidates: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+    if limit < 3 {
+        return candidates.into_iter().take(limit).collect();
+    }
+    let normative_limit = normative_slot_limit(limit);
+    let mut normative: Vec<SearchResult> = Vec::new();
+    let mut non_normative: Vec<SearchResult> = Vec::new();
+    for r in candidates {
+        let is_normative = NORMATIVE_MEMORY_TYPES.contains(&r.payload.memory_type.as_str())
+            && r.score <= MAX_NORMATIVE_DISTANCE;
+        if is_normative {
+            normative.push(r);
+        } else {
+            non_normative.push(r);
+        }
+    }
+    let mut reserved: Vec<SearchResult> = Vec::new();
+    let mut normative_iter = normative.into_iter();
+    for r in normative_iter.by_ref().take(normative_limit) {
+        reserved.push(r);
+    }
+    let remaining = limit.saturating_sub(reserved.len());
+    reserved.extend(non_normative.into_iter().take(remaining));
+    if reserved.len() < limit {
+        let extra = limit - reserved.len();
+        reserved.extend(normative_iter.take(extra));
+    }
+    reserved
 }
 
 /// The bare (logical) id inside a generation-scoped id, or `None` for unscoped
@@ -5257,13 +5284,13 @@ impl VectorStore for LadybugStore {
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
-            // The active generations for this namespace, read once so every
-            // generation-scoped row can be checked against them below. A row
-            // from a superseded generation is dropped; a row that is not
-            // generation-scoped (a rule, fact, task, or legacy id) is always
-            // kept, so the full-DB diagnostic callers keep seeing everything
-            // they always did.
-            let active_gens = active_generations_of(conn, &namespace);
+            // The active generations for this namespace, resolved per source so a
+            // row is validated against the source that owns it (not just any
+            // active generation in the namespace). Read once per search.
+            let (by_source, active_set, max_code_gen) =
+                active_generations_by_source_of(conn, &namespace);
+
+            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
 
             // Build WHERE clause with optional filters (R15: push into Cypher).
             let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
@@ -5282,11 +5309,6 @@ impl VectorStore for LadybugStore {
 
             for row in result {
                 let id: String = format!("{}", row[0]);
-                if let Some((_, gen, _)) = crate::parser::ingest::split_scoped_id(&id) {
-                    if !active_gens.contains(&gen) {
-                        continue; // superseded generation: not reachable
-                    }
-                }
                 let content: String = format!("{}", row[1]);
                 let uid: String = format!("{}", row[2]);
                 let memory_type: String = format!("{}", row[3]);
@@ -5305,8 +5327,22 @@ impl VectorStore for LadybugStore {
                     }
                 };
 
-                results.push(SearchResult {
-                    id,
+                // Wave 2.1 row filter: same generation-scoped reachability the
+                // search path applies, so diagnostics never see superseded rows.
+                if is_active_scoped_row(
+                    &id,
+                    &namespace,
+                    &memory_type,
+                    &metadata_val,
+                    &by_source,
+                    &active_set,
+                    max_code_gen,
+                ).is_none() {
+                    continue;
+                }
+
+                let sr = SearchResult {
+                    id: id.clone(),
                     score: 0.0,
                     payload: MemoryPayload {
                         content,
@@ -5318,7 +5354,33 @@ impl VectorStore for LadybugStore {
                         metadata: metadata_val,
                     },
                     evidence: None,
-                });
+                };
+
+                // Dedup by bare_id across generations: keep the highest
+                // generation for each logical id. Unscoped rows (bare_id_of
+                // returns None) are never deduped.
+                if let Some(bare) = bare_id_of(&id) {
+                    let gen = split_scoped_id(&id)
+                        .map(|(_, g, _)| g as u64)
+                        .unwrap_or(0);
+                    match best_by_bare.get(&bare) {
+                        Some(&(existing_gen, idx)) if gen > existing_gen => {
+                            results[idx] = sr.clone();
+                            best_by_bare.insert(bare, (gen, idx));
+                        }
+                        Some(_) => {
+                            // existing entry has higher or equal gen; skip.
+                            continue;
+                        }
+                        None => {
+                            let idx = results.len();
+                            best_by_bare.insert(bare, (gen, idx));
+                            results.push(sr);
+                        }
+                    }
+                } else {
+                    results.push(sr);
+                }
             }
 
             Ok(results)
@@ -9621,7 +9683,7 @@ eurostrata\src\daemon.rs",
 
         // Search with limit >= 3 to trigger normative slot reservation.
         let results = store
-            .search("probe", query_vec, 5, false, false)
+            .search("probe", query_vec.clone(), 5, false, false)
             .await
             .unwrap();
         let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
@@ -9651,6 +9713,49 @@ eurostrata\src\daemon.rs",
             a_rs_count,
             1,
             "exactly one generation of src/a.rs should appear (dedup by bare_id)"
+        );
+
+        // Normative slot reservation: the top 2 results are normative memories even if
+        // extra active code_ast/doc_section rows match closer in raw vector distance.
+        assert!(
+            matches!(results[0].payload.memory_type.as_str(), "rule" | "fact"),
+            "slot 0 reserved for normative memory, got {}",
+            results[0].payload.memory_type
+        );
+        assert!(
+            matches!(results[1].payload.memory_type.as_str(), "rule" | "fact"),
+            "slot 1 reserved for normative memory, got {}",
+            results[1].payload.memory_type
+        );
+
+        // Multi-source isolation in list() and search(): publish docs at gen 3 while
+        // code_ast (source-a) stays at gen 2. A stale code_ast without source_key at
+        // gen 3 must NOT pass simply because docs is at gen 3.
+        let _ = store.begin_generation("probe", "docs").await.unwrap();
+        store.publish_generation("probe", "docs", 3).await.unwrap();
+        let stale_code_gen3 = crate::parser::ingest::generation_scoped_id("probe", 3, "src/stale.rs");
+        store
+            .upsert(
+                "probe",
+                &stale_code_gen3,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        let listed = store.list("probe", None, None).await.unwrap();
+        let listed_ids: Vec<&str> = listed.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            listed_ids.contains(&gen2_id.as_str()),
+            "list() keeps active code_ast generation 2"
+        );
+        assert!(
+            !listed_ids.contains(&gen1_id.as_str()),
+            "list() drops superseded generation 1"
+        );
+        assert!(
+            !listed_ids.contains(&stale_code_gen3.as_str()),
+            "list() drops code_ast without source_key whose gen (3) only matches docs, not max_code_gen (2)"
         );
     }
 
