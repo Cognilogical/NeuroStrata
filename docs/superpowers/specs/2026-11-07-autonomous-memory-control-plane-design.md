@@ -10,7 +10,7 @@
 
 ## 1. Problem Statement & Empirical Field Audit (597 OpenCode V2 Sessions)
 
-An empirical audit of **597 OpenCode V2 (`v2.2.6`) sessions** (`167,887` `session_message` rows across `NeuroStrata` and `keywest.health` from `2026-11-03` through `2026-11-07`) and decompilation of `/home/kenton/.opencode/bin/opencode` established two root causes for why post-`v1.15.1` / `v1.16.1` autonomous recall, memory capture, and task intake did not fire as intended:
+An empirical audit of **597 OpenCode V2 (`v2.2.6`) sessions** (`167,887` `session_message` rows across `NeuroStrata` and secondary workspace sessions from `2026-11-03` through `2026-11-07`) and decompilation of `/home/kenton/.opencode/bin/opencode` established two root causes for why post-`v1.15.1` / `v1.16.1` autonomous recall, memory capture, and task intake did not fire as intended:
 
 ### 1.1 OpenCode V2 Plugin: Propagation Gap + 3 Code Defects in `v1.16.1`
 
@@ -18,7 +18,7 @@ Both failure modes occurred simultaneously on this machine:
 
 1. **Lazy-Install Propagation Gap (`src/task/harness_plugins.rs:222`, `src/task/mod.rs:2817`, `src/server.rs:3431`):**
    - `/home/kenton/.cargo/bin/neurostrata-mcp` was built `2026-11-05 19:39` (with PR #52 / `v1.16.0`), but the running `neurostrata-mcp daemon` process (`PID 9936`) did not restart until `2026-11-06 15:01 EST` (`1793995260000` ms).
-   - `auto_install_detected_plugins` is only invoked inside `hook_hygiene` when an agent calls `neurostrata_get_snapshot` (or `bootstrap` / `task_setup`). Because zero sessions ran in `keywest.health` after the daemon restart, `keywest.health` still has its `Nov 3` `.opencode/` directory (missing `.opencode/plugins/neurostrata.js`), and `NeuroStrata` only received `.opencode/plugins/neurostrata.js` at `2026-11-07T03:03:47Z` during this audit session.
+   - `auto_install_detected_plugins` is only invoked inside `hook_hygiene` when an agent calls `neurostrata_get_snapshot` (or `bootstrap` / `task_setup`). Because zero sessions ran in secondary workspaces after the daemon restart, those workspaces retained their `Nov 3` `.opencode/` directories (missing `.opencode/plugins/neurostrata.js`), and `NeuroStrata` only received `.opencode/plugins/neurostrata.js` at `2026-11-07T03:03:47Z` during this audit session.
 2. **Defect A — `executeAfterHandler` Payload Contract Mismatch (`plugins/core/index.ts:1310-1331`):**
    - Verified against `/home/kenton/.opencode/bin/opencode` (`v2.2.6`, byte offset `176924277` and `opencode.tool.input.repair` at offset `177909005`): OpenCode V2 invokes `ctx.tool.hook("execute.after", cb)` with a single event object:
      `event = { tool, sessionID, agent, messageID, id, input, status: "completed", result: { content, output?, metadata? } }`
@@ -62,7 +62,7 @@ Both failure modes occurred simultaneously on this machine:
    - `wire_harness_config("opencode", ...)` writes `.opencode/plugins/neurostrata.js` (auto-discovered by OpenCode V2's `.opencode/plugins/` scanner) and `.opencode/neurostrata-plugin.json`.
    - If `.opencode/opencode.json` contains the legacy broken entry `"./.NeuroStrata/plugins/opencode/dist/index.js"` in `"plugins"`, `wire_harness_config` removes that entry (and removes `"plugins": []` if empty) so OpenCode V2 stops logging `ENOENT` warnings.
 2. **Eager Daemon Startup Propagation & Manifest (`src/daemon.rs`, `src/task/harness_plugins.rs`):**
-   - On daemon startup and on `neurostrata-mcp hooks install`, scan `startup_root`, `allowed_external_dirs`, and registered project roots in LadybugDB (`is_registry_row` / `directory` roots containing `.git`) and run `auto_install_detected_plugins` eagerly so upgraded plugin bundles deploy to `keywest.health` and `NeuroStrata` immediately without waiting for `neurostrata_get_snapshot`.
+   - On daemon startup and on `neurostrata-mcp hooks install`, scan `startup_root`, `allowed_external_dirs`, and registered project roots in LadybugDB (`is_registry_row` / `directory` roots containing `.git`) and run `auto_install_detected_plugins` eagerly so upgraded plugin bundles deploy to `NeuroStrata` and all configured project workspaces immediately without waiting for `neurostrata_get_snapshot`.
    - Write `.NeuroStrata/plugins/manifest.json` containing `{ abi_version: 2, plugin_version, bundle_sha256, installed_at, harnesses }`.
 3. **Canonical Project Identity in OpenCode V2 `setup(ctx)` (`plugins/core/index.ts`):**
    - Extract `projectRoot` from `ctx?.location?.project?.canonical ?? ctx?.location?.directory ?? ctx?.directory ?? ctx?.cwd` before falling back to `process.cwd()`.
@@ -165,7 +165,7 @@ Both failure modes occurred simultaneously on this machine:
 
 1. **Wave 1 & 2 (OpenCode V2 Plugin & Hook Contract):**
    - `.opencode/opencode.json` no longer contains `"./.NeuroStrata/plugins/opencode/dist/index.js"`; OpenCode V2 loads `.opencode/plugins/neurostrata.js` with zero `ENOENT` warnings.
-   - Daemon startup and `hooks install` eagerly deploy `.opencode/plugins/neurostrata.js` and `.NeuroStrata/plugins/manifest.json` to both `NeuroStrata` and `keywest.health`.
+   - Daemon startup and `hooks install` eagerly deploy `.opencode/plugins/neurostrata.js` and `.NeuroStrata/plugins/manifest.json` to `NeuroStrata` and all configured project workspaces.
    - `executeAfterHandler` mutates `event.result.content` (both `Array<{type:"text",text:string}>` and `string` formats) on `read`/`edit`/`write` calls and preserves original tool output.
    - `ctx.session.hook("context")` injects epoch-deduplicated session context once per `(sessionID, contextEpoch)` and resets on `ctx.session.hook("compaction")`.
    - `executeBeforeHandler` enriches `subagent` prompts with target-file governing memories and 2-hop bridges.

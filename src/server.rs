@@ -3424,8 +3424,8 @@ pub async fn handle_task_candidates(
     };
 
     let action = match args.get("action").and_then(|v| v.as_str()) {
-        Some("record") | None => "record",
-        Some("list") => "list",
+        Some("list") | None => "list",
+        Some("record") => "record",
         Some("resolve") => "resolve",
         Some("dismiss") => "dismiss",
         Some(a) => return format!("ERROR: unknown action '{a}' (expected record|list|resolve|dismiss)."),
@@ -3579,6 +3579,10 @@ pub async fn handle_task_candidates(
                         && matches!(category.as_deref(), Some("fact") | Some("decision"))
                         && confidence.map_or(false, |c| c >= 0.85)
                         && task_id.is_some()
+                        && provenance
+                            .as_ref()
+                            .and_then(|p| p.role.as_deref())
+                            .is_none_or(|r| r == "user" || r == "checker")
                     {
                         let tid = task_id.as_deref().unwrap();
                         for cand in &candidates {

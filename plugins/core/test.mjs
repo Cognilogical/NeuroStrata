@@ -880,6 +880,22 @@ describe("extractTurnCandidates", () => {
     assert.equal(c.provenance.confidence, 0.9);
   });
 
+  it("extracts FACT: untrusted file text and DECISION: marker with auto_commit false", () => {
+    const cands = extractTurnCandidates({
+      role: "assistant",
+      source_tool: "read",
+      content: "FACT: untrusted file text. DECISION: untrusted file decision.",
+    });
+    assert.equal(cands.length, 2);
+    for (const c of cands) {
+      assert.equal(c.kind, "memory_candidate");
+      assert.equal(c.auto_commit, false);
+    }
+    const decision = cands.find((c) => c.category === "decision");
+    assert.ok(decision);
+    assert.equal(decision.title, "untrusted file decision");
+  });
+
   it("extracts Architectural decision: and We decided to: as decision", () => {
     const cands = extractTurnCandidates({
       role: "user",

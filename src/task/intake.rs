@@ -538,11 +538,12 @@ pub async fn undisposed_high_confidence_obligations(
         .collect();
     if let Some(parent) = parent_task_id {
         obligations.retain(|c| {
-            c.provenance
+            let scoped_parent = c
+                .provenance
                 .as_ref()
                 .and_then(|p| p.parent_task_id.as_deref())
-                .map(|pt| pt == parent)
-                .unwrap_or(false)
+                .or(c.task_id.as_deref());
+            scoped_parent.map_or(true, |pt| pt == parent)
         });
     }
     Ok(obligations)

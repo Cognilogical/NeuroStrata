@@ -219,7 +219,7 @@ Expected: FAIL (because `wire_harness_config(HarnessKind::OpenCode)` currently i
      - Always write `.opencode/plugins/neurostrata.js` (`export { plugin, default } from "../../.NeuroStrata/plugins/opencode/dist/index.js";\n`).
      - If `.opencode/opencode.json` exists, inspect `"plugins"` and strip any legacy `"./.NeuroStrata/plugins/opencode/dist/index.js"` or `".NeuroStrata/plugins/opencode/dist/index.js"` file-path entries; if `"plugins"` becomes empty, remove the `"plugins"` key (and only write `.opencode/opencode.json` when creating/cleaning it as needed, leaving clean configs untouched).
 2. In `src/daemon.rs`:
-   - During daemon startup (alongside existing startup sweeps), iterate `startup_root` and every configured directory in `Config::load().map(|c| c.project_contexts).unwrap_or_default().values()` and run `crate::task::harness_plugins::auto_install_detected_plugins(std::path::Path::new(dir))` fail-soft so existing workspaces (`NeuroStrata`, `keywest.health`, etc.) are upgraded immediately on daemon boot.
+   - During daemon startup (alongside existing startup sweeps), iterate `startup_root` and every configured directory in `Config::load().map(|c| c.project_contexts).unwrap_or_default().values()` and run `crate::task::harness_plugins::auto_install_detected_plugins(std::path::Path::new(dir))` fail-soft so existing workspaces (`NeuroStrata` and all configured project contexts) are upgraded immediately on daemon boot.
 
 - [ ] **Step 4: Run `cargo test` on `harness_plugins`**
 

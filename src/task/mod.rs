@@ -1759,7 +1759,7 @@ pub async fn handle_task_complete(
     let intake_store = store.as_intake_store();
     if let Some(intake) = intake_store {
         let obligations =
-            undisposed_high_confidence_obligations(&*intake, &namespace, None, None)
+            undisposed_high_confidence_obligations(&*intake, &namespace, None, Some(id.as_str()))
                 .await
                 .unwrap_or_default();
         if !obligations.is_empty() {

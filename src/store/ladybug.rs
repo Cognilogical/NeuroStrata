@@ -2001,7 +2001,7 @@ pub(crate) fn is_active_scoped_row(
     metadata: &Value,
     by_source: &HashMap<String, i64>,
     active_set: &std::collections::HashSet<i64>,
-    max_non_doc_gen: Option<i64>,
+    _max_non_doc_gen: Option<i64>,
 ) -> Option<String> {
     let Some((scoped_ns, gen, _bare_id)) = split_scoped_id(id) else {
         // Unscoped (normative or legacy): always reachable.
@@ -2029,7 +2029,7 @@ pub(crate) fn is_active_scoped_row(
     } else if by_source.is_empty() {
         active_set.contains(&gen_i)
     } else {
-        max_non_doc_gen == Some(gen_i)
+        by_source.iter().any(|(k, &g)| k != "docs" && g == gen_i)
     };
     if keep { Some(id.to_string()) } else { None }
 }
@@ -9904,6 +9904,43 @@ eurostrata\src\daemon.rs",
         assert!(
             !listed_ids.contains(&stale_code_gen3.as_str()),
             "list() drops code_ast without source_key whose gen (3) only matches docs, not max_code_gen (2)"
+        );
+
+        // Multi-source: source-b publishes generation 4. A code_ast row at gen 2
+        // without source_key must NOT be dropped (it matches source-a's active gen
+        // 2), and a code_ast row at gen 4 without source_key must be retained
+        // (it matches source-b's active gen 4). Both must survive list().
+        assert_eq!(store.begin_generation("probe", "source-b").await.unwrap(), 4);
+        let gen2_no_source_id = crate::parser::ingest::generation_scoped_id("probe", 2, "src/no-source-a.rs");
+        store
+            .upsert(
+                "probe",
+                &gen2_no_source_id,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        let gen4_no_source_id = crate::parser::ingest::generation_scoped_id("probe", 4, "src/no-source-b.rs");
+        store
+            .upsert(
+                "probe",
+                &gen4_no_source_id,
+                query_vec.clone(),
+                retired_test_payload("code_ast", "auto-ingestor", json!({})),
+            )
+            .await
+            .unwrap();
+        store.publish_generation("probe", "source-b", 4).await.unwrap();
+        let listed2 = store.list("probe", None, None).await.unwrap();
+        let listed2_ids: Vec<&str> = listed2.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            listed2_ids.contains(&gen2_no_source_id.as_str()),
+            "list() retains code_ast without source_key at gen 2 (matches source-a active gen 2)"
+        );
+        assert!(
+            listed2_ids.contains(&gen4_no_source_id.as_str()),
+            "list() retains code_ast without source_key at gen 4 (matches source-b active gen 4)"
         );
     }
 
