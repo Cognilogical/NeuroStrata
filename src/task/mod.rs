@@ -449,6 +449,7 @@ pub async fn build_task_graph_context(
             "memory_type": r.payload.memory_type,
             "location": r.payload.location,
             "snippet": snippet,
+            "metadata": r.payload.metadata,
             "calls": calls,
             "imports": imports,
             "governs": governs,
@@ -506,7 +507,7 @@ pub async fn build_task_graph_context(
                             .map(|s| format!("  - {s}"))
                     })
                     .collect();
-                format!("\n- Cross-Domain Bridges:\n{}", lines.join("\n"))
+                format!("\n### Cross-Domain Bridges\n{}", lines.join("\n"))
             }
         })
         .unwrap_or_default();
@@ -534,6 +535,7 @@ async fn synthesize_conceptual_bridges(
     items: &[Value],
 ) -> Value {
     let mut bridges: Vec<Value> = Vec::new();
+    let mut seen_targets: HashSet<String> = HashSet::new();
     // `related` lives on `GraphRead`, which only `LadybugStore` implements among
     // the `VectorStore` implementors; other store types yield no bridges.
     let Some(ladybug) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() else {
@@ -550,7 +552,8 @@ async fn synthesize_conceptual_bridges(
             None => continue,
         };
         let seed_metadata = item.get("metadata").unwrap_or(&Value::Null);
-        let seed_domain: Vec<String> = crate::domain::domain_keys(seed_metadata);
+        let seed_location = item.get("location").and_then(|v| v.as_str()).unwrap_or("");
+        let seed_tokens = feature_tokens(seed_metadata, seed_location);
         if let Ok(result) = ladybug
             .related(
                 namespace,
@@ -565,6 +568,18 @@ async fn synthesize_conceptual_bridges(
             )
             .await
         {
+            // hop1_ids: the via nodes reached at depth 1 from this seed.
+            let mut hop1_ids: HashSet<String> = HashSet::new();
+            for edge in &result.edges {
+                if edge.depth == 1 {
+                    if edge.source != seed_id {
+                        hop1_ids.insert(edge.source.clone());
+                    }
+                    if edge.target != seed_id {
+                        hop1_ids.insert(edge.target.clone());
+                    }
+                }
+            }
             for edge in &result.edges {
                 if bridges.len() >= MAX_CONCEPTUAL_BRIDGES {
                     break;
@@ -573,8 +588,19 @@ async fn synthesize_conceptual_bridges(
                 if edge.depth != 2 {
                     continue;
                 }
-                let target_id = edge.target.as_str();
-                if target_id == seed_id {
+                let a = edge.source.as_str();
+                let b = edge.target.as_str();
+                // The via is whichever endpoint sits at hop 1; the target is the
+                // other endpoint (the edge may be stored in either orientation
+                // under Direction::Both, so do not assume edge.source is the via).
+                let (via_id, target_id) = if hop1_ids.contains(a) && b != seed_id && !hop1_ids.contains(b) {
+                    (a, b)
+                } else if hop1_ids.contains(b) && a != seed_id && !hop1_ids.contains(a) {
+                    (b, a)
+                } else {
+                    continue;
+                };
+                if seen_targets.contains(target_id) {
                     continue;
                 }
                 let target_node = match result.nodes.iter().find(|n| n.id == target_id) {
@@ -584,14 +610,38 @@ async fn synthesize_conceptual_bridges(
                 if !is_normative_memory(&target_node.memory_type) {
                     continue;
                 }
-                let target_domain = target_node.domain.as_deref().unwrap_or("");
-                if target_domain.is_empty()
-                    || seed_domain.iter().any(|sd| sd == target_domain)
+                // Fetch the target row so its full metadata (domain, tags,
+                // governs, location) is available for token extraction.
+                let target_metadata = if let Ok(Some((_, payload))) =
+                    ladybug.get(namespace, target_id).await
                 {
-                    continue;
+                    payload.metadata
+                } else {
+                    Value::Null
+                };
+                let target_location = target_metadata
+                    .get("location")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut target_tokens: HashSet<String> = HashSet::new();
+                if let Some(domain) = &target_node.domain {
+                    target_tokens.insert(domain.clone());
                 }
+                for t in crate::domain::domain_keys(&target_metadata) {
+                    target_tokens.insert(t);
+                }
+                target_tokens.extend(feature_tokens(&target_metadata, target_location));
+                // Cross-domain filter: require jaccard < 0.35 when the target
+                // carries any tokens; an empty target token set is not a filter.
+                if !target_tokens.is_empty() {
+                    let sim = jaccard_similarity(&seed_tokens, &target_tokens);
+                    if sim >= 0.35 {
+                        continue;
+                    }
+                }
+                seen_targets.insert(target_id.to_string());
                 let why_connected =
-                    format!("{} -> {} -> {}", seed_id, edge.source.as_str(), target_id);
+                    format!("{} -> {} -> {}", seed_id, via_id, target_id);
                 bridges.push(json!({
                     "id": target_node.id,
                     "memory_type": target_node.memory_type,
@@ -602,6 +652,52 @@ async fn synthesize_conceptual_bridges(
         }
     }
     Value::Array(bridges)
+}
+
+/// Build the feature token set for a memory from its domain slugs, tags, and
+/// top-level path prefixes of its `location` and `governs` entries.
+pub(crate) fn feature_tokens(metadata: &Value, location: &str) -> HashSet<String> {
+    let mut tokens: HashSet<String> = HashSet::new();
+    for d in crate::domain::domain_keys(metadata) {
+        tokens.insert(d);
+    }
+    if let Some(tags) = metadata.get("tags").and_then(|v| v.as_array()) {
+        for tag in tags {
+            if let Some(s) = tag.as_str() {
+                tokens.insert(s.to_string());
+            }
+        }
+    }
+    let add_prefix = |tokens: &mut HashSet<String>, path: &str| {
+        let prefix: String = path.split('/').take(2).collect::<Vec<_>>().join("/");
+        if !prefix.is_empty() {
+            tokens.insert(prefix);
+        }
+    };
+    add_prefix(&mut tokens, location);
+    if let Some(gov) = metadata.get("governs").and_then(|v| v.as_array()) {
+        for g in gov {
+            if let Some(s) = g.as_str() {
+                add_prefix(&mut tokens, s);
+            }
+        }
+    }
+    tokens
+}
+
+/// Jaccard similarity between two token sets: `|a ∩ b| / |a ∪ b|`. Returns
+/// `0.0` when either set is empty.
+pub(crate) fn jaccard_similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.union(b).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 /// Record a graph or memory lookup against any active `in_progress` task in
@@ -7797,7 +7893,7 @@ impl crate::traits::AsAny for ListHidingStore {
         );
 
         assert!(
-            prompt.contains("- Cross-Domain Bridges:"),
+            prompt.contains("### Cross-Domain Bridges"),
             "prompt has Cross-Domain Bridges section: {prompt}"
         );
         assert!(prompt.contains("mem-rule-m1"), "prompt references M1: {prompt}");

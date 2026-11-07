@@ -77,7 +77,7 @@ pub struct MemoryHit {
     /// inspect the memory without a second fetch.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
-    /// Up to 3 cross-domain conceptual bridges where this hit is the seed.
+    /// Up to 2 cross-domain conceptual bridges where this hit is the seed.
     /// Populated from 1-hop neighbors whose domain is disjoint from `source_id`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conceptual_bridges: Vec<ConceptualBridge>,

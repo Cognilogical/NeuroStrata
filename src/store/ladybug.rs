@@ -6247,17 +6247,13 @@ impl GraphRead for LadybugStore {
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
         hits.truncate(limit);
 
-        // Populate conceptual_bridges: for each seed hit, find up to 3
+        // Populate conceptual_bridges: for each seed hit, find up to 2
         // 2-hop cross-domain bridges via 1-hop via nodes whose domain
         // is disjoint from the seed's domain. Target must be normative.
-        let seed_domains: Vec<Vec<String>> = hits
-            .iter()
-            .map(|h| crate::domain::domain_keys(&h.metadata))
-            .collect();
-        for (i, hit) in hits.iter_mut().enumerate() {
-            let seed_domain = &seed_domains[i];
+        for hit in hits.iter_mut() {
             let mut bridges: Vec<crate::graph_read::memories_for_file::ConceptualBridge> =
-                Vec::with_capacity(3);
+                Vec::with_capacity(2);
+            let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
             let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
                 .iter()
                 .map(|s| s.to_string())
@@ -6282,7 +6278,7 @@ impl GraphRead for LadybugStore {
                     .map(|n| n.id.as_str())
                     .collect();
                 for via_id in &via_ids {
-                    if bridges.len() >= 3 { break; }
+                    if bridges.len() >= 2 { break; }
                     let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
                         .iter()
                         .map(|s| s.to_string())
@@ -6301,43 +6297,66 @@ impl GraphRead for LadybugStore {
                     .await
                     {
                         for target_node in &related2.nodes {
-                            if bridges.len() >= 3 { break; }
+                            if bridges.len() >= 2 { break; }
                             if target_node.id == hit.id || target_node.id == *via_id { continue; }
+                            if seen_targets.contains(&target_node.id) {
+                                continue;
+                            }
                             if let Ok(Some((_, target_payload))) =
                                 self.get(&namespace, &target_node.id).await
                             {
-                                let target_domain = crate::domain::domain_keys(&target_payload.metadata);
-                                let disjoint = !target_domain
-                                    .is_empty()
-                                    && target_domain
-                                        .iter()
-                                        .all(|td| !seed_domain.iter().any(|sd| sd == td));
                                 let is_normative = matches!(
                                     target_payload.memory_type.as_str(),
                                     "rule" | "fact" | "decision" | "procedure"
                                 );
-                                if disjoint && is_normative && !target_domain.is_empty() {
-                                    let target_type = target_payload.memory_type.clone();
-                                    let mut target_summary = target_payload
-                                        .content
-                                        .chars()
-                                        .take(160)
-                                        .collect::<String>();
-                                    if target_summary.len() >= 160 {
-                                        target_summary.pop();
-                                    }
-                                    bridges.push(crate::graph_read::memories_for_file::ConceptualBridge {
-                                        source_id: hit.id.clone(),
-                                        via_id: via_id.to_string(),
-                                        target_id: target_node.id.clone(),
-                                        target_domain: target_domain.first()
-                                            .cloned()
-                                            .unwrap_or_default(),
-                                        target_type,
-                                        target_summary,
-                                        path: format!("{} -> {} -> {}", hit.id, via_id, target_node.id),
-                                    });
+                                if !is_normative {
+                                    continue;
                                 }
+                                // Cross-domain token sets for the jaccard < 0.35 filter.
+                                let target_domain =
+                                    crate::domain::domain_keys(&target_payload.metadata);
+                                let mut target_tokens: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                for d in &target_domain {
+                                    target_tokens.insert(d.clone());
+                                }
+                                target_tokens.extend(crate::task::feature_tokens(
+                                    &target_payload.metadata,
+                                    &target_payload.location,
+                                ));
+                                let mut seed_tokens: std::collections::HashSet<String> =
+                                    std::collections::HashSet::new();
+                                seed_tokens.extend(crate::task::feature_tokens(&hit.metadata, ""));
+                                if !target_tokens.is_empty() {
+                                    let sim = crate::task::jaccard_similarity(&seed_tokens, &target_tokens);
+                                    if sim >= 0.35 {
+                                        continue;
+                                    }
+                                }
+                                seen_targets.insert(target_node.id.clone());
+                                let target_type = target_payload.memory_type.clone();
+                                let target_summary =
+                                    if target_payload.content.chars().count() > 160 {
+                                        target_payload
+                                            .content
+                                            .chars()
+                                            .take(160)
+                                            .collect::<String>()
+                                    } else {
+                                        target_payload.content.clone()
+                                    };
+                                bridges.push(crate::graph_read::memories_for_file::ConceptualBridge {
+                                    source_id: hit.id.clone(),
+                                    via_id: via_id.to_string(),
+                                    target_id: target_node.id.clone(),
+                                    target_domain: target_domain
+                                        .first()
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                    target_type,
+                                    target_summary,
+                                    path: format!("{} -> {} -> {}", hit.id, via_id, target_node.id),
+                                });
                             }
                         }
                     }
