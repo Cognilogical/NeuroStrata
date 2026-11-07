@@ -389,12 +389,15 @@ pub fn graph_read_related(
                 if all_edges.len() >= MAX_EDGES {
                     truncated = true;
                 } else {
+                    // Edge depth is the depth at which the TARGET is reached
+                    // (seed -> via is depth 1, via -> target is depth 2), so a
+                    // depth-2 edge is exactly a 2-hop bridge target.
                     all_edges.push(TraversalEdge {
                         source: es.source.clone(),
                         relation: es.relation.clone(),
                         target: es.target.clone(),
                         role: edge_role(&es.relation),
-                        depth,
+                        depth: depth + 1,
                         valid_from: es.valid_from,
                         valid_to: es.valid_to,
                     });

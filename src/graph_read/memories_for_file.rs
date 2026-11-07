@@ -77,6 +77,31 @@ pub struct MemoryHit {
     /// inspect the memory without a second fetch.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
+    /// Up to 3 cross-domain conceptual bridges where this hit is the seed.
+    /// Populated from 1-hop neighbors whose domain is disjoint from `source_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conceptual_bridges: Vec<ConceptualBridge>,
+}
+
+/// A cross-domain conceptual bridge connecting a seed memory to a normative target
+/// via a 2-hop path (seed -> via -> target). Used to surface hidden architectural
+/// relationships that are not directly visible through the standard graph edges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptualBridge {
+    /// The seed memory (directly matched to the queried file/symbol).
+    pub source_id: String,
+    /// The intermediate node on the 2-hop path (seed -> via -> target).
+    pub via_id: String,
+    /// The normative target memory in a disjoint domain from `source_id`.
+    pub target_id: String,
+    /// Normalized domain slug of the target (e.g., "rule", "fact", "procedure").
+    pub target_domain: String,
+    /// Human-readable one-sentence summary of the target (max 160 chars).
+    pub target_summary: String,
+    /// Human-readable path description, e.g. "src/server.rs -> via-id -> rule-id".
+    pub path: String,
+    /// Memory type of the target (rule | fact | decision | procedure).
+    pub target_type: String,
 }
 
 /// The memory-type segment of the ranking key (spec §4.1):

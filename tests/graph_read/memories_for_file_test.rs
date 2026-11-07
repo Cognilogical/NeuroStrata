@@ -29,6 +29,7 @@ fn hit(
         access_count,
         explanation: String::new(),
         metadata,
+        conceptual_bridges: Vec::new(),
     }
 }
 

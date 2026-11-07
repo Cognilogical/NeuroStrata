@@ -16,7 +16,8 @@ pub mod receipt;
 pub mod wiring;
 
 use crate::judgment::DeduplicationChecker;
-use crate::traits::{Embedder, MemoryPayload, SearchResult, VectorStore};
+use crate::traits::{Embedder, GraphRead, MemoryPayload, SearchResult, VectorStore};
+use crate::store::LadybugStore;
 use machine::{annotate, apply, Ctx, Status, Task};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -387,6 +388,27 @@ async fn store_new_task(
     Ok((id, payload))
 }
 
+/// Memory types treated as normative (governing constraints) for reserved slots.
+const NORMATIVE_MEMORY_TYPES: &[&str] = &["rule", "fact", "decision", "procedure"];
+/// Memory types treated as structural evidence anchors.
+const STRUCTURAL_MEMORY_TYPES: &[&str] = &["code_ast", "doc_section"];
+/// Max normative memories reserved in `auto_retrieved_context`.
+const MAX_NORMATIVE_MEMORIES: usize = 4;
+/// Max structural anchors in `auto_retrieved_context`.
+const MAX_STRUCTURAL_ANCHORS: usize = 3;
+/// Max cross-domain conceptual bridges emitted per task context.
+const MAX_CONCEPTUAL_BRIDGES: usize = 2;
+/// Relations traversed when synthesising 2-hop conceptual bridges.
+const BRIDGE_RELATIONS: &[&str] = &["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"];
+
+fn is_normative_memory(memory_type: &str) -> bool {
+    NORMATIVE_MEMORY_TYPES.contains(&memory_type)
+}
+
+fn is_structural_memory(memory_type: &str) -> bool {
+    STRUCTURAL_MEMORY_TYPES.contains(&memory_type)
+}
+
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
 /// graph edges for a task, and format a ready-to-paste subagent prompt block.
 pub async fn build_task_graph_context(
@@ -442,14 +464,144 @@ pub async fn build_task_graph_context(
     } else {
         prompt_lines.join("\n")
     };
+
+    // Partition the retrieved items into reserved normative memories and structural anchors.
+    let normative_memories: Vec<Value> = hits_json
+        .iter()
+        .filter(|h| is_normative_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .take(MAX_NORMATIVE_MEMORIES)
+        .cloned()
+        .collect();
+    let structural_anchors: Vec<Value> = hits_json
+        .iter()
+        .filter(|h| is_structural_memory(h.get("memory_type").and_then(|v| v.as_str()).unwrap_or("")))
+        .take(MAX_STRUCTURAL_ANCHORS)
+        .cloned()
+        .collect();
+
+    // Synthesise up to MAX_CONCEPTUAL_BRIDGES cross-domain 2-hop bridges from the
+    // retrieved seed memories to normative targets in a disjoint domain.
+    let conceptual_bridges = synthesize_conceptual_bridges(store, namespace, &hits_json).await;
+
+    let auto_retrieved_context = json!({
+        "query": payload.content,
+        "items": hits_json,
+        "related_edges": Value::Array(Vec::new()),
+        "normative_memories": normative_memories,
+        "structural_anchors": structural_anchors,
+        "conceptual_bridges": conceptual_bridges,
+    });
+
+    let bridges_prompt = conceptual_bridges
+        .as_array()
+        .map(|arr| {
+            if arr.is_empty() {
+                String::new()
+            } else {
+                let lines: Vec<String> = arr
+                    .iter()
+                    .filter_map(|b| {
+                        b.get("why_connected")
+                            .and_then(|v| v.as_str())
+                            .map(|s| format!("  - {s}"))
+                    })
+                    .collect();
+                format!("\n- Cross-Domain Bridges:\n{}", lines.join("\n"))
+            }
+        })
+        .unwrap_or_default();
+
     let subagent_prompt = format!(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
-         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}\n\
+         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}\n\
          - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `include_related: true` / `neurostrata_sparql_query`).",
-        namespace, task_id, payload.content, hits_block
+        namespace, task_id, payload.content, hits_block, bridges_prompt
     );
-    (Value::Array(hits_json), subagent_prompt)
+    (auto_retrieved_context, subagent_prompt)
+}
+
+/// Synthesise cross-domain conceptual bridges from retrieved seed memories.
+///
+/// For each seed item, traverses 2 hops (`seed -> via -> target`) through the
+/// graph and keeps up to `MAX_CONCEPTUAL_BRIDGES` targets whose memory type is
+/// normative and whose domain is disjoint from the seed's domain. Every bridge
+/// carries a concrete `why_connected` path explanation. Fail-soft: a traversal
+/// error yields no bridges for that seed rather than failing the whole context.
+async fn synthesize_conceptual_bridges(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    items: &[Value],
+) -> Value {
+    let mut bridges: Vec<Value> = Vec::new();
+    // `related` lives on `GraphRead`, which only `LadybugStore` implements among
+    // the `VectorStore` implementors; other store types yield no bridges.
+    let Some(ladybug) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() else {
+        return Value::Array(Vec::new());
+    };
+    let relations: Vec<String> = BRIDGE_RELATIONS.iter().map(|s| s.to_string()).collect();
+    let policy = crate::graph_read::traversal::CrossNamespacePolicy::default();
+    for item in items {
+        if bridges.len() >= MAX_CONCEPTUAL_BRIDGES {
+            break;
+        }
+        let seed_id = match item.get("id").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let seed_metadata = item.get("metadata").unwrap_or(&Value::Null);
+        let seed_domain: Vec<String> = crate::domain::domain_keys(seed_metadata);
+        if let Ok(result) = ladybug
+            .related(
+                namespace,
+                &seed_id,
+                &relations,
+                crate::graph_read::related::Direction::Both,
+                2,
+                &[],
+                50,
+                None,
+                &policy,
+            )
+            .await
+        {
+            for edge in &result.edges {
+                if bridges.len() >= MAX_CONCEPTUAL_BRIDGES {
+                    break;
+                }
+                // depth 2 edge: via -> target (seed -> via is depth 1).
+                if edge.depth != 2 {
+                    continue;
+                }
+                let target_id = edge.target.as_str();
+                if target_id == seed_id {
+                    continue;
+                }
+                let target_node = match result.nodes.iter().find(|n| n.id == target_id) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if !is_normative_memory(&target_node.memory_type) {
+                    continue;
+                }
+                let target_domain = target_node.domain.as_deref().unwrap_or("");
+                if target_domain.is_empty()
+                    || seed_domain.iter().any(|sd| sd == target_domain)
+                {
+                    continue;
+                }
+                let why_connected =
+                    format!("{} -> {} -> {}", seed_id, edge.source.as_str(), target_id);
+                bridges.push(json!({
+                    "id": target_node.id,
+                    "memory_type": target_node.memory_type,
+                    "content": target_node.snippet,
+                    "why_connected": why_connected,
+                }));
+            }
+        }
+    }
+    Value::Array(bridges)
 }
 
 /// Record a graph or memory lookup against any active `in_progress` task in
@@ -4032,6 +4184,7 @@ pub async fn import_beads(
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
+    use crate::store::LadybugStore;
 
     /// R5: an "installed" hook must carry the executable bit, so fixtures
     /// asserting `hook_installed: true` install it the way the installer does.
@@ -7484,5 +7637,169 @@ impl crate::traits::AsAny for ListHidingStore {
             "the archived rule snippet must not appear in the recomputed prompt: {}",
             prompt_after
         );
+    }
+
+    /// Wave 3 / Task 3.1: `build_task_graph_context` partitions retrieved items into
+    /// reserved `normative_memories` and `structural_anchors`, synthesises 2-hop
+    /// cross-domain `conceptual_bridges`, and emits a `Cross-Domain Bridges`
+    /// section in the subagent prompt when bridges are present.
+    #[tokio::test]
+    async fn task_graph_context_partitions_normative_structural_and_conceptual_bridges() {
+        let store = store_with_namespace("probe").await;
+
+        // M1: normative rule governing src/server.rs (backend domain).
+        let m1_id = "mem-rule-m1".to_string();
+        store
+            .upsert(
+                "probe",
+                &m1_id,
+                vec![0.0f32; 4],
+                MemoryPayload {
+                    content: "Daemon caller path check required on ingest".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "src/server.rs".to_string(),
+                    location_lines: String::new(),
+                    metadata: json!({"domain": "backend", "governs": ["src/server.rs"], "source": "owner 2026-11-07"}),
+                },
+            )
+            .await
+            .expect("seed M1 rule");
+
+        // File B: plugins/core/index.ts (frontend domain), structural anchor.
+        let file_b_id = "mem-file-b".to_string();
+        store
+            .upsert(
+                "probe",
+                &file_b_id,
+                vec![0.0f32; 4],
+                MemoryPayload {
+                    content: "bundled harness adapter".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    agent_name: None,
+                    location: "plugins/core/index.ts".to_string(),
+                    location_lines: String::new(),
+                    metadata: json!({"domain": "frontend"}),
+                },
+            )
+            .await
+            .expect("seed file B");
+
+        // Intermediate via node (frontend domain).
+        let via_id = "mem-via".to_string();
+        store
+            .upsert(
+                "probe",
+                &via_id,
+                vec![0.0f32; 4],
+                MemoryPayload {
+                    content: "adapter entry point".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "code_ast".to_string(),
+                    agent_name: None,
+                    location: "plugins/core/index.ts#fn:main".to_string(),
+                    location_lines: String::new(),
+                    metadata: json!({"domain": "frontend"}),
+                },
+            )
+            .await
+            .expect("seed via node");
+
+        // 2-hop path: file-b ->(DEPENDS_ON)-> via ->(RELATES_TO)-> M1.
+        let edge = |rel: &str, a: &str, b: &str| {
+            format!(
+                "MERGE (a:Memory {{id: '{a}'}}), (b:Memory {{id: '{b}'}}) MERGE (a)-[r:{rel} {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            )
+        };
+        let ladybug = VectorStore::as_any(&*store)
+            .downcast_ref::<LadybugStore>()
+            .expect("test store is a LadybugStore");
+        for (rel, a, b) in [
+            ("DEPENDS_ON", "mem-file-b", "mem-via"),
+            ("RELATES_TO", "mem-via", "mem-rule-m1"),
+        ] {
+            ladybug
+                .with_conn(move |conn| {
+                    conn.query(&edge(rel, a, b))?;
+                    Ok(())
+                })
+                .await
+                .expect("seed bridge edge");
+        }
+
+        let payload = MemoryPayload {
+            content: "review the harness adapter and its governing rule".to_string(),
+            user_id: "owner".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let (ctx, prompt) =
+            build_task_graph_context(&store, "probe", "task-1", &vec![0.0f32; 4], &payload).await;
+
+        let obj = ctx.as_object().expect("auto_retrieved_context is an object");
+        for key in [
+            "query",
+            "items",
+            "related_edges",
+            "normative_memories",
+            "structural_anchors",
+            "conceptual_bridges",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "auto_retrieved_context missing `{key}`: {obj:?}"
+            );
+        }
+
+        let nm = obj
+            .get("normative_memories")
+            .and_then(|v| v.as_array())
+            .expect("normative_memories is an array");
+        assert!(
+            nm.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-rule-m1")),
+            "M1 rule must be in normative_memories: {nm:?}"
+        );
+        assert!(
+            nm.len() <= MAX_NORMATIVE_MEMORIES,
+            "normative_memories within cap: {nm:?}"
+        );
+
+        let sa = obj
+            .get("structural_anchors")
+            .and_then(|v| v.as_array())
+            .expect("structural_anchors is an array");
+        assert!(
+            sa.iter().any(|v| v.get("id").and_then(|v| v.as_str()) == Some("mem-file-b")),
+            "file B must be in structural_anchors: {sa:?}"
+        );
+        assert!(sa.len() <= MAX_STRUCTURAL_ANCHORS, "structural_anchors within cap: {sa:?}");
+
+        let cb = obj
+            .get("conceptual_bridges")
+            .and_then(|v| v.as_array())
+            .expect("conceptual_bridges is an array");
+        assert!(!cb.is_empty(), "conceptual_bridges should be non-empty: {cb:?}");
+        assert!(cb.len() <= MAX_CONCEPTUAL_BRIDGES, "conceptual_bridges within cap: {cb:?}");
+        let bridge = cb.first().expect("at least one bridge");
+        assert_eq!(
+            bridge.get("id").and_then(|v| v.as_str()),
+            Some("mem-rule-m1"),
+            "bridge target must be M1: {bridge:?}"
+        );
+        assert!(
+            bridge.get("why_connected").and_then(|v| v.as_str()).is_some(),
+            "bridge carries why_connected: {bridge:?}"
+        );
+
+        assert!(
+            prompt.contains("- Cross-Domain Bridges:"),
+            "prompt has Cross-Domain Bridges section: {prompt}"
+        );
+        assert!(prompt.contains("mem-rule-m1"), "prompt references M1: {prompt}");
     }
 }
