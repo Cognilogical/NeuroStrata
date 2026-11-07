@@ -2649,7 +2649,9 @@ pub async fn backfill_imported_procedure_trust(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use uuid::Uuid;
 
@@ -4561,32 +4563,42 @@ mod tests {
         assert!(err.contains("traversal"), "got: {err}");
 
         let (_base, mesh) = mesh_with_commit("hostile");
-        let secret = _base.join("outside.json");
-        std::fs::write(&secret, r#"{"id":"stolen"}"#).unwrap();
-
-        let evil = Uuid::new_v4();
-        let d = mesh.root().join("probe").join("memories");
-        std::fs::create_dir_all(&d).unwrap();
-        symlink(&secret, d.join(format!("{evil}.json"))).unwrap();
-
-        let exec_id = Uuid::new_v4();
         let bad_id = Uuid::new_v4();
         commit_record_json(&mesh, "probe", "memories", &bad_id.to_string(), "{not json");
-        commit_record_json(
-            &mesh,
-            "probe",
-            "memories",
-            &exec_id.to_string(),
-            &serde_json::to_string(&simple_rule(exec_id, "executable payload")).unwrap(),
-        );
-        let exec_path = mesh
-            .root()
-            .join("probe")
-            .join("memories")
-            .join(format!("{exec_id}.json"));
-        let mut mode = std::fs::metadata(&exec_path).unwrap().permissions();
-        mode.set_mode(0o755);
-        std::fs::set_permissions(&exec_path, mode).unwrap();
+
+        // The symlink and executable-bit setups are Unix-only: the link is
+        // created through the Unix `symlink` API, and the exec-bit rejection
+        // is itself a Unix-mode check (`has_exec_bit` is always false on
+        // non-Unix, where the plain record file it chmods would be
+        // legitimate data and would apply). The traversal checks above and the
+        // garbage-JSON assertions below run on every platform.
+        #[cfg(unix)]
+        {
+            let secret = _base.join("outside.json");
+            std::fs::write(&secret, r#"{"id":"stolen"}"#).unwrap();
+
+            let evil = Uuid::new_v4();
+            let d = mesh.root().join("probe").join("memories");
+            std::fs::create_dir_all(&d).unwrap();
+            symlink(&secret, d.join(format!("{evil}.json"))).unwrap();
+
+            let exec_id = Uuid::new_v4();
+            commit_record_json(
+                &mesh,
+                "probe",
+                "memories",
+                &exec_id.to_string(),
+                &serde_json::to_string(&simple_rule(exec_id, "executable payload")).unwrap(),
+            );
+            let exec_path = mesh
+                .root()
+                .join("probe")
+                .join("memories")
+                .join(format!("{exec_id}.json"));
+            let mut mode = std::fs::metadata(&exec_path).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&exec_path, mode).unwrap();
+        }
         mesh.commit_all("peer bits", "node-peer-1").unwrap();
 
         let store = fresh_store("hostile").await;
@@ -4596,14 +4608,19 @@ mod tests {
             .unwrap();
         assert_eq!(report.applied, 0, "hostile files never apply: {report:?}");
         let joined = report.ignored.join(" | ");
-        assert!(
-            report.ignored.iter().any(|i| i.contains("symlink")),
-            "symlink ignored+named: {joined}"
-        );
-        assert!(
-            report.ignored.iter().any(|i| i.contains("executable")),
-            "exec-bit ignored+named: {joined}"
-        );
+        // The symlink and exec-bit entries only exist when the Unix-only
+        // setups above ran.
+        #[cfg(unix)]
+        {
+            assert!(
+                report.ignored.iter().any(|i| i.contains("symlink")),
+                "symlink ignored+named: {joined}"
+            );
+            assert!(
+                report.ignored.iter().any(|i| i.contains("executable")),
+                "exec-bit ignored+named: {joined}"
+            );
+        }
         assert!(
             report.ignored.iter().any(|i| i.contains("unparseable")
                 || i.contains("parsererror")
