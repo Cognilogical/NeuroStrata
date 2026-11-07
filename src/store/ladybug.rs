@@ -5891,6 +5891,7 @@ fn edge_hits_from_rows(
             access_count,
             explanation: format!("{} {}", edge_name, target_id),
             metadata,
+            conceptual_bridges: Vec::new(),
         });
     }
     Ok(hits)
@@ -6137,6 +6138,7 @@ fn add_metadata_fallback_conn(
                     access_count,
                     explanation: format!("declares governs {}", normalized),
                     metadata,
+                    conceptual_bridges: Vec::new(),
                 });
                 break;
             }
@@ -6244,6 +6246,106 @@ impl GraphRead for LadybugStore {
         dedup_hits(&mut hits);
         crate::graph_read::memories_for_file::rank_hits(&mut hits);
         hits.truncate(limit);
+
+        // Populate conceptual_bridges: for each seed hit, find up to 3
+        // 2-hop cross-domain bridges via 1-hop via nodes whose domain
+        // is disjoint from the seed's domain. Target must be normative.
+        let seed_domains: Vec<Vec<String>> = hits
+            .iter()
+            .map(|h| crate::domain::domain_keys(&h.metadata))
+            .collect();
+        for (i, hit) in hits.iter_mut().enumerate() {
+            let seed_domain = &seed_domains[i];
+            let mut bridges: Vec<crate::graph_read::memories_for_file::ConceptualBridge> =
+                Vec::with_capacity(3);
+            let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if let Ok(related) = self.related(
+                &namespace,
+                &hit.id,
+                &relations_vec,
+                crate::graph_read::related::Direction::Both,
+                1,
+                &[],
+                50,
+                None,
+                &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+            )
+            .await
+            {
+                let via_ids: Vec<&str> = related
+                    .nodes
+                    .iter()
+                    .filter(|n| n.id != hit.id)
+                    .map(|n| n.id.as_str())
+                    .collect();
+                for via_id in &via_ids {
+                    if bridges.len() >= 3 { break; }
+                    let relations_vec: Vec<String> = ["GOVERNS", "CONTAINS", "RELATES_TO", "EXTRACTED_FROM", "DEPENDS_ON"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    if let Ok(related2) = self.related(
+                        &namespace,
+                        via_id,
+                        &relations_vec,
+                        crate::graph_read::related::Direction::Both,
+                        1,
+                        &[],
+                        50,
+                        None,
+                        &crate::graph_read::traversal::CrossNamespacePolicy::default(),
+                    )
+                    .await
+                    {
+                        for target_node in &related2.nodes {
+                            if bridges.len() >= 3 { break; }
+                            if target_node.id == hit.id || target_node.id == *via_id { continue; }
+                            if let Ok(Some((_, target_payload))) =
+                                self.get(&namespace, &target_node.id).await
+                            {
+                                let target_domain = crate::domain::domain_keys(&target_payload.metadata);
+                                let disjoint = !target_domain
+                                    .is_empty()
+                                    && target_domain
+                                        .iter()
+                                        .all(|td| !seed_domain.iter().any(|sd| sd == td));
+                                let is_normative = matches!(
+                                    target_payload.memory_type.as_str(),
+                                    "rule" | "fact" | "decision" | "procedure"
+                                );
+                                if disjoint && is_normative && !target_domain.is_empty() {
+                                    let target_type = target_payload.memory_type.clone();
+                                    let mut target_summary = target_payload
+                                        .content
+                                        .chars()
+                                        .take(160)
+                                        .collect::<String>();
+                                    if target_summary.len() >= 160 {
+                                        target_summary.pop();
+                                    }
+                                    bridges.push(crate::graph_read::memories_for_file::ConceptualBridge {
+                                        source_id: hit.id.clone(),
+                                        via_id: via_id.to_string(),
+                                        target_id: target_node.id.clone(),
+                                        target_domain: target_domain.first()
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                        target_type,
+                                        target_summary,
+                                        path: format!("{} -> {} -> {}", hit.id, via_id, target_node.id),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            hit.conceptual_bridges = bridges;
+        }
+
         Ok(hits)
     }
 
