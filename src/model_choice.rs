@@ -84,13 +84,15 @@ use std::path::{Path, PathBuf};
 /// place; with `NEUROSTRATA_MODEL` unset the first entry wins, which is what
 /// makes the choice durable.
 ///
-/// Fail-closed, in order: an existing database at `db_path` refuses (a model
-/// was already chosen by use); an existing `embedders.json` that parses to
+/// Fail-closed, in order: a database at `db_path` that has recorded data
+/// refuses (a model was already chosen by use — see [`store_has_data`]; a
+/// pristine store, whose file a bare daemon start creates before any data
+/// exists, does not refuse); an existing `embedders.json` that parses to
 /// anything other than exactly the built-in default refuses, byte-identical;
 /// an unparseable existing file refuses (the writer never repairs a file it
 /// cannot classify, even though the loader tolerates one by ignoring it).
 /// The one replaceable existing file is the exact built-in default a first
-/// daemon start materializes before any database exists.
+/// daemon start materializes before any data is recorded.
 pub fn write_initial_embedders_file(
     config_dir: &Path,
     choice: &ModelChoice,
@@ -107,9 +109,9 @@ fn write_initial_embedders_file_inner(
     db_path: &Path,
     fail_before_rename: bool,
 ) -> anyhow::Result<PathBuf> {
-    if db_path.exists() {
+    if store_has_data(db_path) {
         anyhow::bail!(
-            "refusing to write the initial embedders file: a database already exists at {}",
+            "refusing to write the initial embedders file: the database at {} has already recorded data (its embedding model was chosen by use)",
             db_path.display()
         );
     }
@@ -166,7 +168,11 @@ fn write_file_atomically(
     let dir = path.parent().ok_or_else(|| {
         anyhow::anyhow!("embedders path {} has no parent directory", path.display())
     })?;
-    let tmp = dir.join(format!(".embedders.json.tmp-{}", std::process::id()));
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "embedders.json".to_string());
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
     let staged = (|| -> anyhow::Result<()> {
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
@@ -191,6 +197,98 @@ fn write_file_atomically(
         let _ = dir_file.sync_all();
     }
     Ok(())
+}
+
+// --- Task A4b-fix: the store-state sidecar and the pristine predicate ---
+//
+// The model-choice lock used to key on the database file's existence, but
+// a bare daemon start creates the store (ladybug.db) before any user data
+// exists, so existence alone misclassifies every daemon-first install as
+// locked. The lock now keys on recorded data, answered by a store-authored
+// sidecar: `ladybug.db.store-state.json` beside the db file, maintained by
+// the store itself (see `LadybugStore`). This module owns the file format
+// and the one predicate both the offer condition and the writer guard
+// evaluate — pure filesystem reads, because the processes that evaluate
+// it cannot open the (single-writer) store.
+
+/// The sidecar format version written by this build.
+pub(crate) const STORE_STATE_VERSION: u32 = 1;
+
+/// The content of `ladybug.db.store-state.json`: whether the store has
+/// recorded user data, and the embedding-space descriptor of the model
+/// that created / last legitimately opened it while pristine.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoreState {
+    pub version: u32,
+    pub has_data: bool,
+    pub descriptor: crate::traits::EmbeddingDescriptor,
+}
+
+/// The sidecar's path: beside the database file, in the directory the
+/// daemon lock already lives in.
+pub(crate) fn store_state_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(".store-state.json");
+    PathBuf::from(name)
+}
+
+enum StoreStateFile {
+    Absent,
+    Present(StoreState),
+    Unparseable,
+}
+
+fn read_store_state_file(db_path: &Path) -> StoreStateFile {
+    let path = store_state_path(db_path);
+    let Ok(content) = fs::read_to_string(&path) else {
+        // A read failure on a file that exists (permissions, a directory)
+        // is not absence: fail closed.
+        return if path.exists() {
+            StoreStateFile::Unparseable
+        } else {
+            StoreStateFile::Absent
+        };
+    };
+    match serde_json::from_str::<StoreState>(&content) {
+        Ok(state) => StoreStateFile::Present(state),
+        Err(_) => StoreStateFile::Unparseable,
+    }
+}
+
+/// The recorded state, when a parseable sidecar exists.
+pub(crate) fn read_store_state(db_path: &Path) -> Option<StoreState> {
+    match read_store_state_file(db_path) {
+        StoreStateFile::Present(state) => Some(state),
+        _ => None,
+    }
+}
+
+/// Write the sidecar atomically (the same temp + fsync + rename pattern
+/// as the embedders file).
+pub(crate) fn write_store_state(db_path: &Path, state: &StoreState) -> anyhow::Result<()> {
+    let serialized = serde_json::to_string_pretty(state)?;
+    write_file_atomically(&store_state_path(db_path), &serialized, false)
+}
+
+/// Whether the store at `db_path` has recorded user data — the one
+/// definition of "locked" for the setup-time model choice. Fail-closed:
+/// true on any doubt. A parseable sidecar's flag governs; an unparseable
+/// sidecar means data; a database with no sidecar (created by a pre-fix
+/// binary, or its sidecar lost) means data, because its state is
+/// unknowable from outside; only a store with neither file has
+/// certainly never recorded anything.
+pub(crate) fn store_has_data(db_path: &Path) -> bool {
+    match read_store_state_file(db_path) {
+        StoreStateFile::Present(state) => state.has_data,
+        StoreStateFile::Unparseable => true,
+        StoreStateFile::Absent => db_path.exists(),
+    }
+}
+
+/// Whether the store at `db_path` may still receive a setup-time model
+/// choice: exactly the negation of [`store_has_data`].
+pub(crate) fn store_is_pristine(db_path: &Path) -> bool {
+    !store_has_data(db_path)
 }
 
 // --- Task A4: deferred setup-time choice (surface c) ---
@@ -248,11 +346,13 @@ fn embedders_file_qualifies_for_offer(config_dir: &Path) -> bool {
     serde_json::to_value(&entries).ok() == serde_json::to_value(default_acceptable_embedders()).ok()
 }
 
-/// The offer condition: no database exists yet, and the embedders file
-/// state qualifies. Re-verified at surfacing time — a database created
-/// since the marker was recorded voids the pending choice.
+/// The offer condition: the store has recorded no data yet (the same
+/// predicate the writer guard uses, so an offer and a pick can never
+/// disagree about locked-ness), and the embedders file state qualifies.
+/// Re-verified at surfacing time — a store that recorded data since the
+/// marker was recorded voids the pending choice.
 fn offer_condition_holds(config_dir: &Path, db_path: &Path) -> bool {
-    !db_path.exists() && embedders_file_qualifies_for_offer(config_dir)
+    store_is_pristine(db_path) && embedders_file_qualifies_for_offer(config_dir)
 }
 
 const PERMANENCE_WARNING: &str = "This choice is permanent for this database: the store refuses any other model once data exists. Changing later requires a new database.";
@@ -340,8 +440,9 @@ pub(crate) enum PendingChoiceOutcome {
     /// A marker exists but this invocation is not interactive; the marker
     /// is left for a later interactive command.
     NotInteractive,
-    /// The offer condition no longer holds (a database exists, or the
-    /// file state is locked); the marker is removed, nothing is offered.
+    /// The offer condition no longer holds (the store has recorded data,
+    /// or the file state is locked); the marker is removed, nothing is
+    /// offered.
     Voided,
     /// The user declined; the marker is removed and the install is not
     /// asked again.
@@ -529,20 +630,130 @@ mod tests {
         }
     }
 
+    // --- Task A4b-fix: the lock keys on recorded store data, not on the
+    // db file's existence. A bare daemon start creates ladybug.db before
+    // any user data exists, so existence alone must never refuse. The
+    // store-authored sidecar (ladybug.db.store-state.json) is the record:
+    // these helpers write it as raw JSON, pinning the on-disk contract.
+
+    fn sidecar_path_for(db_path: &Path) -> PathBuf {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(".store-state.json");
+        PathBuf::from(name)
+    }
+
+    fn write_sidecar(db_path: &Path, has_data: bool) {
+        let content = format!(
+            "{{\"version\": 1, \"has_data\": {has_data}, \"descriptor\": {{\"provider\": \"fastembed\", \"model\": \"NomicEmbedTextV15\", \"revision\": \"onnx\", \"dims\": 768, \"normalization\": \"unknown\", \"preprocessing\": \"unknown\", \"distance_metric\": \"cosine\"}}}}"
+        );
+        fs::write(sidecar_path_for(db_path), content).expect("write sidecar");
+    }
+
+    /// A db file the way a bare daemon start leaves it: present, with a
+    /// 4096-byte first page, and no user data behind it.
+    fn write_bare_db(db_path: &Path) {
+        fs::write(db_path, vec![0u8; 4096]).expect("create bare db file");
+    }
+
     #[test]
-    fn writer_refuses_when_db_exists() {
-        let (tmp, config_dir) = fresh_config_dir("db-exists");
-        let db_path = tmp.path().join("neurostrata.db");
-        fs::write(&db_path, b"").expect("create empty db file");
+    fn writer_succeeds_when_db_exists_but_store_is_pristine() {
+        let (tmp, config_dir) = fresh_config_dir("writer-pristine-db");
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        write_sidecar(&db_path, false);
+        write_initial_embedders_file(&config_dir, bge_small_q(), &db_path)
+            .expect("a pristine store (db file present, no recorded data) must not refuse");
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the pick");
+        assert_eq!(entries[0].model_name, "BGESmallENV15Q");
+    }
+
+    #[test]
+    fn writer_refuses_when_store_has_data() {
+        let (tmp, config_dir) = fresh_config_dir("writer-data-db");
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        write_sidecar(&db_path, true);
         let result = write_initial_embedders_file(&config_dir, bge_small_q(), &db_path);
         assert!(
             result.is_err(),
-            "an existing database must refuse the write"
+            "a store that has recorded data must refuse the write"
         );
         assert!(
             !config_dir.join("embedders.json").exists(),
             "no embedders.json may be created when the write is refused"
         );
+    }
+
+    #[test]
+    fn writer_and_offer_fail_closed_without_sidecar() {
+        // A db file with no sidecar was created by a pre-fix binary (or
+        // lost its sidecar): its data state is unknowable from outside,
+        // so it is locked.
+        let (tmp, config_dir) = fresh_config_dir("fail-closed-no-sidecar");
+        write_default_file(&config_dir);
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        let result = write_initial_embedders_file(&config_dir, bge_small_q(), &db_path);
+        assert!(result.is_err(), "db present + sidecar absent must refuse");
+        let called = std::cell::Cell::new(false);
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            called.set(true);
+            ChoiceResponse::Pick(0)
+        })
+        .expect("surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Voided);
+        assert!(!called.get(), "a fail-closed store is never offered");
+    }
+
+    #[test]
+    fn writer_and_offer_fail_closed_with_unparseable_sidecar() {
+        let (tmp, config_dir) = fresh_config_dir("fail-closed-bad-sidecar");
+        write_default_file(&config_dir);
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        fs::write(sidecar_path_for(&db_path), "{not json").expect("write unparseable sidecar");
+        let result = write_initial_embedders_file(&config_dir, bge_small_q(), &db_path);
+        assert!(result.is_err(), "an unparseable sidecar must refuse");
+        let called = std::cell::Cell::new(false);
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            called.set(true);
+            ChoiceResponse::Pick(0)
+        })
+        .expect("surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Voided);
+        assert!(!called.get(), "an unparseable sidecar is never offered");
+    }
+
+    #[test]
+    fn writer_refuses_when_sidecar_reports_data_without_db() {
+        // Inconsistent state (sidecar says data, db file gone): the
+        // sidecar's word governs — fail closed.
+        let (tmp, config_dir) = fresh_config_dir("sidecar-data-no-db");
+        let db_path = tmp.path().join("ladybug.db");
+        write_sidecar(&db_path, true);
+        assert!(!db_path.exists());
+        let result = write_initial_embedders_file(&config_dir, bge_small_q(), &db_path);
+        assert!(
+            result.is_err(),
+            "a sidecar reporting data must refuse even when the db file is absent"
+        );
+    }
+
+    #[test]
+    fn store_predicate_fresh_install_has_no_data() {
+        let (tmp, config_dir) = fresh_config_dir("predicate-fresh");
+        let db_path = tmp.path().join("ladybug.db");
+        assert!(!store_has_data(&db_path), "nothing on disk: no data");
+        assert!(store_is_pristine(&db_path));
+        // A pristine sidecar alone (db not yet created) is still pristine.
+        write_sidecar(&db_path, false);
+        assert!(!store_has_data(&db_path));
+        assert!(store_is_pristine(&db_path));
+        // And the writer agrees: a fresh install accepts the pick.
+        write_initial_embedders_file(&config_dir, bge_small_q(), &db_path)
+            .expect("fresh install writer succeeds");
     }
 
     #[test]
@@ -646,13 +857,44 @@ mod tests {
     }
 
     #[test]
-    fn setup_never_offers_choice_when_db_exists() {
-        let (tmp, config_dir) = fresh_config_dir("a4-db-exists");
+    fn setup_offers_choice_when_db_exists_but_store_is_pristine() {
+        // The A4b E2E regression (S1.4/S1.5) at unit level: a bare daemon
+        // start creates ladybug.db before any user data exists, and the
+        // pending choice recorded at that start must still surface and
+        // persist at the next interactive command.
+        let (tmp, config_dir) = fresh_config_dir("a4fix-pristine-db");
         write_default_file(&config_dir);
         record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        write_sidecar(&db_path, false);
+        let mut seen_offer = String::new();
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |offer| {
+            seen_offer = offer.to_string();
+            ChoiceResponse::Pick(1)
+        })
+        .expect("surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Chosen("BGESmallENV15Q"));
+        assert!(seen_offer.contains("BGESmallENV15Q"));
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the pick");
+        assert_eq!(entries[0].model_name, "BGESmallENV15Q");
+        assert!(
+            !pending_choice_path(&config_dir).exists(),
+            "a completed pick clears the marker"
+        );
+    }
+
+    #[test]
+    fn setup_never_offers_choice_when_store_has_data() {
+        let (tmp, config_dir) = fresh_config_dir("a4fix-data-db");
+        write_default_file(&config_dir);
+        let target = config_dir.join("embedders.json");
+        let before = fs::read(&target).expect("read default file");
+        record_pending_choice(&config_dir);
         assert!(pending_choice_path(&config_dir).exists());
-        let db_path = tmp.path().join("neurostrata.db");
-        fs::write(&db_path, b"").expect("create db file");
+        let db_path = tmp.path().join("ladybug.db");
+        write_bare_db(&db_path);
+        write_sidecar(&db_path, true);
         let called = std::cell::Cell::new(false);
         let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
             called.set(true);
@@ -662,11 +904,16 @@ mod tests {
         assert_eq!(outcome, PendingChoiceOutcome::Voided);
         assert!(
             !called.get(),
-            "no offer may be presented when a database exists"
+            "no offer may be presented once the store has recorded data"
         );
         assert!(
             !pending_choice_path(&config_dir).exists(),
             "a voided pending choice removes its marker"
+        );
+        assert_eq!(
+            fs::read(&target).expect("re-read file"),
+            before,
+            "a voided choice leaves the embedders file untouched"
         );
     }
 

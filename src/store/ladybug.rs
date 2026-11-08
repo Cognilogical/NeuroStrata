@@ -1180,6 +1180,34 @@ pub struct LadybugStore {
     /// `compatible` is rejected so incompatible embedding spaces cannot be
     /// mixed through this store.
     embedding_registry: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::traits::EmbeddingDescriptor>>>,
+    /// Directory the configured embedding model is resolved from
+    /// (`embedders.json`). Production uses `crate::embed::config_dir()`;
+    /// tests override it via `with_embed_config_dir`.
+    embed_config_dir: PathBuf,
+    /// Whether the database file already existed when this process opened
+    /// it. A sidecar-less store this process created is a fresh install;
+    /// a sidecar-less store that predates it is a pre-fix store whose
+    /// data state is unknowable from outside (fail-closed).
+    db_preexisting: bool,
+    /// This process's view of the store-state sidecar, loaded on first
+    /// use. The sidecar is the setup-time model choice's lock record:
+    /// see `crate::model_choice::store_has_data`.
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+}
+
+/// The store-state sidecar as this process knows it (Task A4b-fix).
+#[derive(Clone)]
+enum CachedStoreState {
+    /// A sidecar exists on disk (written by us or a previous process):
+    /// its content is authoritative.
+    Recorded(crate::model_choice::StoreState),
+    /// No sidecar, and this process must not create a pristine one: the
+    /// store predates the sidecar (or its sidecar is unreadable), so it
+    /// is treated as data-bearing with an unknown descriptor.
+    LockedUnknown,
+    /// A fresh store whose pristine sidecar could not be written yet
+    /// (the configured model did not resolve); retried on later calls.
+    FreshUnrecorded,
 }
 
 /// Whether a write is sitting in the log with no checkpoint behind it yet.
@@ -1341,6 +1369,11 @@ impl LadybugStore {
     ) -> Result<Self> {
         let local_path = local_path.into();
 
+        // Captured before the engine creates the file: whether this store
+        // predates this process decides how a missing store-state sidecar
+        // is read (fresh install vs pre-fix store).
+        let db_preexisting = local_path.exists();
+
         // A WAL present at open time means the last process did not close cleanly:
         // a clean close checkpoints and removes it. Keep a copy before the engine
         // replays, because replay truncates the file to the last good record and
@@ -1460,7 +1493,183 @@ impl LadybugStore {
             ),
             tantivy_lexical: Arc::new(std::sync::RwLock::new(None)),
             embedding_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            embed_config_dir: crate::embed::config_dir(),
+            db_preexisting,
+            store_state: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Override the directory the configured embedding model is resolved
+    /// from. Production processes use `crate::embed::config_dir()`; tests
+    /// point the store at a fixture config dir to control which model
+    /// `embedders.json` selects.
+    pub fn with_embed_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.embed_config_dir = dir.into();
+        self
+    }
+
+    /// The embedding-space descriptor of the *configured* model: resolved
+    /// from `embedders.json` through the same effective resolution the
+    /// loader uses (`embed::configured_model_in` — the env-named entry
+    /// when acceptable, otherwise the first entry), never the
+    /// env-or-placeholder shortcut `store_embedding_descriptor` falls back
+    /// to. The shape mirrors `FastEmbedder::embedding_descriptor`; the
+    /// width is this store's, because every production path opens the
+    /// store with the configured model's width and the store's
+    /// FLOAT[width] column is the width its vectors actually have.
+    fn configured_embedding_descriptor(&self) -> Result<crate::traits::EmbeddingDescriptor> {
+        let configured = crate::embed::configured_model_in(&self.embed_config_dir)?;
+        Ok(crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".into(),
+            model: configured.model_name,
+            revision: "onnx".into(),
+            dims: self.dimensions,
+            normalization: "unknown".into(),
+            preprocessing: "unknown".into(),
+            distance_metric: "cosine".into(),
+        })
+    }
+
+    /// Load (once per process) this store's view of the store-state
+    /// sidecar. Pure filesystem reads against a store this process
+    /// already holds open; never opens another store.
+    fn cached_store_state(&self) -> CachedStoreState {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = &*cache {
+            return state.clone();
+        }
+        let state = match crate::model_choice::read_store_state(&self.local_path) {
+            Some(recorded) => CachedStoreState::Recorded(recorded),
+            None if !self.db_preexisting
+                && !crate::model_choice::store_state_path(&self.local_path).exists() =>
+            {
+                CachedStoreState::FreshUnrecorded
+            }
+            None => CachedStoreState::LockedUnknown,
+        };
+        *cache = Some(state.clone());
+        state
+    }
+
+    fn set_cached_store_state(&self, state: CachedStoreState) {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some(state);
+    }
+
+    /// Maintain the sidecar at a successful `init`: a fresh store records
+    /// its pristine state under the configured model's descriptor; a
+    /// pristine store opened under a different configured model adopts
+    /// that descriptor (a legitimate pick taking effect at restart — the
+    /// last opener before first data wins, which is also what
+    /// `embedders.json` will load at the next start). Data-bearing and
+    /// pre-fix stores are never written here. Best effort: a sidecar
+    /// failure must not fail init for stores the feature never touches,
+    /// so errors are logged, not propagated.
+    fn maintain_store_state(&self) {
+        match self.cached_store_state() {
+            CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
+                match self.configured_embedding_descriptor() {
+                    Ok(descriptor) if descriptor != recorded.descriptor => {
+                        recorded.descriptor = descriptor;
+                        match crate::model_choice::write_store_state(&self.local_path, &recorded) {
+                            Ok(()) => {
+                                self.set_cached_store_state(CachedStoreState::Recorded(recorded))
+                            }
+                            Err(e) => {
+                                tracing::warn!("store-state sidecar update failed: {e}")
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        "configured model did not resolve for the store-state sidecar: {e}"
+                    ),
+                }
+            }
+            CachedStoreState::FreshUnrecorded => match self.configured_embedding_descriptor() {
+                Ok(descriptor) => {
+                    let state = crate::model_choice::StoreState {
+                        version: crate::model_choice::STORE_STATE_VERSION,
+                        has_data: false,
+                        descriptor,
+                    };
+                    match crate::model_choice::write_store_state(&self.local_path, &state) {
+                        Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
+                        Err(e) => {
+                            tracing::warn!("store-state sidecar write failed: {e}")
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "configured model did not resolve for the store-state sidecar: {e}"
+                ),
+            },
+            _ => {}
+        }
+    }
+
+    /// The upsert race guard (Task A4b-fix): while the store is pristine
+    /// with a recorded descriptor, a write may only land under that
+    /// descriptor's model. If `embedders.json` now selects a different
+    /// model — a setup pick persisted while this process holds the store
+    /// open — the write is refused with a restart-to-apply error rather
+    /// than landing data under the stale model, which the next open
+    /// would then serve mixed. Stores with data, and stores whose state
+    /// is unknown, are outside the window this guard protects.
+    fn guard_first_write(&self) -> Result<()> {
+        if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
+            if !recorded.has_data {
+                let current = self.configured_embedding_descriptor()?;
+                if current != recorded.descriptor {
+                    anyhow::bail!(
+                        "refusing to store data: this store was opened under embedding model '{}', but the configured model is now '{}' (a setup-time model choice was persisted while this process was running). Restart the daemon (or this process) so the store is opened under the new model before the first write; data is never stored under a model different from the one the store will next be opened with.",
+                        recorded.descriptor.model,
+                        current.model
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flip the sidecar to data-bearing after the first successful
+    /// upsert. Monotonic: only a pristine state flips, the recorded
+    /// descriptor is kept, and nothing ever flips back. A failed sidecar
+    /// write is logged loudly and the in-memory state still flips, so
+    /// this process keeps treating the store as data-bearing.
+    fn flip_store_state_to_data(&self) {
+        match self.cached_store_state() {
+            CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
+                recorded.has_data = true;
+                if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &recorded)
+                {
+                    tracing::error!(
+                        "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
+                    );
+                }
+                self.set_cached_store_state(CachedStoreState::Recorded(recorded));
+            }
+            CachedStoreState::FreshUnrecorded => {
+                // The pristine sidecar could not be written at init (the
+                // configured model did not resolve then); record the data
+                // flip directly if it resolves now.
+                if let Ok(descriptor) = self.configured_embedding_descriptor() {
+                    let state = crate::model_choice::StoreState {
+                        version: crate::model_choice::STORE_STATE_VERSION,
+                        has_data: true,
+                        descriptor,
+                    };
+                    if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &state)
+                    {
+                        tracing::error!(
+                            "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
+                        );
+                    }
+                    self.set_cached_store_state(CachedStoreState::Recorded(state));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The store's own embedding-space identity: it has only the configured
@@ -3484,6 +3693,9 @@ impl VectorStore for LadybugStore {
         )?;
 
         if self.schema_ready.load(std::sync::atomic::Ordering::Acquire) {
+            // A previous init in this process already succeeded; the
+            // sidecar maintenance is cached and idempotent.
+            self.maintain_store_state();
             return Ok(());
         }
 
@@ -3638,6 +3850,9 @@ impl VectorStore for LadybugStore {
         if outcome.is_ok() {
             self.schema_ready
                 .store(true, std::sync::atomic::Ordering::Release);
+            // First successful init: record the store's pristine state
+            // (or adopt a new configured descriptor while pristine).
+            self.maintain_store_state();
         }
 
         // Creating the tables is itself a write worth flushing.
@@ -3669,6 +3884,13 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
+        // Task A4b-fix race guard: on a pristine store, refuse the first
+        // write if the configured model changed since this process
+        // recorded the store's descriptor (a setup pick landed while the
+        // store is open). Checked before any engine write, so a refused
+        // upsert lands nothing.
+        self.guard_first_write()?;
+
         // Every upsert is one sample of the MemoryCount series for the
         // namespace; anomalies surface through the rolling detector.
         self.metrics.record(
@@ -4308,6 +4530,10 @@ impl VectorStore for LadybugStore {
         .await;
         if outcome.is_ok() {
             self.lexical_apply_doc(lexical_doc);
+            // Task A4b-fix: the first successful upsert is the moment the
+            // store stops being pristine; record it in the sidecar after
+            // the engine accepted the write, before upsert returns.
+            self.flip_store_state_to_data();
         }
         outcome
     }
@@ -14065,6 +14291,259 @@ eurostrata\src\daemon.rs",
             "oversized neighbor content is truncated with indicator"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Task A4b-fix: the store-state sidecar (pristine-store predicate) ---
+    //
+    // The sidecar beside the db file is the store-authored record the
+    // setup-time model choice keys on: `init` records a pristine store
+    // with the configured model's descriptor, the first successful
+    // `upsert` flips it to data-bearing, and the flip is monotonic.
+
+    struct StoreStateFixture {
+        root: std::path::PathBuf,
+        db: std::path::PathBuf,
+        config_dir: std::path::PathBuf,
+    }
+
+    fn write_embedders_config(config_dir: &std::path::Path, model: &str) {
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+        )
+        .expect("write fixture embedders.json");
+    }
+
+    /// A temp root holding one store db plus a config dir whose
+    /// embedders.json names `model` — the configured model the store
+    /// resolves through the `embed::configured_model_in` seam.
+    fn store_state_fixture(tag: &str, model: &str) -> StoreStateFixture {
+        let root =
+            std::env::temp_dir().join(format!("ns-storestate-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).expect("create fixture config dir");
+        write_embedders_config(&config_dir, model);
+        StoreStateFixture {
+            db: root.join("ladybug.db"),
+            root,
+            config_dir,
+        }
+    }
+
+    fn read_sidecar(db: &std::path::Path) -> serde_json::Value {
+        let content = std::fs::read_to_string(crate::model_choice::store_state_path(db))
+            .expect("sidecar exists");
+        serde_json::from_str(&content).expect("sidecar parses")
+    }
+
+    /// NEUROSTRATA_MODEL would override the file's first entry; the
+    /// file-based tests pin it out of the way and restore it after.
+    fn without_model_env() -> Option<String> {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        previous
+    }
+
+    fn restore_model_env(previous: Option<String>) {
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    fn store_state_payload() -> MemoryPayload {
+        retired_test_payload("fact", "owner", json!({}))
+    }
+
+    #[tokio::test]
+    async fn store_state_sidecar_records_pristine_then_flips_on_first_upsert() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("flip", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "init on a fresh store records a pristine sidecar"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+
+        store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("first upsert");
+        assert!(
+            crate::model_choice::store_has_data(&fx.db),
+            "the first successful upsert flips has_data"
+        );
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(store);
+
+        // A second instance on the same path reads the recorded state.
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store2.init("probe").await.expect("re-init");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_failed_upsert_does_not_flip() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("failed-upsert", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("init");
+        assert!(!crate::model_choice::store_has_data(&fx.db));
+        // Wrong-width vector: the Memory table's FLOAT[4] column rejects it.
+        let failed = store
+            .upsert("probe", "bad", vec![0.0; 3], store_state_payload())
+            .await;
+        assert!(
+            failed.is_err(),
+            "a wrong-width upsert must fail at the engine"
+        );
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "a failed upsert must not flip has_data"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_has_data_is_monotonic_across_delete_and_reinit() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("monotonic", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("init");
+        store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("upsert");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+
+        store.delete("probe", "m1").await.expect("delete");
+        assert!(
+            crate::model_choice::store_has_data(&fx.db),
+            "deleting the only memory must not reset has_data: a store that held data stays identity-locked even when emptied"
+        );
+        store.init("probe").await.expect("re-init same instance");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        drop(store);
+
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store2.init("probe").await.expect("re-init new instance");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_upsert_refused_when_configured_model_changed_while_pristine() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("race", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+
+        // A pick lands while this process holds the pristine store open:
+        // embedders.json now selects a different model.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let refused = store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await;
+        let err = refused
+            .expect_err("an upsert under a changed configured model must be refused, not landed");
+        assert!(
+            err.to_string().contains("Restart the daemon"),
+            "the refusal must be the restart-to-apply error: {err}"
+        );
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "a refused write leaves the store pristine"
+        );
+        let gone = store.get("probe", "m1").await.expect("get");
+        assert!(gone.is_none(), "no data lands under the stale model");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_pristine_open_under_new_model_updates_descriptor() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("reopen-new-model", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        drop(store);
+
+        // The pick is in place before this process starts: opening the
+        // pristine store under the new model adopts its descriptor, and
+        // the first write under it proceeds.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let store2 = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store2
+            .init("probe")
+            .await
+            .expect("init under the new model");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelB"),
+            "a pristine store opened under a new model records that model"
+        );
+        store2
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("first upsert under the recorded model succeeds");
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelB"));
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn store_state_sidecar_records_configured_model_not_placeholder() {
+        // NEUROSTRATA_MODEL is unset (pinned out by without_model_env):
+        // the recorded model must be the embedders.json entry, never the
+        // "local-fastembed" placeholder the in-memory registry records.
+        let previous = without_model_env();
+        let fx = store_state_fixture("provenance", "FileModel");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["descriptor"]["model"], json!("FileModel"));
+        assert_eq!(sidecar["descriptor"]["provider"], json!("fastembed"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
     }
 }
 
