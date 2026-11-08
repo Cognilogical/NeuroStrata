@@ -184,106 +184,115 @@ pub fn configured_dimensions() -> Result<usize> {
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 const MAX_EMBED_TOKENS: usize = 2048;
 
-/// Verify a model file's SHA-256 checksum against a pinned value.
-/// Returns `Err` on mismatch or when no model file can be found (fail-closed).
-pub fn verify_model_checksum(cache_dir: &PathBuf, model_name: &str, pinned_sha: &str) -> Result<()> {
-    // Collect candidate model files. Check the flat cache layout first, then
-    // walk the fastembed/HuggingFace snapshot layout (models--X/snapshots/*/onnx/model.onnx).
-    let mut candidates: Vec<PathBuf> = Vec::new();
+/// The pin gate `FastEmbedder::new` applies to the configured model: a
+/// local entry without a pinned SHA-256 fails closed, so a hand-authored
+/// or setup-written entry can never load unverified.
+fn pinned_sha_for(target_model: &AcceptableEmbedder) -> Result<&str> {
+    target_model.model_sha256.as_deref().ok_or_else(|| {
+        anyhow!(
+            "Embedder supply-chain error: model '{}' has no pinned SHA-256",
+            target_model.model_name
+        )
+    })
+}
 
-    // Flat fallback: cache_dir/model.onnx
-    let flat = cache_dir.join("model.onnx");
-    if flat.is_file() {
-        candidates.push(flat);
-    }
-
-    // fastembed layout: cache_dir/models--{name}/snapshots/*/onnx/model.onnx (and model.onnx)
-    let model_dir_name = format!("models--{}", model_name.replace("/", "--"));
-    let model_dir = cache_dir.join(&model_dir_name);
-    if model_dir.is_dir() {
-        collect_onnx_files(&model_dir, &mut candidates, 0, 6);
-    }
-
-    // Generic walk of cache_dir for any model.onnx (covers alternate cache roots)
-    if candidates.is_empty() {
-        collect_onnx_files(cache_dir, &mut candidates, 0, 4);
-    }
-
-    if candidates.is_empty() {
+/// Verify the SHA-256 of the exact model file fastembed loads for
+/// `model` against a pinned value. The file is located through
+/// fastembed's own registry entry (`model_code` / `model_file`), in the
+/// HuggingFace cache layout — never by filename guesswork: quantized
+/// and optimized variants load files a `model.onnx`-only search cannot
+/// see, and a sibling model's file must never satisfy this model's pin.
+/// Returns `Err` on mismatch or when the file cannot be located
+/// unambiguously (fail-closed).
+pub fn verify_model_checksum(
+    cache_dir: &Path,
+    model: &EmbeddingModel,
+    pinned_sha: &str,
+) -> Result<()> {
+    let model_name = format!("{model:?}");
+    let info = TextEmbedding::get_model_info(model).map_err(|e| {
+        anyhow!("Embedder supply-chain error: no fastembed model info for '{model_name}': {e}")
+    })?;
+    let model_dir = cache_dir.join(format!("models--{}", info.model_code.replace('/', "--")));
+    let snapshot = resolve_snapshot_dir(&model_dir, &model_name, pinned_sha)?;
+    let file = snapshot.join(&info.model_file);
+    if !file.is_file() {
         return Err(anyhow!(
             "Embedder supply-chain error: model '{}' model file not found in cache for verification (pinned SHA: {}).",
             model_name, pinned_sha
         ));
     }
+    let actual = hash_file_sha256(&file)?;
+    if actual != pinned_sha {
+        return Err(anyhow!(
+            "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
+            model_name,
+            file.display(),
+            pinned_sha,
+            actual
+        ));
+    }
+    Ok(())
+}
 
-    // Verify candidates: at least one must match the pinned SHA, and the
-    // newest candidate (sorted order ⇒ last entry) must match too. Stale
-    // non-matching candidates only warn, so a fresh valid download beside an
-    // old one still verifies.
-    candidates.sort();
-    let oldest_sha = |path: &PathBuf| -> Result<String> {
-        let data = std::fs::read(path).with_context(|| {
+/// Select a cached model's snapshot directory: the one `refs/main`
+/// names when it exists, else the only snapshot present. Several
+/// snapshots with no ref to disambiguate fail closed rather than guess
+/// which bytes the pin should be checked against.
+fn resolve_snapshot_dir(model_dir: &Path, model_name: &str, pinned_sha: &str) -> Result<PathBuf> {
+    let snapshots_dir = model_dir.join("snapshots");
+    if let Ok(rev) = fs::read_to_string(model_dir.join("refs").join("main")) {
+        let named = snapshots_dir.join(rev.trim());
+        if named.is_dir() {
+            return Ok(named);
+        }
+    }
+    let mut snapshots: Vec<PathBuf> = match fs::read_dir(&snapshots_dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    match snapshots.len() {
+        1 => Ok(snapshots.pop().expect("exactly one snapshot")),
+        0 => Err(anyhow!(
+            "Embedder supply-chain error: model '{}' model file not found in cache for verification (pinned SHA: {}).",
+            model_name, pinned_sha
+        )),
+        count => Err(anyhow!(
+            "Embedder supply-chain error: model '{}' has {} cached snapshots and no refs/main to select one; refusing to guess which to verify (pinned SHA: {}).",
+            model_name, count, pinned_sha
+        )),
+    }
+}
+
+/// Streamed SHA-256 of a file (model files run to hundreds of MiB; the
+/// digest must not require holding one in memory).
+fn hash_file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).with_context(|| {
+        format!(
+            "Failed to read model file {} for checksum verification",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).with_context(|| {
             format!(
                 "Failed to read model file {} for checksum verification",
                 path.display()
             )
         })?;
-        Ok(hex::encode(Sha256::digest(&data)))
-    };
-
-    let mut matched: Option<&PathBuf> = None;
-    let mut stale: Vec<(&PathBuf, String)> = Vec::new();
-    for path in &candidates {
-        let actual = oldest_sha(path)?;
-        if actual == pinned_sha {
-            matched = Some(path);
-        } else {
-            stale.push((path, actual));
+        if read == 0 {
+            break;
         }
+        hasher.update(&buffer[..read]);
     }
-
-    let newest = candidates.last().expect("candidates checked non-empty");
-    if matched.is_none() || stale.iter().any(|(p, _)| *p == newest) {
-        let path = newest;
-        let actual = oldest_sha(path)?;
-        return Err(anyhow!(
-            "Embedder supply-chain error: model '{}' checksum mismatch!\n  File: {}\n  Expected: {}\n  Actual: {}",
-            model_name, path.display(), pinned_sha, actual
-        ));
-    }
-
-    for (path, actual) in stale {
-        tracing::warn!(
-            "Embedder '{}': stale model file {} does not match pin (expected {}, actual {}); using verified candidate {}",
-            model_name, path.display(), pinned_sha, actual,
-            matched.map_or("", |m| m.to_str().unwrap_or(""))
-        );
-    }
-    Ok(())
-}
-
-fn collect_onnx_files(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: usize, max_depth: usize) {
-    if depth > max_depth {
-        return;
-    }
-    match std::fs::read_dir(dir) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name == "model.onnx" {
-                        out.push(path);
-                    }
-                } else if path.is_dir() {
-                    collect_onnx_files(&path, out, depth + 1, max_depth);
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("collect_onnx_files: read_dir({}) failed: {e}", dir.display());
-        }
-    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Local fastembed-backed embedding provider.
@@ -299,21 +308,22 @@ impl FastEmbedder {
 
         // The descriptor must describe the model actually loaded: an unknown
         // configured name silently falls back to NomicEmbedTextV15 (768 dims).
-        let (model_enum, loaded_model_name, loaded_dims) =
-            match EmbeddingModel::from_str(&target_model.model_name) {
-                Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
-                Err(_) => {
-                    tracing::warn!(
-                        "Unknown embedding model '{}', falling back to NomicEmbedTextV15 (768 dims)",
-                        target_model.model_name
-                    );
-                    (
-                        EmbeddingModel::NomicEmbedTextV15,
-                        "NomicEmbedTextV15".to_string(),
-                        768,
-                    )
-                }
-            };
+        let (model_enum, loaded_model_name, loaded_dims) = match EmbeddingModel::from_str(
+            &target_model.model_name,
+        ) {
+            Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
+            Err(_) => {
+                tracing::warn!(
+                    "Unknown embedding model '{}', falling back to NomicEmbedTextV15 (768 dims)",
+                    target_model.model_name
+                );
+                (
+                    EmbeddingModel::NomicEmbedTextV15,
+                    "NomicEmbedTextV15".to_string(),
+                    768,
+                )
+            }
+        };
 
         let cache_dir = find_existing_cache_dir()?;
 
@@ -332,20 +342,19 @@ impl FastEmbedder {
         // what ingestion actually stores per symbol is wasted, so this is set to
         // match MAX_SYMBOL_CHARS in src/parser/ingest.rs -- change the two together.
         let model = TextEmbedding::try_new(
-            TextInitOptions::new(model_enum)
+            TextInitOptions::new(model_enum.clone())
                 .with_cache_dir(cache_dir.clone())
                 .with_max_length(MAX_EMBED_TOKENS)
                 .with_show_download_progress(true),
         )?;
 
-        // Supply-chain verification: if a pinned SHA-256 is specified, verify
-        // the model file against it. This protects against cache poisoning
-        // attacks where an attacker could replace a downloaded model.
-        let pinned_sha = target_model
-            .model_sha256
-            .as_ref()
-            .ok_or_else(|| anyhow!("Embedder supply-chain error: model '{}' has no pinned SHA-256", target_model.model_name))?;
-        verify_model_checksum(&cache_dir, &target_model.model_name, pinned_sha)?;
+        // Supply-chain verification: the configured entry must carry a
+        // pinned SHA-256, and the file fastembed actually loaded (the
+        // resolved enum above, fallback included) must hash to it. This
+        // protects against cache poisoning attacks where an attacker
+        // could replace a downloaded model.
+        let pinned_sha = pinned_sha_for(&target_model)?;
+        verify_model_checksum(&cache_dir, &model_enum, pinned_sha)?;
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
@@ -816,25 +825,195 @@ mod tests {
         assert!(embedder.is_ok());
     }
 
-    #[test]
-    fn verify_model_checksum_fails_on_mismatch() {
-        let dir = std::env::temp_dir().join("ns-checksum-mismatch");
+    /// A fresh temp cache root for the verifier fixtures.
+    fn fresh_cache_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ns-checksum-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let model_path = dir.join("model.onnx");
-        std::fs::write(&model_path, b"not-the-model").unwrap();
-        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
-        assert!(err.to_string().contains("checksum mismatch"));
+        dir
+    }
+
+    /// Write `bytes` as `model_file` inside a fixture snapshot in the real
+    /// fastembed/HuggingFace cache layout:
+    /// `models--{model_code}/snapshots/testrev/{model_file}`.
+    fn fixture_snapshot_file(
+        cache: &Path,
+        model_code: &str,
+        model_file: &str,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let file = cache
+            .join(format!("models--{}", model_code.replace('/', "--")))
+            .join("snapshots")
+            .join("testrev")
+            .join(model_file);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, bytes).unwrap();
+        file
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn verify_model_checksum_fails_on_mismatch() {
+        let dir = fresh_cache_dir("mismatch");
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            b"not-the-model",
+        );
+        let err = verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, "deadbeef")
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn verify_model_checksum_fails_when_no_file() {
-        let dir = std::env::temp_dir().join("ns-checksum-missing");
+        let dir = fresh_cache_dir("missing");
+        let err = verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, "deadbeef")
+            .unwrap_err();
+        assert!(err.to_string().contains("model file not found"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let err = verify_model_checksum(&dir, "NomicEmbedTextV15", "deadbeef").unwrap_err();
-        assert!(err.to_string().contains("model file not found"));
+    }
+
+    #[test]
+    fn verify_model_checksum_accepts_the_default_model_in_the_real_layout() {
+        // The default flow must not regress: FP32 Nomic in the snapshot
+        // layout verifies against the hash of the file fastembed loads.
+        let dir = fresh_cache_dir("default-ok");
+        let bytes = b"fp32-weights";
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            bytes,
+        );
+        verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15, &sha256_hex(bytes))
+            .expect("the default model verifies against the file fastembed loads");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_hashes_the_file_fastembed_loads() {
+        // NomicEmbedTextV15Q shares its snapshot with the FP32 file (the
+        // A4b pre-seed shape): fastembed loads onnx/model_quantized.onnx,
+        // so the quantized bytes' pin must pass and the FP32 sibling's
+        // pin must fail — the old collector never saw the quantized file.
+        let dir = fresh_cache_dir("quantized");
+        let fp32 = b"fp32-sibling-bytes";
+        let quantized = b"quantized-bytes";
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model.onnx",
+            fp32,
+        );
+        fixture_snapshot_file(
+            &dir,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model_quantized.onnx",
+            quantized,
+        );
+        verify_model_checksum(
+            &dir,
+            &EmbeddingModel::NomicEmbedTextV15Q,
+            &sha256_hex(quantized),
+        )
+        .expect("the quantized file's pin verifies");
+        let err =
+            verify_model_checksum(&dir, &EmbeddingModel::NomicEmbedTextV15Q, &sha256_hex(fp32))
+                .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // BGESmallENV15Q loads a root-level model_optimized.onnx; a decoy
+        // onnx/model.onnx in the same snapshot must be ignored.
+        let dir = fresh_cache_dir("optimized");
+        let optimized = b"optimized-bytes";
+        fixture_snapshot_file(
+            &dir,
+            "Qdrant/bge-small-en-v1.5-onnx-Q",
+            "model_optimized.onnx",
+            optimized,
+        );
+        fixture_snapshot_file(
+            &dir,
+            "Qdrant/bge-small-en-v1.5-onnx-Q",
+            "onnx/model.onnx",
+            b"decoy",
+        );
+        verify_model_checksum(
+            &dir,
+            &EmbeddingModel::BGESmallENV15Q,
+            &sha256_hex(optimized),
+        )
+        .expect("the optimized file's pin verifies");
+        let err =
+            verify_model_checksum(&dir, &EmbeddingModel::BGESmallENV15Q, &sha256_hex(b"decoy"))
+                .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_default_pick_pin_flows_from_writer_through_resolution_to_verification() {
+        // The closest faithful FastEmbedder::new proxy that stays
+        // hermetic: new() reads the global config dir and performs a real
+        // model load, so this test runs the exact post-load sequence —
+        // writer output -> configured_model_in resolution -> the pin gate
+        // (pinned_sha_for) -> model-aware verify_model_checksum — for a
+        // non-default pick. Which file gets hashed is proven against
+        // fixture bytes by verify_hashes_the_file_fastembed_loads; the
+        // emitted pin's correctness is the table constant asserted here.
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::set_var("NEUROSTRATA_MODEL", "");
+
+        let root = std::env::temp_dir().join(format!("ns-pin-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db_path = root.join("ladybug.db");
+        let choice = crate::model_choice::candidates()
+            .iter()
+            .find(|c| c.model_name == "NomicEmbedTextV15Q")
+            .expect("shortlist contains NomicEmbedTextV15Q");
+        crate::model_choice::write_initial_embedders_file(&config_dir, choice, &db_path)
+            .expect("write the pick");
+
+        let resolved = configured_model_in(&config_dir).expect("resolve the pick");
+        assert_eq!(resolved.model_name, "NomicEmbedTextV15Q");
+        let pin = pinned_sha_for(&resolved).expect("the written pick carries a pin");
+        assert_eq!(pin, choice.model_sha256);
+
+        let model_enum = EmbeddingModel::from_str(&resolved.model_name).expect("enum parses");
+        let cache = root.join("cache");
+        let quantized = b"proxy-quantized-bytes";
+        fixture_snapshot_file(
+            &cache,
+            "nomic-ai/nomic-embed-text-v1.5",
+            "onnx/model_quantized.onnx",
+            quantized,
+        );
+        verify_model_checksum(&cache, &model_enum, &sha256_hex(quantized))
+            .expect("the resolved model verifies the file fastembed loads");
+
+        // Negative control: the same entry with the pin stripped hits the
+        // exact gate FastEmbedder::new applies — "no pinned SHA-256".
+        let stripped =
+            serde_json::json!([{ "model_name": "NomicEmbedTextV15Q", "dimensions": 768 }]);
+        std::fs::write(config_dir.join("embedders.json"), stripped.to_string()).unwrap();
+        let resolved = configured_model_in(&config_dir).expect("resolve the stripped file");
+        let err = pinned_sha_for(&resolved).unwrap_err();
+        assert!(err.to_string().contains("no pinned SHA-256"), "{err}");
+
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

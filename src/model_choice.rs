@@ -19,6 +19,13 @@ pub struct ModelChoice {
     /// re-verified against the live `resolve` URLs when this table was
     /// written.
     pub file_bytes: u64,
+    /// Lowercase-hex SHA-256 of the exact ONNX file fastembed loads for
+    /// this model (its registry `model_file`), computed from the
+    /// downloaded file after its byte count matched `file_bytes`. The
+    /// writer emits it as the entry's `model_sha256` pin: a local entry
+    /// without a pin fails closed at embedder load, so a pinless pick
+    /// would brick the daemon's first start after the choice.
+    pub model_sha256: &'static str,
     /// Maximum number of input tokens the model embeds before
     /// truncation.
     pub max_tokens: usize,
@@ -34,6 +41,7 @@ pub fn candidates() -> &'static [ModelChoice] {
             model_name: "NomicEmbedTextV15Q",
             dimensions: 768,
             file_bytes: 137296292,
+            model_sha256: "b4342336debaea79de872370664b0aaeb67dea4605513d00ee236ea871a81f27",
             max_tokens: 8192,
             note: "Same model as the standard default, int8-quantized. Dimensions and context unchanged.",
         },
@@ -41,6 +49,7 @@ pub fn candidates() -> &'static [ModelChoice] {
             model_name: "BGESmallENV15Q",
             dimensions: 384,
             file_bytes: 66465124,
+            model_sha256: "51f1bd0addd6e859e42c2c8021a5e5461385bb676a649f4b269aa445449f2431",
             max_tokens: 512,
             note: "Smallest download. 384 dimensions; 512-token context. Already the low profile's model.",
         },
@@ -48,6 +57,7 @@ pub fn candidates() -> &'static [ModelChoice] {
             model_name: "SnowflakeArcticEmbedMQ",
             dimensions: 768,
             file_bytes: 110084023,
+            model_sha256: "e46017484d369593d6bb830936fde2175ce21e1ba1ddf002f23e3212d87c824a",
             max_tokens: 512,
             note: "Keeps 768 dimensions; 512-token context.",
         },
@@ -55,6 +65,7 @@ pub fn candidates() -> &'static [ModelChoice] {
             model_name: "BGESmallENV15",
             dimensions: 384,
             file_bytes: 133093490,
+            model_sha256: "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
             max_tokens: 512,
             note: "The non-quantized small model. 384 dimensions; 512-token context.",
         },
@@ -62,6 +73,7 @@ pub fn candidates() -> &'static [ModelChoice] {
             model_name: "BGEBaseENV15Q",
             dimensions: 768,
             file_bytes: 217824172,
+            model_sha256: "4e556722bc4f65716c544c8a931f1e90fb3f866e5741fd93a96f051d673339c7",
             max_tokens: 512,
             note: "768 dimensions; least memory saved of this list; 512-token context.",
         },
@@ -141,7 +153,10 @@ fn write_initial_embedders_file_inner(
         base_url: None,
         api_key_env: None,
         api_model: None,
-        model_sha256: None,
+        // The candidate's pin: a local entry without one fails closed at
+        // embedder load ("no pinned SHA-256"), which would brick the
+        // first daemon start after the pick (A4b finding B1).
+        model_sha256: Some(choice.model_sha256.to_string()),
     }];
     entries.extend(
         default_acceptable_embedders()
@@ -550,6 +565,65 @@ mod tests {
         for (c, (name, bytes)) in candidates().iter().zip(expected.iter()) {
             assert_eq!(c.model_name, *name);
             assert_eq!(c.file_bytes, *bytes, "file_bytes drift for {}", name);
+        }
+    }
+
+    #[test]
+    fn candidate_pins_are_well_formed() {
+        // The built-in FP32 default's pin (embed.rs): no candidate may
+        // carry it — each candidate's pin is the hash of the exact file
+        // fastembed loads for that candidate, and all five files differ.
+        const FP32_DEFAULT_PIN: &str =
+            "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965";
+        let mut seen = std::collections::HashSet::new();
+        for c in candidates() {
+            assert_eq!(c.model_sha256.len(), 64, "pin length for {}", c.model_name);
+            assert!(
+                c.model_sha256
+                    .chars()
+                    .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()),
+                "pin for {} must be lowercase hex",
+                c.model_name
+            );
+            assert_ne!(
+                c.model_sha256, FP32_DEFAULT_PIN,
+                "{} carries the FP32 default's pin",
+                c.model_name
+            );
+            assert!(
+                seen.insert(c.model_sha256),
+                "duplicate pin at {}",
+                c.model_name
+            );
+        }
+    }
+
+    #[test]
+    fn writer_emits_the_candidates_pin() {
+        // Every pick the writer writes must carry that candidate's pin:
+        // FastEmbedder::new fails closed on a missing pin, so a `None`
+        // here bricks the daemon's first start after the pick (A4b B1).
+        for choice in candidates() {
+            let (tmp, config_dir) = fresh_config_dir("writer-pin");
+            let db_path = tmp.path().join("neurostrata.db");
+            write_initial_embedders_file(&config_dir, choice, &db_path).expect("write choice file");
+            let content =
+                fs::read_to_string(config_dir.join("embedders.json")).expect("read written file");
+            let parsed: Vec<AcceptableEmbedder> =
+                serde_json::from_str(&content).expect("written file parses");
+            assert_eq!(
+                parsed[0].model_sha256.as_deref(),
+                Some(choice.model_sha256),
+                "the written pick for {} must carry its pin",
+                choice.model_name
+            );
+            let entries = get_acceptable_embedders_in(&config_dir).expect("loader round-trip");
+            assert_eq!(
+                entries[0].model_sha256.as_deref(),
+                Some(choice.model_sha256),
+                "the loader must preserve the pin for {}",
+                choice.model_name
+            );
         }
     }
 
