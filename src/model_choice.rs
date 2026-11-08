@@ -316,6 +316,22 @@ pub(crate) fn render_offer(offered: &[ModelChoice]) -> String {
     out
 }
 
+/// The user's answer to a surfaced model-choice offer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChoiceResponse {
+    /// Pick the offered candidate at this index. An out-of-range index is
+    /// not a decline — it is treated as [`ChoiceResponse::Invalid`].
+    Pick(usize),
+    /// Explicitly decline (the documented decline input). Final: the
+    /// marker is removed and the install is not asked again.
+    Decline,
+    /// Anything that is neither a pick nor an explicit decline —
+    /// unparseable or empty input at the terminal. Not a decline: the
+    /// marker stays in place and nothing is written, so the next
+    /// interactive command offers the choice again.
+    Invalid,
+}
+
 /// What a surfacing attempt did with a pending choice.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PendingChoiceOutcome {
@@ -330,6 +346,10 @@ pub(crate) enum PendingChoiceOutcome {
     /// The user declined; the marker is removed and the install is not
     /// asked again.
     Declined,
+    /// The answer was invalid (unparseable, empty, or an out-of-range
+    /// pick); the marker is left in place, nothing is written, and the
+    /// choice is offered again at the next interactive command.
+    InvalidInput,
     /// The user picked a model; it was persisted via
     /// [`write_initial_embedders_file`] and the marker removed.
     Chosen(&'static str),
@@ -337,14 +357,15 @@ pub(crate) enum PendingChoiceOutcome {
 
 /// Surface a pending model choice at an interactive command, before the
 /// command executes (and therefore before any store creation on its
-/// path). `responder` receives the rendered offer and returns the picked
-/// index, or `None` to decline. A failed persist propagates and leaves
-/// the marker in place, so the choice is not lost.
+/// path). `responder` receives the rendered offer and answers with a
+/// [`ChoiceResponse`]: only an explicit decline or a valid pick consumes
+/// the marker; invalid input leaves it in place. A failed persist
+/// propagates and leaves the marker in place, so the choice is not lost.
 pub(crate) fn surface_pending_choice(
     config_dir: &Path,
     db_path: &Path,
     stdin_is_terminal: bool,
-    responder: &mut dyn FnMut(&str) -> Option<usize>,
+    responder: &mut dyn FnMut(&str) -> ChoiceResponse,
 ) -> anyhow::Result<PendingChoiceOutcome> {
     if !pending_choice_path(config_dir).exists() {
         return Ok(PendingChoiceOutcome::NoMarker);
@@ -359,16 +380,17 @@ pub(crate) fn surface_pending_choice(
     let offered = &candidates()[..3];
     let rendered = render_offer(offered);
     match responder(&rendered) {
-        Some(index) if index < offered.len() => {
+        ChoiceResponse::Pick(index) if index < offered.len() => {
             let choice = &offered[index];
             write_initial_embedders_file(config_dir, choice, db_path)?;
             clear_pending_choice(config_dir);
             Ok(PendingChoiceOutcome::Chosen(choice.model_name))
         }
-        _ => {
+        ChoiceResponse::Decline => {
             clear_pending_choice(config_dir);
             Ok(PendingChoiceOutcome::Declined)
         }
+        ChoiceResponse::Pick(_) | ChoiceResponse::Invalid => Ok(PendingChoiceOutcome::InvalidInput),
     }
 }
 
@@ -634,7 +656,7 @@ mod tests {
         let called = std::cell::Cell::new(false);
         let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
             called.set(true);
-            Some(0)
+            ChoiceResponse::Pick(0)
         })
         .expect("surface");
         assert_eq!(outcome, PendingChoiceOutcome::Voided);
@@ -657,7 +679,7 @@ mod tests {
         let mut seen_offer = String::new();
         let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |offer| {
             seen_offer = offer.to_string();
-            Some(1)
+            ChoiceResponse::Pick(1)
         })
         .expect("surface");
         assert_eq!(outcome, PendingChoiceOutcome::Chosen("BGESmallENV15Q"));
@@ -681,7 +703,7 @@ mod tests {
         let called = std::cell::Cell::new(false);
         let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
             called.set(true);
-            Some(0)
+            ChoiceResponse::Pick(0)
         })
         .expect("surface");
         assert_eq!(outcome, PendingChoiceOutcome::Voided);
@@ -703,8 +725,10 @@ mod tests {
         write_default_file(&config_dir);
         record_pending_choice(&config_dir);
         let db_path = tmp.path().join("neurostrata.db");
-        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(2))
-            .expect("first surface");
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Pick(2)
+        })
+        .expect("first surface");
         assert_eq!(
             outcome,
             PendingChoiceOutcome::Chosen("SnowflakeArcticEmbedMQ")
@@ -713,8 +737,10 @@ mod tests {
         let after_pick = fs::read(&target).expect("read picked file");
         // A later interactive command finds no marker and changes nothing;
         // the chosen file is non-default, so the install is locked.
-        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(0))
-            .expect("rerun surface");
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Pick(0)
+        })
+        .expect("rerun surface");
         assert_eq!(outcome, PendingChoiceOutcome::NoMarker);
         assert_eq!(
             fs::read(&target).expect("re-read file"),
@@ -737,12 +763,18 @@ mod tests {
         let tmp_blocker = config_dir.join(format!(".embedders.json.tmp-{}", std::process::id()));
         fs::create_dir(&tmp_blocker).expect("create temp blocker dir");
         let db_path = tmp.path().join("neurostrata.db");
-        let result = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(0));
+        let result = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Pick(0)
+        });
         assert!(result.is_err(), "a failed persist must surface as an error");
         assert_eq!(
             fs::read(&target).expect("re-read file"),
             before,
             "a failed persist leaves the complete previous file, never a partial one"
+        );
+        assert!(
+            pending_choice_path(&config_dir).exists(),
+            "a failed persist leaves the marker in place, so the choice is not lost"
         );
     }
 
@@ -829,14 +861,18 @@ mod tests {
         record_pending_choice(&config_dir);
         let db_path = tmp.path().join("neurostrata.db");
         // A non-interactive invocation leaves the marker for a later one.
-        let outcome = surface_pending_choice(&config_dir, &db_path, false, &mut |_| Some(0))
-            .expect("non-interactive surface");
+        let outcome = surface_pending_choice(&config_dir, &db_path, false, &mut |_| {
+            ChoiceResponse::Pick(0)
+        })
+        .expect("non-interactive surface");
         assert_eq!(outcome, PendingChoiceOutcome::NotInteractive);
         assert!(pending_choice_path(&config_dir).exists());
         // The next interactive command presents the choice; a pick persists
         // via the writer and clears the marker.
-        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(0))
-            .expect("interactive surface");
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Pick(0)
+        })
+        .expect("interactive surface");
         assert_eq!(outcome, PendingChoiceOutcome::Chosen("NomicEmbedTextV15Q"));
         let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the pick");
         assert_eq!(entries[0].model_name, "NomicEmbedTextV15Q");
@@ -850,7 +886,7 @@ mod tests {
         let called = std::cell::Cell::new(false);
         let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
             called.set(true);
-            Some(0)
+            ChoiceResponse::Pick(0)
         })
         .expect("voided surface");
         assert_eq!(outcome, PendingChoiceOutcome::Voided);
@@ -860,5 +896,91 @@ mod tests {
             "a voided choice writes nothing"
         );
         assert!(!pending_choice_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn setup_out_of_range_pick_keeps_pending_choice() {
+        let (tmp, config_dir) = fresh_config_dir("a4fix-out-of-range");
+        write_default_file(&config_dir);
+        let target = config_dir.join("embedders.json");
+        let before = fs::read(&target).expect("read default file");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        // "9" at the terminal maps to an out-of-range pick index: a
+        // fat-finger, not a decline. The marker stays and nothing is
+        // written, so the choice is offered again.
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Pick(9)
+        })
+        .expect("out-of-range surface");
+        assert_eq!(outcome, PendingChoiceOutcome::InvalidInput);
+        assert!(
+            pending_choice_path(&config_dir).exists(),
+            "an out-of-range pick leaves the marker in place"
+        );
+        assert_eq!(
+            fs::read(&target).expect("re-read file"),
+            before,
+            "an out-of-range pick writes nothing"
+        );
+        // The next interactive command offers the choice again, and a
+        // valid pick then persists and clears the marker.
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Pick(0)
+        })
+        .expect("re-offer surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Chosen("NomicEmbedTextV15Q"));
+        assert!(!pending_choice_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn setup_invalid_response_keeps_pending_choice() {
+        let (tmp, config_dir) = fresh_config_dir("a4fix-invalid");
+        write_default_file(&config_dir);
+        let target = config_dir.join("embedders.json");
+        let before = fs::read(&target).expect("read default file");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        // Unparseable input ("abc", blank) is invalid, not a decline:
+        // the marker stays and nothing is written.
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Invalid
+        })
+        .expect("invalid surface");
+        assert_eq!(outcome, PendingChoiceOutcome::InvalidInput);
+        assert!(
+            pending_choice_path(&config_dir).exists(),
+            "invalid input leaves the marker in place"
+        );
+        assert_eq!(
+            fs::read(&target).expect("re-read file"),
+            before,
+            "invalid input writes nothing"
+        );
+    }
+
+    #[test]
+    fn setup_decline_clears_pending_choice() {
+        let (tmp, config_dir) = fresh_config_dir("a4fix-decline");
+        write_default_file(&config_dir);
+        let target = config_dir.join("embedders.json");
+        let before = fs::read(&target).expect("read default file");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        // Only an explicit decline consumes the marker (without writing).
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            ChoiceResponse::Decline
+        })
+        .expect("decline surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Declined);
+        assert!(
+            !pending_choice_path(&config_dir).exists(),
+            "an explicit decline clears the marker"
+        );
+        assert_eq!(
+            fs::read(&target).expect("re-read file"),
+            before,
+            "a decline writes nothing"
+        );
     }
 }
