@@ -1810,26 +1810,37 @@ async fn answer_with_error(
     }
 }
 
-/// The proxy's HTTP client. It carries the daemon bearer token (read
-/// from the token file the daemon maintains) in its default headers:
-/// without it, every forwarded /mcp call is a 401 against the daemon's
-/// auth middleware -- the Task 1 F1 regression, in which the product's
-/// primary client surface went dark the moment the daemon learned to
-/// authenticate.
+/// The proxy's HTTP client. It is deliberately credential-free: it must
+/// not carry the daemon bearer token in its default headers, because a
+/// client built once, at proxy startup, would freeze whatever the token
+/// file held -- or failed to hold -- at that moment. On a first run the
+/// token file may not exist yet when the proxy starts (the daemon
+/// creates it only once it starts, which can be well after the readiness
+/// poll in main.rs has given up on a still-loading model), and a rotated
+/// token -- the documented lockout recovery deletes and regenerates
+/// daemon.token -- must be picked up without a proxy restart. The token
+/// is therefore resolved at forward time instead; see
+/// forward_mcp_request.
+///
+/// The invariant that makes forward-time resolution exact: the daemon
+/// creates daemon.token before it binds its listener (daemon.rs,
+/// start_daemon_on), so the first attempt that can connect at all can
+/// always read a complete token. Moving token creation to after the
+/// bind would reopen a self-healing one-request window -- a request
+/// forwarded while the file is being written could go out without a
+/// header and draw one 401 -- and must be done knowingly.
+///
+/// Without a token on the forwarded call, every /mcp request is a 401
+/// against the daemon's auth middleware -- the Task 1 F1 regression, in
+/// which the product's primary client surface went dark the moment the
+/// daemon learned to authenticate.
 fn proxy_client() -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(token) = crate::daemon::read_token_file("daemon.token") {
-        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
-            headers.insert(reqwest::header::AUTHORIZATION, val);
-        }
-    }
     reqwest::Client::builder()
         // Separate from the overall bound on purpose. A port with nothing behind
         // it hangs rather than refusing on this machine -- the same behaviour
         // DaemonProbe in main.rs exists to describe -- so without this, a daemon
         // that is not running is indistinguishable from one that is merely slow,
         // and the wait is the whole timeout rather than a few seconds.
-        .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(proxy_timeout())
         .build()
@@ -1840,12 +1851,28 @@ fn proxy_client() -> reqwest::Client {
 /// /mcp endpoint with the proxy client. The startup-wait loop in
 /// `start_mcp_proxy` retries this on connect errors while the daemon is
 /// still starting.
+///
+/// The daemon bearer token is resolved here, at forward time: this is
+/// called once per attempt, so resolution is per attempt by
+/// construction, and a token that appears -- or rotates -- after the
+/// proxy started is used by the next attempt. The accepted trade:
+/// deleting or replacing the token file while the daemon runs leaves
+/// the proxy unauthenticated until the file reappears or the daemon
+/// restarts; the proxy deliberately holds no copy of its own to fall
+/// back on.
 async fn forward_mcp_request(
     client: &reqwest::Client,
     url: &str,
     request: &Value,
 ) -> reqwest::Result<reqwest::Response> {
-    client.post(url).json(request).send().await
+    let token = crate::daemon::read_token_file("daemon.token");
+    let mut attempt = client.post(url).json(request);
+    if let Some(token) = token {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            attempt = attempt.header(reqwest::header::AUTHORIZATION, val);
+        }
+    }
+    attempt.send().await
 }
 
 pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
