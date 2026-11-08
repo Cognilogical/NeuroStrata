@@ -516,11 +516,12 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// Write a self-contained snapshot of the store into `dir`.
     ///
     /// This is a checkpointed file copy, not the engine's EXPORT DATABASE:
-    /// lbug 0.20.4 SIGSEGVs planning EXPORT DATABASE on every store (gdb:
-    /// planExportTableData -> std::__format on a dangling string_view), so the
-    /// SQL export path cannot be used. The store is a single file whose only
-    /// writer is one daemon, so a copy taken right after CHECKPOINT is a
-    /// consistent snapshot.
+    /// lbug 0.20.4 SIGSEGVd planning EXPORT DATABASE on every store (gdb:
+    /// planExportTableData -> std::__format on a dangling string_view).
+    /// Revalidated on lbug 0.22.3: EXPORT DATABASE of a fixture store
+    /// succeeded (Linux x86_64), but the snapshot stays a file copy — the
+    /// store is a single file whose only writer is one daemon, so a copy
+    /// taken right after CHECKPOINT is a consistent snapshot.
     async fn export_database(&self, dir: &str) -> Result<()>;
 
     /// Flush everything written so far to durable storage. A long-running

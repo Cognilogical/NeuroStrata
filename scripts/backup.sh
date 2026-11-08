@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # neurostrata-backup.sh — reliable DB backup using CHECKPOINT+cp pattern.
 #
-# The CLI `backup` is broken (lbug 0.20.4 EXPORT DATABASE SIGSEGV — see
-# memory 74524cc4 / 93357321). This script bypasses the engine entirely:
+# Written when the engine's EXPORT DATABASE was unusable (lbug 0.20.4
+# EXPORT DATABASE SIGSEGV — see memory 74524cc4 / 93357321). Revalidated
+# on lbug 0.22.3: EXPORT DATABASE of a fixture store succeeded (Linux
+# x86_64); this script's pattern is kept as-is. It bypasses the engine
+# entirely:
 #   1. systemctl --user stop neurostrata  (graceful shutdown + checkpoint)
 #   2. lsof-verify no holders
 #   3. Raw `cp` the db file
