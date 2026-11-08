@@ -1,12 +1,70 @@
 #!/bin/bash
-# NeuroStrata task gate — scaffolded by neurostrata-bootstrap / task_setup.
+# NeuroStrata pre-push hook: (1) upstream-push guard, (2) task gate.
 #
-# The hook IS the gate. It runs on every push on ANY git host, so it is the
-# required default; CI is vendor-specific and only a defense-in-depth extra.
 # Install once with:  bash scripts/install-hooks.sh
-# (`neurostrata-mcp hooks install` writes these exact bytes into the
-# directory git actually runs hooks from, core.hooksPath honored — one
-# hook text for both install paths, so they cannot drift.)
+# The installer copies this file into the directory git actually runs
+# hooks from (core.hooksPath if set, otherwise the common git dir's
+# hooks/ — shared by all worktrees of the clone). Safe to re-run.
+#
+# ── Guard 1: upstream-push guard (Anthropic-Memory Parity, Task 0.2) ──
+# This fork's venue rule: nothing is pushed to upstream
+# Cognilogical/NeuroStrata without Pratik's explicit per-action
+# consent. The guard is mechanical, not prose: it rejects (exit 1) any
+# push whose remote URL's owner/repo path is Cognilogical/NeuroStrata,
+# in any common form and on any host:
+#   https://github.com/Cognilogical/NeuroStrata[.git]
+#   git@github.com:Cognilogical/NeuroStrata.git
+#   ssh://git@github.com/Cognilogical/NeuroStrata[.git]
+# Matching is on the path segment after the host, case-insensitive, so
+# a mirror or proxy host carrying that path is rejected too. The fork
+# (pratik-saptarshi/NeuroStrata) and every other remote pass. The
+# guard runs first and unconditionally — before the task gate below,
+# and whether or not neurostrata-mcp is installed — and there is no
+# skip variable for it. Git calls this hook as: pre-push <remote-name>
+# <remote-url>, with ref lines on stdin (the guard does not read stdin).
+
+_ns_remote_name="${1:-}"
+_ns_remote_url="${2:-}"
+if [ -n "$_ns_remote_url" ]; then
+    # Normalise: lowercase; strip scheme; strip userinfo; turn the
+    # scp-style host:path separator into host/path; strip trailing
+    # slash and a single trailing .git.
+    _ns_path=$(printf '%s' "$_ns_remote_url" | tr '[:upper:]' '[:lower:]')
+    case "$_ns_path" in
+        *://*) _ns_path="${_ns_path#*://}" ;;
+    esac
+    case "$_ns_path" in
+        *@*) _ns_path="${_ns_path#*@}" ;;
+    esac
+    # scp-style "host:owner/repo": replace the first ':' with '/'
+    # (pure parameter expansion — no external tools beyond git's
+    # usual shell environment).
+    case "$_ns_path" in
+        *:*/*) _ns_path="${_ns_path%%:*}/${_ns_path#*:}" ;;
+    esac
+    _ns_path="${_ns_path%/}"
+    case "$_ns_path" in
+        *.git) _ns_path="${_ns_path%.git}" ;;
+    esac
+    case "$_ns_path" in
+        */cognilogical/neurostrata|cognilogical/neurostrata)
+            echo "Push blocked by upstream-push guard: remote '${_ns_remote_name}' points at upstream Cognilogical/NeuroStrata (${_ns_remote_url})." >&2
+            echo "Venue rule: nothing is pushed to upstream without Pratik's explicit per-action consent. Push to the fork (pratik-saptarshi/NeuroStrata) instead." >&2
+            exit 1
+            ;;
+    esac
+fi
+unset _ns_remote_name _ns_remote_url _ns_path
+
+# ── Guard 2: NeuroStrata task gate ────────────────────────────────────
+# Scaffolded by neurostrata-bootstrap / task_setup.
+# The hook IS the gate. It runs on every push on ANY git host, so it is
+# the required default; CI is vendor-specific and only a defense-in-depth
+# extra. (`neurostrata-mcp hooks install` writes a hook into the
+# directory git actually runs hooks from, core.hooksPath honored; the
+# scaffolded hook text it writes — and that hook hygiene auto-installs
+# over a stale copy — carries the same Guard 1 executable guard above,
+# so either install path, and any hygiene pass, retains the guard.)
 
 command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then

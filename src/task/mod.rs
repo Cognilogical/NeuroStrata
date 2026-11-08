@@ -1876,6 +1876,56 @@ pub(crate) const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
 # directory git actually runs hooks from, core.hooksPath honored — one
 # hook text for both install paths, so they cannot drift.)
 
+# ── Guard 1: upstream-push guard (Anthropic-Memory Parity, Task 0.2) ──
+# This fork's venue rule: nothing is pushed to upstream
+# Cognilogical/NeuroStrata without Pratik's explicit per-action
+# consent. The guard is mechanical, not prose: it rejects (exit 1) any
+# push whose remote URL's owner/repo path is Cognilogical/NeuroStrata,
+# in any common form and on any host:
+#   https://<host>/Cognilogical/NeuroStrata[.git]
+#   git@<host>:Cognilogical/NeuroStrata.git
+#   ssh://git@<host>/Cognilogical/NeuroStrata[.git]
+# Matching is on the path segment after the host, case-insensitive, so
+# a mirror or proxy host carrying that path is rejected too. The fork
+# (pratik-saptarshi/NeuroStrata) and every other remote pass. The
+# guard runs first and unconditionally — before the task gate below,
+# and whether or not neurostrata-mcp is installed — and there is no
+# skip variable for it. Git calls this hook as: pre-push <remote-name>
+# <remote-url>, with ref lines on stdin (the guard does not read stdin).
+
+_ns_remote_name="${1:-}"
+_ns_remote_url="${2:-}"
+if [ -n "$_ns_remote_url" ]; then
+    # Normalise: lowercase; strip scheme; strip userinfo; turn the
+    # scp-style host:path separator into host/path; strip trailing
+    # slash and a single trailing .git.
+    _ns_path=$(printf '%s' "$_ns_remote_url" | tr '[:upper:]' '[:lower:]')
+    case "$_ns_path" in
+        *://*) _ns_path="${_ns_path#*://}" ;;
+    esac
+    case "$_ns_path" in
+        *@*) _ns_path="${_ns_path#*@}" ;;
+    esac
+    # scp-style "host:owner/repo": replace the first ':' with '/'
+    # (pure parameter expansion — no external tools beyond git's
+    # usual shell environment).
+    case "$_ns_path" in
+        *:*/*) _ns_path="${_ns_path%%:*}/${_ns_path#*:}" ;;
+    esac
+    _ns_path="${_ns_path%/}"
+    case "$_ns_path" in
+        *.git) _ns_path="${_ns_path%.git}" ;;
+    esac
+    case "$_ns_path" in
+        */cognilogical/neurostrata|cognilogical/neurostrata)
+            echo "Push blocked by upstream-push guard: remote '${_ns_remote_name}' points at upstream Cognilogical/NeuroStrata (${_ns_remote_url})." >&2
+            echo "Venue rule: nothing is pushed to upstream without Pratik's explicit per-action consent. Push to the fork (pratik-saptarshi/NeuroStrata) instead." >&2
+            exit 1
+            ;;
+    esac
+fi
+unset _ns_remote_name _ns_remote_url _ns_path
+
 command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
@@ -1920,7 +1970,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-# neurostrata-hook-sha256: cb1c385835cfe2ddc026878074e34ea3661674f44d314679c8c85764ef7d70b7
+# neurostrata-hook-sha256: 9def1d7f9f1b07d6d81ba0ca61c7ae4584248f5af93649d48c617cb0a9fd7d77
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -3157,6 +3207,143 @@ mod tests {
     fn foreign_hook_not_ours() {
         assert!(!is_ours_hook("#!/bin/bash\necho hi\n"));
         assert!(!is_current_hook("#!/bin/bash\necho hi\n"));
+    }
+
+    /// Codex P1 on PR #31 (Task 0.2 fix round): hook hygiene rewrites a
+    /// stale NeuroStrata hook with this scaffold, and the shipped
+    /// `scripts/hooks/pre-push` carries no scaffold hash marker — so it
+    /// is always "stale" to hygiene. If the scaffold lacked Guard 1,
+    /// a snapshot with a project root silently stripped the
+    /// upstream-push guard from the installed hook. The scaffold must
+    /// therefore carry the guard itself, ahead of the task gate.
+    #[test]
+    fn scaffolded_pre_push_hook_carries_upstream_guard_before_the_gate() {
+        let hook = SCAFFOLDED_PRE_PUSH_HOOK;
+        let guard = hook
+            .find("*/cognilogical/neurostrata|cognilogical/neurostrata)")
+            .expect("the scaffold must carry Guard 1's upstream path match");
+        assert!(
+            hook.contains("Push blocked by upstream-push guard"),
+            "the scaffold must carry Guard 1's rejection message"
+        );
+        let gate_binary_check = hook
+            .find("command -v neurostrata-mcp")
+            .expect("the scaffold must carry the task gate");
+        let skip_check = hook
+            .find("NEUROSTRATA_SKIP_GATE")
+            .expect("the scaffold must carry the gate's skip check");
+        assert!(
+            guard < gate_binary_check && guard < skip_check,
+            "Guard 1 must run before the task gate and its skip check (it has no skip)"
+        );
+    }
+
+    /// The behavioral half of the same finding: the scaffolded hook, run
+    /// the way git runs it (`pre-push <remote-name> <remote-url>`), must
+    /// reject the upstream remote in its canonical forms — even with the
+    /// task gate stubbed to pass and even with the gate's skip variable
+    /// set — and must let the fork through. Against the pre-fix scaffold
+    /// (no Guard 1) every upstream case exits 0 via the passing stub.
+    #[cfg(unix)]
+    #[test]
+    fn scaffolded_pre_push_hook_rejects_upstream_and_allows_fork() {
+        use std::os::unix::fs::PermissionsExt;
+        if which_bash().is_none() || which_git().is_none() {
+            return; // nothing to smoke-test with
+        }
+        let root = std::env::temp_dir().join(format!("ns-hookguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        // a git project, so `git rev-parse --show-toplevel` resolves
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+
+        let set_exec = |p: &std::path::Path| {
+            let mut perms = std::fs::metadata(p).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(p, perms).unwrap();
+        };
+
+        let hook = root.join("scripts").join("hooks").join("pre-push");
+        std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        set_exec(&hook);
+
+        // stub the gate so it always passes: Guard 1 is the only variable
+        let stub = root.join("bin").join("neurostrata-mcp");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        set_exec(&stub);
+        // stub the one project gate the scaffold wires by default
+        let project_gate = root.join("scripts").join("task-coverage-gate.sh");
+        std::fs::write(&project_gate, "#!/bin/bash\nexit 0\n").unwrap();
+        set_exec(&project_gate);
+
+        let path = format!(
+            "{}:{}",
+            root.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |remote: &str, url: &str, skip_gate: bool| {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("scripts/hooks/pre-push")
+                .arg(remote)
+                .arg(url)
+                .current_dir(&root)
+                .env("PATH", &path)
+                .stdin(std::process::Stdio::null());
+            if skip_gate {
+                cmd.env("NEUROSTRATA_SKIP_GATE", "1");
+            }
+            cmd.output().unwrap()
+        };
+
+        for url in [
+            "https://github.com/Cognilogical/NeuroStrata.git",
+            "git@github.com:Cognilogical/NeuroStrata.git",
+            "ssh://git@github.com/Cognilogical/NeuroStrata",
+            "https://github.com/COGNILOGICAL/NEUROSTRATA.GIT",
+        ] {
+            let out = run("upstream", url, false);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "the scaffolded hook must reject a push to upstream ({})",
+                url
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr)
+                    .contains("Push blocked by upstream-push guard"),
+                "the rejection must come from Guard 1 ({})",
+                url
+            );
+        }
+
+        // Guard 1 has no skip variable: the gate's skip must not bypass it.
+        let skipped = run(
+            "upstream",
+            "https://github.com/Cognilogical/NeuroStrata.git",
+            true,
+        );
+        assert_eq!(
+            skipped.status.code(),
+            Some(1),
+            "NEUROSTRATA_SKIP_GATE=1 must not bypass Guard 1"
+        );
+
+        let fork = run(
+            "origin",
+            "https://github.com/pratik-saptarshi/NeuroStrata.git",
+            false,
+        );
+        assert!(
+            fork.status.success(),
+            "the scaffolded hook must let a fork push through a passing gate"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── the bus, as the completion path sees it ────────────────────────────────
