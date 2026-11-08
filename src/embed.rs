@@ -45,7 +45,7 @@ pub(crate) fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
 }
 
 /// The operator's config directory (`~/.config/neurostrata`).
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     // dirs::home_dir() rather than $HOME: Windows sets USERPROFILE, not HOME, so
     // reading the variable directly sends this to a relative path under whatever
     // directory happened to launch the process. config.rs already resolves it this way.
@@ -109,6 +109,12 @@ pub(crate) fn get_acceptable_embedders_in(config_dir: &Path) -> Result<Vec<Accep
                 "Failed to write default embedder config to {}: {e}",
                 config_path.display()
             );
+        } else {
+            // The default file was just materialized, so a first-run model
+            // choice may still be offered: record it as pending for the
+            // next interactive command. This path runs inside daemon and
+            // serving processes, so it never prompts here.
+            crate::model_choice::record_pending_choice(config_dir);
         }
     }
 

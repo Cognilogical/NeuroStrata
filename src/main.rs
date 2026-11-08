@@ -685,6 +685,45 @@ fn config_db_path() -> Option<String> {
     }
 }
 
+/// Surface a pending first-run embedding-model choice, if materialization
+/// recorded one. Called at interactive dispatch only — the caller has
+/// already excluded the daemon — and the seam re-checks that stdin is a
+/// terminal before anything is presented. Runs before the command
+/// executes, so a pick is persisted before any store creation on its
+/// path. A failure is reported, never fatal to the command.
+fn surface_pending_model_choice() {
+    use std::io::{IsTerminal, Write};
+    let Some(db_path) = config_db_path() else {
+        return;
+    };
+    let interactive = std::io::stdin().is_terminal();
+    let mut responder = |offer: &str| -> Option<usize> {
+        println!("{offer}");
+        print!("Choose a model by number, or press Enter to keep the current default: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return None;
+        }
+        match line.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => Some(n - 1),
+            _ => None,
+        }
+    };
+    match crate::model_choice::surface_pending_choice(
+        &crate::embed::config_dir(),
+        std::path::Path::new(&db_path),
+        interactive,
+        &mut responder,
+    ) {
+        Ok(crate::model_choice::PendingChoiceOutcome::Chosen(name)) => {
+            println!("Embedding model set to {name} for this install.");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("Could not apply the pending embedding-model choice: {e}"),
+    }
+}
+
 /// Where crash breadcrumbs go: a `crash` directory beside the database.
 ///
 /// The database already lives under the user's own config directory, so the
@@ -2890,6 +2929,13 @@ async fn run() -> anyhow::Result<()> {
 
     // Now parse using clap
     if let Some(command) = cli.command {
+        // Deferred embedding-model choice (surface c): materialization
+        // only ever records a pending choice; it is surfaced here, at
+        // interactive dispatch, before the command runs — never on the
+        // daemon/serving path.
+        if !matches!(command, Commands::Daemon) {
+            surface_pending_model_choice();
+        }
         match command {
             Commands::Daemon => {
                 println!("NeuroStrata MCP Server initializing in DAEMON-ONLY mode...");

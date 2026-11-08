@@ -193,6 +193,185 @@ fn write_file_atomically(
     Ok(())
 }
 
+// --- Task A4: deferred setup-time choice (surface c) ---
+//
+// Materialization runs inside daemon/serving processes whose stdin is not
+// a terminal and whose stdout is a log sink or the MCP wire, so it never
+// prompts: it only records a pending choice. The next interactive command
+// surfaces it. The offer itself is a pure rendering of the candidate
+// slice plus the Part 0 coverage, so it is testable without a terminal.
+
+/// The pending-choice marker file, written beside `embedders.json` in the
+/// config directory at materialization time.
+const PENDING_CHOICE_MARKER: &str = "model-choice-pending.json";
+
+fn pending_choice_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(PENDING_CHOICE_MARKER)
+}
+
+/// Record a pending model choice in `config_dir`, unless one is already
+/// recorded. Called from the embedder loader's materialization branch —
+/// the one place the built-in default file is written — so a declined
+/// choice (marker removed, default file now in place) is never recorded
+/// again by later loads. Best-effort: a failed marker write must not fail
+/// the load it rides on.
+pub(crate) fn record_pending_choice(config_dir: &Path) {
+    let marker = pending_choice_path(config_dir);
+    if marker.exists() {
+        return;
+    }
+    let _ = fs::write(&marker, "{\"pending\": \"embedding-model-choice\"}\n");
+}
+
+fn clear_pending_choice(config_dir: &Path) {
+    let _ = fs::remove_file(pending_choice_path(config_dir));
+}
+
+/// Whether the `embedders.json` state in `config_dir` still qualifies for
+/// a first-run offer: the file is absent, an empty list, or exactly the
+/// built-in default. An unparseable file is operator-present — it never
+/// qualifies and is never modified.
+fn embedders_file_qualifies_for_offer(config_dir: &Path) -> bool {
+    let path = config_dir.join("embedders.json");
+    if !path.exists() {
+        return true;
+    }
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<AcceptableEmbedder>>(&content) else {
+        return false;
+    };
+    if entries.is_empty() {
+        return true;
+    }
+    serde_json::to_value(&entries).ok() == serde_json::to_value(default_acceptable_embedders()).ok()
+}
+
+/// The offer condition: no database exists yet, and the embedders file
+/// state qualifies. Re-verified at surfacing time — a database created
+/// since the marker was recorded voids the pending choice.
+fn offer_condition_holds(config_dir: &Path, db_path: &Path) -> bool {
+    !db_path.exists() && embedders_file_qualifies_for_offer(config_dir)
+}
+
+const PERMANENCE_WARNING: &str = "This choice is permanent for this database: the store refuses any other model once data exists. Changing later requires a new database.";
+const NOT_MEASURED_MEMORY_LINE: &str = "Not measured — resident-memory delta unverified.";
+const NOT_MEASURED_QUALITY_LINE: &str = "Not measured — quality delta unverified.";
+/// Task 0e, live-store corpus: 6.08% (18/296) of items exceed 512 tokens;
+/// the measurement's plain-language line rounds that to ~6%.
+const TRUNCATION_PCT_OVER_512: u32 = 6;
+
+/// The resident-memory line for one candidate: Part 0's measured figure
+/// where the candidate was measured end-to-end, the not-measured line
+/// otherwise. A candidate never displays another candidate's numbers.
+fn memory_line(choice: &ModelChoice) -> String {
+    match choice.model_name {
+        // Task 0b: Q after-batch runs 330/332 MiB; FP32 947/938 MiB;
+        // reported saving 606 MiB.
+        "NomicEmbedTextV15Q" => "Measured: resident memory after a batch was 330/332 MiB, a measured saving of 606 MiB against the FP32 default's 947/938 MiB (Part 0, Task 0b).".to_string(),
+        _ => NOT_MEASURED_MEMORY_LINE.to_string(),
+    }
+}
+
+/// The quality line for one candidate, same coverage rule as
+/// [`memory_line`].
+fn quality_line(choice: &ModelChoice) -> String {
+    match choice.model_name {
+        // Task 0c: Probe A overlap 0.873333, mean cosine 0.948251;
+        // Probe B recall 23/30 against FP32's 22/30.
+        "NomicEmbedTextV15Q" => "Measured: Probe A top-5 overlap with the FP32 default was 0.873 (mean cosine 0.948); Probe B recall was 23/30 against the FP32 default's 22/30 (Part 0, Task 0c).".to_string(),
+        // Task 0c: Probe A overlap 0.666667; no resident-memory measurement.
+        "BGESmallENV15Q" => {
+            "Measured: Probe A top-5 overlap with the FP32 default was 0.667 (Part 0, Task 0c)."
+                .to_string()
+        }
+        _ => NOT_MEASURED_QUALITY_LINE.to_string(),
+    }
+}
+
+/// Render the offer for `offered` (the Decision Gate's Top 3 slice of
+/// [`candidates()`]). Pure: the same slice always renders the same text.
+pub(crate) fn render_offer(offered: &[ModelChoice]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "This install has not stored any data yet, so its embedding model can still be chosen.\n",
+    );
+    for (index, choice) in offered.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}\n", index + 1, choice.model_name));
+        out.push_str(&format!(
+            "   File size: {:.1} MiB\n",
+            choice.file_bytes as f64 / 1_048_576.0
+        ));
+        out.push_str(&format!("   {}\n", choice.note));
+        out.push_str(&format!("   Memory: {}\n", memory_line(choice)));
+        out.push_str(&format!("   Quality: {}\n", quality_line(choice)));
+        out.push_str(&format!("   {PERMANENCE_WARNING}\n"));
+        if choice.max_tokens <= 512 {
+            out.push_str(&format!(
+                "   This model's context is 512 tokens. About {TRUNCATION_PCT_OVER_512}% of the items in a measured reference store exceed that and would be embedded truncated — silently, and permanently for those items.\n"
+            ));
+        }
+    }
+    out
+}
+
+/// What a surfacing attempt did with a pending choice.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PendingChoiceOutcome {
+    /// No marker: nothing was pending.
+    NoMarker,
+    /// A marker exists but this invocation is not interactive; the marker
+    /// is left for a later interactive command.
+    NotInteractive,
+    /// The offer condition no longer holds (a database exists, or the
+    /// file state is locked); the marker is removed, nothing is offered.
+    Voided,
+    /// The user declined; the marker is removed and the install is not
+    /// asked again.
+    Declined,
+    /// The user picked a model; it was persisted via
+    /// [`write_initial_embedders_file`] and the marker removed.
+    Chosen(&'static str),
+}
+
+/// Surface a pending model choice at an interactive command, before the
+/// command executes (and therefore before any store creation on its
+/// path). `responder` receives the rendered offer and returns the picked
+/// index, or `None` to decline. A failed persist propagates and leaves
+/// the marker in place, so the choice is not lost.
+pub(crate) fn surface_pending_choice(
+    config_dir: &Path,
+    db_path: &Path,
+    stdin_is_terminal: bool,
+    responder: &mut dyn FnMut(&str) -> Option<usize>,
+) -> anyhow::Result<PendingChoiceOutcome> {
+    if !pending_choice_path(config_dir).exists() {
+        return Ok(PendingChoiceOutcome::NoMarker);
+    }
+    if !stdin_is_terminal {
+        return Ok(PendingChoiceOutcome::NotInteractive);
+    }
+    if !offer_condition_holds(config_dir, db_path) {
+        clear_pending_choice(config_dir);
+        return Ok(PendingChoiceOutcome::Voided);
+    }
+    let offered = &candidates()[..3];
+    let rendered = render_offer(offered);
+    match responder(&rendered) {
+        Some(index) if index < offered.len() => {
+            let choice = &offered[index];
+            write_initial_embedders_file(config_dir, choice, db_path)?;
+            clear_pending_choice(config_dir);
+            Ok(PendingChoiceOutcome::Chosen(choice.model_name))
+        }
+        _ => {
+            clear_pending_choice(config_dir);
+            Ok(PendingChoiceOutcome::Declined)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +613,252 @@ mod tests {
             serde_json::from_str("[{\"model_name\":\"X\",\"dimensions\":1}]").expect("parse");
         assert_eq!(parsed[0].model_name, "X");
         assert!(parsed[0].model_sha256.is_none());
+    }
+
+    // --- Task A4: deferred setup-time choice (surface c) ---
+
+    fn write_default_file(config_dir: &Path) {
+        let default_json =
+            serde_json::to_string_pretty(&default_acceptable_embedders()).expect("serialize");
+        fs::write(config_dir.join("embedders.json"), &default_json).expect("write default file");
+    }
+
+    #[test]
+    fn setup_never_offers_choice_when_db_exists() {
+        let (tmp, config_dir) = fresh_config_dir("a4-db-exists");
+        write_default_file(&config_dir);
+        record_pending_choice(&config_dir);
+        assert!(pending_choice_path(&config_dir).exists());
+        let db_path = tmp.path().join("neurostrata.db");
+        fs::write(&db_path, b"").expect("create db file");
+        let called = std::cell::Cell::new(false);
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            called.set(true);
+            Some(0)
+        })
+        .expect("surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Voided);
+        assert!(
+            !called.get(),
+            "no offer may be presented when a database exists"
+        );
+        assert!(
+            !pending_choice_path(&config_dir).exists(),
+            "a voided pending choice removes its marker"
+        );
+    }
+
+    #[test]
+    fn setup_offers_choice_when_only_default_file_exists() {
+        let (tmp, config_dir) = fresh_config_dir("a4-default-only");
+        write_default_file(&config_dir);
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        let mut seen_offer = String::new();
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |offer| {
+            seen_offer = offer.to_string();
+            Some(1)
+        })
+        .expect("surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Chosen("BGESmallENV15Q"));
+        assert!(seen_offer.contains("BGESmallENV15Q"));
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the pick");
+        assert_eq!(entries[0].model_name, "BGESmallENV15Q");
+        assert!(
+            !pending_choice_path(&config_dir).exists(),
+            "a completed pick clears the marker"
+        );
+    }
+
+    #[test]
+    fn setup_never_offers_choice_when_file_unparseable() {
+        let (tmp, config_dir) = fresh_config_dir("a4-unparseable");
+        let target = config_dir.join("embedders.json");
+        fs::write(&target, "{not json").expect("write unparseable file");
+        let before = fs::read(&target).expect("read file");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        let called = std::cell::Cell::new(false);
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            called.set(true);
+            Some(0)
+        })
+        .expect("surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Voided);
+        assert!(
+            !called.get(),
+            "an unparseable file is operator-present: never offered"
+        );
+        assert_eq!(
+            fs::read(&target).expect("re-read file"),
+            before,
+            "an unparseable file is never modified"
+        );
+        assert!(!pending_choice_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn setup_rerun_preserves_chosen_model() {
+        let (tmp, config_dir) = fresh_config_dir("a4-rerun");
+        write_default_file(&config_dir);
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(2))
+            .expect("first surface");
+        assert_eq!(
+            outcome,
+            PendingChoiceOutcome::Chosen("SnowflakeArcticEmbedMQ")
+        );
+        let target = config_dir.join("embedders.json");
+        let after_pick = fs::read(&target).expect("read picked file");
+        // A later interactive command finds no marker and changes nothing;
+        // the chosen file is non-default, so the install is locked.
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(0))
+            .expect("rerun surface");
+        assert_eq!(outcome, PendingChoiceOutcome::NoMarker);
+        assert_eq!(
+            fs::read(&target).expect("re-read file"),
+            after_pick,
+            "a rerun must preserve the chosen model file byte-identically"
+        );
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the pick");
+        assert_eq!(entries[0].model_name, "SnowflakeArcticEmbedMQ");
+    }
+
+    #[test]
+    fn setup_failure_leaves_no_partial_config() {
+        let (tmp, config_dir) = fresh_config_dir("a4-failure");
+        write_default_file(&config_dir);
+        let target = config_dir.join("embedders.json");
+        let before = fs::read(&target).expect("read default file");
+        record_pending_choice(&config_dir);
+        // Sabotage the writer's temp path (the A3 seam's documented name) so
+        // the persist fails after staging begins.
+        let tmp_blocker = config_dir.join(format!(".embedders.json.tmp-{}", std::process::id()));
+        fs::create_dir(&tmp_blocker).expect("create temp blocker dir");
+        let db_path = tmp.path().join("neurostrata.db");
+        let result = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(0));
+        assert!(result.is_err(), "a failed persist must surface as an error");
+        assert_eq!(
+            fs::read(&target).expect("re-read file"),
+            before,
+            "a failed persist leaves the complete previous file, never a partial one"
+        );
+    }
+
+    #[test]
+    fn setup_presents_not_measured_lines_for_unmeasured_candidates() {
+        let top3 = &candidates()[..3];
+        let arctic = render_offer(&top3[2..3]);
+        assert!(
+            arctic.contains("Not measured — resident-memory delta unverified."),
+            "an unmeasured candidate carries the memory line verbatim"
+        );
+        assert!(
+            arctic.contains("Not measured — quality delta unverified."),
+            "an unmeasured candidate carries the quality line verbatim"
+        );
+        let bge = render_offer(&top3[1..2]);
+        assert!(bge.contains("Not measured — resident-memory delta unverified."));
+        assert!(
+            !bge.contains("Not measured — quality delta unverified."),
+            "BGESmallENV15Q has a measured quality line, so it must not carry the quality disclaimer"
+        );
+        assert!(
+            bge.contains("0.667"),
+            "BGESmallENV15Q shows its measured overlap"
+        );
+        let nomic = render_offer(&top3[0..1]);
+        assert!(
+            !nomic.contains("Not measured —"),
+            "the end-to-end measured candidate carries neither disclaimer"
+        );
+        assert!(
+            nomic.contains("606"),
+            "NomicEmbedTextV15Q shows its measured saving"
+        );
+        assert!(
+            nomic.contains("0.873"),
+            "NomicEmbedTextV15Q shows its measured overlap"
+        );
+        // Warning copy, split by context class, with the Task 0e figure.
+        assert!(bge.contains("This model's context is 512 tokens. About 6% of the items"));
+        assert!(arctic.contains("This model's context is 512 tokens. About 6% of the items"));
+        assert!(
+            !nomic.contains("This model's context is 512 tokens"),
+            "a full-context candidate shows no truncation warning"
+        );
+        for candidate in top3 {
+            assert!(
+                render_offer(std::slice::from_ref(candidate)).contains(
+                    "This choice is permanent for this database: the store refuses any other model once data exists. Changing later requires a new database."
+                ),
+                "every candidate shows the permanence warning verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn materialization_without_terminal_records_pending_choice() {
+        let (_tmp, config_dir) = fresh_config_dir("a4-materialize");
+        // Drive the loader the way any daemon/serving path does: no terminal,
+        // no responder exists on this path, and no prompt can be attempted.
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader materializes");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model_name, "NomicEmbedTextV15");
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(config_dir.join("embedders.json")).expect("read"),
+        )
+        .expect("written file is a JSON array");
+        assert_eq!(
+            on_disk,
+            serde_json::to_value(default_acceptable_embedders()).expect("serialize default"),
+            "materialization writes today's default file exactly; no choice is written"
+        );
+        assert!(
+            pending_choice_path(&config_dir).exists(),
+            "materialization records the pending choice for the next interactive command"
+        );
+        let _ = get_acceptable_embedders_in(&config_dir).expect("second load");
+        assert!(pending_choice_path(&config_dir).exists());
+    }
+
+    #[test]
+    fn pending_choice_surfaces_at_next_interactive_command() {
+        let (tmp, config_dir) = fresh_config_dir("a4-surface");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        // A non-interactive invocation leaves the marker for a later one.
+        let outcome = surface_pending_choice(&config_dir, &db_path, false, &mut |_| Some(0))
+            .expect("non-interactive surface");
+        assert_eq!(outcome, PendingChoiceOutcome::NotInteractive);
+        assert!(pending_choice_path(&config_dir).exists());
+        // The next interactive command presents the choice; a pick persists
+        // via the writer and clears the marker.
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| Some(0))
+            .expect("interactive surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Chosen("NomicEmbedTextV15Q"));
+        let entries = get_acceptable_embedders_in(&config_dir).expect("loader reads the pick");
+        assert_eq!(entries[0].model_name, "NomicEmbedTextV15Q");
+        assert!(!pending_choice_path(&config_dir).exists());
+
+        // Variant: a database created in the interim voids the pending choice.
+        let (tmp, config_dir) = fresh_config_dir("a4-surface-void");
+        record_pending_choice(&config_dir);
+        let db_path = tmp.path().join("neurostrata.db");
+        fs::write(&db_path, b"").expect("create db in the interim");
+        let called = std::cell::Cell::new(false);
+        let outcome = surface_pending_choice(&config_dir, &db_path, true, &mut |_| {
+            called.set(true);
+            Some(0)
+        })
+        .expect("voided surface");
+        assert_eq!(outcome, PendingChoiceOutcome::Voided);
+        assert!(!called.get(), "a voided choice is never presented");
+        assert!(
+            !config_dir.join("embedders.json").exists(),
+            "a voided choice writes nothing"
+        );
+        assert!(!pending_choice_path(&config_dir).exists());
     }
 }
