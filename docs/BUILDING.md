@@ -143,7 +143,7 @@ cargo install --path . --force --locked
 
 `--locked` is the important one. Without it `cargo install` ignores `Cargo.lock`
 and re-resolves dependencies, which picks up whatever newer `lbug` has been
-published -- installing a release newer than the 0.20.4 the lockfile pins. That
+published -- installing a release newer than the 0.22.3 the lockfile pins. That
 silently swaps the storage engine underneath an existing database. The pin is
 deliberate: WAL behaviour is governed by `strict_wal_verification()` in
 `src/store/ladybug.rs`, which refuses an unauthenticated WAL by default
