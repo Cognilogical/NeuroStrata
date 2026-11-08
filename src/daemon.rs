@@ -1682,7 +1682,7 @@ async fn handle_tasks_gate(
 mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicPulse};
-    use crate::test_support::ENV_LOCK;
+    use crate::test_support::{ENV_LOCK, TOKEN_FILE_TEST_LOCK};
     use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult};
     use async_trait::async_trait;
     use std::time::{Duration, Instant};
@@ -2163,6 +2163,12 @@ impl crate::traits::AsAny for RecordingStore {
     /// daemon.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_bus_is_live_before_the_first_request() {
+        // This test spawns its daemon directly rather than through the
+        // helpers, so it takes the credential lock itself: startup
+        // creates the token files and the test rereads them below. The
+        // guard is bound for the whole body, so it drops only after
+        // the daemon task has finished at the end.
+        let _credential_guard = credential_test_lock();
         // An ephemeral port, and the full production startup sequence: the
         // machine's live daemon owns 34343, and a test must never contend
         // with it.
@@ -2252,17 +2258,34 @@ impl crate::traits::AsAny for RecordingStore {
         daemon.await.unwrap().unwrap();
     }
 
+    /// The crate-wide credential lock (see `crate::test_support`),
+    /// taken by the spawn helpers below before the daemon starts —
+    /// startup creates the token files — and handed to the matching
+    /// stop helper, which drops it once the daemon task has finished:
+    /// shutdown rereads the files, so the span the lock covers is the
+    /// daemon's whole life, not just its start.
+    fn credential_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TOKEN_FILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The daemon on an ephemeral port, and a client that has waited until it
     /// answers. An ephemeral port because the machine's live daemon owns
     /// 34343, and the full production startup sequence so the routes under test
-    /// are the ones production registers.
+    /// are the ones production registers. The fourth element is the
+    /// credential lock guard: hand it to `stop_test_daemon`, or — if
+    /// the test stops its daemon by hand — drop it only after the
+    /// daemon task has finished.
     async fn spawn_test_daemon_with(
         store: Arc<RecordingStore>,
     ) -> (
         String,
         reqwest::Client,
         tokio::task::JoinHandle<anyhow::Result<()>>,
+        std::sync::MutexGuard<'static, ()>,
     ) {
+        let credential_guard = credential_test_lock();
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap().to_string();
         drop(probe);
@@ -2329,13 +2352,14 @@ impl crate::traits::AsAny for RecordingStore {
         }
         let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
 
-        (base, client, daemon)
+        (base, client, daemon, credential_guard)
     }
 
     async fn spawn_test_daemon() -> (
         String,
         reqwest::Client,
         tokio::task::JoinHandle<anyhow::Result<()>>,
+        std::sync::MutexGuard<'static, ()>,
     ) {
         spawn_test_daemon_with(Arc::new(RecordingStore::default())).await
     }
@@ -2363,9 +2387,13 @@ impl crate::traits::AsAny for RecordingStore {
     /// bearer + operator headers on /shutdown, then require the task to
     /// finish. (Against a daemon without the operator tier the extra header
     /// is ignored, so the same cleanup works on both sides of the change.)
+    /// The credential guard is dropped only after the task finishes —
+    /// the /shutdown above rereads the token files, so the span the
+    /// lock covers ends at the join, not at the post.
     async fn stop_test_daemon(
         base: &str,
         daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
+        credential_guard: std::sync::MutexGuard<'static, ()>,
     ) {
         let client = bare_client();
         let _ = client
@@ -2375,13 +2403,14 @@ impl crate::traits::AsAny for RecordingStore {
             .send()
             .await;
         daemon.await.unwrap().unwrap();
+        drop(credential_guard);
     }
 
     /// Task 1: no credential at all is a 401 on authenticated routes --
     /// a representative read route and /mcp, the product's primary surface.
     #[tokio::test(flavor = "multi_thread")]
     async fn request_without_token_is_401() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let info = client.get(format!("{base}/info")).send().await.unwrap();
@@ -2395,14 +2424,14 @@ impl crate::traits::AsAny for RecordingStore {
             .unwrap();
         assert_eq!(mcp.status(), axum::http::StatusCode::UNAUTHORIZED);
 
-        stop_test_daemon(&base, daemon).await;
+        stop_test_daemon(&base, daemon, credential_guard).await;
     }
 
     /// Task 1: a wrong credential is the same 401 as none -- the refusal
     /// must not distinguish "no token" from "wrong token".
     #[tokio::test(flavor = "multi_thread")]
     async fn request_with_wrong_token_is_401() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let info = client
@@ -2413,7 +2442,7 @@ impl crate::traits::AsAny for RecordingStore {
             .unwrap();
         assert_eq!(info.status(), axum::http::StatusCode::UNAUTHORIZED);
 
-        stop_test_daemon(&base, daemon).await;
+        stop_test_daemon(&base, daemon, credential_guard).await;
     }
 
     /// Task 1 (DR-5): the destructive routes refuse a bearer-only caller
@@ -2423,7 +2452,7 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn destructive_routes_require_the_operator_token() {
         let store = Arc::new(RecordingStore::holding("trust-test", "m1", "fact"));
-        let (base, _authed, daemon) = spawn_test_daemon_with(store).await;
+        let (base, _authed, daemon, credential_guard) = spawn_test_daemon_with(store).await;
         let client = bare_client();
         let daemon_token = token_file("daemon.token");
         let operator_token = token_file("operator.token");
@@ -2477,7 +2506,7 @@ impl crate::traits::AsAny for RecordingStore {
             "bearer + operator must delete"
         );
 
-        stop_test_daemon(&base, daemon).await;
+        stop_test_daemon(&base, daemon, credential_guard).await;
     }
 
     /// Task 1: the DNS-rebinding leg. A request whose Host is not loopback
@@ -2487,7 +2516,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// passes.
     #[tokio::test(flavor = "multi_thread")]
     async fn hostile_host_and_origin_are_403_even_with_a_valid_token() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
         let daemon_token = token_file("daemon.token");
 
@@ -2523,7 +2552,7 @@ impl crate::traits::AsAny for RecordingStore {
             "a loopback Origin is a local tool, not a rebinding page"
         );
 
-        stop_test_daemon(&base, daemon).await;
+        stop_test_daemon(&base, daemon, credential_guard).await;
     }
 
     /// Task 1: /health stays unauthenticated -- liveness probes (the
@@ -2531,7 +2560,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// liveness ONLY: status 200, body exactly "ok", no version, no data.
     #[tokio::test(flavor = "multi_thread")]
     async fn health_is_open_and_minimal() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let health = client.get(format!("{base}/health")).send().await.unwrap();
@@ -2549,7 +2578,7 @@ impl crate::traits::AsAny for RecordingStore {
             .unwrap();
         assert_eq!(hostile_host.status(), axum::http::StatusCode::FORBIDDEN);
 
-        stop_test_daemon(&base, daemon).await;
+        stop_test_daemon(&base, daemon, credential_guard).await;
     }
 
     /// Task 1: both token files exist with owner-only permissions. The
@@ -2560,7 +2589,7 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn token_files_have_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, credential_guard) = spawn_test_daemon().await;
         let home = dirs::home_dir().unwrap_or_default();
         for name in ["daemon.token", "operator.token"] {
             let path = home.join(".config").join("neurostrata").join(name);
@@ -2572,7 +2601,7 @@ impl crate::traits::AsAny for RecordingStore {
                 "{name} must be mode 0600"
             );
         }
-        stop_test_daemon(&base, daemon).await;
+        stop_test_daemon(&base, daemon, credential_guard).await;
     }
 
     /// `POST /memory/archive` must reach the one handler the MCP tool surface
@@ -2590,7 +2619,7 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_archive_route_delegates_to_the_handler_the_tool_also_calls() {
         let store = Arc::new(RecordingStore::holding("bus-test", "m1", "fact"));
-        let (base, client, daemon) = spawn_test_daemon_with(store.clone()).await;
+        let (base, client, daemon, credential_guard) = spawn_test_daemon_with(store.clone()).await;
 
         let missing = client
             .post(format!("{base}/memory/archive"))
@@ -2663,6 +2692,7 @@ impl crate::traits::AsAny for RecordingStore {
             .await
             .unwrap();
         daemon.await.unwrap().unwrap();
+        drop(credential_guard);
     }
 
     /// `POST /bus/metrics` and `neurostrata-mcp bus-metrics` must be the same
@@ -2672,7 +2702,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// assert that two different buses report different subscriber counts.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_bus_metrics_route_answers_in_the_shared_handlers_shape() {
-        let (base, client, daemon) = spawn_test_daemon().await;
+        let (base, client, daemon, credential_guard) = spawn_test_daemon().await;
 
         let response = client
             .post(format!("{base}/bus/metrics"))
@@ -2719,6 +2749,7 @@ impl crate::traits::AsAny for RecordingStore {
             .await
             .unwrap();
         daemon.await.unwrap().unwrap();
+        drop(credential_guard);
     }
 
     #[tokio::test]
@@ -2786,7 +2817,14 @@ impl crate::traits::AsAny for RecordingStore {
         String,
         reqwest::Client,
         tokio::task::JoinHandle<anyhow::Result<()>>,
+        std::sync::MutexGuard<'static, ()>,
     ) {
+        // The credential lock, taken before the spawn like the other
+        // spawn helper's: startup creates the token files and this
+        // helper rereads them for the client. Hand the guard to
+        // `stop_daemon`. (Callers already hold ENV_LOCK for the env
+        // var set below, so the order is ENV before TOKEN everywhere.)
+        let credential_guard = credential_test_lock();
         std::env::set_var(PROJECT_ROOT_ENV, root);
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap().to_string();
@@ -2834,13 +2872,14 @@ impl crate::traits::AsAny for RecordingStore {
             .default_headers(headers)
             .build()
             .unwrap();
-        (base, client, daemon)
+        (base, client, daemon, credential_guard)
     }
 
     async fn stop_daemon(
         client: &reqwest::Client,
         base: &str,
         daemon: tokio::task::JoinHandle<anyhow::Result<()>>,
+        credential_guard: std::sync::MutexGuard<'static, ()>,
     ) {
         client
             .post(format!("{base}/shutdown"))
@@ -2848,6 +2887,7 @@ impl crate::traits::AsAny for RecordingStore {
             .await
             .unwrap();
         daemon.await.unwrap().unwrap();
+        drop(credential_guard);
     }
 
     /// A scratch directory holding one parseable source file, so an ingest
@@ -2871,7 +2911,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_root("t2r-backup-outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/backup"))
@@ -2893,7 +2933,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file pin: a backup destination inside the served root
@@ -2903,7 +2943,7 @@ impl crate::traits::AsAny for RecordingStore {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-backup-inside-root");
         std::fs::create_dir_all(&root).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
         let dest = root.join("snapshots");
         let res = client
             .post(format!("{base}/backup"))
@@ -2917,7 +2957,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("Backed up to"),
             "the handler's own answer: {body}"
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file (J6): a backup destination spelled with `..` that
@@ -2930,7 +2970,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_root("t2r-dotdot-outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
 
         // Both scratch dirs sit directly under the temp dir, so
         // `<root>/../<outside-name>` canonicalizes onto the outside dir.
@@ -2955,7 +2995,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file (J6, Review Focus #4): a symlink planted inside the
@@ -2970,7 +3010,7 @@ impl crate::traits::AsAny for RecordingStore {
         let outside = scratch_root("t2r-backup-link-target");
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
         let res = client
             .post(format!("{base}/backup"))
             .json(&serde_json::json!({ "dir": root.join("escape").display().to_string() }))
@@ -2982,7 +3022,7 @@ impl crate::traits::AsAny for RecordingStore {
             axum::http::StatusCode::FORBIDDEN,
             "the canonical target governs, not the spelling inside the root"
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file (J6): an ingest directory outside the served root is
@@ -2995,7 +3035,7 @@ impl crate::traits::AsAny for RecordingStore {
         let root = scratch_root("t2r-ingest-root");
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_tree("t2r-ingest-outside");
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/ingest"))
@@ -3020,7 +3060,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file pin: an ingest tree inside the served root is walked
@@ -3032,7 +3072,7 @@ impl crate::traits::AsAny for RecordingStore {
         let tree = root.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/ingest"))
@@ -3049,7 +3089,7 @@ impl crate::traits::AsAny for RecordingStore {
             "an in-root ingest proceeds: {}",
             res.text().await.unwrap()
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file (J6, the /export-graph leg): R22 added this route
@@ -3064,7 +3104,7 @@ impl crate::traits::AsAny for RecordingStore {
         let outside = scratch_root("t2r-export-outside");
         std::fs::create_dir_all(&outside).unwrap();
         let target = outside.join("graph.json");
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
@@ -3087,7 +3127,7 @@ impl crate::traits::AsAny for RecordingStore {
             "a refused export writes nothing: {} must not exist",
             target.display()
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file pin: an export target inside the served root is
@@ -3098,7 +3138,7 @@ impl crate::traits::AsAny for RecordingStore {
         let root = scratch_root("t2r-export-inside-root");
         std::fs::create_dir_all(&root).unwrap();
         let target = root.join("graph.json");
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
@@ -3117,7 +3157,7 @@ impl crate::traits::AsAny for RecordingStore {
             "the export lands at the in-root target: {}",
             target.display()
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file (J6): a beads file outside the served root is
@@ -3131,7 +3171,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&outside).unwrap();
         let beads = outside.join("issues.jsonl");
         std::fs::write(&beads, "this is not a beads file\n").unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/tasks/import"))
@@ -3152,7 +3192,7 @@ impl crate::traits::AsAny for RecordingStore {
             body.contains("allowed_external_dirs"),
             "the refusal names the config key that changes the policy: {body}"
         );
-        stop_daemon(&client, &base, daemon).await;
+        stop_daemon(&client, &base, daemon, credential_guard).await;
     }
 
     /// Task 2 re-file (J6), unit leg: a not-yet-existing destination

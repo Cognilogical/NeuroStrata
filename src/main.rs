@@ -4316,11 +4316,11 @@ async fn run() -> anyhow::Result<()> {
             // Wait for daemon to become ready. Bounded per attempt as well as
             // overall: an unbound port on this machine hangs rather than
             // refusing -- the behaviour DaemonProbe exists to describe -- so an
-            // untimed send here could spend the whole "30 seconds max" inside
+            // untimed send here could spend the whole "20 seconds max" inside
             // one call.
             let client = daemon_http_client();
-            for _ in 0..300 {
-                // 30 seconds max
+            for _ in 0..200 {
+                // 20 seconds max
                 if client
                     .get("http://127.0.0.1:34343/health")
                     .timeout(std::time::Duration::from_millis(500))
@@ -4335,7 +4335,7 @@ async fn run() -> anyhow::Result<()> {
 
             // Deliberately not conditional on that loop having succeeded. A
             // first run downloads the embedding model and takes far longer than
-            // 30s, and the proxy is told where the daemon came from so it waits
+            // 20s, and the proxy is told where the daemon came from so it waits
             // rather than reporting a daemon it started itself as absent.
             server::start_mcp_proxy(server::DaemonOrigin::SpawnedByUs).await?;
             return Ok(());
