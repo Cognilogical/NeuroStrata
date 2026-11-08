@@ -2957,10 +2957,13 @@ async fn run() -> anyhow::Result<()> {
                     tracing::debug!("DAEMON_LOCK was already initialized");
                 }
                 let embedder = build_embedder()?;
-                let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                    config.db_path.to_string_lossy().to_string(),
-                    embedder.dimensions(),
-                )?);
+                let vector_store: Arc<dyn VectorStore> = Arc::new(
+                    LadybugStore::new(
+                        config.db_path.to_string_lossy().to_string(),
+                        embedder.dimensions(),
+                    )?
+                    .with_serving_descriptor(Some(embedder.embedding_descriptor())),
+                );
                 vector_store.init("global").await?;
                 let outcome = daemon::start_daemon(
                     embedder,
@@ -3685,10 +3688,13 @@ async fn run() -> anyhow::Result<()> {
                             std::process::exit(1);
                         }
                         let embedder = build_embedder()?;
-                        let vector_store: Arc<dyn VectorStore> = Arc::new(LadybugStore::new(
-                            config.db_path.to_string_lossy().to_string(),
-                            embed::configured_dimensions()?,
-                        )?);
+                        let vector_store: Arc<dyn VectorStore> = Arc::new(
+                            LadybugStore::new(
+                                config.db_path.to_string_lossy().to_string(),
+                                embed::configured_dimensions()?,
+                            )?
+                            .with_serving_descriptor(Some(embedder.embedding_descriptor())),
+                        );
                         let res = match crate::task::import_beads(
                             vector_store.clone(),
                             embedder.clone(),
