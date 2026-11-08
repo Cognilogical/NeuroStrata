@@ -39,6 +39,7 @@ mod registry;
 mod search;
 mod secrets;
 mod server;
+mod model_choice;
 mod setup;
 mod source_context;
 mod storage;
