@@ -77,12 +77,54 @@ impl SemanticEvaluator {
         // applies its own rule filter below (the `guard_rule` metadata
         // fields), so a change to the store's contract cannot silently change
         // which rules the guard is able to see.
-        let search_results = self
+        let mut combined = self
             .store
-            .search(&self.namespace, vector, limit, true, true)
+            .search(&self.namespace, vector.clone(), limit, true, true)
             .await?;
 
-        let rules = rules_from_rows(search_results);
+        let mut seen_ids: std::collections::HashSet<String> =
+            combined.iter().map(|r| r.id.clone()).collect();
+
+        if let Ok(listed) = self
+            .store
+            .list(&self.namespace, None, Some("guard_rule"))
+            .await
+        {
+            for mut row in listed {
+                if seen_ids.insert(row.id.clone()) {
+                    row.score = row.score.max(1.0);
+                    combined.push(row);
+                }
+            }
+        }
+
+        if self.namespace != "global" {
+            if let Ok(global_listed) = self
+                .store
+                .list("global", None, Some("guard_rule"))
+                .await
+            {
+                for mut row in global_listed {
+                    if seen_ids.insert(row.id.clone()) {
+                        row.score = row.score.max(1.0);
+                        combined.push(row);
+                    }
+                }
+            }
+            if let Ok(global_search) = self
+                .store
+                .search("global", vector, limit, true, true)
+                .await
+            {
+                for row in global_search {
+                    if seen_ids.insert(row.id.clone()) {
+                        combined.push(row);
+                    }
+                }
+            }
+        }
+
+        let rules = rules_from_rows(combined);
 
         Ok(rules)
     }
@@ -103,11 +145,19 @@ impl SemanticEvaluator {
     /// back with the vector it already had: the rule keeps its embedding and
     /// its identity, and only the counter moves.
     pub async fn increment_hit_count(&self, rule_id: &str) -> Result<()> {
-        let Some((vector, mut payload)) = self.store.get(&self.namespace, rule_id).await? else {
-            // The rule is gone. There is nothing left to count, and inventing
-            // a row for a rule that no longer exists would resurrect it.
-            return Ok(());
-        };
+        let (target_ns, vector, mut payload) =
+            if let Some((v, p)) = self.store.get(&self.namespace, rule_id).await? {
+                (self.namespace.as_str(), v, p)
+            } else if self.namespace != "global" {
+                let Some((v, p)) = self.store.get("global", rule_id).await? else {
+                    return Ok(());
+                };
+                ("global", v, p)
+            } else {
+                // The rule is gone. There is nothing left to count, and inventing
+                // a row for a rule that no longer exists would resurrect it.
+                return Ok(());
+            };
 
         if !payload.metadata.is_object() {
             anyhow::bail!("rule {rule_id} carries metadata that is not an object");
@@ -121,7 +171,7 @@ impl SemanticEvaluator {
         payload.metadata["hit_count"] = serde_json::json!(hits + 1);
 
         self.store
-            .upsert(&self.namespace, rule_id, vector, payload)
+            .upsert(target_ns, rule_id, vector, payload)
             .await
             .context("Failed to record the rule hit")?;
 

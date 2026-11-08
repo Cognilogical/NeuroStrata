@@ -251,7 +251,7 @@ describe("findProjectRoot / discoverProjectNamespace", () => {
 
   it("discoverProjectNamespace falls back to directory basename", () => {
     const dir = join(tmpRoot, "no-ns-dir");
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(join(dir, ".git"), { recursive: true });
     assert.equal(discoverProjectNamespace(dir), "no-ns-dir");
   });
 });
@@ -2243,6 +2243,60 @@ describe("sessionContextHandler bridge formatting (no [object Object])", () => {
       await sessionContextHandler(ev, config);
       const ctx = ev.additionalContext ?? "";
       assert.ok(!ctx.includes("[NeuroStrata Conceptual Bridges]"), "no bridges section when absent");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+  });
+
+  it("injects golden_rules from active_session.json both before and after a task is claimed", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-golden-"));
+    const nsDir = join(tmpDir, ".NeuroStrata");
+    mkdirSync(nsDir, { recursive: true });
+    writeFileSync(
+      join(nsDir, "active_session.json"),
+      JSON.stringify({
+        namespace: "NeuroStrata",
+        golden_rules: [
+          "[rule] bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8: RULE: The user has a strong preference AGAINST using Python.",
+        ],
+      }),
+    );
+    try {
+      const config = {
+        projectRoot: tmpDir,
+        namespace: "NeuroStrata",
+        intentDetection: { enabled: false, injectReminder: false },
+      };
+      const evPreClaim = { sessionID: "ses-golden-pre" };
+      await sessionContextHandler(evPreClaim, config);
+      const preCtx = evPreClaim.additionalContext ?? "";
+      assert.ok(
+        preCtx.includes("[NeuroStrata Golden Rules — ALWAYS ENFORCED]"),
+        `expected Golden Rules header before claim, got: ${preCtx}`,
+      );
+      assert.ok(
+        preCtx.includes("AGAINST using Python"),
+        `expected NO PYTHON rule before claim, got: ${preCtx}`,
+      );
+
+      writeFileSync(
+        join(nsDir, "active_session.json"),
+        JSON.stringify({
+          namespace: "NeuroStrata",
+          task_id: "neurostrata-0wle",
+          status: "in_progress",
+          golden_rules: [
+            "[rule] bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8: RULE: The user has a strong preference AGAINST using Python.",
+          ],
+        }),
+      );
+      const evClaimed = { sessionID: "ses-golden-claimed" };
+      await sessionContextHandler(evClaimed, config);
+      const claimedCtx = evClaimed.additionalContext ?? "";
+      assert.ok(claimedCtx.includes("[NeuroStrata Active Context]"));
+      assert.ok(claimedCtx.includes("[NeuroStrata Golden Rules — ALWAYS ENFORCED]"));
+      assert.ok(claimedCtx.includes("AGAINST using Python"));
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
       resetClientForTesting();

@@ -295,15 +295,16 @@ impl VectorStore for MockStore {
         Ok(0)
     }
 
-    async fn list(&self, namespace: &str, user_id: Option<&str>, _memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
+    async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()
             .filter(|r| r.namespace == namespace)
             .filter(|r| user_id.map(|u| r.payload.user_id == u).unwrap_or(true))
+            .filter(|r| memory_type.map(|mt| r.payload.memory_type == mt).unwrap_or(true))
             .map(|r| SearchResult {
                 id: r.id.clone(),
-                score: 1.0,
+                score: 0.0,
                 payload: r.payload.clone(),
                 evidence: None,
             })

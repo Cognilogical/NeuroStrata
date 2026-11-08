@@ -410,6 +410,208 @@ fn is_structural_memory(memory_type: &str) -> bool {
     STRUCTURAL_MEMORY_TYPES.contains(&memory_type)
 }
 
+/// True when a memory row has `metadata.pinned == true`.
+pub fn is_pinned_memory(metadata: &Value) -> bool {
+    metadata
+        .get("pinned")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// True when content opens with a canonical rule prefix (covering legacy global
+/// rules that were stored with `memory_type: "fact"`).
+pub fn is_rule_prefixed_content(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with("RULE:")
+        || trimmed.starts_with("RULE (")
+        || trimmed.starts_with("Project Rule:")
+}
+
+fn is_active_golden_candidate(r: &SearchResult) -> bool {
+    if r.payload.memory_type == "task"
+        || r.payload.memory_type == "community_summary"
+        || crate::registry::is_registry_row(&r.payload.metadata)
+        || crate::handlers::archive_memory::is_archived(&r.payload)
+        || r.payload.metadata.get("superseded_by").is_some()
+        || r.payload
+            .metadata
+            .get("valid_to")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0
+    {
+        return false;
+    }
+    if r.payload.memory_type == "guard_rule" {
+        return r
+            .payload
+            .metadata
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("active")
+            != "deprecated";
+    }
+    true
+}
+
+/// Collect Golden Rules across the `"global"` namespace and the target
+/// `namespace`. In `"global"`, any active rule, `guard_rule`, `pinned: true`
+/// memory, or rule-prefixed (`RULE:` / `RULE (` / `Project Rule:`) memory
+/// qualifies. In a project namespace, any active `pinned: true` memory
+/// qualifies.
+pub async fn collect_golden_rules(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    local_memories: Option<&[SearchResult]>,
+) -> Vec<SearchResult> {
+    let mut out: Vec<SearchResult> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    let global_rows: Vec<SearchResult> = if namespace == "global" {
+        match local_memories {
+            Some(slice) => slice.to_vec(),
+            None => store.list("global", None, None).await.unwrap_or_default(),
+        }
+    } else {
+        store.list("global", None, None).await.unwrap_or_default()
+    };
+
+    for r in global_rows {
+        if !is_active_golden_candidate(&r) {
+            continue;
+        }
+        let qualifies = is_pinned_memory(&r.payload.metadata)
+            || r.payload.memory_type == "rule"
+            || r.payload.memory_type == "guard_rule"
+            || is_rule_prefixed_content(&r.payload.content);
+        if qualifies && seen_ids.insert(r.id.clone()) {
+            out.push(r);
+        }
+    }
+
+    if namespace != "global" {
+        let proj_rows: Vec<SearchResult> = match local_memories {
+            Some(slice) => slice.to_vec(),
+            None => store.list(namespace, None, None).await.unwrap_or_default(),
+        };
+        for r in proj_rows {
+            if !is_active_golden_candidate(&r) {
+                continue;
+            }
+            if is_pinned_memory(&r.payload.metadata) && seen_ids.insert(r.id.clone()) {
+                out.push(r);
+            }
+        }
+    }
+
+    out.sort_by(|a, b| {
+        let a_pin = is_pinned_memory(&a.payload.metadata);
+        let b_pin = is_pinned_memory(&b.payload.metadata);
+        let a_not_guard = a.payload.memory_type != "guard_rule";
+        let b_not_guard = b.payload.memory_type != "guard_rule";
+        let a_cnt = a
+            .payload
+            .metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let b_cnt = b
+            .payload
+            .metadata
+            .get("access_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        b_pin
+            .cmp(&a_pin)
+            .then_with(|| b_not_guard.cmp(&a_not_guard))
+            .then_with(|| b_cnt.cmp(&a_cnt))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut seen_content: HashSet<String> = HashSet::new();
+    out.retain(|r| seen_content.insert(r.payload.content.trim().to_string()));
+    out
+}
+
+/// Render the Golden Rules block for `neurostrata_get_snapshot`.
+pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
+    if golden_rules.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("### Golden Rules (Global & Pinned — ALWAYS ENFORCED):");
+    for r in golden_rules {
+        let snippet: String = r.payload.content.chars().take(280).collect();
+        out.push_str(&format!(
+            "\n  - [{}] `{}`: {}",
+            r.payload.memory_type,
+            r.id,
+            snippet.replace('\n', " ")
+        ));
+    }
+    out
+}
+
+/// Best-effort persistence of `.NeuroStrata/active_session.json` so harness
+/// plugins can inject Golden Rules and active task context on session startup
+/// (`sessionContextHandler`) even before the first tool call.
+pub fn persist_active_session_file(
+    project_root: &std::path::Path,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    active_task: Option<(&str, &MemoryPayload)>,
+) {
+    let ns_dir = project_root.join(".NeuroStrata");
+    let session_path = ns_dir.join("active_session.json");
+    let mut active: Map<String, Value> = std::fs::read_to_string(&session_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    active.insert("namespace".to_string(), json!(namespace));
+    let golden_strings: Vec<String> = golden_rules
+        .iter()
+        .map(|r| {
+            let snippet: String = r.payload.content.chars().take(280).collect();
+            format!(
+                "[{}] {}: {}",
+                r.payload.memory_type,
+                r.id,
+                snippet.replace('\n', " ")
+            )
+        })
+        .collect();
+    active.insert("golden_rules".to_string(), json!(golden_strings));
+
+    if let Some((tid, payload)) = active_task {
+        active.insert("task_id".to_string(), json!(tid));
+        let task_obj = payload.metadata.get("task");
+        let status = task_obj
+            .and_then(|t| t.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("in_progress");
+        active.insert("status".to_string(), json!(status));
+        if let Some(sid) = task_obj
+            .and_then(|t| t.get("session_id"))
+            .and_then(|v| v.as_str())
+        {
+            active.insert("session_id".to_string(), json!(sid));
+        }
+        if let Some(inj) = task_obj
+            .and_then(|t| t.get("subagent_prompt_injection"))
+            .and_then(|v| v.as_str())
+        {
+            active.insert("subagent_prompt_injection".to_string(), json!(inj));
+        }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
+    }
+
+    if std::fs::create_dir_all(&ns_dir).is_ok() {
+        if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
+            let _ = std::fs::write(&session_path, serialized);
+        }
+    }
+}
+
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
 /// graph edges for a task, and format a ready-to-paste subagent prompt block.
 pub async fn build_task_graph_context(
@@ -419,14 +621,37 @@ pub async fn build_task_graph_context(
     vector: &[f32],
     payload: &MemoryPayload,
 ) -> (Value, String) {
+    let golden_rules = collect_golden_rules(store, namespace, None).await;
+    let mut golden_json = Vec::new();
+    let mut prompt_lines = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    for r in &golden_rules {
+        seen_ids.insert(r.id.clone());
+        let snippet: String = r.payload.content.chars().take(240).collect();
+        prompt_lines.push(format!(
+            "  - [GOLDEN {}] `{}`: {}",
+            r.payload.memory_type,
+            r.id,
+            snippet.replace('\n', " ")
+        ));
+        golden_json.push(json!({
+            "id": r.id,
+            "memory_type": r.payload.memory_type,
+            "location": r.payload.location,
+            "snippet": snippet,
+            "metadata": r.payload.metadata,
+        }));
+    }
+
     let raw_hits = store
         .search(namespace, vector.to_vec(), 12, false, false)
         .await
         .unwrap_or_default();
     let mut hits_json = Vec::new();
-    let mut prompt_lines = Vec::new();
     for r in raw_hits {
         if r.id == task_id
+            || seen_ids.contains(&r.id)
             || r.payload.memory_type == "task"
             || crate::registry::is_registry_row(&r.payload.metadata)
             || crate::handlers::archive_memory::is_archived(&r.payload)
@@ -487,6 +712,7 @@ pub async fn build_task_graph_context(
 
     let auto_retrieved_context = json!({
         "query": payload.content,
+        "golden_rules": golden_json,
         "items": hits_json,
         "related_edges": Value::Array(Vec::new()),
         "normative_memories": normative_memories,
@@ -1154,6 +1380,18 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     }
     if let Err(e) = save_task(&store, &namespace, &id, vector.clone(), task.payload.clone()).await {
         return e;
+    }
+    let rid = crate::registry::registry_row_id(&namespace);
+    if let Ok(Some((_, reg_p))) = store.get(&namespace, &rid).await {
+        if let Some(pr) = reg_p.metadata.get("project_root").and_then(|v| v.as_str()) {
+            let golden = collect_golden_rules(&store, &namespace, None).await;
+            persist_active_session_file(
+                std::path::Path::new(pr),
+                &namespace,
+                &golden,
+                Some((&id, &task.payload)),
+            );
+        }
     }
     let event_id = arg_str(&args, "event_id").unwrap_or(&format!("claim-{}", id)).to_string();
     {
@@ -8052,5 +8290,83 @@ impl crate::traits::AsAny for ListHidingStore {
             "prompt has Cross-Domain Bridges section: {prompt}"
         );
         assert!(prompt.contains("mem-rule-m1"), "prompt references M1: {prompt}");
+    }
+
+    #[tokio::test]
+    async fn build_task_graph_context_surfaces_global_and_pinned_golden_rules() {
+        let store = temp_store().await;
+        store.init("global").await.expect("init global");
+        store.init("probe").await.expect("init probe");
+
+        // Global rule (even stored as memory_type="fact" with RULE: prefix and access_count=0).
+        store
+            .upsert(
+                "global",
+                "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8",
+                vec![0.9f32; 4],
+                MemoryPayload {
+                    content: "RULE: The user has a strong preference AGAINST using Python.".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"access_count": 0}),
+                },
+            )
+            .await
+            .expect("seed global python rule");
+
+        // Project pinned rule with access_count=0.
+        store
+            .upsert(
+                "probe",
+                "pinned-local-1",
+                vec![0.8f32; 4],
+                MemoryPayload {
+                    content: "Never use docker, always use podman.".to_string(),
+                    user_id: "owner".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({"pinned": true, "access_count": 0}),
+                },
+            )
+            .await
+            .expect("seed local pinned rule");
+
+        let payload = MemoryPayload {
+            content: "implement feature x".to_string(),
+            user_id: "owner".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let (ctx, prompt) =
+            build_task_graph_context(&store, "probe", "task-1", &vec![0.1f32; 4], &payload).await;
+
+        assert!(
+            prompt.contains("bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8")
+                && prompt.contains("AGAINST using Python"),
+            "subagent prompt must surface global NO PYTHON rule: {prompt}"
+        );
+        assert!(
+            prompt.contains("pinned-local-1") && prompt.contains("always use podman"),
+            "subagent prompt must surface local pinned rule: {prompt}"
+        );
+        let golden = ctx["golden_rules"]
+            .as_array()
+            .expect("auto_retrieved_context.golden_rules array");
+        assert!(
+            golden.iter().any(|g| g["id"] == "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8"),
+            "golden_rules must include global rule: {golden:?}"
+        );
+        assert!(
+            golden.iter().any(|g| g["id"] == "pinned-local-1"),
+            "golden_rules must include local pinned rule: {golden:?}"
+        );
     }
 }

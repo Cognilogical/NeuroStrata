@@ -221,11 +221,16 @@ impl GuardValidator {
         // which caused any rule whose trigger_pattern mentioned an action type
         // (e.g. "bash rm -rf") to fire on EVERY action of that type (e.g.
         // every "bash" command), bricking validation.
-        let pattern_lower = trigger_pattern.to_lowercase();
         let action_lower = action_type.to_lowercase();
         let payload_lower = payload.to_lowercase();
 
-        action_lower.contains(&pattern_lower) || payload_lower.contains(&pattern_lower)
+        trigger_pattern
+            .split('|')
+            .filter(|branch| !branch.trim().is_empty())
+            .any(|branch| {
+                let b = branch.to_lowercase();
+                action_lower.contains(&b) || payload_lower.contains(&b)
+            })
     }
 
     /// Add a new behavioral rule to the guard namespace
@@ -478,5 +483,106 @@ mod tests {
             }
             other => panic!("expected a deterministic reject, got {:?}", other),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_guard_rule_enforced_in_project_namespace_and_increments_global_hit_count() {
+        let store = Arc::new(MockStore::new());
+        let global_validator =
+            GuardValidator::new(store.clone(), Arc::new(StubEmbedder), "global").await;
+        global_validator
+            .add_rule(rule(
+                "global-no-python",
+                "python |python3 |pytest |pip install|.py",
+                "RULE: Do not use Python without explicit user confirmation.",
+                "active",
+            ))
+            .await
+            .expect("seed global rule");
+
+        let proj_validator =
+            GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS).await;
+        let (verdict, fired) = proj_validator
+            .validate("bash", "python3 script.py", "/tmp", false)
+            .await;
+
+        assert_eq!(fired, vec!["global-no-python".to_string()], "global rule must fire in project namespace");
+        match verdict {
+            ValidateVerdict::DeterministicReject { constraints, .. } => {
+                assert_eq!(
+                    constraints,
+                    vec!["RULE: Do not use Python without explicit user confirmation.".to_string()]
+                );
+            }
+            other => panic!("expected DeterministicReject, got {:?}", other),
+        }
+        assert_eq!(
+            store.hit_count_of("global", "global-no-python"),
+            Some(1),
+            "hit_count must increment on the global rule row"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pipe_separated_trigger_patterns_match_any_branch_only() {
+        let (_store, validator) = validator_with(vec![rule(
+            "no-python",
+            "python |python3 |pytest |pip install|.py",
+            "Never use Python",
+            "active",
+        )])
+        .await;
+
+        let (v1, f1) = validator
+            .validate("write", "scripts/helper.py", "/tmp", false)
+            .await;
+        assert_eq!(f1, vec!["no-python".to_string()], ".py branch should fire");
+        assert!(matches!(v1, ValidateVerdict::DeterministicReject { .. }));
+
+        let (v2, f2) = validator
+            .validate("bash", "cargo test --lib", "/tmp", false)
+            .await;
+        assert!(f2.is_empty(), "unrelated command must not fire");
+        assert!(matches!(v2, ValidateVerdict::SandboxPassHighFidelity { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guard_rules_survive_when_non_rule_memories_exceed_search_limit() {
+        let store = Arc::new(MockStore::new());
+        // Seed 10 non-rule memories in NS so `store.search(..., limit=3)` only returns non-rules.
+        for i in 0..10 {
+            store
+                .upsert(
+                    NS,
+                    &format!("fact-{i}"),
+                    vec![0.1, 0.2, 0.3, 0.4],
+                    crate::traits::MemoryPayload {
+                        content: format!("ordinary fact {i}"),
+                        user_id: "u".to_string(),
+                        memory_type: "fact".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let validator = GuardValidator::new(store.clone(), Arc::new(StubEmbedder), NS).await;
+        validator
+            .add_rule(rule("rule.buried", "docker run", "use podman", "active"))
+            .await
+            .unwrap();
+
+        let (verdict, fired) = validator
+            .validate("bash", "docker run alpine", "/tmp", false)
+            .await;
+        assert_eq!(
+            fired.len(),
+            1,
+            "guard_rule must still be matched even when >3 non-rule memories precede it in search()"
+        );
+        assert!(matches!(verdict, ValidateVerdict::DeterministicReject { .. }));
     }
 }

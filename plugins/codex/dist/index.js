@@ -1361,13 +1361,22 @@ export async function sessionContextHandler(event, config) {
         }
     }
     const taskId = asString(active?.task_id);
-    if (!active || !taskId)
-        return; // no active task: nothing to baseline-inject
+    const goldenRules = Array.isArray(active?.golden_rules)
+        ? active.golden_rules.filter((g) => typeof g === "string" && g.trim() !== "")
+        : [];
+    if (!active || (!taskId && goldenRules.length === 0))
+        return; // nothing to baseline-inject
     if (st.baselineInjectedEpoch !== st.epoch) {
         st.baselineInjectedEpoch = st.epoch;
         const ns = asString(active.namespace) ?? config.namespace;
-        const status = asString(active.status) ?? "";
-        const message = `[NeuroStrata Active Context] Namespace: ${ns} | Active Task: ${taskId} [${status}]`;
+        const parts = [];
+        if (taskId) {
+            const status = asString(active.status) ?? "";
+            parts.push(`[NeuroStrata Active Context] Namespace: ${ns} | Active Task: ${taskId} [${status}]`);
+        }
+        if (goldenRules.length > 0) {
+            parts.push(`[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n${goldenRules.map((g) => `  - ${g}`).join("\n")}`);
+        }
         let extra = "";
         const injection = asString(active.subagent_prompt_injection);
         if (injection)
@@ -1388,7 +1397,7 @@ export async function sessionContextHandler(event, config) {
                 .join("; ");
             extra += `\n[NeuroStrata Conceptual Bridges] ${formatted}`;
         }
-        const full = message + extra;
+        const full = parts.join("\n") + extra;
         if (typeof event.additionalContext === "string") {
             event.additionalContext += `\n${full}`;
         }

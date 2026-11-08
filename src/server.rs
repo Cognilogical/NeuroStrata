@@ -3870,6 +3870,31 @@ async fn handle_get_snapshot(
         None => true,
         Some(v) => v.is_null() || (v.as_i64().unwrap_or(0) > now),
     });
+    // Computed off the pre-truncation list too: global and pinned Golden Rules
+    // must surface regardless of whether they made the top-5 by access_count.
+    let golden_rules =
+        crate::task::collect_golden_rules(&store, namespace, Some(&all_memories)).await;
+    let golden_section = crate::task::format_golden_rules_section(&golden_rules);
+    if let Some(root_str) = &inferred_root {
+        let active_task = all_memories
+            .iter()
+            .find(|m| {
+                m.payload.memory_type == "task"
+                    && m.payload
+                        .metadata
+                        .get("task")
+                        .and_then(|t| t.get("status"))
+                        .and_then(|v| v.as_str())
+                        == Some("in_progress")
+            })
+            .map(|m| (m.id.as_str(), &m.payload));
+        crate::task::persist_active_session_file(
+            std::path::Path::new(root_str),
+            namespace,
+            &golden_rules,
+            active_task,
+        );
+    }
     // F10: detect conflicts AFTER active-row filtering (valid_to, archived,
     // mesh-conflicting, registry) so expired rows never participate.
     let conflicts = crate::domain::detect_conflicts(&all_memories);
@@ -4389,6 +4414,9 @@ async fn handle_get_snapshot(
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
+    }
+    if !golden_section.is_empty() {
+        parts.push(golden_section);
     }
     if let Some(dr) = &doctor_report {
         parts.push(dr.clone());
@@ -14183,6 +14211,122 @@ mod context_plan_tests {
             parse_items(none).iter().any(|id| id == "plan-alias-seed"),
             "without prior usage the seed must be planned"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_global_and_pinned_golden_rules_above_top5_and_persists_active_session() {
+        use crate::traits::MemoryPayload;
+        let tmp_dir = std::env::temp_dir().join(format!("ns-golden-snap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(&tmp_dir.join("db"), 4).expect("open"),
+        );
+        store.init("global").await.unwrap();
+        store.init("probe").await.unwrap();
+
+        // Global rule with access_count = 0.
+        store
+            .upsert(
+                "global",
+                "bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8",
+                vec![0.1f32; 4],
+                MemoryPayload {
+                    content: "RULE: The user has a strong preference AGAINST using Python.".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"access_count": 0}),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Pinned local rule with access_count = 0.
+        store
+            .upsert(
+                "probe",
+                "pinned-local-rule",
+                vec![0.1f32; 4],
+                MemoryPayload {
+                    content: "Always use podman instead of docker.".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"pinned": true, "access_count": 0}),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 8 noisy high-access_count facts in "probe" that would otherwise crowd out access_count=0 rows.
+        for i in 0..8 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("noisy-fact-{i}"),
+                    vec![0.2f32; 4],
+                    MemoryPayload {
+                        content: format!("Noisy fact {i}"),
+                        user_id: "kenton".to_string(),
+                        memory_type: "fact".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: serde_json::json!({"access_count": 100 + i}),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let proj_root = tmp_dir.join("repo");
+        std::fs::create_dir_all(&proj_root).unwrap();
+        let text = handle_get_snapshot(
+            serde_json::json!({
+                "namespace": "probe",
+                "project_root": proj_root.to_string_lossy(),
+            }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+
+        assert!(
+            text.contains("### Golden Rules (Global & Pinned — ALWAYS ENFORCED):"),
+            "snapshot must render Golden Rules header: {text}"
+        );
+        assert!(
+            text.contains("bf710e0e-a4b5-41cc-a8d7-e25fb14b12f8")
+                && text.contains("AGAINST using Python"),
+            "snapshot must include global NO PYTHON rule: {text}"
+        );
+        assert!(
+            text.contains("pinned-local-rule")
+                && text.contains("Always use podman instead of docker."),
+            "snapshot must include local pinned rule: {text}"
+        );
+
+        let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
+        assert!(
+            session_file.exists(),
+            "get_snapshot with project_root must persist .NeuroStrata/active_session.json"
+        );
+        let session_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&session_file).unwrap()).unwrap();
+        let golden_arr = session_json["golden_rules"]
+            .as_array()
+            .expect("active_session.json must carry golden_rules array");
+        assert!(
+            golden_arr
+                .iter()
+                .any(|g| g.as_str().unwrap_or("").contains("AGAINST using Python")),
+            "active_session.json golden_rules must include global NO PYTHON rule: {golden_arr:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
 
