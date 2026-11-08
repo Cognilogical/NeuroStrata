@@ -5,7 +5,7 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,22 +28,10 @@ pub struct AcceptableEmbedder {
     pub model_sha256: Option<String>,
 }
 
-fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
-    // dirs::home_dir() rather than $HOME: Windows sets USERPROFILE, not HOME, so
-    // reading the variable directly sends this to a relative path under whatever
-    // directory happened to launch the process. config.rs already resolves it this way.
-    let config_dir = dirs::home_dir()
-        .map(|home| home.join(".config").join("neurostrata"))
-        .unwrap_or_else(|| PathBuf::from(".neurostrata"));
-
-    if !config_dir.exists() {
-        fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
-    }
-
-    let config_path = config_dir.join("embedders.json");
-
-    // Default list if file doesn't exist or is empty
-    let default_models = vec![
+/// The built-in default acceptable-embedder list: the single full-size
+/// Nomic entry every fresh install starts from.
+pub(crate) fn default_acceptable_embedders() -> Vec<AcceptableEmbedder> {
+    vec![
         AcceptableEmbedder {
             model_name: "NomicEmbedTextV15".to_string(),
             dimensions: 768,
@@ -53,7 +41,32 @@ fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
             // Real SHA-256 of the fastembed Nomic v1.5 ONNX weights (computed).
             model_sha256: Some("147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965".to_string()),
         },
-    ];
+    ]
+}
+
+/// The operator's config directory (`~/.config/neurostrata`).
+fn config_dir() -> PathBuf {
+    // dirs::home_dir() rather than $HOME: Windows sets USERPROFILE, not HOME, so
+    // reading the variable directly sends this to a relative path under whatever
+    // directory happened to launch the process. config.rs already resolves it this way.
+    dirs::home_dir()
+        .map(|home| home.join(".config").join("neurostrata"))
+        .unwrap_or_else(|| PathBuf::from(".neurostrata"))
+}
+
+fn get_acceptable_embedders() -> Result<Vec<AcceptableEmbedder>> {
+    get_acceptable_embedders_in(&config_dir())
+}
+
+pub(crate) fn get_acceptable_embedders_in(config_dir: &Path) -> Result<Vec<AcceptableEmbedder>> {
+    if !config_dir.exists() {
+        fs::create_dir_all(config_dir).context("Failed to create config directory")?;
+    }
+
+    let config_path = config_dir.join("embedders.json");
+
+    // Default list if file doesn't exist or is empty
+    let default_models = default_acceptable_embedders();
 
     if config_path.exists() {
         let content = fs::read_to_string(&config_path).context("Failed to read embedders.json")?;
@@ -136,7 +149,15 @@ fn find_existing_cache_dir() -> Result<PathBuf> {
 /// The model this process is configured to use: the one NEUROSTRATA_MODEL names
 /// when it is acceptable, otherwise the first acceptable entry.
 fn configured_model() -> Result<AcceptableEmbedder> {
-    let acceptable_models = get_acceptable_embedders()?;
+    pick_configured_model(get_acceptable_embedders()?)
+}
+
+/// [`configured_model`] against an explicit config directory.
+pub(crate) fn configured_model_in(config_dir: &Path) -> Result<AcceptableEmbedder> {
+    pick_configured_model(get_acceptable_embedders_in(config_dir)?)
+}
+
+fn pick_configured_model(acceptable_models: Vec<AcceptableEmbedder>) -> Result<AcceptableEmbedder> {
     let env_model = std::env::var("NEUROSTRATA_MODEL").unwrap_or_default();
     Ok(acceptable_models
         .iter()
