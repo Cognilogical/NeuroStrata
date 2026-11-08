@@ -141,6 +141,34 @@ pub(crate) fn read_token_file(name: &str) -> Option<String> {
     }
 }
 
+/// The one lock serializing every test in this crate that creates,
+/// reads, rewrites, or deletes the real credential files
+/// (`daemon.token` / `operator.token` in the token config dir): the
+/// server proxy tests replace the file with fixture tokens, and the
+/// daemon tests spawn daemons that load-or-create it and reread it to
+/// authorize shutdown. Those spans share one path on disk but no
+/// funnel, so without a common lock a local parallel run can hand a
+/// spawning or stopping daemon a fixture (or absent) token and hang
+/// its shutdown on a 401. CI runs the suite with --test-threads=1;
+/// this lock keeps local parallel runs deterministic too. It lives
+/// here because this module owns the token files; exactly one lock
+/// object exists for the whole test binary.
+#[cfg(test)]
+pub(crate) static CREDENTIAL_FILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the credential-file test lock (see
+/// `CREDENTIAL_FILE_TEST_LOCK`). Poisoning is recovered: the holders
+/// restore shared state on drop (the server guard rewrites the real
+/// token file; a daemon holder's task is awaited before the guard
+/// drops), so one test's panic cannot cascade into every other
+/// credential test.
+#[cfg(test)]
+pub(crate) fn credential_file_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    CREDENTIAL_FILE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Constant-time equality for credential comparison: a wrong token must
 /// not leak how much of it was right through response timing.
 fn token_eq(provided: &str, expected: &str) -> bool {
@@ -2486,6 +2514,11 @@ impl crate::traits::AsAny for RecordingStore {
     /// daemon.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_bus_is_live_before_the_first_request() {
+        // This test spawns outside the spawn_test_daemon funnel, so it
+        // takes the credential-file lock itself, before the spawn and
+        // until after its inline shutdown below completes -- the same
+        // span the funnel covers (see CREDENTIAL_FILE_TEST_LOCK).
+        let _credential_guard = credential_file_test_lock();
         // An ephemeral port, and the full production startup sequence: the
         // machine's live daemon owns 34343, and a test must never contend
         // with it.
@@ -2586,13 +2619,22 @@ impl crate::traits::AsAny for RecordingStore {
     /// answers. An ephemeral port because the machine's live daemon owns
     /// 34343, and the full production startup sequence so the routes under test
     /// are the ones production registers.
+    ///
+    /// Also returns the credential-file test lock guard, acquired BEFORE
+    /// the spawn: startup load-or-creates the real token files and this
+    /// helper (and `stop_test_daemon`) reread them, while the server
+    /// proxy tests replace the same files with fixtures. The caller
+    /// binds the guard for its whole body, so it drops only after the
+    /// daemon has been stopped -- see `CREDENTIAL_FILE_TEST_LOCK`.
     async fn spawn_test_daemon_with(
         store: Arc<RecordingStore>,
     ) -> (
         String,
         reqwest::Client,
         tokio::task::JoinHandle<anyhow::Result<()>>,
+        std::sync::MutexGuard<'static, ()>,
     ) {
+        let credential_guard = credential_file_test_lock();
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap().to_string();
         drop(probe);
@@ -2642,13 +2684,14 @@ impl crate::traits::AsAny for RecordingStore {
         }
         let client = reqwest::Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
 
-        (base, client, daemon)
+        (base, client, daemon, credential_guard)
     }
 
     async fn spawn_test_daemon() -> (
         String,
         reqwest::Client,
         tokio::task::JoinHandle<anyhow::Result<()>>,
+        std::sync::MutexGuard<'static, ()>,
     ) {
         spawn_test_daemon_with(Arc::new(RecordingStore::default())).await
     }
@@ -2694,7 +2737,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// a representative read route and /mcp, the product's primary surface.
     #[tokio::test(flavor = "multi_thread")]
     async fn request_without_token_is_401() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let info = client.get(format!("{base}/info")).send().await.unwrap();
@@ -2715,7 +2758,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// must not distinguish "no token" from "wrong token".
     #[tokio::test(flavor = "multi_thread")]
     async fn request_with_wrong_token_is_401() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let info = client
@@ -2736,7 +2779,7 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn destructive_routes_require_the_operator_token() {
         let store = Arc::new(RecordingStore::holding("trust-test", "m1", "fact"));
-        let (base, _authed, daemon) = spawn_test_daemon_with(store).await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon_with(store).await;
         let client = bare_client();
         let daemon_token = token_file("daemon.token");
         let operator_token = token_file("operator.token");
@@ -2800,7 +2843,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// passes.
     #[tokio::test(flavor = "multi_thread")]
     async fn hostile_host_and_origin_are_403_even_with_a_valid_token() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
         let daemon_token = token_file("daemon.token");
 
@@ -2844,7 +2887,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// liveness ONLY: status 200, body exactly "ok", no version, no data.
     #[tokio::test(flavor = "multi_thread")]
     async fn health_is_open_and_minimal() {
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let client = bare_client();
 
         let health = client.get(format!("{base}/health")).send().await.unwrap();
@@ -2873,7 +2916,7 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn token_files_have_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
-        let (base, _authed, daemon) = spawn_test_daemon().await;
+        let (base, _authed, daemon, _credential_guard) = spawn_test_daemon().await;
         let home = dirs::home_dir().unwrap_or_default();
         for name in ["daemon.token", "operator.token"] {
             let path = home.join(".config").join("neurostrata").join(name);
@@ -2903,7 +2946,7 @@ impl crate::traits::AsAny for RecordingStore {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_archive_route_delegates_to_the_handler_the_tool_also_calls() {
         let store = Arc::new(RecordingStore::holding("bus-test", "m1", "fact"));
-        let (base, client, daemon) = spawn_test_daemon_with(store.clone()).await;
+        let (base, client, daemon, _credential_guard) = spawn_test_daemon_with(store.clone()).await;
 
         let missing = client
             .post(format!("{base}/memory/archive"))
@@ -2985,7 +3028,7 @@ impl crate::traits::AsAny for RecordingStore {
     /// assert that two different buses report different subscriber counts.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_bus_metrics_route_answers_in_the_shared_handlers_shape() {
-        let (base, client, daemon) = spawn_test_daemon().await;
+        let (base, client, daemon, _credential_guard) = spawn_test_daemon().await;
 
         let response = client
             .post(format!("{base}/bus/metrics"))
@@ -3093,13 +3136,23 @@ impl crate::traits::AsAny for RecordingStore {
     /// captured, not the variable. The client carries both token files,
     /// like the operator's own client (the /backup and /shutdown routes
     /// are destructive-class under DR-5).
+    ///
+    /// Also returns the credential-file test lock guard, acquired BEFORE
+    /// the spawn for the same reason as in `spawn_test_daemon_with`:
+    /// startup load-or-creates the real token files and this helper
+    /// rereads them for the client. The caller binds the guard for its
+    /// whole body (these tests already hold ENV_LOCK the same way), so
+    /// it drops only after `stop_daemon` completes. Lock order is
+    /// ENV_LOCK then this lock, everywhere both are held.
     async fn spawn_daemon_serving(
         root: &Path,
     ) -> (
         String,
         reqwest::Client,
         tokio::task::JoinHandle<anyhow::Result<()>>,
+        std::sync::MutexGuard<'static, ()>,
     ) {
+        let credential_guard = credential_file_test_lock();
         std::env::set_var(PROJECT_ROOT_ENV, root);
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap().to_string();
@@ -3133,7 +3186,7 @@ impl crate::traits::AsAny for RecordingStore {
             .default_headers(headers)
             .build()
             .unwrap();
-        (base, client, daemon)
+        (base, client, daemon, credential_guard)
     }
 
     async fn stop_daemon(
@@ -3170,7 +3223,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_root("t2r-backup-outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/backup"))
@@ -3202,7 +3255,7 @@ impl crate::traits::AsAny for RecordingStore {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-backup-inside-root");
         std::fs::create_dir_all(&root).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
         let dest = root.join("snapshots");
         let res = client
             .post(format!("{base}/backup"))
@@ -3229,7 +3282,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_root("t2r-dotdot-outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         // Both scratch dirs sit directly under the temp dir, so
         // `<root>/../<outside-name>` canonicalizes onto the outside dir.
@@ -3269,7 +3322,7 @@ impl crate::traits::AsAny for RecordingStore {
         let outside = scratch_root("t2r-backup-link-target");
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
         let res = client
             .post(format!("{base}/backup"))
             .json(&serde_json::json!({ "dir": root.join("escape").display().to_string() }))
@@ -3294,7 +3347,7 @@ impl crate::traits::AsAny for RecordingStore {
         let root = scratch_root("t2r-ingest-root");
         std::fs::create_dir_all(&root).unwrap();
         let outside = scratch_tree("t2r-ingest-outside");
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/ingest"))
@@ -3331,7 +3384,7 @@ impl crate::traits::AsAny for RecordingStore {
         let tree = root.join("tree");
         std::fs::create_dir_all(&tree).unwrap();
         std::fs::write(tree.join("lib.rs"), "pub fn t2r_marker() {}\n").unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/ingest"))
@@ -3363,7 +3416,7 @@ impl crate::traits::AsAny for RecordingStore {
         let outside = scratch_root("t2r-export-outside");
         std::fs::create_dir_all(&outside).unwrap();
         let target = outside.join("graph.json");
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
@@ -3397,7 +3450,7 @@ impl crate::traits::AsAny for RecordingStore {
         let root = scratch_root("t2r-export-inside-root");
         std::fs::create_dir_all(&root).unwrap();
         let target = root.join("graph.json");
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
@@ -3430,7 +3483,7 @@ impl crate::traits::AsAny for RecordingStore {
         std::fs::create_dir_all(&outside).unwrap();
         let beads = outside.join("issues.jsonl");
         std::fs::write(&beads, "this is not a beads file\n").unwrap();
-        let (base, client, daemon) = spawn_daemon_serving(&root).await;
+        let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/tasks/import"))

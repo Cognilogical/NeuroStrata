@@ -1810,26 +1810,37 @@ async fn answer_with_error(
     }
 }
 
-/// The proxy's HTTP client. It carries the daemon bearer token (read
-/// from the token file the daemon maintains) in its default headers:
-/// without it, every forwarded /mcp call is a 401 against the daemon's
-/// auth middleware -- the Task 1 F1 regression, in which the product's
-/// primary client surface went dark the moment the daemon learned to
-/// authenticate.
+/// The proxy's HTTP client. It is deliberately credential-free: it must
+/// not carry the daemon bearer token in its default headers, because a
+/// client built once, at proxy startup, would freeze whatever the token
+/// file held -- or failed to hold -- at that moment. On a first run the
+/// token file may not exist yet when the proxy starts (the daemon
+/// creates it only once it starts, which can be well after the readiness
+/// poll in main.rs has given up on a still-loading model), and a rotated
+/// token -- the documented lockout recovery deletes and regenerates
+/// daemon.token -- must be picked up without a proxy restart. The token
+/// is therefore resolved at forward time instead; see
+/// forward_mcp_request.
+///
+/// The invariant that makes forward-time resolution exact: the daemon
+/// creates daemon.token before it binds its listener (daemon.rs,
+/// start_daemon_on), so the first attempt that can connect at all can
+/// always read a complete token. Moving token creation to after the
+/// bind would reopen a self-healing one-request window -- a request
+/// forwarded while the file is being written could go out without a
+/// header and draw one 401 -- and must be done knowingly.
+///
+/// Without a token on the forwarded call, every /mcp request is a 401
+/// against the daemon's auth middleware -- the Task 1 F1 regression, in
+/// which the product's primary client surface went dark the moment the
+/// daemon learned to authenticate.
 fn proxy_client() -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(token) = crate::daemon::read_token_file("daemon.token") {
-        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
-            headers.insert(reqwest::header::AUTHORIZATION, val);
-        }
-    }
     reqwest::Client::builder()
         // Separate from the overall bound on purpose. A port with nothing behind
         // it hangs rather than refusing on this machine -- the same behaviour
         // DaemonProbe in main.rs exists to describe -- so without this, a daemon
         // that is not running is indistinguishable from one that is merely slow,
         // and the wait is the whole timeout rather than a few seconds.
-        .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(proxy_timeout())
         .build()
@@ -1840,12 +1851,28 @@ fn proxy_client() -> reqwest::Client {
 /// /mcp endpoint with the proxy client. The startup-wait loop in
 /// `start_mcp_proxy` retries this on connect errors while the daemon is
 /// still starting.
+///
+/// The daemon bearer token is resolved here, at forward time: this is
+/// called once per attempt, so resolution is per attempt by
+/// construction, and a token that appears -- or rotates -- after the
+/// proxy started is used by the next attempt. The accepted trade:
+/// deleting or replacing the token file while the daemon runs leaves
+/// the proxy unauthenticated until the file reappears or the daemon
+/// restarts; the proxy deliberately holds no copy of its own to fall
+/// back on.
 async fn forward_mcp_request(
     client: &reqwest::Client,
     url: &str,
     request: &Value,
 ) -> reqwest::Result<reqwest::Response> {
-    client.post(url).json(request).send().await
+    let token = crate::daemon::read_token_file("daemon.token");
+    let mut attempt = client.post(url).json(request);
+    if let Some(token) = token {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            attempt = attempt.header(reqwest::header::AUTHORIZATION, val);
+        }
+    }
+    attempt.send().await
 }
 
 pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
@@ -8590,6 +8617,196 @@ mod tests {
         );
     }
 
+    /// Serializes the tests in this module that create, rewrite, or
+    /// delete the real daemon token file, against each other AND
+    /// against the daemon tests that spawn daemons load-or-creating
+    /// the same file and reread it for shutdown: one shared lock for
+    /// the whole test binary, owned by the daemon module (which owns
+    /// the token files). See `crate::daemon::CREDENTIAL_FILE_TEST_LOCK`.
+    fn token_file_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::daemon::credential_file_test_lock()
+    }
+
+    /// The real daemon token path. `crate::daemon::token_config_dir` is
+    /// private, so this mirrors its construction -- the same way
+    /// daemon.rs's own tests locate the file.
+    fn daemon_token_path() -> std::path::PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        home.join(".config").join("neurostrata").join("daemon.token")
+    }
+
+    /// Writes a token file atomically at 0600 on Unix: the bytes go to
+    /// a uniquely named sibling temp file opened with mode 0o600, then
+    /// rename over the target, so a replacement token never exists at
+    /// looser permissions -- a plain create under the usual umask 022
+    /// would leave the daemon credential 0644, readable by other users.
+    /// On non-Unix a plain write is used.
+    fn write_token_file_atomically(
+        path: &std::path::Path,
+        contents: &str,
+    ) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let dir = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "token path has no parent directory",
+                )
+            })?;
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "token path has no file name",
+                    )
+                })?;
+            let tmp_path = dir.join(format!("{file_name}.tmp-{}", std::process::id()));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?;
+            file.write_all(contents.as_bytes())?;
+            drop(file);
+            std::fs::rename(&tmp_path, path)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(path, contents)
+        }
+    }
+
+    /// Save/restore guard for the real daemon token file: snapshots its
+    /// contents (or its absence) and, on Unix, its permissions on
+    /// creation and puts them back on drop, panic included, so a token
+    /// test never leaves the operator's credential created, rewritten,
+    /// deleted, or loosened to wider permissions behind it.
+    struct TokenFileGuard {
+        path: std::path::PathBuf,
+        saved: Option<String>,
+        #[cfg(unix)]
+        saved_mode: Option<u32>,
+    }
+
+    impl TokenFileGuard {
+        fn new() -> Self {
+            let path = daemon_token_path();
+            let saved = std::fs::read_to_string(&path).ok();
+            #[cfg(unix)]
+            let saved_mode = {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&path)
+                    .ok()
+                    .map(|metadata| metadata.permissions().mode() & 0o7777)
+            };
+            Self {
+                path,
+                saved,
+                #[cfg(unix)]
+                saved_mode,
+            }
+        }
+
+        fn remove(&self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+
+        fn write(&self, token: &str) {
+            write_token_file_atomically(&self.path, token).unwrap();
+        }
+    }
+
+    impl Drop for TokenFileGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(contents) => {
+                    if write_token_file_atomically(&self.path, contents).is_ok() {
+                        // The atomic write creates the file at 0600;
+                        // re-apply the captured original permissions so
+                        // the restored file has exactly its original
+                        // mode, whatever that was.
+                        #[cfg(unix)]
+                        if let Some(mode) = self.saved_mode {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                &self.path,
+                                std::fs::Permissions::from_mode(mode),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+
+    /// A recording stub that stands in for the daemon: accepts
+    /// `expected_requests` sequential connections and records each
+    /// request's Authorization header in arrival order (an empty string
+    /// when the request carried none). The canned reply sends
+    /// `connection: close`, so every forwarded request arrives on a
+    /// fresh connection.
+    fn spawn_recording_stub(
+        expected_requests: usize,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub = std::thread::spawn(move || {
+            let mut auths = Vec::new();
+            for _ in 0..expected_requests {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut auth = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    let lower = trimmed.to_ascii_lowercase();
+                    if lower.starts_with("authorization:") {
+                        // The value is compared exactly, so take it from
+                        // the original line -- only the name match is
+                        // folded.
+                        auth = trimmed["authorization:".len()..].trim().to_string();
+                    }
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_length > 0 {
+                    let mut body = vec![0u8; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                }
+                let response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+                auths.push(auth);
+            }
+            auths
+        });
+        (addr, stub)
+    }
+
     /// Task 1 (F1/FM-2 regression): the stdio proxy's client must carry
     /// the daemon bearer token, or every proxied MCP session is a 401
     /// against the token-enforcing daemon -- the proxy is the product's
@@ -8597,59 +8814,137 @@ mod tests {
     /// and captures the Authorization header of the forwarded request.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_forwards_the_daemon_bearer_token() {
-        use std::io::{BufRead, Read, Write};
+        let _lock = token_file_test_lock();
+        // load_or_create_daemon_token below may create the real token
+        // file; the guard puts back whatever was there before the test.
+        let _guard = TokenFileGuard::new();
 
         // The token the daemon would have created and the proxy must read.
         let expected = crate::daemon::load_or_create_daemon_token();
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stub = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream);
-            let mut auth = String::new();
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                let trimmed = line.trim_end();
-                if trimmed.is_empty() {
-                    break;
-                }
-                let lower = trimmed.to_ascii_lowercase();
-                if lower.starts_with("authorization:") {
-                    // The value is compared exactly, so take it from the
-                    // original line -- only the name match is folded.
-                    auth = trimmed["authorization:".len()..].trim().to_string();
-                }
-                if let Some(v) = lower.strip_prefix("content-length:") {
-                    content_length = v.trim().parse().unwrap_or(0);
-                }
-            }
-            if content_length > 0 {
-                let mut body = vec![0u8; content_length];
-                reader.read_exact(&mut body).unwrap();
-            }
-            let response_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            reader.get_mut().write_all(response.as_bytes()).unwrap();
-            auth
-        });
+        let (addr, stub) = spawn_recording_stub(1);
 
         let client = proxy_client();
         let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
         let url = format!("http://{addr}/mcp");
         let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
         assert!(resp.status().is_success());
-        let auth = stub.join().unwrap();
+        let auth = stub.join().unwrap().into_iter().next().unwrap();
         assert_eq!(
             auth,
             format!("Bearer {expected}"),
             "the proxy must forward the daemon bearer token"
+        );
+    }
+
+    /// The startup race: the proxy can start
+    /// before the daemon has created its token file (model load can
+    /// outlast the readiness poll), so a client that snapshots the
+    /// token at construction forwards without credentials forever. The
+    /// token must be resolved when a request is forwarded: a token
+    /// that appears after the client is built is picked up by the next
+    /// request through the same client.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_picks_up_a_token_that_appears_after_the_client_is_built() {
+        let _lock = token_file_test_lock();
+        let guard = TokenFileGuard::new();
+        guard.remove();
+
+        let (addr, stub) = spawn_recording_stub(2);
+        let client = proxy_client();
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let url = format!("http://{addr}/mcp");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        guard.write("stage1-token-appears");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        let auths = stub.join().unwrap();
+        assert_eq!(
+            auths,
+            vec![String::new(), "Bearer stage1-token-appears".to_string()],
+            "the first request predates the token file and carries no header; \
+             the second must carry the token that appeared in between"
+        );
+    }
+
+    /// Token rotation -- the documented lockout recovery deletes and
+    /// regenerates daemon.token -- must reach a running proxy on the
+    /// next request, without a proxy restart, and no caching of the
+    /// token may stand in the way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_uses_the_rotated_token_on_the_next_request() {
+        let _lock = token_file_test_lock();
+        let guard = TokenFileGuard::new();
+        guard.write("stage1-token-a");
+
+        let (addr, stub) = spawn_recording_stub(2);
+        let client = proxy_client();
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        let url = format!("http://{addr}/mcp");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        guard.write("stage1-token-b");
+
+        let resp = forward_mcp_request(&client, &url, &request).await.unwrap();
+        assert!(resp.status().is_success());
+
+        let auths = stub.join().unwrap();
+        assert_eq!(
+            auths,
+            vec![
+                "Bearer stage1-token-a".to_string(),
+                "Bearer stage1-token-b".to_string()
+            ],
+            "each request must carry the token the file held when it was forwarded"
+        );
+    }
+
+    /// The guard's restore must preserve the token file's permissions,
+    /// not just its contents: a restore that
+    /// recreates the operator's 0600 credential through a plain write
+    /// leaves it 0644 under umask 022, readable by other users. The
+    /// outer guard snapshots the true original state; the inner guard
+    /// is exercised against a known 0600 original whose file is then
+    /// deleted and recreated through `guard.write` -- the creation
+    /// path that used to come back 0644.
+    #[cfg(unix)]
+    #[test]
+    fn token_file_guard_restores_contents_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = token_file_test_lock();
+        // Snapshots the operator's true token state; dropped last --
+        // on assertion panic too -- so this test leaves the real file
+        // exactly as it found it, contents and permissions.
+        let outer = TokenFileGuard::new();
+        let path = daemon_token_path();
+
+        // Establish the known "original" the inner guard will snapshot.
+        outer.write("token-file-guard-original");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let guard = TokenFileGuard::new();
+        guard.remove();
+        guard.write("token-file-guard-overwritten");
+        drop(guard);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "token-file-guard-original",
+            "the guard must restore the original token contents"
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the guard must restore the token file at its original 0600 \
+             permissions, not the umask default"
         );
     }
 
