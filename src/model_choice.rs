@@ -443,7 +443,7 @@ fn memory_line(choice: &ModelChoice) -> String {
     match choice.model_name {
         // Measured: Q after-batch runs 330/332 MiB; FP32 947/938 MiB;
         // reported saving 606 MiB.
-        "NomicEmbedTextV15Q" => "Measured: resident memory after a batch was 330/332 MiB, a measured saving of 606 MiB against the FP32 default's 947/938 MiB (Part 0, Task 0b).".to_string(),
+        "NomicEmbedTextV15Q" => "Measured: resident memory after a batch was 330/332 MiB, a measured saving of 606 MiB against the FP32 default's 947/938 MiB.".to_string(),
         _ => NOT_MEASURED_MEMORY_LINE.to_string(),
     }
 }
@@ -452,12 +452,12 @@ fn memory_line(choice: &ModelChoice) -> String {
 /// [`memory_line`].
 fn quality_line(choice: &ModelChoice) -> String {
     match choice.model_name {
-        // Measured: Probe A overlap 0.873333, mean cosine 0.948251;
-        // Probe B recall 23/30 against FP32's 22/30.
-        "NomicEmbedTextV15Q" => "Measured: Probe A top-5 overlap with the FP32 default was 0.873 (mean cosine 0.948); Probe B recall was 23/30 against the FP32 default's 22/30 (Part 0, Task 0c).".to_string(),
-        // Measured: Probe A overlap 0.666667; no resident-memory measurement.
+        // Measured: top-5 overlap 0.873333, mean cosine 0.948251;
+        // blind recall 23/30 against FP32's 22/30.
+        "NomicEmbedTextV15Q" => "Measured: top-5 overlap with the FP32 default was 0.873 (mean cosine 0.948); blind recall was 23/30 against the FP32 default's 22/30.".to_string(),
+        // Measured: top-5 overlap 0.666667; no resident-memory measurement.
         "BGESmallENV15Q" => {
-            "Measured: Probe A top-5 overlap with the FP32 default was 0.667 (Part 0, Task 0c)."
+            "Measured: top-5 overlap with the FP32 default was 0.667."
                 .to_string()
         }
         _ => NOT_MEASURED_QUALITY_LINE.to_string(),
@@ -1180,6 +1180,12 @@ mod tests {
             bge.contains("0.667"),
             "BGESmallENV15Q shows its measured overlap"
         );
+        assert!(
+            bge.contains(
+                "Measured: top-5 overlap with the FP32 default was 0.667."
+            ),
+            "BGESmallENV15Q shows its measured quality line verbatim"
+        );
         let nomic = render_offer(&top3[0..1]);
         assert!(
             !nomic.contains("Not measured —"),
@@ -1192,6 +1198,18 @@ mod tests {
         assert!(
             nomic.contains("0.873"),
             "NomicEmbedTextV15Q shows its measured overlap"
+        );
+        assert!(
+            nomic.contains(
+                "Measured: resident memory after a batch was 330/332 MiB, a measured saving of 606 MiB against the FP32 default's 947/938 MiB."
+            ),
+            "NomicEmbedTextV15Q shows its measured memory line verbatim"
+        );
+        assert!(
+            nomic.contains(
+                "Measured: top-5 overlap with the FP32 default was 0.873 (mean cosine 0.948); blind recall was 23/30 against the FP32 default's 22/30."
+            ),
+            "NomicEmbedTextV15Q shows its measured quality line verbatim"
         );
         // Warning copy, split by context class, with the measured figure.
         assert!(bge.contains("This model's context is 512 tokens. About 6% of the items"));

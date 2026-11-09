@@ -218,10 +218,10 @@ from one machine, not a ranking of the candidates.
 - **Resident memory:** after a batch, `NomicEmbedTextV15Q` ran at 330/332 MiB
   against the FP32 default's 947/938 MiB — a measured saving of 606 MiB (the
   smaller of two paired deltas, 617 MiB and 606 MiB).
-- **Embedding drift (Probe A, 60 texts):** FP32-to-quantized mean cosine
+- **Embedding drift (60 texts):** FP32-to-quantized mean cosine
   0.948 for `NomicEmbedTextV15Q`; top-5 overlap against FP32 was 0.873 for
   `NomicEmbedTextV15Q` and 0.667 for `BGESmallENV15Q`.
-- **Recall (Probe B, 30 blind-judged queries):** FP32 22/30,
+- **Recall (30 blind-judged queries):** FP32 22/30,
   `NomicEmbedTextV15Q` 23/30. The one-query difference sits well inside the
   ±0.214 noise band, so it is not evidence that either model recalls better.
 - **Not measured:** `SnowflakeArcticEmbedMQ` — resident memory and recall
