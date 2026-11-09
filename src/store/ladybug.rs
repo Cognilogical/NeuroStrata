@@ -1450,6 +1450,127 @@ impl Drop for LadybugStore {
         }
     }
 }
+/// The configured model's embedding-space descriptor, synthesized from
+/// the config directory and the store's width alone: the factored form
+/// of [`LadybugStore::configured_embedding_descriptor`], so callers that
+/// cannot borrow the store (the first-write flip handle below) reproduce
+/// the identical descriptor.
+fn configured_embedding_descriptor_in(
+    embed_config_dir: &std::path::Path,
+    dimensions: usize,
+) -> Result<crate::traits::EmbeddingDescriptor> {
+    let configured = crate::embed::configured_model_in(embed_config_dir)?;
+    Ok(crate::traits::EmbeddingDescriptor {
+        provider: "fastembed".into(),
+        model: configured.model_name,
+        revision: "onnx".into(),
+        dims: dimensions,
+        normalization: "unknown".into(),
+        preprocessing: "unknown".into(),
+        distance_metric: "cosine".into(),
+    })
+}
+
+/// A clonable handle to everything the first-data sidecar flip touches,
+/// built from `&LadybugStore` at upsert entry so one clone can move into
+/// the `'static` write closure: the flip is then performed by the same
+/// blocking task that commits the write, immediately after the core
+/// MERGE succeeds, whether or not the caller is still waiting (the
+/// write deadline releases the caller, not the query). The flip is
+/// monotonic and idempotent, so the collision-retry loop re-running the
+/// closure is safe.
+#[derive(Clone)]
+struct FirstWriteFlip {
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    local_path: PathBuf,
+    serving: Option<crate::traits::EmbeddingDescriptor>,
+    embed_config_dir: PathBuf,
+    dimensions: usize,
+}
+
+impl FirstWriteFlip {
+    /// This handle's view of the store-state sidecar, mirroring
+    /// `LadybugStore::cached_store_state`: the cache is shared with the
+    /// store, and a state the store already loaded is authoritative. A
+    /// cold cache is classified from the sidecar file alone — a
+    /// parseable sidecar is `Recorded`; anything else cannot be a
+    /// pristine state this flip may move, so it reads as `LockedUnknown`
+    /// and the flip no-ops. (The store's own first classification, with
+    /// its fresh-store handling, has always run by upsert entry:
+    /// `guard_first_write` and `check_data_bearing_identity` load it.)
+    fn cached_store_state(&self) -> CachedStoreState {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = &*cache {
+            return state.clone();
+        }
+        let state = match crate::model_choice::read_store_state(&self.local_path) {
+            Some(recorded) => CachedStoreState::Recorded(recorded),
+            None => CachedStoreState::LockedUnknown,
+        };
+        *cache = Some(state.clone());
+        state
+    }
+
+    fn set_cached_store_state(&self, state: CachedStoreState) {
+        let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
+        *cache = Some(state);
+    }
+
+    /// Flip the sidecar to data-bearing after the first successful
+    /// write. Monotonic: only a pristine state flips, the recorded
+    /// descriptor is kept, and nothing ever flips back. A failed sidecar
+    /// write is logged loudly and the in-memory state still flips, so
+    /// this process keeps treating the store as data-bearing.
+    fn flip_store_state_to_data(&self) {
+        match self.cached_store_state() {
+            CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
+                recorded.has_data = true;
+                if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &recorded)
+                {
+                    tracing::error!(
+                        "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
+                    );
+                }
+                self.set_cached_store_state(CachedStoreState::Recorded(recorded));
+            }
+            CachedStoreState::FreshUnrecorded => {
+                // The pristine sidecar could not be written at init;
+                // record the data flip directly. The descriptor is the
+                // serving one when this process has an embedder (the
+                // model that produced the vectors), else the configured
+                // one. A recorded descriptor, once present, is never
+                // rewritten by the flip — this branch runs only when
+                // none exists yet. The serving preference is deliberate
+                // and pinned by test: the flip records the model that
+                // produced the vectors, never a config re-read.
+                let descriptor = match &self.serving {
+                    Some(serving) => Some(serving.clone()),
+                    None => configured_embedding_descriptor_in(
+                        &self.embed_config_dir,
+                        self.dimensions,
+                    )
+                    .ok(),
+                };
+                if let Some(descriptor) = descriptor {
+                    let state = crate::model_choice::StoreState {
+                        version: crate::model_choice::STORE_STATE_VERSION,
+                        has_data: true,
+                        descriptor,
+                    };
+                    if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &state)
+                    {
+                        tracing::error!(
+                            "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
+                        );
+                    }
+                    self.set_cached_store_state(CachedStoreState::Recorded(state));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl LadybugStore {
     /// Construct a `LadybugStore` for tests with a small system footprint so
     /// `cargo test` (parallel by default) does not mmap-reserve 8 TiB per
@@ -1687,16 +1808,21 @@ impl LadybugStore {
     /// store with the configured model's width and the store's
     /// FLOAT[width] column is the width its vectors actually have.
     fn configured_embedding_descriptor(&self) -> Result<crate::traits::EmbeddingDescriptor> {
-        let configured = crate::embed::configured_model_in(&self.embed_config_dir)?;
-        Ok(crate::traits::EmbeddingDescriptor {
-            provider: "fastembed".into(),
-            model: configured.model_name,
-            revision: "onnx".into(),
-            dims: self.dimensions,
-            normalization: "unknown".into(),
-            preprocessing: "unknown".into(),
-            distance_metric: "cosine".into(),
-        })
+        configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
+    }
+
+    /// The first-write flip handle for this store (see [`FirstWriteFlip`]):
+    /// a snapshot of the flip's inputs taken at upsert entry — the shared
+    /// store-state cache, the sidecar path, the serving descriptor this
+    /// process writes under, and the configured-descriptor inputs.
+    fn first_write_flip(&self) -> FirstWriteFlip {
+        FirstWriteFlip {
+            store_state: Arc::clone(&self.store_state),
+            local_path: self.local_path.clone(),
+            serving: self.serving_descriptor(),
+            embed_config_dir: self.embed_config_dir.clone(),
+            dimensions: self.dimensions,
+        }
     }
 
     /// Load (once per process) this store's view of the store-state
@@ -1922,53 +2048,11 @@ impl LadybugStore {
     }
 
     /// Flip the sidecar to data-bearing after the first successful
-    /// upsert. Monotonic: only a pristine state flips, the recorded
-    /// descriptor is kept, and nothing ever flips back. A failed sidecar
-    /// write is logged loudly and the in-memory state still flips, so
-    /// this process keeps treating the store as data-bearing.
+    /// upsert. The flip logic lives on [`FirstWriteFlip`] so the
+    /// committing write task performs it (see `upsert`); this entry
+    /// point delegates to a handle built from `&self`.
     fn flip_store_state_to_data(&self) {
-        match self.cached_store_state() {
-            CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
-                recorded.has_data = true;
-                if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &recorded)
-                {
-                    tracing::error!(
-                        "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
-                    );
-                }
-                self.set_cached_store_state(CachedStoreState::Recorded(recorded));
-            }
-            CachedStoreState::FreshUnrecorded => {
-                // The pristine sidecar could not be written at init;
-                // record the data flip directly. The descriptor is the
-                // serving one when this process has an embedder (the
-                // model that produced the vectors), else the configured
-                // one. A recorded descriptor, once present, is never
-                // rewritten by the flip — this branch runs only when
-                // none exists yet. The serving preference is deliberate
-                // and pinned by test: the flip records the model that
-                // produced the vectors, never a config re-read.
-                let descriptor = match self.serving_descriptor() {
-                    Some(serving) => Some(serving),
-                    None => self.configured_embedding_descriptor().ok(),
-                };
-                if let Some(descriptor) = descriptor {
-                    let state = crate::model_choice::StoreState {
-                        version: crate::model_choice::STORE_STATE_VERSION,
-                        has_data: true,
-                        descriptor,
-                    };
-                    if let Err(e) = crate::model_choice::write_store_state(&self.local_path, &state)
-                    {
-                        tracing::error!(
-                            "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
-                        );
-                    }
-                    self.set_cached_store_state(CachedStoreState::Recorded(state));
-                }
-            }
-            _ => {}
-        }
+        self.first_write_flip().flip_store_state_to_data();
     }
 
     /// The legacy placeholder identity: the last
@@ -4331,6 +4415,11 @@ impl VectorStore for LadybugStore {
         // here rather than at init.
         self.check_data_bearing_identity()?;
 
+        // The first-data flip handle, snapshotted at entry: one clone
+        // moves into the write closure below, so the task that commits
+        // the first write records the transition itself.
+        let first_write_flip = self.first_write_flip();
+
         // Every upsert is one sample of the MemoryCount series for the
         // namespace; anomalies surface through the rolling detector.
         self.metrics.record(
@@ -4630,6 +4719,15 @@ impl VectorStore for LadybugStore {
             );
 
             conn.query(&insert_query)?;
+
+            // The core MERGE has landed, so this write's data is in the
+            // store: record the first-data transition here, in the
+            // committing task, before the best-effort edge bookkeeping.
+            // The caller may already have been released by the write
+            // deadline; the transition must not depend on what the
+            // caller observed. Monotonic and idempotent, so a
+            // collision-retry re-run of this closure is safe.
+            first_write_flip.flip_store_state_to_data();
 
             // Emit shape warnings after successful row write.
             for w in &shape_warnings {
@@ -4970,10 +5068,10 @@ impl VectorStore for LadybugStore {
         .await;
         if outcome.is_ok() {
             self.lexical_apply_doc(lexical_doc);
-            // The first successful upsert is the moment the
-            // store stops being pristine; record it in the sidecar after
-            // the engine accepted the write, before upsert returns.
-            self.flip_store_state_to_data();
+            // No caller-side first-data flip: the committing task
+            // already recorded the transition inside the write closure
+            // (see above), so it is recorded even when this caller was
+            // released by the deadline before the write landed.
         }
         outcome
     }
@@ -14949,6 +15047,84 @@ eurostrata\src\daemon.rs",
             !crate::model_choice::store_has_data(&fx.db),
             "a failed upsert must not flip has_data"
         );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn upsert_times_out_to_caller_but_committing_task_records_first_data() {
+        // The finding's scenario: a first write that outlives the
+        // caller's deadline inside its committing task. The deadline
+        // releases the caller, not the query — the blocking task keeps
+        // running and its MERGE lands — so the first-data transition
+        // must be recorded by that task, not by the caller.
+        //
+        // The slowdown is the write closure's own edge bookkeeping:
+        // thousands of declared-but-missing edge targets keep the
+        // committing task busy for seconds after the core MERGE lands
+        // (measured ~4.6 s per 2,000 targets on the gate VM; 4,000 are
+        // declared here), against a 1 s caller deadline. Holding the
+        // store's write turn to queue the write instead does not
+        // reproduce the scenario at this HEAD: upsert's pre-write reads
+        // take the same turn through `with_conn` with no deadline, so a
+        // held turn deadlocks the upsert before its write task exists,
+        // and a write still queued when its deadline fires is dropped
+        // with the timed future, never committed.
+        let previous = without_model_env();
+        let fx = store_state_fixture("flip-timeout", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "init on a fresh store records a pristine sidecar"
+        );
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(false));
+
+        let mut payload = store_state_payload();
+        payload.metadata = json!({
+            "related_to": (0..4000)
+                .map(|i| format!("missing-target-{i}"))
+                .collect::<Vec<_>>(),
+        });
+        let previous_timeout = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        let timed_out = store.upsert("probe", "m1", vec![0.0; 4], payload).await;
+        // write_timeout() is read at invocation, so restoring the var
+        // now cannot affect the already-running task.
+        match previous_timeout {
+            Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
+            None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
+        }
+        let err = timed_out.expect_err("the slow first write must time out to the caller");
+        assert!(
+            err.to_string().contains("the database is busy"),
+            "the caller must see the deadline error: {err}"
+        );
+
+        // The committing task is still running its edge bookkeeping;
+        // its MERGE has landed, so the sidecar must flip without the
+        // caller ever having observed success.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut flipped = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(state) = crate::model_choice::read_store_state(&fx.db) {
+                if state.has_data {
+                    flipped = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            flipped,
+            "the committing task must flip has_data after its write lands, even though the caller timed out"
+        );
+        let landed = store.get("probe", "m1").await.expect("get");
+        assert!(landed.is_some(), "the timed-out write actually landed");
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
