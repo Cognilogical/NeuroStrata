@@ -1897,11 +1897,15 @@ impl LadybugStore {
     /// re-read never creates, adopts, or rewrites the record: a
     /// long-lived process that started before a setup pick landed
     /// adopts nothing, on any number of repeated inits, and a process
-    /// with no serving embedder never moves the record in either
-    /// direction. Data-bearing and pre-fix stores are never written
-    /// here. Best effort: a sidecar failure must not fail init for
-    /// stores the feature never touches, so errors are logged, not
-    /// propagated.
+    /// with no serving embedder never moves an *existing* record in
+    /// either direction. The one exception is creation: a fresh store
+    /// has no record to move, and the creating process is the only
+    /// one that can attest the store was born under this build, so
+    /// an unbound creation records its birth identity from the
+    /// configured descriptor. Data-bearing and pre-fix stores are
+    /// never written here. Best effort: a sidecar failure must not
+    /// fail init for stores the feature never touches, so errors are
+    /// logged, not propagated.
     fn maintain_store_state(&self) {
         match self.cached_store_state() {
             CachedStoreState::Recorded(recorded) if !recorded.has_data => {
@@ -1938,6 +1942,38 @@ impl LadybugStore {
                             Err(e) => {
                                 tracing::warn!("store-state sidecar write failed: {e}")
                             }
+                        }
+                    }
+                } else {
+                    // No serving embedder: this process created the
+                    // store on this open (FreshUnrecorded is reachable
+                    // only when the DB file did not pre-exist), so it
+                    // records the birth identity from the configured
+                    // descriptor — the model the store's table was
+                    // physically created under. Best-effort: on
+                    // resolution or write failure, log and write
+                    // nothing, leaving today's behavior for this open.
+                    match self.configured_embedding_descriptor() {
+                        Ok(configured) => {
+                            let state = crate::model_choice::StoreState {
+                                version: crate::model_choice::STORE_STATE_VERSION,
+                                has_data: false,
+                                descriptor: configured,
+                            };
+                            match crate::model_choice::write_store_state(&self.local_path, &state)
+                            {
+                                Ok(()) => {
+                                    self.set_cached_store_state(CachedStoreState::Recorded(state))
+                                }
+                                Err(e) => {
+                                    tracing::warn!("store-state sidecar write failed: {e}")
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "configured model did not resolve for the store-state sidecar: {e}"
+                            )
                         }
                     }
                 }
@@ -15518,19 +15554,113 @@ eurostrata\src\daemon.rs",
         drop(opener);
         let _ = std::fs::remove_dir_all(&fx.root);
 
-        // And a fresh store opened without a serving embedder records
-        // nothing at all.
+        // Contrast the creation case: a fresh store *created* by a
+        // non-serving open has no existing record to move, and the
+        // creating process is the only provenance witness, so it is
+        // born recorded under the configured model — unlike the
+        // existing record above, which a non-serving open never moves.
         let fx2 = store_state_fixture("non-serving-fresh", "ModelA");
         let fresh = LadybugStore::for_testing(&fx2.db, 4)
             .expect("open fresh database")
             .with_embed_config_dir(&fx2.config_dir);
         fresh.init("probe").await.expect("init");
         assert!(
-            !crate::model_choice::store_state_path(&fx2.db).exists(),
-            "a non-serving open of a fresh store records no descriptor"
+            crate::model_choice::store_state_path(&fx2.db).exists(),
+            "a non-serving open that creates a fresh store records its birth descriptor"
+        );
+        let sidecar = read_sidecar(&fx2.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "a store created without a serving embedder is born recorded under the configured model"
         );
         drop(fresh);
         let _ = std::fs::remove_dir_all(&fx2.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn unbound_created_store_is_born_recorded_and_adoptable() {
+        // The verifier's N1 shape, permanent: a store created by an
+        // unbound (non-serving) init is born Recorded{pristine,
+        // configured}, so the setup choice stays offerable, a later
+        // serving open can adopt a different same-width model, and
+        // once data lands the identity check refuses a third model.
+        let previous = without_model_env();
+        let fx = store_state_fixture("n1-unbound-born-recorded", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        assert!(
+            crate::model_choice::store_state_path(&fx.db).exists(),
+            "a store created by an unbound open is born recorded: its sidecar exists"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "the birth record names the configured model"
+        );
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "a born-recorded pristine store reads as having no data"
+        );
+        drop(creator);
+
+        // A serving-bound init under a different same-width model
+        // adopts through the existing pristine arm, and a write lands
+        // and flips to data-bearing under the adopted descriptor.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let adopter = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        adopter.init("probe").await.expect("adopting init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelB"),
+            "the serving open adopts the configured pick over the birth record"
+        );
+        adopter
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("a write lands under the adopted model");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelB"),
+            "the first write flips to data-bearing under the adopted descriptor"
+        );
+        drop(adopter);
+
+        // A subsequent open under a third same-width model is refused
+        // by the identity check.
+        write_embedders_config(&fx.config_dir, "ModelC");
+        let refused = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelC")));
+        let err = refused
+            .init("probe")
+            .await
+            .expect_err("a third same-width model is refused on a data-bearing store");
+        assert!(
+            embedding_identity_refusal_message(&err).is_some(),
+            "the refusal is the identity check: {err}"
+        );
+        drop(refused);
+        let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
 
@@ -16041,6 +16171,10 @@ eurostrata\src\daemon.rs",
             .with_embed_config_dir(&fx.config_dir);
         creator.init("probe").await.expect("init");
         drop(creator);
+        // Build the genuine legacy on-disk shape: the DB exists, the
+        // sidecar file is deleted, and the next instance reopens with
+        // db_preexisting true and a cold cache.
+        let _ = std::fs::remove_file(crate::model_choice::store_state_path(&fx.db));
         assert!(
             !crate::model_choice::store_state_path(&fx.db).exists(),
             "the pre-sidecar fixture carries no sidecar"
@@ -16089,6 +16223,10 @@ eurostrata\src\daemon.rs",
             .with_embed_config_dir(&fx.config_dir);
         creator.init("probe").await.expect("init");
         drop(creator);
+        // Build the genuine legacy on-disk shape: the DB exists, the
+        // sidecar file is deleted, and the next instance reopens with
+        // db_preexisting true and a cold cache.
+        let _ = std::fs::remove_file(crate::model_choice::store_state_path(&fx.db));
 
         let store = LadybugStore::for_testing(&fx.db, 8)
             .expect("reopen temp database")
@@ -16338,14 +16476,18 @@ eurostrata\src\daemon.rs",
         // model that produced the vectors — not the configured one.
         let previous = without_model_env();
         let fx = store_state_fixture("a5-flip-prefers-serving", "ModelA");
+        // Setup re-routed into FreshUnrecorded via a bound-divergent
+        // init: serving is bound to a descriptor that differs from
+        // the fixture's configured model, so the FreshUnrecorded arm
+        // writes nothing. (The old setup assertion — an unbound init
+        // of a fresh store records nothing — is removed: it is
+        // superseded by `unbound_created_store_is_born_recorded_and_adoptable`,
+        // which pins that an unbound creation is now born recorded.)
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
-            .with_embed_config_dir(&fx.config_dir);
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelDivergent")));
         store.init("probe").await.expect("init");
-        assert!(
-            !crate::model_choice::store_state_path(&fx.db).exists(),
-            "an unbound init of a fresh store records nothing"
-        );
         store.set_serving_descriptor(Some(serving_descriptor_for("ModelServed")));
         store
             .upsert(
