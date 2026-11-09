@@ -2013,6 +2013,58 @@ impl LadybugStore {
         }
     }
 
+    /// The stamp step of the #74 LockedUnknown provenance upgrade,
+    /// re-attesting emptiness at stamp time (overseer panel
+    /// condition 3, findings SA-F1 + N1).
+    ///
+    /// The first attestation happens inside `init`'s schema closure,
+    /// under that instance's writer's turn; the stamp itself runs
+    /// after the closure returns, and stamping alone re-checks only
+    /// cached state + serving == configured — never emptiness again.
+    /// A write landing between the attestation and the stamp would
+    /// therefore be stamped over as if the store were pristine. Two
+    /// shapes reach that window: an intra-instance write from a
+    /// primed non-canonical writer, and — needing no priming at
+    /// all — a write from a second `LadybugStore` instance on the
+    /// same database, whose `write_lock` is a different per-Self
+    /// lock and so shares no turn with this instance. Re-attesting
+    /// inside a fresh writer's turn at stamp time closes both: the
+    /// stamp lands only when the engine still attests the table
+    /// empty at that moment, with the same DDL the schema closure
+    /// used (see [`memory_table_ddl`]).
+    ///
+    /// The helper's width leg on this second call is safe both
+    /// ways: for a still-empty store the width was already
+    /// reconciled by the first attestation, so the physical width
+    /// already matches and nothing is dropped; if rows landed in
+    /// the window, the helper's row-count check returns `false`
+    /// before any drop/recreate is considered.
+    ///
+    /// Fail-closed and best-effort, matching the stamp's existing
+    /// contract: a false re-attestation or a failed turn leaves the
+    /// store unstamped and LockedUnknown, and `init` still succeeds
+    /// — a later init can retry the upgrade.
+    async fn reattest_and_upgrade_empty_locked_unknown_store_state(&self, dimensions: usize) {
+        let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
+        let reattested_empty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reattested_flag = reattested_empty.clone();
+        let outcome = self
+            .write_with_deadline("re-attesting an empty LockedUnknown store", move |conn| {
+                let attested_empty = reconcile_empty_locked_unknown_width(
+                    conn,
+                    dimensions,
+                    &create_node_table,
+                    &create_rel_tables,
+                )?;
+                reattested_flag.store(attested_empty, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })
+            .await;
+        if outcome.is_ok() && reattested_empty.load(std::sync::atomic::Ordering::Acquire) {
+            self.upgrade_empty_locked_unknown_store_state();
+        }
+    }
+
     /// Whether the serving descriptor equals the currently configured
     /// descriptor (a fresh `embedders.json` re-read). A resolution
     /// failure is logged and reads as "no match": adoption is opt-in on
@@ -4192,6 +4244,37 @@ impl LadybugStore {
     }
 }
 
+/// The Memory schema DDL at `dimensions`: the node-table string
+/// and the five rel-table strings `init`'s schema closure runs.
+/// Single-sourced so the #74 provenance re-attestation at stamp
+/// time (see
+/// `LadybugStore::reattest_and_upgrade_empty_locked_unknown_store_state`)
+/// reconciles with exactly the DDL the schema closure used — the
+/// strings are deterministic from `dimensions`.
+fn memory_table_ddl(dimensions: usize) -> (String, [&'static str; 5]) {
+    let create_node_table = format!(
+        "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
+        dimensions
+    );
+    let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
+    let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
+    let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
+    // Vocabulary v10: extraction edges (memory -> task) behind Lock 2.
+    let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
+    // F7: dependency edges (directed).
+    let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
+    (
+        create_node_table,
+        [
+            create_rel_table,
+            create_contains_table,
+            create_governs_table,
+            create_extracted_table,
+            create_depends_table,
+        ],
+    )
+}
+
 /// The LockedUnknown counterpart of
 /// [`reconcile_pristine_embedding_width`] (issue #74): attest from the
 /// engine whether the Memory table is empty, reconciling its physical
@@ -4479,28 +4562,13 @@ impl VectorStore for LadybugStore {
         // with_conn releases it on timeout while the C++ call is still running.
         let outcome = self.write_with_deadline("initializing schema", move |conn| {
 
-            let create_node_table = format!(
-                "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{}], PRIMARY KEY (id))",
-                dimensions
-            );
+            let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
             if let Err(e) = conn.query(&create_node_table) {
                 if !e.to_string().contains("already exists") {
                     return Err(e.into());
                 }
             }
 
-            let create_rel_table = "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-
-            let create_contains_table = "CREATE REL TABLE CONTAINS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-
-            let create_governs_table = "CREATE REL TABLE GOVERNS (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-
-            // Vocabulary v10: extraction edges (memory -> task) behind Lock 2.
-            let create_extracted_table = "CREATE REL TABLE EXTRACTED_FROM (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-
-            // F7: dependency edges (directed).
-            let create_depends_table = "CREATE REL TABLE DEPENDS_ON (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)";
-            let create_rel_tables = [create_rel_table, create_contains_table, create_governs_table, create_extracted_table, create_depends_table];
             for ddl in create_rel_tables {
                 if let Err(e) = conn.query(ddl) {
                     if !e.to_string().contains("already exists") {
@@ -4660,8 +4728,21 @@ impl VectorStore for LadybugStore {
             // descriptor (see `upgrade_empty_locked_unknown_store_state`);
             // the general maintenance below then proceeds as for any
             // recorded-pristine store.
+            //
+            // The stamp is gated on a FRESH attestation taken at
+            // stamp time, not only the in-closure one above: a write
+            // can land between the closure's attestation and this
+            // stamp — from a primed non-canonical writer in this
+            // instance, or, with no priming at all, from a second
+            // LadybugStore instance on the same database, whose
+            // per-Self `write_lock` shares no turn with this one —
+            // and the stamp alone re-checks only cached state and
+            // serving == configured, so it would record a pristine
+            // identity over live data (overseer panel condition 3,
+            // findings SA-F1 + N1).
             if locked_unknown_attested_empty.load(std::sync::atomic::Ordering::Acquire) {
-                self.upgrade_empty_locked_unknown_store_state();
+                self.reattest_and_upgrade_empty_locked_unknown_store_state(dimensions)
+                    .await;
             }
             // First successful init: record the store's pristine state
             // (or adopt a new configured descriptor while pristine).
@@ -16515,6 +16596,91 @@ eurostrata\src\daemon.rs",
                 "the store is left as found: the count query still fails afterwards"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn locked_unknown_stamp_step_reattests_and_skips_store_with_landed_row() {
+        // Panel condition 3 (findings SA-F1 + N1): the #74 upgrade
+        // attested emptiness inside init's schema closure but stamped
+        // the pristine sidecar afterwards without re-checking it, so
+        // a write landing between the attestation and the stamp was
+        // stamped over as if the store were pristine. A deterministic
+        // mid-init interleave is not constructible with existing
+        // seams (no hook runs between the attestation and the stamp),
+        // so this pins the behavior at the stamp-step seam itself,
+        // following this program's disclosed-seam precedent: build
+        // the state init would be in after a positive attestation —
+        // a LockedUnknown store, serving == configured, with a row
+        // now landed in the window — and invoke the stamp step
+        // directly, exactly as init does.
+        let previous = without_model_env();
+        let fx = store_state_fixture("cond3-stamp-reattest", "ModelA");
+
+        // The pre-sidecar store: a non-serving open creates the DB
+        // file and schema but records no sidecar, so every later
+        // construction classifies LockedUnknown.
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+
+        // One row lands through a second LadybugStore instance on
+        // the same database — the cross-instance shape (N1): that
+        // instance's per-Self write_lock shares no turn with the
+        // instance that will run the stamp step. The fixtures
+        // support sequential handles only, so the writer is dropped
+        // before the stamping instance opens; the state the stamp
+        // step then faces — LockedUnknown with a row present — is
+        // exactly the state the mid-init window produces.
+        let writer = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        writer.init("probe").await.expect("init");
+        writer
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the second instance's write lands");
+        drop(writer);
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the landed write backfills no sidecar"
+        );
+
+        // The stamping instance: serving bound and == configured,
+        // cached state LockedUnknown. Invoking the stamp step here
+        // must re-attest, find the row, and stamp nothing.
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "precondition: the stamping instance classifies LockedUnknown"
+        );
+        store
+            .reattest_and_upgrade_empty_locked_unknown_store_state(4)
+            .await;
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the stamp step must not record a pristine sidecar over a landed row"
+        );
+        assert!(
+            matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
+            "the cached state stays LockedUnknown when the re-attestation finds rows"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
     }
 
     /// The physical width of `Memory.embedding` as the engine's
