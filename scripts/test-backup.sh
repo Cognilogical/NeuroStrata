@@ -11,6 +11,9 @@
 #   3. Pair-aware pruning: with NEUROSTRATA_MAX_BACKUPS exceeded, pruned
 #      backups lose their companions with them, surviving backups keep
 #      theirs, and no orphan companion is left behind.
+#   4. Failure contract: a sidecar-only verify failure (step 4b) exits
+#      non-zero, deletes BOTH the backup db and its companion, and
+#      leaves the source db and source sidecar byte-untouched.
 #
 # How to run: scripts/test-backup.sh
 #   Exits 0 and prints a PASS summary when every assertion holds; exits
@@ -66,6 +69,20 @@ chmod +x "$SHIM_DIR/systemctl"
 run_backup() {
     local config="$1" backup_dir="$2" max_backups="$3" rc=0
     env PATH="$SHIM_DIR:$PATH" \
+        NEUROSTRATA_CONFIG="$config" \
+        NEUROSTRATA_BACKUP_DIR="$backup_dir" \
+        NEUROSTRATA_MAX_BACKUPS="$max_backups" \
+        NEUROSTRATA_SERVICE="neurostrata-test.service" \
+        bash "$BACKUP_SH" >"$WORK/last-run.log" 2>&1 || rc=$?
+    return "$rc"
+}
+
+# run_backup_path <extra_path_dir> <config> <backup_dir> <max_backups>:
+# like run_backup, with one extra directory prepended to PATH (scenario
+# 4's corrupting cp shim); returns backup.sh's exit code.
+run_backup_path() {
+    local extra_path="$1" config="$2" backup_dir="$3" max_backups="$4" rc=0
+    env PATH="$extra_path:$SHIM_DIR:$PATH" \
         NEUROSTRATA_CONFIG="$config" \
         NEUROSTRATA_BACKUP_DIR="$backup_dir" \
         NEUROSTRATA_MAX_BACKUPS="$max_backups" \
@@ -224,4 +241,64 @@ done
 shopt -u nullglob
 pass "scenario 3: no orphan companion exists"
 
-echo "PASS: all $CHECKS checks passed (backup sidecar carry + pair-aware pruning)"
+# --- Scenario 4: sidecar failure contract (step 4b) -----------------------
+# A cp shim corrupts ONLY the companion copy: it delegates to the real
+# cp, then appends a byte when the destination is a *.store-state.json
+# path. The db copy passes through uncorrupted, so backup.sh clears
+# step 4's db md5 check and reaches step 4b, where the companion's real
+# md5 mismatch must delete BOTH copies and exit non-zero. (Shimming cp,
+# not md5sum: the mismatch is then genuine — real bytes checked by the
+# real md5sum — instead of a lying verifier.)
+echo "== scenario 4: sidecar verify failure deletes both copies"
+S4="$WORK/s4"
+CONFIG4="$(make_store "$S4/store" 1)"
+cp -p "$S4/store/store.db" "$S4/expected.db"
+cp -p "$S4/store/store.db.store-state.json" "$S4/expected.sidecar"
+
+CP_SHIM_DIR="$WORK/cp-shim"
+mkdir -p "$CP_SHIM_DIR"
+cat > "$CP_SHIM_DIR/cp" <<'EOF'
+#!/usr/bin/env bash
+# Delegate to the real cp (first cp on PATH outside this shim's own
+# directory), then corrupt a companion destination by appending a byte.
+self_dir="$(cd "$(dirname "$0")" && pwd)"
+real_cp=""
+OLDIFS="$IFS"; IFS=:
+for d in $PATH; do
+    [ "$d" = "$self_dir" ] && continue
+    if [ -x "$d/cp" ]; then real_cp="$d/cp"; break; fi
+done
+IFS="$OLDIFS"
+[ -n "$real_cp" ] || exit 127
+dest=""
+for a in "$@"; do dest="$a"; done
+"$real_cp" "$@" || exit $?
+case "$dest" in
+    *.store-state.json) printf 'x' >> "$dest" ;;
+esac
+EOF
+chmod +x "$CP_SHIM_DIR/cp"
+
+if run_backup_path "$CP_SHIM_DIR" "$CONFIG4" "$S4/backups" 7; then
+    cat "$WORK/last-run.log" >&2
+    fail "scenario 4: backup.sh exited 0 on a sidecar verify failure (see log above)"
+fi
+pass "scenario 4: backup.sh exits non-zero on sidecar verify failure"
+
+[ "$(count_backups "$S4/backups")" = "0" ] \
+    || fail "scenario 4: backup db file survived a sidecar verify failure"
+pass "scenario 4: backup db file is deleted on sidecar verify failure"
+
+[ "$(count_companions "$S4/backups")" = "0" ] \
+    || fail "scenario 4: companion file survived a sidecar verify failure"
+pass "scenario 4: companion file is deleted on sidecar verify failure"
+
+cmp -s "$S4/expected.db" "$S4/store/store.db" \
+    || fail "scenario 4: source db bytes changed"
+pass "scenario 4: source db is byte-untouched"
+
+cmp -s "$S4/expected.sidecar" "$S4/store/store.db.store-state.json" \
+    || fail "scenario 4: source sidecar bytes changed"
+pass "scenario 4: source sidecar is byte-untouched"
+
+echo "PASS: all $CHECKS checks passed (backup sidecar carry + pair-aware pruning + sidecar failure contract)"
