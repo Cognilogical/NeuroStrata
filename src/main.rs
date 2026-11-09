@@ -893,6 +893,34 @@ fn bind_fallback_serving_descriptor(
     }
 }
 
+/// Prepare the fallback store for a write arm (Add, Edit): bind the
+/// serving descriptor, then initialize the store under it.
+///
+/// `init` is the step that runs the store-state maintenance
+/// (`maintain_store_state`): on a store recorded pristine under a
+/// different model, it adopts the serving descriptor when serving
+/// matches the configuration — which is exactly the descriptor a
+/// fallback arm binds, because it built its embedder from the
+/// configuration. Without this step the write arms dispatched
+/// straight to `upsert`, whose first-write guard refuses a pristine
+/// store whose recorded descriptor differs from serving with
+/// restart guidance this path could never satisfy: re-running the
+/// command bound and upserted again, still with no init, so the
+/// demanded adoption never occurred (issue #75). The daemon write
+/// half has always ordered its work this way
+/// (`embed_dedup_and_upsert` inits before it embeds or upserts);
+/// the fallback write arms now follow the same pattern. Read arms
+/// deliberately do not use this helper: they gain no init side
+/// effects they do not have today.
+async fn prepare_fallback_write_store(
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn crate::traits::Embedder>,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    bind_fallback_serving_descriptor(vector_store, embedder);
+    vector_store.init(namespace).await
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -2657,6 +2685,250 @@ mod tests {
         );
 
         assert!(gate_verify_daemon(None, own).is_err());
+    }
+
+    /// An embedder serving ModelB at the fixture width: its descriptor
+    /// is the shape `FastEmbedder::embedding_descriptor` produces for
+    /// the ModelB entry, matching the descriptor the store synthesizes
+    /// for the same configured entry.
+    struct FallbackModelBEmbedder;
+
+    #[async_trait::async_trait]
+    impl crate::traits::Embedder for FallbackModelBEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.1, 0.2, 0.3, 0.4])
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn embedder_id(&self) -> &str {
+            "ModelB"
+        }
+        fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
+            crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelB".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }
+        }
+    }
+
+    /// Regression test for issue #75 (Codex finding T6 on PR #66): the
+    /// daemon-stopped fallback `add` on a store recorded pristine
+    /// under the default model, after the user configured a different
+    /// model. The fallback process serves the configured model, so
+    /// the pristine record must be adopted in this process and the
+    /// add must proceed — re-running `add` must not loop on the
+    /// guard's restart guidance forever.
+    #[tokio::test]
+    async fn fallback_add_on_pristine_store_adopts_configured_model_and_writes() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-add-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let sidecar = |db: &std::path::Path| -> serde_json::Value {
+            let content =
+                std::fs::read_to_string(crate::model_choice::store_state_path(db)).unwrap();
+            serde_json::from_str(&content).unwrap()
+        };
+
+        // The store as the daemon left it: recorded pristine under
+        // the default model (ModelA here).
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
+                provider: "fastembed".to_string(),
+                model: "ModelA".to_string(),
+                revision: "onnx".to_string(),
+                dims: 4,
+                normalization: "unknown".to_string(),
+                preprocessing: "unknown".to_string(),
+                distance_metric: "cosine".to_string(),
+            }));
+        seed.init("probe").await.expect("seed init");
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelA")
+        );
+        drop(seed);
+
+        // The user configured ModelB; the daemon is stopped, so the
+        // fallback arm runs: it constructs its store unbound, builds
+        // the configured embedder, and binds its descriptor.
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let vector = embedder
+            .embed("a memory added while the daemon is stopped")
+            .await
+            .expect("embed");
+        let payload = crate::traits::MemoryPayload {
+            content: "a memory added while the daemon is stopped".to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+        vector_store
+            .upsert("probe", "fallback-m1", vector, payload)
+            .await
+            .expect("the fallback add must adopt the pristine record and proceed");
+        assert_eq!(
+            sidecar(&db_path)["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
+        let found = vector_store
+            .search("probe", vec![0.1, 0.2, 0.3, 0.4], 5, false, false)
+            .await
+            .expect("search under the adopted model");
+        assert!(!found.is_empty(), "the added row is searchable");
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+    }
+
+    /// The sibling fallback Edit arm shares the Add arm's shape —
+    /// bind a serving descriptor, then write through `edit_memory`'s
+    /// `upsert` with no init — so it shares the defect on any store
+    /// whose recorded state is still pristine when its upsert runs
+    /// (here: a row-bearing store whose sidecar still reads pristine,
+    /// the stale-label state the store-state tests construct by hand).
+    /// Its upsert is the same guard's subject, so the arm prepares
+    /// its store through the same helper and the edit proceeds after
+    /// the pristine record is adopted.
+    #[tokio::test]
+    async fn fallback_edit_on_pristine_labelled_store_adopts_and_edits() {
+        let previous = std::env::var("NEUROSTRATA_MODEL").ok();
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        let root =
+            std::env::temp_dir().join(format!("ns-fallback-edit-adopt-{}", uuid::Uuid::new_v4()));
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write_config = |model: &str| {
+            std::fs::write(
+                config_dir.join("embedders.json"),
+                format!("[{{\"model_name\":\"{model}\",\"dimensions\":4}}]"),
+            )
+            .unwrap();
+        };
+        let db_path = root.join("ladybug.db");
+        let descriptor = |model: &str| crate::traits::EmbeddingDescriptor {
+            provider: "fastembed".to_string(),
+            model: model.to_string(),
+            revision: "onnx".to_string(),
+            dims: 4,
+            normalization: "unknown".to_string(),
+            preprocessing: "unknown".to_string(),
+            distance_metric: "cosine".to_string(),
+        };
+        let payload = |content: &str| crate::traits::MemoryPayload {
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            location: String::new(),
+            user_id: "system".to_string(),
+            agent_name: Some("NeuroStrata".to_string()),
+            location_lines: String::new(),
+            metadata: serde_json::json!({}),
+        };
+
+        write_config("ModelA");
+        let seed = LadybugStore::for_testing(&db_path, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&config_dir)
+            .with_serving_descriptor(Some(descriptor("ModelA")));
+        seed.init("probe").await.expect("seed init");
+        seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
+            .await
+            .expect("seed upsert");
+        drop(seed);
+        // The stale label: the sidecar reads pristine under ModelA
+        // although the table holds the seeded row.
+        crate::model_choice::write_store_state(
+            &db_path,
+            &crate::model_choice::StoreState {
+                version: crate::model_choice::STORE_STATE_VERSION,
+                has_data: false,
+                descriptor: descriptor("ModelA"),
+            },
+        )
+        .expect("rewrite the sidecar to the pristine label");
+
+        write_config("ModelB");
+        let vector_store: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen temp database")
+                .with_embed_config_dir(&config_dir),
+        );
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        prepare_fallback_write_store(&vector_store, &embedder, "probe")
+            .await
+            .expect("the fallback write preparation inits the store under the serving model");
+        let outcome = crate::server::edit_memory(
+            &*vector_store,
+            &*embedder,
+            "probe",
+            "m1",
+            "probe",
+            "edited",
+            "",
+        )
+        .await
+        .expect("the fallback edit must adopt the pristine record and proceed");
+        assert!(
+            matches!(outcome, crate::server::EditOutcome::Edited),
+            "the seeded row is edited: {outcome:?}"
+        );
+        let (_, edited) = vector_store
+            .get("probe", "m1")
+            .await
+            .expect("get the edited row")
+            .expect("the edited row exists");
+        assert_eq!(edited.content, "edited");
+        let content = std::fs::read_to_string(crate::model_choice::store_state_path(&db_path))
+            .expect("sidecar exists");
+        let sidecar: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            serde_json::json!("ModelB"),
+            "the pristine record is adopted to the configured model"
+        );
+        drop(vector_store);
+        let _ = std::fs::remove_dir_all(&root);
+        match previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
     }
 }
 
@@ -4513,7 +4785,8 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
-                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         let vector = embedder.embed(&content).await?;
                         let payload = crate::traits::MemoryPayload {
                             content: content.clone(),
@@ -4538,7 +4811,8 @@ async fn run() -> anyhow::Result<()> {
                         location,
                     } => {
                         let embedder = build_embedder()?;
-                        bind_fallback_serving_descriptor(&vector_store, &embedder);
+                        prepare_fallback_write_store(&vector_store, &embedder, &namespace)
+                            .await?;
                         match crate::server::edit_memory(
                             &*vector_store,
                             &*embedder,
