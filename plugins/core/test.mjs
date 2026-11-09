@@ -14,6 +14,8 @@ import {
   formatFileTouchRecallBlock,
   getTrackingState,
   resetClientForTesting,
+  DAEMON_ADVISORY_REMINDER,
+  resetAdvisoryStateForTesting,
   handleHookEvent,
   handleClaudeHookEvent,
   buildSubagentContextHeader,
@@ -2301,6 +2303,59 @@ describe("sessionContextHandler bridge formatting (no [object Object])", () => {
       rmSync(tmpDir, { recursive: true, force: true });
       resetClientForTesting();
     }
+  });
+});
+
+describe("daemon memory advisory on execute.after", () => {
+  async function runWith(texts, sessionID) {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ns-core-advice-"));
+    mkdirSync(join(tmpDir, ".NeuroStrata"), { recursive: true });
+    const { server, url } = await createMockDaemonServer();
+    let afterHandler = null;
+    const events = [];
+    try {
+      await initialize({
+        location: { directory: tmpDir, project: { root: tmpDir, canonical: tmpDir } },
+        session: { hook: () => {} },
+        tool: { hook: (name, cb) => { if (name === "execute.after") afterHandler = cb; } },
+        hooks: {},
+        config: { namespace: "advice-ns", endpoint: url, bearerToken: "tok", strictMode: false, requestTimeoutMs: 200 },
+      });
+      for (const text of texts) {
+        const evt = {
+          name: "neurostrata_search_memory",
+          sessionID,
+          status: "completed",
+          result: { content: text, output: text },
+        };
+        await afterHandler(evt);
+        events.push(evt);
+      }
+    } finally {
+      server.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+      resetClientForTesting();
+    }
+    return events;
+  }
+
+  const failure =
+    "NEUROSTRATA_ADVICE[buffer_pool] Buffer manager exception: The buffer pool is full -- raise storage_hygiene.buffer_pool_mb";
+
+  it("adds the reminder when a result carries the marker, and leaves other results alone", async () => {
+    resetAdvisoryStateForTesting();
+    const [bad, fine] = await runWith([failure, "3 memories found"], "ses-advice-1");
+    assert.ok(bad.result.content.includes(DAEMON_ADVISORY_REMINDER), bad.result.content);
+    assert.ok(bad.result.content.startsWith("NEUROSTRATA_ADVICE[buffer_pool]"), "the original text stays first");
+    assert.match(bad.result.content, /Do not stop, kill or restart the daemon yourself/);
+    assert.ok(!fine.result.content.includes("DAEMON MEMORY ADVISORY"), fine.result.content);
+  });
+
+  it("does not repeat the reminder inside one session within ten minutes", async () => {
+    resetAdvisoryStateForTesting();
+    const [first, second] = await runWith([failure, failure], "ses-advice-2");
+    assert.ok(first.result.content.includes("DAEMON MEMORY ADVISORY"));
+    assert.ok(!second.result.content.includes("DAEMON MEMORY ADVISORY"), "second failure is not reminded again");
   });
 });
 

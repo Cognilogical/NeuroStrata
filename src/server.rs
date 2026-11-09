@@ -1785,7 +1785,7 @@ async fn write_message(writer: &mut io::Stdout, message: &str) -> io::Result<()>
 /// on one is reported to stderr and goes no further. Everything else gets an
 /// error response: a request read and then dropped leaves the client waiting on
 /// an id that never comes back, which is a hang with no error reported
-/// anywhere (bead neurostrata-oty).
+/// anywhere.
 fn failure_line(id: Option<Value>, code: i64, message: &str) -> Option<String> {
     // Notifications (no id) must never receive a response — that is the
     // intended suppression, not an error.
@@ -2986,7 +2986,7 @@ pub(crate) async fn embed_dedup_and_upsert(
 }
 
 // A memory is durable only once checkpointed -- WAL replay restores the catalog
-// but not row insertions (bead neurostrata-kug) -- and this surface used to
+// but not row insertions -- and this surface used to
 // checkpoint after every write to close that window. It cost more than it
 // bought: the engine waits for all transactions to drain before flushing, so
 // under load the checkpoint blocked the writer for minutes and failed anyway
@@ -4462,6 +4462,11 @@ async fn handle_get_snapshot(
     let mut parts: Vec<String> = vec![task_head.to_string()];
     if !hooks_line.is_empty() {
         parts.push(hooks_line.clone());
+    }
+    // Only when memory is high or a query failed for lack of buffer pool; an
+    // agent reads the snapshot first, so this is where it learns of it.
+    if let Some(advisory) = crate::procmem::snapshot_notice() {
+        parts.push(advisory);
     }
     if !golden_section.is_empty() {
         parts.push(golden_section);
@@ -7719,7 +7724,7 @@ async fn handle_search_memory(
 /// when they cloned it. This machine's checkout is .../neurostrata while the
 /// repository is NeuroStrata; the GUI derives the namespace from the folder
 /// name and agents pass the project name, so one project quietly became two
-/// strata (bead neurostrata-fld). Windows and macOS being case-insensitive
+/// strata. Windows and macOS being case-insensitive
 /// means the same directory can be addressed several ways besides.
 ///
 /// An existing namespace wins on a case-insensitive match and keeps the
@@ -7853,7 +7858,7 @@ pub(crate) async fn edit_memory(
 
     // Re-embed whenever the text changes. Reusing the old vector left the row
     // ranked by wording it no longer contained, so correcting a wrong rule kept
-    // the wrong rule findable and hid the correction (bead neurostrata-vbj).
+    // the wrong rule findable and hid the correction.
     let vector = if payload.content == content {
         vector
     } else {

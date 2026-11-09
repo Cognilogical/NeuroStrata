@@ -1439,6 +1439,7 @@ fn with_buffer_pool(cfg: SystemConfig) -> SystemConfig {
     let env = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
     let (mb, note) = resolve_buffer_pool_mb(configured, env.as_deref());
     BUFFER_POOL_MB_IN_USE.store(mb, std::sync::atomic::Ordering::Relaxed);
+    crate::procmem::set_pool_mb(mb);
     SAID.call_once(|| {
         if let Some(n) = &note {
             eprintln!("WARNING: {n}");
@@ -1464,10 +1465,16 @@ fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
         return e;
     }
     let mb = BUFFER_POOL_MB_IN_USE.load(std::sync::atomic::Ordering::Relaxed);
+    // Counted for the daemon's advice level, and marked so a harness plugin can
+    // tell the agent to bring it to the user.
+    crate::procmem::note_pool_full();
     anyhow::anyhow!(
-        "{text} -- the database engine's buffer pool ({mb} MB) is too small for this query. \
+        "{marker} {text} -- the database engine's buffer pool ({mb} MB) is too small for this query. \
          Raise storage_hygiene.buffer_pool_mb in ~/.config/neurostrata/config.json, or set \
-         NEUROSTRATA_BUFFER_POOL_MB; 0 lets the engine size it, at the cost of memory."
+         NEUROSTRATA_BUFFER_POOL_MB; 0 lets the engine size it, at the cost of memory. \
+         Ask the user before changing anything: the daemon has to be restarted by them \
+         (neurostrata-mcp shutdown), never killed.",
+        marker = crate::procmem::ADVICE_MARKER_BUFFER_POOL
     )
 }
 
@@ -1536,6 +1543,8 @@ mod buffer_pool_tests {
         assert!(text.contains("The buffer pool is full"), "{text}");
         assert!(text.contains("storage_hygiene.buffer_pool_mb"), "{text}");
         assert!(text.contains("NEUROSTRATA_BUFFER_POOL_MB"), "{text}");
+        assert!(text.starts_with("NEUROSTRATA_ADVICE[buffer_pool]"), "{text}");
+        assert!(text.contains("Ask the user"), "{text}");
 
         let other = explain_engine_error(anyhow::anyhow!("Parser exception: nope")).to_string();
         assert_eq!(other, "Parser exception: nope");

@@ -41,19 +41,19 @@ export type ResolvedConfig = PluginConfig;
  *  3. discoverProjectNamespace(cwd)
  * Never falls back to a hardcoded "NeuroStrata".
  */
-export declare function resolveConfig(pluginConfig?: unknown, cwd?: any): PluginConfig;
+export declare function resolveConfig(pluginConfig?: unknown, cwd?: string): PluginConfig;
 /**
  * Walk up from resolve(startDir) to the filesystem root looking for `.git`
  * (dir or file) or `.NeuroStrata`; return the directory containing it, or
  * resolve(startDir) if none found.
  */
-export declare function findProjectRoot(startDir?: any): string;
+export declare function findProjectRoot(startDir?: string): string;
 /**
  * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
  *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
-export declare function discoverProjectNamespace(startDir?: any): string;
+export declare function discoverProjectNamespace(startDir?: string): string;
 /**
  * Resolve the project root from an OpenCode V2 host context, falling back
  * through ctx fields to process.cwd(). Priority:
@@ -333,6 +333,16 @@ export declare const pendingRecallByCall: Map<string, string>;
  * `event.toolName` is checked first.
  */
 export declare function extractToolName(event: any): string;
+/**
+ * The daemon puts `NEUROSTRATA_ADVICE[<topic>]` in an error when the database
+ * engine ran out of buffer pool. The error text already says what to change;
+ * this reminder makes sure the agent takes it to the user instead of retrying
+ * or restarting anything itself.
+ */
+export declare const DAEMON_ADVICE_MARKER = "NEUROSTRATA_ADVICE[";
+export declare const DAEMON_ADVISORY_REMINDER: string;
+/** Test hook: forget which sessions have been reminded. */
+export declare function resetAdvisoryStateForTesting(): void;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
 export declare const handleClaudeHookEvent: typeof handleHookEvent;

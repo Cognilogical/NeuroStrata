@@ -1797,6 +1797,30 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
 ]);
 
 /**
+ * The daemon puts `NEUROSTRATA_ADVICE[<topic>]` in an error when the database
+ * engine ran out of buffer pool. The error text already says what to change;
+ * this reminder makes sure the agent takes it to the user instead of retrying
+ * or restarting anything itself.
+ */
+export const DAEMON_ADVICE_MARKER = "NEUROSTRATA_ADVICE[";
+export const DAEMON_ADVISORY_REMINDER =
+  "[NeuroStrata Plugin — DAEMON MEMORY ADVISORY]\n" +
+  "The NeuroStrata daemon reported that its database buffer pool is full, so that query failed. " +
+  "Tell the user, and ask before acting. The fix is to raise storage_hygiene.buffer_pool_mb " +
+  "(~/.config/neurostrata/config.json) or set NEUROSTRATA_BUFFER_POOL_MB, and the user then restarts " +
+  "the daemon with `neurostrata-mcp shutdown` (graceful; the next MCP connection starts a new one). " +
+  "Do not stop, kill or restart the daemon yourself: it is shared with every open IDE and a kill loses " +
+  "memories that are not yet checkpointed.";
+/** Remind again no sooner than this per session, so a retry loop does not repeat it. */
+const ADVISORY_REPEAT_MS = 10 * 60 * 1000;
+const advisoryLastShown = new Map<string, number>();
+
+/** Test hook: forget which sessions have been reminded. */
+export function resetAdvisoryStateForTesting(): void {
+  advisoryLastShown.clear();
+}
+
+/**
  * Read the active task_id from `.NeuroStrata/active_session.json` so the
  * plugin can forward it as parent_task_id on candidate submission, reaching
  * the server-side auto-commit gate (task_id.is_some()) from the live hook.
@@ -1904,6 +1928,17 @@ const executeAfterHandler = async (output: any, secondArg?: any): Promise<any> =
           );
         }
       }
+    }
+  }
+
+  // 4. Daemon memory advisory: a tool result that carries the daemon's marker.
+  if (rawText.includes(DAEMON_ADVICE_MARKER)) {
+    const key = sessionId ?? "__no_session__";
+    const last = advisoryLastShown.get(key);
+    const now = Date.now();
+    if (last === undefined || now - last >= ADVISORY_REPEAT_MS) {
+      advisoryLastShown.set(key, now);
+      suffixParts.push(DAEMON_ADVISORY_REMINDER);
     }
   }
 

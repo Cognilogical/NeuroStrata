@@ -126,6 +126,160 @@ fn mb(bytes: Option<u64>) -> serde_json::Value {
     bytes.map_or(serde_json::Value::Null, |b| serde_json::json!(b / MB))
 }
 
+/// Marker the daemon puts in an error when the database buffer pool is full.
+/// Harness plugins look for it to remind the agent to tell the user.
+pub const ADVICE_MARKER_BUFFER_POOL: &str = "NEUROSTRATA_ADVICE[buffer_pool]";
+
+/// Resident memory (MB) at which the daemon starts to mention it. Idle is about
+/// 860 MB and one large search used to take it to about 1.9 GB, so these are
+/// starting points; `advice` lines in the growth log show when they fire.
+const DEFAULT_WATCH_MB: u64 = 1536;
+/// Resident memory (MB) at which the agent is asked to raise it with the user.
+const DEFAULT_ACT_MB: u64 = 2560;
+
+/// Pool-full failures since the process started.
+static POOL_FULL_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// The buffer pool size in force, in MB; 0 means the engine sized it.
+static POOL_MB: AtomicU64 = AtomicU64::new(0);
+/// The advice level last seen, so the growth log gets one line per change.
+static LAST_LEVEL: AtomicUsize = AtomicUsize::new(0);
+
+/// Called when the engine reports that its buffer pool is full.
+pub fn note_pool_full() {
+    POOL_FULL_ERRORS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Called once the daemon knows which pool size it is running with.
+pub fn set_pool_mb(mb: u64) {
+    POOL_MB.store(mb, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    Ok,
+    Watch,
+    Act,
+}
+
+impl Level {
+    fn as_str(self) -> &'static str {
+        match self {
+            Level::Ok => "ok",
+            Level::Watch => "watch",
+            Level::Act => "act",
+        }
+    }
+    fn index(self) -> usize {
+        match self {
+            Level::Ok => 0,
+            Level::Watch => 1,
+            Level::Act => 2,
+        }
+    }
+}
+
+fn env_mb(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// How worried to be, and why. Pure, so the thresholds are testable. A pool-full
+/// failure is always `Act`: queries are failing. Memory alone is `Watch` at the
+/// first threshold and `Act` at the second. An unknown figure is never a reason.
+pub fn assess(rss_mb: Option<u64>, pool_full_errors: u64, watch_mb: u64, act_mb: u64) -> (Level, String) {
+    if pool_full_errors > 0 {
+        return (
+            Level::Act,
+            format!("the database buffer pool filled up {pool_full_errors} time(s) since the daemon started, and the query that hit it failed"),
+        );
+    }
+    match rss_mb {
+        Some(r) if r >= act_mb => (Level::Act, format!("the daemon is using {r} MB of memory (act threshold {act_mb} MB)")),
+        Some(r) if r >= watch_mb => (Level::Watch, format!("the daemon is using {r} MB of memory (watch threshold {watch_mb} MB)")),
+        _ => (Level::Ok, String::new()),
+    }
+}
+
+/// What the agent should do at this level. Empty when nothing is wrong.
+fn suggestions(level: Level, pool_full_errors: u64, pool_mb: u64) -> Vec<String> {
+    if level == Level::Ok {
+        return Vec::new();
+    }
+    let mut out = vec!["Tell the user what you saw and ask before doing anything about it.".to_string()];
+    if pool_full_errors > 0 {
+        let now = if pool_mb == 0 { "sized by the engine".to_string() } else { format!("{pool_mb} MB") };
+        out.push(format!(
+            "Raise storage_hygiene.buffer_pool_mb in ~/.config/neurostrata/config.json (now {now}) or set NEUROSTRATA_BUFFER_POOL_MB; it takes effect when the daemon restarts."
+        ));
+    } else if level == Level::Act {
+        out.push(
+            "If it keeps growing, the buffer pool cap can be lowered (storage_hygiene.buffer_pool_mb, or NEUROSTRATA_BUFFER_POOL_MB) at some cost in query speed; a restart frees the memory now."
+                .to_string(),
+        );
+    }
+    out.push(
+        "Restarting is the user's to do: `neurostrata-mcp shutdown` (graceful, can take minutes), then the next MCP connection starts a new daemon. It disconnects every IDE that shares the daemon."
+            .to_string(),
+    );
+    out.push("Never kill the daemon process: memories not yet checkpointed are lost.".to_string());
+    out
+}
+
+/// The `advice` object in `neurostrata_storage_status`. Also writes one `advice`
+/// line to the growth log whenever the level changes, so the thresholds can be
+/// tuned from real use.
+fn advice_json(s: Sample) -> serde_json::Value {
+    let rss = s.rss_bytes.map(|b| b / MB);
+    let (watch, act) = (env_mb("NEUROSTRATA_RSS_WATCH_MB", DEFAULT_WATCH_MB), env_mb("NEUROSTRATA_RSS_ACT_MB", DEFAULT_ACT_MB));
+    let pool_full = POOL_FULL_ERRORS.load(Ordering::Relaxed);
+    let pool_mb = POOL_MB.load(Ordering::Relaxed);
+    let (level, reason) = assess(rss, pool_full, watch, act);
+    let previous = LAST_LEVEL.swap(level.index(), Ordering::Relaxed);
+    // Not in tests: they must not write into the real growth log.
+    if !cfg!(test) && previous != level.index() && profile_enabled() {
+        append(
+            &log_path(),
+            &serde_json::json!({
+                "kind": "advice",
+                "ts": now_secs(),
+                "level": level.as_str(),
+                "reason": reason,
+                "rss_mb": rss,
+                "pool_full_errors": pool_full,
+            })
+            .to_string(),
+        );
+    }
+    serde_json::json!({
+        "level": level.as_str(),
+        "reason": reason,
+        "pool_full_errors": pool_full,
+        "buffer_pool_mb": pool_mb,
+        "watch_mb": watch,
+        "act_mb": act,
+        "suggestions": suggestions(level, pool_full, pool_mb),
+    })
+}
+
+/// A short block for `neurostrata_get_snapshot`, which agents read first, or
+/// `None` when memory is fine.
+pub fn snapshot_notice() -> Option<String> {
+    let advice = advice_json(sample());
+    let level = advice["level"].as_str().unwrap_or("ok");
+    if level == "ok" {
+        return None;
+    }
+    let reason = advice["reason"].as_str().unwrap_or("");
+    let mut out = format!("DAEMON MEMORY ADVISORY ({level}): {reason}.");
+    if level == "watch" {
+        out.push_str(" Nothing is failing. Mention it to the user if it matters to what they are doing.");
+        return Some(out);
+    }
+    for (i, step) in advice["suggestions"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).enumerate() {
+        out.push_str(&format!("\n  {}. {}", i + 1, step));
+    }
+    Some(out)
+}
+
 /// The figures `neurostrata_storage_status` reports. Null where the platform
 /// has none, never a made-up zero.
 pub fn status_json() -> serde_json::Value {
@@ -135,6 +289,7 @@ pub fn status_json() -> serde_json::Value {
         "peak_rss_mb": mb(s.peak_bytes),
         "growth_log": log_path().to_string_lossy(),
         "growth_log_threshold_mb": threshold_mb(),
+        "advice": advice_json(s),
     })
 }
 
@@ -260,6 +415,9 @@ async fn run_sampler(
     loop {
         let calls = CALLS.swap(0, Ordering::Relaxed);
         append(&path, &sample_line(sample(), calls, IN_FLIGHT.load(Ordering::SeqCst)));
+        // Evaluates the advice level, so a change is logged even when nobody
+        // asked for the status.
+        let _ = advice_json(sample());
         tokio::select! {
             _ = tokio::time::sleep(every) => {}
             _ = stop.changed() => break,
@@ -348,6 +506,55 @@ mod tests {
         assert_eq!(v["namespace"], "example-project");
         assert_eq!(v["delta_mb"], 300);
         assert_eq!(v["in_flight"], 2);
+    }
+
+    #[test]
+    fn advice_levels_follow_memory_and_pool_failures() {
+        let (w, a) = (1536, 2560);
+        assert_eq!(assess(Some(860), 0, w, a).0, Level::Ok);
+        assert_eq!(assess(Some(1535), 0, w, a).0, Level::Ok);
+        assert_eq!(assess(Some(1536), 0, w, a).0, Level::Watch);
+        assert_eq!(assess(Some(2559), 0, w, a).0, Level::Watch);
+        assert_eq!(assess(Some(2560), 0, w, a).0, Level::Act);
+        assert_eq!(assess(None, 0, w, a).0, Level::Ok, "an unknown figure is not a reason");
+        let (level, reason) = assess(Some(500), 2, w, a);
+        assert_eq!(level, Level::Act, "a failed query is always worth raising");
+        assert!(reason.contains("2 time(s)"), "{reason}");
+    }
+
+    #[test]
+    fn ok_has_no_suggestions_and_act_never_tells_the_agent_to_restart_it() {
+        assert!(suggestions(Level::Ok, 0, 384).is_empty());
+        let act = suggestions(Level::Act, 1, 384).join("\n");
+        assert!(act.contains("ask before"), "{act}");
+        assert!(act.contains("storage_hygiene.buffer_pool_mb"), "{act}");
+        assert!(act.contains("384 MB"), "{act}");
+        assert!(act.contains("neurostrata-mcp shutdown"), "{act}");
+        assert!(act.contains("user's to do"), "{act}");
+        assert!(act.contains("Never kill"), "{act}");
+        let sized_by_engine = suggestions(Level::Act, 1, 0).join("\n");
+        assert!(sized_by_engine.contains("sized by the engine"), "{sized_by_engine}");
+    }
+
+    #[test]
+    fn the_status_carries_an_advice_object_that_is_explicit_when_all_is_well() {
+        let out = status_with_process_memory(&serde_json::json!({"dirty": false}));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let advice = &v["process"]["advice"];
+        assert!(advice["level"].is_string(), "{advice}");
+        assert!(advice["suggestions"].is_array());
+        assert!(advice["watch_mb"].as_u64().unwrap() > 0 && advice["act_mb"].as_u64().unwrap() > advice["watch_mb"].as_u64().unwrap());
+    }
+
+    #[test]
+    fn a_pool_full_failure_is_counted_and_surfaces_in_the_snapshot_notice() {
+        let before = POOL_FULL_ERRORS.load(Ordering::Relaxed);
+        note_pool_full();
+        assert_eq!(POOL_FULL_ERRORS.load(Ordering::Relaxed), before + 1);
+        let notice = snapshot_notice().expect("a pool failure must produce a notice");
+        assert!(notice.starts_with("DAEMON MEMORY ADVISORY (act)"), "{notice}");
+        assert!(notice.contains("1. Tell the user"), "{notice}");
+        assert!(ADVICE_MARKER_BUFFER_POOL.starts_with("NEUROSTRATA_ADVICE["));
     }
 
     #[test]
