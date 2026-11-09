@@ -4217,10 +4217,17 @@ fn reconcile_empty_locked_unknown_width(
     // A query-EXECUTION failure attests nothing either: downgrade
     // it to the same leave-as-found `false` as an unreadable width
     // below — this helper never refuses an open (panel condition 2,
-    // finding P4-F3).
+    // finding P4-F3). The failure is logged, so a store whose
+    // attestation persistently fails is distinguishable from a
+    // healthy legacy store.
     let table_info = match conn.query("CALL table_info('Memory') RETURN *") {
         Ok(rows) => rows,
-        Err(_) => return Ok(false),
+        Err(e) => {
+            tracing::warn!(
+                "provenance attestation could not execute (table_info query failed: {e}); leaving the store as found"
+            );
+            return Ok(false);
+        }
     };
     for row in table_info {
         let name = match row.get(1) {
@@ -4244,10 +4251,16 @@ fn reconcile_empty_locked_unknown_width(
     };
 
     // Same downgrade as the table-info query above: an
-    // unexecutable count attests nothing, so leave as found.
+    // unexecutable count attests nothing, so leave as found —
+    // with the failure logged, as above.
     let mut count_rows = match conn.query("MATCH (m:Memory) RETURN count(m)") {
         Ok(rows) => rows,
-        Err(_) => return Ok(false),
+        Err(e) => {
+            tracing::warn!(
+                "provenance attestation could not execute (row-count query failed: {e}); leaving the store as found"
+            );
+            return Ok(false);
+        }
     };
     let rows = match count_rows.next() {
         Some(row) => match row.get(0) {
