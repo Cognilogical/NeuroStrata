@@ -1382,7 +1382,198 @@ impl Dirty {
 /// and silently drops every record it could not authenticate, which is exactly
 /// the outcome this code exists to make visible.
 fn verifying_config() -> SystemConfig {
-    SystemConfig::default().throw_on_wal_replay_failure(true)
+    with_buffer_pool(SystemConfig::default().throw_on_wal_replay_failure(true))
+}
+
+/// Smallest buffer pool the daemon will run with. Measured on a copy of a
+/// 705 MB store: 96 MB and up completed every query, 64 MB failed 8 of 12
+/// with "Unable to allocate memory! The buffer pool is full". The floor sits
+/// above the last size that worked because the largest query depends on the
+/// data, which grows.
+const MIN_BUFFER_POOL_MB: u64 = 128;
+
+/// The pool size in force, for the error message that tells a caller what to
+/// change. 0 means the engine sized it.
+static BUFFER_POOL_MB_IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What size, in MB, to give the buffer pool, and what to say about it.
+/// `configured` is `storage_hygiene.buffer_pool_mb`; `env` is
+/// `NEUROSTRATA_BUFFER_POOL_MB`, which wins when it parses. 0 means "let the
+/// engine decide". Anything else below the floor is raised to it.
+fn resolve_buffer_pool_mb(configured: u64, env: Option<&str>) -> (u64, Option<String>) {
+    let mut note = None;
+    let wanted = match env.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                note = Some(format!(
+                    "NEUROSTRATA_BUFFER_POOL_MB={v:?} is not a number of megabytes; using {configured} from the config"
+                ));
+                configured
+            }
+        },
+        None => configured,
+    };
+    if wanted == 0 {
+        return (0, note);
+    }
+    if wanted < MIN_BUFFER_POOL_MB {
+        note = Some(format!(
+            "a buffer pool of {wanted} MB is below the {MIN_BUFFER_POOL_MB} MB floor (queries fail under it); using {MIN_BUFFER_POOL_MB} MB"
+        ));
+        return (MIN_BUFFER_POOL_MB, note);
+    }
+    (wanted, note)
+}
+
+/// Caps the engine's buffer pool per `storage_hygiene.buffer_pool_mb` and
+/// `NEUROSTRATA_BUFFER_POOL_MB`. Said once per process, so the log shows what
+/// the daemon is running with.
+fn with_buffer_pool(cfg: SystemConfig) -> SystemConfig {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    // `load`, not `from_default_path`: opening a store must not create a config
+    // file as a side effect. A missing file is the normal case and says nothing.
+    let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
+    let configured = match crate::config::Config::default_path() {
+        Ok(path) if !path.exists() => default_mb,
+        _ => match crate::config::Config::load() {
+            Ok(c) => c.storage_hygiene.buffer_pool_mb,
+            Err(e) => {
+                tracing::warn!("could not read the config for buffer_pool_mb, using {default_mb}: {e}");
+                default_mb
+            }
+        },
+    };
+    let env = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
+    let (mb, note) = resolve_buffer_pool_mb(configured, env.as_deref());
+    BUFFER_POOL_MB_IN_USE.store(mb, std::sync::atomic::Ordering::Relaxed);
+    SAID.call_once(|| {
+        if let Some(n) = &note {
+            eprintln!("WARNING: {n}");
+        }
+        if mb == 0 {
+            eprintln!("Buffer pool: sized by the engine (storage_hygiene.buffer_pool_mb = 0)");
+        } else {
+            eprintln!("Buffer pool: capped at {mb} MB");
+        }
+    });
+    if mb == 0 {
+        cfg
+    } else {
+        cfg.buffer_pool_size(mb * 1024 * 1024)
+    }
+}
+
+/// An engine error that says the buffer pool was too small, with what to do
+/// about it. Any other error passes through unchanged.
+fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
+    let text = e.to_string();
+    if !text.contains("buffer pool is full") {
+        return e;
+    }
+    let mb = BUFFER_POOL_MB_IN_USE.load(std::sync::atomic::Ordering::Relaxed);
+    anyhow::anyhow!(
+        "{text} -- the database engine's buffer pool ({mb} MB) is too small for this query. \
+         Raise storage_hygiene.buffer_pool_mb in ~/.config/neurostrata/config.json, or set \
+         NEUROSTRATA_BUFFER_POOL_MB; 0 lets the engine size it, at the cost of memory."
+    )
+}
+
+#[cfg(test)]
+mod buffer_pool_tests {
+    use super::*;
+
+    #[test]
+    fn the_config_value_is_used_when_the_environment_says_nothing() {
+        assert_eq!(resolve_buffer_pool_mb(384, None), (384, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some("  ")), (384, None));
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_config() {
+        assert_eq!(resolve_buffer_pool_mb(384, Some("512")), (512, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some(" 640 ")), (640, None));
+    }
+
+    #[test]
+    fn zero_hands_the_sizing_back_to_the_engine() {
+        assert_eq!(resolve_buffer_pool_mb(0, None), (0, None));
+        assert_eq!(resolve_buffer_pool_mb(384, Some("0")), (0, None));
+    }
+
+    #[test]
+    fn a_value_below_the_floor_is_raised_and_said_so() {
+        let (mb, note) = resolve_buffer_pool_mb(64, None);
+        assert_eq!(mb, MIN_BUFFER_POOL_MB);
+        assert!(note.unwrap().contains("floor"));
+        let (mb, _) = resolve_buffer_pool_mb(384, Some("96"));
+        assert_eq!(mb, MIN_BUFFER_POOL_MB);
+        assert_eq!(resolve_buffer_pool_mb(MIN_BUFFER_POOL_MB, None), (MIN_BUFFER_POOL_MB, None));
+    }
+
+    #[test]
+    fn an_environment_value_that_is_not_a_number_falls_back_to_the_config() {
+        let (mb, note) = resolve_buffer_pool_mb(384, Some("lots"));
+        assert_eq!(mb, 384);
+        assert!(note.unwrap().contains("NEUROSTRATA_BUFFER_POOL_MB"));
+    }
+
+    #[test]
+    fn the_default_is_above_the_floor() {
+        let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
+        assert!(default_mb >= MIN_BUFFER_POOL_MB, "{default_mb}");
+    }
+
+    #[test]
+    fn an_older_config_without_the_key_gets_the_default() {
+        let cfg: crate::storage::StorageHygieneConfig =
+            serde_json::from_str(r#"{"checkpoint_interval_secs": 5}"#).unwrap();
+        assert_eq!(cfg.checkpoint_interval_secs, 5);
+        assert_eq!(
+            cfg.buffer_pool_mb,
+            crate::storage::StorageHygieneConfig::default().buffer_pool_mb
+        );
+    }
+
+    #[test]
+    fn a_full_pool_error_names_the_setting_and_other_errors_pass_through() {
+        let full = anyhow::anyhow!(
+            "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!"
+        );
+        let text = explain_engine_error(full).to_string();
+        assert!(text.contains("The buffer pool is full"), "{text}");
+        assert!(text.contains("storage_hygiene.buffer_pool_mb"), "{text}");
+        assert!(text.contains("NEUROSTRATA_BUFFER_POOL_MB"), "{text}");
+
+        let other = explain_engine_error(anyhow::anyhow!("Parser exception: nope")).to_string();
+        assert_eq!(other, "Parser exception: nope");
+    }
+
+    /// A pool far under the floor must fail with the explained error, not
+    /// silently return nothing. Needs a COPY of a database (never the live one):
+    ///   NS_PROBE_DB=<dir with a copy of ladybug.db> cargo test --release \
+    ///   --bin neurostrata-mcp a_pool_too_small_for_the_data_fails_with_advice -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn a_pool_too_small_for_the_data_fails_with_advice() {
+        use crate::traits::VectorStore;
+        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
+        let cfg = SystemConfig::default()
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true);
+        let store = LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
+        let namespaces = store.list_namespaces().await.expect("namespaces");
+        let mut advised = 0;
+        for ns in &namespaces {
+            if let Err(e) = store.search(ns, vec![0.05; 768], 5, false, false).await {
+                let text = e.to_string();
+                if text.contains("storage_hygiene.buffer_pool_mb") {
+                    advised += 1;
+                }
+            }
+        }
+        assert!(advised > 0, "no search failed with the advice; the pool may be big enough here");
+    }
 }
 
 /// Recovery open, used only after verification has already failed. The engine
@@ -1394,9 +1585,11 @@ fn verifying_config() -> SystemConfig {
 /// This trades tamper-evidence for the writes, so it is never the normal path
 /// and never silent.
 fn unverified_config() -> SystemConfig {
-    SystemConfig::default()
-        .throw_on_wal_replay_failure(false)
-        .enable_checksums(false)
+    with_buffer_pool(
+        SystemConfig::default()
+            .throw_on_wal_replay_failure(false)
+            .enable_checksums(false),
+    )
 }
 
 /// Fail closed by default: an unauthenticated WAL is refused rather than
@@ -2551,7 +2744,8 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
-            })();
+            })()
+            .map_err(explain_engine_error);
             ENGINE_CALLS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (turn, outcome)
         })
@@ -2596,7 +2790,8 @@ impl LadybugStore {
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
                 f(&conn)
-            })();
+            })()
+            .map_err(explain_engine_error);
             // Counted here rather than after the await: the await is what a
             // deadline drops, and the whole question is whether the work
             // outlives the caller that stopped waiting for it.
