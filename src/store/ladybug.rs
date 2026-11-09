@@ -3533,6 +3533,126 @@ impl LadybugStore {
         .await
     }
 
+    /// `list`, optionally narrowed in the engine to rows whose metadata text
+    /// contains `metadata_contains`. The narrowing only drops rows the caller
+    /// would discard anyway; every row it returns goes through the same
+    /// generation and dedup rules as `list`.
+    pub(crate) async fn list_rows(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>, metadata_contains: Option<&str>) -> Result<Vec<SearchResult>> {
+        let namespace = namespace.to_string();
+        let user_id = user_id.map(|v| v.to_string());
+        let memory_type = memory_type.map(|v| v.to_string());
+        let metadata_contains = metadata_contains.map(|v| v.to_string());
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+
+            // The active generations for this namespace, resolved per source so a
+            // row is validated against the source that owns it (not just any
+            // active generation in the namespace). Read once per search.
+            let (by_source, active_set, max_code_gen) =
+                active_generations_by_source_of(conn, &namespace);
+
+            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
+
+            // Build WHERE clause with optional filters (R15: push into Cypher).
+            let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
+            if let Some(ref uid) = user_id {
+                conditions.push(format!("m.user_id = '{}'", escape_ladybug_string(uid)));
+            }
+            if let Some(ref mt) = memory_type {
+                conditions.push(format!("m.memory_type = '{}'", escape_ladybug_string(mt)));
+            }
+            if let Some(ref needle) = metadata_contains {
+                conditions.push(format!("m.metadata CONTAINS '{}'", escape_ladybug_string(needle)));
+            }
+            let where_clause = conditions.join(" AND ");
+
+            let query = format!("MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", where_clause);
+
+            let result = conn.query(&query)?;
+            let mut results = Vec::new();
+
+            for row in result {
+                let id: String = format!("{}", row[0]);
+                let content: String = format!("{}", row[1]);
+                let uid: String = format!("{}", row[2]);
+                let memory_type: String = format!("{}", row[3]);
+                let agent_name: String = format!("{}", row[4]);
+                let location: String = format!("{}", row[5]);
+                let location_lines: String = format!("{}", row[6]);
+                let metadata_str: String = format!("{}", row[7]);
+
+                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !metadata_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
+
+                // Wave 2.1 row filter: same generation-scoped reachability the
+                // search path applies, so diagnostics never see superseded rows.
+                if is_active_scoped_row(
+                    &id,
+                    &namespace,
+                    &memory_type,
+                    &metadata_val,
+                    &by_source,
+                    &active_set,
+                    max_code_gen,
+                ).is_none() {
+                    continue;
+                }
+
+                let sr = SearchResult {
+                    id: id.clone(),
+                    score: 0.0,
+                    payload: MemoryPayload {
+                        content,
+                        user_id: uid,
+                        memory_type,
+                        agent_name: Some(agent_name),
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                    evidence: None,
+                };
+
+                // Dedup by bare_id across generations: keep the highest
+                // generation for each logical id. Unscoped rows (bare_id_of
+                // returns None) are never deduped.
+                if let Some(bare) = bare_id_of(&id) {
+                    let gen = split_scoped_id(&id)
+                        .map(|(_, g, _)| g as u64)
+                        .unwrap_or(0);
+                    match best_by_bare.get(&bare) {
+                        Some(&(existing_gen, idx)) if gen > existing_gen => {
+                            results[idx] = sr.clone();
+                            best_by_bare.insert(bare, (gen, idx));
+                        }
+                        Some(_) => {
+                            // existing entry has higher or equal gen; skip.
+                            continue;
+                        }
+                        None => {
+                            let idx = results.len();
+                            best_by_bare.insert(bare, (gen, idx));
+                            results.push(sr);
+                        }
+                    }
+                } else {
+                    results.push(sr);
+                }
+            }
+
+            Ok(results)
+        })
+        .await
+    }
+
+
     pub async fn repair_namespace_hygiene(&self, namespace: &str) -> Result<(usize, usize)> {
         let namespace = namespace.to_string();
         self.write_with_deadline("repairing namespace hygiene", move |conn| {
@@ -6685,114 +6805,11 @@ impl VectorStore for LadybugStore {
     }
 
     async fn list(&self, namespace: &str, user_id: Option<&str>, memory_type: Option<&str>) -> Result<Vec<SearchResult>> {
-        let namespace = namespace.to_string();
-        let user_id = user_id.map(|v| v.to_string());
-        let memory_type = memory_type.map(|v| v.to_string());
-        self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
+        self.list_rows(namespace, user_id, memory_type, None).await
+    }
 
-            // The active generations for this namespace, resolved per source so a
-            // row is validated against the source that owns it (not just any
-            // active generation in the namespace). Read once per search.
-            let (by_source, active_set, max_code_gen) =
-                active_generations_by_source_of(conn, &namespace);
-
-            let mut best_by_bare: HashMap<String, (u64, usize)> = HashMap::new();
-
-            // Build WHERE clause with optional filters (R15: push into Cypher).
-            let mut conditions = vec![format!("m.namespace = '{}'", safe_ns)];
-            if let Some(ref uid) = user_id {
-                conditions.push(format!("m.user_id = '{}'", escape_ladybug_string(uid)));
-            }
-            if let Some(ref mt) = memory_type {
-                conditions.push(format!("m.memory_type = '{}'", escape_ladybug_string(mt)));
-            }
-            let where_clause = conditions.join(" AND ");
-
-            let query = format!("MATCH (m:Memory) WHERE {} RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", where_clause);
-
-            let result = conn.query(&query)?;
-            let mut results = Vec::new();
-
-            for row in result {
-                let id: String = format!("{}", row[0]);
-                let content: String = format!("{}", row[1]);
-                let uid: String = format!("{}", row[2]);
-                let memory_type: String = format!("{}", row[3]);
-                let agent_name: String = format!("{}", row[4]);
-                let location: String = format!("{}", row[5]);
-                let location_lines: String = format!("{}", row[6]);
-                let metadata_str: String = format!("{}", row[7]);
-
-                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if !metadata_str.trim().is_empty() {
-                            tracing::warn!("corrupt metadata JSON in store row: {e}");
-                        }
-                        Value::Null
-                    }
-                };
-
-                // Wave 2.1 row filter: same generation-scoped reachability the
-                // search path applies, so diagnostics never see superseded rows.
-                if is_active_scoped_row(
-                    &id,
-                    &namespace,
-                    &memory_type,
-                    &metadata_val,
-                    &by_source,
-                    &active_set,
-                    max_code_gen,
-                ).is_none() {
-                    continue;
-                }
-
-                let sr = SearchResult {
-                    id: id.clone(),
-                    score: 0.0,
-                    payload: MemoryPayload {
-                        content,
-                        user_id: uid,
-                        memory_type,
-                        agent_name: Some(agent_name),
-                        location,
-                        location_lines,
-                        metadata: metadata_val,
-                    },
-                    evidence: None,
-                };
-
-                // Dedup by bare_id across generations: keep the highest
-                // generation for each logical id. Unscoped rows (bare_id_of
-                // returns None) are never deduped.
-                if let Some(bare) = bare_id_of(&id) {
-                    let gen = split_scoped_id(&id)
-                        .map(|(_, g, _)| g as u64)
-                        .unwrap_or(0);
-                    match best_by_bare.get(&bare) {
-                        Some(&(existing_gen, idx)) if gen > existing_gen => {
-                            results[idx] = sr.clone();
-                            best_by_bare.insert(bare, (gen, idx));
-                        }
-                        Some(_) => {
-                            // existing entry has higher or equal gen; skip.
-                            continue;
-                        }
-                        None => {
-                            let idx = results.len();
-                            best_by_bare.insert(bare, (gen, idx));
-                            results.push(sr);
-                        }
-                    }
-                } else {
-                    results.push(sr);
-                }
-            }
-
-            Ok(results)
-        })
-        .await
+    async fn list_pinned(&self, namespace: &str) -> Result<Vec<SearchResult>> {
+        self.list_rows(namespace, None, None, Some("pinned")).await
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
