@@ -5873,18 +5873,44 @@ impl VectorStore for LadybugStore {
                     e
                 )
             })?;
+        } else {
+            // The destination may be a reused snapshot directory: a WAL
+            // an earlier export placed there must not survive into this
+            // snapshot, or write_checksums would bless it and a restore
+            // would replay it against a store it never belonged to.
+            let dest_wal = dir.join("ladybug.store.wal");
+            if dest_wal.exists() {
+                std::fs::remove_file(&dest_wal).map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not remove the stale write-ahead log from the snapshot: {}",
+                        e
+                    )
+                })?;
+            }
         }
         // The store-state sidecar rides along too, under
         // the snapshot's store name. Without it a restored store has
         // no recorded identity — it reads as a pre-sidecar store and
         // silently exits the identity protection the sidecar exists
         // to provide. Absent sidecar (a pre-feature store) snapshots
-        // exactly as before.
+        // exactly as before — and a sidecar already sitting in a
+        // reused destination directory is removed, so the snapshot
+        // can only carry an identity that came from its source
+        // (issue #76): a stale sidecar would otherwise be blessed
+        // into the new checksums and restored as the wrong identity.
         let sidecar = crate::model_choice::store_state_path(&source);
+        let dest_sidecar = dir.join("ladybug.store.store-state.json");
         if sidecar.exists() {
-            std::fs::copy(&sidecar, dir.join("ladybug.store.store-state.json")).map_err(|e| {
+            std::fs::copy(&sidecar, &dest_sidecar).map_err(|e| {
                 anyhow::anyhow!(
                     "could not copy the store-state sidecar into the snapshot: {}",
+                    e
+                )
+            })?;
+        } else if dest_sidecar.exists() {
+            std::fs::remove_file(&dest_sidecar).map_err(|e| {
+                anyhow::anyhow!(
+                    "could not remove the stale store-state sidecar from the snapshot: {}",
                     e
                 )
             })?;
@@ -16952,6 +16978,138 @@ eurostrata\src\daemon.rs",
             .expect("the restored store opens under its recorded model");
         drop(ok);
         let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn export_into_a_reused_snapshot_dir_drops_the_stale_sidecar() {
+        // Issue #76: export_database tolerates an existing destination
+        // directory and overwrites the store, WAL, and manifest in
+        // place, but it copied the store-state sidecar only when the
+        // source had one — a destination sidecar from an earlier export
+        // survived a later export of a pre-sidecar store, was blessed
+        // into the new checksums, and restored as the wrong identity.
+        // Reusing a snapshot directory for a pre-sidecar store must
+        // leave a snapshot that carries no sidecar at all.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("t5-reuse-recorded").await;
+        let out = fx.root.join("snapshot");
+        let opener = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        opener
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export the recorded store");
+        drop(opener);
+        assert!(
+            out.join("ladybug.store.store-state.json").exists(),
+            "the first export carries the recorded store's sidecar"
+        );
+        let first = crate::storage::snapshot::verify_snapshot(&out).expect("verify export one");
+        assert!(first.valid);
+        assert!(
+            first
+                .checksums
+                .as_ref()
+                .expect("checksums reported")
+                .store_state_sha256
+                .is_some(),
+            "the first export's checksums name the sidecar it placed"
+        );
+        // A stale destination WAL, planted the way an earlier export
+        // whose source still had one after its checkpoint would have
+        // placed it: the same-class hazard as the sidecar, covered
+        // below once the pre-sidecar export reuses this directory.
+        std::fs::write(out.join("ladybug.store.wal"), b"stale wal bytes")
+            .expect("plant the stale destination WAL");
+
+        // A pre-sidecar store: the db file exists (created by a
+        // non-serving open, exactly as the LockedUnknown fixtures
+        // build one) and no sidecar was ever written for it.
+        let fx2 = store_state_fixture("t5-reuse-pre-sidecar", "ModelA");
+        let creator = LadybugStore::for_testing(&fx2.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx2.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        assert!(
+            !crate::model_choice::store_state_path(&fx2.db).exists(),
+            "the pre-sidecar fixture carries no sidecar"
+        );
+
+        let exporter = LadybugStore::for_testing(&fx2.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx2.config_dir);
+        exporter
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export the pre-sidecar store into the same directory");
+        drop(exporter);
+        assert!(
+            !crate::model_choice::store_state_path(&fx2.db).exists(),
+            "exporting must not create a sidecar on the pre-sidecar source"
+        );
+        assert!(
+            !out.join("ladybug.store.store-state.json").exists(),
+            "the reused snapshot directory carries no stale sidecar"
+        );
+        assert!(
+            !out.join("ladybug.store.wal").exists(),
+            "the reused snapshot directory carries no stale WAL: the pre-sidecar source had none to place"
+        );
+        let checksums_json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("checksums.json")).expect("read checksums.json"),
+        )
+        .expect("checksums.json parses");
+        assert!(
+            checksums_json.get("store_state_sha256").is_none(),
+            "checksums.json carries no sidecar entry for a sidecar the export did not place: {checksums_json}"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify export two");
+        assert!(report.valid, "the reused snapshot verifies");
+        assert!(
+            report
+                .checksums
+                .as_ref()
+                .expect("checksums reported")
+                .store_state_sha256
+                .is_none(),
+            "verification reports no sidecar checksum"
+        );
+
+        // The restore-side view (the Restore arm's copies in src/main.rs):
+        // with no sidecar in the snapshot there is nothing to copy onto
+        // the target, and the restored store reads as identity-less.
+        let restored_dir = fx.root.join("restored-reuse");
+        std::fs::create_dir_all(&restored_dir).expect("create restore dir");
+        let restored_db = restored_dir.join("ladybug.db");
+        std::fs::copy(out.join("ladybug.store"), &restored_db).expect("copy the db");
+        let snapshot_wal = out.join("ladybug.store.wal");
+        if snapshot_wal.exists() {
+            let mut target_wal = restored_db.clone().into_os_string();
+            target_wal.push(".wal");
+            std::fs::copy(&snapshot_wal, std::path::PathBuf::from(target_wal))
+                .expect("copy the WAL");
+        }
+        let snapshot_sidecar = out.join("ladybug.store.store-state.json");
+        if snapshot_sidecar.exists() {
+            std::fs::copy(
+                &snapshot_sidecar,
+                crate::model_choice::store_state_path(&restored_db),
+            )
+            .expect("copy the sidecar");
+        }
+        assert!(
+            !crate::model_choice::store_state_path(&restored_db).exists(),
+            "the restore lands no sidecar from the reused snapshot"
+        );
+        assert!(
+            crate::model_choice::read_store_state(&restored_db).is_none(),
+            "the restored store has no recorded identity"
+        );
+        let _ = std::fs::remove_dir_all(&fx.root);
+        let _ = std::fs::remove_dir_all(&fx2.root);
         restore_model_env(previous);
     }
 }
