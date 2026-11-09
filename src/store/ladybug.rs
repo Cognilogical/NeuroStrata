@@ -1970,7 +1970,14 @@ impl LadybugStore {
     /// the restart-to-apply error, and a recorded descriptor that
     /// disagrees with the serving one is refused, never healed at write
     /// time. Without a serving descriptor, the guard falls back
-    /// to the configured-vs-recorded comparison. Stores with data, and
+    /// to the configured-vs-recorded comparison. A fresh store with no
+    /// record yet (`FreshUnrecorded`) is in the same window: no
+    /// recorded descriptor exists to compare against, but a serving
+    /// descriptor that disagrees with the configured one is the same
+    /// stale-serving hazard — the first write would commit vectors
+    /// under the stale model and the flip would record that model as
+    /// the data-bearing identity — so the serving-vs-configured check
+    /// applies there too. Stores with data, and
     /// stores whose state is unknown, are outside the window this
     /// guard protects. Every refusal is a [`RestartToApplyError`], so
     /// callers can surface it verbatim.
@@ -2008,6 +2015,33 @@ impl LadybugStore {
                             .into());
                         }
                     }
+                }
+            }
+        }
+        if let CachedStoreState::FreshUnrecorded = self.cached_store_state() {
+            // No sidecar exists yet — `maintain_store_state` could not
+            // write the pristine record at init because serving and
+            // configured disagreed (the first-start window: the daemon
+            // is still loading the default model while a setup pick
+            // persists a different one). There is no recorded
+            // descriptor to protect, but the stale-serving hazard is
+            // identical: a write now would commit vectors under the
+            // serving model and the first-write flip would record that
+            // model as the store's data-bearing identity, so the
+            // restart the setup flow demands would then refuse to open
+            // the store. Refuse with the same restart-to-apply
+            // guidance as the recorded-pristine case above. Without a
+            // serving descriptor there is no serving identity to be
+            // stale, and the write proceeds as before.
+            if let Some(serving) = self.serving_descriptor() {
+                let current = self.configured_embedding_descriptor()?;
+                if current != serving {
+                    return Err(RestartToApplyError::new(format!(
+                        "refusing to store data: this process serves embedding model '{}', but the configured model is now '{}' (a setup-time model choice was persisted while this process was running). Restart the daemon (or this process) so the store is opened under the new model before the first write; data is never stored under a model different from the one producing it.",
+                        serving.model,
+                        current.model
+                    ))
+                    .into());
                 }
             }
         }
@@ -16332,10 +16366,117 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
-    async fn fresh_unrecorded_flip_prefers_the_serving_descriptor() {
-        // A FreshUnrecorded store's
-        // flip records the serving descriptor bound after init — the
-        // model that produced the vectors — not the configured one.
+    async fn fresh_unrecorded_first_write_refuses_stale_serving_until_restart() {
+        // Regression test for issue #73 (Codex finding T5 on PR #66).
+        // During the first daemon start, the pending model-choice
+        // marker exists while `build_embedder()` is still loading the
+        // default model and the DB does not yet exist. The user picks
+        // the Q model in that window: the pick persists (configured =
+        // NomicEmbedTextV15Q) while this process still serves the
+        // default (NomicEmbedTextV15 FP32). At its first init, serving
+        // != configured, so `maintain_store_state` writes no pristine
+        // sidecar and the store stays FreshUnrecorded. A first write
+        // in that window must refuse with restart-to-apply guidance —
+        // before this fix the guard skipped FreshUnrecorded stores, so
+        // the write committed FP32 vectors and the flip recorded FP32
+        // as the data-bearing identity, after which the restart under
+        // the chosen Q model refused to open the store at all.
+        let previous = without_model_env();
+        let dims = 768;
+        let fx = store_state_fixture("t5-q-pick-during-first-start", "NomicEmbedTextV15Q");
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            format!("[{{\"model_name\":\"NomicEmbedTextV15Q\",\"dimensions\":{dims}}}]"),
+        )
+        .expect("write Q fixture config");
+
+        // The first-start process: its embedder was built before the
+        // pick landed, so it serves the default FP32 model while the
+        // configuration already names Q.
+        let store = LadybugStore::for_testing(&fx.db, dims)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("NomicEmbedTextV15", dims)));
+        store.init("probe").await.expect("init");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "serving != configured at first init: no pristine sidecar is written, \
+             so the store stays FreshUnrecorded into its first write"
+        );
+
+        let refused = store
+            .upsert("probe", "m1", vec![0.1; dims], store_state_payload())
+            .await;
+        let err = refused.expect_err(
+            "a first write under stale serving on a FreshUnrecorded store must be refused",
+        );
+        let message = restart_to_apply_message(&err)
+            .expect("the refusal must be the typed restart-to-apply error");
+        assert!(
+            message.contains("Restart the daemon"),
+            "the refusal must carry the restart guidance that resolves it: {message}"
+        );
+        assert!(
+            message.contains("'NomicEmbedTextV15'") && message.contains("'NomicEmbedTextV15Q'"),
+            "the refusal names the serving and configured models: {message}"
+        );
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "a refused first write records no identity: no sidecar may appear"
+        );
+        let rows = store
+            .list("probe", None, None)
+            .await
+            .expect("list after refusal");
+        assert!(rows.is_empty(), "a refused first write lands no row");
+        drop(store);
+
+        // The restart the guidance demands: a fresh process serving
+        // the configured Q model opens the store cleanly and accepts
+        // the first write under Q.
+        let restarted = LadybugStore::for_testing(&fx.db, dims)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_dims("NomicEmbedTextV15Q", dims)));
+        restarted
+            .init("probe")
+            .await
+            .expect("the store opens cleanly under the chosen Q model after restart");
+        restarted
+            .upsert("probe", "m1", vec![0.1; dims], store_state_payload())
+            .await
+            .expect("the first write under the chosen model succeeds after restart");
+        let found = restarted
+            .search("probe", vec![0.1; dims], 5, false, false)
+            .await
+            .expect("search under the chosen model");
+        assert!(
+            !found.is_empty(),
+            "the row written after restart is searchable under Q"
+        );
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fresh_unrecorded_flip_records_serving_only_when_it_matches_configured() {
+        // PREMISE REVISED (issue #73): this test was
+        // `fresh_unrecorded_flip_prefers_the_serving_descriptor` and
+        // pinned the opposite behavior — an upsert on a
+        // FreshUnrecorded store under a serving descriptor that
+        // disagreed with the configuration was expected to succeed
+        // ("the pristine guard does not cover FreshUnrecorded
+        // stores") and the flip to record that serving descriptor as
+        // the data-bearing identity. That premise was the defect: a
+        // setup pick persisted while the first-start process still
+        // serves the default model makes serving != configured, and
+        // letting the write land records an identity the user did not
+        // choose, bricking the store at the restart setup demands.
+        // The flip's serving preference survives only where it is
+        // sound — when serving == configured, the serving descriptor
+        // (the model that produced the vectors) is what the flip
+        // records.
         let previous = without_model_env();
         let fx = store_state_fixture("a5-flip-prefers-serving", "ModelA");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -16346,7 +16487,35 @@ eurostrata\src\daemon.rs",
             !crate::model_choice::store_state_path(&fx.db).exists(),
             "an unbound init of a fresh store records nothing"
         );
+
+        // The stale-serving shape the old premise allowed: serving
+        // bound after init to a model the configuration does not
+        // name. The write is now refused, and no identity is recorded.
         store.set_serving_descriptor(Some(serving_descriptor_for("ModelServed")));
+        let refused = store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await;
+        let err = refused.expect_err(
+            "the pristine guard now covers FreshUnrecorded stores: \
+             a stale-serving first write must be refused",
+        );
+        assert!(
+            restart_to_apply_message(&err).is_some(),
+            "the refusal must be the typed restart-to-apply error: {err}"
+        );
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "a refused first write records no identity"
+        );
+
+        // Bound to the configured model instead, the same write lands
+        // and the flip records the serving descriptor as data-bearing.
+        store.set_serving_descriptor(Some(serving_descriptor_for("ModelA")));
         store
             .upsert(
                 "probe",
@@ -16355,13 +16524,13 @@ eurostrata\src\daemon.rs",
                 store_state_payload(),
             )
             .await
-            .expect("the pristine guard does not cover FreshUnrecorded stores");
+            .expect("a first write whose serving matches the configuration proceeds");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(true));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelServed"),
-            "the flip records the serving descriptor, not the configured one"
+            json!("ModelA"),
+            "the flip records the serving descriptor, which the guard has verified against the configured one"
         );
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
