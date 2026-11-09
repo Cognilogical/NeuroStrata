@@ -712,7 +712,8 @@ mod tests {
             "the second entry appends: {text}"
         );
         assert!(
-            std::path::Path::new(&outcome.file).starts_with(std::fs::canonicalize(&root).unwrap()),
+            std::path::Path::new(&outcome.file)
+                .starts_with(std::fs::canonicalize(&root).unwrap()),
             "the buffer file lives under the project root: {}",
             outcome.file
         );

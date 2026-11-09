@@ -181,7 +181,10 @@ fn is_absolute_location(location: &str, path: &Path) -> bool {
         && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\');
     let windows_unc_absolute = bytes.starts_with(b"\\\\");
-    windows_drive_absolute || windows_unc_absolute
+    // A rooted POSIX location stored by a Linux peer is absolute data on a
+    // Windows host even though the OS calls it rooted-but-relative.
+    let posix_absolute = bytes.first() == Some(&b'/');
+    windows_drive_absolute || windows_unc_absolute || posix_absolute
 }
 
 fn normalize_relative(path: &Path) -> Option<PathBuf> {
@@ -325,11 +328,25 @@ mod tests {
     #[test]
     fn resolve_graph_output_path_missing_context_never_falls_back_to_cwd_output_tree() {
         let invocation = temp_root("missing-output-context");
-        let error =
-            resolve_graph_output_path(None, None, &HashMap::new(), None, &invocation).unwrap_err();
+        let result = resolve_graph_output_path(None, None, &HashMap::new(), None, &invocation);
 
-        assert!(error.to_string().contains("--source-id"));
-        assert!(error.to_string().contains("explicit output path"));
+        // The temp dir can sit under a real marker (Windows temp is under the
+        // user profile, which has ~/.NeuroStrata); the walk then legitimately
+        // finds that ancestor. Either way it must not be the cwd output tree.
+        match invocation
+            .ancestors()
+            .map(|a| a.join(".NeuroStrata"))
+            .find(|m| is_valid_marker_directory(m))
+        {
+            Some(ancestor_marker) => {
+                assert_eq!(result.unwrap(), ancestor_marker.join("graph/graph.json"))
+            }
+            None => {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("--source-id"));
+                assert!(error.to_string().contains("explicit output path"));
+            }
+        }
         assert!(!invocation.join(".NeuroStrata").exists());
     }
 
@@ -476,7 +493,10 @@ mod tests {
         let project_root = temp.join("project");
         let marker = project(&project_root);
         fs::create_dir_all(project_root.join("nested")).unwrap();
-        let noncanonical = project_root.join("nested/../.NeuroStrata");
+        // Spelled without the verbatim prefix: Rust collapses `..` when it
+        // joins onto a verbatim path, which would make this canonical.
+        let plain_root = dunce::simplified(&project_root).to_path_buf();
+        let noncanonical = plain_root.join("nested/../.NeuroStrata");
         assert!(noncanonical.is_dir());
         assert_ne!(std::fs::canonicalize(&noncanonical).unwrap(), noncanonical);
         let contexts = HashMap::from([("source".to_string(), noncanonical.clone())]);
