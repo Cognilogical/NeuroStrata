@@ -893,6 +893,25 @@ fn bind_fallback_serving_descriptor(
     }
 }
 
+/// Record the birth identity of a store this process constructed
+/// but may never `init` — the fallback group's store (most of its
+/// arms never init) and the Backup arm's store. Construction
+/// creates the DB file, so without this step a store first created
+/// by one of those routes is born sidecar-less and classifies
+/// LockedUnknown on its next open, voiding the setup choice. The
+/// step is the store's birth-record-only maintenance (see
+/// `LadybugStore::record_birth_identity`): it must run while the
+/// store is still unbound — at the fallback group that is here,
+/// before the arm match, ahead of any arm's own binding.
+fn record_birth_identity(vector_store: &Arc<dyn VectorStore>) {
+    use crate::store::ladybug::LadybugStore;
+    if let Some(store) =
+        crate::traits::VectorStore::as_any(vector_store.as_ref()).downcast_ref::<LadybugStore>()
+    {
+        store.record_birth_identity();
+    }
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -3337,6 +3356,11 @@ async fn run() -> anyhow::Result<()> {
                     config.db_path.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
                 )?);
+                // A backup taken before the first daemon start
+                // creates the DB at construction; record its birth
+                // identity before exporting, so neither the home
+                // store nor the snapshot is born unrecorded.
+                record_birth_identity(&vector_store);
                 vector_store.export_database(&dir).await?;
                 println!("Backed up to {}", dir);
                 return Ok(());
@@ -4115,6 +4139,11 @@ async fn run() -> anyhow::Result<()> {
                     config.db_path.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
                 )?);
+                // Most arms below never init, and construction has
+                // already created the DB file on a fresh install:
+                // record the store's birth identity now, while the
+                // store is still unbound, before the arm match.
+                record_birth_identity(&vector_store);
                 let read = ReadSource::Direct(vector_store.clone());
 
                 // CLI fallback: hook hygiene against the CWD git root (daemon down).

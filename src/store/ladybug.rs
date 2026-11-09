@@ -1828,6 +1828,32 @@ impl LadybugStore {
             .unwrap_or_else(|e| e.into_inner()) = descriptor;
     }
 
+    /// Record this store's birth identity, for the production routes
+    /// that construct a store on a path this process may be creating
+    /// but never `init` — the daemon-down fallback group and the
+    /// Backup arm. The engine creates the DB file at construction,
+    /// so a store whose first open never reaches `init` would
+    /// otherwise be born sidecar-less and classify LockedUnknown on
+    /// its next open. This runs `init`'s store-state maintenance —
+    /// and nothing else: no schema DDL, no embedding-registry
+    /// seeding, no identity check, no dirty mark, so the routes'
+    /// behavior is unchanged apart from the record itself (a full
+    /// `init` at those sites seeds the registry with the recorded
+    /// descriptor and breaks a later bound init's adoption on the
+    /// same instance; see the N1 remainder design addendum). The
+    /// unbound-only constraint is structural: with a serving
+    /// descriptor bound this does nothing, so no caller can record
+    /// or adopt under a descriptor the process serves. On an
+    /// existing store the maintenance writes nothing — Recorded
+    /// records move only from a bound serving descriptor, and the
+    /// LockedUnknown arm is untouched — so pre-existing stores of
+    /// every shape behave exactly as before.
+    pub fn record_birth_identity(&self) {
+        if self.serving_descriptor().is_none() {
+            self.maintain_store_state();
+        }
+    }
+
     /// The embedding-space descriptor of the *configured* model: resolved
     /// from `embedders.json` through the same effective resolution the
     /// loader uses (`embed::configured_model_in` — the env-named entry
@@ -17079,6 +17105,299 @@ eurostrata\src\daemon.rs",
         assert_eq!(sidecar["has_data"], json!(true));
         assert_eq!(sidecar["descriptor"]["model"], json!("ModelB"));
         drop(fixed);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fallback_route_birth_records_fresh_store() {
+        // N1 remainder, judge test 1: the fallback group's shipped
+        // sequence for a non-init arm — construct on a fresh path,
+        // the group-level birth step, then a read arm's usage (the
+        // namespaces shape: no init, no serving descriptor). Before
+        // the remainder, construction alone created the DB file and
+        // no process ever recorded it: the store was LockedUnknown
+        // from its second open on, and the setup choice was voided.
+        let previous = without_model_env();
+        let fx = store_state_fixture("n1rem-fallback-birth", "ModelA");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.record_birth_identity();
+        let _ = store.list_namespaces().await;
+        assert!(
+            crate::model_choice::store_state_path(&fx.db).exists(),
+            "a store created by a non-init fallback route is born recorded: its sidecar exists"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "the birth record names the configured model"
+        );
+        assert!(
+            !crate::model_choice::store_has_data(&fx.db),
+            "a born-recorded pristine store reads as having no data, so the choice is not voided"
+        );
+        drop(store);
+
+        // The r2verify_n1 tail: a serving-bound open under a
+        // different same-width model adopts, and a write lands.
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let adopter = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        adopter.init("probe").await.expect("adopting init");
+        adopter
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("a write lands under the adopted model");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelB"));
+        drop(adopter);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn construction_only_birth_records_fresh_store() {
+        // N1 remainder, judge test 2: the VerifySnapshot shape —
+        // construction plus the birth step, with no store method
+        // call at all. Construction is the arm's only store
+        // interaction in production; the birth record must not
+        // depend on any arm touching the store afterward.
+        let previous = without_model_env();
+        let fx = store_state_fixture("n1rem-construction-only-birth", "ModelA");
+        {
+            let store = LadybugStore::for_testing(&fx.db, 4)
+                .expect("open temp database")
+                .with_embed_config_dir(&fx.config_dir);
+            store.record_birth_identity();
+        }
+        assert!(
+            crate::model_choice::store_state_path(&fx.db).exists(),
+            "a store created by a construction-only route is born recorded: its sidecar exists"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert!(!crate::model_choice::store_has_data(&fx.db));
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn backup_route_birth_records_and_snapshot_carries_sidecar() {
+        // N1 remainder, judge test 3: the Backup arm's shipped
+        // sequence — construct on a fresh path, the birth step, then
+        // export_database. A backup taken before the first daemon
+        // start must neither mint an unrecorded home store nor
+        // snapshot one: the home store is born recorded, and the
+        // snapshot carries the newborn sidecar as the store's
+        // companion. The destination is pre-seeded with a previous
+        // snapshot's stale sidecar, so the carriage assertion also
+        // pins N4's mirror rule: the snapshot carries THIS store's
+        // companion, not the stale file that was sitting there.
+        let previous = without_model_env();
+        let fx = store_state_fixture("n1rem-backup-birth", "ModelA");
+        let out = fx.root.join("snapshot");
+        std::fs::create_dir_all(&out).expect("create snapshot dir");
+        let stale = crate::model_choice::StoreState {
+            version: crate::model_choice::STORE_STATE_VERSION,
+            has_data: true,
+            descriptor: serving_descriptor_for("ModelStale"),
+        };
+        crate::model_choice::write_store_state(&out.join("ladybug.store"), &stale)
+            .expect("plant the previous snapshot's stale sidecar");
+
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.record_birth_identity();
+        store
+            .export_database(&out.to_string_lossy())
+            .await
+            .expect("export the newborn store");
+        drop(store);
+
+        assert!(
+            crate::model_choice::store_state_path(&fx.db).exists(),
+            "the home store is born recorded: its sidecar exists"
+        );
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+
+        let snapshot_sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("ladybug.store.store-state.json"))
+                .expect("the snapshot carries a sidecar"),
+        )
+        .expect("snapshot sidecar parses");
+        assert_eq!(
+            snapshot_sidecar["has_data"],
+            json!(false),
+            "the snapshot carries the newborn sidecar, not the stale one"
+        );
+        assert_eq!(
+            snapshot_sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "the snapshot's sidecar is this store's birth record"
+        );
+        let checksums: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("checksums.json")).expect("read checksums"),
+        )
+        .expect("checksums parse");
+        assert!(
+            checksums.get("store_state_sha256").is_some_and(|v| !v.is_null()),
+            "the snapshot checksums its sidecar"
+        );
+        let report = crate::storage::snapshot::verify_snapshot(&out).expect("verify the snapshot");
+        assert!(report.valid, "the snapshot verifies valid");
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fallback_birth_step_leaves_recorded_store_untouched() {
+        // N1 remainder, judge test 4 (Recorded half): a data-bearing
+        // recorded store taken through the fallback sequence —
+        // construct, birth step, a read arm's usage — behaves
+        // exactly as before the remainder: no refusal is introduced
+        // and the record is neither created, moved, nor rewritten.
+        let previous = without_model_env();
+        let fx = data_bearing_store_fixture("n1rem-recorded-untouched").await;
+        let sidecar_before =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.record_birth_identity();
+        let namespaces = store
+            .list_namespaces()
+            .await
+            .expect("a read arm's usage on a data-bearing store is not refused");
+        assert!(
+            namespaces.iter().any(|ns| ns == "probe"),
+            "the read sees the store's namespace: {namespaces:?}"
+        );
+        let sidecar_after =
+            std::fs::read(crate::model_choice::store_state_path(&fx.db)).expect("read sidecar");
+        assert_eq!(
+            sidecar_before, sidecar_after,
+            "the birth step leaves a recorded store's sidecar byte-identical"
+        );
+        assert!(crate::model_choice::store_has_data(&fx.db));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fallback_birth_step_leaves_locked_unknown_store_untouched() {
+        // N1 remainder, judge test 4 (LockedUnknown half): a
+        // pre-sidecar store in the genuine legacy on-disk shape,
+        // taken through the same fallback sequence, behaves exactly
+        // as before the remainder — A5's posture is untouched: no
+        // record is created for a store whose DB file pre-existed
+        // this process, and no refusal is introduced.
+        let previous = without_model_env();
+        let fx = store_state_fixture("n1rem-locked-untouched", "ModelA");
+        let creator = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        creator.init("probe").await.expect("init");
+        drop(creator);
+        let _ = std::fs::remove_file(crate::model_choice::store_state_path(&fx.db));
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "the fixture is the legacy shape: DB present, sidecar absent"
+        );
+
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.record_birth_identity();
+        store
+            .list_namespaces()
+            .await
+            .expect("a read arm's usage on a pre-sidecar store is not refused");
+        assert!(
+            !crate::model_choice::store_state_path(&fx.db).exists(),
+            "no record is created for a store that pre-existed this process"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn fallback_birth_step_composes_with_bound_init_adoption() {
+        // N1 remainder, composition pin (verdict section 1.4): the
+        // group-level birth step and an arm-level bound init compose
+        // on one instance. A pristine recorded store goes through
+        // the fallback sequence — construct unbound, birth step,
+        // bind the pick, the arm's init, the write — and the pick
+        // is adopted and the write lands, exactly as the arm's
+        // sequence behaves without the group step (N3). The design
+        // probe showed a full unbound init at the group site would
+        // break this sequence for the seeded namespace, by seeding
+        // the embedding registry with the recorded descriptor ahead
+        // of the adoption init; the birth step seeds nothing.
+        let previous = without_model_env();
+        let fx = store_state_fixture("n1rem-compose", "ModelA");
+        let seed = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        seed.init("probe").await.expect("seed init");
+        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        drop(seed);
+
+        write_embedders_config(&fx.config_dir, "ModelB");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        store.record_birth_identity();
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelA"),
+            "the birth step does not move an existing record"
+        );
+        store.set_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        store
+            .init("probe")
+            .await
+            .expect("the arm's bound init adopts after the birth step");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!("ModelB"),
+            "the arm-level init adopts the pick over the existing record"
+        );
+        store
+            .upsert(
+                "probe",
+                "m1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                store_state_payload(),
+            )
+            .await
+            .expect("the arm's write lands after adoption");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(true));
+        assert_eq!(sidecar["descriptor"]["model"], json!("ModelB"));
+        drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
