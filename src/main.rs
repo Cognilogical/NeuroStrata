@@ -3107,6 +3107,72 @@ mod tests {
         assert!(!crate::model_choice::store_state_path(&target).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    fn restore_verify_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        // Built the way export builds a snapshot: a ladybug.store file,
+        // a manifest.json carrying the snapshot format/version, and a
+        // checksums.json written by write_checksums over the actual
+        // bytes (which also writes the manifest.json.zst copy). No WAL
+        // and no sidecar are written, so their checksums are absent —
+        // verify_snapshot treats an absent, unmentioned WAL (and
+        // sidecar) as not part of the snapshot.
+        let root = std::env::temp_dir().join(format!(
+            "ns-restore-verify-{}-{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot_dir = root.join("snapshot");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"snapshot-db").unwrap();
+        std::fs::write(
+            snapshot_dir.join("manifest.json"),
+            format!(
+                "{{\"format\":\"{}\",\"version\":{},\"created_at\":\"2026-01-01T00:00:00Z\"}}",
+                crate::storage::snapshot::SNAPSHOT_FORMAT,
+                crate::storage::snapshot::SNAPSHOT_VERSION
+            ),
+        )
+        .unwrap();
+        crate::storage::snapshot::write_checksums(&snapshot_dir).unwrap();
+        (root, snapshot_dir)
+    }
+
+    #[test]
+    fn restore_verify_accepts_valid_snapshot() {
+        let (root, snapshot_dir) = restore_verify_fixture("valid");
+
+        ensure_snapshot_verified(&snapshot_dir).expect("a valid snapshot verifies");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_verify_rejects_tampered_store_bytes() {
+        let (root, snapshot_dir) = restore_verify_fixture("tampered");
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"tampered-db").unwrap();
+
+        let result = ensure_snapshot_verified(&snapshot_dir);
+
+        assert!(
+            result.is_err(),
+            "store bytes that no longer match checksums.json must fail verification"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_verify_rejects_missing_manifest() {
+        let (root, snapshot_dir) = restore_verify_fixture("no-manifest");
+        std::fs::remove_file(snapshot_dir.join("manifest.json")).unwrap();
+
+        let result = ensure_snapshot_verified(&snapshot_dir);
+
+        assert!(
+            result.is_err(),
+            "a snapshot with no manifest.json must fail verification"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -3275,6 +3341,27 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
             }
         })
         .build()?)
+}
+
+/// Verify a snapshot directory before a restore copies anything from it.
+///
+/// Export writes `manifest.json` and `checksums.json` precisely so an
+/// import can check them; restoring without this call would import a
+/// tampered or corrupt snapshot — including its store-state sidecar, a
+/// checksummed member — as recorded identity with no integrity check.
+/// Err carries the verification error, or the report's error text when
+/// verification completed but judged the snapshot invalid.
+fn ensure_snapshot_verified(dir: &std::path::Path) -> anyhow::Result<()> {
+    match crate::storage::verify_snapshot(dir) {
+        Ok(report) if report.valid => Ok(()),
+        Ok(report) => Err(anyhow::anyhow!(
+            "{}",
+            report
+                .error
+                .unwrap_or_else(|| "snapshot is not valid".to_string())
+        )),
+        Err(e) => Err(anyhow::anyhow!("{}", e)),
+    }
 }
 
 /// Copy a snapshot's files into place for a restore: the store file, its
@@ -3872,6 +3959,10 @@ async fn run() -> anyhow::Result<()> {
                         "{:?} does not look like a snapshot: no ladybug.store inside it.",
                         dir
                     );
+                    std::process::exit(1);
+                }
+                if let Err(e) = ensure_snapshot_verified(std::path::Path::new(&dir)) {
+                    eprintln!("Snapshot verification failed: {}", e);
                     std::process::exit(1);
                 }
                 copy_snapshot_into_place(std::path::Path::new(&dir), &target)?;
